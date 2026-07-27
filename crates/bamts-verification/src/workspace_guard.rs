@@ -987,12 +987,10 @@ fn codegen_closure(metadata: &CargoMetadata) -> Result<ResolvedClosure> {
                 package.id
             )));
         }
-        if package.name == "bamts-codegen" {
-            if codegen.replace(package.id.as_str()).is_some() {
-                return Err(workspace_error(
-                    "cargo metadata contains multiple bamts-codegen packages",
-                ));
-            }
+        if package.name == "bamts-codegen" && codegen.replace(package.id.as_str()).is_some() {
+            return Err(workspace_error(
+                "cargo metadata contains multiple bamts-codegen packages",
+            ));
         }
     }
     let codegen =

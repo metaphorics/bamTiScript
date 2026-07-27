@@ -410,14 +410,16 @@ fn validate_control_documents(
     let mut checks = 0usize;
     for mutation in &mutations.mutations {
         validate_simulation_controls(
-            &mutation.main_module,
-            &mutation.init,
-            &mutation.step,
-            &mutation.backend,
-            mutation.threads,
-            mutation.max_steps,
-            mutation.max_samples,
-            &mutation.seed,
+            &SimulationControls {
+                main_module: &mutation.main_module,
+                init: &mutation.init,
+                step: &mutation.step,
+                backend: &mutation.backend,
+                threads: mutation.threads,
+                max_steps: mutation.max_steps,
+                max_samples: mutation.max_samples,
+                seed: &mutation.seed,
+            },
             &root.join(QUINT_MUTATIONS_PATH),
         )?;
         let invariant_id = catalog_id(
@@ -494,14 +496,16 @@ fn validate_control_documents(
     let mut actual_witnesses = BTreeSet::new();
     for witness in &witnesses.witnesses {
         validate_simulation_controls(
-            &witness.main_module,
-            &witness.init,
-            &witness.step,
-            &witness.backend,
-            witness.threads,
-            witness.max_steps,
-            witness.max_samples,
-            &witness.seed,
+            &SimulationControls {
+                main_module: &witness.main_module,
+                init: &witness.init,
+                step: &witness.step,
+                backend: &witness.backend,
+                threads: witness.threads,
+                max_steps: witness.max_steps,
+                max_samples: witness.max_samples,
+                seed: &witness.seed,
+            },
             &root.join(QUINT_WITNESSES_PATH),
         )?;
         let invariant_id = catalog_id(
@@ -1241,14 +1245,16 @@ fn validate_quint_runs(
             .ok_or_else(|| schema_error(&path, format!("missing Quint model {}", run.model)))?;
         require_model_module(source, &run.main_module, &path)?;
         validate_simulation_controls(
-            &run.main_module,
-            &run.init,
-            &run.step,
-            "rust",
-            1,
-            run.max_steps,
-            run.max_samples,
-            &run.seed,
+            &SimulationControls {
+                main_module: &run.main_module,
+                init: &run.init,
+                step: &run.step,
+                backend: "rust",
+                threads: 1,
+                max_steps: run.max_steps,
+                max_samples: run.max_samples,
+                seed: &run.seed,
+            },
             &path,
         )?;
         if !seen_models.insert(run.model.clone()) {
@@ -1305,25 +1311,26 @@ fn validate_quint_runs(
     Ok(())
 }
 
-fn validate_simulation_controls(
-    main_module: &str,
-    init: &str,
-    step: &str,
-    backend: &str,
+struct SimulationControls<'a> {
+    main_module: &'a str,
+    init: &'a str,
+    step: &'a str,
+    backend: &'a str,
     threads: u64,
     max_steps: u64,
     max_samples: u64,
-    seed: &str,
-    path: &Path,
-) -> Result<()> {
-    require_identifier(main_module, "main module", path)?;
-    if init != "init"
-        || step != "step"
-        || backend != "rust"
-        || threads != 1
-        || max_steps == 0
-        || max_samples == 0
-        || !decimal_seed(seed)
+    seed: &'a str,
+}
+
+fn validate_simulation_controls(controls: &SimulationControls<'_>, path: &Path) -> Result<()> {
+    require_identifier(controls.main_module, "main module", path)?;
+    if controls.init != "init"
+        || controls.step != "step"
+        || controls.backend != "rust"
+        || controls.threads != 1
+        || controls.max_steps == 0
+        || controls.max_samples == 0
+        || !decimal_seed(controls.seed)
     {
         return Err(schema_error(
             path,

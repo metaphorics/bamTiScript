@@ -593,18 +593,17 @@ fn validate_run_manifest(
                 format!("run `{}` has an invalid invariant set", run.model),
             ));
         }
-        if let Some(witness) = &run.liveness_witness {
-            if witness.max_samples == 0
+        if let Some(witness) = &run.liveness_witness
+            && (witness.max_samples == 0
                 || witness.max_steps == 0
                 || witness.witnessed == 0
                 || witness.name.trim().is_empty()
-                || !decimal_seed(&witness.seed)
-            {
-                return Err(VerificationError::new(
-                    ErrorCode::Schema,
-                    format!("run `{}` has an invalid liveness witness", run.model),
-                ));
-            }
+                || !decimal_seed(&witness.seed))
+        {
+            return Err(VerificationError::new(
+                ErrorCode::Schema,
+                format!("run `{}` has an invalid liveness witness", run.model),
+            ));
         }
         if run.max_samples == 0 || run.max_steps == 0 || !decimal_seed(&run.seed) {
             return Err(VerificationError::new(
@@ -1676,15 +1675,21 @@ mod tests {
         let first = transition("quint/DriverSystem/000", 1);
         let second = transition("quint/DriverSystem/001", 2);
         assert_eq!(
-            compare_transitions(&[first.clone(), second.clone()], &[first.clone()])
-                .unwrap_err()
-                .code(),
+            compare_transitions(
+                &[first.clone(), second.clone()],
+                std::slice::from_ref(&first)
+            )
+            .unwrap_err()
+            .code(),
             ErrorCode::SetMismatch
         );
         assert_eq!(
-            compare_transitions(&[first.clone()], &[first.clone(), second.clone()])
-                .unwrap_err()
-                .code(),
+            compare_transitions(
+                std::slice::from_ref(&first),
+                &[first.clone(), second.clone()]
+            )
+            .unwrap_err()
+            .code(),
             ErrorCode::SetMismatch
         );
         assert_eq!(

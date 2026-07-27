@@ -424,13 +424,13 @@ fn validate_source(root: &Path, path: &Path, source: &SourcePin) -> Result<()> {
         &source.digest,
     )?;
 
-    if let Some(commit) = &source.commit {
-        if !is_lower_hex(commit, 40) {
-            return Err(schema_error(
-                path,
-                format!("source `{}` has malformed commit", source.name),
-            ));
-        }
+    if let Some(commit) = &source.commit
+        && !is_lower_hex(commit, 40)
+    {
+        return Err(schema_error(
+            path,
+            format!("source `{}` has malformed commit", source.name),
+        ));
     }
 
     if let Some(vendored_path) = &source.vendored_path {
