@@ -1,0 +1,153 @@
+{
+  "generator_backend": "quint",
+  "node_version": "24.18.0",
+  "package_lock_sha256": "f97121173b9f773b7ec7f4fc48a9774776b00028f78f568b4506124b7ec9c140",
+  "runs": [
+    {
+      "init": "init",
+      "invariants": [
+        "inv_phase",
+        "inv_graph",
+        "inv_dependency_first",
+        "inv_cancel_no_publish",
+        "inv_atomic_emit",
+        "inv_emit_exit",
+        "inv_dirty_cancels"
+      ],
+      "liveness_witness": {
+        "max_samples": 1000,
+        "max_steps": 20,
+        "name": "live_quiescent",
+        "seed": "9301",
+        "witnessed": 1000
+      },
+      "main_module": "DriverSystem",
+      "max_samples": 200,
+      "max_steps": 12,
+      "model": "driver/DriverSystem.qnt",
+      "seed": "101",
+      "step": "step",
+      "trace": "verification/formal/quint/driver_0.itf.json",
+      "trace_sha256": "6218a9cd83138fe13a76e84747c0ebe4771fbeb5461e8bd3c52702e51bdac259"
+    },
+    {
+      "init": "init",
+      "invariants": [
+        "ReachableResolves",
+        "ShadeTicketExact",
+        "CloseQuiescent",
+        "NoFalseReclamationAtClose",
+        "RememberedSound",
+        "EpochSafeReclaim",
+        "CompactOnePage",
+        "FinalizerExactlyOnce",
+        "FailedAllocPublishesNothing",
+        "ShutdownSealed",
+        "DrrRoundBound"
+      ],
+      "main_module": "model",
+      "max_samples": 200,
+      "max_steps": 12,
+      "model": "gc/model.qnt",
+      "seed": "202",
+      "step": "step",
+      "trace": "verification/formal/quint/gc_0.itf.json",
+      "trace_sha256": "9021a1b93b6c38230d88fcaa728d2f6540db98d7f5d28e2809be4ecf1248d36c"
+    },
+    {
+      "init": "init",
+      "invariants": [
+        "TypeOK",
+        "InvFIFO",
+        "InvExactlyOnce",
+        "InvAsyncOwner",
+        "InvClose",
+        "InvCheckpointOrder",
+        "InvShutdown"
+      ],
+      "liveness_witness": {
+        "max_samples": 1000,
+        "max_steps": 20,
+        "name": "Live",
+        "seed": "9302",
+        "witnessed": 1000
+      },
+      "main_module": "node_loop",
+      "max_samples": 200,
+      "max_steps": 12,
+      "model": "node_loop.qnt",
+      "seed": "303",
+      "step": "step",
+      "trace": "verification/formal/quint/node_loop_0.itf.json",
+      "trace_sha256": "b32febd30b2ac035585594d3a3d3eb3f594bd03fb56fcfd9f9fe9ef070a0d2af"
+    },
+    {
+      "init": "init",
+      "invariants": [
+        "QueueBound",
+        "OneReadyToken",
+        "SingleCompilerOwner",
+        "SlotConservation",
+        "NoPublishBeforeFinalize",
+        "WxBeforePublish",
+        "CancelledNeverLive",
+        "EntryGenerationMatchesSnapshot",
+        "NoReclaimBeforeQuiescence",
+        "FallbackOnEveryRejectOrFailure",
+        "OsrOrdinalInRange",
+        "ResumeOrdinalStable"
+      ],
+      "main_module": "jit_lifecycle",
+      "max_samples": 200,
+      "max_steps": 12,
+      "model": "jit_lifecycle.qnt",
+      "seed": "404",
+      "step": "step",
+      "trace": "verification/formal/quint/jit_0.itf.json",
+      "trace_sha256": "e4f3ec9ecb17060de82a106b1d1e2a272c60d826f2ffb02a605ab4c19bc6089e"
+    },
+    {
+      "init": "init",
+      "invariants": [
+        "InvOwnerGeneration",
+        "InvScopeLifo",
+        "InvRefRoot",
+        "InvAsyncWork",
+        "InvTsfn",
+        "InvTeardownOrder",
+        "InvFinalizer",
+        "InvAbiCap"
+      ],
+      "main_module": "napi_lifecycle",
+      "max_samples": 200,
+      "max_steps": 12,
+      "model": "napi_lifecycle.qnt",
+      "seed": "505",
+      "step": "step",
+      "trace": "verification/formal/quint/napi_0.itf.json",
+      "trace_sha256": "cd859ec370dfb1da23443b957e3e12f11f58c5fa682d95d5aefb2b24fa54668d"
+    },
+    {
+      "init": "init",
+      "invariants": [
+        "ServeOnlyVerified",
+        "CacheFieldIsolation"
+      ],
+      "main_module": "bytecode_cache_keys",
+      "max_samples": 200,
+      "max_steps": 12,
+      "model": "bytecode_cache_keys.qnt",
+      "seed": "606",
+      "step": "step",
+      "trace": "verification/formal/quint/cache_0.itf.json",
+      "trace_sha256": "03812676844d5a339b65e78aa092b8a1689211105c2084463c61e8c0eae2f0aa"
+    }
+  ],
+  "schema": "bamti.quint-runs/v1",
+  "tool": {
+    "archive_digest": "9Yoji7DU6moRm1ofDaN+ftdxNcEGciiGbm7eN4MjlcCbfv7/Y/zchadcXXRmMZmN9oTPXUk9GmhjQOhADJsiSQ==",
+    "archive_digest_algorithm": "sha512",
+    "name": "@informalsystems/quint",
+    "version": "0.32.0"
+  }
+}

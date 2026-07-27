@@ -1,0 +1,22 @@
+[package]
+name = "bamts-codegen"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+bamts-bytecode = { path = "../bamts-bytecode" }
+bamts-native = { path = "../bamts-native", optional = true, features = ["jit-entry"] }
+cranelift-codegen = { version = "=0.134.2", default-features = false, features = ["std", "unwind", "all-native-arch"] }
+cranelift-frontend = "=0.134.2"
+cranelift-module = "=0.134.2"
+cranelift-object = { version = "=0.134.2", optional = true }
+cranelift-jit = { version = "=0.134.2", optional = true }
+
+[features]
+default = []
+aot = ["dep:cranelift-object"]
+host-jit = ["dep:cranelift-jit", "dep:bamts-native"]
+
+[lints]
+workspace = true

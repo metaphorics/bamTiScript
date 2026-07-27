@@ -1,0 +1,311 @@
+{
+  "forbidden_constructs": {
+    "admit": 0,
+    "axiom": 0,
+    "implemented_by": 0,
+    "sorry": 0
+  },
+  "lean_version": "4.32.1",
+  "observed_kernel_assumptions": [
+    "Classical.choice",
+    "Quot.sound",
+    "propext"
+  ],
+  "public_theorems": [
+    {
+      "file": "Bamti/Abi.lean",
+      "name": "Bamti.generation_never_wraps"
+    },
+    {
+      "file": "Bamti/Abi.lean",
+      "name": "Bamti.le_roundtrip"
+    },
+    {
+      "file": "Bamti/Abi.lean",
+      "name": "Bamti.shadow_frame_layout"
+    },
+    {
+      "file": "Bamti/Abi.lean",
+      "name": "Bamti.stale_after_retire"
+    },
+    {
+      "file": "Bamti/Bytecode/Bridge.lean",
+      "name": "Bamti.Bytecode.bridge_trace_preserves_boundaries"
+    },
+    {
+      "file": "Bamti/Bytecode/CacheKey.lean",
+      "name": "Bamti.Bytecode.no_serialized_runtime_identity"
+    },
+    {
+      "file": "Bamti/Bytecode/Verify.lean",
+      "name": "Bamti.Bytecode.cfg_targets_are_boundaries"
+    },
+    {
+      "file": "Bamti/Bytecode/Verify.lean",
+      "name": "Bamti.Bytecode.decode_encode_canonical"
+    },
+    {
+      "file": "Bamti/Bytecode/Verify.lean",
+      "name": "Bamti.Bytecode.decode_total"
+    },
+    {
+      "file": "Bamti/Bytecode/Verify.lean",
+      "name": "Bamti.Bytecode.definite_init_sound"
+    },
+    {
+      "file": "Bamti/Bytecode/Verify.lean",
+      "name": "Bamti.Bytecode.encode_decode_identity"
+    },
+    {
+      "file": "Bamti/Bytecode/Verify.lean",
+      "name": "Bamti.Bytecode.entry_ordinal_injective"
+    },
+    {
+      "file": "Bamti/Bytecode/Verify.lean",
+      "name": "Bamti.Bytecode.entry_points_complete"
+    },
+    {
+      "file": "Bamti/Bytecode/Verify.lean",
+      "name": "Bamti.Bytecode.handlers_well_nested"
+    },
+    {
+      "file": "Bamti/Bytecode/Verify.lean",
+      "name": "Bamti.Bytecode.verifier_never_skips_invariant"
+    },
+    {
+      "file": "Bamti/Bytecode/Verify.lean",
+      "name": "Bamti.Bytecode.verify_ok_iff"
+    },
+    {
+      "file": "Bamti/Bytecode/Verify.lean",
+      "name": "Bamti.Bytecode.verify_sound"
+    },
+    {
+      "file": "Bamti/Compiler/Correctness.lean",
+      "name": "Bamti.Compiler.compile_core_observational_equivalence"
+    },
+    {
+      "file": "Bamti/Compiler/Correctness.lean",
+      "name": "Bamti.Compiler.compile_core_weak_bisim"
+    },
+    {
+      "file": "Bamti/Compiler/Correctness.lean",
+      "name": "Bamti.Compiler.compile_verified"
+    },
+    {
+      "file": "Bamti/Compiler/Correctness.lean",
+      "name": "Bamti.Compiler.simulate_async"
+    },
+    {
+      "file": "Bamti/Compiler/Correctness.lean",
+      "name": "Bamti.Compiler.simulate_binding"
+    },
+    {
+      "file": "Bamti/Compiler/Correctness.lean",
+      "name": "Bamti.Compiler.simulate_call"
+    },
+    {
+      "file": "Bamti/Compiler/Correctness.lean",
+      "name": "Bamti.Compiler.simulate_conditional"
+    },
+    {
+      "file": "Bamti/Compiler/Correctness.lean",
+      "name": "Bamti.Compiler.simulate_construct"
+    },
+    {
+      "file": "Bamti/Compiler/Correctness.lean",
+      "name": "Bamti.Compiler.simulate_dynamic_import"
+    },
+    {
+      "file": "Bamti/Compiler/Correctness.lean",
+      "name": "Bamti.Compiler.simulate_iterator"
+    },
+    {
+      "file": "Bamti/Compiler/Correctness.lean",
+      "name": "Bamti.Compiler.simulate_literal"
+    },
+    {
+      "file": "Bamti/Compiler/Correctness.lean",
+      "name": "Bamti.Compiler.simulate_loop"
+    },
+    {
+      "file": "Bamti/Compiler/Correctness.lean",
+      "name": "Bamti.Compiler.simulate_module_evaluate"
+    },
+    {
+      "file": "Bamti/Compiler/Correctness.lean",
+      "name": "Bamti.Compiler.simulate_module_link"
+    },
+    {
+      "file": "Bamti/Compiler/Correctness.lean",
+      "name": "Bamti.Compiler.simulate_promise"
+    },
+    {
+      "file": "Bamti/Compiler/Correctness.lean",
+      "name": "Bamti.Compiler.simulate_property_get"
+    },
+    {
+      "file": "Bamti/Compiler/Correctness.lean",
+      "name": "Bamti.Compiler.simulate_property_set"
+    },
+    {
+      "file": "Bamti/Compiler/Correctness.lean",
+      "name": "Bamti.Compiler.simulate_sequence"
+    },
+    {
+      "file": "Bamti/Compiler/Correctness.lean",
+      "name": "Bamti.Compiler.simulate_throw"
+    },
+    {
+      "file": "Bamti/Compiler/Correctness.lean",
+      "name": "Bamti.Compiler.simulate_try_catch_finally"
+    },
+    {
+      "file": "Bamti/Compiler/Correctness.lean",
+      "name": "Bamti.Compiler.simulate_variable"
+    },
+    {
+      "file": "Bamti/Compiler/Correctness.lean",
+      "name": "Bamti.Compiler.simulation_stop"
+    },
+    {
+      "file": "Bamti/Compiler/Correctness.lean",
+      "name": "Bamti.Compiler.simulation_tick"
+    },
+    {
+      "file": "Bamti/Compiler/Relation.lean",
+      "name": "Bamti.Compiler.bc_step_deterministic"
+    },
+    {
+      "file": "Bamti/Compiler/Relation.lean",
+      "name": "Bamti.Compiler.bytecode_step_deterministic"
+    },
+    {
+      "file": "Bamti/Compiler/Relation.lean",
+      "name": "Bamti.Compiler.compile_state_step_commutes"
+    },
+    {
+      "file": "Bamti/Compiler/Relation.lean",
+      "name": "Bamti.Compiler.source_step_deterministic"
+    },
+    {
+      "file": "Bamti/Compiler/Relation.lean",
+      "name": "Bamti.Compiler.src_step_deterministic"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.cancelled_never_live"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.entry_generation_matches_snapshot"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.fallback_on_every_reject_or_failure"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.no_publish_before_finalize"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.no_reclaim_before_quiescence"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.one_ready_token"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.osr_ordinal_in_range"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.publication_after_finalization"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.queue_bound"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.resume_ordinal_stable"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.retirement_after_quiescence"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.retirement_waits_for_quiescence"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.single_compiler_owner"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.slot_conservation"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.wx_before_publish"
+    },
+    {
+      "file": "Bamti/NapiLifecycle.lean",
+      "name": "Bamti.at_most_once_complete"
+    },
+    {
+      "file": "Bamti/NapiLifecycle.lean",
+      "name": "Bamti.at_most_once_finalizer"
+    },
+    {
+      "file": "Bamti/NapiLifecycle.lean",
+      "name": "Bamti.no_cross_env_root"
+    },
+    {
+      "file": "Bamti/NapiLifecycle.lean",
+      "name": "Bamti.teardown_phase_monotone"
+    },
+    {
+      "file": "Bamti/NodeLoop.lean",
+      "name": "Bamti.completion_exactly_once"
+    },
+    {
+      "file": "Bamti/NodeLoop.lean",
+      "name": "Bamti.completion_fifo"
+    },
+    {
+      "file": "Bamti/NodeLoop.lean",
+      "name": "Bamti.no_callback_after_close"
+    },
+    {
+      "file": "Bamti/NodeLoop.lean",
+      "name": "Bamti.shutdown_no_future_user_callback"
+    },
+    {
+      "file": "Bamti/NodeLoop.lean",
+      "name": "Bamti.step_preserves_wellFormed"
+    },
+    {
+      "file": "Bamti/Value.lean",
+      "name": "Bamti.canonical_nan"
+    },
+    {
+      "file": "Bamti/Value.lean",
+      "name": "Bamti.encode_decode"
+    },
+    {
+      "file": "Bamti/Value.lean",
+      "name": "Bamti.slot_pack_unpack"
+    },
+    {
+      "file": "Bamti/Value.lean",
+      "name": "Bamti.tags_disjoint"
+    }
+  ],
+  "schema": "bamti.lean-assumptions/v1",
+  "source_sha256": "cdf8f82ec8b8fe53999ebd09aa80625095f15bfaf2e03752477291b064dc3eeb",
+  "user_axioms": []
+}

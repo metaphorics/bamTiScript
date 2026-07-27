@@ -1,0 +1,18 @@
+[package]
+name = "bamts-cli"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+bamts-compiler = { path = "../bamts-compiler" }
+bamts-runtime = { path = "../bamts-runtime" }
+bamts-codegen = { path = "../bamts-codegen" }
+bamts-node = { path = "../bamts-node", optional = true }
+
+[features]
+default = []
+node = ["dep:bamts-node"]
+
+[lints]
+workspace = true

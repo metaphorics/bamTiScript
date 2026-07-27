@@ -1,0 +1,11 @@
+{
+  "name": "bamti-formal-quint",
+  "private": true,
+  "version": "0.0.0",
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@informalsystems/quint": "0.32.0"
+  }
+}

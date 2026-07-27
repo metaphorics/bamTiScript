@@ -1,0 +1,14 @@
+[package]
+name = "bamts-native"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+gc = []
+node-host = []
+jit-entry = []
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

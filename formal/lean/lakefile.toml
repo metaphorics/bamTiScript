@@ -1,0 +1,6 @@
+name = "bamti-formal"
+version = "0.0.0"
+defaultTargets = ["Bamti"]
+
+[[lean_lib]]
+name = "Bamti"

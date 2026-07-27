@@ -1,0 +1,1294 @@
+use crate::{ErrorCode, Gate, GateReport, Result, VerificationError};
+use serde::Deserialize;
+use std::collections::{BTreeMap, BTreeSet};
+use std::env;
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use toml::{Table, Value};
+
+const MEMBERS: [(&str, &str); 8] = [
+    ("bamts-compiler", "crates/bamts-compiler"),
+    ("bamts-bytecode", "crates/bamts-bytecode"),
+    ("bamts-runtime", "crates/bamts-runtime"),
+    ("bamts-native", "crates/bamts-native"),
+    ("bamts-node", "crates/bamts-node"),
+    ("bamts-codegen", "crates/bamts-codegen"),
+    ("bamts-cli", "crates/bamts-cli"),
+    ("bamts-verification", "crates/bamts-verification"),
+];
+
+const DEPENDENCY_TABLES: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+const WORKSPACE_CHECKS: usize = 13;
+
+#[derive(Debug)]
+struct MemberManifest {
+    directory: PathBuf,
+    manifest_path: PathBuf,
+    value: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InternalDependency {
+    optional: bool,
+    features: BTreeSet<String>,
+}
+
+type InternalGraph = BTreeMap<String, BTreeMap<String, InternalDependency>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisitState {
+    Visiting,
+    Complete,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoMetadata {
+    packages: Vec<CargoPackage>,
+    resolve: Option<CargoResolve>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoPackage {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoResolve {
+    nodes: Vec<CargoNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoNode {
+    id: String,
+    dependencies: Vec<String>,
+    features: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct ResolvedClosure {
+    package_names: BTreeSet<String>,
+    package_features: BTreeMap<String, BTreeSet<String>>,
+}
+
+pub fn audit_workspace(root: &Path) -> Result<GateReport> {
+    let root = fs::canonicalize(root).map_err(|error| {
+        VerificationError::new(
+            ErrorCode::Io,
+            format!(
+                "cannot resolve workspace root `{}`: {error}",
+                root.display()
+            ),
+        )
+    })?;
+    let root_manifest = read_toml(&root.join("Cargo.toml"))?;
+
+    validate_root_manifest(&root_manifest)?;
+    validate_workspace_dependencies(&root_manifest)?;
+
+    let members = load_members(&root)?;
+    let graph = collect_internal_graph(&members)?;
+    validate_internal_graph(&graph)?;
+    validate_feature_closures(&root)?;
+
+    Ok(GateReport {
+        gate: Gate::G0,
+        checks: WORKSPACE_CHECKS,
+    })
+}
+
+fn read_toml(path: &Path) -> Result<Value> {
+    let source = fs::read_to_string(path).map_err(|error| {
+        VerificationError::new(
+            ErrorCode::Io,
+            format!(
+                "cannot read workspace manifest `{}`: {error}",
+                path.display()
+            ),
+        )
+    })?;
+
+    toml::from_str::<Value>(&source).map_err(|error| {
+        VerificationError::new(
+            ErrorCode::Toml,
+            format!(
+                "cannot parse workspace manifest `{}`: {error}",
+                path.display()
+            ),
+        )
+    })
+}
+
+fn validate_root_manifest(manifest: &Value) -> Result<()> {
+    let root = root_table(manifest, "root Cargo.toml")?;
+    let workspace = required_table(root, "workspace", "root Cargo.toml")?;
+
+    validate_members(workspace)?;
+    require_exact_string(workspace, "resolver", "3", "root [workspace]")?;
+
+    let package = required_table(workspace, "package", "root [workspace]")?;
+    require_exact_string(package, "edition", "2024", "root [workspace.package]")?;
+    require_exact_string(
+        package,
+        "rust-version",
+        "1.97.1",
+        "root [workspace.package]",
+    )?;
+    require_exact_bool(package, "publish", false, "root [workspace.package]")?;
+
+    let lints = required_table(workspace, "lints", "root [workspace]")?;
+    let rust = required_table(lints, "rust", "root [workspace.lints]")?;
+    require_exact_string(rust, "unsafe_code", "forbid", "root [workspace.lints.rust]")
+}
+
+fn validate_members(workspace: &Table) -> Result<()> {
+    let values = match workspace.get("members") {
+        Some(Value::Array(values)) => values,
+        Some(_) => return Err(workspace_error("root [workspace].members must be an array")),
+        None => return Err(workspace_error("root [workspace].members is missing")),
+    };
+
+    let mut members = BTreeSet::new();
+    let mut duplicates = BTreeSet::new();
+    for value in values {
+        let member = match value.as_str() {
+            Some(member) => member,
+            None => {
+                return Err(workspace_error(
+                    "root [workspace].members must contain only strings",
+                ));
+            }
+        };
+        if !members.insert(member.to_owned()) {
+            duplicates.insert(member.to_owned());
+        }
+    }
+
+    if !duplicates.is_empty() {
+        return Err(workspace_error(format!(
+            "root [workspace].members contains duplicates [{}]",
+            format_set(&duplicates)
+        )));
+    }
+
+    let expected = expected_member_paths();
+    if members != expected {
+        return Err(workspace_error(format!(
+            "root [workspace].members differ: {}",
+            set_difference(&expected, &members)
+        )));
+    }
+
+    Ok(())
+}
+
+fn expected_member_paths() -> BTreeSet<String> {
+    MEMBERS.iter().map(|(_, path)| (*path).to_owned()).collect()
+}
+
+fn validate_workspace_dependencies(manifest: &Value) -> Result<()> {
+    let root = root_table(manifest, "root Cargo.toml")?;
+    let workspace = required_table(root, "workspace", "root Cargo.toml")?;
+    let Some(value) = workspace.get("dependencies") else {
+        return Ok(());
+    };
+    let dependencies = value.as_table().ok_or_else(|| {
+        workspace_error("root [workspace.dependencies] must be a dependency table")
+    })?;
+
+    for (name, dependency) in sorted_table_entries(dependencies) {
+        validate_registry_dependency(name, dependency, "root [workspace.dependencies]")?;
+    }
+
+    Ok(())
+}
+
+fn load_members(root: &Path) -> Result<BTreeMap<String, MemberManifest>> {
+    let mut members = BTreeMap::new();
+
+    for (expected_name, member_path) in MEMBERS {
+        let directory = fs::canonicalize(root.join(member_path)).map_err(|error| {
+            VerificationError::new(
+                ErrorCode::Io,
+                format!(
+                    "cannot resolve member directory `{}`: {error}",
+                    root.join(member_path).display()
+                ),
+            )
+        })?;
+        let manifest_path = directory.join("Cargo.toml");
+        let value = read_toml(&manifest_path)?;
+        validate_member_manifest(expected_name, &value, &manifest_path)?;
+
+        let member = MemberManifest {
+            directory,
+            manifest_path,
+            value,
+        };
+        if members.insert(expected_name.to_owned(), member).is_some() {
+            return Err(workspace_error(format!(
+                "member `{expected_name}` was loaded more than once"
+            )));
+        }
+    }
+
+    Ok(members)
+}
+
+fn validate_member_manifest(expected_name: &str, manifest: &Value, path: &Path) -> Result<()> {
+    let root = root_table(manifest, &path.display().to_string())?;
+    let package = required_table(root, "package", &path.display().to_string())?;
+    let name = required_string(package, "name", &format!("{} [package]", path.display()))?;
+    if name != expected_name {
+        return Err(workspace_error(format!(
+            "{} declares package `{name}`, expected `{expected_name}`",
+            path.display()
+        )));
+    }
+
+    require_workspace_inheritance(package, "edition", path)?;
+    require_workspace_inheritance(package, "rust-version", path)?;
+    require_workspace_inheritance(package, "publish", path)?;
+    validate_member_lints(expected_name, manifest, &path.display().to_string())?;
+
+    if expected_name == "bamts-native" {
+        validate_native_features(manifest, &path.display().to_string())?;
+    } else if expected_name == "bamts-codegen" {
+        validate_codegen_features(manifest, &path.display().to_string())?;
+    } else if expected_name == "bamts-cli" {
+        validate_cli_features(manifest, &path.display().to_string())?;
+    }
+
+    Ok(())
+}
+
+fn require_workspace_inheritance(package: &Table, key: &str, path: &Path) -> Result<()> {
+    let context = format!("{} [package]", path.display());
+    let setting = required_table(package, key, &context)?;
+    if setting.len() != 1 || setting.get("workspace").and_then(Value::as_bool) != Some(true) {
+        return Err(workspace_error(format!(
+            "{context}.{key} must be inherited with `{key}.workspace = true`"
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_member_lints(name: &str, manifest: &Value, context: &str) -> Result<()> {
+    let root = root_table(manifest, context)?;
+    let lints = required_table(root, "lints", context)?;
+
+    if name == "bamts-native" {
+        if lints.contains_key("workspace") {
+            return Err(workspace_error(format!(
+                "{context}: bamts-native must not inherit workspace lints"
+            )));
+        }
+        let rust = required_table(lints, "rust", context)?;
+        require_exact_string(
+            rust,
+            "unsafe_op_in_unsafe_fn",
+            "deny",
+            &format!("{context} [lints.rust]"),
+        )?;
+        if rust.contains_key("unsafe_code") {
+            return Err(workspace_error(format!(
+                "{context}: bamts-native must not override `unsafe_code`"
+            )));
+        }
+        return Ok(());
+    }
+
+    if lints.get("workspace").and_then(Value::as_bool) != Some(true) {
+        return Err(workspace_error(format!(
+            "{context}: {name} must inherit workspace lints"
+        )));
+    }
+
+    if let Some(rust) = lints.get("rust") {
+        let rust = rust
+            .as_table()
+            .ok_or_else(|| workspace_error(format!("{context}: [lints.rust] must be a table")))?;
+        if rust.contains_key("unsafe_code") {
+            return Err(workspace_error(format!(
+                "{context}: {name} must inherit the workspace `unsafe_code` policy"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_native_features(manifest: &Value, context: &str) -> Result<()> {
+    let root = root_table(manifest, context)?;
+    let features = required_table(root, "features", context)?;
+    let expected: BTreeSet<String> = ["default", "gc", "node-host", "jit-entry"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let actual: BTreeSet<String> = features.keys().cloned().collect();
+    if actual != expected {
+        return Err(workspace_error(format!(
+            "{context}: bamts-native features differ: {}",
+            set_difference(&expected, &actual)
+        )));
+    }
+
+    for feature in ["default", "gc", "node-host", "jit-entry"] {
+        require_feature_set(features, feature, &[], context)?;
+    }
+
+    Ok(())
+}
+
+fn validate_codegen_features(manifest: &Value, context: &str) -> Result<()> {
+    let root = root_table(manifest, context)?;
+    let features = required_table(root, "features", context)?;
+    let expected_keys: BTreeSet<String> = ["default", "aot", "host-jit"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let actual_keys: BTreeSet<String> = features.keys().cloned().collect();
+    if actual_keys != expected_keys {
+        return Err(workspace_error(format!(
+            "{context}: bamts-codegen features differ: {}",
+            set_difference(&expected_keys, &actual_keys)
+        )));
+    }
+
+    let default = parse_feature_set(features, "default", context)?;
+    let aot = parse_feature_set(features, "aot", context)?;
+    let host_jit = parse_feature_set(features, "host-jit", context)?;
+    if !aot.is_disjoint(&host_jit) {
+        let overlap: BTreeSet<String> = aot.intersection(&host_jit).cloned().collect();
+        return Err(workspace_error(format!(
+            "{context}: bamts-codegen `aot` and `host-jit` overlap [{}]",
+            format_set(&overlap)
+        )));
+    }
+
+    require_exact_feature_set("default", &default, &[], context)?;
+    require_exact_feature_set("aot", &aot, &["dep:cranelift-object"], context)?;
+    require_exact_feature_set(
+        "host-jit",
+        &host_jit,
+        &["dep:cranelift-jit", "dep:bamts-native"],
+        context,
+    )
+}
+
+fn validate_cli_features(manifest: &Value, context: &str) -> Result<()> {
+    let root = root_table(manifest, context)?;
+    let features = required_table(root, "features", context)?;
+    let expected_keys: BTreeSet<String> =
+        ["default", "node"].into_iter().map(str::to_owned).collect();
+    let actual_keys: BTreeSet<String> = features.keys().cloned().collect();
+    if actual_keys != expected_keys {
+        return Err(workspace_error(format!(
+            "{context}: bamts-cli features differ: {}",
+            set_difference(&expected_keys, &actual_keys)
+        )));
+    }
+
+    require_feature_set(features, "default", &[], context)?;
+    require_feature_set(features, "node", &["dep:bamts-node"], context)
+}
+
+fn require_feature_set(
+    features: &Table,
+    feature: &str,
+    expected: &[&str],
+    context: &str,
+) -> Result<()> {
+    let actual = parse_feature_set(features, feature, context)?;
+    require_exact_feature_set(feature, &actual, expected, context)
+}
+
+fn require_exact_feature_set(
+    feature: &str,
+    actual: &BTreeSet<String>,
+    expected: &[&str],
+    context: &str,
+) -> Result<()> {
+    let expected: BTreeSet<String> = expected.iter().map(|value| (*value).to_owned()).collect();
+    if actual != &expected {
+        return Err(workspace_error(format!(
+            "{context}: feature `{feature}` differs: {}",
+            set_difference(&expected, actual)
+        )));
+    }
+
+    Ok(())
+}
+
+fn parse_feature_set(features: &Table, feature: &str, context: &str) -> Result<BTreeSet<String>> {
+    let values = match features.get(feature) {
+        Some(Value::Array(values)) => values,
+        Some(_) => {
+            return Err(workspace_error(format!(
+                "{context}: feature `{feature}` must be an array"
+            )));
+        }
+        None => {
+            return Err(workspace_error(format!(
+                "{context}: feature `{feature}` is missing"
+            )));
+        }
+    };
+
+    parse_string_set(values, &format!("{context}: feature `{feature}`"))
+}
+
+fn collect_internal_graph(members: &BTreeMap<String, MemberManifest>) -> Result<InternalGraph> {
+    let mut member_directories = BTreeMap::new();
+    for (name, member) in members {
+        if member_directories
+            .insert(member.directory.clone(), name.clone())
+            .is_some()
+        {
+            return Err(workspace_error(format!(
+                "members resolve to the same directory `{}`",
+                member.directory.display()
+            )));
+        }
+    }
+
+    let mut graph = BTreeMap::new();
+    for (name, member) in members {
+        let mut dependencies = BTreeMap::new();
+        inspect_member_dependencies(member, &member_directories, &mut dependencies)?;
+        graph.insert(name.clone(), dependencies);
+    }
+
+    Ok(graph)
+}
+
+fn inspect_member_dependencies(
+    member: &MemberManifest,
+    member_directories: &BTreeMap<PathBuf, String>,
+    edges: &mut BTreeMap<String, InternalDependency>,
+) -> Result<()> {
+    let root = root_table(&member.value, &member.manifest_path.display().to_string())?;
+
+    for table_name in DEPENDENCY_TABLES {
+        if let Some(value) = root.get(table_name) {
+            let table = value.as_table().ok_or_else(|| {
+                workspace_error(format!(
+                    "{}: [{table_name}] must be a dependency table",
+                    member.manifest_path.display()
+                ))
+            })?;
+            inspect_dependency_table(member, table, member_directories, edges)?;
+        }
+    }
+
+    let Some(targets) = root.get("target") else {
+        return Ok(());
+    };
+    let targets = targets.as_table().ok_or_else(|| {
+        workspace_error(format!(
+            "{}: [target] must be a table",
+            member.manifest_path.display()
+        ))
+    })?;
+
+    for (target_name, target) in sorted_table_entries(targets) {
+        let target = target.as_table().ok_or_else(|| {
+            workspace_error(format!(
+                "{}: [target.{target_name:?}] must be a table",
+                member.manifest_path.display()
+            ))
+        })?;
+        for table_name in DEPENDENCY_TABLES {
+            if let Some(value) = target.get(table_name) {
+                let table = value.as_table().ok_or_else(|| {
+                    workspace_error(format!(
+                        "{}: [target.{target_name:?}.{table_name}] must be a dependency table",
+                        member.manifest_path.display()
+                    ))
+                })?;
+                inspect_dependency_table(member, table, member_directories, edges)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn inspect_dependency_table(
+    member: &MemberManifest,
+    dependencies: &Table,
+    member_directories: &BTreeMap<PathBuf, String>,
+    edges: &mut BTreeMap<String, InternalDependency>,
+) -> Result<()> {
+    for (name, dependency) in sorted_table_entries(dependencies) {
+        let Some(table) = dependency.as_table() else {
+            validate_registry_dependency(
+                name,
+                dependency,
+                &member.manifest_path.display().to_string(),
+            )?;
+            continue;
+        };
+
+        if table.contains_key("path") {
+            inspect_internal_dependency(member, name, table, member_directories, edges)?;
+        } else {
+            validate_registry_dependency(
+                name,
+                dependency,
+                &member.manifest_path.display().to_string(),
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn inspect_internal_dependency(
+    member: &MemberManifest,
+    dependency_name: &str,
+    attributes: &Table,
+    member_directories: &BTreeMap<PathBuf, String>,
+    edges: &mut BTreeMap<String, InternalDependency>,
+) -> Result<()> {
+    let context = format!(
+        "{} dependency `{dependency_name}`",
+        member.manifest_path.display()
+    );
+    for key in attributes.keys() {
+        if !matches!(key.as_str(), "path" | "optional" | "features") {
+            return Err(workspace_error(format!(
+                "{context}: internal dependencies may only declare `path`, `optional`, and `features`"
+            )));
+        }
+    }
+
+    let path = required_string(attributes, "path", &context)?;
+    let directory = fs::canonicalize(member.directory.join(path)).map_err(|error| {
+        VerificationError::new(
+            ErrorCode::Io,
+            format!("{context}: cannot resolve path dependency `{path}`: {error}"),
+        )
+    })?;
+    let target = member_directories.get(&directory).ok_or_else(|| {
+        workspace_error(format!(
+            "{context}: path dependency `{path}` does not resolve to an approved member"
+        ))
+    })?;
+    if target.as_str() != dependency_name {
+        return Err(workspace_error(format!(
+            "{context}: dependency key must be `{target}`"
+        )));
+    }
+
+    let dependency = InternalDependency {
+        optional: optional_bool(attributes, "optional", &context)?,
+        features: optional_feature_set(attributes, "features", &context)?,
+    };
+    if edges.insert(target.clone(), dependency).is_some() {
+        return Err(workspace_error(format!(
+            "{} declares internal dependency `{target}` more than once",
+            member.manifest_path.display()
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_registry_dependency(name: &str, dependency: &Value, context: &str) -> Result<()> {
+    if is_member_name(name) {
+        return Err(workspace_error(format!(
+            "{context}: internal dependency `{name}` must use an approved path dependency"
+        )));
+    }
+
+    match dependency {
+        Value::String(version) => validate_exact_registry_version(name, version, context),
+        Value::Table(attributes) => {
+            if attributes.contains_key("path") {
+                return Err(workspace_error(format!(
+                    "{context}: path dependency `{name}` does not resolve to an approved member"
+                )));
+            }
+            if attributes.contains_key("workspace") {
+                return Err(workspace_error(format!(
+                    "{context}: dependency `{name}` must declare an exact registry version directly"
+                )));
+            }
+            if attributes.contains_key("git") {
+                return Err(workspace_error(format!(
+                    "{context}: dependency `{name}` must use an exact registry version, not `git`"
+                )));
+            }
+
+            let version = required_string(attributes, "version", context)?;
+            validate_exact_registry_version(name, version, context)?;
+            optional_bool(attributes, "optional", context)?;
+            optional_feature_set(attributes, "features", context)?;
+            Ok(())
+        }
+        _ => Err(workspace_error(format!(
+            "{context}: dependency `{name}` must be a version string or table"
+        ))),
+    }
+}
+
+fn validate_exact_registry_version(name: &str, version: &str, context: &str) -> Result<()> {
+    let Some(version) = version.strip_prefix('=') else {
+        return Err(workspace_error(format!(
+            "{context}: registry dependency `{name}` must use an exact `=` version, found `{version}`"
+        )));
+    };
+    if version.is_empty()
+        || version.chars().any(char::is_whitespace)
+        || version
+            .chars()
+            .any(|character| matches!(character, ',' | '<' | '>' | '^' | '~' | '*' | '='))
+    {
+        return Err(workspace_error(format!(
+            "{context}: registry dependency `{name}` must use one exact `=` version"
+        )));
+    }
+
+    Ok(())
+}
+
+fn is_member_name(name: &str) -> bool {
+    MEMBERS.iter().any(|(member, _)| *member == name)
+}
+
+fn optional_bool(table: &Table, key: &str, context: &str) -> Result<bool> {
+    match table.get(key) {
+        None => Ok(false),
+        Some(Value::Boolean(value)) => Ok(*value),
+        Some(_) => Err(workspace_error(format!(
+            "{context}: `{key}` must be a boolean"
+        ))),
+    }
+}
+
+fn optional_feature_set(table: &Table, key: &str, context: &str) -> Result<BTreeSet<String>> {
+    match table.get(key) {
+        None => Ok(BTreeSet::new()),
+        Some(Value::Array(values)) => parse_string_set(values, &format!("{context}: `{key}`")),
+        Some(_) => Err(workspace_error(format!(
+            "{context}: `{key}` must be an array"
+        ))),
+    }
+}
+
+fn parse_string_set(values: &[Value], context: &str) -> Result<BTreeSet<String>> {
+    let mut parsed = BTreeSet::new();
+    for value in values {
+        let value = value
+            .as_str()
+            .ok_or_else(|| workspace_error(format!("{context} must contain only strings")))?;
+        if value.is_empty() {
+            return Err(workspace_error(format!(
+                "{context} must not contain empty strings"
+            )));
+        }
+        if !parsed.insert(value.to_owned()) {
+            return Err(workspace_error(format!(
+                "{context} contains duplicate `{value}`"
+            )));
+        }
+    }
+
+    Ok(parsed)
+}
+
+fn validate_internal_graph(graph: &InternalGraph) -> Result<()> {
+    ensure_acyclic(graph)?;
+
+    let expected = expected_internal_graph();
+    let actual_members: BTreeSet<String> = graph.keys().cloned().collect();
+    let expected_members: BTreeSet<String> = expected.keys().cloned().collect();
+    if actual_members != expected_members {
+        return Err(workspace_error(format!(
+            "internal dependency graph members differ: {}",
+            set_difference(&expected_members, &actual_members)
+        )));
+    }
+
+    for (owner, expected_dependencies) in &expected {
+        let actual_dependencies = graph
+            .get(owner)
+            .ok_or_else(|| workspace_error(format!("internal dependency graph lacks `{owner}`")))?;
+        let actual_targets: BTreeSet<String> = actual_dependencies.keys().cloned().collect();
+        let expected_targets: BTreeSet<String> = expected_dependencies.keys().cloned().collect();
+        if actual_targets != expected_targets {
+            return Err(workspace_error(format!(
+                "internal dependencies of `{owner}` differ: {}",
+                set_difference(&expected_targets, &actual_targets)
+            )));
+        }
+
+        for (target, expected_attributes) in expected_dependencies {
+            let actual_attributes = actual_dependencies.get(target).ok_or_else(|| {
+                workspace_error(format!(
+                    "internal dependency `{owner}` -> `{target}` is missing"
+                ))
+            })?;
+            if actual_attributes != expected_attributes {
+                return Err(workspace_error(format!(
+                    "internal dependency `{owner}` -> `{target}` has {}, expected {}",
+                    format_internal_dependency(actual_attributes),
+                    format_internal_dependency(expected_attributes)
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn expected_internal_graph() -> InternalGraph {
+    let mut graph = BTreeMap::new();
+    graph.insert("bamts-bytecode".to_owned(), BTreeMap::new());
+    graph.insert("bamts-native".to_owned(), BTreeMap::new());
+    graph.insert(
+        "bamts-compiler".to_owned(),
+        BTreeMap::from([("bamts-bytecode".to_owned(), internal_dependency(false, &[]))]),
+    );
+    graph.insert(
+        "bamts-runtime".to_owned(),
+        BTreeMap::from([
+            ("bamts-bytecode".to_owned(), internal_dependency(false, &[])),
+            (
+                "bamts-native".to_owned(),
+                internal_dependency(false, &["gc"]),
+            ),
+        ]),
+    );
+    graph.insert(
+        "bamts-node".to_owned(),
+        BTreeMap::from([
+            ("bamts-runtime".to_owned(), internal_dependency(false, &[])),
+            (
+                "bamts-native".to_owned(),
+                internal_dependency(false, &["node-host"]),
+            ),
+        ]),
+    );
+    graph.insert(
+        "bamts-codegen".to_owned(),
+        BTreeMap::from([
+            ("bamts-bytecode".to_owned(), internal_dependency(false, &[])),
+            (
+                "bamts-native".to_owned(),
+                internal_dependency(true, &["jit-entry"]),
+            ),
+        ]),
+    );
+    graph.insert(
+        "bamts-cli".to_owned(),
+        BTreeMap::from([
+            ("bamts-compiler".to_owned(), internal_dependency(false, &[])),
+            ("bamts-runtime".to_owned(), internal_dependency(false, &[])),
+            ("bamts-codegen".to_owned(), internal_dependency(false, &[])),
+            ("bamts-node".to_owned(), internal_dependency(true, &[])),
+        ]),
+    );
+    graph.insert(
+        "bamts-verification".to_owned(),
+        BTreeMap::from([
+            ("bamts-bytecode".to_owned(), internal_dependency(false, &[])),
+            ("bamts-cli".to_owned(), internal_dependency(false, &[])),
+            ("bamts-codegen".to_owned(), internal_dependency(false, &[])),
+            ("bamts-compiler".to_owned(), internal_dependency(false, &[])),
+            ("bamts-native".to_owned(), internal_dependency(false, &[])),
+            ("bamts-node".to_owned(), internal_dependency(false, &[])),
+            ("bamts-runtime".to_owned(), internal_dependency(false, &[])),
+        ]),
+    );
+    graph
+}
+
+fn internal_dependency(optional: bool, features: &[&str]) -> InternalDependency {
+    InternalDependency {
+        optional,
+        features: features
+            .iter()
+            .map(|feature| (*feature).to_owned())
+            .collect(),
+    }
+}
+
+fn ensure_acyclic(graph: &InternalGraph) -> Result<()> {
+    let mut states = BTreeMap::new();
+    let mut stack = Vec::new();
+
+    for node in graph.keys() {
+        if states.get(node).copied() == Some(VisitState::Complete) {
+            continue;
+        }
+        visit_graph(node, graph, &mut states, &mut stack)?;
+    }
+
+    Ok(())
+}
+
+fn visit_graph(
+    node: &str,
+    graph: &InternalGraph,
+    states: &mut BTreeMap<String, VisitState>,
+    stack: &mut Vec<String>,
+) -> Result<()> {
+    states.insert(node.to_owned(), VisitState::Visiting);
+    stack.push(node.to_owned());
+
+    let dependencies = graph
+        .get(node)
+        .ok_or_else(|| workspace_error(format!("internal dependency graph lacks node `{node}`")))?;
+    for dependency in dependencies.keys() {
+        match states.get(dependency).copied() {
+            Some(VisitState::Complete) => {}
+            Some(VisitState::Visiting) => {
+                let position = stack
+                    .iter()
+                    .position(|entry| entry == dependency)
+                    .ok_or_else(|| {
+                        workspace_error(format!(
+                            "internal dependency graph lost cycle origin `{dependency}`"
+                        ))
+                    })?;
+                let mut cycle = stack[position..].to_vec();
+                cycle.push(dependency.clone());
+                return Err(workspace_error(format!(
+                    "internal dependency graph contains cycle {}",
+                    cycle.join(" -> ")
+                )));
+            }
+            None => visit_graph(dependency, graph, states, stack)?,
+        }
+    }
+
+    let _ = stack.pop();
+    states.insert(node.to_owned(), VisitState::Complete);
+    Ok(())
+}
+
+fn validate_feature_closures(root: &Path) -> Result<()> {
+    let default = cargo_metadata(root, None)?;
+    validate_default_closure(&default)?;
+
+    let aot = cargo_metadata(root, Some("bamts-codegen/aot"))?;
+    validate_aot_closure(&aot)?;
+
+    let host_jit = cargo_metadata(root, Some("bamts-codegen/host-jit"))?;
+    validate_host_jit_closure(&host_jit)
+}
+
+fn cargo_metadata(root: &Path, feature: Option<&str>) -> Result<CargoMetadata> {
+    let cargo = match env::var_os("CARGO") {
+        Some(path) => path,
+        None => "cargo".into(),
+    };
+    let mut command = Command::new(cargo);
+    command
+        .current_dir(root)
+        .arg("metadata")
+        .arg("--format-version")
+        .arg("1")
+        .arg("--locked")
+        .arg("--offline")
+        .arg("--no-default-features");
+    if let Some(feature) = feature {
+        command.arg("--features").arg(feature);
+    }
+
+    let output = command.output().map_err(|error| {
+        let code = if error.kind() == ErrorKind::NotFound {
+            ErrorCode::ToolMissing
+        } else {
+            ErrorCode::ToolFailed
+        };
+        VerificationError::new(code, format!("cargo metadata could not start: {error}"))
+    })?;
+    if !output.status.success() {
+        let status = match output.status.code() {
+            Some(code) => format!("exit status {code}"),
+            None => "terminated by signal".to_owned(),
+        };
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        return Err(VerificationError::new(
+            ErrorCode::ToolFailed,
+            format!("cargo metadata {status}: {stderr}"),
+        ));
+    }
+
+    serde_json::from_slice(&output.stdout).map_err(|error| {
+        VerificationError::new(
+            ErrorCode::Json,
+            format!("cargo metadata emitted invalid JSON: {error}"),
+        )
+    })
+}
+
+fn validate_default_closure(metadata: &CargoMetadata) -> Result<()> {
+    let closure = codegen_closure(metadata)?;
+    require_absent_feature(&closure, "default", "aot")?;
+    require_absent_feature(&closure, "default", "host-jit")?;
+    require_absent_package(&closure, "default", "cranelift-jit")?;
+    require_absent_package(&closure, "default", "bamts-native")
+}
+
+fn validate_aot_closure(metadata: &CargoMetadata) -> Result<()> {
+    let closure = codegen_closure(metadata)?;
+    require_enabled_feature(&closure, "aot", "aot")?;
+    require_absent_feature(&closure, "aot", "host-jit")?;
+    require_present_package(&closure, "aot", "cranelift-object")?;
+    require_absent_package(&closure, "aot", "cranelift-jit")?;
+    require_absent_package(&closure, "aot", "bamts-native")
+}
+
+fn validate_host_jit_closure(metadata: &CargoMetadata) -> Result<()> {
+    let closure = codegen_closure(metadata)?;
+    require_enabled_feature(&closure, "host-jit", "host-jit")?;
+    require_absent_feature(&closure, "host-jit", "aot")?;
+    require_present_package(&closure, "host-jit", "cranelift-jit")?;
+    require_present_package(&closure, "host-jit", "bamts-native")?;
+    require_absent_package(&closure, "host-jit", "cranelift-object")?;
+
+    let native_features = closure
+        .package_features
+        .get("bamts-native")
+        .ok_or_else(|| {
+            workspace_error("host-jit closure reaches bamts-native without resolved features")
+        })?;
+    if !native_features.contains("jit-entry") {
+        return Err(workspace_error(
+            "host-jit closure reaches bamts-native without `jit-entry`",
+        ));
+    }
+
+    Ok(())
+}
+
+fn codegen_closure(metadata: &CargoMetadata) -> Result<ResolvedClosure> {
+    let resolve = metadata
+        .resolve
+        .as_ref()
+        .ok_or_else(|| workspace_error("cargo metadata did not include a resolve graph"))?;
+    let mut packages = BTreeMap::new();
+    let mut codegen = None;
+    for package in &metadata.packages {
+        if packages
+            .insert(package.id.as_str(), package.name.as_str())
+            .is_some()
+        {
+            return Err(workspace_error(format!(
+                "cargo metadata contains duplicate package id `{}`",
+                package.id
+            )));
+        }
+        if package.name == "bamts-codegen" {
+            if codegen.replace(package.id.as_str()).is_some() {
+                return Err(workspace_error(
+                    "cargo metadata contains multiple bamts-codegen packages",
+                ));
+            }
+        }
+    }
+    let codegen =
+        codegen.ok_or_else(|| workspace_error("cargo metadata does not contain bamts-codegen"))?;
+
+    let mut nodes = BTreeMap::new();
+    for node in &resolve.nodes {
+        if nodes.insert(node.id.as_str(), node).is_some() {
+            return Err(workspace_error(format!(
+                "cargo metadata contains duplicate resolve node `{}`",
+                node.id
+            )));
+        }
+    }
+
+    let mut closure = ResolvedClosure::default();
+    let mut pending = vec![codegen];
+    let mut visited = BTreeSet::new();
+    while let Some(package_id) = pending.pop() {
+        if !visited.insert(package_id) {
+            continue;
+        }
+        let node = nodes.get(package_id).ok_or_else(|| {
+            workspace_error(format!(
+                "cargo metadata resolve graph lacks package `{package_id}`"
+            ))
+        })?;
+        let name = packages.get(package_id).ok_or_else(|| {
+            workspace_error(format!("cargo metadata package table lacks `{package_id}`"))
+        })?;
+        closure.package_names.insert((*name).to_owned());
+        let features = closure
+            .package_features
+            .entry((*name).to_owned())
+            .or_default();
+        features.extend(node.features.iter().cloned());
+        for dependency in &node.dependencies {
+            pending.push(dependency.as_str());
+        }
+    }
+
+    Ok(closure)
+}
+
+fn require_enabled_feature(closure: &ResolvedClosure, mode: &str, feature: &str) -> Result<()> {
+    let active = closure
+        .package_features
+        .get("bamts-codegen")
+        .ok_or_else(|| workspace_error("codegen closure lacks bamts-codegen features"))?;
+    if !active.contains(feature) {
+        return Err(workspace_error(format!(
+            "{mode} metadata closure does not enable bamts-codegen feature `{feature}`"
+        )));
+    }
+
+    Ok(())
+}
+
+fn require_absent_feature(closure: &ResolvedClosure, mode: &str, feature: &str) -> Result<()> {
+    let active = closure
+        .package_features
+        .get("bamts-codegen")
+        .ok_or_else(|| workspace_error("codegen closure lacks bamts-codegen features"))?;
+    if active.contains(feature) {
+        return Err(workspace_error(format!(
+            "{mode} metadata closure unexpectedly enables bamts-codegen feature `{feature}`"
+        )));
+    }
+
+    Ok(())
+}
+
+fn require_present_package(closure: &ResolvedClosure, mode: &str, package: &str) -> Result<()> {
+    if !closure.package_names.contains(package) {
+        return Err(workspace_error(format!(
+            "{mode} metadata closure does not reach `{package}`"
+        )));
+    }
+
+    Ok(())
+}
+
+fn require_absent_package(closure: &ResolvedClosure, mode: &str, package: &str) -> Result<()> {
+    if closure.package_names.contains(package) {
+        return Err(workspace_error(format!(
+            "{mode} metadata closure unexpectedly reaches `{package}`"
+        )));
+    }
+
+    Ok(())
+}
+
+fn root_table<'a>(value: &'a Value, context: &str) -> Result<&'a Table> {
+    value
+        .as_table()
+        .ok_or_else(|| workspace_error(format!("{context} must be a TOML table")))
+}
+
+fn required_table<'a>(table: &'a Table, key: &str, context: &str) -> Result<&'a Table> {
+    match table.get(key) {
+        Some(Value::Table(value)) => Ok(value),
+        Some(_) => Err(workspace_error(format!(
+            "{context}: `{key}` must be a TOML table"
+        ))),
+        None => Err(workspace_error(format!("{context}: `{key}` is missing"))),
+    }
+}
+
+fn required_string<'a>(table: &'a Table, key: &str, context: &str) -> Result<&'a str> {
+    match table.get(key) {
+        Some(Value::String(value)) => Ok(value),
+        Some(_) => Err(workspace_error(format!(
+            "{context}: `{key}` must be a string"
+        ))),
+        None => Err(workspace_error(format!("{context}: `{key}` is missing"))),
+    }
+}
+
+fn require_exact_string(table: &Table, key: &str, expected: &str, context: &str) -> Result<()> {
+    let actual = required_string(table, key, context)?;
+    if actual != expected {
+        return Err(workspace_error(format!(
+            "{context}: `{key}` must be `{expected}`, found `{actual}`"
+        )));
+    }
+
+    Ok(())
+}
+
+fn require_exact_bool(table: &Table, key: &str, expected: bool, context: &str) -> Result<()> {
+    let actual = match table.get(key) {
+        Some(Value::Boolean(value)) => *value,
+        Some(_) => {
+            return Err(workspace_error(format!(
+                "{context}: `{key}` must be a boolean"
+            )));
+        }
+        None => return Err(workspace_error(format!("{context}: `{key}` is missing"))),
+    };
+    if actual != expected {
+        return Err(workspace_error(format!(
+            "{context}: `{key}` must be `{expected}`, found `{actual}`"
+        )));
+    }
+
+    Ok(())
+}
+
+fn sorted_table_entries(table: &Table) -> BTreeMap<&str, &Value> {
+    table
+        .iter()
+        .map(|(key, value)| (key.as_str(), value))
+        .collect()
+}
+
+fn format_internal_dependency(dependency: &InternalDependency) -> String {
+    format!(
+        "optional={}; features=[{}]",
+        dependency.optional,
+        dependency
+            .features
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn set_difference(expected: &BTreeSet<String>, actual: &BTreeSet<String>) -> String {
+    let missing: BTreeSet<String> = expected.difference(actual).cloned().collect();
+    let extra: BTreeSet<String> = actual.difference(expected).cloned().collect();
+    format!(
+        "missing [{}]; extra [{}]",
+        format_set(&missing),
+        format_set(&extra)
+    )
+}
+
+fn format_set(values: &BTreeSet<String>) -> String {
+    values
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn workspace_error(detail: impl Into<String>) -> VerificationError {
+    VerificationError::new(ErrorCode::Workspace, detail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_manifest(source: &str) -> Value {
+        toml::from_str(source).expect("valid TOML fixture")
+    }
+
+    fn root_manifest(omit: Option<&str>, extra: Option<&str>) -> Value {
+        let mut members: Vec<String> = MEMBERS
+            .iter()
+            .filter(|(_, path)| Some(*path) != omit)
+            .map(|(_, path)| format!("{path:?}"))
+            .collect();
+        if let Some(extra) = extra {
+            members.push(format!("{extra:?}"));
+        }
+        parse_manifest(&format!(
+            r#"
+[workspace]
+members = [{}]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97.1"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+"#,
+            members.join(", ")
+        ))
+    }
+
+    fn assert_workspace_error(result: Result<()>) {
+        let error = result.expect_err("fixture must fail");
+        assert_eq!(error.code(), ErrorCode::Workspace);
+    }
+
+    #[test]
+    fn rejects_missing_and_extra_members() {
+        assert_workspace_error(validate_root_manifest(&root_manifest(
+            Some("crates/bamts-cli"),
+            None,
+        )));
+        assert_workspace_error(validate_root_manifest(&root_manifest(
+            None,
+            Some("crates/not-approved"),
+        )));
+    }
+
+    #[test]
+    fn rejects_forbidden_internal_edge() {
+        let mut graph = expected_internal_graph();
+        graph
+            .get_mut("bamts-compiler")
+            .expect("approved graph includes compiler")
+            .insert("bamts-native".to_owned(), internal_dependency(false, &[]));
+
+        assert_workspace_error(validate_internal_graph(&graph));
+    }
+
+    #[test]
+    fn rejects_inexact_registry_pin() {
+        assert_workspace_error(validate_registry_dependency(
+            "serde",
+            &Value::String("1.0.0".to_owned()),
+            "fixture",
+        ));
+    }
+
+    #[test]
+    fn rejects_overlapping_codegen_features() {
+        let manifest = parse_manifest(
+            r#"
+[features]
+default = []
+aot = ["dep:cranelift-object", "dep:cranelift-jit"]
+host-jit = ["dep:cranelift-jit", "dep:bamts-native"]
+"#,
+        );
+
+        assert_workspace_error(validate_codegen_features(&manifest, "fixture"));
+    }
+
+    #[test]
+    fn rejects_unsafe_exception_drift() {
+        let manifest = parse_manifest(
+            r#"
+[lints]
+workspace = false
+"#,
+        );
+
+        assert_workspace_error(validate_member_lints("bamts-runtime", &manifest, "fixture"));
+    }
+
+    #[test]
+    fn rejects_internal_cycles() {
+        let mut graph = expected_internal_graph();
+        graph
+            .get_mut("bamts-bytecode")
+            .expect("approved graph includes bytecode")
+            .insert("bamts-compiler".to_owned(), internal_dependency(false, &[]));
+
+        assert_workspace_error(validate_internal_graph(&graph));
+    }
+}

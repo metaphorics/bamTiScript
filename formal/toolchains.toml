@@ -1,0 +1,27 @@
+schema = "bamti.formal-toolchains/v1"
+
+[quint]
+version = "0.32.0"
+node_minimum = "18"
+url = "https://registry.npmjs.org/@informalsystems/quint/-/quint-0.32.0.tgz"
+digest_algorithm = "sha512"
+digest = "9Yoji7DU6moRm1ofDaN+ftdxNcEGciiGbm7eN4MjlcCbfv7/Y/zchadcXXRmMZmN9oTPXUk9GmhjQOhADJsiSQ=="
+commit = "fd772606588b40def9978d8c82da69c2db7a0e3b"
+
+[racket]
+version = "9.2"
+url = "https://github.com/racket/racket/archive/refs/tags/v9.2.tar.gz"
+digest_algorithm = "sha256"
+digest = "788a19eb7bfe99d5410281f975df9850f212c1c1c3a0abeddcbba2cf0f58cae7"
+commit = "98b92f8ba3eda0481551e63ffd7702850c079870"
+redex_url = "https://github.com/racket/redex/archive/refs/tags/v9.2.tar.gz"
+redex_digest_algorithm = "sha256"
+redex_digest = "ceb170d34749a153d53e70396cb78569d690151835050fb491900f27b343af06"
+redex_commit = "2e2f65b9b5bf36d51411049232e6ad9839f48220"
+
+[lean]
+version = "4.32.1"
+url = "https://github.com/leanprover/lean4/archive/refs/tags/v4.32.1.tar.gz"
+digest_algorithm = "sha256"
+digest = "5ee893d6081dba103c3d1206930a0637f9dd8afe3c631823b98a21593386dbd7"
+commit = "f054605aea4b840552cca2e725580bffd1e1b704"

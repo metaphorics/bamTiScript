@@ -1,0 +1,12 @@
+[package]
+name = "bamts-runtime"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+bamts-bytecode = { path = "../bamts-bytecode" }
+bamts-native = { path = "../bamts-native", features = ["gc"] }
+
+[lints]
+workspace = true

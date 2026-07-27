@@ -1,0 +1,20 @@
+[workspace]
+members = [
+    "crates/bamts-compiler",
+    "crates/bamts-bytecode",
+    "crates/bamts-runtime",
+    "crates/bamts-native",
+    "crates/bamts-node",
+    "crates/bamts-codegen",
+    "crates/bamts-cli",
+    "crates/bamts-verification",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97.1"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

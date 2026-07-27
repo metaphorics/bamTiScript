@@ -1,0 +1,12 @@
+[package]
+name = "bamts-node"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+bamts-runtime = { path = "../bamts-runtime" }
+bamts-native = { path = "../bamts-native", features = ["node-host"] }
+
+[lints]
+workspace = true
