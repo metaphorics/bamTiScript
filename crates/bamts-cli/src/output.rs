@@ -1,0 +1,1030 @@
+//! Pure output-path planning and durable atomic artifact publication.
+//!
+//! Planning is deliberately lexical: callers provide an absolute output root, and no
+//! filesystem lookup (including symlink resolution) occurs. Publication is isolated
+//! behind [`AtomicFs`] so the write protocol can be tested without touching a real
+//! filesystem.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
+use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Component, Path, PathBuf};
+
+/// The kind of compiler artifact assigned to an output path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ArtifactKind {
+    /// Executable JavaScript (`.js`, `.mjs`, or `.cjs`).
+    JavaScript,
+    /// A TypeScript declaration (`.d.ts`).
+    Declaration,
+    /// A source map for the JavaScript artifact (`.map`).
+    SourceMap,
+}
+
+/// One normalized source-to-output assignment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedArtifact {
+    /// The normalized absolute entrypoint that produces this artifact.
+    pub source: PathBuf,
+    /// The normalized absolute destination path.
+    pub path: PathBuf,
+    /// The artifact written at `path`.
+    pub kind: ArtifactKind,
+}
+
+/// A complete, collision-free output plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputPlan {
+    /// The normalized absolute confinement root.
+    pub root: PathBuf,
+    /// Artifacts in entrypoint order, then JavaScript/declaration/source-map order.
+    pub artifacts: Vec<PlannedArtifact>,
+}
+
+/// Inputs to pure output planning.
+///
+/// Relative entrypoints and output options are interpreted beneath `root`. An absolute
+/// path is accepted only when its lexical normalization remains beneath `root`.
+#[derive(Debug, Clone, Copy)]
+pub struct PlanRequest<'a> {
+    /// Absolute lexical confinement root.
+    pub root: &'a Path,
+    /// Source entrypoints to compile.
+    pub entrypoints: &'a [PathBuf],
+    /// Exact JavaScript output path, valid for one entrypoint only.
+    pub output_file: Option<&'a Path>,
+    /// Output directory. Source-relative subdirectories are preserved beneath it.
+    pub output_dir: Option<&'a Path>,
+    /// Whether to plan `.d.ts` companions.
+    pub emit_declarations: bool,
+    /// Whether to plan JavaScript source-map companions.
+    pub source_maps: bool,
+}
+
+/// A rejected output plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanError {
+    /// A pure planner cannot resolve a relative confinement root without consulting the
+    /// process environment.
+    RootNotAbsolute { root: PathBuf },
+    /// At least one entrypoint is required.
+    NoEntrypoints,
+    /// `--output` and `--out-dir` select incompatible layouts.
+    ConflictingOutputOptions,
+    /// An exact output file is ambiguous for multiple entrypoints.
+    OutputFileRequiresSingleEntrypoint { count: usize },
+    /// A path lexically escapes the output root.
+    OutsideRoot { path: PathBuf, root: PathBuf },
+    /// A source or destination does not name a file.
+    MissingFileName { path: PathBuf },
+    /// The same normalized entrypoint was supplied more than once.
+    DuplicateEntrypoint { path: PathBuf },
+    /// An artifact would overwrite one of the input files.
+    ClobbersInput { path: PathBuf, source: PathBuf },
+    /// Two artifacts normalize to the same destination.
+    Collision {
+        path: PathBuf,
+        first_source: PathBuf,
+        first_kind: ArtifactKind,
+        second_source: PathBuf,
+        second_kind: ArtifactKind,
+    },
+}
+
+impl fmt::Display for PlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RootNotAbsolute { root } => {
+                write!(f, "output root must be absolute: {}", root.display())
+            }
+            Self::NoEntrypoints => f.write_str("at least one entrypoint is required"),
+            Self::ConflictingOutputOptions => {
+                f.write_str("cannot use an output file and output directory together")
+            }
+            Self::OutputFileRequiresSingleEntrypoint { count } => write!(
+                f,
+                "an explicit output file requires exactly one entrypoint, got {count}"
+            ),
+            Self::OutsideRoot { path, root } => write!(
+                f,
+                "path {} escapes output root {}",
+                path.display(),
+                root.display()
+            ),
+            Self::MissingFileName { path } => {
+                write!(f, "path does not name a file: {}", path.display())
+            }
+            Self::DuplicateEntrypoint { path } => {
+                write!(f, "duplicate entrypoint: {}", path.display())
+            }
+            Self::ClobbersInput { path, source } => write!(
+                f,
+                "output {} would overwrite input {}",
+                path.display(),
+                source.display()
+            ),
+            Self::Collision {
+                path,
+                first_source,
+                first_kind,
+                second_source,
+                second_kind,
+            } => write!(
+                f,
+                "output collision at {} between {:?} from {} and {:?} from {}",
+                path.display(),
+                first_kind,
+                first_source.display(),
+                second_kind,
+                second_source.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PlanError {}
+
+/// Produces a normalized, confined, collision-free output plan without filesystem I/O.
+pub fn plan_outputs(request: PlanRequest<'_>) -> Result<OutputPlan, PlanError> {
+    let root = normalize_lexically(request.root).ok_or_else(|| PlanError::OutsideRoot {
+        path: request.root.to_path_buf(),
+        root: request.root.to_path_buf(),
+    })?;
+    if !root.is_absolute() {
+        return Err(PlanError::RootNotAbsolute {
+            root: request.root.to_path_buf(),
+        });
+    }
+    if request.entrypoints.is_empty() {
+        return Err(PlanError::NoEntrypoints);
+    }
+    if request.output_file.is_some() && request.output_dir.is_some() {
+        return Err(PlanError::ConflictingOutputOptions);
+    }
+    if request.output_file.is_some() && request.entrypoints.len() != 1 {
+        return Err(PlanError::OutputFileRequiresSingleEntrypoint {
+            count: request.entrypoints.len(),
+        });
+    }
+
+    let mut sources = Vec::with_capacity(request.entrypoints.len());
+    let mut source_set = BTreeSet::new();
+    for entrypoint in request.entrypoints {
+        let source = confined_path(&root, entrypoint)?;
+        require_file_name(&source)?;
+        if !source_set.insert(source.clone()) {
+            return Err(PlanError::DuplicateEntrypoint { path: source });
+        }
+        sources.push(source);
+    }
+
+    let output_dir = request
+        .output_dir
+        .map(|path| confined_path(&root, path))
+        .transpose()?;
+    let output_file = request
+        .output_file
+        .map(|path| confined_path(&root, path))
+        .transpose()?;
+    if let Some(path) = &output_file {
+        require_file_name(path)?;
+    }
+
+    let mut artifacts = Vec::new();
+    let mut destinations: BTreeMap<PathBuf, (PathBuf, ArtifactKind)> = BTreeMap::new();
+
+    for source in sources {
+        let javascript = match &output_file {
+            Some(path) => path.clone(),
+            None => {
+                let relative = source
+                    .strip_prefix(&root)
+                    .expect("confined source must be beneath normalized root");
+                let parent = match &output_dir {
+                    Some(dir) => dir.join(relative.parent().unwrap_or_else(|| Path::new(""))),
+                    None => source
+                        .parent()
+                        .expect("absolute source with a file name must have a parent")
+                        .to_path_buf(),
+                };
+                parent.join(javascript_file_name(&source)?)
+            }
+        };
+
+        push_artifact(
+            &mut artifacts,
+            &mut destinations,
+            &source_set,
+            source.clone(),
+            javascript.clone(),
+            ArtifactKind::JavaScript,
+        )?;
+
+        if request.emit_declarations {
+            let declaration = declaration_path(&javascript);
+            push_artifact(
+                &mut artifacts,
+                &mut destinations,
+                &source_set,
+                source.clone(),
+                declaration,
+                ArtifactKind::Declaration,
+            )?;
+        }
+        if request.source_maps {
+            let source_map = append_suffix(&javascript, ".map")?;
+            push_artifact(
+                &mut artifacts,
+                &mut destinations,
+                &source_set,
+                source.clone(),
+                source_map,
+                ArtifactKind::SourceMap,
+            )?;
+        }
+    }
+
+    Ok(OutputPlan { root, artifacts })
+}
+
+fn push_artifact(
+    artifacts: &mut Vec<PlannedArtifact>,
+    destinations: &mut BTreeMap<PathBuf, (PathBuf, ArtifactKind)>,
+    sources: &BTreeSet<PathBuf>,
+    source: PathBuf,
+    path: PathBuf,
+    kind: ArtifactKind,
+) -> Result<(), PlanError> {
+    if let Some(input) = sources.get(&path) {
+        return Err(PlanError::ClobbersInput {
+            path,
+            source: input.clone(),
+        });
+    }
+    if let Some((first_source, first_kind)) = destinations.get(&path) {
+        return Err(PlanError::Collision {
+            path,
+            first_source: first_source.clone(),
+            first_kind: *first_kind,
+            second_source: source,
+            second_kind: kind,
+        });
+    }
+    destinations.insert(path.clone(), (source.clone(), kind));
+    artifacts.push(PlannedArtifact { source, path, kind });
+    Ok(())
+}
+
+fn confined_path(root: &Path, path: &Path) -> Result<PathBuf, PlanError> {
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let normalized = normalize_lexically(&candidate).ok_or_else(|| PlanError::OutsideRoot {
+        path: path.to_path_buf(),
+        root: root.to_path_buf(),
+    })?;
+    if normalized.starts_with(root) {
+        Ok(normalized)
+    } else {
+        Err(PlanError::OutsideRoot {
+            path: path.to_path_buf(),
+            root: root.to_path_buf(),
+        })
+    }
+}
+
+fn normalize_lexically(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Some(normalized)
+}
+
+fn require_file_name(path: &Path) -> Result<&OsStr, PlanError> {
+    path.file_name().ok_or_else(|| PlanError::MissingFileName {
+        path: path.to_path_buf(),
+    })
+}
+
+fn javascript_file_name(source: &Path) -> Result<OsString, PlanError> {
+    let mut path = PathBuf::from(require_file_name(source)?);
+    let extension = source
+        .extension()
+        .and_then(OsStr::to_str)
+        .map(str::to_ascii_lowercase);
+    let output_extension = match extension.as_deref() {
+        Some("mts" | "mjs") => "mjs",
+        Some("cts" | "cjs") => "cjs",
+        _ => "js",
+    };
+    path.set_extension(output_extension);
+    Ok(path.into_os_string())
+}
+
+// The declaration extension is derived from the emitted JavaScript module kind
+// (`.mjs` -> `.d.mts`, `.cjs` -> `.d.cts`, otherwise `.d.ts`), matching tsc. This is
+// intentionally coupled to `javascript_file_name`'s source-to-output extension table:
+// both describe the same emitted module, so its kind is read once from the planned
+// JavaScript path rather than re-derived from the source.
+fn declaration_path(javascript: &Path) -> PathBuf {
+    let extension = javascript
+        .extension()
+        .and_then(OsStr::to_str)
+        .map(str::to_ascii_lowercase);
+    match extension.as_deref() {
+        Some("mjs") => javascript.with_extension("d.mts"),
+        Some("cjs") => javascript.with_extension("d.cts"),
+        Some("js" | "jsx") => javascript.with_extension("d.ts"),
+        _ => append_suffix(javascript, ".d.ts")
+            .expect("a planned JavaScript path was already required to have a file name"),
+    }
+}
+
+fn append_suffix(path: &Path, suffix: &str) -> Result<PathBuf, PlanError> {
+    let name = require_file_name(path)?;
+    let mut suffixed = name.to_os_string();
+    suffixed.push(suffix);
+    Ok(path.with_file_name(suffixed))
+}
+
+/// Result of exclusive temporary-file creation.
+pub enum CreateTemp<F> {
+    /// The path was unused and the returned file is open for writing.
+    Created(F),
+    /// The candidate path already exists and must not be modified.
+    AlreadyExists,
+}
+
+/// Filesystem operations required by [`publish_atomic`].
+///
+/// `create_new` must be exclusive. `rename` must perform an atomic same-directory
+/// replacement. Implementations must not buffer `write` calls beyond `sync_file`.
+pub trait AtomicFs {
+    /// Open temporary-file handle.
+    type File;
+    /// Filesystem-specific error.
+    type Error;
+
+    /// Exclusively creates `path`, or reports that the candidate already exists.
+    fn create_new(&mut self, path: &Path) -> Result<CreateTemp<Self::File>, Self::Error>;
+    /// Writes some bytes and returns the number consumed.
+    fn write(&mut self, file: &mut Self::File, bytes: &[u8]) -> Result<usize, Self::Error>;
+    /// Flushes file contents and metadata to durable storage.
+    fn sync_file(&mut self, file: &mut Self::File) -> Result<(), Self::Error>;
+    /// Atomically renames `from` over `to` within one directory.
+    fn rename(&mut self, from: &Path, to: &Path) -> Result<(), Self::Error>;
+    /// Flushes directory metadata after the rename.
+    fn sync_dir(&mut self, dir: &Path) -> Result<(), Self::Error>;
+    /// Removes an unpublished temporary file during rollback.
+    fn remove_file(&mut self, path: &Path) -> Result<(), Self::Error>;
+}
+
+/// Standard-library implementation of [`AtomicFs`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StdAtomicFs;
+
+impl AtomicFs for StdAtomicFs {
+    type File = File;
+    type Error = io::Error;
+
+    fn create_new(&mut self, path: &Path) -> Result<CreateTemp<Self::File>, Self::Error> {
+        match OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(file) => Ok(CreateTemp::Created(file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                Ok(CreateTemp::AlreadyExists)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn write(&mut self, file: &mut Self::File, bytes: &[u8]) -> Result<usize, Self::Error> {
+        file.write(bytes)
+    }
+
+    fn sync_file(&mut self, file: &mut Self::File) -> Result<(), Self::Error> {
+        file.sync_all()
+    }
+
+    fn rename(&mut self, from: &Path, to: &Path) -> Result<(), Self::Error> {
+        std::fs::rename(from, to)
+    }
+
+    fn sync_dir(&mut self, dir: &Path) -> Result<(), Self::Error> {
+        File::open(dir)?.sync_all()
+    }
+
+    fn remove_file(&mut self, path: &Path) -> Result<(), Self::Error> {
+        std::fs::remove_file(path)
+    }
+}
+
+/// Publication protocol stage that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishStage {
+    /// Exclusive temporary-file creation.
+    CreateTemp,
+    /// Temporary-file content write.
+    Write,
+    /// Temporary-file durability sync.
+    SyncFile,
+    /// Atomic destination replacement.
+    Rename,
+    /// Destination-directory durability sync.
+    SyncDirectory,
+}
+
+/// Failure from atomic publication.
+#[derive(Debug)]
+pub enum PublishError<E> {
+    /// The destination has no usable file name.
+    InvalidDestination { path: PathBuf },
+    /// Every bounded temporary-file candidate already existed.
+    TempNamesExhausted { destination: PathBuf },
+    /// A filesystem operation failed. `cleanup` records a rollback failure without
+    /// hiding the primary failure.
+    Operation {
+        stage: PublishStage,
+        source: E,
+        cleanup: Option<E>,
+    },
+    /// A write made no progress before all bytes were consumed.
+    WriteZero { cleanup: Option<E> },
+    /// A filesystem implementation reported consuming more bytes than it received.
+    InvalidWriteCount {
+        reported: usize,
+        remaining: usize,
+        cleanup: Option<E>,
+    },
+}
+
+impl<E: fmt::Display> fmt::Display for PublishError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidDestination { path } => {
+                write!(f, "invalid output destination: {}", path.display())
+            }
+            Self::TempNamesExhausted { destination } => write!(
+                f,
+                "could not reserve a temporary file beside {}",
+                destination.display()
+            ),
+            Self::Operation {
+                stage,
+                source,
+                cleanup,
+            } => {
+                write!(f, "atomic publication failed during {stage:?}: {source}")?;
+                if let Some(cleanup) = cleanup {
+                    write!(f, "; temporary-file cleanup also failed: {cleanup}")?;
+                }
+                Ok(())
+            }
+            Self::WriteZero { cleanup } => {
+                f.write_str("atomic publication write made no progress")?;
+                if let Some(cleanup) = cleanup {
+                    write!(f, "; temporary-file cleanup also failed: {cleanup}")?;
+                }
+                Ok(())
+            }
+            Self::InvalidWriteCount {
+                reported,
+                remaining,
+                cleanup,
+            } => {
+                write!(
+                    f,
+                    "filesystem reported writing {reported} bytes from a {remaining}-byte buffer"
+                )?;
+                if let Some(cleanup) = cleanup {
+                    write!(f, "; temporary-file cleanup also failed: {cleanup}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for PublishError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Operation { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+const TEMP_ATTEMPTS: u32 = 128;
+
+/// Publishes `contents` with the protocol:
+///
+/// `create temp in destination directory -> write all -> fsync file -> rename -> fsync dir`.
+///
+/// Any failure before a successful rename attempts to remove the temporary file. A
+/// directory-sync failure is returned after publication because the rename cannot be
+/// safely rolled back. The destination directory must already exist.
+pub fn publish_atomic<F: AtomicFs>(
+    fs: &mut F,
+    destination: &Path,
+    contents: &[u8],
+) -> Result<(), PublishError<F::Error>> {
+    let file_name = destination
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| PublishError::InvalidDestination {
+            path: destination.to_path_buf(),
+        })?;
+    let dir = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    let mut reserved = None;
+    for attempt in 0..TEMP_ATTEMPTS {
+        let mut name = OsString::from(".");
+        name.push(file_name);
+        name.push(format!(".bamts.tmp.{attempt}"));
+        let path = dir.join(name);
+        match fs.create_new(&path) {
+            Ok(CreateTemp::Created(file)) => {
+                reserved = Some((path, file));
+                break;
+            }
+            Ok(CreateTemp::AlreadyExists) => {}
+            Err(source) => {
+                return Err(PublishError::Operation {
+                    stage: PublishStage::CreateTemp,
+                    source,
+                    cleanup: None,
+                });
+            }
+        }
+    }
+
+    let Some((temporary, mut file)) = reserved else {
+        return Err(PublishError::TempNamesExhausted {
+            destination: destination.to_path_buf(),
+        });
+    };
+
+    let mut written = 0;
+    while written < contents.len() {
+        let remaining = contents.len() - written;
+        match fs.write(&mut file, &contents[written..]) {
+            Ok(0) => {
+                drop(file);
+                let cleanup = fs.remove_file(&temporary).err();
+                return Err(PublishError::WriteZero { cleanup });
+            }
+            Ok(count) if count > remaining => {
+                drop(file);
+                let cleanup = fs.remove_file(&temporary).err();
+                return Err(PublishError::InvalidWriteCount {
+                    reported: count,
+                    remaining,
+                    cleanup,
+                });
+            }
+            Ok(count) => written += count,
+            Err(source) => {
+                drop(file);
+                let cleanup = fs.remove_file(&temporary).err();
+                return Err(PublishError::Operation {
+                    stage: PublishStage::Write,
+                    source,
+                    cleanup,
+                });
+            }
+        }
+    }
+
+    if let Err(source) = fs.sync_file(&mut file) {
+        drop(file);
+        let cleanup = fs.remove_file(&temporary).err();
+        return Err(PublishError::Operation {
+            stage: PublishStage::SyncFile,
+            source,
+            cleanup,
+        });
+    }
+    drop(file);
+
+    if let Err(source) = fs.rename(&temporary, destination) {
+        let cleanup = fs.remove_file(&temporary).err();
+        return Err(PublishError::Operation {
+            stage: PublishStage::Rename,
+            source,
+            cleanup,
+        });
+    }
+
+    fs.sync_dir(dir)
+        .map_err(|source| PublishError::Operation {
+            stage: PublishStage::SyncDirectory,
+            source,
+            cleanup: None,
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn request<'a>(root: &'a Path, entrypoints: &'a [PathBuf]) -> PlanRequest<'a> {
+        PlanRequest {
+            root,
+            entrypoints,
+            output_file: None,
+            output_dir: None,
+            emit_declarations: false,
+            source_maps: false,
+        }
+    }
+
+    #[test]
+    fn plans_confined_source_relative_outputs_in_stable_order() {
+        let root = Path::new("/workspace");
+        let entries = vec![PathBuf::from("src/main.mts"), PathBuf::from("lib/util.cts")];
+        let mut input = request(root, &entries);
+        input.output_dir = Some(Path::new("dist/./generated"));
+        input.emit_declarations = true;
+        input.source_maps = true;
+
+        let plan = plan_outputs(input).unwrap();
+        let actual: Vec<_> = plan
+            .artifacts
+            .iter()
+            .map(|artifact| (artifact.kind, artifact.path.as_path()))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                (ArtifactKind::JavaScript, Path::new("/workspace/dist/generated/src/main.mjs")),
+                (ArtifactKind::Declaration, Path::new("/workspace/dist/generated/src/main.d.mts")),
+                (ArtifactKind::SourceMap, Path::new("/workspace/dist/generated/src/main.mjs.map")),
+                (ArtifactKind::JavaScript, Path::new("/workspace/dist/generated/lib/util.cjs")),
+                (ArtifactKind::Declaration, Path::new("/workspace/dist/generated/lib/util.d.cts")),
+                (ArtifactKind::SourceMap, Path::new("/workspace/dist/generated/lib/util.cjs.map")),
+            ]
+        );
+    }
+
+    #[test]
+    fn exact_output_derives_declaration_and_map_companions() {
+        let entries = vec![PathBuf::from("src/main.ts")];
+        let mut input = request(Path::new("/workspace"), &entries);
+        input.output_file = Some(Path::new("build/bundle.js"));
+        input.emit_declarations = true;
+        input.source_maps = true;
+
+        let plan = plan_outputs(input).unwrap();
+        let paths: Vec<_> = plan
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.path.as_path())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                Path::new("/workspace/build/bundle.js"),
+                Path::new("/workspace/build/bundle.d.ts"),
+                Path::new("/workspace/build/bundle.js.map"),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_non_utf8_file_names_during_planning() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let entries = vec![
+            PathBuf::from(OsStr::from_bytes(b"src/\xff.ts")),
+            PathBuf::from(OsStr::from_bytes(b"src/\xfe.mts")),
+        ];
+        let mut input = request(Path::new("/workspace"), &entries);
+        input.output_dir = Some(Path::new("dist"));
+
+        let plan = plan_outputs(input).unwrap();
+
+        assert_eq!(plan.artifacts.len(), 2);
+        assert_eq!(
+            plan.artifacts[0].path.as_os_str().as_bytes(),
+            b"/workspace/dist/src/\xff.js"
+        );
+        assert_eq!(
+            plan.artifacts[1].path.as_os_str().as_bytes(),
+            b"/workspace/dist/src/\xfe.mjs"
+        );
+    }
+
+    #[test]
+    fn rejects_lexical_path_traversal() {
+        let entries = vec![PathBuf::from("src/main.ts")];
+        let mut input = request(Path::new("/workspace/project"), &entries);
+        input.output_dir = Some(Path::new("../../escape"));
+
+        assert!(matches!(
+            plan_outputs(input),
+            Err(PlanError::OutsideRoot { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_absolute_paths_outside_root() {
+        let entries = vec![PathBuf::from("/other/main.ts")];
+        let input = request(Path::new("/workspace"), &entries);
+
+        assert!(matches!(
+            plan_outputs(input),
+            Err(PlanError::OutsideRoot { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_normalized_output_collisions() {
+        let entries = vec![PathBuf::from("src/value.ts"), PathBuf::from("src/value.tsx")];
+        let mut input = request(Path::new("/workspace"), &entries);
+        input.output_dir = Some(Path::new("dist/a/../"));
+
+        assert!(matches!(
+            plan_outputs(input),
+            Err(PlanError::Collision {
+                path,
+                second_kind: ArtifactKind::JavaScript,
+                ..
+            }) if path == Path::new("/workspace/dist/src/value.js")
+        ));
+    }
+
+    #[test]
+    fn rejects_outputs_that_clobber_javascript_inputs() {
+        let entries = vec![PathBuf::from("src/value.js")];
+        let input = request(Path::new("/workspace"), &entries);
+
+        assert!(matches!(
+            plan_outputs(input),
+            Err(PlanError::ClobbersInput { path, .. })
+                if path == Path::new("/workspace/src/value.js")
+        ));
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FakeError {
+        Injected(PublishStage),
+        Cleanup,
+        Missing,
+    }
+
+    impl fmt::Display for FakeError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{self:?}")
+        }
+    }
+
+    impl std::error::Error for FakeError {}
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Call {
+        Create(PathBuf),
+        Write(PathBuf, usize),
+        SyncFile(PathBuf),
+        Rename(PathBuf, PathBuf),
+        SyncDir(PathBuf),
+        Remove(PathBuf),
+    }
+
+    #[derive(Default)]
+    struct MemoryFs {
+        files: BTreeMap<PathBuf, Vec<u8>>,
+        calls: Vec<Call>,
+        fail: Option<PublishStage>,
+        fail_write_after: Option<usize>,
+        fail_cleanup: bool,
+        max_write: usize,
+        writes: usize,
+    }
+
+    impl MemoryFs {
+        fn new() -> Self {
+            Self {
+                max_write: usize::MAX,
+                ..Self::default()
+            }
+        }
+
+        fn temporary_files(&self) -> Vec<&Path> {
+            self.files
+                .keys()
+                .filter(|path| path.to_string_lossy().contains(".bamts.tmp."))
+                .map(PathBuf::as_path)
+                .collect()
+        }
+    }
+
+    impl AtomicFs for MemoryFs {
+        type File = PathBuf;
+        type Error = FakeError;
+
+        fn create_new(&mut self, path: &Path) -> Result<CreateTemp<Self::File>, Self::Error> {
+            self.calls.push(Call::Create(path.to_path_buf()));
+            if self.fail == Some(PublishStage::CreateTemp) {
+                return Err(FakeError::Injected(PublishStage::CreateTemp));
+            }
+            if self.files.contains_key(path) {
+                return Ok(CreateTemp::AlreadyExists);
+            }
+            self.files.insert(path.to_path_buf(), Vec::new());
+            Ok(CreateTemp::Created(path.to_path_buf()))
+        }
+
+        fn write(&mut self, file: &mut Self::File, bytes: &[u8]) -> Result<usize, Self::Error> {
+            self.calls.push(Call::Write(file.clone(), bytes.len()));
+            if self.fail == Some(PublishStage::Write)
+                && self.fail_write_after.is_none_or(|limit| self.writes >= limit)
+            {
+                return Err(FakeError::Injected(PublishStage::Write));
+            }
+            self.writes += 1;
+            let count = bytes.len().min(self.max_write);
+            self.files
+                .get_mut(file)
+                .ok_or(FakeError::Missing)?
+                .extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+
+        fn sync_file(&mut self, file: &mut Self::File) -> Result<(), Self::Error> {
+            self.calls.push(Call::SyncFile(file.clone()));
+            if self.fail == Some(PublishStage::SyncFile) {
+                Err(FakeError::Injected(PublishStage::SyncFile))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn rename(&mut self, from: &Path, to: &Path) -> Result<(), Self::Error> {
+            self.calls
+                .push(Call::Rename(from.to_path_buf(), to.to_path_buf()));
+            if self.fail == Some(PublishStage::Rename) {
+                return Err(FakeError::Injected(PublishStage::Rename));
+            }
+            let contents = self.files.remove(from).ok_or(FakeError::Missing)?;
+            self.files.insert(to.to_path_buf(), contents);
+            Ok(())
+        }
+
+        fn sync_dir(&mut self, dir: &Path) -> Result<(), Self::Error> {
+            self.calls.push(Call::SyncDir(dir.to_path_buf()));
+            if self.fail == Some(PublishStage::SyncDirectory) {
+                Err(FakeError::Injected(PublishStage::SyncDirectory))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn remove_file(&mut self, path: &Path) -> Result<(), Self::Error> {
+            self.calls.push(Call::Remove(path.to_path_buf()));
+            if self.fail_cleanup {
+                return Err(FakeError::Cleanup);
+            }
+            self.files.remove(path).ok_or(FakeError::Missing)?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn atomic_publication_retries_partial_writes_then_syncs_in_order() {
+        let mut fs = MemoryFs::new();
+        fs.max_write = 2;
+        let destination = Path::new("/out/program.js");
+
+        publish_atomic(&mut fs, destination, b"abcdef").unwrap();
+
+        assert_eq!(fs.files.get(destination).unwrap(), b"abcdef");
+        assert!(fs.temporary_files().is_empty());
+        assert!(matches!(fs.calls[0], Call::Create(_)));
+        assert!(matches!(fs.calls[1], Call::Write(_, 6)));
+        assert!(matches!(fs.calls[2], Call::Write(_, 4)));
+        assert!(matches!(fs.calls[3], Call::Write(_, 2)));
+        assert!(matches!(fs.calls[4], Call::SyncFile(_)));
+        assert!(matches!(fs.calls[5], Call::Rename(_, ref to) if to == destination));
+        assert_eq!(fs.calls[6], Call::SyncDir(PathBuf::from("/out")));
+    }
+
+    #[test]
+    fn partial_write_failure_rolls_back_temp_and_preserves_destination() {
+        let mut fs = MemoryFs::new();
+        let destination = PathBuf::from("/out/program.js");
+        fs.files.insert(destination.clone(), b"old".to_vec());
+        fs.max_write = 2;
+        fs.fail = Some(PublishStage::Write);
+        fs.fail_write_after = Some(1);
+
+        let error = publish_atomic(&mut fs, &destination, b"abcdef").unwrap_err();
+
+        assert!(matches!(
+            error,
+            PublishError::Operation {
+                stage: PublishStage::Write,
+                cleanup: None,
+                ..
+            }
+        ));
+        assert_eq!(fs.files.get(&destination).unwrap(), b"old");
+        assert!(fs.temporary_files().is_empty());
+        assert!(matches!(fs.calls.last(), Some(Call::Remove(_))));
+    }
+
+    #[test]
+    fn sync_and_rename_failures_remove_unpublished_temp() {
+        for stage in [PublishStage::SyncFile, PublishStage::Rename] {
+            let mut fs = MemoryFs::new();
+            fs.fail = Some(stage);
+            let destination = Path::new("/out/program.js");
+
+            let error = publish_atomic(&mut fs, destination, b"new").unwrap_err();
+
+            assert!(matches!(
+                error,
+                PublishError::Operation {
+                    stage: actual,
+                    cleanup: None,
+                    ..
+                } if actual == stage
+            ));
+            assert!(!fs.files.contains_key(destination));
+            assert!(fs.temporary_files().is_empty());
+            assert!(matches!(fs.calls.last(), Some(Call::Remove(_))));
+        }
+    }
+
+    #[test]
+    fn cleanup_failure_is_reported_without_hiding_primary_failure() {
+        let mut fs = MemoryFs::new();
+        fs.fail = Some(PublishStage::Write);
+        fs.fail_cleanup = true;
+
+        let error = publish_atomic(&mut fs, Path::new("/out/program.js"), b"new").unwrap_err();
+
+        assert!(matches!(
+            error,
+            PublishError::Operation {
+                stage: PublishStage::Write,
+                source: FakeError::Injected(PublishStage::Write),
+                cleanup: Some(FakeError::Cleanup),
+            }
+        ));
+    }
+
+    #[test]
+    fn directory_sync_failure_reports_uncertain_durability_without_rollback() {
+        let mut fs = MemoryFs::new();
+        fs.fail = Some(PublishStage::SyncDirectory);
+        let destination = Path::new("/out/program.js");
+
+        let error = publish_atomic(&mut fs, destination, b"new").unwrap_err();
+
+        assert!(matches!(
+            error,
+            PublishError::Operation {
+                stage: PublishStage::SyncDirectory,
+                cleanup: None,
+                ..
+            }
+        ));
+        assert_eq!(fs.files.get(destination).unwrap(), b"new");
+        assert!(!fs.calls.iter().any(|call| matches!(call, Call::Remove(_))));
+    }
+
+    #[test]
+    fn existing_temp_candidate_is_never_overwritten() {
+        let mut fs = MemoryFs::new();
+        let occupied = PathBuf::from("/out/.program.js.bamts.tmp.0");
+        fs.files.insert(occupied.clone(), b"occupied".to_vec());
+
+        publish_atomic(&mut fs, Path::new("/out/program.js"), b"new").unwrap();
+
+        assert_eq!(fs.files.get(&occupied).unwrap(), b"occupied");
+        assert!(matches!(
+            fs.calls.as_slice(),
+            [Call::Create(first), Call::Create(second), ..]
+                if first == &occupied && second == Path::new("/out/.program.js.bamts.tmp.1")
+        ));
+    }
+}

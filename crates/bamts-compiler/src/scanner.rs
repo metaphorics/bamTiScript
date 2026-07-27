@@ -1,0 +1,1789 @@
+//! The lexical scanner: total UTF-8 source text to a UTF-16-ranged token stream.
+//!
+//! The scanner is *total*: it accepts any `&str`, never panics, and guarantees
+//! forward progress, so every call to [`Scanner::next_token`] on a non-empty
+//! remainder consumes at least one code point. Trivia (whitespace, comments, a
+//! leading shebang) are emitted as tokens because [`crate::syntax::SourceFile`]
+//! preserves the full token stream.
+//!
+//! Token ranges are measured in UTF-16 code units so they line up with the
+//! coordinate space of [`SourceText`]. Positions are tracked incrementally as
+//! code points are consumed, so no per-token coordinate conversion is required.
+//!
+//! Two lexical forms cannot be decided by a raw left-to-right pass and are
+//! resolved through *explicit* scanner operations rather than guesses:
+//!
+//! * A `/` is ambiguous between division and a regular-expression literal. The
+//!   default pass always emits [`TokenKind::Slash`]/[`TokenKind::SlashEq`]; a
+//!   caller with grammar context calls [`Scanner::rescan_regex`] to reinterpret
+//!   it as a [`TokenKind::RegularExpressionLiteral`].
+//! * A `>` is ambiguous between a single relational operator and the start of a
+//!   shift/compound operator. The default pass greedily forms the longest
+//!   operator; a caller closing type arguments or a JSX tag calls
+//!   [`Scanner::rescan_greater_than`] to take exactly one `>`.
+//!
+//! Template literals are segmented in a single pass because the scanner tracks
+//! `{`/`}` nesting: a `}` that returns to a `${` boundary continues the template
+//! deterministically instead of being guessed. A parser that drives the scanner
+//! itself may instead call [`Scanner::rescan_template_continuation`].
+
+use std::sync::Arc;
+
+use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
+use crate::source::{ScriptKind, SourceId, SourceText, TextRange, Utf16Pos};
+use crate::syntax::{Token, TokenKind};
+
+/// Unterminated string literal.
+const UNTERMINATED_STRING: DiagnosticCode = DiagnosticCode::new("BAMTS-L001");
+/// Unterminated block comment.
+const UNTERMINATED_BLOCK_COMMENT: DiagnosticCode = DiagnosticCode::new("BAMTS-L002");
+/// Unterminated template literal.
+const UNTERMINATED_TEMPLATE: DiagnosticCode = DiagnosticCode::new("BAMTS-L003");
+/// Unterminated regular-expression literal.
+const UNTERMINATED_REGEX: DiagnosticCode = DiagnosticCode::new("BAMTS-L004");
+/// A character that cannot begin any token.
+const UNEXPECTED_CHARACTER: DiagnosticCode = DiagnosticCode::new("BAMTS-L005");
+/// A malformed escape sequence.
+const INVALID_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L006");
+/// A malformed unicode escape sequence.
+const INVALID_UNICODE_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L007");
+/// A misplaced numeric separator.
+const INVALID_NUMERIC_SEPARATOR: DiagnosticCode = DiagnosticCode::new("BAMTS-L008");
+/// A numeric literal with no valid digits.
+const INVALID_NUMERIC_LITERAL: DiagnosticCode = DiagnosticCode::new("BAMTS-L009");
+/// A `BigInt` suffix on a form that cannot be a `BigInt`.
+const INVALID_BIGINT_LITERAL: DiagnosticCode = DiagnosticCode::new("BAMTS-L010");
+/// A `#` that does not begin a private identifier.
+const INVALID_PRIVATE_IDENTIFIER: DiagnosticCode = DiagnosticCode::new("BAMTS-L011");
+
+/// The immutable product of one lexical pass over a source file.
+///
+/// It retains the file identity, the [`ScriptKind`], the shared source text, the
+/// non-EOF tokens in lexical order (including trivia), and the terminal
+/// end-of-file token whose empty range anchors the end of the source.
+#[derive(Clone, Debug)]
+pub struct ScannedSource {
+    source_id: SourceId,
+    script_kind: ScriptKind,
+    source: Arc<SourceText>,
+    tokens: Vec<Token>,
+    eof: Token,
+}
+
+impl ScannedSource {
+    /// Returns the source this token stream describes.
+    #[must_use]
+    pub const fn source_id(&self) -> SourceId {
+        self.source_id
+    }
+
+    /// Returns the syntax the source was scanned as.
+    #[must_use]
+    pub const fn script_kind(&self) -> ScriptKind {
+        self.script_kind
+    }
+
+    /// Returns the shared, immutable source text.
+    #[must_use]
+    pub fn source(&self) -> &Arc<SourceText> {
+        &self.source
+    }
+
+    /// Returns the source text mapper directly.
+    #[must_use]
+    pub fn source_text(&self) -> &SourceText {
+        &self.source
+    }
+
+    /// Returns the non-EOF tokens in lexical order, including trivia.
+    #[must_use]
+    pub fn tokens(&self) -> &[Token] {
+        &self.tokens
+    }
+
+    /// Returns the terminal end-of-file token.
+    #[must_use]
+    pub const fn eof(&self) -> &Token {
+        &self.eof
+    }
+
+    /// Returns the zero-copy lexeme for one token of this source.
+    ///
+    /// `None` identifies a range that is not a valid UTF-16 slice of this file,
+    /// which cannot arise from a scanner-produced token.
+    #[must_use]
+    pub fn token_text(&self, token: &Token) -> Option<&str> {
+        if token.is_missing() {
+            return Some("");
+        }
+        let range = token.range();
+        let start = self.source.utf16_to_byte(range.start()).ok()?;
+        let end = self.source.utf16_to_byte(range.end()).ok()?;
+        self.source.as_str().get(start..end)
+    }
+}
+
+/// Scans a whole source into an ordered token stream with recovery diagnostics.
+///
+/// This is the default single-pass driver: `/` stays division and `>` forms the
+/// longest operator, both of which a grammar-aware caller can reinterpret with
+/// [`Scanner::rescan_regex`] and [`Scanner::rescan_greater_than`]. Template
+/// literals are fully segmented here.
+#[must_use]
+pub fn scan(
+    source_id: SourceId,
+    script_kind: ScriptKind,
+    source: Arc<SourceText>,
+) -> Recovered<ScannedSource> {
+    let (tokens, eof, diagnostics) = {
+        let mut scanner = Scanner::new(source_id, script_kind, &source);
+        let mut tokens = Vec::new();
+        let eof = loop {
+            let token = scanner.next_token();
+            if token.kind() == TokenKind::EndOfFile {
+                break token;
+            }
+            tokens.push(token);
+        };
+        (tokens, eof, scanner.into_diagnostics())
+    };
+
+    let product = ScannedSource {
+        source_id,
+        script_kind,
+        source,
+        tokens,
+        eof,
+    };
+    Recovered::new(product, diagnostics)
+}
+
+/// The kind of an open brace the scanner is currently inside, used to segment
+/// template literals in one pass without grammar feedback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingBrace {
+    /// An ordinary `{` block or object literal.
+    Normal,
+    /// A `${` template substitution; its closing `}` continues the template.
+    Template,
+}
+
+/// A stateful lexical cursor over one immutable source text.
+///
+/// A caller may drive it token by token with [`Scanner::next_token`] and, at a
+/// grammatical decision point, request an explicit reinterpretation with one of
+/// the `rescan_*`/`scan_jsx_*` operations.
+pub struct Scanner<'a> {
+    source_id: SourceId,
+    script_kind: ScriptKind,
+    text: &'a str,
+    byte_pos: usize,
+    utf16_pos: usize,
+    last_start_byte: usize,
+    last_start_utf16: usize,
+    braces: Vec<PendingBrace>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl<'a> Scanner<'a> {
+    /// Creates a scanner positioned at the start of `source`.
+    #[must_use]
+    pub fn new(source_id: SourceId, script_kind: ScriptKind, source: &'a SourceText) -> Self {
+        Self {
+            source_id,
+            script_kind,
+            text: source.as_str(),
+            byte_pos: 0,
+            utf16_pos: 0,
+            last_start_byte: 0,
+            last_start_utf16: 0,
+            braces: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    /// Returns the syntax this scanner lexes.
+    #[must_use]
+    pub const fn script_kind(&self) -> ScriptKind {
+        self.script_kind
+    }
+
+    /// Returns the current UTF-16 cursor position.
+    #[must_use]
+    pub const fn position(&self) -> Utf16Pos {
+        Utf16Pos::new(self.utf16_pos)
+    }
+
+    /// Returns whether the whole source has been consumed.
+    #[must_use]
+    pub fn is_at_end(&self) -> bool {
+        self.byte_pos >= self.text.len()
+    }
+
+    /// Returns the diagnostics recorded so far, in emission order.
+    #[must_use]
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
+
+    /// Consumes the scanner and returns its recorded diagnostics.
+    #[must_use]
+    pub fn into_diagnostics(self) -> Vec<Diagnostic> {
+        self.diagnostics
+    }
+
+    /// Scans the next token, or an end-of-file token at the end of the source.
+    pub fn next_token(&mut self) -> Token {
+        let start_b = self.byte_pos;
+        let start_u = self.utf16_pos;
+        self.last_start_byte = start_b;
+        self.last_start_utf16 = start_u;
+
+        let Some(c) = self.first() else {
+            return self.make(TokenKind::EndOfFile, start_u);
+        };
+
+        let kind = match c {
+            _ if is_whitespace(c) => self.scan_whitespace(),
+            '/' => match self.second() {
+                Some('/') => self.scan_line_comment(),
+                Some('*') => self.scan_block_comment(start_u),
+                Some('=') => {
+                    self.bump();
+                    self.bump();
+                    TokenKind::SlashEq
+                }
+                _ => {
+                    self.bump();
+                    TokenKind::Slash
+                }
+            },
+            '\'' | '"' => self.scan_string(c, start_u),
+            '`' => {
+                let kind = self.scan_template(start_u, false);
+                if kind == TokenKind::TemplateHead {
+                    self.braces.push(PendingBrace::Template);
+                }
+                kind
+            }
+            '{' => {
+                self.bump();
+                self.braces.push(PendingBrace::Normal);
+                TokenKind::LBrace
+            }
+            '}' => match self.braces.pop() {
+                Some(PendingBrace::Template) => {
+                    let kind = self.scan_template(start_u, true);
+                    if kind == TokenKind::TemplateMiddle {
+                        self.braces.push(PendingBrace::Template);
+                    }
+                    kind
+                }
+                _ => {
+                    self.bump();
+                    TokenKind::RBrace
+                }
+            },
+            '0'..='9' => self.scan_number(start_u),
+            '.' if self.second().is_some_and(|d| d.is_ascii_digit()) => self.scan_number(start_u),
+            '#' => self.scan_hash(start_b, start_u),
+            '\\' if self.second() == Some('u') => self.scan_identifier(start_b),
+            _ if is_id_start(c) => self.scan_identifier(start_b),
+            _ => self.scan_operator(c, start_u),
+        };
+
+        self.make(kind, start_u)
+    }
+
+    /// Reinterprets the most recent `/`/`/=` token as a regular-expression
+    /// literal starting at the same position, advancing past its body and flags.
+    ///
+    /// This is the explicit division-versus-regex decision. The caller supplies
+    /// the grammatical context; the scanner never guesses it.
+    pub fn rescan_regex(&mut self) -> Token {
+        self.reset_to_last();
+        let start_u = self.utf16_pos;
+        let kind = self.scan_regex(start_u);
+        self.make(kind, start_u)
+    }
+
+    /// Reinterprets the most recent `>`-family token as a single `>`, advancing
+    /// exactly one code unit past the last token's start.
+    ///
+    /// A caller closing type arguments or a JSX element uses this to split a
+    /// greedily formed shift/compound operator.
+    pub fn rescan_greater_than(&mut self) -> Token {
+        self.reset_to_last();
+        let start_u = self.utf16_pos;
+        self.bump();
+        self.make(TokenKind::GreaterThan, start_u)
+    }
+
+    /// Reinterprets the most recent `}` token as a template continuation,
+    /// producing [`TokenKind::TemplateMiddle`] or [`TokenKind::TemplateTail`].
+    ///
+    /// This serves a caller that drives the scanner without relying on the
+    /// single-pass brace tracking used by [`scan`].
+    pub fn rescan_template_continuation(&mut self) -> Token {
+        self.reset_to_last();
+        let start_u = self.utf16_pos;
+        let kind = self.scan_template(start_u, true);
+        self.make(kind, start_u)
+    }
+
+    /// Scans a run of JSX character data up to the next `<` or `{`.
+    ///
+    /// The token kind is [`TokenKind::StringLiteral`]: the fixed token space has
+    /// no dedicated JSX kind, and JSX text is uninterpreted character content
+    /// whose lexeme the caller reads directly. The run may be empty when the
+    /// caller is already positioned at a `<` or `{`.
+    pub fn scan_jsx_text(&mut self) -> Token {
+        let start_u = self.utf16_pos;
+        self.last_start_byte = self.byte_pos;
+        self.last_start_utf16 = start_u;
+        while let Some(c) = self.first() {
+            if c == '<' || c == '{' {
+                break;
+            }
+            self.bump();
+        }
+        self.make(TokenKind::StringLiteral, start_u)
+    }
+
+    /// Scans a JSX name, which unlike an ECMAScript identifier admits interior
+    /// hyphens (for example `data-role`).
+    pub fn scan_jsx_identifier(&mut self) -> Token {
+        let start_u = self.utf16_pos;
+        self.last_start_byte = self.byte_pos;
+        self.last_start_utf16 = start_u;
+        if self.first().is_some_and(is_id_start) {
+            self.bump();
+            while let Some(c) = self.first() {
+                if c == '-' || is_id_continue(c) {
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.make(TokenKind::Identifier, start_u)
+    }
+
+    /// Scans a JSX attribute string, which is delimited by matching quotes,
+    /// performs no escape processing, and may span line terminators.
+    pub fn scan_jsx_attribute_string(&mut self) -> Token {
+        let start_u = self.utf16_pos;
+        self.last_start_byte = self.byte_pos;
+        self.last_start_utf16 = start_u;
+        let Some(quote @ ('\'' | '"')) = self.first() else {
+            self.error(
+                UNEXPECTED_CHARACTER,
+                start_u,
+                self.utf16_pos,
+                "a JSX attribute value must be a quoted string",
+            );
+            return self.make(TokenKind::StringLiteral, start_u);
+        };
+        self.bump();
+        loop {
+            match self.first() {
+                None => {
+                    self.error(
+                        UNTERMINATED_STRING,
+                        start_u,
+                        self.utf16_pos,
+                        "unterminated string literal",
+                    );
+                    break;
+                }
+                Some(c) if c == quote => {
+                    self.bump();
+                    break;
+                }
+                Some(_) => {
+                    self.bump();
+                }
+            }
+        }
+        self.make(TokenKind::StringLiteral, start_u)
+    }
+
+    fn scan_whitespace(&mut self) -> TokenKind {
+        while self.first().is_some_and(is_whitespace) {
+            self.bump();
+        }
+        TokenKind::Whitespace
+    }
+
+    fn scan_line_comment(&mut self) -> TokenKind {
+        self.bump();
+        self.bump();
+        while let Some(c) = self.first() {
+            if is_line_terminator(c) {
+                break;
+            }
+            self.bump();
+        }
+        TokenKind::LineComment
+    }
+
+    fn scan_block_comment(&mut self, start_u: usize) -> TokenKind {
+        self.bump();
+        self.bump();
+        loop {
+            match self.first() {
+                None => {
+                    self.error(
+                        UNTERMINATED_BLOCK_COMMENT,
+                        start_u,
+                        self.utf16_pos,
+                        "unterminated block comment",
+                    );
+                    break;
+                }
+                Some('*') if self.second() == Some('/') => {
+                    self.bump();
+                    self.bump();
+                    break;
+                }
+                Some(_) => {
+                    self.bump();
+                }
+            }
+        }
+        TokenKind::BlockComment
+    }
+
+    fn scan_string(&mut self, quote: char, start_u: usize) -> TokenKind {
+        self.bump();
+        loop {
+            match self.first() {
+                None => {
+                    self.error(
+                        UNTERMINATED_STRING,
+                        start_u,
+                        self.utf16_pos,
+                        "unterminated string literal",
+                    );
+                    break;
+                }
+                Some(c) if c == quote => {
+                    self.bump();
+                    break;
+                }
+                // A raw CR or LF terminates a string; LS/PS are permitted.
+                Some('\r' | '\n') => {
+                    self.error(
+                        UNTERMINATED_STRING,
+                        start_u,
+                        self.utf16_pos,
+                        "unterminated string literal",
+                    );
+                    break;
+                }
+                Some('\\') => self.scan_escape(),
+                Some(_) => {
+                    self.bump();
+                }
+            }
+        }
+        TokenKind::StringLiteral
+    }
+
+    /// Scans a template segment. With `continuation`, the cursor begins on the
+    /// `}` closing a substitution; otherwise it begins on the opening backtick.
+    fn scan_template(&mut self, start_u: usize, continuation: bool) -> TokenKind {
+        self.bump();
+        let closed = if continuation {
+            TokenKind::TemplateTail
+        } else {
+            TokenKind::NoSubstitutionTemplate
+        };
+        loop {
+            match self.first() {
+                None => {
+                    self.error(
+                        UNTERMINATED_TEMPLATE,
+                        start_u,
+                        self.utf16_pos,
+                        "unterminated template literal",
+                    );
+                    return closed;
+                }
+                Some('`') => {
+                    self.bump();
+                    return closed;
+                }
+                Some('$') if self.second() == Some('{') => {
+                    self.bump();
+                    self.bump();
+                    return if continuation {
+                        TokenKind::TemplateMiddle
+                    } else {
+                        TokenKind::TemplateHead
+                    };
+                }
+                Some('\\') => self.scan_escape(),
+                Some(_) => {
+                    self.bump();
+                }
+            }
+        }
+    }
+
+    fn scan_regex(&mut self, start_u: usize) -> TokenKind {
+        self.bump();
+        let mut in_class = false;
+        loop {
+            match self.first() {
+                None => {
+                    self.error(
+                        UNTERMINATED_REGEX,
+                        start_u,
+                        self.utf16_pos,
+                        "unterminated regular expression literal",
+                    );
+                    return TokenKind::RegularExpressionLiteral;
+                }
+                Some(c) if is_line_terminator(c) => {
+                    self.error(
+                        UNTERMINATED_REGEX,
+                        start_u,
+                        self.utf16_pos,
+                        "unterminated regular expression literal",
+                    );
+                    return TokenKind::RegularExpressionLiteral;
+                }
+                Some('\\') => {
+                    self.bump();
+                    match self.first() {
+                        None => {}
+                        Some(c) if is_line_terminator(c) => {
+                            self.error(
+                                UNTERMINATED_REGEX,
+                                start_u,
+                                self.utf16_pos,
+                                "unterminated regular expression literal",
+                            );
+                            return TokenKind::RegularExpressionLiteral;
+                        }
+                        Some(_) => {
+                            self.bump();
+                        }
+                    }
+                }
+                Some('[') => {
+                    in_class = true;
+                    self.bump();
+                }
+                Some(']') => {
+                    in_class = false;
+                    self.bump();
+                }
+                Some('/') if !in_class => {
+                    self.bump();
+                    break;
+                }
+                Some(_) => {
+                    self.bump();
+                }
+            }
+        }
+        while self.first().is_some_and(is_id_continue) {
+            self.bump();
+        }
+        TokenKind::RegularExpressionLiteral
+    }
+
+    fn scan_number(&mut self, start_u: usize) -> TokenKind {
+        let first = self.first().unwrap_or('0');
+        if first == '0' {
+            match self.second() {
+                Some('x' | 'X') => return self.scan_radix(16, start_u),
+                Some('o' | 'O') => return self.scan_radix(8, start_u),
+                Some('b' | 'B') => return self.scan_radix(2, start_u),
+                _ => {}
+            }
+        }
+
+        let legacy_octal_leading_zero =
+            first == '0' && self.second().is_some_and(|d| d.is_ascii_digit());
+        let mut is_integer = true;
+
+        if first == '.' {
+            is_integer = false;
+            self.bump();
+            self.consume_digits(10, start_u);
+        } else {
+            self.consume_digits(10, start_u);
+            if self.first() == Some('.') {
+                is_integer = false;
+                self.bump();
+                self.consume_digits(10, start_u);
+            }
+        }
+
+        if matches!(self.first(), Some('e' | 'E')) {
+            is_integer = false;
+            self.bump();
+            if matches!(self.first(), Some('+' | '-')) {
+                self.bump();
+            }
+            if !self.consume_digits(10, start_u) {
+                self.error(
+                    INVALID_NUMERIC_LITERAL,
+                    start_u,
+                    self.utf16_pos,
+                    "an exponent must have at least one digit",
+                );
+            }
+        }
+
+        if self.first() == Some('n') {
+            if is_integer && !legacy_octal_leading_zero {
+                self.bump();
+                return TokenKind::BigIntLiteral;
+            }
+            self.error(
+                INVALID_BIGINT_LITERAL,
+                start_u,
+                self.utf16_pos,
+                "a BigInt literal must be an integer without a leading zero",
+            );
+            self.bump();
+            return TokenKind::NumericLiteral;
+        }
+
+        TokenKind::NumericLiteral
+    }
+
+    fn scan_radix(&mut self, radix: u32, start_u: usize) -> TokenKind {
+        self.bump();
+        self.bump();
+        let any = self.consume_digits(radix, start_u);
+        if !any {
+            self.error(
+                INVALID_NUMERIC_LITERAL,
+                start_u,
+                self.utf16_pos,
+                "a numeric literal must have at least one digit",
+            );
+        }
+        if self.first() == Some('n') {
+            self.bump();
+            return TokenKind::BigIntLiteral;
+        }
+        TokenKind::NumericLiteral
+    }
+
+    /// Consumes a run of `radix` digits with ECMAScript numeric separators.
+    /// Returns whether at least one digit was consumed.
+    fn consume_digits(&mut self, radix: u32, start_u: usize) -> bool {
+        let mut any = false;
+        let mut last_was_digit = false;
+        let mut trailing_separator = false;
+        loop {
+            match self.first() {
+                Some(c) if c.is_digit(radix) => {
+                    self.bump();
+                    any = true;
+                    last_was_digit = true;
+                    trailing_separator = false;
+                }
+                Some('_') => {
+                    if !last_was_digit {
+                        self.error(
+                            INVALID_NUMERIC_SEPARATOR,
+                            start_u,
+                            self.utf16_pos,
+                            "a numeric separator must sit between two digits",
+                        );
+                    }
+                    self.bump();
+                    last_was_digit = false;
+                    trailing_separator = true;
+                }
+                _ => break,
+            }
+        }
+        if trailing_separator {
+            self.error(
+                INVALID_NUMERIC_SEPARATOR,
+                start_u,
+                self.utf16_pos,
+                "a numeric literal must not end with a separator",
+            );
+        }
+        any
+    }
+
+    fn scan_identifier(&mut self, start_b: usize) -> TokenKind {
+        let mut had_escape = false;
+        if self.first() == Some('\\') {
+            self.scan_identifier_escape(true);
+            had_escape = true;
+        } else {
+            self.bump();
+        }
+        loop {
+            match self.first() {
+                Some('\\') if self.second() == Some('u') => {
+                    self.scan_identifier_escape(false);
+                    had_escape = true;
+                }
+                Some(c) if is_id_continue(c) => {
+                    self.bump();
+                }
+                _ => break,
+            }
+        }
+
+        // Escaped identifiers are never keywords, matching the ECMAScript rule
+        // that a reserved word spelled with escapes is an ordinary identifier.
+        if had_escape {
+            return TokenKind::Identifier;
+        }
+        let word = &self.text[start_b..self.byte_pos];
+        keyword_kind(word).unwrap_or(TokenKind::Identifier)
+    }
+
+    fn scan_identifier_escape(&mut self, is_start: bool) {
+        let esc_start = self.utf16_pos;
+        self.bump();
+        if self.first() != Some('u') {
+            self.error(
+                INVALID_UNICODE_ESCAPE,
+                esc_start,
+                self.utf16_pos,
+                "an identifier escape must be a unicode escape",
+            );
+            return;
+        }
+        self.bump();
+        if let Some(code_point) = self.read_hex_code_point(esc_start) {
+            let valid = if is_start {
+                is_id_start(code_point)
+            } else {
+                is_id_continue(code_point)
+            };
+            if !valid {
+                self.error(
+                    INVALID_UNICODE_ESCAPE,
+                    esc_start,
+                    self.utf16_pos,
+                    "the escaped code point is not a valid identifier character",
+                );
+            }
+        }
+    }
+
+    fn scan_hash(&mut self, start_b: usize, start_u: usize) -> TokenKind {
+        if start_b == 0 && self.second() == Some('!') {
+            self.bump();
+            self.bump();
+            while let Some(c) = self.first() {
+                if is_line_terminator(c) {
+                    break;
+                }
+                self.bump();
+            }
+            return TokenKind::Shebang;
+        }
+
+        self.bump();
+        let begins_name = match self.first() {
+            Some('\\') => self.second() == Some('u'),
+            Some(c) => is_id_start(c),
+            None => false,
+        };
+        if begins_name {
+            if self.first() == Some('\\') {
+                self.scan_identifier_escape(true);
+            } else {
+                self.bump();
+            }
+            loop {
+                match self.first() {
+                    Some('\\') if self.second() == Some('u') => self.scan_identifier_escape(false),
+                    Some(c) if is_id_continue(c) => {
+                        self.bump();
+                    }
+                    _ => break,
+                }
+            }
+        } else {
+            self.error(
+                INVALID_PRIVATE_IDENTIFIER,
+                start_u,
+                self.utf16_pos,
+                "a private identifier must have a name after `#`",
+            );
+        }
+        TokenKind::PrivateIdentifier
+    }
+
+    fn scan_escape(&mut self) {
+        let esc_start = self.utf16_pos;
+        self.bump();
+        match self.first() {
+            None => {}
+            // A line continuation consumes the terminator; CRLF counts as one.
+            Some('\r') => {
+                self.bump();
+                if self.first() == Some('\n') {
+                    self.bump();
+                }
+            }
+            Some(c) if is_line_terminator(c) => {
+                self.bump();
+            }
+            Some('x') => {
+                self.bump();
+                if !self.consume_fixed_hex(2) {
+                    self.error(
+                        INVALID_ESCAPE,
+                        esc_start,
+                        self.utf16_pos,
+                        "a hexadecimal escape requires two digits",
+                    );
+                }
+            }
+            Some('u') => {
+                self.bump();
+                let _ = self.read_hex_code_point(esc_start);
+            }
+            Some(_) => {
+                self.bump();
+            }
+        }
+    }
+
+    /// Reads a `\u`-style code point after the `u` has been consumed, handling
+    /// both the fixed four-digit and braced forms and reporting malformations.
+    fn read_hex_code_point(&mut self, esc_start: usize) -> Option<char> {
+        if self.first() == Some('{') {
+            self.bump();
+            let mut value: u32 = 0;
+            let mut any = false;
+            let mut overflow = false;
+            while let Some(digit) = self.first().and_then(|c| c.to_digit(16)) {
+                self.bump();
+                any = true;
+                value = value.saturating_mul(16).saturating_add(digit);
+                if value > 0x0010_FFFF {
+                    overflow = true;
+                }
+            }
+            if self.first() == Some('}') {
+                self.bump();
+            } else {
+                self.error(
+                    INVALID_UNICODE_ESCAPE,
+                    esc_start,
+                    self.utf16_pos,
+                    "a unicode escape is missing its closing brace",
+                );
+                return None;
+            }
+            if !any {
+                self.error(
+                    INVALID_UNICODE_ESCAPE,
+                    esc_start,
+                    self.utf16_pos,
+                    "a unicode escape has no digits",
+                );
+                return None;
+            }
+            if overflow {
+                self.error(
+                    INVALID_UNICODE_ESCAPE,
+                    esc_start,
+                    self.utf16_pos,
+                    "a unicode escape is greater than the maximum code point",
+                );
+                return None;
+            }
+            char::from_u32(value)
+        } else {
+            let mut value: u32 = 0;
+            let mut count = 0;
+            while count < 4 {
+                match self.first().and_then(|c| c.to_digit(16)) {
+                    Some(digit) => {
+                        self.bump();
+                        value = value * 16 + digit;
+                        count += 1;
+                    }
+                    None => break,
+                }
+            }
+            if count < 4 {
+                self.error(
+                    INVALID_UNICODE_ESCAPE,
+                    esc_start,
+                    self.utf16_pos,
+                    "a unicode escape requires four hexadecimal digits",
+                );
+                return None;
+            }
+            char::from_u32(value)
+        }
+    }
+
+    /// Consumes exactly `count` hexadecimal digits, or as many as are present,
+    /// returning whether the full count was available.
+    fn consume_fixed_hex(&mut self, count: usize) -> bool {
+        for _ in 0..count {
+            match self.first() {
+                Some(c) if c.is_ascii_hexdigit() => {
+                    self.bump();
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    fn scan_operator(&mut self, c: char, start_u: usize) -> TokenKind {
+        match c {
+            '(' => self.single(TokenKind::LParen),
+            ')' => self.single(TokenKind::RParen),
+            '[' => self.single(TokenKind::LBracket),
+            ']' => self.single(TokenKind::RBracket),
+            ',' => self.single(TokenKind::Comma),
+            ';' => self.single(TokenKind::Semicolon),
+            ':' => self.single(TokenKind::Colon),
+            '~' => self.single(TokenKind::Tilde),
+            '@' => self.single(TokenKind::At),
+            '.' => {
+                if self.second() == Some('.') && self.third() == Some('.') {
+                    self.advance(3);
+                    TokenKind::DotDotDot
+                } else {
+                    self.single(TokenKind::Dot)
+                }
+            }
+            '+' => match self.second() {
+                Some('+') => self.pair(TokenKind::PlusPlus),
+                Some('=') => self.pair(TokenKind::PlusEq),
+                _ => self.single(TokenKind::Plus),
+            },
+            '-' => match self.second() {
+                Some('-') => self.pair(TokenKind::MinusMinus),
+                Some('=') => self.pair(TokenKind::MinusEq),
+                _ => self.single(TokenKind::Minus),
+            },
+            '*' => match self.second() {
+                Some('*') => {
+                    if self.third() == Some('=') {
+                        self.advance(3);
+                        TokenKind::StarStarEq
+                    } else {
+                        self.pair(TokenKind::StarStar)
+                    }
+                }
+                Some('=') => self.pair(TokenKind::StarEq),
+                _ => self.single(TokenKind::Star),
+            },
+            '%' => match self.second() {
+                Some('=') => self.pair(TokenKind::PercentEq),
+                _ => self.single(TokenKind::Percent),
+            },
+            '=' => match self.second() {
+                Some('=') => {
+                    if self.third() == Some('=') {
+                        self.advance(3);
+                        TokenKind::EqEqEq
+                    } else {
+                        self.pair(TokenKind::EqEq)
+                    }
+                }
+                Some('>') => self.pair(TokenKind::Arrow),
+                _ => self.single(TokenKind::Eq),
+            },
+            '!' => match self.second() {
+                Some('=') => {
+                    if self.third() == Some('=') {
+                        self.advance(3);
+                        TokenKind::BangEqEq
+                    } else {
+                        self.pair(TokenKind::BangEq)
+                    }
+                }
+                _ => self.single(TokenKind::Bang),
+            },
+            '<' => match self.second() {
+                Some('<') => {
+                    if self.third() == Some('=') {
+                        self.advance(3);
+                        TokenKind::LessLessEq
+                    } else {
+                        self.pair(TokenKind::LessLess)
+                    }
+                }
+                Some('=') => self.pair(TokenKind::LessThanEq),
+                _ => self.single(TokenKind::LessThan),
+            },
+            '>' => match self.second() {
+                Some('>') => match self.third() {
+                    Some('>') => {
+                        if self.nth(3) == Some('=') {
+                            self.advance(4);
+                            TokenKind::GreaterGreaterGreaterEq
+                        } else {
+                            self.advance(3);
+                            TokenKind::GreaterGreaterGreater
+                        }
+                    }
+                    Some('=') => {
+                        self.advance(3);
+                        TokenKind::GreaterGreaterEq
+                    }
+                    _ => self.pair(TokenKind::GreaterGreater),
+                },
+                Some('=') => self.pair(TokenKind::GreaterThanEq),
+                _ => self.single(TokenKind::GreaterThan),
+            },
+            '&' => match self.second() {
+                Some('&') => {
+                    if self.third() == Some('=') {
+                        self.advance(3);
+                        TokenKind::AmpAmpEq
+                    } else {
+                        self.pair(TokenKind::AmpAmp)
+                    }
+                }
+                Some('=') => self.pair(TokenKind::AmpEq),
+                _ => self.single(TokenKind::Amp),
+            },
+            '|' => match self.second() {
+                Some('|') => {
+                    if self.third() == Some('=') {
+                        self.advance(3);
+                        TokenKind::PipePipeEq
+                    } else {
+                        self.pair(TokenKind::PipePipe)
+                    }
+                }
+                Some('=') => self.pair(TokenKind::PipeEq),
+                _ => self.single(TokenKind::Pipe),
+            },
+            '^' => match self.second() {
+                Some('=') => self.pair(TokenKind::CaretEq),
+                _ => self.single(TokenKind::Caret),
+            },
+            '?' => match self.second() {
+                Some('?') => {
+                    if self.third() == Some('=') {
+                        self.advance(3);
+                        TokenKind::QuestionQuestionEq
+                    } else {
+                        self.pair(TokenKind::QuestionQuestion)
+                    }
+                }
+                // `?.` is optional chaining only when not followed by a digit,
+                // so `x?.5` scans as `?` then `.5`.
+                Some('.') if !self.third().is_some_and(|d| d.is_ascii_digit()) => {
+                    self.pair(TokenKind::QuestionDot)
+                }
+                _ => self.single(TokenKind::Question),
+            },
+            _ => {
+                self.bump();
+                self.error(
+                    UNEXPECTED_CHARACTER,
+                    start_u,
+                    self.utf16_pos,
+                    "this character cannot begin a token",
+                );
+                TokenKind::Unknown
+            }
+        }
+    }
+
+    fn single(&mut self, kind: TokenKind) -> TokenKind {
+        self.bump();
+        kind
+    }
+
+    fn pair(&mut self, kind: TokenKind) -> TokenKind {
+        self.bump();
+        self.bump();
+        kind
+    }
+
+    fn advance(&mut self, count: usize) {
+        for _ in 0..count {
+            if self.bump().is_none() {
+                break;
+            }
+        }
+    }
+
+    fn reset_to_last(&mut self) {
+        self.byte_pos = self.last_start_byte;
+        self.utf16_pos = self.last_start_utf16;
+    }
+
+    fn rest(&self) -> &str {
+        &self.text[self.byte_pos..]
+    }
+
+    fn first(&self) -> Option<char> {
+        self.rest().chars().next()
+    }
+
+    fn second(&self) -> Option<char> {
+        self.nth(1)
+    }
+
+    fn third(&self) -> Option<char> {
+        self.nth(2)
+    }
+
+    fn nth(&self, index: usize) -> Option<char> {
+        self.rest().chars().nth(index)
+    }
+
+    fn bump(&mut self) -> Option<char> {
+        let c = self.first()?;
+        self.byte_pos += c.len_utf8();
+        self.utf16_pos += c.len_utf16();
+        Some(c)
+    }
+
+    fn make(&self, kind: TokenKind, start_u: usize) -> Token {
+        let range = TextRange::new(Utf16Pos::new(start_u), Utf16Pos::new(self.utf16_pos))
+            .expect("scanner ranges advance monotonically");
+        Token::new(kind, range)
+    }
+
+    fn error(&mut self, code: DiagnosticCode, start_u: usize, end_u: usize, message: &'static str) {
+        let range = TextRange::new(Utf16Pos::new(start_u), Utf16Pos::new(end_u))
+            .expect("diagnostic ranges advance monotonically");
+        self.diagnostics
+            .push(Diagnostic::error(code, self.source_id, range, message));
+    }
+}
+
+/// Returns whether a code point is scanner trivia whitespace.
+///
+/// This folds line terminators into whitespace; callers that need ASI decide by
+/// inspecting the token lexeme. U+FEFF (byte-order mark / ZWNBSP) is treated as
+/// whitespace, matching the ECMAScript `WhiteSpace` production.
+fn is_whitespace(c: char) -> bool {
+    c == '\u{FEFF}' || c.is_whitespace()
+}
+
+fn is_line_terminator(c: char) -> bool {
+    matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}')
+}
+
+/// Returns whether a code point may begin an identifier.
+///
+/// This uses `char::is_alphabetic` plus `$` and `_` as a total, allocation-free
+/// approximation of the Unicode `ID_Start` set, so classification never depends
+/// on an external table crate.
+fn is_id_start(c: char) -> bool {
+    c == '$' || c == '_' || c.is_alphabetic()
+}
+
+/// Returns whether a code point may continue an identifier.
+///
+/// This approximates `ID_Continue` with `char::is_alphanumeric` plus `$`, `_`,
+/// and the ZWNJ/ZWJ joiners the ECMAScript grammar explicitly permits.
+fn is_id_continue(c: char) -> bool {
+    c == '$' || c == '_' || c == '\u{200C}' || c == '\u{200D}' || c.is_alphanumeric()
+}
+
+/// Maps a raw, escape-free identifier lexeme to its reserved or contextual
+/// keyword token, if any. The parser decides where contextual keywords are used
+/// as ordinary identifiers.
+fn keyword_kind(word: &str) -> Option<TokenKind> {
+    Some(match word {
+        "abstract" => TokenKind::KwAbstract,
+        "accessor" => TokenKind::KwAccessor,
+        "any" => TokenKind::KwAny,
+        "as" => TokenKind::KwAs,
+        "asserts" => TokenKind::KwAsserts,
+        "async" => TokenKind::KwAsync,
+        "await" => TokenKind::KwAwait,
+        "bigint" => TokenKind::KwBigint,
+        "boolean" => TokenKind::KwBoolean,
+        "break" => TokenKind::KwBreak,
+        "case" => TokenKind::KwCase,
+        "catch" => TokenKind::KwCatch,
+        "class" => TokenKind::KwClass,
+        "const" => TokenKind::KwConst,
+        "constructor" => TokenKind::KwConstructor,
+        "continue" => TokenKind::KwContinue,
+        "declare" => TokenKind::KwDeclare,
+        "debugger" => TokenKind::KwDebugger,
+        "default" => TokenKind::KwDefault,
+        "delete" => TokenKind::KwDelete,
+        "do" => TokenKind::KwDo,
+        "else" => TokenKind::KwElse,
+        "enum" => TokenKind::KwEnum,
+        "export" => TokenKind::KwExport,
+        "extends" => TokenKind::KwExtends,
+        "false" => TokenKind::KwFalse,
+        "finally" => TokenKind::KwFinally,
+        "for" => TokenKind::KwFor,
+        "from" => TokenKind::KwFrom,
+        "function" => TokenKind::KwFunction,
+        "get" => TokenKind::KwGet,
+        "if" => TokenKind::KwIf,
+        "implements" => TokenKind::KwImplements,
+        "import" => TokenKind::KwImport,
+        "in" => TokenKind::KwIn,
+        "infer" => TokenKind::KwInfer,
+        "instanceof" => TokenKind::KwInstanceof,
+        "interface" => TokenKind::KwInterface,
+        "is" => TokenKind::KwIs,
+        "keyof" => TokenKind::KwKeyof,
+        "let" => TokenKind::KwLet,
+        "namespace" => TokenKind::KwNamespace,
+        "never" => TokenKind::KwNever,
+        "new" => TokenKind::KwNew,
+        "null" => TokenKind::KwNull,
+        "number" => TokenKind::KwNumber,
+        "object" => TokenKind::KwObject,
+        "of" => TokenKind::KwOf,
+        "override" => TokenKind::KwOverride,
+        "package" => TokenKind::KwPackage,
+        "private" => TokenKind::KwPrivate,
+        "protected" => TokenKind::KwProtected,
+        "public" => TokenKind::KwPublic,
+        "readonly" => TokenKind::KwReadonly,
+        "return" => TokenKind::KwReturn,
+        "satisfies" => TokenKind::KwSatisfies,
+        "set" => TokenKind::KwSet,
+        "static" => TokenKind::KwStatic,
+        "string" => TokenKind::KwString,
+        "super" => TokenKind::KwSuper,
+        "switch" => TokenKind::KwSwitch,
+        "symbol" => TokenKind::KwSymbol,
+        "this" => TokenKind::KwThis,
+        "throw" => TokenKind::KwThrow,
+        "true" => TokenKind::KwTrue,
+        "try" => TokenKind::KwTry,
+        "type" => TokenKind::KwType,
+        "typeof" => TokenKind::KwTypeof,
+        "undefined" => TokenKind::KwUndefined,
+        "unique" => TokenKind::KwUnique,
+        "unknown" => TokenKind::KwUnknown,
+        "var" => TokenKind::KwVar,
+        "void" => TokenKind::KwVoid,
+        "while" => TokenKind::KwWhile,
+        "with" => TokenKind::KwWith,
+        "yield" => TokenKind::KwYield,
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn scan_text(text: &str) -> Recovered<ScannedSource> {
+        let source = Arc::new(SourceText::new(text));
+        scan(SourceId::new(0), ScriptKind::TypeScript, source)
+    }
+
+    fn kinds(text: &str) -> Vec<TokenKind> {
+        scan_text(text)
+            .into_product()
+            .tokens()
+            .iter()
+            .map(Token::kind)
+            .collect()
+    }
+
+    fn significant(text: &str) -> Vec<(TokenKind, String)> {
+        let product = scan_text(text).into_product();
+        product
+            .tokens()
+            .iter()
+            .filter(|token| {
+                !matches!(
+                    token.kind(),
+                    TokenKind::Whitespace
+                        | TokenKind::LineComment
+                        | TokenKind::BlockComment
+                        | TokenKind::Shebang
+                )
+            })
+            .map(|token| {
+                (
+                    token.kind(),
+                    product.token_text(token).unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// The stream must tile the whole source: adjacent, gap-free, and ending
+    /// exactly at the source length, which the EOF token also anchors.
+    fn assert_tiles(text: &str) {
+        let product = scan_text(text).into_product();
+        let mut cursor = 0usize;
+        for token in product.tokens() {
+            assert_eq!(
+                token.range().start().get(),
+                cursor,
+                "token {:?} left a gap in {text:?}",
+                token.kind()
+            );
+            assert!(
+                !token.range().is_empty(),
+                "token {:?} made no forward progress in {text:?}",
+                token.kind()
+            );
+            cursor = token.range().end().get();
+        }
+        let len = product.source_text().len_utf16().get();
+        assert_eq!(cursor, len, "tokens did not reach end of {text:?}");
+        assert_eq!(product.eof().range().start().get(), len);
+        assert_eq!(product.eof().range().end().get(), len);
+        assert_eq!(product.eof().kind(), TokenKind::EndOfFile);
+    }
+
+    #[test]
+    fn empty_source_has_only_eof() {
+        let product = scan_text("").into_product();
+        assert!(product.tokens().is_empty());
+        assert_eq!(product.eof().kind(), TokenKind::EndOfFile);
+        assert_eq!(product.eof().range().len(), 0);
+    }
+
+    #[test]
+    fn whitespace_and_newlines_fold_into_one_trivia_token() {
+        assert_eq!(kinds(" \t\n\r\n "), vec![TokenKind::Whitespace]);
+        assert_tiles(" \t\n\r\n ");
+    }
+
+    #[test]
+    fn line_and_block_comments_are_trivia() {
+        assert_eq!(
+            kinds("// hi\n/* a */"),
+            vec![
+                TokenKind::LineComment,
+                TokenKind::Whitespace,
+                TokenKind::BlockComment,
+            ]
+        );
+    }
+
+    #[test]
+    fn shebang_only_at_start() {
+        assert_eq!(kinds("#!/usr/bin/env node\n"), {
+            vec![TokenKind::Shebang, TokenKind::Whitespace]
+        });
+        // A `#` after the first byte is a private identifier, never a shebang.
+        assert_eq!(
+            significant("a\n#!x")
+                .iter()
+                .map(|(kind, _)| *kind)
+                .collect::<Vec<_>>(),
+            vec![
+                TokenKind::Identifier,
+                TokenKind::PrivateIdentifier,
+                TokenKind::Bang,
+                TokenKind::Identifier,
+            ]
+        );
+    }
+
+    #[test]
+    fn keywords_are_distinct_from_identifiers() {
+        assert_eq!(
+            significant("const of asyncish"),
+            vec![
+                (TokenKind::KwConst, "const".into()),
+                (TokenKind::KwOf, "of".into()),
+                (TokenKind::Identifier, "asyncish".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn escaped_keyword_is_an_identifier() {
+        // `\u{69}f` spells `if` but escapes disqualify it from being a keyword.
+        let tokens = significant(r"\u{69}f");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].0, TokenKind::Identifier);
+    }
+
+    #[test]
+    fn unicode_identifier_ranges_are_utf16() {
+        // `π` occupies two UTF-8 bytes but one UTF-16 unit.
+        let product = scan_text("π=1").into_product();
+        let ident = &product.tokens()[0];
+        assert_eq!(ident.kind(), TokenKind::Identifier);
+        assert_eq!(ident.range().start().get(), 0);
+        assert_eq!(ident.range().end().get(), 1);
+        assert_eq!(product.tokens()[1].kind(), TokenKind::Eq);
+        assert_eq!(product.tokens()[1].range().start().get(), 1);
+        assert_tiles("π=1");
+    }
+
+    #[test]
+    fn astral_characters_span_two_utf16_units() {
+        // `𝕏` is a single code point of length 2 in UTF-16.
+        let text = "\"𝕏\"";
+        let product = scan_text(text).into_product();
+        let string = &product.tokens()[0];
+        assert_eq!(string.kind(), TokenKind::StringLiteral);
+        assert_eq!(string.range().len(), 4); // quote + 2 units + quote
+        assert_eq!(product.token_text(string), Some(text));
+        assert_tiles(text);
+    }
+
+    #[test]
+    fn strings_handle_escapes_and_report_unterminated() {
+        assert_eq!(
+            kinds(r#""a\"b\n\u{1F600}""#),
+            vec![TokenKind::StringLiteral]
+        );
+        let recovered = scan_text("\"open\nnext");
+        assert_eq!(
+            recovered.diagnostics()[0].code(),
+            UNTERMINATED_STRING,
+            "a raw newline must terminate the string"
+        );
+        // Recovery still tiles the source and resumes after the break.
+        assert_tiles("\"open\nnext");
+    }
+
+    #[test]
+    fn unterminated_block_comment_is_diagnosed() {
+        let recovered = scan_text("/* nope");
+        assert_eq!(
+            recovered.diagnostics()[0].code(),
+            UNTERMINATED_BLOCK_COMMENT
+        );
+        assert_eq!(
+            recovered.product().tokens()[0].kind(),
+            TokenKind::BlockComment
+        );
+    }
+
+    #[test]
+    fn numbers_cover_all_bases_and_bigint() {
+        assert_eq!(kinds("0xFF"), vec![TokenKind::NumericLiteral]);
+        assert_eq!(kinds("0o17"), vec![TokenKind::NumericLiteral]);
+        assert_eq!(kinds("0b1010"), vec![TokenKind::NumericLiteral]);
+        assert_eq!(kinds("1_000.5e-3"), vec![TokenKind::NumericLiteral]);
+        assert_eq!(kinds(".25"), vec![TokenKind::NumericLiteral]);
+        assert_eq!(kinds("123n"), vec![TokenKind::BigIntLiteral]);
+        assert_eq!(kinds("0xFFn"), vec![TokenKind::BigIntLiteral]);
+    }
+
+    #[test]
+    fn malformed_numbers_are_diagnosed() {
+        assert_eq!(
+            scan_text("1__2").diagnostics()[0].code(),
+            INVALID_NUMERIC_SEPARATOR
+        );
+        assert_eq!(
+            scan_text("1_").diagnostics()[0].code(),
+            INVALID_NUMERIC_SEPARATOR
+        );
+        assert_eq!(
+            scan_text("1e").diagnostics()[0].code(),
+            INVALID_NUMERIC_LITERAL
+        );
+        assert_eq!(
+            scan_text("0x").diagnostics()[0].code(),
+            INVALID_NUMERIC_LITERAL
+        );
+        // A float or leading-zero integer cannot carry a BigInt suffix.
+        assert_eq!(
+            scan_text("1.5n").diagnostics()[0].code(),
+            INVALID_BIGINT_LITERAL
+        );
+    }
+
+    #[test]
+    fn operators_take_the_longest_match() {
+        assert_eq!(
+            kinds(">>>= >>> >>= >> >="),
+            vec![
+                TokenKind::GreaterGreaterGreaterEq,
+                TokenKind::Whitespace,
+                TokenKind::GreaterGreaterGreater,
+                TokenKind::Whitespace,
+                TokenKind::GreaterGreaterEq,
+                TokenKind::Whitespace,
+                TokenKind::GreaterGreater,
+                TokenKind::Whitespace,
+                TokenKind::GreaterThanEq,
+            ]
+        );
+        assert_eq!(
+            kinds("...a?.b??c"),
+            vec![
+                TokenKind::DotDotDot,
+                TokenKind::Identifier,
+                TokenKind::QuestionDot,
+                TokenKind::Identifier,
+                TokenKind::QuestionQuestion,
+                TokenKind::Identifier,
+            ]
+        );
+    }
+
+    #[test]
+    fn optional_chain_before_digit_splits() {
+        // `x?.5` is `x`, `?`, `.5`, not `x`, `?.`, `5`.
+        assert_eq!(
+            kinds("x?.5"),
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Question,
+                TokenKind::NumericLiteral,
+            ]
+        );
+    }
+
+    #[test]
+    fn private_identifier_and_missing_name() {
+        assert_eq!(kinds("#field"), vec![TokenKind::PrivateIdentifier]);
+        let recovered = scan_text("# ");
+        assert_eq!(
+            recovered.diagnostics()[0].code(),
+            INVALID_PRIVATE_IDENTIFIER
+        );
+    }
+
+    #[test]
+    fn templates_segment_with_nested_braces() {
+        // `${ {a:1} }` nests an object literal whose braces must not close the
+        // substitution early.
+        let text = "`h${ {a:1} }m${x}t`";
+        assert_eq!(
+            kinds(text),
+            vec![
+                TokenKind::TemplateHead,
+                TokenKind::Whitespace,
+                TokenKind::LBrace,
+                TokenKind::Identifier,
+                TokenKind::Colon,
+                TokenKind::NumericLiteral,
+                TokenKind::RBrace,
+                TokenKind::Whitespace,
+                TokenKind::TemplateMiddle,
+                TokenKind::Identifier,
+                TokenKind::TemplateTail,
+            ]
+        );
+        assert_tiles(text);
+    }
+
+    #[test]
+    fn no_substitution_template() {
+        assert_eq!(kinds("`plain`"), vec![TokenKind::NoSubstitutionTemplate]);
+    }
+
+    #[test]
+    fn unterminated_template_recovers() {
+        let recovered = scan_text("`open");
+        assert_eq!(recovered.diagnostics()[0].code(), UNTERMINATED_TEMPLATE);
+        assert_eq!(
+            recovered.product().tokens()[0].kind(),
+            TokenKind::NoSubstitutionTemplate
+        );
+    }
+
+    #[test]
+    fn default_pass_treats_slash_as_division() {
+        assert_eq!(
+            kinds("a / b"),
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Whitespace,
+                TokenKind::Slash,
+                TokenKind::Whitespace,
+                TokenKind::Identifier,
+            ]
+        );
+    }
+
+    #[test]
+    fn rescan_regex_reinterprets_slash() {
+        let source = Arc::new(SourceText::new(r"/ab[/]c/gi;"));
+        let mut scanner = Scanner::new(SourceId::new(0), ScriptKind::JavaScript, &source);
+        let slash = scanner.next_token();
+        assert_eq!(slash.kind(), TokenKind::Slash);
+        let regex = scanner.rescan_regex();
+        assert_eq!(regex.kind(), TokenKind::RegularExpressionLiteral);
+        // The character class keeps the interior `/` literal; flags follow.
+        assert_eq!(regex.range().start().get(), 0);
+        assert_eq!(regex.range().end().get(), r"/ab[/]c/gi".len());
+        let next = scanner.next_token();
+        assert_eq!(next.kind(), TokenKind::Semicolon);
+    }
+
+    #[test]
+    fn rescan_regex_reports_unterminated() {
+        let source = Arc::new(SourceText::new("/ab\nc"));
+        let mut scanner = Scanner::new(SourceId::new(0), ScriptKind::JavaScript, &source);
+        scanner.next_token();
+        let regex = scanner.rescan_regex();
+        assert_eq!(regex.kind(), TokenKind::RegularExpressionLiteral);
+        assert_eq!(scanner.diagnostics()[0].code(), UNTERMINATED_REGEX);
+    }
+
+    #[test]
+    fn rescan_greater_than_splits_operator() {
+        let source = Arc::new(SourceText::new(">>"));
+        let mut scanner = Scanner::new(SourceId::new(0), ScriptKind::TypeScript, &source);
+        let shift = scanner.next_token();
+        assert_eq!(shift.kind(), TokenKind::GreaterGreater);
+        let single = scanner.rescan_greater_than();
+        assert_eq!(single.kind(), TokenKind::GreaterThan);
+        assert_eq!(single.range().len(), 1);
+        let rest = scanner.next_token();
+        assert_eq!(rest.kind(), TokenKind::GreaterThan);
+    }
+
+    #[test]
+    fn jsx_operations_scan_text_names_and_attribute_strings() {
+        let source = Arc::new(SourceText::new("hello world<"));
+        let mut scanner = Scanner::new(SourceId::new(0), ScriptKind::TypeScriptReact, &source);
+        let text = scanner.scan_jsx_text();
+        assert_eq!(text.kind(), TokenKind::StringLiteral);
+        assert_eq!(text.range().end().get(), "hello world".len());
+        assert_eq!(scanner.next_token().kind(), TokenKind::LessThan);
+
+        let names = Arc::new(SourceText::new("data-role="));
+        let mut scanner = Scanner::new(SourceId::new(0), ScriptKind::TypeScriptReact, &names);
+        let name = scanner.scan_jsx_identifier();
+        assert_eq!(name.kind(), TokenKind::Identifier);
+        assert_eq!(name.range().end().get(), "data-role".len());
+
+        let attr = Arc::new(SourceText::new("'a\"b'"));
+        let mut scanner = Scanner::new(SourceId::new(0), ScriptKind::TypeScriptReact, &attr);
+        let value = scanner.scan_jsx_attribute_string();
+        assert_eq!(value.kind(), TokenKind::StringLiteral);
+        // The other quote is content, not a terminator.
+        assert_eq!(value.range().len(), 5);
+    }
+
+    #[test]
+    fn unexpected_character_makes_progress() {
+        let recovered = scan_text("\u{7}a");
+        assert_eq!(recovered.diagnostics()[0].code(), UNEXPECTED_CHARACTER);
+        assert_eq!(recovered.product().tokens()[0].kind(), TokenKind::Unknown);
+        assert_eq!(
+            recovered.product().tokens()[1].kind(),
+            TokenKind::Identifier
+        );
+        assert_tiles("\u{7}a");
+    }
+
+    #[test]
+    fn scanner_is_total_over_arbitrary_inputs() {
+        // A battery of hostile fragments must never panic and must always tile.
+        let fragments = [
+            "",
+            "\\",
+            "\\u",
+            "\\u{",
+            "\\u{ZZ}",
+            "0x",
+            "'\\",
+            "`${",
+            "}",
+            "/*",
+            "/",
+            "#",
+            "\u{2028}\u{2029}",
+            "𝕏\\u{1F4A9}n",
+            "\"\\x1\"",
+            "1_2_3n",
+            "aaaa",
+            "?.?.??=>>>=",
+        ];
+        for fragment in fragments {
+            assert_tiles(fragment);
+        }
+    }
+
+    #[test]
+    fn corpus_cases_lex_totally_and_tile() {
+        // The default pass does not guess `/` as a regular expression, so a
+        // file that uses a regex literal will not lex cleanly without the
+        // explicit `rescan_regex` a parser would drive. These files still must
+        // tile and round-trip; only the clean-diagnostics claim is waived.
+        const REGEX_LITERAL_CASES: &[&str] = &["escape-string-regexp.ts"];
+
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus/cases");
+        let mut scanned_any = false;
+        let mut regex_case_seen = false;
+        for entry in std::fs::read_dir(&root).expect("corpus/cases must be readable") {
+            let path = entry.expect("directory entry").path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("ts") {
+                continue;
+            }
+            scanned_any = true;
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let text = std::fs::read_to_string(&path).expect("corpus case is UTF-8");
+            let source = Arc::new(SourceText::new(text.clone()));
+            let recovered = scan(SourceId::new(0), ScriptKind::TypeScript, source);
+            let product = recovered.product();
+
+            // Totality invariant: the stream tiles the source with no gaps and
+            // the concatenated lexemes reproduce the source byte for byte.
+            let mut cursor = 0usize;
+            let mut rebuilt = String::with_capacity(text.len());
+            for token in product.tokens() {
+                assert_eq!(
+                    token.range().start().get(),
+                    cursor,
+                    "{name}: gap before {:?}",
+                    token.kind()
+                );
+                cursor = token.range().end().get();
+                rebuilt.push_str(product.token_text(token).expect("token maps to a lexeme"));
+            }
+            assert_eq!(
+                cursor,
+                product.source_text().len_utf16().get(),
+                "{name}: stream did not reach end of source"
+            );
+            assert_eq!(
+                rebuilt, text,
+                "{name}: lexemes did not reproduce the source"
+            );
+
+            if REGEX_LITERAL_CASES.contains(&name.as_str()) {
+                regex_case_seen = true;
+                // The no-guess contract means the default pass reports at least
+                // one diagnostic on a raw regex literal it cannot recognize.
+                assert!(
+                    !recovered.diagnostics().is_empty(),
+                    "{name}: expected the default pass to reject a regex literal"
+                );
+            } else {
+                // Every regex-free corpus driver is valid TypeScript and must
+                // lex cleanly under the default pass.
+                assert!(
+                    recovered.diagnostics().is_empty(),
+                    "{name}: unexpected diagnostics {:?}",
+                    recovered.diagnostics()
+                );
+            }
+        }
+        assert!(scanned_any, "expected at least one corpus case");
+        assert!(
+            regex_case_seen,
+            "expected the regex-literal case to be present"
+        );
+    }
+}

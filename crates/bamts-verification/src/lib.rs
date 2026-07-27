@@ -1,3 +1,4 @@
+pub mod corpus;
 pub mod formal_bridge;
 pub mod formal_gates;
 pub mod ledger;
