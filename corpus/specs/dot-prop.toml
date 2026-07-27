@@ -1,0 +1,24 @@
+schema = 1
+id = "dot-prop"
+repository = "https://github.com/sindresorhus/dot-prop"
+commit = "d5d11c71a70bfb643a45d22821ed6d284240fce5"
+license = "MIT"
+source_dir = "corpus/projects/dot-prop"
+entrypoint = "corpus/cases/dot-prop.ts"
+node_args = []
+expected_timeout_ms = 5000
+constructs = [
+  "getProperty",
+  "setProperty",
+  "hasProperty",
+  "deleteProperty",
+  "escapePath",
+  "deepKeys",
+  "unflatten",
+  "parsePath",
+  "stringifyPath",
+  "prototype-pollution-guard",
+]
+source_files = [
+  "corpus/projects/dot-prop/index.js",
+]

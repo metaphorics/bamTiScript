@@ -1,0 +1,47 @@
+schema = 1
+id = "rou3"
+repository = "https://github.com/h3js/rou3"
+# Canonical full 40-char SHA. The value supplied in the assignment
+# (39b0e9b79585cea3871629aa23d4e693b276fb) was 38 chars and matched no
+# commit; `git rev-parse 39b0e9b` uniquely resolves to the SHA below
+# (commit "fix: canonicalize empty segments in route patterns (#195)").
+# Provenance verified by checking out this exact object and vendoring a
+# clean `git archive` of it (no .git, no node_modules, no build output).
+commit = "39b0e9b79585cea3871629a2aa23d4e693b276fb"
+license = "MIT"
+source_dir = "corpus/projects/rou3"
+entrypoint = "corpus/cases/rou3.ts"
+node_args = []
+expected_timeout_ms = 10000
+constructs = [
+  "router-context",
+  "static-route-lookup",
+  "named-params",
+  "wildcard-catchall",
+  "group-alternation",
+  "optional-modifier",
+  "method-dispatch",
+  "route-removal",
+  "route-overlap-detection",
+  "route-to-regexp",
+]
+source_files = [
+  "corpus/projects/rou3/src/index.ts",
+  "corpus/projects/rou3/src/context.ts",
+  "corpus/projects/rou3/src/object.ts",
+  "corpus/projects/rou3/src/types.ts",
+  "corpus/projects/rou3/src/operations/add.ts",
+  "corpus/projects/rou3/src/operations/find.ts",
+  "corpus/projects/rou3/src/operations/find-all.ts",
+  "corpus/projects/rou3/src/operations/remove.ts",
+  "corpus/projects/rou3/src/operations/overlap.ts",
+  "corpus/projects/rou3/src/operations/_utils.ts",
+  "corpus/projects/rou3/src/_overlap.ts",
+  "corpus/projects/rou3/src/_subsume.ts",
+  "corpus/projects/rou3/src/_group-delimiters.ts",
+  "corpus/projects/rou3/src/_group-names.ts",
+  "corpus/projects/rou3/src/_segment-wildcards.ts",
+  "corpus/projects/rou3/src/_escape.ts",
+  "corpus/projects/rou3/src/regexp.ts",
+  "corpus/projects/rou3/src/regexp-to-route.ts",
+]

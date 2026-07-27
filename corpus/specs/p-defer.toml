@@ -1,0 +1,14 @@
+schema = 1
+id = "p-defer"
+repository = "https://github.com/sindresorhus/p-defer"
+commit = "67a30a04de1086305b24a31a37594d3129fee415"
+license = "MIT"
+source_dir = "corpus/projects/p-defer"
+entrypoint = "corpus/cases/p-defer.ts"
+node_args = []
+expected_timeout_ms = 5000
+constructs = ["promise", "deferred", "resolve", "reject", "async-await", "esm-default-export"]
+source_files = [
+  "corpus/projects/p-defer/index.js",
+  "corpus/projects/p-defer/index.d.ts",
+]

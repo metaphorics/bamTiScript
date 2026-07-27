@@ -1,0 +1,17 @@
+schema = 1
+id = "ufo"
+repository = "https://github.com/unjs/ufo"
+commit = "f06c800d0c59f2a4a1b9ba65eb6cb61a84419be6"
+license = "MIT"
+source_dir = "corpus/projects/ufo"
+entrypoint = "corpus/cases/ufo.ts"
+node_args = []
+expected_timeout_ms = 5000
+constructs = [
+  "punycode-toASCII",
+  "IDN-encoding",
+  "unicode-hostname-ACE",
+]
+source_files = [
+  "corpus/projects/ufo/src/punycode.ts",
+]

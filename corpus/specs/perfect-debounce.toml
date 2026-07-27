@@ -1,0 +1,21 @@
+schema = 1
+id = "perfect-debounce"
+repository = "https://github.com/unjs/perfect-debounce"
+commit = "430686fdcb590b838909eac66fbd99997c09ef12"
+license = "MIT"
+source_dir = "corpus/projects/perfect-debounce"
+entrypoint = "corpus/cases/perfect-debounce.ts"
+node_args = []
+expected_timeout_ms = 5000
+constructs = [
+  "debounce-options-validation",
+  "trailing-edge-debounce",
+  "synchronous-flush",
+  "cancellation",
+  "leading-edge-debounce",
+  "context-binding",
+  "concurrent-promise-lock",
+]
+source_files = [
+  "corpus/projects/perfect-debounce/src/index.ts",
+]

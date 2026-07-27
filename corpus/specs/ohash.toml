@@ -1,0 +1,23 @@
+schema = 1
+id = "ohash"
+repository = "https://github.com/unjs/ohash"
+commit = "2c6e231ccfc229ab90a3e026635984f1ccd89b1d"
+license = "MIT"
+source_dir = "corpus/projects/ohash"
+entrypoint = "corpus/cases/ohash.ts"
+node_args = []
+expected_timeout_ms = 5000
+constructs = [
+  "value-serialization",
+  "object-key-sorting",
+  "sha256-digest",
+  "crypto-js-sha256",
+  "crypto-node-sha256",
+  "circular-reference-handling",
+  "collection-serialization",
+]
+source_files = [
+  "corpus/projects/ohash/src/serialize.ts",
+  "corpus/projects/ohash/src/crypto/node/index.ts",
+  "corpus/projects/ohash/src/crypto/js/index.ts",
+]

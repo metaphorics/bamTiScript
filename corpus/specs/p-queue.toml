@@ -1,0 +1,18 @@
+schema = 1
+id = "p-queue"
+repository = "https://github.com/sindresorhus/p-queue"
+commit = "180ab9e25cd10b6f548767d7176076b50d25e188"
+license = "MIT"
+source_dir = "corpus/projects/p-queue"
+entrypoint = "corpus/cases/p-queue.ts"
+node_args = []
+expected_timeout_ms = 5000
+constructs = [
+    "binary-search",
+    "lower-bound",
+    "insertion-sort",
+    "priority-queue-internals",
+]
+source_files = [
+    "corpus/projects/p-queue/source/lower-bound.ts",
+]

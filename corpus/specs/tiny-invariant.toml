@@ -1,0 +1,19 @@
+schema = 1
+id = "tiny-invariant"
+repository = "https://github.com/alexreardon/tiny-invariant"
+commit = "b5587cf4ba45e257bce49053c3345b6614324252"
+license = "MIT"
+source_dir = "corpus/projects/tiny-invariant"
+entrypoint = "corpus/cases/tiny-invariant.ts"
+node_args = []
+expected_timeout_ms = 5000
+constructs = [
+  "assertion-function-asserts-condition",
+  "truthy-condition-passthrough",
+  "falsy-condition-throw",
+  "string-message-formatting",
+  "lazy-message-function",
+]
+source_files = [
+  "corpus/projects/tiny-invariant/src/tiny-invariant.ts",
+]

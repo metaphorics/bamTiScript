@@ -1,0 +1,43 @@
+{
+  "name": "@badrap/valita",
+  "version": "0.5.4",
+  "description": "A validation & parsing library for TypeScript",
+  "license": "MIT",
+  "author": "Joachim Viide <jviide@iki.fi>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/badrap/valita.git"
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "types": "./dist/index.d.ts",
+  "exports": "./dist/index.js",
+  "publishConfig": {
+    "provenance": true
+  },
+  "scripts": {
+    "fix": "oxfmt && oxlint --fix",
+    "check": "oxfmt --check && oxlint",
+    "test": "vitest run",
+    "build": "rm -rf dist/* && tsc -p ./tsconfig.build.json",
+    "changeset": "changeset",
+    "bump": "changeset version && sed --in-place \"s/\\\"version\\\": \\\".*\\\"/\\\"version\\\": \\\"$(sed -n 's/^\\s*\\\"version\\\": \\\"\\([^\\\"/]*\\)\\\".*/\\1/p' package.json)\\\"/\" jsr.json",
+    "tag": "node --run build && changeset tag"
+  },
+  "devDependencies": {
+    "@changesets/changelog-github": "^0.6.0",
+    "@changesets/cli": "^2.31.0",
+    "oxfmt": "^0.47.0",
+    "oxlint": "^1.66.0",
+    "oxlint-tsgolint": "^0.23.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.5"
+  },
+  "engines": {
+    "node": ">= 22"
+  },
+  "packageManager": "pnpm@11.3.0+sha512.2c403d6594527287672b1f7056343a1f7c3634036a67ffabfcc2b3d7595d843768f8787148d1b57cf7956c90606bbd192857c363af19e96d2d0ec9ec5741d215"
+}

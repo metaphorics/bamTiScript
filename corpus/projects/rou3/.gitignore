@@ -1,0 +1,8 @@
+node_modules
+*.log*
+dist
+.nyc_output
+coverage
+.profile
+bun.lockb
+tsconfig.tsbuildinfo

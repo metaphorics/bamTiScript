@@ -1,0 +1,11 @@
+schema = 1
+id = "citty"
+repository = "https://github.com/unjs/citty"
+commit = "9cb0edcc55c133ea04d3cbb350284a9a3548946e"
+license = "MIT"
+source_dir = "corpus/projects/citty"
+entrypoint = "corpus/cases/citty.ts"
+node_args = []
+expected_timeout_ms = 5000
+constructs = ["argument-parsing", "alias-resolution", "negation-flags", "node-util", "positional-args"]
+source_files = ["corpus/projects/citty/src/_parser.ts"]

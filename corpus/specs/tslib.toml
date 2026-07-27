@@ -1,0 +1,28 @@
+schema = 1
+id = "tslib"
+repository = "https://github.com/microsoft/tslib"
+commit = "12bd8a74b320e3acfaba36b0ecb0e14964a9165b"
+license = "0BSD"
+source_dir = "corpus/projects/tslib"
+entrypoint = "corpus/cases/tslib.ts"
+node_args = []
+expected_timeout_ms = 5000
+constructs = [
+  "prototype-inheritance-extends",
+  "object-assign-polyfill",
+  "object-rest-destructuring",
+  "decorator-target-metadata",
+  "property-key-normalization",
+  "function-name-setter",
+  "iterable-values-iterator",
+  "array-read-slice",
+  "array-spread-concatenation",
+  "tagged-template-raw-object",
+  "es-module-interop-star-default",
+  "weakmap-private-fields",
+  "explicit-resource-management-disposal",
+  "relative-import-extension-rewriter",
+]
+source_files = [
+  "corpus/projects/tslib/tslib.es6.mjs",
+]

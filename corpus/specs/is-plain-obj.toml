@@ -1,0 +1,19 @@
+schema = 1
+id = "is-plain-obj"
+repository = "https://github.com/sindresorhus/is-plain-obj"
+commit = "97f38e8836f86a642cce98fc6ab3058bc36df181"
+license = "MIT"
+source_dir = "corpus/projects/is-plain-obj"
+entrypoint = "corpus/cases/is-plain-obj.ts"
+node_args = []
+expected_timeout_ms = 5000
+constructs = [
+  "plain-object-detection",
+  "prototype-chain-check",
+  "cross-realm-via-vm",
+  "symbol-tostringtag-guard",
+  "symbol-iterator-guard",
+]
+source_files = [
+  "corpus/projects/is-plain-obj/index.js",
+]

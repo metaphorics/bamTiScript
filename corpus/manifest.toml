@@ -1,0 +1,144 @@
+schema = 1
+node_version = "24.18.0"
+environment = ["TZ=UTC", "LANG=C", "LC_ALL=C", "NO_COLOR=1"]
+compare = ["stdout", "exit_code"]
+
+[[projects]]
+id = "citty"
+repository = "https://github.com/unjs/citty"
+commit = "9cb0edcc55c133ea04d3cbb350284a9a3548946e"
+spec = "corpus/specs/citty.toml"
+entrypoint = "corpus/cases/citty.ts"
+
+[[projects]]
+id = "defu"
+repository = "https://github.com/unjs/defu"
+commit = "82632b66f5914e9946edce300e10633a3d5c0cb7"
+spec = "corpus/specs/defu.toml"
+entrypoint = "corpus/cases/defu.ts"
+
+[[projects]]
+id = "destr"
+repository = "https://github.com/unjs/destr"
+commit = "541b6f9aeada9fc30de9c5a7e086dbfc1c6fcdc7"
+spec = "corpus/specs/destr.toml"
+entrypoint = "corpus/cases/destr.ts"
+
+[[projects]]
+id = "dot-prop"
+repository = "https://github.com/sindresorhus/dot-prop"
+commit = "d5d11c71a70bfb643a45d22821ed6d284240fce5"
+spec = "corpus/specs/dot-prop.toml"
+entrypoint = "corpus/cases/dot-prop.ts"
+
+[[projects]]
+id = "escape-string-regexp"
+repository = "https://github.com/sindresorhus/escape-string-regexp"
+commit = "cbc42403142c96923b482604e1f3d627b1956aff"
+spec = "corpus/specs/escape-string-regexp.toml"
+entrypoint = "corpus/cases/escape-string-regexp.ts"
+
+[[projects]]
+id = "hookable"
+repository = "https://github.com/unjs/hookable"
+commit = "b77477c027039362ee0ec4f39b8998c4f1b21707"
+spec = "corpus/specs/hookable.toml"
+entrypoint = "corpus/cases/hookable.ts"
+
+[[projects]]
+id = "is-plain-obj"
+repository = "https://github.com/sindresorhus/is-plain-obj"
+commit = "97f38e8836f86a642cce98fc6ab3058bc36df181"
+spec = "corpus/specs/is-plain-obj.toml"
+entrypoint = "corpus/cases/is-plain-obj.ts"
+
+[[projects]]
+id = "mitt"
+repository = "https://github.com/developit/mitt"
+commit = "6b41670516ed8e8b738612f60491995470aa63b3"
+spec = "corpus/specs/mitt.toml"
+entrypoint = "corpus/cases/mitt.ts"
+
+[[projects]]
+id = "ohash"
+repository = "https://github.com/unjs/ohash"
+commit = "2c6e231ccfc229ab90a3e026635984f1ccd89b1d"
+spec = "corpus/specs/ohash.toml"
+entrypoint = "corpus/cases/ohash.ts"
+
+[[projects]]
+id = "p-defer"
+repository = "https://github.com/sindresorhus/p-defer"
+commit = "67a30a04de1086305b24a31a37594d3129fee415"
+spec = "corpus/specs/p-defer.toml"
+entrypoint = "corpus/cases/p-defer.ts"
+
+[[projects]]
+id = "p-map"
+repository = "https://github.com/sindresorhus/p-map"
+commit = "bc26cf03f81292325236a1188063dac8e7a4de0f"
+spec = "corpus/specs/p-map.toml"
+entrypoint = "corpus/cases/p-map.ts"
+
+[[projects]]
+id = "p-queue"
+repository = "https://github.com/sindresorhus/p-queue"
+commit = "180ab9e25cd10b6f548767d7176076b50d25e188"
+spec = "corpus/specs/p-queue.toml"
+entrypoint = "corpus/cases/p-queue.ts"
+
+[[projects]]
+id = "pathe"
+repository = "https://github.com/unjs/pathe"
+commit = "bc7477a01f0bd60ada017add8142c9f9d69ccdc5"
+spec = "corpus/specs/pathe.toml"
+entrypoint = "corpus/cases/pathe.ts"
+
+[[projects]]
+id = "perfect-debounce"
+repository = "https://github.com/unjs/perfect-debounce"
+commit = "430686fdcb590b838909eac66fbd99997c09ef12"
+spec = "corpus/specs/perfect-debounce.toml"
+entrypoint = "corpus/cases/perfect-debounce.ts"
+
+[[projects]]
+id = "rou3"
+repository = "https://github.com/h3js/rou3"
+commit = "39b0e9b79585cea3871629a2aa23d4e693b276fb"
+spec = "corpus/specs/rou3.toml"
+entrypoint = "corpus/cases/rou3.ts"
+
+[[projects]]
+id = "tiny-invariant"
+repository = "https://github.com/alexreardon/tiny-invariant"
+commit = "b5587cf4ba45e257bce49053c3345b6614324252"
+spec = "corpus/specs/tiny-invariant.toml"
+entrypoint = "corpus/cases/tiny-invariant.ts"
+
+[[projects]]
+id = "tslib"
+repository = "https://github.com/microsoft/tslib"
+commit = "12bd8a74b320e3acfaba36b0ecb0e14964a9165b"
+spec = "corpus/specs/tslib.toml"
+entrypoint = "corpus/cases/tslib.ts"
+
+[[projects]]
+id = "ufo"
+repository = "https://github.com/unjs/ufo"
+commit = "f06c800d0c59f2a4a1b9ba65eb6cb61a84419be6"
+spec = "corpus/specs/ufo.toml"
+entrypoint = "corpus/cases/ufo.ts"
+
+[[projects]]
+id = "valita"
+repository = "https://github.com/badrap/valita"
+commit = "65e685f6f2539dd04d7883acbffe40cc7f956232"
+spec = "corpus/specs/valita.toml"
+entrypoint = "corpus/cases/valita.ts"
+
+[[projects]]
+id = "yocto-queue"
+repository = "https://github.com/sindresorhus/yocto-queue"
+commit = "b07eac099753833b29d06c614149904445739776"
+spec = "corpus/specs/yocto-queue.toml"
+entrypoint = "corpus/cases/yocto-queue.ts"

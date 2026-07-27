@@ -1,0 +1,22 @@
+schema = 1
+id = "mitt"
+repository = "https://github.com/developit/mitt"
+commit = "6b41670516ed8e8b738612f60491995470aa63b3"
+license = "MIT"
+source_dir = "corpus/projects/mitt"
+entrypoint = "corpus/cases/mitt.ts"
+node_args = []
+expected_timeout_ms = 5000
+constructs = [
+  "event-registration",
+  "event-dispatch",
+  "wildcard-handler",
+  "handler-removal",
+  "custom-event-map",
+  "snapshot-safe-mutation",
+  "symbol-event-keys",
+  "all-handlers-map",
+]
+source_files = [
+  "corpus/projects/mitt/src/index.ts",
+]

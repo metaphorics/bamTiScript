@@ -1,0 +1,18 @@
+schema = 1
+id = "defu"
+repository = "https://github.com/unjs/defu"
+commit = "82632b66f5914e9946edce300e10633a3d5c0cb7"
+license = "MIT"
+source_dir = "corpus/projects/defu"
+entrypoint = "corpus/cases/defu.ts"
+node_args = []
+expected_timeout_ms = 5000
+constructs = [
+  "plain-object-detection",
+  "prototype-chain-check",
+  "symbol-iterator-guard",
+  "symbol-tostringtag-guard",
+]
+source_files = [
+  "corpus/projects/defu/src/_utils.ts",
+]

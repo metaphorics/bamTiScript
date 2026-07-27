@@ -1,0 +1,11 @@
+schema = 1
+id = "yocto-queue"
+repository = "https://github.com/sindresorhus/yocto-queue"
+commit = "b07eac099753833b29d06c614149904445739776"
+license = "MIT"
+source_dir = "corpus/projects/yocto-queue"
+entrypoint = "corpus/cases/yocto-queue.ts"
+node_args = []
+expected_timeout_ms = 5000
+constructs = ["class", "private-field", "getter", "generator", "import-esm"]
+source_files = ["corpus/projects/yocto-queue/index.js"]

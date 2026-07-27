@@ -1,0 +1,14 @@
+schema = 1
+id = "pathe"
+repository = "https://github.com/unjs/pathe"
+commit = "bc7477a01f0bd60ada017add8142c9f9d69ccdc5"
+license = "MIT"
+source_dir = "corpus/projects/pathe"
+entrypoint = "corpus/cases/pathe.ts"
+node_args = []
+expected_timeout_ms = 5000
+constructs = ["glob-matching", "path-normalization", "brace-expansion", "character-classes", "negation", "numeric-ranges"]
+source_files = [
+  "corpus/projects/pathe/src/_glob.ts",
+  "corpus/projects/pathe/src/_internal.ts",
+]

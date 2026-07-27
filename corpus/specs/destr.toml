@@ -1,0 +1,21 @@
+schema = 1
+id = "destr"
+repository = "https://github.com/unjs/destr"
+commit = "541b6f9aeada9fc30de9c5a7e086dbfc1c6fcdc7"
+license = "MIT"
+source_dir = "corpus/projects/destr"
+entrypoint = "corpus/cases/destr.ts"
+node_args = []
+expected_timeout_ms = 5000
+constructs = [
+  "json-parse-with-reviver",
+  "prototype-pollution-guard",
+  "regex-signature-detection",
+  "strict-mode-throw",
+  "string-literal-unwrapping",
+  "short-keyword-coercion",
+  "non-string-passthrough",
+]
+source_files = [
+  "corpus/projects/destr/src/index.ts",
+]

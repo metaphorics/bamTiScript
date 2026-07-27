@@ -1,0 +1,25 @@
+schema = 1
+id = "hookable"
+repository = "https://github.com/unjs/hookable"
+commit = "b77477c027039362ee0ec4f39b8998c4f1b21707"
+license = "MIT"
+source_dir = "corpus/projects/hookable"
+entrypoint = "corpus/cases/hookable.ts"
+node_args = []
+expected_timeout_ms = 5000
+constructs = [
+  "serial-hook-execution-order",
+  "hookOnce-single-fire",
+  "deprecateHook-redirect-registration",
+  "nested-namespace-flattening",
+  "beforeEach-afterEach-spy-events",
+  "removeHook-selective-drop",
+  "callHookParallel-settled-results",
+  "HookableCore-minimal-variant",
+  "bound-method-destructuring",
+]
+source_files = [
+  "corpus/projects/hookable/src/hookable.ts",
+  "corpus/projects/hookable/src/utils.ts",
+  "corpus/projects/hookable/src/types.ts",
+]

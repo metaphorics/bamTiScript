@@ -1,0 +1,19 @@
+schema = 1
+id = "escape-string-regexp"
+repository = "https://github.com/sindresorhus/escape-string-regexp"
+commit = "cbc42403142c96923b482604e1f3d627b1956aff"
+license = "MIT"
+source_dir = "corpus/projects/escape-string-regexp"
+entrypoint = "corpus/cases/escape-string-regexp.ts"
+node_args = []
+expected_timeout_ms = 5000
+constructs = [
+  "default-export-function",
+  "string-regex-escape",
+  "regexp-roundtrip",
+  "typeerror-on-non-string",
+  "unicode-flag-compat",
+]
+source_files = [
+  "corpus/projects/escape-string-regexp/index.js",
+]
