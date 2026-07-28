@@ -250,8 +250,7 @@ pub struct RuleDefinition {
 
 impl RuleDefinition {
     const fn new(
-        code: &'static str,
-        slug: &'static str,
+        id: RuleId,
         group: RuleGroup,
         default_level: LintLevel,
         rationale: &'static str,
@@ -260,7 +259,7 @@ impl RuleDefinition {
         examples: RuleExamples,
     ) -> Self {
         Self {
-            id: RuleId { code, slug },
+            id,
             group,
             default_level,
             rationale,
@@ -340,8 +339,10 @@ macro_rules! examples {
 macro_rules! rule {
     ($code:literal, $slug:literal, $group:ident, $level:ident, $rationale:literal, $alternative:literal, $examples:expr) => {
         RuleDefinition::new(
-            $code,
-            $slug,
+            RuleId {
+                code: $code,
+                slug: $slug,
+            },
             RuleGroup::$group,
             LintLevel::$level,
             $rationale,

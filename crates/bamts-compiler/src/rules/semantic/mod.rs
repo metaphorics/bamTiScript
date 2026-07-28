@@ -797,10 +797,9 @@ pub(crate) fn collect_program_facts(
         if from_text.contains("export ")
             && from_text.contains(" = ")
             && from_text.contains("import ")
+            && let Some(index) = from_text.find("export ")
         {
-            if let Some(index) = from_text.find("export ") {
-                additions.push((SemanticHazard::DeclarationInferenceDependency, index, 6));
-            }
+            additions.push((SemanticHazard::DeclarationInferenceDependency, index, 6));
         }
         if let Some(model) = models.get_mut(&edge.from) {
             let mut facts = model.facts().clone();
