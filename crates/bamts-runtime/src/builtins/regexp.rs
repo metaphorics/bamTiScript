@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
+use bamts_bytecode::EcmaString;
 use bamts_native::Value;
 
 use super::{
@@ -82,10 +83,13 @@ fn constructor<H: Host>(
             "flags",
             allocate_string(
                 machine,
-                Regex::compile(&pattern, &flags)
-                    .expect("validated")
-                    .flags()
-                    .canonical(),
+                Regex::compile(
+                    &EcmaString::from_utf8(&pattern),
+                    &EcmaString::from_utf8(&flags),
+                )
+                .expect("validated")
+                .flags()
+                .canonical(),
             )?,
             false,
         ),
@@ -117,7 +121,11 @@ pub(super) fn compile<H: Host>(
     pattern: &str,
     flags: &str,
 ) -> Result<Regex, EvalFailure> {
-    Regex::compile(pattern, flags).map_err(|error| {
+    Regex::compile(
+        &EcmaString::from_utf8(pattern),
+        &EcmaString::from_utf8(flags),
+    )
+    .map_err(|error| {
         let id = machine
             .intrinsics
             .builtins
@@ -141,7 +149,7 @@ pub(super) fn regexp_parts<H: Host>(
 pub(super) fn execute<H: Host>(
     machine: &mut Machine<'_, H>,
     regexp: Value,
-    input: &str,
+    input: &EcmaString,
 ) -> Result<Option<Match>, EvalFailure> {
     let (pattern, flags) = regexp_parts(machine, regexp)
         .ok_or_else(|| type_error("RegExp method called on incompatible receiver"))?;
@@ -166,7 +174,9 @@ fn exec<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let input = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let input = EcmaString::from_utf8(
+        &machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?,
+    );
     let Some(matched) = execute(machine, this, &input)? else {
         return Ok(BuiltinOutcome::Value(Value::NULL));
     };
@@ -181,7 +191,9 @@ fn test<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let input = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let input = EcmaString::from_utf8(
+        &machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?,
+    );
     Ok(BuiltinOutcome::Value(Value::boolean(
         execute(machine, this, &input)?.is_some(),
     )))
@@ -203,13 +215,15 @@ fn to_string<H: Host>(
 
 pub(super) fn match_array<H: Host>(
     machine: &mut Machine<'_, H>,
-    input: &str,
+    input: &EcmaString,
     matched: Match,
 ) -> Result<Value, EvalFailure> {
     let mut values = Vec::with_capacity(matched.captures.len());
     for capture in &matched.captures {
         values.push(match capture {
-            Some(range) => allocate_string(machine, slice_chars(input, range.clone()))?,
+            Some(range) => {
+                allocate_string(machine, slice_units(input, range.clone()).to_utf8_lossy())?
+            }
             None => Value::UNDEFINED,
         });
     }
@@ -219,7 +233,7 @@ pub(super) fn match_array<H: Host>(
         "index",
         crate::number_value(matched.range.start as f64),
     )?;
-    let input_value = allocate_string(machine, input.to_owned())?;
+    let input_value = allocate_string(machine, input.to_utf8_lossy())?;
     machine.set_data_property(array, "input", input_value)?;
     if matched.named.is_empty() {
         machine.set_data_property(array, "groups", Value::UNDEFINED)?;
@@ -234,7 +248,7 @@ pub(super) fn match_array<H: Host>(
             .map_err(EvalFailure::Runtime)?;
         for (name, range) in matched.named {
             let value = match range {
-                Some(range) => allocate_string(machine, slice_chars(input, range))?,
+                Some(range) => allocate_string(machine, slice_units(input, range).to_utf8_lossy())?,
                 None => Value::UNDEFINED,
             };
             machine.set_data_property(groups, &name, value)?;
@@ -244,12 +258,8 @@ pub(super) fn match_array<H: Host>(
     Ok(array)
 }
 
-pub(super) fn slice_chars(input: &str, range: Range<usize>) -> String {
-    input
-        .chars()
-        .skip(range.start)
-        .take(range.end - range.start)
-        .collect()
+pub(super) fn slice_units(input: &EcmaString, range: Range<usize>) -> EcmaString {
+    input.slice_units(range)
 }
 fn index_value(value: Value) -> usize {
     match value.decode() {
@@ -258,5 +268,108 @@ fn index_value(value: Value) -> usize {
             value as usize
         }
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bamts_bytecode::{
+        Constant, ConstantId, Function, FunctionFlags, FunctionId, Instruction, Module, ModuleId,
+        Program, ProgramModule, Verified,
+    };
+
+    use super::*;
+    use crate::Limits;
+
+    #[derive(Default)]
+    struct TestHost;
+    impl Host for TestHost {}
+
+    fn module() -> Program<Verified> {
+        let code = Module::new(
+            vec![Constant::String("<test>".to_owned())],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                1,
+                FunctionFlags::default(),
+                vec![Instruction::Halt],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("valid test module");
+        Program::link(
+            vec![ProgramModule {
+                name: ConstantId::new(0),
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect("valid test program")
+    }
+
+    fn construct_regexp(machine: &mut Machine<'_, TestHost>, pattern: &str, flags: &str) -> Value {
+        let constructor = machine.intrinsics.global("RegExp").expect("RegExp exists");
+        let pattern = machine
+            .allocate(HeapEntry::String(pattern.to_owned()))
+            .unwrap();
+        let flags = machine
+            .allocate(HeapEntry::String(flags.to_owned()))
+            .unwrap();
+        let index = machine.runtime_slot(constructor).unwrap().unwrap();
+        let HeapEntry::NativeFunction { id, .. } = machine.heap[index] else {
+            panic!("RegExp constructor is native")
+        };
+        let BuiltinOutcome::Value(value) = machine
+            .call_builtin(id, Value::UNDEFINED, &[pattern, flags], true)
+            .unwrap()
+        else {
+            panic!("RegExp constructor returns a value")
+        };
+        value
+    }
+
+    #[test]
+    fn sticky_last_index_is_a_utf16_code_unit_offset() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let regexp = construct_regexp(&mut machine, "x", "y");
+        machine
+            .set_data_property(regexp, "lastIndex", Value::int32(2))
+            .unwrap();
+
+        let matched = execute(&mut machine, regexp, &EcmaString::from_utf8("😀x"))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(matched.range, 2..3);
+        assert_eq!(
+            machine.get_named_property(regexp, "lastIndex").unwrap(),
+            Value::int32(3)
+        );
+    }
+
+    #[test]
+    fn exec_index_after_astral_prefix_is_a_code_unit_offset() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let regexp = construct_regexp(&mut machine, "x", "");
+        let input = EcmaString::from_utf8("😀x");
+        let matched = execute(&mut machine, regexp, &input).unwrap().unwrap();
+
+        let result = match_array(&mut machine, &input, matched).unwrap();
+
+        assert_eq!(
+            machine.get_named_property(result, "index").unwrap(),
+            Value::int32(2)
+        );
     }
 }

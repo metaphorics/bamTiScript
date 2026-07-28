@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
 use super::{
@@ -700,7 +701,8 @@ fn string_match<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let input = text(machine, this)?;
+    let input_text = text(machine, this)?;
+    let input = EcmaString::from_utf8(&input_text);
     let argument = args.first().copied().unwrap_or(Value::UNDEFINED);
     let (regex, object) = regexp_for_argument(machine, argument)?;
     if !regex.flags().global {
@@ -726,7 +728,7 @@ fn string_match<H: Host>(
     for matched in matches {
         values.push(allocate_string(
             machine,
-            super::regexp::slice_chars(&input, matched.range),
+            super::regexp::slice_units(&input, matched.range).to_utf8_lossy(),
         )?);
     }
     Ok(BuiltinOutcome::Value(allocate_array(machine, values)?))
@@ -738,7 +740,8 @@ fn match_all<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let input = text(machine, this)?;
+    let input_text = text(machine, this)?;
+    let input = EcmaString::from_utf8(&input_text);
     let argument = args.first().copied().unwrap_or(Value::UNDEFINED);
     let (regex, object) = regexp_for_argument(machine, argument)?;
     if object.is_some() && !regex.flags().global {
@@ -762,7 +765,8 @@ fn search<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let input = text(machine, this)?;
+    let input_text = text(machine, this)?;
+    let input = EcmaString::from_utf8(&input_text);
     let argument = args.first().copied().unwrap_or(Value::UNDEFINED);
     let (regex, _) = regexp_for_argument(machine, argument)?;
     Ok(BuiltinOutcome::Value(crate::number_value(
@@ -774,19 +778,25 @@ fn search<H: Host>(
 
 fn collect_matches(
     regex: &crate::intrinsics::regexp::Regex,
-    input: &str,
+    input: &EcmaString,
 ) -> Vec<crate::intrinsics::regexp::Match> {
     let mut matches = Vec::new();
     let mut start = 0;
-    let length = input.chars().count();
+    let length = input.len_units();
     while start <= length {
         let Some(matched) = regex.exec(input, start) else {
             break;
         };
-        let next = if matched.range.end == matched.range.start {
-            matched.range.end + 1
-        } else {
+        let next = if matched.range.end == matched.range.start && matched.range.end < length {
             matched.range.end
+                + crate::intrinsics::regexp::next_code_point(
+                    input.as_units(),
+                    matched.range.end,
+                    regex.flags().unicode,
+                )
+                .1
+        } else {
+            matched.range.end + usize::from(matched.range.end == matched.range.start)
         };
         matches.push(matched);
         if !regex.flags().global || next > length {
@@ -802,7 +812,8 @@ fn split_regexp<H: Host>(
     this: Value,
     args: &[Value],
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let input = text(machine, this)?;
+    let input_text = text(machine, this)?;
+    let input = EcmaString::from_utf8(&input_text);
     let separator = args[0];
     let (pattern, flags) =
         super::regexp::regexp_parts(machine, separator).expect("caller checked RegExp argument");
@@ -816,12 +827,12 @@ fn split_regexp<H: Host>(
     ) as u32 as usize;
     let mut pieces = Vec::new();
     let mut cursor = 0;
-    let length = input.chars().count();
+    let length = input.len_units();
     while cursor <= length && pieces.len() < limit {
         let Some(matched) = regex.exec(&input, cursor) else {
             break;
         };
-        pieces.push(super::regexp::slice_chars(
+        pieces.push(super::regexp::slice_units(
             &input,
             cursor..matched.range.start,
         ));
@@ -829,25 +840,31 @@ fn split_regexp<H: Host>(
             if pieces.len() == limit {
                 break;
             }
-            pieces.push(capture.clone().map_or(String::new(), |range| {
-                super::regexp::slice_chars(&input, range)
+            pieces.push(capture.clone().map_or_else(EcmaString::default, |range| {
+                super::regexp::slice_units(&input, range)
             }));
         }
-        cursor = if matched.range.end == matched.range.start {
-            matched.range.end + 1
-        } else {
+        cursor = if matched.range.end == matched.range.start && matched.range.end < length {
             matched.range.end
+                + crate::intrinsics::regexp::next_code_point(
+                    input.as_units(),
+                    matched.range.end,
+                    regex.flags().unicode,
+                )
+                .1
+        } else {
+            matched.range.end + usize::from(matched.range.end == matched.range.start)
         };
     }
     if pieces.len() < limit {
-        pieces.push(super::regexp::slice_chars(
+        pieces.push(super::regexp::slice_units(
             &input,
             cursor.min(length)..length,
         ));
     }
     let mut values = Vec::new();
     for piece in pieces.into_iter().take(limit) {
-        values.push(allocate_string(machine, piece)?);
+        values.push(allocate_string(machine, piece.to_utf8_lossy())?);
     }
     Ok(BuiltinOutcome::Value(allocate_array(machine, values)?))
 }
@@ -858,7 +875,8 @@ fn replace_regexp<H: Host>(
     args: &[Value],
     replace_all_call: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let input = text(machine, this)?;
+    let input_text = text(machine, this)?;
+    let input = EcmaString::from_utf8(&input_text);
     let regexp = args[0];
     let (pattern, flags) =
         super::regexp::regexp_parts(machine, regexp).expect("caller checked RegExp argument");
@@ -873,59 +891,59 @@ fn replace_regexp<H: Host>(
     let mut output = String::new();
     let mut cursor = 0;
     for matched in matches {
-        output.push_str(&super::regexp::slice_chars(
-            &input,
-            cursor..matched.range.start,
-        ));
+        output.push_str(
+            &super::regexp::slice_units(&input, cursor..matched.range.start).to_utf8_lossy(),
+        );
         output.push_str(&regexp_replacement(machine, replacer, &input, &matched)?);
         cursor = matched.range.end;
         if !regex.flags().global {
             break;
         }
     }
-    output.push_str(&super::regexp::slice_chars(
-        &input,
-        cursor..input.chars().count(),
-    ));
+    output.push_str(&super::regexp::slice_units(&input, cursor..input.len_units()).to_utf8_lossy());
     Ok(BuiltinOutcome::Value(allocate_string(machine, output)?))
 }
 
 fn regexp_replacement<H: Host>(
     machine: &mut Machine<'_, H>,
     replacer: Value,
-    input: &str,
+    input: &EcmaString,
     matched: &crate::intrinsics::regexp::Match,
 ) -> Result<String, EvalFailure> {
-    let matched_text = super::regexp::slice_chars(input, matched.range.clone());
+    let matched_text = super::regexp::slice_units(input, matched.range.clone()).to_utf8_lossy();
     if machine.is_callable(replacer)? {
         let mut arguments = Vec::with_capacity(matched.captures.len() + 2);
         for capture in &matched.captures {
             arguments.push(match capture {
-                Some(range) => {
-                    allocate_string(machine, super::regexp::slice_chars(input, range.clone()))?
-                }
+                Some(range) => allocate_string(
+                    machine,
+                    super::regexp::slice_units(input, range.clone()).to_utf8_lossy(),
+                )?,
                 None => Value::UNDEFINED,
             });
         }
         arguments.push(crate::number_value(matched.range.start as f64));
-        arguments.push(allocate_string(machine, input.to_owned())?);
+        arguments.push(allocate_string(machine, input.to_utf8_lossy())?);
         return machine
             .call_value(replacer, Value::UNDEFINED, &arguments)
             .and_then(|value| machine.to_string(value));
     }
     let replacement = machine.to_string(replacer)?;
-    let before = super::regexp::slice_chars(input, 0..matched.range.start);
-    let after = super::regexp::slice_chars(input, matched.range.end..input.chars().count());
+    let before = super::regexp::slice_units(input, 0..matched.range.start).to_utf8_lossy();
+    let after =
+        super::regexp::slice_units(input, matched.range.end..input.len_units()).to_utf8_lossy();
     let mut output = String::new();
-    let chars: Vec<char> = replacement.chars().collect();
-    let mut index = 0;
-    while index < chars.len() {
-        if chars[index] != '$' || index + 1 == chars.len() {
-            output.push(chars[index]);
-            index += 1;
+    let mut chars = replacement.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '$' {
+            output.push(character);
             continue;
         }
-        match chars[index + 1] {
+        let Some(next) = chars.peek().copied() else {
+            output.push('$');
+            break;
+        };
+        match next {
             '$' => output.push('$'),
             '&' => output.push_str(&matched_text),
             '`' => output.push_str(&before),
@@ -933,7 +951,9 @@ fn regexp_replacement<H: Host>(
             digit if digit.is_ascii_digit() && digit != '0' => {
                 let capture = digit.to_digit(10).expect("digit") as usize;
                 if let Some(Some(range)) = matched.captures.get(capture) {
-                    output.push_str(&super::regexp::slice_chars(input, range.clone()));
+                    output.push_str(
+                        &super::regexp::slice_units(input, range.clone()).to_utf8_lossy(),
+                    );
                 }
             }
             other => {
@@ -941,7 +961,7 @@ fn regexp_replacement<H: Host>(
                 output.push(other);
             }
         }
-        index += 2;
+        chars.next();
     }
     Ok(output)
 }

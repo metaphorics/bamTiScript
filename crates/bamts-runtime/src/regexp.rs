@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
+use bamts_bytecode::EcmaString;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Flags {
     pub(crate) global: bool,
@@ -12,9 +14,12 @@ pub(crate) struct Flags {
 }
 
 impl Flags {
-    fn parse(text: &str) -> Result<Self, RegexError> {
+    fn parse(text: &EcmaString) -> Result<Self, RegexError> {
         let mut flags = Self::default();
-        for flag in text.chars() {
+        for unit in text.as_units() {
+            let Some(flag) = char::from_u32(u32::from(*unit)).filter(char::is_ascii) else {
+                return Err(RegexError::new("invalid regular expression flag"));
+            };
             let slot = match flag {
                 'g' => &mut flags.global,
                 'i' => &mut flags.ignore_case,
@@ -89,9 +94,9 @@ pub(crate) struct Regex {
 }
 
 impl Regex {
-    pub(crate) fn compile(pattern: &str, flags: &str) -> Result<Self, RegexError> {
+    pub(crate) fn compile(pattern: &EcmaString, flags: &EcmaString) -> Result<Self, RegexError> {
         let flags = Flags::parse(flags)?;
-        let mut parser = Parser::new(pattern);
+        let mut parser = Parser::new(pattern.as_units(), flags.unicode);
         let expression = parser.parse_disjunction(None)?;
         if parser.peek().is_some() {
             return Err(parser.error("unexpected token"));
@@ -108,21 +113,19 @@ impl Regex {
         self.flags
     }
 
-    pub(crate) fn exec(&self, input: &str, start: usize) -> Option<Match> {
-        let chars: Vec<char> = input.chars().collect();
-        let start = start.min(chars.len());
-        let positions: Box<dyn Iterator<Item = usize>> = if self.flags.sticky {
-            Box::new(std::iter::once(start))
-        } else {
-            Box::new(start..=chars.len())
-        };
-        for position in positions {
+    pub(crate) fn exec(&self, input: &EcmaString, start: usize) -> Option<Match> {
+        let input = input.as_units();
+        if start > input.len() {
+            return None;
+        }
+        let mut position = start;
+        loop {
             let state = State {
                 position,
                 captures: vec![None; self.capture_count + 1],
             };
             if let Some(mut matched) = self
-                .match_node(&self.expression, &chars, state)
+                .match_node(&self.expression, input, state)
                 .into_iter()
                 .next()
             {
@@ -138,36 +141,56 @@ impl Regex {
                     named,
                 });
             }
+            if self.flags.sticky || position == input.len() {
+                return None;
+            }
+            position += next_code_point(input, position, self.flags.unicode).1;
         }
-        None
     }
 
-    fn match_node(&self, node: &Node, input: &[char], state: State) -> Vec<State> {
+    fn match_node(&self, node: &Node, input: &[u16], state: State) -> Vec<State> {
         match node {
             Node::Sequence(nodes) => self.match_sequence(nodes, input, state),
             Node::Alternation(branches) => branches
                 .iter()
                 .flat_map(|branch| self.match_node(branch, input, state.clone()))
                 .collect(),
-            Node::Literal(expected) => input
-                .get(state.position)
-                .filter(|actual| self.char_eq(**actual, *expected))
-                .map_or_else(Vec::new, |_| vec![state.advanced(1)]),
-            Node::Dot => input
-                .get(state.position)
-                .filter(|actual| {
-                    self.flags.dot_all || !matches!(actual, '\n' | '\r' | '\u{2028}' | '\u{2029}')
-                })
-                .map_or_else(Vec::new, |_| vec![state.advanced(1)]),
-            Node::Class(class) => input
-                .get(state.position)
-                .filter(|actual| class.matches(**actual, self.flags.ignore_case))
-                .map_or_else(Vec::new, |_| vec![state.advanced(1)]),
+            Node::Literal(expected) => {
+                if state.position == input.len() {
+                    return Vec::new();
+                }
+                let (actual, width) = next_code_point(input, state.position, self.flags.unicode);
+                self.code_point_eq(actual, *expected)
+                    .then(|| state.advanced(width))
+                    .into_iter()
+                    .collect()
+            }
+            Node::Dot => {
+                if state.position == input.len() {
+                    return Vec::new();
+                }
+                let (actual, width) = next_code_point(input, state.position, self.flags.unicode);
+                (self.flags.dot_all || !is_line_terminator(actual))
+                    .then(|| state.advanced(width))
+                    .into_iter()
+                    .collect()
+            }
+            Node::Class(class) => {
+                if state.position == input.len() {
+                    return Vec::new();
+                }
+                let (actual, width) = next_code_point(input, state.position, self.flags.unicode);
+                class
+                    .matches(actual, self.flags.ignore_case)
+                    .then(|| state.advanced(width))
+                    .into_iter()
+                    .collect()
+            }
             Node::Start => {
                 let at_start = state.position == 0
                     || (self.flags.multiline
                         && state.position > 0
-                        && is_line_terminator(input[state.position - 1]));
+                        && is_line_terminator(u32::from(input[state.position - 1])));
                 at_start.then_some(state).into_iter().collect()
             }
             Node::End => {
@@ -175,7 +198,7 @@ impl Regex {
                     || (self.flags.multiline
                         && input
                             .get(state.position)
-                            .is_some_and(|value| is_line_terminator(*value)));
+                            .is_some_and(|value| is_line_terminator(u32::from(*value))));
                 at_end.then_some(state).into_iter().collect()
             }
             Node::WordBoundary(positive) => {
@@ -183,8 +206,10 @@ impl Regex {
                     .position
                     .checked_sub(1)
                     .and_then(|index| input.get(index))
-                    .is_some_and(|c| is_word(*c));
-                let right = input.get(state.position).is_some_and(|c| is_word(*c));
+                    .is_some_and(|unit| is_word(u32::from(*unit)));
+                let right = input
+                    .get(state.position)
+                    .is_some_and(|unit| is_word(u32::from(*unit)));
                 ((left != right) == *positive)
                     .then_some(state)
                     .into_iter()
@@ -206,15 +231,7 @@ impl Regex {
                 let Some(range) = state.captures.get(*index).and_then(Clone::clone) else {
                     return vec![state];
                 };
-                let count = range.end - range.start;
-                if state.position + count > input.len() {
-                    return Vec::new();
-                }
-                let matches = input[range]
-                    .iter()
-                    .zip(&input[state.position..state.position + count])
-                    .all(|(left, right)| self.char_eq(*left, *right));
-                matches.then(|| state.advanced(count)).into_iter().collect()
+                self.match_backreference(input, range, state)
             }
             Node::NamedBackReference(name) => self.names.get(name).map_or_else(Vec::new, |index| {
                 self.match_node(&Node::BackReference(*index), input, state)
@@ -225,14 +242,25 @@ impl Regex {
                 positive,
             } => {
                 let candidates = if *behind {
-                    (0..=state.position)
-                        .flat_map(|begin| {
-                            let mut initial = state.clone();
-                            initial.position = begin;
+                    let mut candidates = Vec::new();
+                    let mut begin = 0;
+                    loop {
+                        let mut initial = state.clone();
+                        initial.position = begin;
+                        candidates.extend(
                             self.match_node(body, input, initial)
-                        })
-                        .filter(|matched| matched.position == state.position)
-                        .collect::<Vec<_>>()
+                                .into_iter()
+                                .filter(|matched| matched.position == state.position),
+                        );
+                        if begin == state.position {
+                            break;
+                        }
+                        begin += next_code_point(input, begin, self.flags.unicode).1;
+                        if begin > state.position {
+                            break;
+                        }
+                    }
+                    candidates
                 } else {
                     self.match_node(body, input, state.clone())
                 };
@@ -254,7 +282,26 @@ impl Regex {
         }
     }
 
-    fn match_sequence(&self, nodes: &[Node], input: &[char], state: State) -> Vec<State> {
+    fn match_backreference(&self, input: &[u16], range: Range<usize>, state: State) -> Vec<State> {
+        let mut captured = range.start;
+        let mut candidate = state.position;
+        while captured < range.end {
+            if candidate >= input.len() {
+                return Vec::new();
+            }
+            let (left, left_width) = next_code_point(input, captured, self.flags.unicode);
+            let (right, right_width) = next_code_point(input, candidate, self.flags.unicode);
+            if captured + left_width > range.end || !self.code_point_eq(left, right) {
+                return Vec::new();
+            }
+            captured += left_width;
+            candidate += right_width;
+        }
+        let width = candidate - state.position;
+        vec![state.advanced(width)]
+    }
+
+    fn match_sequence(&self, nodes: &[Node], input: &[u16], state: State) -> Vec<State> {
         let Some((first, rest)) = nodes.split_first() else {
             return vec![state];
         };
@@ -302,9 +349,22 @@ impl Regex {
         }
     }
 
-    fn char_eq(&self, left: char, right: char) -> bool {
+    fn code_point_eq(&self, left: u32, right: u32) -> bool {
         left == right || (self.flags.ignore_case && fold(left) == fold(right))
     }
+}
+
+pub(crate) fn next_code_point(input: &[u16], position: usize, unicode: bool) -> (u32, usize) {
+    let first = input[position];
+    if unicode && (0xd800..=0xdbff).contains(&first) {
+        if let Some(second @ 0xdc00..=0xdfff) = input.get(position + 1).copied() {
+            return (
+                0x1_0000 + ((u32::from(first) - 0xd800) << 10) + (u32::from(second) - 0xdc00),
+                2,
+            );
+        }
+    }
+    (u32::from(first), 1)
 }
 
 #[derive(Clone, Debug)]
@@ -324,7 +384,7 @@ impl State {
 enum Node {
     Sequence(Vec<Node>),
     Alternation(Vec<Node>),
-    Literal(char),
+    Literal(u32),
     Dot,
     Class(CharacterClass),
     Start,
@@ -356,7 +416,7 @@ struct CharacterClass {
 }
 
 impl CharacterClass {
-    fn matches(&self, value: char, ignore_case: bool) -> bool {
+    fn matches(&self, value: u32, ignore_case: bool) -> bool {
         let matched = self
             .items
             .iter()
@@ -367,8 +427,8 @@ impl CharacterClass {
 
 #[derive(Clone, Debug)]
 enum ClassItem {
-    Character(char),
-    Range(char, char),
+    Character(u32),
+    Range(u32, u32),
     Digit,
     NotDigit,
     Word,
@@ -378,7 +438,7 @@ enum ClassItem {
 }
 
 impl ClassItem {
-    fn matches(&self, value: char, ignore_case: bool) -> bool {
+    fn matches(&self, value: u32, ignore_case: bool) -> bool {
         match self {
             Self::Character(expected) => {
                 value == *expected || (ignore_case && fold(value) == fold(*expected))
@@ -389,50 +449,58 @@ impl ClassItem {
                 let end = if ignore_case { fold(*end) } else { *end };
                 (start..=end).contains(&candidate)
             }
-            Self::Digit => value.is_ascii_digit(),
-            Self::NotDigit => !value.is_ascii_digit(),
+            Self::Digit => value <= 0x7f && (value as u8).is_ascii_digit(),
+            Self::NotDigit => !(value <= 0x7f && (value as u8).is_ascii_digit()),
             Self::Word => is_word(value),
             Self::NotWord => !is_word(value),
-            Self::Space => value.is_whitespace() || value == '\u{feff}',
-            Self::NotSpace => !(value.is_whitespace() || value == '\u{feff}'),
+            Self::Space => {
+                char::from_u32(value).is_some_and(char::is_whitespace) || value == 0xfeff
+            }
+            Self::NotSpace => {
+                !(char::from_u32(value).is_some_and(char::is_whitespace) || value == 0xfeff)
+            }
         }
     }
 }
 
-fn fold(value: char) -> char {
-    value.to_lowercase().next().unwrap_or(value)
+fn fold(value: u32) -> u32 {
+    char::from_u32(value)
+        .and_then(|value| value.to_lowercase().next())
+        .map_or(value, u32::from)
 }
 
-fn is_word(value: char) -> bool {
-    value.is_ascii_alphanumeric() || value == '_'
+fn is_word(value: u32) -> bool {
+    value <= 0x7f && ((value as u8).is_ascii_alphanumeric() || value == u32::from(b'_'))
 }
 
-fn is_line_terminator(value: char) -> bool {
-    matches!(value, '\n' | '\r' | '\u{2028}' | '\u{2029}')
+fn is_line_terminator(value: u32) -> bool {
+    matches!(value, 0x0a | 0x0d | 0x2028 | 0x2029)
 }
 
-struct Parser {
-    chars: Vec<char>,
+struct Parser<'a> {
+    units: &'a [u16],
     position: usize,
     capture_count: usize,
     names: BTreeMap<String, usize>,
+    unicode: bool,
 }
 
-impl Parser {
-    fn new(pattern: &str) -> Self {
+impl<'a> Parser<'a> {
+    fn new(units: &'a [u16], unicode: bool) -> Self {
         Self {
-            chars: pattern.chars().collect(),
+            units,
             position: 0,
             capture_count: 0,
             names: BTreeMap::new(),
+            unicode,
         }
     }
 
-    fn parse_disjunction(&mut self, terminator: Option<char>) -> Result<Node, RegexError> {
+    fn parse_disjunction(&mut self, terminator: Option<u16>) -> Result<Node, RegexError> {
         let mut branches = Vec::new();
         loop {
             branches.push(Node::Sequence(self.parse_sequence(terminator)?));
-            if self.peek() != Some('|') {
+            if self.peek() != Some(u16::from(b'|')) {
                 break;
             }
             self.position += 1;
@@ -444,10 +512,10 @@ impl Parser {
         }
     }
 
-    fn parse_sequence(&mut self, terminator: Option<char>) -> Result<Vec<Node>, RegexError> {
+    fn parse_sequence(&mut self, terminator: Option<u16>) -> Result<Vec<Node>, RegexError> {
         let mut nodes = Vec::new();
         while let Some(token) = self.peek() {
-            if Some(token) == terminator || token == '|' {
+            if Some(token) == terminator || token == u16::from(b'|') {
                 break;
             }
             let atom = self.parse_atom()?;
@@ -461,38 +529,43 @@ impl Parser {
             .next()
             .ok_or_else(|| self.error("expected regular expression atom"))?;
         match token {
-            '.' => Ok(Node::Dot),
-            '^' => Ok(Node::Start),
-            '$' => Ok(Node::End),
-            '[' => self.parse_class().map(Node::Class),
-            '(' => self.parse_group(),
-            '\\' => self.parse_escape(false),
-            ')' => Err(self.error("unmatched ')'")),
-            '*' | '+' | '?' => Err(self.error("nothing to repeat")),
-            value => Ok(Node::Literal(value)),
+            0x2e => Ok(Node::Dot),
+            0x5e => Ok(Node::Start),
+            0x24 => Ok(Node::End),
+            0x5b => self.parse_class().map(Node::Class),
+            0x28 => self.parse_group(),
+            0x5c => self.parse_escape(false),
+            0x29 => Err(self.error("unmatched ')'")),
+            0x2a | 0x2b | 0x3f => Err(self.error("nothing to repeat")),
+            _ => {
+                let start = self.position - 1;
+                let (value, width) = next_code_point(self.units, start, self.unicode);
+                self.position = start + width;
+                Ok(Node::Literal(value))
+            }
         }
     }
 
     fn parse_group(&mut self) -> Result<Node, RegexError> {
         let mut index = None;
         let mut look = None;
-        if self.peek() == Some('?') {
+        if self.peek() == Some(u16::from(b'?')) {
             self.position += 1;
             match self.next() {
-                Some(':') => {}
-                Some('=') => look = Some((false, true)),
-                Some('!') => look = Some((false, false)),
-                Some('<') => match self.peek() {
-                    Some('=') => {
+                Some(0x3a) => {}
+                Some(0x3d) => look = Some((false, true)),
+                Some(0x21) => look = Some((false, false)),
+                Some(0x3c) => match self.peek() {
+                    Some(0x3d) => {
                         self.position += 1;
                         look = Some((true, true));
                     }
-                    Some('!') => {
+                    Some(0x21) => {
                         self.position += 1;
                         look = Some((true, false));
                     }
                     _ => {
-                        let name = self.take_until('>')?;
+                        let name = self.take_until(0x3e)?;
                         if name.is_empty() || self.names.contains_key(&name) {
                             return Err(self.error("invalid duplicate capture group name"));
                         }
@@ -507,8 +580,8 @@ impl Parser {
             self.capture_count += 1;
             index = Some(self.capture_count);
         }
-        let body = self.parse_disjunction(Some(')'))?;
-        if self.next() != Some(')') {
+        let body = self.parse_disjunction(Some(0x29))?;
+        if self.next() != Some(0x29) {
             return Err(self.error("unterminated group"));
         }
         Ok(if let Some((behind, positive)) = look {
@@ -526,7 +599,7 @@ impl Parser {
     }
 
     fn parse_class(&mut self) -> Result<CharacterClass, RegexError> {
-        let negated = if self.peek() == Some('^') {
+        let negated = if self.peek() == Some(0x5e) {
             self.position += 1;
             true
         } else {
@@ -535,18 +608,18 @@ impl Parser {
         let mut items = Vec::new();
         let mut first = true;
         while let Some(token) = self.peek() {
-            if token == ']' && !first {
+            if token == 0x5d && !first {
                 self.position += 1;
                 return Ok(CharacterClass { negated, items });
             }
             first = false;
             let left = self.parse_class_item()?;
-            if self.peek() == Some('-') && self.chars.get(self.position + 1) != Some(&']') {
+            if self.peek() == Some(0x2d) && self.units.get(self.position + 1) != Some(&0x5d) {
                 self.position += 1;
                 let right = self.parse_class_item()?;
                 match (left, right) {
                     (ClassItem::Character(start), ClassItem::Character(end)) if start <= end => {
-                        items.push(ClassItem::Range(start, end))
+                        items.push(ClassItem::Range(start, end));
                     }
                     _ => return Err(self.error("invalid character class range")),
                 }
@@ -561,17 +634,20 @@ impl Parser {
         let token = self
             .next()
             .ok_or_else(|| self.error("unterminated character class"))?;
-        if token != '\\' {
-            return Ok(ClassItem::Character(token));
+        if token != 0x5c {
+            let start = self.position - 1;
+            let (value, width) = next_code_point(self.units, start, self.unicode);
+            self.position = start + width;
+            return Ok(ClassItem::Character(value));
         }
         let escaped = self.next().ok_or_else(|| self.error("trailing escape"))?;
         match escaped {
-            'd' => Ok(ClassItem::Digit),
-            'D' => Ok(ClassItem::NotDigit),
-            'w' => Ok(ClassItem::Word),
-            'W' => Ok(ClassItem::NotWord),
-            's' => Ok(ClassItem::Space),
-            'S' => Ok(ClassItem::NotSpace),
+            0x64 => Ok(ClassItem::Digit),
+            0x44 => Ok(ClassItem::NotDigit),
+            0x77 => Ok(ClassItem::Word),
+            0x57 => Ok(ClassItem::NotWord),
+            0x73 => Ok(ClassItem::Space),
+            0x53 => Ok(ClassItem::NotSpace),
             _ => self.escape_character(escaped).map(ClassItem::Character),
         }
     }
@@ -579,38 +655,22 @@ impl Parser {
     fn parse_escape(&mut self, _in_class: bool) -> Result<Node, RegexError> {
         let escaped = self.next().ok_or_else(|| self.error("trailing escape"))?;
         match escaped {
-            'd' => Ok(Node::Class(CharacterClass {
-                negated: false,
-                items: vec![ClassItem::Digit],
-            })),
-            'D' => Ok(Node::Class(CharacterClass {
-                negated: false,
-                items: vec![ClassItem::NotDigit],
-            })),
-            'w' => Ok(Node::Class(CharacterClass {
-                negated: false,
-                items: vec![ClassItem::Word],
-            })),
-            'W' => Ok(Node::Class(CharacterClass {
-                negated: false,
-                items: vec![ClassItem::NotWord],
-            })),
-            's' => Ok(Node::Class(CharacterClass {
-                negated: false,
-                items: vec![ClassItem::Space],
-            })),
-            'S' => Ok(Node::Class(CharacterClass {
-                negated: false,
-                items: vec![ClassItem::NotSpace],
-            })),
-            'b' => Ok(Node::WordBoundary(true)),
-            'B' => Ok(Node::WordBoundary(false)),
-            'k' if self.next() == Some('<') => Ok(Node::NamedBackReference(self.take_until('>')?)),
-            value if value.is_ascii_digit() && value != '0' => {
-                let mut number = value.to_digit(10).expect("digit") as usize;
-                while let Some(digit) = self.peek().and_then(|next| next.to_digit(10)) {
+            0x64 => Ok(class_node(ClassItem::Digit)),
+            0x44 => Ok(class_node(ClassItem::NotDigit)),
+            0x77 => Ok(class_node(ClassItem::Word)),
+            0x57 => Ok(class_node(ClassItem::NotWord)),
+            0x73 => Ok(class_node(ClassItem::Space)),
+            0x53 => Ok(class_node(ClassItem::NotSpace)),
+            0x62 => Ok(Node::WordBoundary(true)),
+            0x42 => Ok(Node::WordBoundary(false)),
+            0x6b if self.next() == Some(0x3c) => {
+                Ok(Node::NamedBackReference(self.take_until(0x3e)?))
+            }
+            value if value <= 0x7f && (value as u8).is_ascii_digit() && value != 0x30 => {
+                let mut number = (value - 0x30) as usize;
+                while let Some(digit) = self.peek().and_then(decimal_digit) {
                     self.position += 1;
-                    number = number * 10 + digit as usize;
+                    number = number * 10 + digit;
                 }
                 Ok(Node::BackReference(number))
             }
@@ -618,40 +678,55 @@ impl Parser {
         }
     }
 
-    fn escape_character(&mut self, escaped: char) -> Result<char, RegexError> {
+    fn escape_character(&mut self, escaped: u16) -> Result<u32, RegexError> {
         match escaped {
-            'n' => Ok('\n'),
-            'r' => Ok('\r'),
-            't' => Ok('\t'),
-            'f' => Ok('\u{c}'),
-            'v' => Ok('\u{b}'),
-            '0' => Ok('\0'),
-            'x' => self.hex_escape(2),
-            'u' if self.peek() == Some('{') => {
+            0x6e => Ok(0x0a),
+            0x72 => Ok(0x0d),
+            0x74 => Ok(0x09),
+            0x66 => Ok(0x0c),
+            0x76 => Ok(0x0b),
+            0x30 => Ok(0),
+            0x78 => self.hex_escape(2),
+            0x75 if self.peek() == Some(0x7b) => {
                 self.position += 1;
-                let digits = self.take_until('}')?;
+                let digits = self.take_until(0x7d)?;
                 u32::from_str_radix(&digits, 16)
                     .ok()
-                    .and_then(char::from_u32)
+                    .filter(|value| *value <= 0x10ffff && !(0xd800..=0xdfff).contains(value))
                     .ok_or_else(|| self.error("invalid Unicode escape"))
             }
-            'u' => self.hex_escape(4),
-            value => Ok(value),
+            0x75 => {
+                let first = self.hex_escape(4)?;
+                if self.unicode && (0xd800..=0xdbff).contains(&first) {
+                    let checkpoint = self.position;
+                    if self.next() == Some(0x5c) && self.next() == Some(0x75) {
+                        if let Ok(second) = self.hex_escape(4) {
+                            if (0xdc00..=0xdfff).contains(&second) {
+                                return Ok(combine_surrogates(first as u16, second as u16));
+                            }
+                        }
+                    }
+                    self.position = checkpoint;
+                }
+                Ok(first)
+            }
+            value => Ok(u32::from(value)),
         }
     }
 
-    fn hex_escape(&mut self, count: usize) -> Result<char, RegexError> {
-        if self.position + count > self.chars.len() {
+    fn hex_escape(&mut self, count: usize) -> Result<u32, RegexError> {
+        if self.position + count > self.units.len() {
             return Err(self.error("invalid hexadecimal escape"));
         }
-        let digits: String = self.chars[self.position..self.position + count]
-            .iter()
-            .collect();
+        let mut value = 0u32;
+        for unit in &self.units[self.position..self.position + count] {
+            let Some(digit) = hex_digit(*unit) else {
+                return Err(self.error("invalid hexadecimal escape"));
+            };
+            value = value * 16 + digit;
+        }
         self.position += count;
-        u32::from_str_radix(&digits, 16)
-            .ok()
-            .and_then(char::from_u32)
-            .ok_or_else(|| self.error("invalid hexadecimal escape"))
+        Ok(value)
     }
 
     fn parse_quantifier(&mut self, atom: Node) -> Result<Node, RegexError> {
@@ -659,19 +734,19 @@ impl Parser {
             return Ok(atom);
         };
         let (min, max) = match token {
-            '*' => {
+            0x2a => {
                 self.position += 1;
                 (0, None)
             }
-            '+' => {
+            0x2b => {
                 self.position += 1;
                 (1, None)
             }
-            '?' => {
+            0x3f => {
                 self.position += 1;
                 (0, Some(1))
             }
-            '{' => {
+            0x7b => {
                 let checkpoint = self.position;
                 self.position += 1;
                 let Some(minimum) = self.parse_decimal() else {
@@ -679,10 +754,10 @@ impl Parser {
                     return Ok(atom);
                 };
                 match self.next() {
-                    Some('}') => (minimum, Some(minimum)),
-                    Some(',') => {
+                    Some(0x7d) => (minimum, Some(minimum)),
+                    Some(0x2c) => {
                         let maximum = self.parse_decimal();
-                        if self.next() != Some('}') {
+                        if self.next() != Some(0x7d) {
                             return Err(self.error("invalid quantifier"));
                         }
                         if maximum.is_some_and(|value| value < minimum) {
@@ -695,7 +770,7 @@ impl Parser {
             }
             _ => return Ok(atom),
         };
-        let greedy = if self.peek() == Some('?') {
+        let greedy = if self.peek() == Some(0x3f) {
             self.position += 1;
             false
         } else {
@@ -712,67 +787,97 @@ impl Parser {
     fn parse_decimal(&mut self) -> Option<usize> {
         let begin = self.position;
         let mut value = 0usize;
-        while let Some(digit) = self.peek().and_then(|token| token.to_digit(10)) {
+        while let Some(digit) = self.peek().and_then(decimal_digit) {
             self.position += 1;
-            value = value.checked_mul(10)?.checked_add(digit as usize)?;
+            value = value.checked_mul(10)?.checked_add(digit)?;
         }
         (self.position > begin).then_some(value)
     }
 
-    fn take_until(&mut self, terminator: char) -> Result<String, RegexError> {
+    fn take_until(&mut self, terminator: u16) -> Result<String, RegexError> {
         let begin = self.position;
         while self.peek().is_some_and(|token| token != terminator) {
             self.position += 1;
         }
         if self.next() != Some(terminator) {
-            return Err(self.error(format!("expected '{terminator}'")));
+            let printable = char::from_u32(u32::from(terminator)).unwrap_or('?');
+            return Err(self.error(format!("expected '{printable}'")));
         }
-        Ok(self.chars[begin..self.position - 1].iter().collect())
+        String::from_utf16(&self.units[begin..self.position - 1])
+            .map_err(|_| self.error("invalid Unicode capture name"))
     }
 
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.position).copied()
+    fn peek(&self) -> Option<u16> {
+        self.units.get(self.position).copied()
     }
-    fn next(&mut self) -> Option<char> {
+
+    fn next(&mut self) -> Option<u16> {
         let value = self.peek()?;
         self.position += 1;
         Some(value)
     }
+
     fn error(&self, message: impl Into<String>) -> RegexError {
         RegexError::new(format!("{} at position {}", message.into(), self.position))
     }
 }
 
+fn class_node(item: ClassItem) -> Node {
+    Node::Class(CharacterClass {
+        negated: false,
+        items: vec![item],
+    })
+}
+
+fn decimal_digit(unit: u16) -> Option<usize> {
+    (unit <= 0x7f)
+        .then_some(unit as u8)
+        .and_then(|byte| byte.is_ascii_digit().then_some((byte - b'0') as usize))
+}
+
+fn hex_digit(unit: u16) -> Option<u32> {
+    (unit <= 0x7f)
+        .then_some(unit as u8)
+        .and_then(|byte| (byte as char).to_digit(16))
+}
+
+fn combine_surrogates(high: u16, low: u16) -> u32 {
+    0x1_0000 + ((u32::from(high) - 0xd800) << 10) + (u32::from(low) - 0xdc00)
+}
+
 #[cfg(test)]
 mod tests {
     use super::Regex;
+    use bamts_bytecode::EcmaString;
+
+    fn text(value: &str) -> EcmaString {
+        EcmaString::from_utf8(value)
+    }
+
+    fn regex(pattern: &str, flags: &str) -> Regex {
+        Regex::compile(&text(pattern), &text(flags)).unwrap()
+    }
 
     fn ranges(pattern: &str, flags: &str, input: &str) -> Vec<Option<std::ops::Range<usize>>> {
-        Regex::compile(pattern, flags)
-            .unwrap()
-            .exec(input, 0)
+        regex(pattern, flags)
+            .exec(&text(input), 0)
             .unwrap()
             .captures
     }
 
     #[test]
     fn corpus_escape_patterns_match_byte_exact_node_results() {
-        let escaped =
-            Regex::compile(r"\\ \^ \$ \* \+ \? \. \( \) \| \{ \} \[ \] \x2d", "").unwrap();
+        let escaped = regex(r"\\ \^ \$ \* \+ \? \. \( \) \| \{ \} \[ \] \x2d", "");
         assert_eq!(
             escaped
-                .exec(r"\ ^ $ * + ? . ( ) | { } [ ] -", 0)
+                .exec(&text(r"\ ^ $ * + ? . ( ) | { } [ ] -"), 0)
                 .unwrap()
                 .range,
             0..29
         );
-        assert!(Regex::compile(r"\x2d", "u").unwrap().exec("-", 0).is_some());
+        assert_eq!(regex(r"\x2d", "u").exec(&text("-"), 0).unwrap().range, 0..1);
         assert_eq!(
-            Regex::compile(r"\\", "g")
-                .unwrap()
-                .exec(r"a\b", 0)
-                .unwrap()
-                .range,
+            regex(r"\\", "g").exec(&text(r"a\b"), 0).unwrap().range,
             1..2
         );
     }
@@ -780,72 +885,102 @@ mod tests {
     #[test]
     fn supports_corpus_glob_shapes() {
         assert!(
-            Regex::compile(r"^(?:[^/]*?)\.js$", "")
-                .unwrap()
-                .exec("a.js", 0)
+            regex(r"^(?:[^/]*?)\.js$", "")
+                .exec(&text("a.js"), 0)
                 .is_some()
         );
         assert!(
-            Regex::compile(r"^(?:.*?/)?.*?\.ts$", "")
-                .unwrap()
-                .exec("src/a/b.ts", 0)
+            regex(r"^(?:.*?)\/?\.ts$", "")
+                .exec(&text("src/a/b.ts"), 0)
                 .is_some()
         );
-        assert!(
-            Regex::compile(r"^[abc]at$", "")
-                .unwrap()
-                .exec("cat", 0)
-                .is_some()
-        );
-        assert!(
-            Regex::compile(r"^(a|b)\.js$", "")
-                .unwrap()
-                .exec("b.js", 0)
-                .is_some()
-        );
+        assert!(regex(r"[abc]at", "").exec(&text("cat"), 0).is_some());
+        assert!(regex(r"^(a|b)\.js$", "").exec(&text("b.js"), 0).is_some());
     }
 
     #[test]
     fn captures_backreferences_and_lookarounds() {
         assert_eq!(
-            ranges(r"(?<word>[a-z]+)-\k<word>", "i", "Ab-ab")[1],
+            ranges(r"(?<word>[A-z]+)-\k<word>", "i", "Ab-ab")[1],
             Some(0..2)
         );
         assert!(
-            Regex::compile(r"(?<=foo)bar(?=$)", "")
-                .unwrap()
-                .exec("foobar", 0)
+            regex(r"(?<=foo)bar(?=$)", "")
+                .exec(&text("foobar"), 0)
                 .is_some()
         );
-        assert!(
-            Regex::compile(r"foo(?!bar)", "")
-                .unwrap()
-                .exec("foobaz", 0)
-                .is_some()
-        );
+        assert!(regex(r"foo(?!bar)", "").exec(&text("foobaz"), 0).is_some());
     }
 
     #[test]
     fn lazy_and_sticky_matching() {
-        assert_eq!(
-            Regex::compile(r"a.*?b", "s")
-                .unwrap()
-                .exec("a1b2b", 0)
-                .unwrap()
-                .range,
-            0..3
-        );
-        let sticky = Regex::compile("b", "y").unwrap();
-        assert!(sticky.exec("ab", 0).is_none());
-        assert_eq!(sticky.exec("ab", 1).unwrap().range, 1..2);
+        let lazy = regex("a.*?b", "s");
+        assert_eq!(lazy.exec(&text("a1b2b"), 0).unwrap().range, 0..3);
+        let sticky = regex("b", "y");
+        assert!(sticky.exec(&text("ab"), 0).is_none());
+        assert_eq!(sticky.exec(&text("ab"), 1).unwrap().range, 1..2);
     }
 
     #[test]
     fn flags_are_canonical_like_node_24() {
+        assert_eq!(regex("", "yusmig").flags().canonical(), "gimsuy");
+        assert!(Regex::compile(&text(""), &text("gg")).is_err());
+    }
+
+    #[test]
+    fn dot_uses_code_units_without_u_and_code_points_with_u() {
+        let input = text("😀");
+        let plain = regex(".", "g");
+        assert_eq!(plain.exec(&input, 0).unwrap().range, 0..1);
+        assert_eq!(plain.exec(&input, 1).unwrap().range, 1..2);
+        assert_eq!(regex(".", "u").exec(&input, 0).unwrap().range, 0..2);
+    }
+
+    #[test]
+    fn captures_and_match_indices_are_code_unit_offsets() {
+        let matched = regex("(x)", "").exec(&text("😀x"), 0).unwrap();
+        assert_eq!(matched.range, 2..3);
+        assert_eq!(matched.captures[1], Some(2..3));
+    }
+
+    #[test]
+    fn unicode_classes_support_supplementary_ranges() {
+        let matched = regex(r"[\u{1F600}-\u{1F64F}]", "u")
+            .exec(&text("😀"), 0)
+            .unwrap();
+        assert_eq!(matched.range, 0..2);
+    }
+
+    #[test]
+    fn lone_surrogates_remain_exact_units() {
+        let input = EcmaString::from_units(&[0xd800]);
+        let pattern = EcmaString::from_units(&[0xd800]);
+        let matched = Regex::compile(&pattern, &text(""))
+            .unwrap()
+            .exec(&input, 0)
+            .unwrap();
+        assert_eq!(matched.range, 0..1);
+        assert_eq!(input.as_units(), &[0xd800]);
+    }
+
+    #[test]
+    fn sticky_offsets_are_code_units() {
+        let sticky = regex("x", "y");
+        let input = text("😀x");
+        assert!(sticky.exec(&input, 1).is_none());
+        assert_eq!(sticky.exec(&input, 2).unwrap().range, 2..3);
+    }
+
+    #[test]
+    fn escaped_surrogate_pairs_combine_only_in_unicode_mode() {
+        let input = text("😀");
         assert_eq!(
-            Regex::compile("", "yusmig").unwrap().flags().canonical(),
-            "gimsuy"
+            regex(r"\uD83D\uDE00", "u").exec(&input, 0).unwrap().range,
+            0..2
         );
-        assert!(Regex::compile("", "gg").is_err());
+        assert_eq!(
+            regex(r"\uD83D\uDE00", "").exec(&input, 0).unwrap().range,
+            0..2
+        );
     }
 }
