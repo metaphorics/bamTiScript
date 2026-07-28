@@ -649,6 +649,13 @@ impl<'a> NativeFrame<'a> {
         u32::from(self.frame.handle_len)
     }
 
+    /// The dense module id of the executing function.
+    #[inline]
+    #[must_use]
+    pub fn module_id(&self) -> u32 {
+        self.frame.module_id
+    }
+
     /// The current bytecode program counter / resume token.
     #[inline]
     #[must_use]
@@ -1566,15 +1573,16 @@ const _: unsafe extern "C" fn(*mut ShadowFrame, u32, u64, *mut Completion) -> u3
 /// A finalized native entry point: `extern "C" fn(frame, out) -> tag`.
 pub type NativeEntryFn = unsafe extern "C" fn(*mut ShadowFrame, *mut Completion) -> u32;
 
-/// A non-self-referential seam for invoking a compiled native entry by
-/// function id. A JIT backend implements this over its `JITModule`; a linked
-/// AOT image ([`LinkedProgram`]) implements it over its unit table. The runtime
-/// engine stores `&dyn NativeEntryTable` and routes nested `CreateClosure`
-/// re-entry through it.
+/// A non-self-referential seam for invoking a compiled native entry by its
+/// `(module_id, function_id)` identity. A JIT backend implements this over its
+/// `JITModule`; a linked AOT image ([`LinkedProgram`]) implements it over its
+/// unit table. The runtime engine stores `&dyn NativeEntryTable` and routes
+/// nested `CreateClosure` re-entry through it.
 pub trait NativeEntryTable {
-    /// Invokes the entry for `function_id`, returning its completion tag.
+    /// Invokes the entry for `(module_id, function_id)`, returning its completion tag.
     fn invoke(
         &self,
+        module_id: u32,
         function_id: u32,
         frame: &mut ShadowFrame,
         out: &mut Completion,
@@ -1612,7 +1620,7 @@ unsafe fn call_native_entry(
 /// The little-endian image magic, `b"BMTSAOT1"`.
 pub const AOT_MAGIC: u64 = u64::from_le_bytes(*b"BMTSAOT1");
 /// The supported AOT image ABI version.
-pub const AOT_ABI_VERSION: u32 = 1;
+pub const AOT_ABI_VERSION: u32 = 2;
 
 /// One compiled function in a linked AOT image.
 #[repr(C)]
@@ -1620,8 +1628,8 @@ pub const AOT_ABI_VERSION: u32 = 1;
 pub struct UnitDescriptor {
     /// The bytecode function id this entry implements.
     pub function_id: u32,
-    /// Reserved; must be zero.
-    pub reserved: u32,
+    /// The bytecode module id containing `function_id`.
+    pub module_id: u32,
     /// The finalized native entry.
     pub entry: NativeEntryFn,
 }
@@ -1645,10 +1653,10 @@ pub struct ProgramDescriptor {
     pub units: *const UnitDescriptor,
     /// The number of units.
     pub unit_count: usize,
-    /// The entry function id (must appear in `units`).
+    /// The entry function id (must appear in `units` with `entry_module`).
     pub entry_function: u32,
-    /// Reserved; must be zero.
-    pub reserved: u32,
+    /// The entry module id.
+    pub entry_module: u32,
 }
 
 /// A validated, borrow-checked view of a linked AOT image. The bytecode is
@@ -1657,16 +1665,17 @@ pub struct ProgramDescriptor {
 pub struct LinkedProgram<'a> {
     bytecode: &'a [u8],
     units: &'a [UnitDescriptor],
+    entry_module: u32,
     entry_function: u32,
 }
 
 impl<'a> LinkedProgram<'a> {
     /// Validates a program descriptor into a borrowed linked view.
     ///
-    /// Checks magic, ABI version, zeroed flags/reserved fields, non-null and
-    /// non-empty bytecode and unit tables, overflow-safe slice extents, unique
-    /// unit function ids, and that `entry_function` is present. Layout is only
-    /// defined on 64-bit targets; other widths yield
+    /// Checks magic, ABI version, zeroed flags, non-null and non-empty bytecode
+    /// and unit tables, overflow-safe slice extents, unit identities sorted and
+    /// unique by `(module_id, function_id)`, and that the tuple entry is present.
+    /// Layout is only defined on 64-bit targets; other widths yield
     /// [`AbiError::UnsupportedPointerWidth`].
     ///
     /// # Safety
@@ -1696,11 +1705,6 @@ impl<'a> LinkedProgram<'a> {
         if descriptor.flags != 0 {
             return Err(AbiError::NonZeroFlags {
                 flags: descriptor.flags,
-            });
-        }
-        if descriptor.reserved != 0 {
-            return Err(AbiError::NonZeroReserved {
-                reserved: descriptor.reserved,
             });
         }
 
@@ -1739,28 +1743,36 @@ impl<'a> LinkedProgram<'a> {
         let units = unsafe { core::slice::from_raw_parts(descriptor.units, descriptor.unit_count) };
 
         let mut entry_present = false;
-        for (index, unit) in units.iter().enumerate() {
-            if unit.reserved != 0 {
-                return Err(AbiError::NonZeroReserved {
-                    reserved: unit.reserved,
-                });
-            }
-            if unit.function_id == descriptor.entry_function {
+        let mut previous = None;
+        for unit in units {
+            let identity = (unit.module_id, unit.function_id);
+            if identity == (descriptor.entry_module, descriptor.entry_function) {
                 entry_present = true;
             }
-            // Unit counts are bounded by the bytecode's function ceiling, so a
-            // quadratic uniqueness scan stays cheap and allocation-free.
-            if units[..index]
-                .iter()
-                .any(|prior| prior.function_id == unit.function_id)
-            {
-                return Err(AbiError::DuplicateFunctionId {
-                    function_id: unit.function_id,
-                });
+            if let Some((previous_module_id, previous_function_id)) = previous {
+                match identity.cmp(&(previous_module_id, previous_function_id)) {
+                    core::cmp::Ordering::Less => {
+                        return Err(AbiError::UnsortedUnits {
+                            previous_module_id,
+                            previous_function_id,
+                            module_id: unit.module_id,
+                            function_id: unit.function_id,
+                        });
+                    }
+                    core::cmp::Ordering::Equal => {
+                        return Err(AbiError::DuplicateFunction {
+                            module_id: unit.module_id,
+                            function_id: unit.function_id,
+                        });
+                    }
+                    core::cmp::Ordering::Greater => {}
+                }
             }
+            previous = Some(identity);
         }
         if !entry_present {
             return Err(AbiError::EntryFunctionMissing {
+                module_id: descriptor.entry_module,
                 function_id: descriptor.entry_function,
             });
         }
@@ -1768,6 +1780,7 @@ impl<'a> LinkedProgram<'a> {
         Ok(LinkedProgram {
             bytecode,
             units,
+            entry_module: descriptor.entry_module,
             entry_function: descriptor.entry_function,
         })
     }
@@ -1786,6 +1799,13 @@ impl<'a> LinkedProgram<'a> {
         self.units
     }
 
+    /// The entry module id.
+    #[inline]
+    #[must_use]
+    pub fn entry_module(&self) -> u32 {
+        self.entry_module
+    }
+
     /// The entry function id.
     #[inline]
     #[must_use]
@@ -1793,25 +1813,32 @@ impl<'a> LinkedProgram<'a> {
         self.entry_function
     }
 
-    /// The unit for `function_id`, if present.
+    /// The unit for `(module_id, function_id)`, if present.
     #[must_use]
-    pub fn unit(&self, function_id: u32) -> Option<&'a UnitDescriptor> {
+    pub fn unit(&self, module_id: u32, function_id: u32) -> Option<&'a UnitDescriptor> {
         self.units
-            .iter()
-            .find(|unit| unit.function_id == function_id)
+            .binary_search_by_key(&(module_id, function_id), |unit| {
+                (unit.module_id, unit.function_id)
+            })
+            .ok()
+            .map(|index| &self.units[index])
     }
 }
 
 impl NativeEntryTable for LinkedProgram<'_> {
     fn invoke(
         &self,
+        module_id: u32,
         function_id: u32,
         frame: &mut ShadowFrame,
         out: &mut Completion,
     ) -> Result<CompletionTag, AbiError> {
         let unit = self
-            .unit(function_id)
-            .ok_or(AbiError::UnknownFunction { function_id })?;
+            .unit(module_id, function_id)
+            .ok_or(AbiError::UnknownFunction {
+                module_id,
+                function_id,
+            })?;
         // SAFETY: `unit.entry` is a finalized native entry installed by the AOT
         // image, upholding the native-entry ABI; its code stays mapped for the
         // program's lifetime.
@@ -1828,7 +1855,7 @@ const _: () = {
     assert!(size_of::<UnitDescriptor>() == 16);
     assert!(align_of::<UnitDescriptor>() == 8);
     assert!(offset_of!(UnitDescriptor, function_id) == 0);
-    assert!(offset_of!(UnitDescriptor, reserved) == 4);
+    assert!(offset_of!(UnitDescriptor, module_id) == 4);
     assert!(offset_of!(UnitDescriptor, entry) == 8);
 
     // ProgramDescriptor: 56 bytes, 8-aligned, fields at fixed offsets.
@@ -1842,7 +1869,7 @@ const _: () = {
     assert!(offset_of!(ProgramDescriptor, units) == 32);
     assert!(offset_of!(ProgramDescriptor, unit_count) == 40);
     assert!(offset_of!(ProgramDescriptor, entry_function) == 48);
-    assert!(offset_of!(ProgramDescriptor, reserved) == 52);
+    assert!(offset_of!(ProgramDescriptor, entry_module) == 52);
 };
 
 /// A typed AOT/entry-linkage failure.
@@ -1868,11 +1895,6 @@ pub enum AbiError {
         /// The observed flags.
         flags: u32,
     },
-    /// A `reserved` field was non-zero.
-    NonZeroReserved {
-        /// The observed reserved value.
-        reserved: u32,
-    },
     /// The bytecode pointer was null with a non-zero length.
     NullBytecode,
     /// The bytecode image was empty.
@@ -1883,19 +1905,36 @@ pub enum AbiError {
     EmptyUnits,
     /// A slice extent overflowed `isize::MAX`.
     LengthOverflow,
-    /// Two units shared a function id.
-    DuplicateFunctionId {
-        /// The duplicated id.
+    /// Unit identities are not sorted by `(module_id, function_id)`.
+    UnsortedUnits {
+        /// The preceding module id.
+        previous_module_id: u32,
+        /// The preceding function id.
+        previous_function_id: u32,
+        /// The out-of-order module id.
+        module_id: u32,
+        /// The out-of-order function id.
         function_id: u32,
     },
-    /// The declared entry function was absent from the unit table.
+    /// Two units shared a `(module_id, function_id)` identity.
+    DuplicateFunction {
+        /// The duplicated module id.
+        module_id: u32,
+        /// The duplicated function id.
+        function_id: u32,
+    },
+    /// The declared tuple entry was absent from the unit table.
     EntryFunctionMissing {
-        /// The missing entry id.
+        /// The missing module id.
+        module_id: u32,
+        /// The missing function id.
         function_id: u32,
     },
-    /// [`NativeEntryTable::invoke`] was asked for an unknown function id.
+    /// [`NativeEntryTable::invoke`] was asked for an unknown function identity.
     UnknownFunction {
-        /// The requested id.
+        /// The requested module id.
+        module_id: u32,
+        /// The requested function id.
         function_id: u32,
     },
 }
@@ -1915,23 +1954,41 @@ impl fmt::Display for AbiError {
             AbiError::NonZeroFlags { flags } => {
                 write!(f, "AOT image flags {flags:#x} must be zero")
             }
-            AbiError::NonZeroReserved { reserved } => {
-                write!(f, "AOT reserved field {reserved:#x} must be zero")
-            }
             AbiError::NullBytecode => f.write_str("AOT image bytecode pointer is null"),
             AbiError::EmptyBytecode => f.write_str("AOT image bytecode is empty"),
             AbiError::NullUnits => f.write_str("AOT image unit pointer is null"),
             AbiError::EmptyUnits => f.write_str("AOT image unit table is empty"),
             AbiError::LengthOverflow => f.write_str("AOT image slice extent overflows isize::MAX"),
-            AbiError::DuplicateFunctionId { function_id } => {
-                write!(f, "AOT image has duplicate function id {function_id}")
-            }
-            AbiError::EntryFunctionMissing { function_id } => {
-                write!(f, "AOT image entry function {function_id} is absent")
-            }
-            AbiError::UnknownFunction { function_id } => {
-                write!(f, "no native entry for function id {function_id}")
-            }
+            AbiError::UnsortedUnits {
+                previous_module_id,
+                previous_function_id,
+                module_id,
+                function_id,
+            } => write!(
+                f,
+                "AOT unit ({module_id}, {function_id}) follows ({previous_module_id}, {previous_function_id}) out of order"
+            ),
+            AbiError::DuplicateFunction {
+                module_id,
+                function_id,
+            } => write!(
+                f,
+                "AOT image has duplicate native function ({module_id}, {function_id})"
+            ),
+            AbiError::EntryFunctionMissing {
+                module_id,
+                function_id,
+            } => write!(
+                f,
+                "AOT image entry function ({module_id}, {function_id}) is absent"
+            ),
+            AbiError::UnknownFunction {
+                module_id,
+                function_id,
+            } => write!(
+                f,
+                "no native entry for function ({module_id}, {function_id})"
+            ),
         }
     }
 }
@@ -2166,7 +2223,7 @@ mod tests {
 
     fn frame_with(regs: &mut [Value]) -> ShadowFrame {
         let len = u16::try_from(regs.len()).expect("register count fits u16");
-        ShadowFrame::new(core::ptr::null_mut(), 0, regs.as_mut_ptr(), len)
+        ShadowFrame::new(core::ptr::null_mut(), 0, 0, regs.as_mut_ptr(), len)
     }
 
     /// A dispatcher that re-enters itself once on the outer `Call`: it fires a
@@ -2422,7 +2479,7 @@ mod tests {
     fn native_frame_new_validates_metadata() {
         let mut regs = [Value::int32(1), Value::int32(2)];
         let base = regs.as_mut_ptr();
-        let mut frame = ShadowFrame::new(core::ptr::null_mut(), 0, base, 2);
+        let mut frame = ShadowFrame::new(core::ptr::null_mut(), 0, 3, base, 2);
         // Length mismatch against the frame header.
         {
             let mut short = [Value::int32(1)];
@@ -2453,12 +2510,13 @@ mod tests {
         );
 
         let mut regs = [Value::int32(10), Value::int32(20)];
-        let mut frame = ShadowFrame::new(core::ptr::null_mut(), 7, regs.as_mut_ptr(), 2);
+        let mut frame = ShadowFrame::new(core::ptr::null_mut(), 7, 11, regs.as_mut_ptr(), 2);
         {
             // SAFETY: `frame` is a live, unaliased local and its metadata points
             // at exactly the two initialized Values in `regs` for this scope.
             let mut native = unsafe { NativeFrame::from_raw(&mut frame) }.expect("valid frame");
             assert_eq!(native.handle_len(), 2);
+            assert_eq!(native.module_id(), 11);
             assert_eq!(native.pc(), 7);
             assert_eq!(native.register(0), Value::int32(10));
             assert_eq!(native.try_register(5), None);
@@ -2473,7 +2531,7 @@ mod tests {
 
     #[test]
     fn native_frame_from_raw_rejects_handles_overlapping_header() {
-        let mut frame = ShadowFrame::new(core::ptr::null_mut(), 0, core::ptr::null_mut(), 1);
+        let mut frame = ShadowFrame::new(core::ptr::null_mut(), 0, 0, core::ptr::null_mut(), 1);
         frame.handles = core::ptr::addr_of_mut!(frame).cast::<Value>();
         // SAFETY: `frame` is live and aligned; this test intentionally supplies
         // malformed metadata to verify it is rejected before aliasing references.
@@ -2501,7 +2559,7 @@ mod tests {
     #[test]
     fn invalid_native_completion_tag_replaces_stale_output() {
         let mut regs: [Value; 0] = [];
-        let mut frame = ShadowFrame::new(core::ptr::null_mut(), 0, regs.as_mut_ptr(), 0);
+        let mut frame = ShadowFrame::new(core::ptr::null_mut(), 0, 0, regs.as_mut_ptr(), 0);
         let mut out = Completion::new(Value::int32(123));
         // SAFETY: test entry has the native ABI and frame/output are live, unique.
         let tag = unsafe { call_native_entry(entry_returns_invalid_tag, &mut frame, &mut out) };
@@ -2509,15 +2567,20 @@ mod tests {
         assert_eq!(out.value.as_int32(), Some(TRAP_INVALID_COMPLETION_TAG));
     }
 
-    fn unit(function_id: u32) -> UnitDescriptor {
+    fn unit(module_id: u32, function_id: u32) -> UnitDescriptor {
         UnitDescriptor {
             function_id,
-            reserved: 0,
+            module_id,
             entry: entry_returns_seven,
         }
     }
 
-    fn program(bytecode: &[u8], units: &[UnitDescriptor], entry: u32) -> ProgramDescriptor {
+    fn program(
+        bytecode: &[u8],
+        units: &[UnitDescriptor],
+        entry_module: u32,
+        entry_function: u32,
+    ) -> ProgramDescriptor {
         ProgramDescriptor {
             magic: AOT_MAGIC,
             abi_version: AOT_ABI_VERSION,
@@ -2526,8 +2589,8 @@ mod tests {
             bytecode_len: bytecode.len(),
             units: units.as_ptr(),
             unit_count: units.len(),
-            entry_function: entry,
-            reserved: 0,
+            entry_function,
+            entry_module,
         }
     }
 
@@ -2548,98 +2611,109 @@ mod tests {
     }
 
     #[test]
-    fn linked_program_validates_and_invokes_a_synthetic_image() {
+    fn linked_program_validates_and_invokes_tuple_identities() {
         let bytecode = [1u8, 2, 3];
-        let units = [unit(4), unit(5)];
-        let descriptor = program(&bytecode, &units, 5);
+        let units = [unit(2, 4), unit(2, 5), unit(3, 5)];
+        let descriptor = program(&bytecode, &units, 3, 5);
         let linked = linked_of(&descriptor, &bytecode, &units).expect("valid image");
         assert_eq!(linked.bytecode(), &[1, 2, 3]);
-        assert_eq!(linked.units().len(), 2);
+        assert_eq!(linked.units().len(), 3);
+        assert_eq!(linked.entry_module(), 3);
         assert_eq!(linked.entry_function(), 5);
-        assert!(linked.unit(4).is_some());
-        assert!(linked.unit(9).is_none());
+        assert!(linked.unit(2, 5).is_some());
+        assert!(linked.unit(3, 5).is_some());
+        assert!(linked.unit(3, 4).is_none());
 
         let mut regs: [Value; 0] = [];
-        let mut frame = ShadowFrame::new(core::ptr::null_mut(), 0, regs.as_mut_ptr(), 0);
+        let mut frame = ShadowFrame::new(core::ptr::null_mut(), 0, 3, regs.as_mut_ptr(), 0);
         let mut completion = Completion::new(Value::UNDEFINED);
         let tag = linked
-            .invoke(5, &mut frame, &mut completion)
+            .invoke(3, 5, &mut frame, &mut completion)
             .expect("entry present");
         assert_eq!(tag, CompletionTag::Normal);
         assert_eq!(completion.value.as_int32(), Some(7));
         assert_eq!(
-            linked.invoke(9, &mut frame, &mut completion).err(),
-            Some(AbiError::UnknownFunction { function_id: 9 })
+            linked.invoke(4, 5, &mut frame, &mut completion).err(),
+            Some(AbiError::UnknownFunction {
+                module_id: 4,
+                function_id: 5,
+            })
         );
     }
 
     #[test]
     fn linked_program_rejects_malformed_descriptors() {
         let bytecode = [1u8, 2, 3];
-        let units = [unit(5)];
+        let units = [unit(2, 5)];
 
-        let mut bad_magic = program(&bytecode, &units, 5);
+        let mut bad_magic = program(&bytecode, &units, 2, 5);
         bad_magic.magic = 0;
         assert_eq!(
             linked_of(&bad_magic, &bytecode, &units).err(),
             Some(AbiError::BadMagic { found: 0 })
         );
 
-        let mut bad_version = program(&bytecode, &units, 5);
-        bad_version.abi_version = 2;
+        let mut bad_version = program(&bytecode, &units, 2, 5);
+        bad_version.abi_version = 1;
         assert_eq!(
             linked_of(&bad_version, &bytecode, &units).err(),
-            Some(AbiError::UnsupportedAbiVersion { found: 2 })
+            Some(AbiError::UnsupportedAbiVersion { found: 1 })
         );
 
-        let mut bad_flags = program(&bytecode, &units, 5);
+        let mut bad_flags = program(&bytecode, &units, 2, 5);
         bad_flags.flags = 1;
         assert_eq!(
             linked_of(&bad_flags, &bytecode, &units).err(),
             Some(AbiError::NonZeroFlags { flags: 1 })
         );
 
-        let mut bad_reserved = program(&bytecode, &units, 5);
-        bad_reserved.reserved = 1;
-        assert_eq!(
-            linked_of(&bad_reserved, &bytecode, &units).err(),
-            Some(AbiError::NonZeroReserved { reserved: 1 })
-        );
-
-        let empty_bytecode = program(&[], &units, 5);
+        let empty_bytecode = program(&[], &units, 2, 5);
         assert_eq!(
             linked_of(&empty_bytecode, &[], &units).err(),
             Some(AbiError::EmptyBytecode)
         );
 
-        let empty_units = program(&bytecode, &[], 5);
+        let empty_units = program(&bytecode, &[], 2, 5);
         assert_eq!(
             linked_of(&empty_units, &bytecode, &[]).err(),
             Some(AbiError::EmptyUnits)
         );
+    }
 
-        let duplicate = [unit(5), unit(5)];
-        let dup_descriptor = program(&bytecode, &duplicate, 5);
+    #[test]
+    fn linked_program_rejects_unsorted_duplicate_and_missing_tuple_entries() {
+        let bytecode = [1u8, 2, 3];
+
+        let unsorted = [unit(2, 5), unit(1, 9)];
+        let unsorted_descriptor = program(&bytecode, &unsorted, 2, 5);
         assert_eq!(
-            linked_of(&dup_descriptor, &bytecode, &duplicate).err(),
-            Some(AbiError::DuplicateFunctionId { function_id: 5 })
+            linked_of(&unsorted_descriptor, &bytecode, &unsorted).err(),
+            Some(AbiError::UnsortedUnits {
+                previous_module_id: 2,
+                previous_function_id: 5,
+                module_id: 1,
+                function_id: 9,
+            })
         );
 
-        let missing_entry = program(&bytecode, &units, 6);
+        let duplicate = [unit(2, 5), unit(2, 5)];
+        let duplicate_descriptor = program(&bytecode, &duplicate, 2, 5);
+        assert_eq!(
+            linked_of(&duplicate_descriptor, &bytecode, &duplicate).err(),
+            Some(AbiError::DuplicateFunction {
+                module_id: 2,
+                function_id: 5,
+            })
+        );
+
+        let units = [unit(2, 5), unit(3, 5)];
+        let missing_entry = program(&bytecode, &units, 4, 5);
         assert_eq!(
             linked_of(&missing_entry, &bytecode, &units).err(),
-            Some(AbiError::EntryFunctionMissing { function_id: 6 })
-        );
-
-        let bad_unit = [UnitDescriptor {
-            function_id: 5,
-            reserved: 9,
-            entry: entry_returns_seven,
-        }];
-        let bad_unit_descriptor = program(&bytecode, &bad_unit, 5);
-        assert_eq!(
-            linked_of(&bad_unit_descriptor, &bytecode, &bad_unit).err(),
-            Some(AbiError::NonZeroReserved { reserved: 9 })
+            Some(AbiError::EntryFunctionMissing {
+                module_id: 4,
+                function_id: 5,
+            })
         );
     }
 
