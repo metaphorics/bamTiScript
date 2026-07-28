@@ -63,8 +63,19 @@ struct CargoResolve {
 #[derive(Debug, Deserialize)]
 struct CargoNode {
     id: String,
-    dependencies: Vec<String>,
+    deps: Vec<CargoNodeDependency>,
     features: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoNodeDependency {
+    pkg: String,
+    dep_kinds: Vec<CargoDependencyKind>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoDependencyKind {
+    kind: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -259,6 +270,8 @@ fn validate_member_manifest(expected_name: &str, manifest: &Value, path: &Path) 
         validate_codegen_features(manifest, &path.display().to_string())?;
     } else if expected_name == "bamts-cli" {
         validate_cli_features(manifest, &path.display().to_string())?;
+    } else if expected_name == "bamts-node" {
+        validate_node_features(manifest, &path.display().to_string())?;
     }
 
     Ok(())
@@ -280,23 +293,36 @@ fn validate_member_lints(name: &str, manifest: &Value, context: &str) -> Result<
     let root = root_table(manifest, context)?;
     let lints = required_table(root, "lints", context)?;
 
-    if name == "bamts-native" {
+    // `bamts-native` owns every unsafe operation; `bamts-node` owns only the
+    // edition-2024 `#[unsafe(no_mangle)]` marker on the AOT program entry. Both
+    // therefore declare their own `[lints.rust]` instead of inheriting the
+    // workspace `forbid(unsafe_code)`, and both are pinned exactly here.
+    if name == "bamts-native" || name == "bamts-node" {
         if lints.contains_key("workspace") {
             return Err(workspace_error(format!(
-                "{context}: bamts-native must not inherit workspace lints"
+                "{context}: {name} must not inherit workspace lints"
             )));
         }
         let rust = required_table(lints, "rust", context)?;
-        require_exact_string(
-            rust,
-            "unsafe_op_in_unsafe_fn",
-            "deny",
-            &format!("{context} [lints.rust]"),
-        )?;
-        if rust.contains_key("unsafe_code") {
-            return Err(workspace_error(format!(
-                "{context}: bamts-native must not override `unsafe_code`"
-            )));
+        if name == "bamts-native" {
+            require_exact_string(
+                rust,
+                "unsafe_op_in_unsafe_fn",
+                "deny",
+                &format!("{context} [lints.rust]"),
+            )?;
+            if rust.contains_key("unsafe_code") {
+                return Err(workspace_error(format!(
+                    "{context}: bamts-native must not override `unsafe_code`"
+                )));
+            }
+        } else {
+            require_exact_string(
+                rust,
+                "unsafe_code",
+                "deny",
+                &format!("{context} [lints.rust]"),
+            )?;
         }
         return Ok(());
     }
@@ -324,7 +350,7 @@ fn validate_member_lints(name: &str, manifest: &Value, context: &str) -> Result<
 fn validate_native_features(manifest: &Value, context: &str) -> Result<()> {
     let root = root_table(manifest, context)?;
     let features = required_table(root, "features", context)?;
-    let expected: BTreeSet<String> = ["default", "gc", "node-host", "jit-entry"]
+    let expected: BTreeSet<String> = ["default", "gc", "node-host", "jit-entry", "aot-image"]
         .into_iter()
         .map(str::to_owned)
         .collect();
@@ -336,9 +362,17 @@ fn validate_native_features(manifest: &Value, context: &str) -> Result<()> {
         )));
     }
 
-    for feature in ["default", "gc", "node-host", "jit-entry"] {
+    for feature in ["default", "gc", "node-host", "aot-image"] {
         require_feature_set(features, feature, &[], context)?;
     }
+    // `jit-entry` owns the JIT-only Cranelift dependencies so the AOT and
+    // interpreter closures never pull an executable-memory provider.
+    require_feature_set(
+        features,
+        "jit-entry",
+        &["dep:cranelift-jit", "dep:cranelift-module"],
+        context,
+    )?;
 
     Ok(())
 }
@@ -375,6 +409,34 @@ fn validate_codegen_features(manifest: &Value, context: &str) -> Result<()> {
         "host-jit",
         &host_jit,
         &["dep:cranelift-jit", "dep:bamts-native"],
+        context,
+    )
+}
+
+/// `bamts-node` keeps the `node-host` and `aot-image` capabilities of
+/// `bamts-native` behind its own features so a default dependency on the Node
+/// host never pulls the AOT image reader and its external descriptor symbol.
+fn validate_node_features(manifest: &Value, context: &str) -> Result<()> {
+    let root = root_table(manifest, context)?;
+    let features = required_table(root, "features", context)?;
+    let expected_keys: BTreeSet<String> = ["default", "node-host", "aot-main"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let actual_keys: BTreeSet<String> = features.keys().cloned().collect();
+    if actual_keys != expected_keys {
+        return Err(workspace_error(format!(
+            "{context}: bamts-node features differ: {}",
+            set_difference(&expected_keys, &actual_keys)
+        )));
+    }
+
+    require_feature_set(features, "default", &["node-host"], context)?;
+    require_feature_set(features, "node-host", &["bamts-native/node-host"], context)?;
+    require_feature_set(
+        features,
+        "aot-main",
+        &["node-host", "dep:bamts-bytecode", "bamts-native/aot-image"],
         context,
     )
 }
@@ -768,16 +830,17 @@ fn expected_internal_graph() -> InternalGraph {
         "bamts-node".to_owned(),
         BTreeMap::from([
             ("bamts-runtime".to_owned(), internal_dependency(false, &[])),
-            (
-                "bamts-native".to_owned(),
-                internal_dependency(false, &["node-host"]),
-            ),
+            ("bamts-native".to_owned(), internal_dependency(false, &[])),
+            // Enabled only by `aot-main`, which decodes the canonical bytecode
+            // embedded in a linked AOT image before handing it to the engine.
+            ("bamts-bytecode".to_owned(), internal_dependency(true, &[])),
         ]),
     );
     graph.insert(
         "bamts-codegen".to_owned(),
         BTreeMap::from([
             ("bamts-bytecode".to_owned(), internal_dependency(false, &[])),
+            ("bamts-runtime".to_owned(), internal_dependency(false, &[])),
             (
                 "bamts-native".to_owned(),
                 internal_dependency(true, &["jit-entry"]),
@@ -1027,8 +1090,14 @@ fn codegen_closure(metadata: &CargoMetadata) -> Result<ResolvedClosure> {
             .entry((*name).to_owned())
             .or_default();
         features.extend(node.features.iter().cloned());
-        for dependency in &node.dependencies {
-            pending.push(dependency.as_str());
+        for dependency in &node.deps {
+            let contributes_to_artifact = dependency
+                .dep_kinds
+                .iter()
+                .any(|kind| kind.kind.as_deref() != Some("dev"));
+            if contributes_to_artifact {
+                pending.push(dependency.pkg.as_str());
+            }
         }
     }
 
