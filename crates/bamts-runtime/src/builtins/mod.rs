@@ -35,6 +35,10 @@ pub(crate) fn install<H: Host>(
     regexp::install(heap, globals, builtins);
     install_globals(heap, globals, builtins);
     json::install(heap, globals, builtins);
+    let json = *globals
+        .get("JSON")
+        .expect("JSON builtin installs its namespace");
+    define_to_string_tag(heap, json, builtins.symbol_to_string_tag(), "JSON");
     install_errors(heap, globals, builtins);
 }
 
@@ -65,6 +69,23 @@ fn define_data(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) 
         }
         _ => panic!("intrinsic property target must be an ordinary object"),
     }
+}
+
+pub(super) fn define_to_string_tag(
+    heap: &mut Vec<HeapEntry>,
+    object: Value,
+    symbol: Value,
+    tag: &str,
+) {
+    let value = push(heap, HeapEntry::String(tag.to_owned()));
+    let index = heap_index(object);
+    let HeapEntry::Object { properties, .. } = &mut heap[index] else {
+        panic!("namespace tag target must be an ordinary object");
+    };
+    properties.insert(
+        PropertyKey::Private(heap_index(symbol) as u32),
+        builtin_property(value),
+    );
 }
 
 fn builtin_property(value: Value) -> Property {
@@ -210,6 +231,7 @@ fn install_math<H: Host>(
         let function = install_function(heap, builtins, name, length, handler);
         define_data(heap, math, name, function);
     }
+    define_to_string_tag(heap, math, builtins.symbol_to_string_tag(), "Math");
     globals.insert("Math".to_owned(), math);
 }
 
@@ -707,16 +729,19 @@ impl<'a, H: Host> Machine<'a, H> {
             }))
     }
 
-    fn own_named_descriptor(
+    pub(crate) fn own_descriptor(
         &self,
         object: Value,
-        name: &str,
+        key: &PropertyKey,
     ) -> Result<Option<Property>, EvalFailure> {
         let Some(index) = self.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
             return Ok(None);
         };
         let properties = match &self.heap[index] {
             HeapEntry::ModuleNamespace { module } => {
+                let PropertyKey::Named(name) = key else {
+                    return Ok(None);
+                };
                 return self
                     .namespace_export(*module, name)
                     .map(|value| {
@@ -729,34 +754,48 @@ impl<'a, H: Host> Machine<'a, H> {
                     })
                     .map_err(EvalFailure::Runtime);
             }
+            HeapEntry::Array {
+                elements,
+                properties,
+                ..
+            } => {
+                if let Some(property) = properties.get(key) {
+                    return Ok(Some(property.clone()));
+                }
+                if let PropertyKey::Named(name) = key
+                    && let Some(offset) = crate::array_index(name)
+                    && let Some(value) = elements.get(offset as usize)
+                    && *value != Value::HOLE
+                {
+                    return Ok(Some(Property::Data {
+                        value: *value,
+                        writable: true,
+                        enumerable: true,
+                        configurable: true,
+                    }));
+                }
+                return Ok(None);
+            }
             HeapEntry::Object { properties, .. }
-            | HeapEntry::Array { properties, .. }
             | HeapEntry::Function { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
             | HeapEntry::RegExp { properties, .. } => properties,
             _ => return Ok(None),
         };
-        Ok(properties
-            .get(&PropertyKey::Named(name.to_owned()))
-            .cloned())
+        Ok(properties.get(key).cloned())
     }
 
-    fn define_named_descriptor(
+    pub(crate) fn define_descriptor(
         &mut self,
         object: Value,
-        name: String,
+        key: PropertyKey,
         descriptor: Property,
     ) -> Result<(), EvalFailure> {
         let Some(index) = self.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
             return Err(type_error("Object.defineProperty called on non-object"));
         };
-        let (properties, extensible) = match &mut self.heap[index] {
+        let (properties, extensible, exists) = match &mut self.heap[index] {
             HeapEntry::Object {
-                properties,
-                extensible,
-                ..
-            }
-            | HeapEntry::Array {
                 properties,
                 extensible,
                 ..
@@ -775,11 +814,42 @@ impl<'a, H: Host> Machine<'a, H> {
                 properties,
                 extensible,
                 ..
-            } => (properties, extensible),
+            } => {
+                let exists = properties.contains_key(&key);
+                (properties, extensible, exists)
+            }
+            HeapEntry::Array {
+                elements,
+                properties,
+                extensible,
+                ..
+            } => {
+                let array_index = key
+                    .as_str()
+                    .and_then(crate::array_index)
+                    .map(|offset| offset as usize);
+                let exists = properties.contains_key(&key)
+                    || array_index.is_some_and(|offset| {
+                        elements
+                            .get(offset)
+                            .is_some_and(|element| *element != Value::HOLE)
+                    });
+                if !*extensible && !exists {
+                    return Err(type_error(
+                        "Cannot define property, object is not extensible",
+                    ));
+                }
+                if let Some(offset) = array_index {
+                    if elements.len() <= offset {
+                        elements.resize(offset + 1, Value::HOLE);
+                    }
+                    elements[offset] = Value::HOLE;
+                }
+                (properties, extensible, exists)
+            }
             _ => return Err(type_error("Object.defineProperty called on non-object")),
         };
-        let key = PropertyKey::Named(name);
-        if !*extensible && !properties.contains_key(&key) {
+        if !*extensible && !exists {
             return Err(type_error(
                 "Cannot define property, object is not extensible",
             ));

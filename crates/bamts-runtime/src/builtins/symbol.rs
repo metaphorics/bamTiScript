@@ -20,6 +20,7 @@ pub(super) fn install<H: Host>(
     let has_instance = private_name(heap, "Symbol.hasInstance");
     let to_string_tag = private_name(heap, "Symbol.toStringTag");
     builtins.set_symbol_iterator(iterator);
+    builtins.set_symbol_to_string_tag(to_string_tag);
 
     let constructor = install_function(heap, builtins, "Symbol", 0, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);

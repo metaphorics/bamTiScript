@@ -48,6 +48,7 @@ pub(crate) struct BuiltinTable<H: Host> {
     boolean_prototype: Value,
     error_prototypes: Vec<(BuiltinId, Value)>,
     symbol_iterator: Option<Value>,
+    symbol_to_string_tag: Option<Value>,
     marker: PhantomData<fn() -> H>,
 }
 
@@ -70,6 +71,7 @@ impl<H: Host> BuiltinTable<H> {
             boolean_prototype,
             error_prototypes: Vec::new(),
             symbol_iterator: None,
+            symbol_to_string_tag: None,
             marker: PhantomData,
         }
     }
@@ -116,6 +118,15 @@ impl<H: Host> BuiltinTable<H> {
 
     pub(crate) fn symbol_iterator(&self) -> Value {
         self.symbol_iterator.expect("Symbol builtins install first")
+    }
+
+    pub(crate) fn set_symbol_to_string_tag(&mut self, symbol: Value) {
+        self.symbol_to_string_tag = Some(symbol);
+    }
+
+    pub(crate) fn symbol_to_string_tag(&self) -> Value {
+        self.symbol_to_string_tag
+            .expect("Symbol builtins install first")
     }
 
     pub(crate) fn set_constructor_prototype(

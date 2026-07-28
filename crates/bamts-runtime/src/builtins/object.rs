@@ -27,6 +27,7 @@ pub(super) fn install<H: Host>(
         ("defineProperty", 3, define_property::<H>),
         ("defineProperties", 2, define_properties::<H>),
         ("getOwnPropertyNames", 1, get_own_property_names::<H>),
+        ("getOwnPropertySymbols", 1, get_own_property_symbols::<H>),
         (
             "getOwnPropertyDescriptor",
             2,
@@ -249,8 +250,9 @@ fn descriptor_from<H: Host>(
     if accessor {
         if (getter != Value::UNDEFINED && !machine.is_callable(getter)?)
             || (setter != Value::UNDEFINED && !machine.is_callable(setter)?)
-            || machine.has_own_named_property(descriptor, "value")?
-            || machine.has_own_named_property(descriptor, "writable")?
+            || machine.has_own_property_key(descriptor, &PropertyKey::Named("value".to_owned()))?
+            || machine
+                .has_own_property_key(descriptor, &PropertyKey::Named("writable".to_owned()))?
         {
             return Err(type_error("Invalid property descriptor"));
         }
@@ -281,9 +283,9 @@ fn define_property<H: Host>(
     if !machine.is_object(target) {
         return Err(type_error("Object.defineProperty called on non-object"));
     }
-    let key = machine.to_string(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+    let key = machine.to_property_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
     let descriptor = descriptor_from(machine, args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
-    machine.define_named_descriptor(target, key, descriptor)?;
+    machine.define_descriptor(target, key, descriptor)?;
     Ok(BuiltinOutcome::Value(target))
 }
 
@@ -293,12 +295,18 @@ fn define_properties_on<H: Host>(
     descriptors: Value,
 ) -> Result<(), EvalFailure> {
     let mut definitions = Vec::new();
-    for key in machine.enumerable_keys(descriptors)? {
-        let descriptor = machine.get_named_property(descriptors, &key)?;
+    for key in machine.own_property_keys(descriptors)? {
+        if !machine
+            .own_descriptor(descriptors, &key)?
+            .is_some_and(|property| property.enumerable())
+        {
+            continue;
+        }
+        let descriptor = machine.get_property(descriptors, &key)?;
         definitions.push((key, descriptor_from(machine, descriptor)?));
     }
     for (key, descriptor) in definitions {
-        machine.define_named_descriptor(target, key, descriptor)?;
+        machine.define_descriptor(target, key, descriptor)?;
     }
     Ok(())
 }
@@ -336,6 +344,27 @@ fn get_own_property_names<H: Host>(
     Ok(BuiltinOutcome::Value(allocate_array(machine, names)?))
 }
 
+fn get_own_property_symbols<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let value = object_arg(machine, args, "Cannot convert undefined or null to object")?;
+    let symbols = machine
+        .own_property_keys(value)?
+        .into_iter()
+        .filter_map(|key| match key {
+            PropertyKey::Named(_) => None,
+            PropertyKey::Private(index) => Some(Value::heap_ref(
+                bamts_native::SlotId::from_parts(crate::RUNTIME_HEAP_SEGMENT, index + 1)
+                    .expect("property key is a valid runtime heap slot"),
+            )),
+        })
+        .collect();
+    Ok(BuiltinOutcome::Value(allocate_array(machine, symbols)?))
+}
+
 fn get_own_property_descriptor<H: Host>(
     machine: &mut Machine<'_, H>,
     _this: Value,
@@ -343,8 +372,8 @@ fn get_own_property_descriptor<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let target = object_arg(machine, args, "Cannot convert undefined or null to object")?;
-    let key = machine.to_string(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
-    let Some(property) = machine.own_named_descriptor(target, &key)? else {
+    let key = machine.to_property_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+    let Some(property) = machine.own_descriptor(target, &key)? else {
         return Ok(BuiltinOutcome::Value(Value::UNDEFINED));
     };
     let descriptor = machine
@@ -435,9 +464,9 @@ fn from_entries<H: Host>(
         let pair = machine
             .array_elements(entry)?
             .ok_or_else(|| type_error("Iterator value is not an entry object"))?;
-        let key = machine.to_string(pair.first().copied().unwrap_or(Value::UNDEFINED))?;
+        let key = machine.to_property_key(pair.first().copied().unwrap_or(Value::UNDEFINED))?;
         let value = pair.get(1).copied().unwrap_or(Value::UNDEFINED);
-        machine.set_data_property(object, &key, value)?;
+        machine.set_data_property_key(object, key, value)?;
     }
     Ok(BuiltinOutcome::Value(object))
 }
@@ -449,9 +478,9 @@ fn has_own<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let target = object_arg(machine, args, "Cannot convert undefined or null to object")?;
-    let key = machine.to_string(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+    let key = machine.to_property_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
     Ok(BuiltinOutcome::Value(Value::boolean(
-        machine.has_own_named_property(target, &key)?,
+        machine.has_own_property_key(target, &key)?,
     )))
 }
 
@@ -461,7 +490,24 @@ fn prototype_to_string<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let tag = machine.object_to_string_tag(this)?;
+    let tag = match this.decode() {
+        Some(Decoded::Undefined) => "Undefined".to_owned(),
+        Some(Decoded::Null) => "Null".to_owned(),
+        _ => {
+            let fallback = machine.object_to_string_tag(this)?;
+            let symbol = machine.intrinsics.builtins.symbol_to_string_tag();
+            let key = PropertyKey::Private(
+                machine
+                    .runtime_slot(symbol)
+                    .map_err(EvalFailure::Runtime)?
+                    .expect("well-known symbol belongs to the runtime heap") as u32,
+            );
+            let tag_value = machine.get_property(this, &key)?;
+            machine
+                .string_value(tag_value)
+                .unwrap_or_else(|| fallback.to_owned())
+        }
+    };
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
         format!("[object {tag}]"),
@@ -474,9 +520,9 @@ fn has_own_property<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let key = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let key = machine.to_property_key(args.first().copied().unwrap_or(Value::UNDEFINED))?;
     Ok(BuiltinOutcome::Value(Value::boolean(
-        machine.has_own_named_property(this, &key)?,
+        machine.has_own_property_key(this, &key)?,
     )))
 }
 
@@ -511,9 +557,9 @@ fn property_is_enumerable<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let key = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let key = machine.to_property_key(args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let enumerable = machine
-        .own_named_descriptor(this, &key)?
+        .own_descriptor(this, &key)?
         .is_some_and(|property| property.enumerable());
     Ok(BuiltinOutcome::Value(Value::boolean(enumerable)))
 }
@@ -676,13 +722,171 @@ mod tests {
         machine.call_value(method, constructor, &[target, descriptors])
     }
 
+    fn call_object(
+        machine: &mut Machine<'_, TestHost>,
+        method_name: &str,
+        args: &[Value],
+    ) -> Result<Value, EvalFailure> {
+        let constructor = machine.intrinsics.global("Object").unwrap();
+        let method = machine.get_named_property(constructor, method_name)?;
+        machine.call_value(method, constructor, args)
+    }
+
     fn assert_unchanged(machine: &mut Machine<'_, TestHost>, target: Value) {
         assert_eq!(
             machine.get_named_property(target, "stable").unwrap(),
             Value::int32(9)
         );
-        assert!(!machine.has_own_named_property(target, "first").unwrap());
-        assert!(!machine.has_own_named_property(target, "second").unwrap());
+        assert!(
+            !machine
+                .has_own_property_key(target, &PropertyKey::Named("first".to_owned()))
+                .unwrap()
+        );
+        assert!(
+            !machine
+                .has_own_property_key(target, &PropertyKey::Named("second".to_owned()))
+                .unwrap()
+        );
+    }
+
+    fn symbol_key(machine: &Machine<'_, TestHost>, symbol: Value) -> PropertyKey {
+        machine.to_property_key(symbol).unwrap()
+    }
+
+    fn symbol(machine: &mut Machine<'_, TestHost>, description: &str) -> Value {
+        machine
+            .allocate(HeapEntry::PrivateName {
+                description: description.to_owned(),
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn object_reflection_preserves_symbol_keys_and_filters_string_names() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = object(&mut machine);
+        let key = symbol(&mut machine, "key");
+        let descriptor = data_descriptor(&mut machine, Value::int32(42));
+
+        call_object(&mut machine, "defineProperty", &[target, key, descriptor]).unwrap();
+
+        let property_key = symbol_key(&machine, key);
+        assert_eq!(
+            machine.get_property(target, &property_key).unwrap(),
+            Value::int32(42)
+        );
+        let names = call_object(&mut machine, "getOwnPropertyNames", &[target]).unwrap();
+        assert!(machine.array_elements(names).unwrap().unwrap().is_empty());
+        let symbols = call_object(&mut machine, "getOwnPropertySymbols", &[target]).unwrap();
+        assert_eq!(machine.array_elements(symbols).unwrap().unwrap(), vec![key]);
+    }
+
+    #[test]
+    fn define_properties_collects_enumerable_symbol_descriptors() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = object(&mut machine);
+        let descriptors = object(&mut machine);
+        let key = symbol(&mut machine, "definition");
+        let descriptor = data_descriptor(&mut machine, Value::int32(7));
+        let property_key = symbol_key(&machine, key);
+        machine
+            .set_data_property_key(descriptors, property_key, descriptor)
+            .unwrap();
+
+        call_define_properties(&mut machine, target, descriptors).unwrap();
+
+        let property_key = symbol_key(&machine, key);
+        assert_eq!(
+            machine.get_property(target, &property_key).unwrap(),
+            Value::int32(7)
+        );
+    }
+
+    #[test]
+    fn existing_namespaces_expose_standard_to_string_tags() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let object_to_string = machine.intrinsics.object_to_string();
+
+        for (name, expected) in [("Math", "[object Math]"), ("JSON", "[object JSON]")] {
+            let namespace = machine.intrinsics.global(name).unwrap();
+            let result = machine
+                .call_value(object_to_string, namespace, &[])
+                .unwrap();
+            assert_eq!(machine.string_value(result).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn object_define_property_keeps_array_index_semantics() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let array = allocate_array(&mut machine, Vec::new()).unwrap();
+        let descriptor = data_descriptor(&mut machine, Value::int32(9));
+
+        call_object(
+            &mut machine,
+            "defineProperty",
+            &[array, Value::int32(0), descriptor],
+        )
+        .unwrap();
+
+        assert_eq!(
+            machine.get_named_property(array, "0").unwrap(),
+            Value::int32(9)
+        );
+        let length = machine.get_named_property(array, "length").unwrap();
+        assert_eq!(machine.to_string(length).unwrap(), "1");
+    }
+
+    #[test]
+    fn object_to_string_uses_string_tags_and_evaluates_tag_accessors() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let tag_key = symbol_key(&machine, machine.intrinsics.builtins.symbol_to_string_tag());
+        let object_to_string = machine.intrinsics.object_to_string();
+
+        let non_string_tag = object(&mut machine);
+        machine
+            .set_data_property_key(non_string_tag, tag_key.clone(), Value::int32(1))
+            .unwrap();
+        let value = machine
+            .call_value(object_to_string, non_string_tag, &[])
+            .unwrap();
+        assert_eq!(
+            machine.string_value(value).as_deref(),
+            Some("[object Object]")
+        );
+
+        let accessor_tag = object(&mut machine);
+        let object_constructor = machine.intrinsics.global("Object").unwrap();
+        let throwing_getter = machine
+            .get_named_property(object_constructor, "defineProperty")
+            .unwrap();
+        machine
+            .define_descriptor(
+                accessor_tag,
+                tag_key,
+                Property::Accessor {
+                    getter: Some(throwing_getter),
+                    setter: None,
+                    enumerable: false,
+                    configurable: true,
+                },
+            )
+            .unwrap();
+        assert!(
+            machine
+                .call_value(object_to_string, accessor_tag, &[])
+                .is_err()
+        );
     }
 
     #[test]
@@ -729,9 +933,9 @@ mod tests {
             .get_named_property(object_constructor, "defineProperty")
             .unwrap();
         machine
-            .define_named_descriptor(
+            .define_descriptor(
                 second,
-                "get".to_owned(),
+                PropertyKey::Named("get".to_owned()),
                 Property::Accessor {
                     getter: Some(throwing_getter),
                     setter: None,

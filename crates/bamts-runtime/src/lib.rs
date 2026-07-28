@@ -2176,7 +2176,15 @@ impl<'a, H: Host> Machine<'a, H> {
         object: Value,
         name: &str,
     ) -> Result<Value, EvalFailure> {
-        match self.resolve_get(object, &PropertyKey::Named(name.to_owned()))? {
+        self.get_property(object, &PropertyKey::Named(name.to_owned()))
+    }
+
+    pub(crate) fn get_property(
+        &mut self,
+        object: Value,
+        key: &PropertyKey,
+    ) -> Result<Value, EvalFailure> {
+        match self.resolve_get(object, key)? {
             GetOutcome::Value(value) => Ok(value),
             GetOutcome::Text(text) => self
                 .allocate(HeapEntry::String(text))
@@ -2191,7 +2199,16 @@ impl<'a, H: Host> Machine<'a, H> {
         name: &str,
         value: Value,
     ) -> Result<(), EvalFailure> {
-        match self.resolve_set(object, PropertyKey::Named(name.to_owned()), value)? {
+        self.set_data_property_key(object, PropertyKey::Named(name.to_owned()), value)
+    }
+
+    pub(crate) fn set_data_property_key(
+        &mut self,
+        object: Value,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<(), EvalFailure> {
+        match self.resolve_set(object, key, value)? {
             SetOutcome::Done => Ok(()),
             SetOutcome::Setter(setter) => {
                 self.call_value(setter, object, &[value])?;
@@ -2293,17 +2310,15 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    pub(crate) fn has_own_named_property(
+    pub(crate) fn has_own_property_key(
         &self,
         object: Value,
-        name: &str,
+        key: &PropertyKey,
     ) -> Result<bool, EvalFailure> {
         let Some(index) = self.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
             return Ok(false);
         };
-        Ok(self
-            .own_get(index, &PropertyKey::Named(name.to_owned()))
-            .is_some())
+        Ok(self.own_get(index, key).is_some())
     }
 
     pub(crate) fn call_value(
@@ -3186,6 +3201,15 @@ impl<'a, H: Host> Machine<'a, H> {
                     properties,
                     ..
                 } => {
+                    if properties
+                        .get(key)
+                        .is_some_and(|property| !property.configurable())
+                    {
+                        return Ok(false);
+                    }
+                    if properties.remove(key).is_some() {
+                        return Ok(true);
+                    }
                     if let PropertyKey::Named(name) = key {
                         if name == "length" {
                             return Ok(false);
@@ -3197,13 +3221,6 @@ impl<'a, H: Host> Machine<'a, H> {
                             return Ok(true);
                         }
                     }
-                    if properties
-                        .get(key)
-                        .is_some_and(|property| !property.configurable())
-                    {
-                        return Ok(false);
-                    }
-                    properties.remove(key);
                     Ok(true)
                 }
                 HeapEntry::ProcessEnv { .. } => {
@@ -3512,11 +3529,13 @@ impl<'a, H: Host> Machine<'a, H> {
                         .filter(|offset| elements[*offset] != Value::HOLE)
                         .map(|offset| PropertyKey::Named(offset.to_string()))
                         .collect();
-                    keys.extend(
-                        ordered_property_keys(properties)
-                            .into_iter()
-                            .filter(|key| key.as_str().and_then(array_index).is_none()),
-                    );
+                    keys.extend(ordered_property_keys(properties).into_iter().filter(|key| {
+                        key.as_str().and_then(array_index).is_none_or(|offset| {
+                            elements
+                                .get(offset as usize)
+                                .is_none_or(|element| *element == Value::HOLE)
+                        })
+                    }));
                     Ok(keys)
                 }
                 HeapEntry::String(text) => Ok((0..text.chars().count())
@@ -3563,13 +3582,15 @@ impl<'a, H: Host> Machine<'a, H> {
                         elements,
                         properties,
                         ..
-                    } => array_index(name).map_or_else(
-                        || properties.get(&key).is_some_and(Property::enumerable),
-                        |offset| {
-                            elements
-                                .get(offset as usize)
-                                .is_some_and(|element| *element != Value::HOLE)
+                    } => properties.get(&key).map_or_else(
+                        || {
+                            array_index(name).is_some_and(|offset| {
+                                elements
+                                    .get(offset as usize)
+                                    .is_some_and(|element| *element != Value::HOLE)
+                            })
                         },
+                        Property::enumerable,
                     ),
                     HeapEntry::String(text) => array_index(name)
                         .is_some_and(|offset| (offset as usize) < text.chars().count()),
