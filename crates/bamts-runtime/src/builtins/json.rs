@@ -6,6 +6,8 @@ use super::{allocate_array, allocate_string, define_data, install_function, type
 use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyMap};
 
+const LONE_SURROGATE_ESCAPE: &str = "JSON.parse cannot represent a lone UTF-16 surrogate escape";
+
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     globals: &mut BTreeMap<String, Value>,
@@ -36,6 +38,9 @@ fn parse<H: Host>(
     let source = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let value = match Parser::new(&source).parse(machine) {
         Ok(value) => value,
+        Err(message) if message == LONE_SURROGATE_ESCAPE => {
+            return Err(type_error(LONE_SURROGATE_ESCAPE));
+        }
         Err(message) => {
             let id = machine
                 .intrinsics
@@ -48,7 +53,7 @@ fn parse<H: Host>(
     if let Some(reviver) = args
         .get(1)
         .copied()
-        .filter(|value| *value != Value::UNDEFINED)
+        .filter(|value| machine.is_callable(*value).unwrap_or(false))
     {
         let root = machine
             .allocate(HeapEntry::Object {
@@ -368,11 +373,38 @@ impl<'a> Parser<'a> {
                             if self.pos + 4 > self.source.len() {
                                 return Err(self.error_unexpected());
                             }
-                            let hex = &self.source[self.pos..self.pos + 4];
-                            let unit = u16::from_str_radix(hex, 16)
-                                .map_err(|_| self.error_unexpected())?;
+                            let high =
+                                u16::from_str_radix(&self.source[self.pos..self.pos + 4], 16)
+                                    .map_err(|_| self.error_unexpected())?;
                             self.pos += 4;
-                            out.push_str(&String::from_utf16_lossy(&[unit]))
+                            let scalar = if (0xd800..=0xdbff).contains(&high) {
+                                if !self.source[self.pos..].starts_with("\\u") {
+                                    return Err(LONE_SURROGATE_ESCAPE.to_owned());
+                                }
+                                if self.pos + 6 > self.source.len() {
+                                    return Err(self.error_unexpected());
+                                }
+                                let low = u16::from_str_radix(
+                                    &self.source[self.pos + 2..self.pos + 6],
+                                    16,
+                                )
+                                .map_err(|_| self.error_unexpected())?;
+                                if !(0xdc00..=0xdfff).contains(&low) {
+                                    return Err(LONE_SURROGATE_ESCAPE.to_owned());
+                                }
+                                self.pos += 6;
+                                0x1_0000
+                                    + ((u32::from(high) - 0xd800) << 10)
+                                    + (u32::from(low) - 0xdc00)
+                            } else {
+                                if (0xdc00..=0xdfff).contains(&high) {
+                                    return Err(LONE_SURROGATE_ESCAPE.to_owned());
+                                }
+                                u32::from(high)
+                            };
+                            out.push(
+                                char::from_u32(scalar).expect("surrogate pair produces a scalar"),
+                            );
                         }
                         _ => return Err(self.error_unexpected()),
                     }
@@ -527,5 +559,104 @@ fn quote_excerpt(source: &str) -> String {
         format!("\"{source}\"")
     } else {
         format!("\"{}\"...", &source[..20])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bamts_bytecode::{Function, FunctionFlags, FunctionId, Instruction, Module, Verified};
+
+    use super::*;
+    use crate::Limits;
+    use crate::ThrowOrigin;
+
+    #[derive(Default)]
+    struct TestHost;
+
+    impl Host for TestHost {}
+
+    fn module() -> Module<Verified> {
+        Module::new(
+            Vec::new(),
+            vec![Function::new(
+                None,
+                0,
+                0,
+                1,
+                FunctionFlags::default(),
+                vec![Instruction::Halt],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("valid test module")
+    }
+
+    #[test]
+    fn parse_ignores_non_callable_revivers() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let json = machine.intrinsics.global("JSON").expect("JSON exists");
+        let parse = machine
+            .get_named_property(json, "parse")
+            .expect("JSON.parse exists");
+        let object = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .expect("object allocation succeeds");
+
+        for reviver in [Value::NULL, Value::FALSE, object] {
+            let source =
+                allocate_string(&mut machine, "1".to_owned()).expect("string allocation succeeds");
+            let value = machine
+                .call_value(parse, json, &[source, reviver])
+                .expect("non-callable reviver is ignored");
+            assert_eq!(value, Value::int32(1));
+        }
+    }
+
+    #[test]
+    fn parse_decodes_utf16_surrogate_pairs() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let json = machine.intrinsics.global("JSON").expect("JSON exists");
+        let parse = machine
+            .get_named_property(json, "parse")
+            .expect("JSON.parse exists");
+        let source = allocate_string(&mut machine, "\"\\uD83D\\uDE00\"".to_owned())
+            .expect("string allocation succeeds");
+
+        let value = machine
+            .call_value(parse, json, &[source])
+            .expect("JSON.parse succeeds");
+
+        assert_eq!(machine.string_value(value).as_deref(), Some("😀"));
+    }
+
+    #[test]
+    fn parse_rejects_lone_utf16_surrogate_escapes() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let json = machine.intrinsics.global("JSON").expect("JSON exists");
+        let parse = machine
+            .get_named_property(json, "parse")
+            .expect("JSON.parse exists");
+        let source = allocate_string(&mut machine, "\"\\uD83D\"".to_owned())
+            .expect("string allocation succeeds");
+
+        assert!(matches!(
+            machine.call_value(parse, json, &[source]),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: LONE_SURROGATE_ESCAPE
+            }))
+        ));
     }
 }
