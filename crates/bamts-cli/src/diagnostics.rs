@@ -14,18 +14,23 @@
 //!   editors and the language server protocol use. A non-BMP character therefore
 //!   advances the reported column by two.
 //! - **Visual snippets.** The caret underline in `Pretty` output is aligned by
-//!   UTF-16 code-unit count, consistent with the reported columns. This is not a
-//!   perfect terminal-cell alignment (a wide glyph may occupy two cells while a
-//!   BMP character occupies one), but it keeps the caret and the reported column
-//!   in the same coordinate space and tracks wide non-BMP glyphs more closely
-//!   than a code-point count would.
+//!   UTF-16 code-unit count, consistent with the reported columns. This is not
+//!   a perfect terminal-cell alignment (a wide glyph may occupy two cells while
+//!   a BMP character occupies one), but it keeps the caret and the reported
+//!   column in the same coordinate space and tracks wide non-BMP glyphs more
+//!   closely than a code-point count would. Source excerpts are capped to a
+//!   fixed display width ([`PRETTY_SNIPPET_WIDTH`], 80 UTF-16 code units)
+//!   centered on the diagnostic span, with `…` ellipses marking elided
+//!   regions so output size stays bounded per diagnostic regardless of line
+//!   length. Window edges are snapped to UTF-8 character boundaries so
+//!   surrogate pairs are never split.
 //! - **Hand-written JSON.** JSON is emitted without serde, with explicit escaping
 //!   and a stable field order.
 
 use std::fmt::Write as _;
 
 use bamts_compiler::diagnostic::{Diagnostic, DiagnosticSeverity};
-use bamts_compiler::source::{SourceId, SourceText, TextRange};
+use bamts_compiler::source::{SourceId, SourcePositionError, SourceText, TextRange, Utf16Pos};
 
 use crate::args::DiagnosticsFormat;
 
@@ -200,10 +205,18 @@ fn render_pretty(diagnostics: &[&Diagnostic], sources: &[DiagnosticSource<'_>]) 
             Some(snippet) => {
                 let gutter = " ".repeat(snippet.line_number_width);
                 let _ = writeln!(out, "{gutter} |");
-                let _ = writeln!(out, "{} | {}", snippet.line_number, snippet.line_text);
                 let _ = writeln!(
                     out,
-                    "{gutter} | {}{}",
+                    "{} | {}{}{}",
+                    snippet.line_number,
+                    snippet.prefix_ellipsis,
+                    snippet.excerpt,
+                    snippet.suffix_ellipsis,
+                );
+                let _ = writeln!(
+                    out,
+                    "{gutter} | {}{}{}",
+                    snippet.prefix_ellipsis,
                     " ".repeat(snippet.caret_indent),
                     "^".repeat(snippet.caret_width),
                 );
@@ -216,11 +229,31 @@ fn render_pretty(diagnostics: &[&Diagnostic], sources: &[DiagnosticSource<'_>]) 
     out
 }
 
+/// Maximum display width of a pretty source excerpt, measured in UTF-16 code
+/// units. Lines longer than this are truncated to a window centered on the
+/// diagnostic span, with `…` ellipses marking the elided regions. The cap is
+/// in UTF-16 units (not bytes or terminal cells) so that the caret geometry
+/// and the reported columns stay in the same coordinate space; a non-BMP
+/// character contributes two units, matching [`SourceText::line_column`].
+const PRETTY_SNIPPET_WIDTH: usize = 80;
+
+/// The ellipsis string used to mark elided source regions.
+const SNIPPET_ELLIPSIS: &str = "…";
+
 /// A resolved single-line snippet with caret geometry measured in UTF-16 units.
+///
+/// `excerpt` is the possibly-truncated source text displayed to the user.
+/// When the original line exceeds [`PRETTY_SNIPPET_WIDTH`], `prefix_ellipsis`
+/// and/or `suffix_ellipsis` are set to `…` to mark the elided regions.
+/// `caret_indent` is the offset from the start of `excerpt` (not including the
+/// prefix ellipsis, which `render_pretty` prints separately), keeping the
+/// caret aligned to the displayed text.
 struct Snippet {
     line_number: usize,
     line_number_width: usize,
-    line_text: String,
+    excerpt: String,
+    prefix_ellipsis: &'static str,
+    suffix_ellipsis: &'static str,
     caret_indent: usize,
     caret_width: usize,
 }
@@ -228,7 +261,10 @@ struct Snippet {
 /// Builds a snippet for the line containing `range`'s start.
 ///
 /// The caret indent and width use the same UTF-16 coordinate space as reported
-/// columns, including two-unit non-BMP code points.
+/// columns, including two-unit non-BMP code points. When the line is longer
+/// than [`PRETTY_SNIPPET_WIDTH`] UTF-16 units, the excerpt is truncated to a
+/// window centered on the diagnostic span. Window edges are snapped to UTF-8
+/// character boundaries so that surrogate pairs are never split.
 fn snippet(text: &SourceText, range: TextRange) -> Option<Snippet> {
     let (line_index, _) = text.line_column(range.start()).ok()?;
     let start_byte = text.utf16_to_byte(range.start()).ok()?;
@@ -242,19 +278,109 @@ fn snippet(text: &SourceText, range: TextRange) -> Option<Snippet> {
     let span_end = end_byte.min(line_end).max(span_start);
 
     let line_start_utf16 = text.byte_to_utf16(line_start).ok()?.get();
+    let line_end_utf16 = text.byte_to_utf16(line_end).ok()?.get();
     let span_start_utf16 = text.byte_to_utf16(span_start).ok()?.get();
     let span_end_utf16 = text.byte_to_utf16(span_end).ok()?.get();
-    let caret_indent = span_start_utf16 - line_start_utf16;
-    let caret_width = (span_end_utf16 - span_start_utf16).max(1);
+
+    let line_len_utf16 = line_end_utf16 - line_start_utf16;
+    let span_indent_utf16 = span_start_utf16 - line_start_utf16;
+    let span_width_utf16 = (span_end_utf16 - span_start_utf16).max(1);
     let line_number = line_index + 1;
+
+    // Fast path: the full line fits within the display budget.
+    if line_len_utf16 <= PRETTY_SNIPPET_WIDTH {
+        return Some(Snippet {
+            line_number,
+            line_number_width: line_number.to_string().len(),
+            excerpt: raw.get(line_start..line_end)?.to_owned(),
+            prefix_ellipsis: "",
+            suffix_ellipsis: "",
+            caret_indent: span_indent_utf16,
+            caret_width: span_width_utf16,
+        });
+    }
+
+    // Truncation path: center a window of PRETTY_SNIPPET_WIDTH UTF-16 units on
+    // the span. Account for ellipsis width in the budget.
+    let ellipsis_width = SNIPPET_ELLIPSIS.encode_utf16().count(); // 1
+    let budget = PRETTY_SNIPPET_WIDTH - 2 * ellipsis_width;
+
+    // Center the window on the span midpoint. If the span itself is wider than
+    // the budget, left-align the window to the span start so the caret origin
+    // is always visible.
+    let visible_span = span_width_utf16.min(budget);
+    let span_mid = span_indent_utf16 + visible_span / 2;
+    let window_start_rel = span_mid.saturating_sub(budget / 2);
+    let window_end_rel = (window_start_rel + budget).min(line_len_utf16);
+    // Re-adjust start if end hit the line boundary (reclaim unused space).
+    let window_start_rel = window_start_rel.min(window_end_rel.saturating_sub(budget));
+
+    let window_start_utf16 = line_start_utf16 + window_start_rel;
+    let window_end_utf16 = line_start_utf16 + window_end_rel;
+
+    // Snap window edges to UTF-8 character boundaries. A UTF-16 offset landing
+    // inside a surrogate pair (non-BMP char = 2 units) would cause
+    // `utf16_to_byte` to error; nudge inward until we hit a valid boundary.
+    let window_start_byte = snap_utf16_to_char_boundary(text, window_start_utf16, true)?;
+    let window_end_byte = snap_utf16_to_char_boundary(text, window_end_utf16, false)?;
+
+    // Recompute the actual window edges in UTF-16 after snapping.
+    let snapped_start_utf16 = text.byte_to_utf16(window_start_byte).ok()?.get();
+    let snapped_end_utf16 = text.byte_to_utf16(window_end_byte).ok()?.get();
+
+    // Caret position relative to the displayed excerpt text (excluding the
+    // prefix ellipsis, which `render_pretty` prints separately before the
+    // indent spaces).
+    let span_visible_start = span_start_utf16.max(snapped_start_utf16);
+    let span_visible_end = span_end_utf16
+        .min(snapped_end_utf16)
+        .max(span_visible_start);
+    let caret_indent = span_visible_start - snapped_start_utf16;
+    let caret_width = (span_visible_end - span_visible_start).max(1);
+
+    // Determine which ellipses are needed. Both sides are elided when the
+    // window doesn't reach the respective line boundary.
+    let need_prefix = window_start_rel > 0;
+    let need_suffix = window_end_rel < line_len_utf16;
+    let prefix_ellipsis: &'static str = if need_prefix { SNIPPET_ELLIPSIS } else { "" };
+    let suffix_ellipsis: &'static str = if need_suffix { SNIPPET_ELLIPSIS } else { "" };
 
     Some(Snippet {
         line_number,
         line_number_width: line_number.to_string().len(),
-        line_text: raw.get(line_start..line_end)?.to_owned(),
+        excerpt: raw.get(window_start_byte..window_end_byte)?.to_owned(),
+        prefix_ellipsis,
+        suffix_ellipsis,
         caret_indent,
         caret_width,
     })
+}
+
+/// Snaps a UTF-16 offset to a valid UTF-8 character boundary.
+///
+/// If `position` lands inside a surrogate pair (i.e. the corresponding byte
+/// is a UTF-8 continuation byte), nudges one UTF-16 unit inward (`forward =
+/// true` nudges toward higher offsets, `false` toward lower). Returns the
+/// byte offset of the nearest valid character boundary.
+fn snap_utf16_to_char_boundary(text: &SourceText, position: usize, forward: bool) -> Option<usize> {
+    let raw = text.as_str();
+    let mut pos = position;
+    loop {
+        match text.utf16_to_byte(Utf16Pos::new(pos)) {
+            Ok(byte) => {
+                debug_assert!(raw.is_char_boundary(byte));
+                return Some(byte);
+            }
+            Err(SourcePositionError::Utf16PositionInsideSurrogatePair { .. }) => {
+                pos = if forward {
+                    pos.saturating_add(1)
+                } else {
+                    pos.saturating_sub(1)
+                };
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 /// Returns each line's `(content_start_byte, content_end_byte)`, excluding the
@@ -293,7 +419,11 @@ fn render_github(diagnostics: &[&Diagnostic], sources: &[DiagnosticSource<'_>]) 
     for diagnostic in diagnostics {
         let location = locate(diagnostic, sources);
         let level = severity_str(diagnostic.severity());
-        let _ = write!(out, "::{level} file={}", escape_github_property(&location.name));
+        let _ = write!(
+            out,
+            "::{level} file={}",
+            escape_github_property(&location.name)
+        );
         if let Some(((line, col), (end_line, end_col))) = location.line_col {
             let _ = write!(
                 out,
@@ -447,10 +577,7 @@ mod tests {
             &[later, earlier],
             &sources("a.ts", &text),
         );
-        assert_eq!(
-            out,
-            "a.ts:1:2: warning: earlier\na.ts:1:5: error: later\n",
-        );
+        assert_eq!(out, "a.ts:1:2: warning: earlier\na.ts:1:5: error: later\n",);
     }
 
     #[test]
@@ -492,14 +619,22 @@ mod tests {
         let diag = Diagnostic::error(code("BTS0005"), FILE, range(2, 3), "on x");
 
         // JSON/text column is UTF-16 based: 'x' is at column 3 (1-based).
-        let json = render(DiagnosticsFormat::Json, &[diag.clone()], &sources("e.ts", &text));
+        let json = render(
+            DiagnosticsFormat::Json,
+            std::slice::from_ref(&diag),
+            &sources("e.ts", &text),
+        );
         assert!(
             json.contains("\"line\":1,\"column\":3,\"endLine\":1,\"endColumn\":4"),
             "utf16 columns wrong: {json}",
         );
 
         // Pretty uses the same UTF-16 coordinate: two columns precede 'x'.
-        let pretty = render(DiagnosticsFormat::Pretty, &[diag], &sources("e.ts", &text));
+        let pretty = render(
+            DiagnosticsFormat::Pretty,
+            std::slice::from_ref(&diag),
+            &sources("e.ts", &text),
+        );
         assert!(pretty.contains("1 | 😀x\n"), "snippet wrong: {pretty}");
         assert!(pretty.contains("  |   ^\n"), "caret misaligned: {pretty}");
     }
@@ -524,7 +659,9 @@ mod tests {
             &[diag],
             &sources("dir,name:1.ts", &text),
         );
-        assert!(out.starts_with("::error file=dir%2Cname%3A1.ts,line=1,col=1,endLine=1,endColumn=2::"));
+        assert!(
+            out.starts_with("::error file=dir%2Cname%3A1.ts,line=1,col=1,endLine=1,endColumn=2::")
+        );
         assert!(out.contains("bad, thing%0Anext"));
         assert!(out.ends_with('\n'));
     }
@@ -557,13 +694,198 @@ mod tests {
         let da = Diagnostic::error(code("BTS0001"), src_a, range(0, 1), "in a");
         let db = Diagnostic::error(code("BTS0001"), src_b, range(0, 1), "in b");
         let catalog = vec![
-            DiagnosticSource { id: src_a, name: "a.ts", text: &a },
-            DiagnosticSource { id: src_b, name: "b.ts", text: &b },
+            DiagnosticSource {
+                id: src_a,
+                name: "a.ts",
+                text: &a,
+            },
+            DiagnosticSource {
+                id: src_b,
+                name: "b.ts",
+                text: &b,
+            },
         ];
         let out = render(DiagnosticsFormat::Compact, &[db, da], &catalog);
-        assert_eq!(
-            out,
-            "a.ts:1:1: error: in a\nb.ts:1:1: error: in b\n",
+        assert_eq!(out, "a.ts:1:1: error: in a\nb.ts:1:1: error: in b\n",);
+    }
+    #[test]
+    fn pretty_truncates_long_line_with_ellipses_and_aligned_caret() {
+        // 120 ASCII chars; far exceeds PRETTY_SNIPPET_WIDTH (80).
+        // The span targets 'X' at UTF-16 offset 60 (column 61, 1-based).
+        let body = "a".repeat(60) + "X" + &"b".repeat(59);
+        let text = SourceText::new(body.as_str());
+        let diag = Diagnostic::error(code("BTS0009"), FILE, range(60, 61), "on X");
+        let out = render(
+            DiagnosticsFormat::Pretty,
+            &[diag],
+            &sources("long.ts", &text),
         );
+
+        // Reported location is the true UTF-16 column, unaffected by truncation.
+        assert!(out.contains(" --> long.ts:1:61\n"), "location wrong: {out}");
+
+        // The source line is capped: prefix ellipsis + ≤78 chars + suffix ellipsis.
+        let source_line = out
+            .lines()
+            .find(|line| line.starts_with("1 | "))
+            .expect("source line");
+        let displayed = source_line.strip_prefix("1 | ").expect("stripped");
+        // … + excerpt + … ; excerpt is ≤78 UTF-16 units, total ≤80.
+        assert!(
+            displayed.starts_with('…'),
+            "missing prefix ellipsis: {displayed}"
+        );
+        assert!(
+            displayed.ends_with('…'),
+            "missing suffix ellipsis: {displayed}"
+        );
+        let total_utf16 = displayed.encode_utf16().count();
+        assert!(
+            total_utf16 <= PRETTY_SNIPPET_WIDTH,
+            "excerpt {total_utf16} exceeds cap {}: {displayed}",
+            PRETTY_SNIPPET_WIDTH,
+        );
+
+        // The caret must point at 'X'. In the window, 'X' at offset 60 is
+        // centered. The caret line has a leading ellipsis then spaces then '^'.
+        let caret_line = out
+            .lines()
+            .find(|line| line.starts_with("  | "))
+            .expect("caret line");
+        let caret_displayed = caret_line.strip_prefix("  | ").expect("caret stripped");
+        assert!(
+            caret_displayed.starts_with('…'),
+            "caret missing prefix ellipsis: {caret_displayed}"
+        );
+        // There is exactly one caret and it sits on 'X'.
+        let carets = caret_displayed.matches('^').count();
+        assert_eq!(carets, 1, "expected exactly one caret: {caret_displayed}");
+        // The caret column (counting the leading ellipsis as 1) must match
+        // the column of 'X' within the source line's displayed content.
+        let caret_col = caret_displayed.find('^').expect("caret position");
+        let x_col = displayed.find('X').expect("X in source line");
+        assert_eq!(
+            caret_col, x_col,
+            "caret misaligned: caret={caret_displayed} source={displayed}"
+        );
+    }
+
+    #[test]
+    fn pretty_truncation_snaps_non_bmp_at_window_boundary() {
+        // 77 ASCII chars + 😀 (2 UTF-16 units, 4 UTF-8 bytes) + 3 ASCII = 82
+        // UTF-16 units total. With the span at offset 0, the window is
+        // [0, 78). UTF-16 offset 78 lands on the low surrogate of 😀 — inside
+        // the pair. The snap step must nudge backward to 77 so the excerpt
+        // never splits the non-BMP character.
+        let pre = "a".repeat(77);
+        let mid = "😀"; // offsets 77..79 in UTF-16
+        let post = "b".repeat(3);
+        let body = format!("{pre}{mid}{post}");
+        let text = SourceText::new(body.as_str());
+        let diag = Diagnostic::error(code("BTS0010"), FILE, range(0, 1), "first");
+        let out = render(DiagnosticsFormat::Pretty, &[diag], &sources("nb.ts", &text));
+
+        // Must not panic or return None — the snap step handled the pair.
+        let source_line = out
+            .lines()
+            .find(|line| line.starts_with("1 | "))
+            .expect("source line");
+        let displayed = source_line.strip_prefix("1 | ").expect("stripped");
+        let total_utf16 = displayed.encode_utf16().count();
+        assert!(
+            total_utf16 <= PRETTY_SNIPPET_WIDTH,
+            "non-bmp excerpt {total_utf16} exceeds cap: {displayed}",
+        );
+        // The non-BMP char must not be split — no replacement char from a
+        // broken surrogate, and the output must remain valid UTF-8 (which
+        // guarantees no lone surrogates survived into the string).
+        assert!(
+            !displayed.contains('\u{FFFD}'),
+            "replacement char from split surrogate: {displayed}",
+        );
+        assert!(
+            std::str::from_utf8(displayed.as_bytes()).is_ok(),
+            "excerpt is not valid UTF-8: {displayed:?}",
+        );
+
+        // Caret line is well-formed and within bounds.
+        let caret_line = out
+            .lines()
+            .find(|line| line.starts_with("  | "))
+            .expect("caret line");
+        assert!(caret_line.contains('^'), "no caret: {caret_line}");
+    }
+
+    #[test]
+    fn snap_utf16_to_char_boundary_handles_surrogate_pair() {
+        // "a😀b": 'a' at offset 0, 😀 at offsets 1..3 (2 UTF-16 units), 'b' at 3.
+        let text = SourceText::new("a😀b");
+
+        // Offset 2 lands on the low surrogate of 😀 (inside the pair).
+        // Snapping backward (forward=false) → offset 1 (the high surrogate,
+        // which is a valid char boundary).
+        let snapped =
+            snap_utf16_to_char_boundary(&text, 2, false).expect("snap backward from low surrogate");
+        assert_eq!(
+            text.as_str()[snapped..].chars().next(),
+            Some('😀'),
+            "backward snap should land on the 😀 start",
+        );
+
+        // Snapping forward (forward=true) from offset 1 (high surrogate) →
+        // offset 3 ('b'), which is the next valid boundary after the pair.
+        // But offset 1 itself IS valid (char start), so forward stays at 1.
+        // Instead, snap forward from offset 2 (low surrogate): → offset 3.
+        let snapped_fwd =
+            snap_utf16_to_char_boundary(&text, 2, true).expect("snap forward from low surrogate");
+        assert_eq!(
+            text.as_str()[snapped_fwd..].chars().next(),
+            Some('b'),
+            "forward snap should land past the 😀",
+        );
+
+        // A valid offset passes through unchanged.
+        let valid =
+            snap_utf16_to_char_boundary(&text, 0, true).expect("valid offset snaps to itself");
+        assert_eq!(valid, 0);
+    }
+
+    #[test]
+    fn pretty_truncation_clamps_wide_span_to_window() {
+        // A span wider than the display budget. The caret must be clamped to
+        // the visible window, never underflow.
+        let body = "a".repeat(200);
+        let text = SourceText::new(body.as_str());
+        // Span covers UTF-16 offsets 10..190 — far wider than the cap.
+        let diag = Diagnostic::error(code("BTS0011"), FILE, range(10, 190), "wide");
+        let out = render(
+            DiagnosticsFormat::Pretty,
+            &[diag],
+            &sources("wide.ts", &text),
+        );
+
+        let source_line = out
+            .lines()
+            .find(|line| line.starts_with("1 | "))
+            .expect("source line");
+        let displayed = source_line.strip_prefix("1 | ").expect("stripped");
+        let total_utf16 = displayed.encode_utf16().count();
+        assert!(
+            total_utf16 <= PRETTY_SNIPPET_WIDTH,
+            "wide-span excerpt {total_utf16} exceeds cap: {displayed}",
+        );
+
+        // The caret width must be bounded by the visible portion.
+        let caret_line = out
+            .lines()
+            .find(|line| line.starts_with("  | "))
+            .expect("caret line");
+        let caret_displayed = caret_line.strip_prefix("  | ").expect("caret stripped");
+        let caret_width = caret_displayed.matches('^').count();
+        assert!(
+            caret_width <= PRETTY_SNIPPET_WIDTH,
+            "caret width {caret_width} exceeds cap: {caret_displayed}",
+        );
+        assert!(caret_width >= 1, "wide span produced zero-width caret");
     }
 }

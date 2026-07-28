@@ -79,6 +79,9 @@ pub enum PlanError {
     OutsideRoot { path: PathBuf, root: PathBuf },
     /// A source or destination does not name a file.
     MissingFileName { path: PathBuf },
+    /// An entrypoint normalizes to the confinement root itself rather than a file
+    /// beneath it.
+    EntrypointIsRoot { path: PathBuf },
     /// The same normalized entrypoint was supplied more than once.
     DuplicateEntrypoint { path: PathBuf },
     /// An artifact would overwrite one of the input files.
@@ -115,6 +118,13 @@ impl fmt::Display for PlanError {
             ),
             Self::MissingFileName { path } => {
                 write!(f, "path does not name a file: {}", path.display())
+            }
+            Self::EntrypointIsRoot { path } => {
+                write!(
+                    f,
+                    "entrypoint is the output root, not a file: {}",
+                    path.display()
+                )
             }
             Self::DuplicateEntrypoint { path } => {
                 write!(f, "duplicate entrypoint: {}", path.display())
@@ -173,6 +183,9 @@ pub fn plan_outputs(request: PlanRequest<'_>) -> Result<OutputPlan, PlanError> {
     let mut source_set = BTreeSet::new();
     for entrypoint in request.entrypoints {
         let source = confined_path(&root, entrypoint)?;
+        if source == root {
+            return Err(PlanError::EntrypointIsRoot { path: source });
+        }
         require_file_name(&source)?;
         if !source_set.insert(source.clone()) {
             return Err(PlanError::DuplicateEntrypoint { path: source });
@@ -530,6 +543,28 @@ impl<E: std::error::Error + 'static> std::error::Error for PublishError<E> {
 
 const TEMP_ATTEMPTS: u32 = 128;
 
+/// Deterministic 64-bit seed for temporary-file names, derived from the destination
+/// path via FNV-1a. Distinct destinations in one directory get distinct temp names,
+/// avoiding spurious collisions, while the emitted basename length stays constant and
+/// independent of the destination basename length.
+fn temp_name_seed(destination: &Path) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for byte in destination.as_os_str().to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// Bounded temporary-file basename. Its length is fixed at 31 bytes (`.bamts-tmp-` +
+/// 16 hex digits + `-` + up to 3 attempt digits), so it never exceeds the portable
+/// 255-byte `NAME_MAX` regardless of how long the destination basename is.
+fn temp_file_name(seed: u64, attempt: u32) -> String {
+    format!(".bamts-tmp-{seed:016x}-{attempt}")
+}
+
 /// Publishes `contents` with the protocol:
 ///
 /// `create temp in destination directory -> write all -> fsync file -> rename -> fsync dir`.
@@ -542,23 +577,24 @@ pub fn publish_atomic<F: AtomicFs>(
     destination: &Path,
     contents: &[u8],
 ) -> Result<(), PublishError<F::Error>> {
-    let file_name = destination
+    if destination
         .file_name()
         .filter(|name| !name.is_empty())
-        .ok_or_else(|| PublishError::InvalidDestination {
+        .is_none()
+    {
+        return Err(PublishError::InvalidDestination {
             path: destination.to_path_buf(),
-        })?;
+        });
+    }
     let dir = destination
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
 
+    let name_seed = temp_name_seed(destination);
     let mut reserved = None;
     for attempt in 0..TEMP_ATTEMPTS {
-        let mut name = OsString::from(".");
-        name.push(file_name);
-        name.push(format!(".bamts.tmp.{attempt}"));
-        let path = dir.join(name);
+        let path = dir.join(temp_file_name(name_seed, attempt));
         match fs.create_new(&path) {
             Ok(CreateTemp::Created(file)) => {
                 reserved = Some((path, file));
@@ -632,12 +668,11 @@ pub fn publish_atomic<F: AtomicFs>(
         });
     }
 
-    fs.sync_dir(dir)
-        .map_err(|source| PublishError::Operation {
-            stage: PublishStage::SyncDirectory,
-            source,
-            cleanup: None,
-        })
+    fs.sync_dir(dir).map_err(|source| PublishError::Operation {
+        stage: PublishStage::SyncDirectory,
+        source,
+        cleanup: None,
+    })
 }
 
 #[cfg(test)]
@@ -674,12 +709,30 @@ mod tests {
         assert_eq!(
             actual,
             vec![
-                (ArtifactKind::JavaScript, Path::new("/workspace/dist/generated/src/main.mjs")),
-                (ArtifactKind::Declaration, Path::new("/workspace/dist/generated/src/main.d.mts")),
-                (ArtifactKind::SourceMap, Path::new("/workspace/dist/generated/src/main.mjs.map")),
-                (ArtifactKind::JavaScript, Path::new("/workspace/dist/generated/lib/util.cjs")),
-                (ArtifactKind::Declaration, Path::new("/workspace/dist/generated/lib/util.d.cts")),
-                (ArtifactKind::SourceMap, Path::new("/workspace/dist/generated/lib/util.cjs.map")),
+                (
+                    ArtifactKind::JavaScript,
+                    Path::new("/workspace/dist/generated/src/main.mjs")
+                ),
+                (
+                    ArtifactKind::Declaration,
+                    Path::new("/workspace/dist/generated/src/main.d.mts")
+                ),
+                (
+                    ArtifactKind::SourceMap,
+                    Path::new("/workspace/dist/generated/src/main.mjs.map")
+                ),
+                (
+                    ArtifactKind::JavaScript,
+                    Path::new("/workspace/dist/generated/lib/util.cjs")
+                ),
+                (
+                    ArtifactKind::Declaration,
+                    Path::new("/workspace/dist/generated/lib/util.d.cts")
+                ),
+                (
+                    ArtifactKind::SourceMap,
+                    Path::new("/workspace/dist/generated/lib/util.cjs.map")
+                ),
             ]
         );
     }
@@ -758,7 +811,10 @@ mod tests {
 
     #[test]
     fn rejects_normalized_output_collisions() {
-        let entries = vec![PathBuf::from("src/value.ts"), PathBuf::from("src/value.tsx")];
+        let entries = vec![
+            PathBuf::from("src/value.ts"),
+            PathBuf::from("src/value.tsx"),
+        ];
         let mut input = request(Path::new("/workspace"), &entries);
         input.output_dir = Some(Path::new("dist/a/../"));
 
@@ -831,7 +887,7 @@ mod tests {
         fn temporary_files(&self) -> Vec<&Path> {
             self.files
                 .keys()
-                .filter(|path| path.to_string_lossy().contains(".bamts.tmp."))
+                .filter(|path| path.to_string_lossy().contains(".bamts-tmp-"))
                 .map(PathBuf::as_path)
                 .collect()
         }
@@ -856,7 +912,9 @@ mod tests {
         fn write(&mut self, file: &mut Self::File, bytes: &[u8]) -> Result<usize, Self::Error> {
             self.calls.push(Call::Write(file.clone(), bytes.len()));
             if self.fail == Some(PublishStage::Write)
-                && self.fail_write_after.is_none_or(|limit| self.writes >= limit)
+                && self
+                    .fail_write_after
+                    .is_none_or(|limit| self.writes >= limit)
             {
                 return Err(FakeError::Injected(PublishStage::Write));
             }
@@ -1015,16 +1073,65 @@ mod tests {
     #[test]
     fn existing_temp_candidate_is_never_overwritten() {
         let mut fs = MemoryFs::new();
-        let occupied = PathBuf::from("/out/.program.js.bamts.tmp.0");
+        let destination = Path::new("/out/program.js");
+        let seed = temp_name_seed(destination);
+        let occupied = PathBuf::from("/out").join(temp_file_name(seed, 0));
         fs.files.insert(occupied.clone(), b"occupied".to_vec());
 
-        publish_atomic(&mut fs, Path::new("/out/program.js"), b"new").unwrap();
+        publish_atomic(&mut fs, destination, b"new").unwrap();
 
         assert_eq!(fs.files.get(&occupied).unwrap(), b"occupied");
+        let expected_second = PathBuf::from("/out").join(temp_file_name(seed, 1));
         assert!(matches!(
             fs.calls.as_slice(),
             [Call::Create(first), Call::Create(second), ..]
-                if first == &occupied && second == Path::new("/out/.program.js.bamts.tmp.1")
+                if first == &occupied && second == &expected_second
         ));
+    }
+
+    #[test]
+    fn rejects_entrypoint_normalizing_to_root() {
+        let root = PathBuf::from("/workspace");
+        for entrypoint in [
+            PathBuf::from("."),
+            PathBuf::from("/workspace"),
+            PathBuf::from("src/.."),
+        ] {
+            let entrypoints = [entrypoint.clone()];
+            let input = request(&root, &entrypoints);
+            assert!(
+                matches!(plan_outputs(input), Err(PlanError::EntrypointIsRoot { .. })),
+                "entrypoint {entrypoint:?} must be rejected as the confinement root"
+            );
+        }
+    }
+
+    #[test]
+    fn temp_name_stays_within_name_max_for_max_length_multibyte_destination() {
+        let mut fs = MemoryFs::new();
+        // 84 three-byte chars + ".js" == exactly 255 UTF-8 bytes: the portable NAME_MAX.
+        let basename = format!("{}.js", "好".repeat(84));
+        assert_eq!(basename.len(), 255);
+        let destination = PathBuf::from("/out").join(&basename);
+
+        publish_atomic(&mut fs, &destination, b"payload").unwrap();
+
+        assert_eq!(fs.files.get(&destination).unwrap(), b"payload");
+        assert!(fs.temporary_files().is_empty());
+        let Call::Create(first) = &fs.calls[0] else {
+            panic!("first publication call must reserve a temporary file");
+        };
+        let temp_name = first.file_name().unwrap().to_string_lossy();
+        assert!(
+            temp_name.len() <= 255,
+            "temp basename {temp_name:?} ({} bytes) exceeds NAME_MAX",
+            temp_name.len()
+        );
+        assert!(temp_name.starts_with(".bamts-tmp-"));
+        // Deterministic bounded scheme: constant basename, independent of the 255-byte
+        // destination basename.
+        assert_eq!(temp_name, temp_file_name(temp_name_seed(&destination), 0));
+        // Same-directory atomic rename: the temporary lives beside the destination.
+        assert_eq!(first.parent(), destination.parent());
     }
 }

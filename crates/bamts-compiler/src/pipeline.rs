@@ -103,13 +103,27 @@ impl FrontendOutput {
     /// Returns whether any diagnostic is an error.
     #[must_use]
     pub fn has_errors(&self) -> bool {
-        self.diagnostics.iter().any(|diagnostic| !diagnostic.is_warning())
+        self.diagnostics
+            .iter()
+            .any(|diagnostic| !diagnostic.is_warning())
     }
 
     /// Consumes the output into its parts.
     #[must_use]
-    pub fn into_parts(self) -> (SourceFile, SemanticModel, Option<EmitOutput>, Vec<Diagnostic>) {
-        (self.source_file, self.semantic_model, self.emit, self.diagnostics)
+    pub fn into_parts(
+        self,
+    ) -> (
+        SourceFile,
+        SemanticModel,
+        Option<EmitOutput>,
+        Vec<Diagnostic>,
+    ) {
+        (
+            self.source_file,
+            self.semantic_model,
+            self.emit,
+            self.diagnostics,
+        )
     }
 }
 
@@ -172,7 +186,7 @@ fn canonicalize(mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonicalize, compile_frontend, FrontendMode, FrontendRequest};
+    use super::{FrontendMode, FrontendRequest, canonicalize, compile_frontend};
     use crate::diagnostic::{Diagnostic, DiagnosticCode, DiagnosticSeverity};
     use crate::source::{ScriptKind, SourceId, SourceText, TextRange, Utf16Pos};
     use std::sync::Arc;
@@ -205,7 +219,8 @@ mod tests {
         // Warning (unchecked catch property access), a type error (string not
         // assignable to number), and a trailing syntax error (missing initializer)
         // all coexist in one source.
-        let source = "try {} catch (e) { e.message }\nconst n: number = \"oops\";\nconst bad: number =";
+        let source =
+            "try {} catch (e) { e.message }\nconst n: number = \"oops\";\nconst bad: number =";
         let output = compile_frontend(request(source, FrontendMode::Check));
         let diagnostics = output.diagnostics();
 
@@ -213,16 +228,20 @@ mod tests {
         assert!(has_code(diagnostics, "BAMTS-W005"), "warning stage missing");
         assert!(has_code(diagnostics, "BAMTS-C004"), "type stage missing");
         assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.severity() == DiagnosticSeverity::Error
-                    && diagnostic.code().as_str() != "BAMTS-C004"),
+            diagnostics.iter().any(
+                |diagnostic| diagnostic.severity() == DiagnosticSeverity::Error
+                    && diagnostic.code().as_str() != "BAMTS-C004"
+            ),
             "syntax stage missing",
         );
 
         // Both severities survive the merge.
         assert!(diagnostics.iter().any(Diagnostic::is_warning));
-        assert!(diagnostics.iter().any(|diagnostic| !diagnostic.is_warning()));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| !diagnostic.is_warning())
+        );
 
         // The single vector is canonically ordered and free of exact duplicates.
         assert!(is_sorted_unique(diagnostics), "diagnostics not canonical");
@@ -264,7 +283,6 @@ mod tests {
         assert_ne!(js_emit.code, declaration_emit.code);
     }
 
-
     #[test]
     fn canonicalize_collapses_exact_duplicates_and_preserves_distinct_ones() {
         let source_id = SourceId::new(0);
@@ -276,8 +294,12 @@ mod tests {
         // Distinct in range only.
         let elsewhere = Diagnostic::error(code, source_id, range(2, 3), "duplicate");
         // Distinct in code only.
-        let other_code =
-            Diagnostic::error(DiagnosticCode::new("BAMTS-C002"), source_id, range(0, 1), "duplicate");
+        let other_code = Diagnostic::error(
+            DiagnosticCode::new("BAMTS-C002"),
+            source_id,
+            range(0, 1),
+            "duplicate",
+        );
 
         let merged = canonicalize(vec![
             base.clone(),
@@ -299,7 +321,8 @@ mod tests {
 
     #[test]
     fn frontend_output_never_contains_duplicate_diagnostics() {
-        let source = "try {} catch (e) { e.message }\nconst n: number = \"oops\";\nconst bad: number =";
+        let source =
+            "try {} catch (e) { e.message }\nconst n: number = \"oops\";\nconst bad: number =";
         let output = compile_frontend(request(source, FrontendMode::JavaScript));
         assert!(is_sorted_unique(output.diagnostics()));
     }
