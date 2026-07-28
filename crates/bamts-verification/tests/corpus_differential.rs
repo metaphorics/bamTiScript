@@ -166,6 +166,8 @@ mod formatting_tests {
             stdout_truncated: false,
             stderr: Vec::new(),
             stderr_truncated: false,
+            compile_stderr: Vec::new(),
+            compile_stderr_truncated: false,
         }
     }
 
@@ -225,6 +227,8 @@ mod formatting_tests {
             stdout_truncated: false,
             stderr: Vec::new(),
             stderr_truncated: false,
+            compile_stderr: Vec::new(),
+            compile_stderr_truncated: false,
         };
         let actual = outcome(b"partial");
         let mut failures = Vec::new();

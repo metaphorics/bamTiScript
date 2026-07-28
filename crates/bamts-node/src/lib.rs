@@ -376,37 +376,101 @@ fn decode_aot_program(
 
 #[cfg(feature = "aot-main")]
 fn run_aot_main() -> i32 {
-    use std::io::Write;
-
     use bamts_native::linked_program;
     use bamts_runtime::{Limits, run_linked_program};
 
+    let mut host = NodeHost::new();
     let linked = match linked_program() {
         Ok(linked) => linked,
-        Err(_) => return 1,
+        Err(_) => return finish_aot_process(&host, AotCompletion::Failure(AotMainFailure::Link)),
     };
     let program = match decode_aot_program(linked.bytecode()) {
         Ok(program) => program,
-        Err(_) => return 1,
+        Err(_) => return finish_aot_process(&host, AotCompletion::Failure(AotMainFailure::Decode)),
     };
-    let mut host = NodeHost::new();
-    if initialize_aot_process_context(&mut host, std::env::args_os(), std::env::vars_os()).is_err()
+    if let Err(error) =
+        initialize_aot_process_context(&mut host, std::env::args_os(), std::env::vars_os())
     {
-        return 1;
+        return finish_aot_process(&host, AotCompletion::Failure(AotMainFailure::Context(error)));
     }
     let outcome = match run_linked_program(&program, &linked, &mut host, &Limits::default()) {
         Ok(outcome) => outcome,
-        Err(_) => return 1,
+        Err(_) => return finish_aot_process(&host, AotCompletion::Failure(AotMainFailure::Runtime)),
     };
+    finish_aot_process(&host, AotCompletion::Success(&outcome))
+}
+
+#[cfg(any(feature = "aot-main", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AotMainFailure {
+    Link,
+    Decode,
+    Context(AotProcessContextError),
+    Runtime,
+}
+
+#[cfg(any(feature = "aot-main", test))]
+impl std::fmt::Display for AotMainFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Link => formatter.write_str("aot link"),
+            Self::Decode => formatter.write_str("aot decode"),
+            Self::Context(AotProcessContextError::Argument) => {
+                formatter.write_str("aot context argument")
+            }
+            Self::Context(AotProcessContextError::EnvironmentName) => {
+                formatter.write_str("aot context environment name")
+            }
+            Self::Context(AotProcessContextError::EnvironmentValue) => {
+                formatter.write_str("aot context environment value")
+            }
+            Self::Runtime => formatter.write_str("aot runtime"),
+        }
+    }
+}
+
+#[cfg(any(feature = "aot-main", test))]
+enum AotCompletion<'a> {
+    Success(&'a bamts_runtime::ExecutionOutcome),
+    Failure(AotMainFailure),
+}
+
+/// Emits each buffered host stream once; host stderr is flushed before return.
+#[cfg(any(feature = "aot-main", test))]
+fn write_aot_completion(
+    host: &NodeHost,
+    completion: AotCompletion<'_>,
+    stdout: &mut impl std::io::Write,
+    stderr: &mut impl std::io::Write,
+) -> std::io::Result<i32> {
+    stdout.write_all(host.stdout())?;
+    let (exit_code, failure) = match completion {
+        AotCompletion::Success(outcome) => {
+            stdout.write_all(&outcome.stdout)?;
+            (
+                if host.exit_code() == 0 {
+                    outcome.exit_code
+                } else {
+                    host.exit_code()
+                },
+                None,
+            )
+        }
+        AotCompletion::Failure(error) => (1, Some(error)),
+    };
+    stderr.write_all(host.stderr())?;
+    if let Some(error) = failure {
+        writeln!(stderr, "bamts: {error}")?;
+    }
+    stderr.flush()?;
+    Ok(exit_code)
+}
+
+#[cfg(feature = "aot-main")]
+fn finish_aot_process(host: &NodeHost, completion: AotCompletion<'_>) -> i32 {
     let mut stdout = std::io::stdout().lock();
-    if stdout.write_all(host.stdout()).is_err() || stdout.write_all(&outcome.stdout).is_err() {
-        return 1;
-    }
-    if host.exit_code() == 0 {
-        outcome.exit_code
-    } else {
-        host.exit_code()
-    }
+    let mut stderr = std::io::stderr().lock();
+    write_aot_completion(host, completion, &mut stdout, &mut stderr).unwrap_or(1)
 }
 
 /// C process entry for a linked BamTS AOT image.
@@ -418,7 +482,7 @@ pub extern "C" fn main() -> i32 {
 }
 
 #[cfg(any(feature = "aot-main", test))]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AotProcessContextError {
     Argument,
     EnvironmentName,
@@ -577,6 +641,77 @@ mod tests {
         assert_eq!(host.argv(), ["bamts", "/tmp/program", "--flag"]);
         assert_eq!(host.env("ALPHA"), Some("first"));
         assert_eq!(host.env("ZED"), Some("last"));
+    }
+
+    #[test]
+    fn aot_runtime_failure_emits_host_stderr_and_stable_error() {
+        let mut host = NodeHost::new();
+        Host::write_stdout(&mut host, b"before failure");
+        Host::write_stderr(&mut host, b"host diagnostic\n");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit_code = write_aot_completion(
+            &host,
+            AotCompletion::Failure(AotMainFailure::Runtime),
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("completion writes");
+
+        assert_eq!(exit_code, 1);
+        assert_eq!(stdout, b"before failure");
+        assert_eq!(stderr, b"host diagnostic\nbamts: aot runtime\n");
+    }
+
+    #[test]
+    fn aot_failure_labels_are_stable() {
+        assert_eq!(AotMainFailure::Link.to_string(), "aot link");
+        assert_eq!(AotMainFailure::Decode.to_string(), "aot decode");
+        assert_eq!(
+            AotMainFailure::Context(AotProcessContextError::Argument).to_string(),
+            "aot context argument"
+        );
+    }
+
+    #[test]
+    fn aot_success_preserves_host_and_runtime_output_and_exit_precedence() {
+        let mut host = NodeHost::new();
+        Host::write_stdout(&mut host, b"host stdout");
+        Host::write_stderr(&mut host, b"host stderr");
+        let outcome = bamts_runtime::ExecutionOutcome {
+            stdout: b"runtime stdout".to_vec(),
+            exit_code: 7,
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit_code = write_aot_completion(
+            &host,
+            AotCompletion::Success(&outcome),
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("completion writes");
+
+        assert_eq!(exit_code, 7);
+        assert_eq!(stdout, b"host stdoutruntime stdout");
+        assert_eq!(stderr, b"host stderr");
+
+        Host::set_exit_code(&mut host, 11);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit_code = write_aot_completion(
+            &host,
+            AotCompletion::Success(&outcome),
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("completion writes");
+
+        assert_eq!(exit_code, 11);
+        assert_eq!(stdout, b"host stdoutruntime stdout");
+        assert_eq!(stderr, b"host stderr");
     }
 
     #[cfg(unix)]

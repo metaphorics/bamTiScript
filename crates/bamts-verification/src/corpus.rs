@@ -456,7 +456,8 @@ pub struct OracleLimits {
 /// The captured result of running a case under the Node oracle.
 ///
 /// The parity key is `(stdout, exit_code)` per the manifest's `compare` set.
-/// `stderr` is retained as evidence and is never part of the parity key.
+/// `stderr` is retained as executable evidence and is never part of the parity key.
+/// AOT compilation diagnostics are retained separately for diagnosis.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OracleOutcome {
     pub timed_out: bool,
@@ -466,6 +467,8 @@ pub struct OracleOutcome {
     pub stdout_truncated: bool,
     pub stderr: Vec<u8>,
     pub stderr_truncated: bool,
+    pub compile_stderr: Vec<u8>,
+    pub compile_stderr_truncated: bool,
 }
 
 impl OracleOutcome {
@@ -826,18 +829,12 @@ impl BamtsRunner {
             Some(&executable),
         )
         .map_err(|error| corpus_stage_error(CorpusStage::Resolve, error))?;
-        let started = Instant::now();
+        // Compilation is an in-process, unbounded prerequisite: the driver does
+        // not expose a killable child boundary. Only the observed executable is
+        // subject to the case execution budget.
         let compile =
             driver::execute(&args).map_err(|error| cli_error(spec, ExecutionMode::Aot, error))?;
-        let elapsed = started.elapsed();
-        if elapsed >= spec.timeout() {
-            return Ok(driver_outcome(compile, true, self.max_output_bytes));
-        }
-
-        let limits = OracleLimits {
-            timeout: spec.timeout() - elapsed,
-            max_output_bytes: self.max_output_bytes,
-        };
+        let limits = aot_execution_limits(spec, self.max_output_bytes);
         let mut outcome = run_process(
             "BamTS AOT executable",
             &executable,
@@ -847,14 +844,29 @@ impl BamtsRunner {
             &limits,
         )
         .map_err(|error| corpus_stage_error(CorpusStage::Spawn, error))?;
-        if !compile.stderr.is_empty() {
-            let remaining = self.max_output_bytes.saturating_sub(outcome.stderr.len());
-            let take = remaining.min(compile.stderr.len());
-            outcome.stderr.extend_from_slice(&compile.stderr[..take]);
-            outcome.stderr_truncated |= take < compile.stderr.len();
-        }
-        Ok(outcome)
+        Ok(with_aot_compile_evidence(
+            outcome,
+            compile.stderr,
+            self.max_output_bytes,
+        ))
     }
+}
+
+fn aot_execution_limits(spec: &CaseSpec, max_output_bytes: usize) -> OracleLimits {
+    OracleLimits {
+        timeout: spec.timeout(),
+        max_output_bytes,
+    }
+}
+
+fn with_aot_compile_evidence(
+    mut runtime: OracleOutcome,
+    compile_stderr: Vec<u8>,
+    max_output_bytes: usize,
+) -> OracleOutcome {
+    (runtime.compile_stderr, runtime.compile_stderr_truncated) =
+        bounded_output(compile_stderr, max_output_bytes);
+    runtime
 }
 
 fn cli_args(
@@ -882,12 +894,8 @@ fn cli_args(
 }
 
 fn driver_outcome(outcome: driver::CommandOutcome, timed_out: bool, cap: usize) -> OracleOutcome {
-    let mut stdout = outcome.stdout;
-    let mut stderr = outcome.stderr;
-    let stdout_truncated = stdout.len() > cap;
-    let stderr_truncated = stderr.len() > cap;
-    stdout.truncate(cap);
-    stderr.truncate(cap);
+    let (stdout, stdout_truncated) = bounded_output(outcome.stdout, cap);
+    let (stderr, stderr_truncated) = bounded_output(outcome.stderr, cap);
     OracleOutcome {
         timed_out,
         exit_code: Some(outcome.exit_code),
@@ -896,7 +904,15 @@ fn driver_outcome(outcome: driver::CommandOutcome, timed_out: bool, cap: usize) 
         stdout_truncated,
         stderr,
         stderr_truncated,
+        compile_stderr: Vec::new(),
+        compile_stderr_truncated: false,
     }
+}
+
+fn bounded_output(mut output: Vec<u8>, cap: usize) -> (Vec<u8>, bool) {
+    let truncated = output.len() > cap;
+    output.truncate(cap);
+    (output, truncated)
 }
 
 struct ArtifactDirectory(PathBuf);
@@ -1077,6 +1093,8 @@ fn run_process(
         stdout_truncated,
         stderr,
         stderr_truncated,
+        compile_stderr: Vec::new(),
+        compile_stderr_truncated: false,
     })
 }
 
@@ -1904,6 +1922,48 @@ mod tests {
     }
 
     #[test]
+    fn aot_executable_uses_the_full_case_timeout() {
+        let spec = CaseSpec {
+            id: "aot-budget".into(),
+            repository: "https://example.com/aot-budget".into(),
+            commit: "a".repeat(40),
+            license: "MIT".into(),
+            source_dir: "corpus/projects/aot-budget".into(),
+            entrypoint: "corpus/cases/aot-budget.ts".into(),
+            node_args: Vec::new(),
+            expected_timeout_ms: 250,
+            constructs: Vec::new(),
+            source_files: Vec::new(),
+        };
+
+        let limits = aot_execution_limits(&spec, 123);
+        assert_eq!(limits.timeout, Duration::from_millis(250));
+        assert_eq!(limits.max_output_bytes, 123);
+    }
+
+    #[test]
+    fn aot_compile_evidence_cannot_fake_a_successful_timeout_exit() {
+        let runtime = OracleOutcome {
+            timed_out: true,
+            exit_code: None,
+            signal: Some(9),
+            stdout: b"runtime stdout".to_vec(),
+            stdout_truncated: false,
+            stderr: b"runtime stderr".to_vec(),
+            stderr_truncated: false,
+            compile_stderr: Vec::new(),
+            compile_stderr_truncated: false,
+        };
+
+        let outcome = with_aot_compile_evidence(runtime, b"compile warning".to_vec(), 128);
+        assert!(outcome.timed_out);
+        assert_eq!(outcome.exit_code, None);
+        assert_eq!(outcome.stdout, b"runtime stdout");
+        assert_eq!(outcome.stderr, b"runtime stderr");
+        assert_eq!(outcome.compile_stderr, b"compile warning");
+    }
+
+    #[test]
     fn oracle_treats_stderr_as_evidence_not_parity() {
         let dir = scratch("stderr");
         let outcome = run_script(
@@ -1930,6 +1990,8 @@ mod tests {
             stdout_truncated: false,
             stderr: Vec::new(),
             stderr_truncated: false,
+            compile_stderr: Vec::new(),
+            compile_stderr_truncated: false,
         };
 
         // Two clean, identical runs agree.
@@ -1948,6 +2010,8 @@ mod tests {
             stdout_truncated: false,
             stderr: Vec::new(),
             stderr_truncated: false,
+            compile_stderr: Vec::new(),
+            compile_stderr_truncated: false,
         };
         assert!(!killed.is_reliable());
         assert!(!killed.parity_matches(&killed));
@@ -1961,6 +2025,8 @@ mod tests {
             stdout_truncated: true,
             stderr: Vec::new(),
             stderr_truncated: false,
+            compile_stderr: Vec::new(),
+            compile_stderr_truncated: false,
         };
         assert!(!truncated.is_reliable());
         assert!(!truncated.parity_matches(&truncated));
