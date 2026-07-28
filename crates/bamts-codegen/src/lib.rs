@@ -38,8 +38,19 @@
 //! Every access derives the byte offset as `i64::from(register.get()) * 8`; the
 //! validation pass ([`validate_slots`]) proves this offset fits the `Offset32`
 //! used by loads and stores, so `u32` register ids and CLIF addresses never mix
-//! widths inconsistently. Call/construct argument windows compute a pointer
-//! `handles + args_start * 8` the same way.
+//! widths inconsistently. This holds for register ids well past 127: a slot
+//! offset is a full 32-bit displacement, not a signed byte.
+//!
+//! # Dynamic operands: no fixed windows, no constant-keyed properties
+//!
+//! The production ISA carries no fixed argument window and no constant-keyed
+//! property access. Calls and constructs take a single **arguments array** in a
+//! register (`Call`/`Construct` `arguments`), so spread and any arity flow
+//! through one `Value` handle with no pointer arithmetic. Property access takes
+//! its **key from a register** (`GetProperty`/`SetProperty`/`DeleteProperty`
+//! `key`), a `Value` the runtime coerces to a property key (string, symbol, or
+//! private name). Closures capture through an array register
+//! (`CreateClosure` `captures`), again a single `Value` handle.
 //!
 //! # Value semantics: the explicit helper ABI
 //!
@@ -56,35 +67,64 @@
 //! `fn(frame, <operands…>, out: *mut Completion) -> u32(tag)`. On
 //! `Normal` (0) the result is in `out.value`; on `Throw` the thrown handle is in
 //! `out.value` and control routes to a covering handler; `FatalTrap` always
-//! propagates to the runtime. [`Helper::Truthy`] is the sole exception: coercion
-//! to boolean is total and cannot throw, so it returns the truth value directly
-//! as `0`/`1` and never a completion.
+//! propagates to the runtime. Two exceptions to the "result in `out.value`"
+//! rule:
+//!
+//! * [`Helper::Truthy`] performs the total ToBoolean coercion and returns the
+//!   truth value directly as `0`/`1`; it never writes `out` and never throws.
+//! * [`Helper::IteratorNext`] writes **two** registers — it receives the `done`
+//!   and `value` register indices and, on `Normal`, writes both slots in the
+//!   frame directly (a single completion channel cannot carry two results);
+//!   `out.value` is used only to carry a thrown handle on `Throw`.
+//!
+//! A subset of the completion helpers is **total** (`Normal` only, never
+//! `Throw`/`FatalTrap`): [`Helper::TypeOfGlobal`], [`Helper::LoadThis`],
+//! [`Helper::LoadArguments`], [`Helper::LoadNewTarget`], and
+//! [`Helper::CreatePrivateName`]. They still use the completion ABI (result in
+//! `out.value`) but their abnormal edge is unreachable, so they never mark a
+//! handler block reachable.
 //!
 //! ## Opcode ledger (every variant has an explicit path)
 //!
-//! | Opcode           | Lowering                                                   |
-//! |------------------|-----------------------------------------------------------|
-//! | `LoadConst`      | [`Helper::LoadConstant`] by `ConstantId` → `dst`          |
-//! | `Move`           | inline copy `handles[src]` → `handles[dst]`               |
-//! | `Unary`          | [`Helper::Unary`] with the operator selector             |
-//! | `Binary`         | [`Helper::Binary`] with the operator selector            |
-//! | `CreateObject`   | [`Helper::CreateObject`] → `dst`                          |
-//! | `CreateArray`    | [`Helper::CreateArray`] → `dst`                           |
-//! | `DefineFunction` | [`Helper::DefineFunction`] by `FunctionId` → `dst`        |
-//! | `GetProperty`    | [`Helper::GetProperty`] (`object`, string-`key`) → `dst`  |
-//! | `SetProperty`    | [`Helper::SetProperty`] (`object`, string-`key`, `value`) |
-//! | `DeleteProperty` | [`Helper::DeleteProperty`] (`object`, string-`key`) → dst |
-//! | `Call`           | [`Helper::Call`] (`callee`, `this`, arg window) → `dst`   |
-//! | `Construct`      | [`Helper::Construct`] (`callee`, arg window) → `dst`      |
-//! | `Import`         | [`Helper::Import`] by string-`specifier` → `dst`          |
-//! | `Jump`           | unconditional branch                                      |
-//! | `JumpIfTrue`     | [`Helper::Truthy`] then conditional branch                |
-//! | `JumpIfFalse`    | [`Helper::Truthy`] then conditional branch                |
-//! | `Return`         | `handles[value]` → `out.value`, return `Normal`           |
-//! | `Throw`          | route to covering handler (bind `catch_register`) or      |
-//! |                  | `out.value` + return `Throw`                              |
-//! | `Suspend`        | yield path + resume path via [`Helper::ResumeValue`]      |
-//! | `Halt`           | `undefined` → `out.value`, return `Normal`                |
+//! | Opcode              | Lowering                                                     |
+//! |---------------------|-------------------------------------------------------------|
+//! | `LoadConst`         | [`Helper::LoadConstant`] by `ConstantId` → `dst`            |
+//! | `Move`              | inline copy `handles[src]` → `handles[dst]`                 |
+//! | `Unary`             | [`Helper::Unary`] with the operator selector               |
+//! | `Binary`            | [`Helper::Binary`] with the operator selector              |
+//! | `CreateObject`      | [`Helper::CreateObject`] → `dst`                            |
+//! | `CreateArray`       | [`Helper::CreateArray`] → `dst`                             |
+//! | `CreateClosure`     | [`Helper::CreateClosure`] (`function`, `captures` array)→dst|
+//! | `GetProperty`       | [`Helper::GetProperty`] (`object`, register `key`) → `dst`  |
+//! | `SetProperty`       | [`Helper::SetProperty`] (`object`, register `key`, `value`) |
+//! | `DeleteProperty`    | [`Helper::DeleteProperty`] (`object`, register `key`) → dst |
+//! | `DefineAccessor`    | [`Helper::DefineAccessor`] (`object`, `key`, `accessor`, kind)|
+//! | `Call`              | [`Helper::Call`] (`callee`, `this`, `arguments` array) → dst|
+//! | `Construct`         | [`Helper::Construct`] (`callee`, `arguments` array) → `dst` |
+//! | `LoadGlobal`        | [`Helper::LoadGlobal`] by string `name` → `dst`            |
+//! | `StoreGlobal`       | [`Helper::StoreGlobal`] (string `name`, `value`)          |
+//! | `TypeOfGlobal`      | [`Helper::TypeOfGlobal`] by string `name` → `dst` (total)  |
+//! | `LoadThis`          | [`Helper::LoadThis`] → `dst` (total)                       |
+//! | `LoadArguments`     | [`Helper::LoadArguments`] → `dst` (total)                  |
+//! | `LoadNewTarget`     | [`Helper::LoadNewTarget`] → `dst` (total)                  |
+//! | `ArrayPush`         | [`Helper::ArrayPush`] (`array`, `value`)                   |
+//! | `ArrayExtend`       | [`Helper::ArrayExtend`] (`array`, `iterable`)              |
+//! | `ObjectSpread`      | [`Helper::ObjectSpread`] (`target`, `source`)             |
+//! | `SetPrototype`      | [`Helper::SetPrototype`] (`object`, `prototype`)          |
+//! | `CreatePrivateName` | [`Helper::CreatePrivateName`] by `description` → dst (total)|
+//! | `CreateRegExp`      | [`Helper::CreateRegExp`] (`pattern`, `flags`) → `dst`      |
+//! | `GetIterator`       | [`Helper::GetIterator`] (`src`, kind) → `dst`             |
+//! | `IteratorNext`      | [`Helper::IteratorNext`] (`iterator`) → `done` + `value`   |
+//! | `Import`            | [`Helper::Import`] by string `specifier` → `dst`          |
+//! | `Export`            | [`Helper::Export`] (string `name`, `src`)                 |
+//! | `Jump`              | unconditional branch                                       |
+//! | `JumpIfTrue`        | [`Helper::Truthy`] then conditional branch                |
+//! | `JumpIfFalse`       | [`Helper::Truthy`] then conditional branch                |
+//! | `Return`            | `handles[value]` → `out.value`, return `Normal`           |
+//! | `Throw`             | route to covering handler (bind `catch_register`) or       |
+//! |                     | `out.value` + return `Throw`                              |
+//! | `Suspend`           | yield path + resume path via [`Helper::ResumeValue`]      |
+//! | `Halt`              | `undefined` → `out.value`, return `Normal`               |
 //!
 //! No opcode is silently dropped and none is lowered to a placeholder no-op.
 //!
@@ -126,7 +166,8 @@ use std::error::Error;
 use std::fmt;
 
 use bamts_bytecode::{
-    BinaryOp, ExceptionHandler, FunctionId, Instruction, Module, Pc, Register, UnaryOp, Verified,
+    AccessorKind, BinaryOp, ExceptionHandler, FunctionId, Instruction, IteratorKind, Module, Pc,
+    Register, UnaryOp, Verified,
 };
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
@@ -194,11 +235,48 @@ const _: () = {
 /// A runtime routine the lowered code calls but does not define. Backends
 /// resolve each [`Helper::symbol`] to an address (JIT) or relocation (AOT).
 ///
-/// Every helper except [`Helper::Truthy`] follows the completion ABI
-/// `fn(frame, <operands…>, out) -> tag`: it writes its result (or, on `Throw`,
-/// the error handle) into `*out` and returns a `bamts_native::CompletionTag`.
-/// [`Helper::Truthy`] performs the total ToBoolean coercion and returns `0`/`1`
-/// directly, never a completion.
+/// # Stable helper table
+///
+/// The variant order below is the canonical `external_index` order and the
+/// public contract a backend and the runtime link against. `frame` (`i64`)
+/// leads and `out` (`*mut Completion`, `i64`) trails every completion helper;
+/// runtime `Value`s are `i64`; small integer selectors and indices are `i32`.
+///
+/// | idx | variant             | params after `frame` (before `out`)          |
+/// |-----|---------------------|----------------------------------------------|
+/// |  0  | `LoadConstant`      | `const_id: i32`                              |
+/// |  1  | `Unary`             | `op: i32, operand: i64`                      |
+/// |  2  | `Binary`            | `op: i32, left: i64, right: i64`            |
+/// |  3  | `CreateObject`      | —                                            |
+/// |  4  | `CreateArray`       | —                                            |
+/// |  5  | `CreateClosure`     | `function_id: i32, captures: i64`           |
+/// |  6  | `GetProperty`       | `object: i64, key: i64`                     |
+/// |  7  | `SetProperty`       | `object: i64, key: i64, value: i64`         |
+/// |  8  | `DeleteProperty`    | `object: i64, key: i64`                     |
+/// |  9  | `Call`              | `callee: i64, this: i64, arguments: i64`    |
+/// | 10  | `Construct`         | `callee: i64, arguments: i64`               |
+/// | 11  | `Import`            | `specifier: i32`                            |
+/// | 12  | `Truthy`            | `value: i64` → `i32` (no `out`, total)      |
+/// | 13  | `ResumeValue`       | —                                            |
+/// | 14  | `DefineAccessor`    | `object: i64, key: i64, accessor: i64, kind: i32` |
+/// | 15  | `LoadGlobal`        | `name: i32`                                 |
+/// | 16  | `StoreGlobal`       | `name: i32, value: i64`                     |
+/// | 17  | `TypeOfGlobal`      | `name: i32` (total)                         |
+/// | 18  | `LoadThis`          | — (total)                                   |
+/// | 19  | `LoadArguments`     | — (total)                                   |
+/// | 20  | `LoadNewTarget`     | — (total)                                   |
+/// | 21  | `ArrayPush`         | `array: i64, value: i64`                    |
+/// | 22  | `ArrayExtend`       | `array: i64, iterable: i64`                 |
+/// | 23  | `ObjectSpread`      | `target: i64, source: i64`                  |
+/// | 24  | `SetPrototype`      | `object: i64, prototype: i64`               |
+/// | 25  | `CreatePrivateName` | `description: i32` (total)                  |
+/// | 26  | `CreateRegExp`      | `pattern: i32, flags: i32`                  |
+/// | 27  | `GetIterator`       | `src: i64, kind: i32`                        |
+/// | 28  | `IteratorNext`      | `iterator: i64, done_reg: i32, value_reg: i32` (two-write) |
+/// | 29  | `Export`            | `name: i32, src: i64`                        |
+///
+/// Every helper except [`Helper::Truthy`] returns a
+/// `bamts_native::CompletionTag`. [`Helper::Truthy`] returns `0`/`1`.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Helper {
     /// `bamts_load_constant(frame, const_id, out)`: materialize the module
@@ -214,22 +292,24 @@ pub enum Helper {
     CreateObject,
     /// `bamts_create_array(frame, out)`: fresh empty array into `out.value`.
     CreateArray,
-    /// `bamts_define_function(frame, function_id, out)`: closure over the named
-    /// function into `out.value`.
-    DefineFunction,
+    /// `bamts_create_closure(frame, function_id, captures, out)`: materialize a
+    /// closure over the named function, binding the captured cells held in the
+    /// `captures` array value, into `out.value`. The runtime reads the callee's
+    /// `capture_count` to copy the leading capture registers.
+    CreateClosure,
     /// `bamts_get_property(frame, object, key, out)`: `out.value = object[key]`,
-    /// `key` naming a string constant.
+    /// with `key` a runtime value coerced to a property key.
     GetProperty,
     /// `bamts_set_property(frame, object, key, value, out)`: `object[key] = value`.
     SetProperty,
     /// `bamts_delete_property(frame, object, key, out)`:
     /// `out.value = delete object[key]`.
     DeleteProperty,
-    /// `bamts_call(frame, callee, this, args, arg_count, out)`: call `callee`
-    /// with receiver `this` over the `arg_count` values at `args`.
+    /// `bamts_call(frame, callee, this, arguments, out)`: call `callee` with
+    /// receiver `this` over the dynamic `arguments` array value.
     Call,
-    /// `bamts_construct(frame, callee, args, arg_count, out)`: construct with
-    /// `callee` over the `arg_count` values at `args`.
+    /// `bamts_construct(frame, callee, arguments, out)`: construct with `callee`
+    /// over the dynamic `arguments` array value.
     Construct,
     /// `bamts_import(frame, specifier, out)`: import the module named by the
     /// string constant `specifier` into `out.value`.
@@ -243,6 +323,54 @@ pub enum Helper {
     /// entry ABI (see the crate docs); may return `Throw` (`generator.throw`)
     /// or `FatalTrap`.
     ResumeValue,
+    /// `bamts_define_accessor(frame, object, key, accessor, kind, out)`: install
+    /// a getter or setter (`kind`, see [`accessor_kind_selector`]) under `key`.
+    DefineAccessor,
+    /// `bamts_load_global(frame, name, out)`: `out.value = globalThis[name]`;
+    /// throws a `ReferenceError` for an undeclared global.
+    LoadGlobal,
+    /// `bamts_store_global(frame, name, value, out)`: `globalThis[name] = value`.
+    StoreGlobal,
+    /// `bamts_typeof_global(frame, name, out)`: `out.value = typeof
+    /// globalThis[name]`; total, yielding `"undefined"` for an undeclared global.
+    TypeOfGlobal,
+    /// `bamts_load_this(frame, out)`: load the `this` binding into `out.value`.
+    /// Total.
+    LoadThis,
+    /// `bamts_load_arguments(frame, out)`: load the `arguments` object into
+    /// `out.value`. Total.
+    LoadArguments,
+    /// `bamts_load_new_target(frame, out)`: load `new.target` into `out.value`.
+    /// Total.
+    LoadNewTarget,
+    /// `bamts_array_push(frame, array, value, out)`: append `value` to `array`.
+    ArrayPush,
+    /// `bamts_array_extend(frame, array, iterable, out)`: spread `iterable` onto
+    /// the end of `array`.
+    ArrayExtend,
+    /// `bamts_object_spread(frame, target, source, out)`: copy the own
+    /// enumerable properties of `source` onto `target`.
+    ObjectSpread,
+    /// `bamts_set_prototype(frame, object, prototype, out)`: set the
+    /// `[[Prototype]]` of `object`.
+    SetPrototype,
+    /// `bamts_create_private_name(frame, description, out)`: create a fresh
+    /// private name into `out.value`. Total.
+    CreatePrivateName,
+    /// `bamts_create_regexp(frame, pattern, flags, out)`: build a `RegExp` from
+    /// the string-constant `pattern` and `flags` into `out.value`.
+    CreateRegExp,
+    /// `bamts_get_iterator(frame, src, kind, out)`: acquire an iterator over
+    /// `src` using protocol `kind` (see [`iterator_kind_selector`]).
+    GetIterator,
+    /// `bamts_iterator_next(frame, iterator, done_reg, value_reg, out)`: advance
+    /// `iterator`, writing the done flag into `handles[done_reg]` and the
+    /// produced value into `handles[value_reg]` directly (two writes). On
+    /// `Throw`, the thrown handle is in `out.value` and neither slot is written.
+    IteratorNext,
+    /// `bamts_export(frame, name, src, out)`: export the local value `src` under
+    /// the string constant `name`.
+    Export,
 }
 
 impl Helper {
@@ -255,7 +383,7 @@ impl Helper {
             Helper::Binary => "bamts_binary",
             Helper::CreateObject => "bamts_create_object",
             Helper::CreateArray => "bamts_create_array",
-            Helper::DefineFunction => "bamts_define_function",
+            Helper::CreateClosure => "bamts_create_closure",
             Helper::GetProperty => "bamts_get_property",
             Helper::SetProperty => "bamts_set_property",
             Helper::DeleteProperty => "bamts_delete_property",
@@ -264,6 +392,22 @@ impl Helper {
             Helper::Import => "bamts_import",
             Helper::Truthy => "bamts_truthy",
             Helper::ResumeValue => "bamts_resume_value",
+            Helper::DefineAccessor => "bamts_define_accessor",
+            Helper::LoadGlobal => "bamts_load_global",
+            Helper::StoreGlobal => "bamts_store_global",
+            Helper::TypeOfGlobal => "bamts_typeof_global",
+            Helper::LoadThis => "bamts_load_this",
+            Helper::LoadArguments => "bamts_load_arguments",
+            Helper::LoadNewTarget => "bamts_load_new_target",
+            Helper::ArrayPush => "bamts_array_push",
+            Helper::ArrayExtend => "bamts_array_extend",
+            Helper::ObjectSpread => "bamts_object_spread",
+            Helper::SetPrototype => "bamts_set_prototype",
+            Helper::CreatePrivateName => "bamts_create_private_name",
+            Helper::CreateRegExp => "bamts_create_regexp",
+            Helper::GetIterator => "bamts_get_iterator",
+            Helper::IteratorNext => "bamts_iterator_next",
+            Helper::Export => "bamts_export",
         }
     }
 
@@ -277,7 +421,7 @@ impl Helper {
             Helper::Binary => 2,
             Helper::CreateObject => 3,
             Helper::CreateArray => 4,
-            Helper::DefineFunction => 5,
+            Helper::CreateClosure => 5,
             Helper::GetProperty => 6,
             Helper::SetProperty => 7,
             Helper::DeleteProperty => 8,
@@ -286,6 +430,22 @@ impl Helper {
             Helper::Import => 11,
             Helper::Truthy => 12,
             Helper::ResumeValue => 13,
+            Helper::DefineAccessor => 14,
+            Helper::LoadGlobal => 15,
+            Helper::StoreGlobal => 16,
+            Helper::TypeOfGlobal => 17,
+            Helper::LoadThis => 18,
+            Helper::LoadArguments => 19,
+            Helper::LoadNewTarget => 20,
+            Helper::ArrayPush => 21,
+            Helper::ArrayExtend => 22,
+            Helper::ObjectSpread => 23,
+            Helper::SetPrototype => 24,
+            Helper::CreatePrivateName => 25,
+            Helper::CreateRegExp => 26,
+            Helper::GetIterator => 27,
+            Helper::IteratorNext => 28,
+            Helper::Export => 29,
         }
     }
 
@@ -299,7 +459,7 @@ impl Helper {
             2 => Some(Helper::Binary),
             3 => Some(Helper::CreateObject),
             4 => Some(Helper::CreateArray),
-            5 => Some(Helper::DefineFunction),
+            5 => Some(Helper::CreateClosure),
             6 => Some(Helper::GetProperty),
             7 => Some(Helper::SetProperty),
             8 => Some(Helper::DeleteProperty),
@@ -308,6 +468,22 @@ impl Helper {
             11 => Some(Helper::Import),
             12 => Some(Helper::Truthy),
             13 => Some(Helper::ResumeValue),
+            14 => Some(Helper::DefineAccessor),
+            15 => Some(Helper::LoadGlobal),
+            16 => Some(Helper::StoreGlobal),
+            17 => Some(Helper::TypeOfGlobal),
+            18 => Some(Helper::LoadThis),
+            19 => Some(Helper::LoadArguments),
+            20 => Some(Helper::LoadNewTarget),
+            21 => Some(Helper::ArrayPush),
+            22 => Some(Helper::ArrayExtend),
+            23 => Some(Helper::ObjectSpread),
+            24 => Some(Helper::SetPrototype),
+            25 => Some(Helper::CreatePrivateName),
+            26 => Some(Helper::CreateRegExp),
+            27 => Some(Helper::GetIterator),
+            28 => Some(Helper::IteratorNext),
+            29 => Some(Helper::Export),
             _ => None,
         }
     }
@@ -324,19 +500,27 @@ impl Helper {
             // (frame, op, left, right, out)
             Helper::Binary => &[types::I64, types::I32, types::I64, types::I64, types::I64],
             // (frame, out)
-            Helper::CreateObject | Helper::CreateArray | Helper::ResumeValue => {
-                &[types::I64, types::I64]
-            }
+            Helper::CreateObject
+            | Helper::CreateArray
+            | Helper::ResumeValue
+            | Helper::LoadThis
+            | Helper::LoadArguments
+            | Helper::LoadNewTarget => &[types::I64, types::I64],
             // (frame, index, out)
-            Helper::DefineFunction | Helper::Import => &[types::I64, types::I32, types::I64],
+            Helper::Import
+            | Helper::LoadGlobal
+            | Helper::TypeOfGlobal
+            | Helper::CreatePrivateName => &[types::I64, types::I32, types::I64],
+            // (frame, function_id, captures, out)
+            Helper::CreateClosure => &[types::I64, types::I32, types::I64, types::I64],
             // (frame, object, key, out)
             Helper::GetProperty | Helper::DeleteProperty => {
-                &[types::I64, types::I64, types::I32, types::I64]
+                &[types::I64, types::I64, types::I64, types::I64]
             }
             // (frame, object, key, value, out)
-            Helper::SetProperty => &[types::I64, types::I64, types::I32, types::I64, types::I64],
-            // (frame, callee, this, args, arg_count, out)
-            Helper::Call => &[
+            Helper::SetProperty => &[types::I64, types::I64, types::I64, types::I64, types::I64],
+            // (frame, object, key, accessor, kind, out)
+            Helper::DefineAccessor => &[
                 types::I64,
                 types::I64,
                 types::I64,
@@ -344,8 +528,25 @@ impl Helper {
                 types::I32,
                 types::I64,
             ],
-            // (frame, callee, args, arg_count, out)
-            Helper::Construct => &[types::I64, types::I64, types::I64, types::I32, types::I64],
+            // (frame, callee, this, arguments, out)
+            Helper::Call => &[types::I64, types::I64, types::I64, types::I64, types::I64],
+            // (frame, callee, arguments, out)
+            Helper::Construct => &[types::I64, types::I64, types::I64, types::I64],
+            // (frame, a, b, out): array/object mutations over two value operands
+            Helper::ArrayPush
+            | Helper::ArrayExtend
+            | Helper::ObjectSpread
+            | Helper::SetPrototype => &[types::I64, types::I64, types::I64, types::I64],
+            // (frame, name/selector, value, out): string-constant selector then value
+            Helper::StoreGlobal | Helper::Export => {
+                &[types::I64, types::I32, types::I64, types::I64]
+            }
+            // (frame, pattern, flags, out)
+            Helper::CreateRegExp => &[types::I64, types::I32, types::I32, types::I64],
+            // (frame, src, kind, out)
+            Helper::GetIterator => &[types::I64, types::I64, types::I32, types::I64],
+            // (frame, iterator, done_reg, value_reg, out)
+            Helper::IteratorNext => &[types::I64, types::I64, types::I32, types::I32, types::I64],
             // (frame, value)
             Helper::Truthy => &[types::I64, types::I64],
         }
@@ -406,45 +607,57 @@ const fn binary_op_selector(op: BinaryOp) -> i64 {
     }
 }
 
+/// The ABI selector for an iterator protocol, passed as the `kind` argument to
+/// [`Helper::GetIterator`]. This is the stable codegen-side encoding.
+const fn iterator_kind_selector(kind: IteratorKind) -> i64 {
+    match kind {
+        IteratorKind::Sync => 0,
+        IteratorKind::Async => 1,
+        IteratorKind::Keys => 2,
+    }
+}
+
+/// The ABI selector for an accessor half, passed as the `kind` argument to
+/// [`Helper::DefineAccessor`]. This is the stable codegen-side encoding.
+const fn accessor_kind_selector(kind: AccessorKind) -> i64 {
+    match kind {
+        AccessorKind::Getter => 0,
+        AccessorKind::Setter => 1,
+    }
+}
+
 // -- Errors ------------------------------------------------------------------
 
 /// A deterministic, typed lowering failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LowerError {
-    /// The target is not 64-bit; the `ShadowFrame`/`Value` ABI is 64-bit only.
+    /// The target is not 64-bit.
     UnsupportedPointerWidth {
-        /// The target's pointer width, in bits.
+        /// The offending pointer width in bits.
         bits: u8,
     },
-    /// The module has more functions than the `u0:<index>` external-name space
-    /// (`u32`) can address. Verified modules never hit this; it is surfaced
-    /// explicitly rather than truncated.
+    /// The module has more functions than a `u32` can index.
     TooManyFunctions {
         /// The offending function count.
         count: usize,
     },
-    /// A function's register file is too large to address with the `Offset32`
-    /// used by frame loads and stores (`register_count * 8` overflows `i32`).
-    /// Verified modules stay well under this; it is a codegen slot-validation
-    /// guard, surfaced rather than silently truncated.
+    /// A function's register file cannot be addressed with 32-bit slot offsets.
     RegisterFileTooLarge {
-        /// The function whose register file is unaddressable.
+        /// The offending function.
         function: FunctionId,
-        /// The offending register count.
+        /// Its register count.
         register_count: u32,
     },
-    /// A produced function's signature did not match the shared native-entry
-    /// ABI. This is an internal codegen invariant failure.
+    /// A lowered function's entry signature differs from the native ABI.
     EntrySignatureMismatch {
-        /// The function whose signature was wrong.
+        /// The offending function.
         function: FunctionId,
     },
-    /// Cranelift's IR verifier rejected a lowered function. This is an internal
-    /// codegen invariant failure, not attacker-controlled input.
+    /// Cranelift's IR verifier rejected a lowered function.
     IrVerification {
-        /// The function whose IR failed verification.
+        /// The offending function.
         function: FunctionId,
-        /// The verifier's diagnostic.
+        /// The verifier's diagnostics.
         message: String,
     },
 }
@@ -452,32 +665,32 @@ pub enum LowerError {
 impl fmt::Display for LowerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LowerError::UnsupportedPointerWidth { bits } => write!(
-                f,
-                "codegen requires a 64-bit target, but the pointer width is {bits} bits"
-            ),
-            LowerError::TooManyFunctions { count } => write!(
-                f,
-                "module has {count} functions, which exceeds the addressable u32 range"
-            ),
+            LowerError::UnsupportedPointerWidth { bits } => {
+                write!(f, "target must be 64-bit, got {bits}-bit")
+            }
+            LowerError::TooManyFunctions { count } => {
+                write!(f, "module has {count} functions, exceeding u32 index range")
+            }
             LowerError::RegisterFileTooLarge {
                 function,
                 register_count,
             } => write!(
                 f,
-                "function {} has {register_count} registers, whose frame offsets exceed the 32-bit slot range",
+                "function {} register file of {register_count} slots is not 32-bit addressable",
                 function.get()
             ),
             LowerError::EntrySignatureMismatch { function } => write!(
                 f,
-                "lowered function {} does not match the native-entry ABI signature",
+                "function {} lowered to a non-native entry signature",
                 function.get()
             ),
-            LowerError::IrVerification { function, message } => write!(
-                f,
-                "Cranelift IR verification failed for function {}: {message}",
-                function.get()
-            ),
+            LowerError::IrVerification { function, message } => {
+                write!(
+                    f,
+                    "function {} failed IR verification: {message}",
+                    function.get()
+                )
+            }
         }
     }
 }
@@ -490,28 +703,33 @@ impl Error for LowerError {}
 /// compile and link it without re-deriving anything.
 #[derive(Clone)]
 pub struct LoweredFunction {
-    /// The bytecode function this was lowered from.
+    /// The bytecode function this lowering corresponds to.
     pub id: FunctionId,
-    /// The linker symbol (`bamts_fn_<index>`).
+    /// The linker symbol for this function.
     pub symbol: String,
-    /// The entry ABI signature (identical for every function).
+    /// The native-entry signature `(frame, out) -> tag`.
     pub signature: Signature,
     /// The verified Cranelift IR.
     pub clif: Function,
-    /// Sorted resume-dispatch tokens the entry accepts: `0` for a fresh call,
-    /// plus `P + 1` for each reachable `Suspend` at bytecode pc `P`.
+    /// The resume-dispatch tokens the entry accepts (`0` plus each `P + 1`).
     pub entry_points: Vec<u32>,
-    /// The runtime helpers this function imports, sorted and deduplicated.
+    /// The runtime helpers this function imports, in a stable order.
     pub helpers: Vec<Helper>,
+    /// The count of leading capture-cell registers the runtime seeds from a
+    /// `CreateClosure` captures array before parameters (from
+    /// [`bamts_bytecode::Function::capture_count`]). Codegen surfaces it as
+    /// metadata; the entry-init copy is a runtime concern.
+    pub capture_count: u32,
 }
 
 impl fmt::Debug for LoweredFunction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LoweredFunction")
-            .field("id", &self.id.get())
+            .field("id", &self.id)
             .field("symbol", &self.symbol)
             .field("entry_points", &self.entry_points)
             .field("helpers", &self.helpers)
+            .field("capture_count", &self.capture_count)
             .finish_non_exhaustive()
     }
 }
@@ -519,11 +737,11 @@ impl fmt::Debug for LoweredFunction {
 /// The complete lowering of a verified module.
 #[derive(Clone)]
 pub struct LoweredModule {
-    /// Lowered functions, in bytecode function order.
+    /// One lowered function per bytecode function, in index order.
     pub functions: Vec<LoweredFunction>,
     /// The module entry function.
     pub entry: FunctionId,
-    /// The calling convention every entry and helper uses.
+    /// The calling convention every lowered function uses.
     pub call_conv: CallConv,
 }
 
@@ -531,7 +749,7 @@ impl fmt::Debug for LoweredModule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LoweredModule")
             .field("functions", &self.functions)
-            .field("entry", &self.entry.get())
+            .field("entry", &self.entry)
             .field("call_conv", &self.call_conv)
             .finish()
     }
@@ -673,6 +891,7 @@ fn lower_function(
         clif,
         entry_points,
         helpers,
+        capture_count: function.capture_count(),
     })
 }
 
@@ -730,7 +949,7 @@ impl<'a> Lowering<'a> {
                 self.resume_blocks.insert(pc, block);
             }
         }
-        self.emit_dispatch(reachable);
+        self.emit_dispatch();
         for &pc in reachable {
             self.emit_instruction(pc, code[pc]);
         }
@@ -752,7 +971,7 @@ impl<'a> Lowering<'a> {
     /// Emits the entry block: select the starting block from the resume token in
     /// `frame.bytecode_pc`. Token `0` is a fresh call (pc-0 block); token `P + 1`
     /// enters the resume prologue for the suspend at pc `P`.
-    fn emit_dispatch(&mut self, reachable: &BTreeSet<usize>) {
+    fn emit_dispatch(&mut self) {
         // A function with no suspends has a single entry (token 0): fresh calls
         // always begin at pc 0, so no token comparison is emitted.
         if self.resume_blocks.is_empty() {
@@ -760,7 +979,6 @@ impl<'a> Lowering<'a> {
             self.builder.ins().jump(target, &[]);
             return;
         }
-        let _ = reachable;
 
         let token = self.builder.ins().load(
             types::I32,
@@ -845,92 +1063,247 @@ impl<'a> Lowering<'a> {
                 let tag = self.call_helper(Helper::CreateArray, &[self.frame, self.out]);
                 self.route_completion(pc, tag, Some(dst));
             }
-            Instruction::DefineFunction { dst, function } => {
+            Instruction::CreateClosure {
+                dst,
+                function,
+                captures,
+            } => {
+                let handles = self.load_handles();
+                let captures_value = self.load_register(handles, captures);
                 let function_id = self.iconst32(i64::from(function.get()));
-                let tag =
-                    self.call_helper(Helper::DefineFunction, &[self.frame, function_id, self.out]);
+                let tag = self.call_helper(
+                    Helper::CreateClosure,
+                    &[self.frame, function_id, captures_value, self.out],
+                );
                 self.route_completion(pc, tag, Some(dst));
             }
             Instruction::GetProperty { dst, object, key } => {
                 let handles = self.load_handles();
                 let object_value = self.load_register(handles, object);
-                let key_id = self.iconst32(i64::from(key.get()));
+                let key_value = self.load_register(handles, key);
                 let tag = self.call_helper(
                     Helper::GetProperty,
-                    &[self.frame, object_value, key_id, self.out],
+                    &[self.frame, object_value, key_value, self.out],
                 );
                 self.route_completion(pc, tag, Some(dst));
             }
             Instruction::SetProperty { object, key, value } => {
                 let handles = self.load_handles();
                 let object_value = self.load_register(handles, object);
+                let key_value = self.load_register(handles, key);
                 let value_value = self.load_register(handles, value);
-                let key_id = self.iconst32(i64::from(key.get()));
                 let tag = self.call_helper(
                     Helper::SetProperty,
-                    &[self.frame, object_value, key_id, value_value, self.out],
+                    &[self.frame, object_value, key_value, value_value, self.out],
                 );
                 self.route_completion(pc, tag, None);
             }
             Instruction::DeleteProperty { dst, object, key } => {
                 let handles = self.load_handles();
                 let object_value = self.load_register(handles, object);
-                let key_id = self.iconst32(i64::from(key.get()));
+                let key_value = self.load_register(handles, key);
                 let tag = self.call_helper(
                     Helper::DeleteProperty,
-                    &[self.frame, object_value, key_id, self.out],
+                    &[self.frame, object_value, key_value, self.out],
                 );
                 self.route_completion(pc, tag, Some(dst));
+            }
+            Instruction::DefineAccessor {
+                object,
+                key,
+                accessor,
+                kind,
+            } => {
+                let handles = self.load_handles();
+                let object_value = self.load_register(handles, object);
+                let key_value = self.load_register(handles, key);
+                let accessor_value = self.load_register(handles, accessor);
+                let selector = self.iconst32(accessor_kind_selector(kind));
+                let tag = self.call_helper(
+                    Helper::DefineAccessor,
+                    &[
+                        self.frame,
+                        object_value,
+                        key_value,
+                        accessor_value,
+                        selector,
+                        self.out,
+                    ],
+                );
+                self.route_completion(pc, tag, None);
             }
             Instruction::Call {
                 dst,
                 callee,
                 this_value,
-                args_start,
-                arg_count,
+                arguments,
             } => {
                 let handles = self.load_handles();
                 let callee_value = self.load_register(handles, callee);
                 let this = self.load_register(handles, this_value);
-                let args = self.argument_window(handles, args_start);
-                let count = self.iconst32(i64::from(arg_count));
+                let args = self.load_register(handles, arguments);
                 let tag = self.call_helper(
                     Helper::Call,
-                    &[self.frame, callee_value, this, args, count, self.out],
+                    &[self.frame, callee_value, this, args, self.out],
                 );
                 self.route_completion(pc, tag, Some(dst));
             }
             Instruction::Construct {
                 dst,
                 callee,
-                args_start,
-                arg_count,
+                arguments,
             } => {
                 let handles = self.load_handles();
                 let callee_value = self.load_register(handles, callee);
-                let args = self.argument_window(handles, args_start);
-                let count = self.iconst32(i64::from(arg_count));
+                let args = self.load_register(handles, arguments);
                 let tag = self.call_helper(
                     Helper::Construct,
-                    &[self.frame, callee_value, args, count, self.out],
+                    &[self.frame, callee_value, args, self.out],
                 );
                 self.route_completion(pc, tag, Some(dst));
             }
+            Instruction::LoadGlobal { dst, name } => {
+                let name_id = self.iconst32(i64::from(name.get()));
+                let tag = self.call_helper(Helper::LoadGlobal, &[self.frame, name_id, self.out]);
+                self.route_completion(pc, tag, Some(dst));
+            }
+            Instruction::StoreGlobal { name, value } => {
+                let handles = self.load_handles();
+                let value_value = self.load_register(handles, value);
+                let name_id = self.iconst32(i64::from(name.get()));
+                let tag = self.call_helper(
+                    Helper::StoreGlobal,
+                    &[self.frame, name_id, value_value, self.out],
+                );
+                self.route_completion(pc, tag, None);
+            }
+            Instruction::TypeOfGlobal { dst, name } => {
+                let name_id = self.iconst32(i64::from(name.get()));
+                let tag = self.call_helper(Helper::TypeOfGlobal, &[self.frame, name_id, self.out]);
+                self.route_completion(pc, tag, Some(dst));
+            }
+            Instruction::LoadThis { dst } => {
+                let tag = self.call_helper(Helper::LoadThis, &[self.frame, self.out]);
+                self.route_completion(pc, tag, Some(dst));
+            }
+            Instruction::LoadArguments { dst } => {
+                let tag = self.call_helper(Helper::LoadArguments, &[self.frame, self.out]);
+                self.route_completion(pc, tag, Some(dst));
+            }
+            Instruction::LoadNewTarget { dst } => {
+                let tag = self.call_helper(Helper::LoadNewTarget, &[self.frame, self.out]);
+                self.route_completion(pc, tag, Some(dst));
+            }
+            Instruction::ArrayPush { array, value } => {
+                let handles = self.load_handles();
+                let array_value = self.load_register(handles, array);
+                let value_value = self.load_register(handles, value);
+                let tag = self.call_helper(
+                    Helper::ArrayPush,
+                    &[self.frame, array_value, value_value, self.out],
+                );
+                self.route_completion(pc, tag, None);
+            }
+            Instruction::ArrayExtend { array, iterable } => {
+                let handles = self.load_handles();
+                let array_value = self.load_register(handles, array);
+                let iterable_value = self.load_register(handles, iterable);
+                let tag = self.call_helper(
+                    Helper::ArrayExtend,
+                    &[self.frame, array_value, iterable_value, self.out],
+                );
+                self.route_completion(pc, tag, None);
+            }
+            Instruction::ObjectSpread { target, source } => {
+                let handles = self.load_handles();
+                let target_value = self.load_register(handles, target);
+                let source_value = self.load_register(handles, source);
+                let tag = self.call_helper(
+                    Helper::ObjectSpread,
+                    &[self.frame, target_value, source_value, self.out],
+                );
+                self.route_completion(pc, tag, None);
+            }
+            Instruction::SetPrototype { object, prototype } => {
+                let handles = self.load_handles();
+                let object_value = self.load_register(handles, object);
+                let prototype_value = self.load_register(handles, prototype);
+                let tag = self.call_helper(
+                    Helper::SetPrototype,
+                    &[self.frame, object_value, prototype_value, self.out],
+                );
+                self.route_completion(pc, tag, None);
+            }
+            Instruction::CreatePrivateName { dst, description } => {
+                let description_id = self.iconst32(i64::from(description.get()));
+                let tag = self.call_helper(
+                    Helper::CreatePrivateName,
+                    &[self.frame, description_id, self.out],
+                );
+                self.route_completion(pc, tag, Some(dst));
+            }
+            Instruction::CreateRegExp {
+                dst,
+                pattern,
+                flags,
+            } => {
+                let pattern_id = self.iconst32(i64::from(pattern.get()));
+                let flags_id = self.iconst32(i64::from(flags.get()));
+                let tag = self.call_helper(
+                    Helper::CreateRegExp,
+                    &[self.frame, pattern_id, flags_id, self.out],
+                );
+                self.route_completion(pc, tag, Some(dst));
+            }
+            Instruction::GetIterator { dst, src, kind } => {
+                let handles = self.load_handles();
+                let src_value = self.load_register(handles, src);
+                let selector = self.iconst32(iterator_kind_selector(kind));
+                let tag = self.call_helper(
+                    Helper::GetIterator,
+                    &[self.frame, src_value, selector, self.out],
+                );
+                self.route_completion(pc, tag, Some(dst));
+            }
+            Instruction::IteratorNext {
+                done,
+                value,
+                iterator,
+            } => {
+                let handles = self.load_handles();
+                let iterator_value = self.load_register(handles, iterator);
+                let done_reg = self.iconst32(i64::from(done.get()));
+                let value_reg = self.iconst32(i64::from(value.get()));
+                // Two-write: the helper writes both `done` and `value` slots
+                // directly from the frame on Normal, so no `dst` store here.
+                let tag = self.call_helper(
+                    Helper::IteratorNext,
+                    &[self.frame, iterator_value, done_reg, value_reg, self.out],
+                );
+                self.route_completion(pc, tag, None);
+            }
             Instruction::Import { dst, specifier } => {
                 let specifier_id = self.iconst32(i64::from(specifier.get()));
-                let tag =
-                    self.call_helper(Helper::Import, &[self.frame, specifier_id, self.out]);
+                let tag = self.call_helper(Helper::Import, &[self.frame, specifier_id, self.out]);
                 self.route_completion(pc, tag, Some(dst));
+            }
+            Instruction::Export { name, src } => {
+                let handles = self.load_handles();
+                let src_value = self.load_register(handles, src);
+                let name_id = self.iconst32(i64::from(name.get()));
+                let tag =
+                    self.call_helper(Helper::Export, &[self.frame, name_id, src_value, self.out]);
+                self.route_completion(pc, tag, None);
             }
             Instruction::Jump { target } => {
                 let target = self.pc_block(target);
                 self.builder.ins().jump(target, &[]);
             }
             Instruction::JumpIfTrue { condition, target } => {
-                self.emit_conditional(pc, condition, target.get() as usize, pc + 1);
+                self.emit_conditional(condition, target.get() as usize, pc + 1);
             }
             Instruction::JumpIfFalse { condition, target } => {
-                self.emit_conditional(pc, condition, pc + 1, target.get() as usize);
+                self.emit_conditional(condition, pc + 1, target.get() as usize);
             }
             Instruction::Return { value } => self.emit_return(value),
             Instruction::Throw { value } => self.emit_throw(pc, value),
@@ -963,10 +1336,17 @@ impl<'a> Lowering<'a> {
     /// Routes a nonzero completion tag: to a covering handler on `Throw` (the
     /// thrown value is bound into the handler's `catch_register`), otherwise
     /// propagated to the caller. `FatalTrap` never enters a handler.
+    ///
+    /// If the covering handler's block was not emitted (only a total,
+    /// non-throwing helper reaches it), the completion is propagated to the
+    /// caller — this abnormal edge is provably unreachable for such helpers.
     fn emit_abnormal_completion(&mut self, pc: usize, tag: Value) {
-        match innermost_handler(self.handlers, pc) {
-            Some(handler) => {
-                let handler_block = self.pc_block(handler.handler);
+        let covering = innermost_handler(self.handlers, pc).and_then(|handler| {
+            self.emitted_handler_block(handler)
+                .map(|block| (handler, block))
+        });
+        match covering {
+            Some((handler, handler_block)) => {
                 let bind = self.builder.create_block();
                 let propagate = self.builder.create_block();
                 let is_throw = self.builder.ins().icmp_imm_u(IntCC::Equal, tag, TAG_THROW);
@@ -987,17 +1367,16 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// The emitted block for a handler's target pc, or `None` when that pc was
+    /// not marked reachable (so no throwing opcode routes there).
+    fn emitted_handler_block(&self, handler: ExceptionHandler) -> Option<Block> {
+        self.pc_blocks[handler.handler.get() as usize]
+    }
+
     /// Emits `JumpIfTrue`/`JumpIfFalse`: coerce `condition` to boolean via the
     /// total [`Helper::Truthy`], then branch to `true_target` on truthy and
     /// `false_target` otherwise.
-    fn emit_conditional(
-        &mut self,
-        pc: usize,
-        condition: Register,
-        true_target: usize,
-        false_target: usize,
-    ) {
-        let _ = pc;
+    fn emit_conditional(&mut self, condition: Register, true_target: usize, false_target: usize) {
         let handles = self.load_handles();
         let condition_value = self.load_register(handles, condition);
         let truth = self.call_helper(Helper::Truthy, &[self.frame, condition_value]);
@@ -1151,19 +1530,6 @@ impl<'a> Lowering<'a> {
         );
     }
 
-    /// The base pointer of the argument window `[args_start, …)`: the register
-    /// array plus `args_start * 8`. Uses `i64` pointer arithmetic so windows in
-    /// large register files stay addressable.
-    fn argument_window(&mut self, handles: Value, args_start: Register) -> Value {
-        let offset = i64::from(args_start.get()) * VALUE_BYTES;
-        if offset == 0 {
-            handles
-        } else {
-            let delta = self.builder.ins().iconst(types::I64, offset);
-            self.builder.ins().iadd(handles, delta)
-        }
-    }
-
     fn call_helper(&mut self, helper: Helper, args: &[Value]) -> Value {
         let func_ref = self.helper_ref(helper);
         let call = self.builder.ins().call(func_ref, args);
@@ -1196,6 +1562,8 @@ impl<'a> Lowering<'a> {
 
 /// The byte offset of a register slot within the handles array. [`validate_slots`]
 /// proves `register_count * 8` fits `i32`, so this conversion never truncates.
+/// A slot offset is a full 32-bit displacement, so register ids past 127 scale
+/// linearly without any special path.
 fn register_offset(register: Register) -> i32 {
     i32::try_from(i64::from(register.get()) * VALUE_BYTES).expect("register slot offset fits i32")
 }
@@ -1218,10 +1586,10 @@ fn reachable_pcs(code: &[Instruction], handlers: &[ExceptionHandler]) -> BTreeSe
         }
         let instruction = code[pc];
         instruction.visit_normal_successors(pc, |target| worklist.push(target));
-        if routes_to_handler(instruction) {
-            if let Some(handler) = innermost_handler(handlers, pc) {
-                worklist.push(handler.handler.get() as usize);
-            }
+        if routes_to_handler(instruction)
+            && let Some(handler) = innermost_handler(handlers, pc)
+        {
+            worklist.push(handler.handler.get() as usize);
         }
     }
     reachable
@@ -1231,24 +1599,51 @@ fn reachable_pcs(code: &[Instruction], handlers: &[ExceptionHandler]) -> BTreeSe
 /// explicit `Throw`, or any completion-helper opcode whose abnormal path may
 /// return `Throw`. Keeping this exhaustive guarantees every handler block a
 /// throwing opcode targets is marked reachable and thus emitted.
+///
+/// The `false` arm lists every opcode that provably cannot route a `Throw`:
+/// pure control flow, `Move`, and the total helpers ([`Helper::TypeOfGlobal`],
+/// [`Helper::LoadThis`], [`Helper::LoadArguments`], [`Helper::LoadNewTarget`],
+/// [`Helper::CreatePrivateName`]). Using an exhaustive `match` — not
+/// `matches!` — forces a compile error if a new opcode is left unclassified.
 fn routes_to_handler(instruction: Instruction) -> bool {
-    matches!(
-        instruction,
+    match instruction {
         Instruction::LoadConst { .. }
-            | Instruction::Unary { .. }
-            | Instruction::Binary { .. }
-            | Instruction::CreateObject { .. }
-            | Instruction::CreateArray { .. }
-            | Instruction::DefineFunction { .. }
-            | Instruction::GetProperty { .. }
-            | Instruction::SetProperty { .. }
-            | Instruction::DeleteProperty { .. }
-            | Instruction::Call { .. }
-            | Instruction::Construct { .. }
-            | Instruction::Import { .. }
-            | Instruction::Suspend { .. }
-            | Instruction::Throw { .. }
-    )
+        | Instruction::Unary { .. }
+        | Instruction::Binary { .. }
+        | Instruction::CreateObject { .. }
+        | Instruction::CreateArray { .. }
+        | Instruction::CreateClosure { .. }
+        | Instruction::GetProperty { .. }
+        | Instruction::SetProperty { .. }
+        | Instruction::DeleteProperty { .. }
+        | Instruction::DefineAccessor { .. }
+        | Instruction::Call { .. }
+        | Instruction::Construct { .. }
+        | Instruction::LoadGlobal { .. }
+        | Instruction::StoreGlobal { .. }
+        | Instruction::ArrayPush { .. }
+        | Instruction::ArrayExtend { .. }
+        | Instruction::ObjectSpread { .. }
+        | Instruction::SetPrototype { .. }
+        | Instruction::CreateRegExp { .. }
+        | Instruction::GetIterator { .. }
+        | Instruction::IteratorNext { .. }
+        | Instruction::Import { .. }
+        | Instruction::Export { .. }
+        | Instruction::Suspend { .. }
+        | Instruction::Throw { .. } => true,
+        Instruction::Move { .. }
+        | Instruction::TypeOfGlobal { .. }
+        | Instruction::LoadThis { .. }
+        | Instruction::LoadArguments { .. }
+        | Instruction::LoadNewTarget { .. }
+        | Instruction::CreatePrivateName { .. }
+        | Instruction::Jump { .. }
+        | Instruction::JumpIfTrue { .. }
+        | Instruction::JumpIfFalse { .. }
+        | Instruction::Return { .. }
+        | Instruction::Halt => false,
+    }
 }
 
 /// The resume-dispatch tokens the entry accepts: `0` (fresh call) plus `P + 1`
@@ -1315,13 +1710,29 @@ impl NormalSuccessors for Instruction {
             | Instruction::Binary { .. }
             | Instruction::CreateObject { .. }
             | Instruction::CreateArray { .. }
-            | Instruction::DefineFunction { .. }
+            | Instruction::CreateClosure { .. }
             | Instruction::GetProperty { .. }
             | Instruction::SetProperty { .. }
             | Instruction::DeleteProperty { .. }
+            | Instruction::DefineAccessor { .. }
             | Instruction::Call { .. }
             | Instruction::Construct { .. }
-            | Instruction::Import { .. } => visit(pc + 1),
+            | Instruction::LoadGlobal { .. }
+            | Instruction::StoreGlobal { .. }
+            | Instruction::TypeOfGlobal { .. }
+            | Instruction::LoadThis { .. }
+            | Instruction::LoadArguments { .. }
+            | Instruction::LoadNewTarget { .. }
+            | Instruction::ArrayPush { .. }
+            | Instruction::ArrayExtend { .. }
+            | Instruction::ObjectSpread { .. }
+            | Instruction::SetPrototype { .. }
+            | Instruction::CreatePrivateName { .. }
+            | Instruction::CreateRegExp { .. }
+            | Instruction::GetIterator { .. }
+            | Instruction::IteratorNext { .. }
+            | Instruction::Import { .. }
+            | Instruction::Export { .. } => visit(pc + 1),
         }
     }
 }
@@ -1345,10 +1756,10 @@ mod tests {
             "s390x",
             "x86_64-unknown-linux-gnu",
         ] {
-            if let Ok(builder) = isa::lookup_by_name(name) {
-                if let Ok(target) = builder.finish(flags.clone()) {
-                    return target.frontend_config();
-                }
+            if let Ok(builder) = isa::lookup_by_name(name)
+                && let Ok(target) = builder.finish(flags.clone())
+            {
+                return target.frontend_config();
             }
         }
         panic!("no native ISA available for tests");
@@ -1365,6 +1776,7 @@ mod tests {
     ) -> BytecodeFunction {
         BytecodeFunction::new(
             None,
+            0,
             0,
             register_count,
             FunctionFlags::default(),
@@ -1383,6 +1795,32 @@ mod tests {
         verified(vec![Constant::Undefined], vec![function])
     }
 
+    #[test]
+    fn capture_count_metadata_is_surfaced() {
+        // A function declaring leading capture cells surfaces that count as
+        // lowering metadata so a backend/runtime need not re-derive it. Entry
+        // init (capture cells then parameters) counts as definitely-initialized,
+        // so the body may read its capture registers without a prior write.
+        let function = BytecodeFunction::new(
+            None,
+            2, // capture_count
+            1, // parameter_count
+            4, // register_count (>= captures + params)
+            FunctionFlags::default(),
+            vec![
+                Instruction::Move {
+                    dst: reg(3),
+                    src: reg(0), // a capture cell, initialized on entry
+                },
+                Instruction::Halt,
+            ],
+            Vec::new(),
+        );
+        let module = single(function);
+        let lowered = lower_module(&module, host_config()).expect("lowers");
+        assert_eq!(lowered.functions[0].capture_count, 2);
+    }
+
     /// Load `Undefined` (constant 0) into `dst`; a cheap way to satisfy the
     /// definite-initialization verifier before a register is read.
     fn load_undef(dst: Register) -> Instruction {
@@ -1395,6 +1833,16 @@ mod tests {
     fn clif_of(module: &Module<Verified>) -> String {
         let lowered = lower_module(module, host_config()).expect("lowers");
         lowered.functions[0].clif.display().to_string()
+    }
+
+    /// Lower a module and return the single function's helpers and CLIF text.
+    fn lower_one(module: &Module<Verified>) -> (Vec<Helper>, String) {
+        let lowered = lower_module(module, host_config()).expect("lowers");
+        let function = &lowered.functions[0];
+        (
+            function.helpers.clone(),
+            function.clif.display().to_string(),
+        )
     }
 
     #[test]
@@ -1433,19 +1881,68 @@ mod tests {
     }
 
     #[test]
+    fn helper_index_table_is_a_stable_bijection() {
+        // Every helper round-trips through its external index, and the table
+        // covers a dense 0..=29 range with unique symbols.
+        let helpers = [
+            Helper::LoadConstant,
+            Helper::Unary,
+            Helper::Binary,
+            Helper::CreateObject,
+            Helper::CreateArray,
+            Helper::CreateClosure,
+            Helper::GetProperty,
+            Helper::SetProperty,
+            Helper::DeleteProperty,
+            Helper::Call,
+            Helper::Construct,
+            Helper::Import,
+            Helper::Truthy,
+            Helper::ResumeValue,
+            Helper::DefineAccessor,
+            Helper::LoadGlobal,
+            Helper::StoreGlobal,
+            Helper::TypeOfGlobal,
+            Helper::LoadThis,
+            Helper::LoadArguments,
+            Helper::LoadNewTarget,
+            Helper::ArrayPush,
+            Helper::ArrayExtend,
+            Helper::ObjectSpread,
+            Helper::SetPrototype,
+            Helper::CreatePrivateName,
+            Helper::CreateRegExp,
+            Helper::GetIterator,
+            Helper::IteratorNext,
+            Helper::Export,
+        ];
+        let mut symbols = BTreeSet::new();
+        for (expected_index, helper) in helpers.iter().copied().enumerate() {
+            let index = helper.external_index();
+            assert_eq!(index as usize, expected_index, "dense index for {helper:?}");
+            assert_eq!(
+                Helper::from_external_index(index),
+                Some(helper),
+                "round-trip for {helper:?}"
+            );
+            assert!(symbols.insert(helper.symbol()), "unique symbol {helper:?}");
+        }
+        assert_eq!(symbols.len(), 30);
+        assert_eq!(Helper::from_external_index(30), None);
+    }
+
+    #[test]
     fn load_const_routes_through_the_constant_helper() {
         let module = single(func(
             1,
             vec![load_undef(reg(0)), Instruction::Halt],
             Vec::new(),
         ));
-        let lowered = lower_module(&module, host_config()).expect("lowers");
-        let function = &lowered.functions[0];
-        assert_eq!(function.helpers, vec![Helper::LoadConstant]);
+        let (helpers, clif) = lower_one(&module);
+        assert_eq!(helpers, vec![Helper::LoadConstant]);
         assert_eq!(Helper::LoadConstant.symbol(), "bamts_load_constant");
         assert_eq!(Helper::LoadConstant.external_index(), 0);
         assert_eq!(Helper::from_external_index(0), Some(Helper::LoadConstant));
-        let clif = function.clif.display().to_string();
         assert!(
             clif.contains("u1:0"),
             "constant helper import missing:\n{clif}"
@@ -1471,17 +1968,15 @@ mod tests {
             Instruction::Halt,
         ];
         let module = single(func(3, code, Vec::new()));
-        let lowered = lower_module(&module, host_config()).expect("lowers");
-        let function = &lowered.functions[0];
-        assert!(function.helpers.contains(&Helper::Binary));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::Binary));
         assert_eq!(Helper::Binary.external_index(), 2);
-        let clif = function.clif.display().to_string();
         assert!(
             clif.contains("u1:2"),
             "binary helper import missing:\n{clif}"
         );
         assert!(
-            clif.contains("(i64, i32, i64, i64) -> i32"),
+            clif.contains("(i64, i32, i64, i64, i64) -> i32"),
             "binary helper sig wrong:\n{clif}"
         );
     }
@@ -1498,16 +1993,14 @@ mod tests {
             Instruction::Halt,
         ];
         let module = single(func(2, code, Vec::new()));
-        let lowered = lower_module(&module, host_config()).expect("lowers");
-        let function = &lowered.functions[0];
-        assert!(function.helpers.contains(&Helper::Unary));
-        let clif = function.clif.display().to_string();
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::Unary));
         assert!(
             clif.contains("u1:1"),
             "unary helper import missing:\n{clif}"
         );
         assert!(
-            clif.contains("(i64, i32, i64) -> i32"),
+            clif.contains("(i64, i32, i64, i64) -> i32"),
             "unary helper sig wrong:\n{clif}"
         );
     }
@@ -1523,9 +2016,9 @@ mod tests {
             Instruction::Halt,
         ];
         let module = single(func(2, code, Vec::new()));
-        let lowered = lower_module(&module, host_config()).expect("lowers");
+        let (helpers, _) = lower_one(&module);
         // Move introduces no helper of its own.
-        assert_eq!(lowered.functions[0].helpers, vec![Helper::LoadConstant]);
+        assert_eq!(helpers, vec![Helper::LoadConstant]);
     }
 
     #[test]
@@ -1541,11 +2034,9 @@ mod tests {
             Instruction::Halt,
         ];
         let module = single(func(1, code, Vec::new()));
-        let lowered = lower_module(&module, host_config()).expect("lowers");
-        let function = &lowered.functions[0];
-        assert!(function.helpers.contains(&Helper::Truthy));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::Truthy));
         assert_eq!(Helper::Truthy.external_index(), 12);
-        let clif = function.clif.display().to_string();
         assert!(
             clif.contains("u1:12"),
             "truthy helper import missing:\n{clif}"
@@ -1556,6 +2047,535 @@ mod tests {
             "truthy helper sig wrong:\n{clif}"
         );
         assert!(clif.contains("brif"), "conditional branch missing:\n{clif}");
+    }
+
+    #[test]
+    fn jump_if_false_branches_with_inverted_polarity() {
+        // pc0: r0 = undef. pc1: if !truthy(r0) goto pc3 else fall to pc2.
+        // The truthy edge must fall through to pc2; the falsy edge must reach
+        // the jump target pc3 — the argument-swapped mirror of JumpIfTrue.
+        let code = vec![
+            load_undef(reg(0)),
+            Instruction::JumpIfFalse {
+                condition: reg(0),
+                target: Pc::new(3),
+            },
+            Instruction::Halt,
+            Instruction::Halt,
+        ];
+        let module = single(func(1, code, Vec::new()));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::Truthy));
+        // The conditional's `brif` is the last branch emitted (the LoadConst
+        // completion routing precedes it). Its operands render truthy (then)
+        // first, falsy (else) second. Blocks are numbered in ascending
+        // reachable-pc order, so for JumpIfFalse the truthy edge must target the
+        // earlier fallthrough (pc2) block and the falsy edge the later jump
+        // target (pc3) block: truthy block number < falsy block number. A swap
+        // to JumpIfTrue polarity would reverse this.
+        let brif = clif
+            .lines()
+            .rfind(|line| line.contains("brif"))
+            .expect("conditional branch missing");
+        let edges: Vec<u32> = brif
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter_map(|token| token.strip_prefix("block").and_then(|n| n.parse().ok()))
+            .collect();
+        assert_eq!(
+            edges.len(),
+            2,
+            "conditional brif has two block edges:\n{clif}"
+        );
+        assert!(
+            edges[0] < edges[1],
+            "JumpIfFalse polarity: truthy edge must target the earlier fallthrough block:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn create_closure_passes_the_captures_value_not_an_index() {
+        // r0 = undef (captures array placeholder); r1 = closure(fn 0, captures r0).
+        let code = vec![
+            load_undef(reg(0)),
+            Instruction::CreateClosure {
+                dst: reg(1),
+                function: FunctionId::new(0),
+                captures: reg(0),
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(2, code, Vec::new()));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::CreateClosure));
+        assert_eq!(Helper::CreateClosure.external_index(), 5);
+        assert!(
+            clif.contains("u1:5"),
+            "closure helper import missing:\n{clif}"
+        );
+        // (frame, function_id:i32, captures:i64, out) -> tag.
+        assert!(
+            clif.contains("(i64, i32, i64, i64) -> i32"),
+            "closure helper sig wrong:\n{clif}"
+        );
+        // The captures register (r0) is loaded and passed as a value; the args
+        // path performs no pointer arithmetic.
+        assert!(
+            !clif.contains("iadd"),
+            "closure captures must be a value, not a computed pointer:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn call_passes_arguments_as_a_value_without_pointer_math() {
+        // r0..r2 = undef; r3 = call r0 with this=r1 and arguments array r2.
+        let code = vec![
+            load_undef(reg(0)),
+            load_undef(reg(1)),
+            load_undef(reg(2)),
+            Instruction::Call {
+                dst: reg(3),
+                callee: reg(0),
+                this_value: reg(1),
+                arguments: reg(2),
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(4, code, Vec::new()));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::Call));
+        assert_eq!(Helper::Call.external_index(), 9);
+        assert!(clif.contains("u1:9"), "call helper import missing:\n{clif}");
+        // (frame, callee, this, arguments, out) -> tag; arguments is a value.
+        assert!(
+            clif.contains("(i64, i64, i64, i64, i64) -> i32"),
+            "call helper sig wrong:\n{clif}"
+        );
+        // No fixed window: the arguments array is a register value, not a
+        // computed base pointer.
+        assert!(
+            !clif.contains("iadd"),
+            "arguments must be a value, not a window pointer:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn construct_passes_arguments_as_a_value() {
+        let code = vec![
+            load_undef(reg(0)),
+            load_undef(reg(1)),
+            Instruction::Construct {
+                dst: reg(2),
+                callee: reg(0),
+                arguments: reg(1),
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(3, code, Vec::new()));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::Construct));
+        assert_eq!(Helper::Construct.external_index(), 10);
+        assert!(clif.contains("u1:10"), "construct import missing:\n{clif}");
+        assert!(
+            clif.contains("(i64, i64, i64, i64) -> i32"),
+            "construct helper sig wrong:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn calls_scale_past_fixed_window_via_arguments_array() {
+        // A single arguments-array register removes any fixed-window ceiling:
+        // there is no arg_count operand and no per-argument addressing at all.
+        let code = vec![
+            load_undef(reg(0)),
+            load_undef(reg(1)),
+            load_undef(reg(2)),
+            Instruction::Call {
+                dst: reg(3),
+                callee: reg(0),
+                this_value: reg(1),
+                arguments: reg(2),
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(4, code, Vec::new()));
+        let (_, clif) = lower_one(&module);
+        // The call carries exactly one arguments operand regardless of arity.
+        assert!(
+            !clif.contains("iadd"),
+            "no window arithmetic for any arity:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn property_access_uses_a_register_key() {
+        // r0 = object; r1 = key value; r2 = r0[r1]; r0[r1] = r1; delete r0[r1].
+        let code = vec![
+            Instruction::CreateObject { dst: reg(0) },
+            load_undef(reg(1)),
+            Instruction::GetProperty {
+                dst: reg(2),
+                object: reg(0),
+                key: reg(1),
+            },
+            Instruction::SetProperty {
+                object: reg(0),
+                key: reg(1),
+                value: reg(1),
+            },
+            Instruction::DeleteProperty {
+                dst: reg(3),
+                object: reg(0),
+                key: reg(1),
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(4, code, Vec::new()));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::GetProperty));
+        assert!(helpers.contains(&Helper::SetProperty));
+        assert!(helpers.contains(&Helper::DeleteProperty));
+        assert!(
+            clif.contains("u1:6"),
+            "get-property import missing:\n{clif}"
+        );
+        assert!(
+            clif.contains("u1:7"),
+            "set-property import missing:\n{clif}"
+        );
+        assert!(
+            clif.contains("u1:8"),
+            "delete-property import missing:\n{clif}"
+        );
+        // Register key: get/delete take (frame, object, key, out) all i64 ops.
+        assert!(
+            clif.contains("(i64, i64, i64, i64) -> i32"),
+            "get/delete property sig wrong (register key):\n{clif}"
+        );
+        // Set takes (frame, object, key, value, out).
+        assert!(
+            clif.contains("(i64, i64, i64, i64, i64) -> i32"),
+            "set property sig wrong (register key):\n{clif}"
+        );
+    }
+
+    #[test]
+    fn define_accessor_carries_a_kind_selector() {
+        let code = vec![
+            Instruction::CreateObject { dst: reg(0) },
+            load_undef(reg(1)),
+            load_undef(reg(2)),
+            Instruction::DefineAccessor {
+                object: reg(0),
+                key: reg(1),
+                accessor: reg(2),
+                kind: AccessorKind::Getter,
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(3, code, Vec::new()));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::DefineAccessor));
+        assert_eq!(Helper::DefineAccessor.external_index(), 14);
+        assert!(clif.contains("u1:14"), "accessor import missing:\n{clif}");
+        // (frame, object, key, accessor, kind:i32, out) -> tag.
+        assert!(
+            clif.contains("(i64, i64, i64, i64, i32, i64) -> i32"),
+            "accessor helper sig wrong:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn globals_lower_to_load_store_and_typeof_helpers() {
+        let code = vec![
+            Instruction::LoadGlobal {
+                dst: reg(0),
+                name: ConstantId::new(0),
+            },
+            Instruction::StoreGlobal {
+                name: ConstantId::new(0),
+                value: reg(0),
+            },
+            Instruction::TypeOfGlobal {
+                dst: reg(1),
+                name: ConstantId::new(0),
+            },
+            Instruction::Halt,
+        ];
+        let module = verified(
+            vec![Constant::String("g".to_string())],
+            vec![func(2, code, Vec::new())],
+        );
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::LoadGlobal));
+        assert!(helpers.contains(&Helper::StoreGlobal));
+        assert!(helpers.contains(&Helper::TypeOfGlobal));
+        assert!(
+            clif.contains("u1:15"),
+            "load-global import missing:\n{clif}"
+        );
+        assert!(
+            clif.contains("u1:16"),
+            "store-global import missing:\n{clif}"
+        );
+        assert!(
+            clif.contains("u1:17"),
+            "typeof-global import missing:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn this_arguments_new_target_are_total_and_unhandled() {
+        // Total helpers (no throw) still write out.value; even under a covering
+        // handler they must not mark the handler reachable, so LoadThis under a
+        // handler still lowers cleanly with no handler routing helper.
+        let code = vec![
+            Instruction::LoadThis { dst: reg(0) },
+            Instruction::LoadArguments { dst: reg(1) },
+            Instruction::LoadNewTarget { dst: reg(2) },
+            Instruction::Halt,
+        ];
+        let module = single(func(3, code, Vec::new()));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::LoadThis));
+        assert!(helpers.contains(&Helper::LoadArguments));
+        assert!(helpers.contains(&Helper::LoadNewTarget));
+        assert!(clif.contains("u1:18"), "load-this import missing:\n{clif}");
+        assert!(
+            clif.contains("u1:19"),
+            "load-arguments import missing:\n{clif}"
+        );
+        assert!(
+            clif.contains("u1:20"),
+            "load-new-target import missing:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn total_helper_under_handler_does_not_emit_handler_edge() {
+        // A handler covers a total (non-throwing) TypeOfGlobal. Because it can
+        // never throw, the handler pc is unreachable and not emitted; lowering
+        // must still succeed (the abnormal edge propagates rather than jumping
+        // to a non-existent block).
+        let code = vec![
+            Instruction::TypeOfGlobal {
+                dst: reg(0),
+                name: ConstantId::new(0),
+            },
+            Instruction::Halt,
+            // pc 2: would-be handler, unreachable via the total op.
+            load_undef(reg(0)),
+            Instruction::Halt,
+        ];
+        let handlers = vec![ExceptionHandler {
+            start: Pc::new(0),
+            end: Pc::new(1),
+            handler: Pc::new(2),
+            catch_register: reg(0),
+        }];
+        let module = verified(
+            vec![Constant::String("g".to_string())],
+            vec![func(1, code, handlers)],
+        );
+        // Must lower without panicking on a missing handler block.
+        let lowered = lower_module(&module, host_config()).expect("lowers");
+        assert!(lowered.functions[0].helpers.contains(&Helper::TypeOfGlobal));
+    }
+
+    #[test]
+    fn arrays_and_spreads_lower_to_their_helpers() {
+        let code = vec![
+            Instruction::CreateArray { dst: reg(0) },
+            load_undef(reg(1)),
+            Instruction::ArrayPush {
+                array: reg(0),
+                value: reg(1),
+            },
+            Instruction::ArrayExtend {
+                array: reg(0),
+                iterable: reg(1),
+            },
+            Instruction::CreateObject { dst: reg(2) },
+            Instruction::ObjectSpread {
+                target: reg(2),
+                source: reg(1),
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(3, code, Vec::new()));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::ArrayPush));
+        assert!(helpers.contains(&Helper::ArrayExtend));
+        assert!(helpers.contains(&Helper::ObjectSpread));
+        assert!(clif.contains("u1:21"), "array-push import missing:\n{clif}");
+        assert!(
+            clif.contains("u1:22"),
+            "array-extend import missing:\n{clif}"
+        );
+        assert!(
+            clif.contains("u1:23"),
+            "object-spread import missing:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn prototype_private_and_regexp_lower_to_their_helpers() {
+        let code = vec![
+            Instruction::CreateObject { dst: reg(0) },
+            Instruction::CreateObject { dst: reg(1) },
+            Instruction::SetPrototype {
+                object: reg(0),
+                prototype: reg(1),
+            },
+            Instruction::CreatePrivateName {
+                dst: reg(2),
+                description: ConstantId::new(0),
+            },
+            Instruction::CreateRegExp {
+                dst: reg(3),
+                pattern: ConstantId::new(0),
+                flags: ConstantId::new(1),
+            },
+            Instruction::Halt,
+        ];
+        let module = verified(
+            vec![
+                Constant::String("p".to_string()),
+                Constant::String("g".to_string()),
+            ],
+            vec![func(4, code, Vec::new())],
+        );
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::SetPrototype));
+        assert!(helpers.contains(&Helper::CreatePrivateName));
+        assert!(helpers.contains(&Helper::CreateRegExp));
+        assert!(
+            clif.contains("u1:24"),
+            "set-prototype import missing:\n{clif}"
+        );
+        assert!(
+            clif.contains("u1:25"),
+            "private-name import missing:\n{clif}"
+        );
+        assert!(clif.contains("u1:26"), "regexp import missing:\n{clif}");
+        // RegExp carries two i32 constant selectors.
+        assert!(
+            clif.contains("(i64, i32, i32, i64) -> i32"),
+            "regexp helper sig wrong:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn get_iterator_carries_a_kind_selector() {
+        let code = vec![
+            load_undef(reg(0)),
+            Instruction::GetIterator {
+                dst: reg(1),
+                src: reg(0),
+                kind: IteratorKind::Sync,
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(2, code, Vec::new()));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::GetIterator));
+        assert_eq!(Helper::GetIterator.external_index(), 27);
+        assert!(
+            clif.contains("u1:27"),
+            "get-iterator import missing:\n{clif}"
+        );
+        // (frame, src:i64, kind:i32, out) -> tag.
+        assert!(
+            clif.contains("(i64, i64, i32, i64) -> i32"),
+            "get-iterator helper sig wrong:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn iterator_next_writes_both_done_and_value_registers() {
+        // r0 = iterator; IteratorNext done=r1 value=r2 iterator=r0.
+        let code = vec![
+            load_undef(reg(0)),
+            Instruction::IteratorNext {
+                done: reg(1),
+                value: reg(2),
+                iterator: reg(0),
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(3, code, Vec::new()));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::IteratorNext));
+        assert_eq!(Helper::IteratorNext.external_index(), 28);
+        assert!(
+            clif.contains("u1:28"),
+            "iterator-next import missing:\n{clif}"
+        );
+        // (frame, iterator:i64, done_reg:i32, value_reg:i32, out) -> tag: the two
+        // destination register indices are passed so the helper writes both.
+        assert!(
+            clif.contains("(i64, i64, i32, i32, i64) -> i32"),
+            "iterator-next helper sig wrong:\n{clif}"
+        );
+        // Both destination register indices (r1 -> 1, r2 -> 2) are materialized
+        // as i32 constants and handed to the helper.
+        assert!(
+            clif.contains("iconst.i32 1") && clif.contains("iconst.i32 2"),
+            "both destination register indices must be passed:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn iterator_next_under_handler_binds_catch_on_throw() {
+        // A throwing IteratorNext under a handler routes its Throw to the catch.
+        let code = vec![
+            load_undef(reg(0)),
+            Instruction::IteratorNext {
+                done: reg(1),
+                value: reg(2),
+                iterator: reg(0),
+            },
+            Instruction::Halt,
+            // pc 3: handler.
+            Instruction::Halt,
+        ];
+        let handlers = vec![ExceptionHandler {
+            start: Pc::new(0),
+            end: Pc::new(3),
+            handler: Pc::new(3),
+            catch_register: reg(0),
+        }];
+        let module = single(func(3, code, handlers));
+        let clif = clif_of(&module);
+        // Normal-vs-abnormal then throw-vs-propagate around the throwing op.
+        let brif_count = clif.matches("brif").count();
+        assert!(
+            brif_count >= 2,
+            "expected handler routing brifs, got {brif_count}:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn export_lowers_to_the_export_helper() {
+        let code = vec![
+            load_undef(reg(0)),
+            Instruction::Export {
+                name: ConstantId::new(0),
+                src: reg(0),
+            },
+            Instruction::Halt,
+        ];
+        let module = verified(
+            vec![Constant::String("x".to_string())],
+            vec![func(1, code, Vec::new())],
+        );
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::Export));
+        assert_eq!(Helper::Export.external_index(), 29);
+        assert!(clif.contains("u1:29"), "export import missing:\n{clif}");
+        assert!(
+            clif.contains("(i64, i32, i64, i64) -> i32"),
+            "export helper sig wrong:\n{clif}"
+        );
     }
 
     #[test]
@@ -1644,10 +2664,9 @@ mod tests {
             catch_register: reg(0),
         }];
         let module = single(func(1, code, handlers));
-        let lowered = lower_module(&module, host_config()).expect("lowers");
+        let (helpers, clif) = lower_one(&module);
         // A locally-caught throw needs no helper and jumps to the handler.
-        assert_eq!(lowered.functions[0].helpers, vec![Helper::LoadConstant]);
-        let clif = lowered.functions[0].clif.display().to_string();
+        assert_eq!(helpers, vec![Helper::LoadConstant]);
         assert!(clif.contains("jump"), "handler jump missing:\n{clif}");
         assert!(
             clif.contains("store"),
@@ -1659,9 +2678,8 @@ mod tests {
     fn return_writes_completion_and_normal_tag() {
         let code = vec![load_undef(reg(0)), Instruction::Return { value: reg(0) }];
         let module = single(func(1, code, Vec::new()));
-        let lowered = lower_module(&module, host_config()).expect("lowers");
-        assert_eq!(lowered.functions[0].helpers, vec![Helper::LoadConstant]);
-        let clif = lowered.functions[0].clif.display().to_string();
+        let (helpers, clif) = lower_one(&module);
+        assert_eq!(helpers, vec![Helper::LoadConstant]);
         assert!(
             clif.contains("store"),
             "return value store missing:\n{clif}"
@@ -1670,87 +2688,41 @@ mod tests {
     }
 
     #[test]
-    fn call_computes_argument_window_and_imports_call_helper() {
-        // r0..r3 = undef; r4 = call r0 with this=r1 over window [r2, r2+2).
+    fn high_register_offsets_scale_past_127() {
+        // A register id past 127 (r500) addresses at byte offset 500*8 = 4000,
+        // a full 32-bit displacement, not a signed byte. LoadConst into r500
+        // stores out.value at that offset.
+        let code = vec![load_undef(reg(500)), Instruction::Halt];
+        let module = single(func(501, code, Vec::new()));
+        let (_, clif) = lower_one(&module);
+        assert!(
+            clif.contains("+4000"),
+            "expected a +4000 byte offset for r500:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn import_and_closure_are_lowered() {
         let code = vec![
             load_undef(reg(0)),
-            load_undef(reg(1)),
-            load_undef(reg(2)),
-            load_undef(reg(3)),
-            Instruction::Call {
-                dst: reg(4),
-                callee: reg(0),
-                this_value: reg(1),
-                args_start: reg(2),
-                arg_count: 2,
-            },
-            Instruction::Halt,
-        ];
-        let module = single(func(5, code, Vec::new()));
-        let lowered = lower_module(&module, host_config()).expect("lowers");
-        let function = &lowered.functions[0];
-        assert!(function.helpers.contains(&Helper::Call));
-        assert_eq!(Helper::Call.external_index(), 9);
-        let clif = function.clif.display().to_string();
-        assert!(clif.contains("u1:9"), "call helper import missing:\n{clif}");
-        assert!(
-            clif.contains("(i64, i64, i64, i64, i32, i64) -> i32"),
-            "call helper sig wrong:\n{clif}"
-        );
-        // args_start = r2 -> byte offset 16, computed with an iadd on handles.
-        assert!(
-            clif.contains("iadd"),
-            "argument window pointer missing:\n{clif}"
-        );
-    }
-
-    #[test]
-    fn property_access_uses_string_key_constants() {
-        let code = vec![
-            Instruction::CreateObject { dst: reg(0) },
-            Instruction::GetProperty {
+            Instruction::CreateClosure {
                 dst: reg(1),
-                object: reg(0),
-                key: ConstantId::new(0),
-            },
-            Instruction::Halt,
-        ];
-        let module = verified(
-            vec![Constant::String("x".to_string())],
-            vec![func(2, code, Vec::new())],
-        );
-        let lowered = lower_module(&module, host_config()).expect("lowers");
-        let function = &lowered.functions[0];
-        assert!(function.helpers.contains(&Helper::CreateObject));
-        assert!(function.helpers.contains(&Helper::GetProperty));
-        let clif = function.clif.display().to_string();
-        assert!(
-            clif.contains("u1:6"),
-            "get-property helper import missing:\n{clif}"
-        );
-    }
-
-    #[test]
-    fn import_and_define_function_are_lowered() {
-        let code = vec![
-            Instruction::DefineFunction {
-                dst: reg(0),
                 function: FunctionId::new(0),
+                captures: reg(0),
             },
             Instruction::Import {
-                dst: reg(1),
+                dst: reg(2),
                 specifier: ConstantId::new(0),
             },
             Instruction::Halt,
         ];
         let module = verified(
             vec![Constant::String("mod".to_string())],
-            vec![func(2, code, Vec::new())],
+            vec![func(3, code, Vec::new())],
         );
-        let lowered = lower_module(&module, host_config()).expect("lowers");
-        let function = &lowered.functions[0];
-        assert!(function.helpers.contains(&Helper::DefineFunction));
-        assert!(function.helpers.contains(&Helper::Import));
+        let (helpers, _) = lower_one(&module);
+        assert!(helpers.contains(&Helper::CreateClosure));
+        assert!(helpers.contains(&Helper::Import));
     }
 
     #[test]
@@ -1787,11 +2759,8 @@ mod tests {
             Instruction::Halt,
         ];
         let module = single(func(1, code, Vec::new()));
-        let lowered = lower_module(&module, host_config()).expect("lowers");
-        assert!(
-            lowered.functions[0].helpers.is_empty(),
-            "unreachable Binary lowered a helper"
-        );
+        let (helpers, _) = lower_one(&module);
+        assert!(helpers.is_empty(), "unreachable Binary lowered a helper");
     }
 
     #[test]
@@ -1889,6 +2858,7 @@ mod tests {
     fn constant_pool_does_not_perturb_lowering() {
         let functions = vec![BytecodeFunction::new(
             Some(ConstantId::new(0)),
+            0,
             0,
             0,
             FunctionFlags::default(),
