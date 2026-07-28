@@ -1,0 +1,20 @@
+[package]
+name = "bamts"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+aot = ["dep:bamts-codegen", "bamts-codegen/aot"]
+host-jit = ["dep:bamts-codegen", "bamts-codegen/host-jit"]
+
+[dependencies]
+bamts-bytecode = { path = "../bamts-bytecode" }
+bamts-codegen = { path = "../bamts-codegen", optional = true, default-features = false }
+bamts-compiler = { path = "../bamts-compiler" }
+bamts-node = { path = "../bamts-node" }
+bamts-runtime = { path = "../bamts-runtime" }
+
+[lints]
+workspace = true

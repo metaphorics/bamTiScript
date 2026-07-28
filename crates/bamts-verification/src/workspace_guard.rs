@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use toml::{Table, Value};
 
-const MEMBERS: [(&str, &str); 8] = [
+const MEMBERS: [(&str, &str); 9] = [
     ("bamts-compiler", "crates/bamts-compiler"),
     ("bamts-bytecode", "crates/bamts-bytecode"),
     ("bamts-runtime", "crates/bamts-runtime"),
@@ -17,10 +17,11 @@ const MEMBERS: [(&str, &str); 8] = [
     ("bamts-codegen", "crates/bamts-codegen"),
     ("bamts-cli", "crates/bamts-cli"),
     ("bamts-verification", "crates/bamts-verification"),
+    ("bamts", "crates/bamts"),
 ];
 
 const DEPENDENCY_TABLES: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
-const WORKSPACE_CHECKS: usize = 13;
+const WORKSPACE_CHECKS: usize = 14;
 
 #[derive(Debug)]
 struct MemberManifest {
@@ -272,6 +273,8 @@ fn validate_member_manifest(expected_name: &str, manifest: &Value, path: &Path) 
         validate_cli_features(manifest, &path.display().to_string())?;
     } else if expected_name == "bamts-node" {
         validate_node_features(manifest, &path.display().to_string())?;
+    } else if expected_name == "bamts" {
+        validate_facade_manifest_features(manifest, &path.display().to_string())?;
     }
 
     Ok(())
@@ -456,6 +459,36 @@ fn validate_cli_features(manifest: &Value, context: &str) -> Result<()> {
 
     require_feature_set(features, "default", &[], context)?;
     require_feature_set(features, "node", &["dep:bamts-node"], context)
+}
+
+fn validate_facade_manifest_features(manifest: &Value, context: &str) -> Result<()> {
+    let root = root_table(manifest, context)?;
+    let features = required_table(root, "features", context)?;
+    let expected_keys: BTreeSet<String> = ["default", "aot", "host-jit"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let actual_keys: BTreeSet<String> = features.keys().cloned().collect();
+    if actual_keys != expected_keys {
+        return Err(workspace_error(format!(
+            "{context}: bamts features differ: {}",
+            set_difference(&expected_keys, &actual_keys)
+        )));
+    }
+
+    require_feature_set(features, "default", &[], context)?;
+    require_feature_set(
+        features,
+        "aot",
+        &["dep:bamts-codegen", "bamts-codegen/aot"],
+        context,
+    )?;
+    require_feature_set(
+        features,
+        "host-jit",
+        &["dep:bamts-codegen", "bamts-codegen/host-jit"],
+        context,
+    )
 }
 
 fn require_feature_set(
@@ -848,6 +881,16 @@ fn expected_internal_graph() -> InternalGraph {
         ]),
     );
     graph.insert(
+        "bamts".to_owned(),
+        BTreeMap::from([
+            ("bamts-bytecode".to_owned(), internal_dependency(false, &[])),
+            ("bamts-codegen".to_owned(), internal_dependency(true, &[])),
+            ("bamts-compiler".to_owned(), internal_dependency(false, &[])),
+            ("bamts-node".to_owned(), internal_dependency(false, &[])),
+            ("bamts-runtime".to_owned(), internal_dependency(false, &[])),
+        ]),
+    );
+    graph.insert(
         "bamts-cli".to_owned(),
         BTreeMap::from([
             ("bamts-compiler".to_owned(), internal_dependency(false, &[])),
@@ -938,12 +981,40 @@ fn visit_graph(
 fn validate_feature_closures(root: &Path) -> Result<()> {
     let default = cargo_metadata(root, None)?;
     validate_default_closure(&default)?;
-
     let aot = cargo_metadata(root, Some("bamts-codegen/aot"))?;
     validate_aot_closure(&aot)?;
-
     let host_jit = cargo_metadata(root, Some("bamts-codegen/host-jit"))?;
-    validate_host_jit_closure(&host_jit)
+    validate_host_jit_closure(&host_jit)?;
+    validate_facade_features(root)
+}
+
+fn validate_facade_features(root: &Path) -> Result<()> {
+    let default = cargo_metadata(root, None)?;
+    let closure = facade_closure(&default)?;
+    for package in [
+        "cranelift-codegen",
+        "cranelift-frontend",
+        "cranelift-module",
+        "cranelift-object",
+        "cranelift-jit",
+    ] {
+        require_absent_package(&closure, "bamts default", package)?;
+    }
+    require_absent_package(&closure, "bamts default", "bamts-codegen")?;
+
+    let aot = cargo_metadata(root, Some("bamts/aot"))?;
+    let aot = facade_closure(&aot)?;
+    require_enabled_feature(&aot, "bamts aot", "aot")?;
+    require_present_package(&aot, "bamts aot", "cranelift-object")?;
+    require_absent_feature(&aot, "bamts aot", "host-jit")?;
+    require_absent_package(&aot, "bamts aot", "cranelift-jit")?;
+
+    let host_jit = cargo_metadata(root, Some("bamts/host-jit"))?;
+    let host_jit = facade_closure(&host_jit)?;
+    require_enabled_feature(&host_jit, "bamts host-jit", "host-jit")?;
+    require_present_package(&host_jit, "bamts host-jit", "cranelift-jit")?;
+    require_absent_feature(&host_jit, "bamts host-jit", "aot")?;
+    require_absent_package(&host_jit, "bamts host-jit", "cranelift-object")
 }
 
 fn cargo_metadata(root: &Path, feature: Option<&str>) -> Result<CargoMetadata> {
@@ -1090,6 +1161,76 @@ fn codegen_closure(metadata: &CargoMetadata) -> Result<ResolvedClosure> {
             .entry((*name).to_owned())
             .or_default();
         features.extend(node.features.iter().cloned());
+        for dependency in &node.deps {
+            let contributes_to_artifact = dependency
+                .dep_kinds
+                .iter()
+                .any(|kind| kind.kind.as_deref() != Some("dev"));
+            if contributes_to_artifact {
+                pending.push(dependency.pkg.as_str());
+            }
+        }
+    }
+
+    Ok(closure)
+}
+
+fn facade_closure(metadata: &CargoMetadata) -> Result<ResolvedClosure> {
+    let resolve = metadata
+        .resolve
+        .as_ref()
+        .ok_or_else(|| workspace_error("cargo metadata did not include a resolve graph"))?;
+    let mut packages = BTreeMap::new();
+    let mut facade = None;
+    for package in &metadata.packages {
+        if packages
+            .insert(package.id.as_str(), package.name.as_str())
+            .is_some()
+        {
+            return Err(workspace_error(format!(
+                "cargo metadata contains duplicate package id `{}`",
+                package.id
+            )));
+        }
+        if package.name == "bamts" && facade.replace(package.id.as_str()).is_some() {
+            return Err(workspace_error(
+                "cargo metadata contains multiple bamts packages",
+            ));
+        }
+    }
+    let facade = facade.ok_or_else(|| workspace_error("cargo metadata does not contain bamts"))?;
+
+    let mut nodes = BTreeMap::new();
+    for node in &resolve.nodes {
+        if nodes.insert(node.id.as_str(), node).is_some() {
+            return Err(workspace_error(format!(
+                "cargo metadata contains duplicate resolve node `{}`",
+                node.id
+            )));
+        }
+    }
+
+    let mut closure = ResolvedClosure::default();
+    let mut pending = vec![facade];
+    let mut visited = BTreeSet::new();
+    while let Some(package_id) = pending.pop() {
+        if !visited.insert(package_id) {
+            continue;
+        }
+        let node = nodes.get(package_id).ok_or_else(|| {
+            workspace_error(format!(
+                "cargo metadata resolve graph lacks package `{package_id}`"
+            ))
+        })?;
+        let name = packages.get(package_id).ok_or_else(|| {
+            workspace_error(format!("cargo metadata package table lacks `{package_id}`"))
+        })?;
+        closure.package_names.insert((*name).to_owned());
+        closure
+            .package_features
+            .entry((*name).to_owned())
+            .or_default()
+            .extend(node.features.iter().cloned());
         for dependency in &node.deps {
             let contributes_to_artifact = dependency
                 .dep_kinds

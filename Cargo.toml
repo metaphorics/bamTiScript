@@ -8,6 +8,7 @@ members = [
     "crates/bamts-codegen",
     "crates/bamts-cli",
     "crates/bamts-verification",
+    "crates/bamts",
 ]
 resolver = "3"
 
