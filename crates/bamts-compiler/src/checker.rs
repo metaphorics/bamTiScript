@@ -1994,7 +1994,9 @@ impl<'src> Checker<'src> {
             Expression::Parenthesized(inner) => self.resolve_expr(inner, scope),
             Expression::As(cast) => {
                 self.resolve_expr(&cast.expression, scope);
-                let _ = self.resolve_type(&cast.type_node, scope);
+                if let Some(type_node) = &cast.type_node {
+                    let _ = self.resolve_type(type_node, scope);
+                }
             }
             Expression::Satisfies(satisfies) => {
                 self.resolve_expr(&satisfies.expression, scope);
@@ -2381,7 +2383,10 @@ impl<'src> Checker<'src> {
             Expression::Literal(literal) => self.type_of_literal(literal),
             Expression::Parenthesized(inner) => self.type_of_expr(inner, scope),
             Expression::NonNull(non_null) => self.type_of_expr(&non_null.expression, scope),
-            Expression::As(cast) => self.resolve_type(&cast.type_node, scope),
+            Expression::As(cast) => match &cast.type_node {
+                Some(type_node) => self.resolve_type(type_node, scope),
+                None => self.type_of_expr(&cast.expression, scope),
+            },
             Expression::TypeAssertion(assertion) => self.resolve_type(&assertion.type_node, scope),
             Expression::Array(array) => {
                 let mut element_types = Vec::new();
@@ -2851,6 +2856,8 @@ mod tests {
             "Promise",
             "Error",
             "TypeError",
+            "escape",
+            "unescape",
             // Collections, reflection, shared-memory, and typed-array families.
             "Map",
             "Set",
@@ -3104,6 +3111,12 @@ mod tests {
         let result = check_text(
             "function copy<T>(value: T): T { const result = value as T; return result; }",
         );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn const_assertions_preserve_literal_expression_types() {
+        let result = check_text("const state: \"ready\" = \"ready\" as const;");
         assert!(checker_codes(&result).is_empty());
     }
 

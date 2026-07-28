@@ -45,6 +45,9 @@ const STANDARD_VALUES: &[&str] = &[
     "decodeURIComponent",
     "encodeURI",
     "encodeURIComponent",
+    // Annex B URI functions retained by the checker runtime contract.
+    "escape",
+    "unescape",
     "Object",
     "Function",
     "Boolean",

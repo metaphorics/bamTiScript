@@ -3547,11 +3547,11 @@ mod tests {
         // (a + b as T) * c erases to (a + b) * c.
         let as_expr = expr(Expression::As(AsExpression {
             expression: Box::new(binary(BinaryOperator::Add, a, bb)),
-            type_node: Box::new(Node::new(
+            type_node: Some(Box::new(Node::new(
                 NodeId::new(0),
                 dummy(),
                 TypeNode::Keyword(KeywordType::Any),
-            )),
+            ))),
         }));
         let tree = binary(BinaryOperator::Multiply, as_expr, c);
         let file = b.finish(vec![expr_stmt(tree)]);

@@ -2997,40 +2997,31 @@ impl Parser {
                 let range = self.cur().range();
                 self.note_typescript_syntax(range);
                 self.bump();
-                let type_node = if !is_satisfies && self.at(TokenKind::KwConst) {
-                    // `as const`: represent the const assertion as a reference
-                    // to a `const` type name, since the type space has no
-                    // dedicated const-assertion node.
-                    let const_token = self.bump();
-                    let name = self.ident_from(const_token);
-                    let ref_start = name.range().start();
-                    self.node(
-                        ref_start,
-                        TypeNode::Reference(TypeReference {
-                            name: EntityName::Identifier(name),
-                            type_arguments: None,
-                        }),
-                    )
-                } else {
-                    self.parse_type()
-                };
-                left = if is_satisfies {
-                    self.node(
+                if is_satisfies {
+                    let type_node = self.parse_type();
+                    left = self.node(
                         start,
                         Expression::Satisfies(SatisfiesExpression {
                             expression: Box::new(left),
                             type_node: Box::new(type_node),
                         }),
-                    )
+                    );
                 } else {
-                    self.node(
+                    let type_node = if self.at(TokenKind::KwConst) {
+                        // `as const` is a language construct, not a type reference.
+                        self.bump();
+                        None
+                    } else {
+                        Some(Box::new(self.parse_type()))
+                    };
+                    left = self.node(
                         start,
                         Expression::As(AsExpression {
                             expression: Box::new(left),
-                            type_node: Box::new(type_node),
+                            type_node,
                         }),
-                    )
-                };
+                    );
+                }
                 continue;
             }
 
