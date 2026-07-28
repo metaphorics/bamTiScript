@@ -168,6 +168,7 @@ impl SymbolKind {
                 | Self::Interface
                 | Self::TypeAlias
                 | Self::TypeParameter
+                | Self::Import
         )
     }
 
@@ -967,10 +968,12 @@ enum TypeState {
 enum TypeDef<'src> {
     Alias {
         scope: ScopeId,
+        type_parameters: Option<&'src crate::syntax::TypeParameterList>,
         node: &'src Ty,
     },
     Interface {
         scope: ScopeId,
+        type_parameters: Option<&'src crate::syntax::TypeParameterList>,
         extends: &'src [TypeReference],
         members: &'src [crate::syntax::TypeMemberNode],
     },
@@ -1411,10 +1414,13 @@ impl<'src> Checker<'src> {
             declaration,
             interface.name.range(),
         );
+        let type_scope = self.new_scope(ScopeKind::Block, Some(scope));
+        self.bind_type_parameter_names(interface.type_parameters.as_ref(), type_scope);
         // Only the first interface of a mergeable set owns the definition slot;
         // later merges keep their symbol but reuse the representative's shape.
         self.type_defs.entry(id).or_insert(TypeDef::Interface {
-            scope,
+            scope: type_scope,
+            type_parameters: interface.type_parameters.as_ref(),
             extends: &interface.extends,
             members: &interface.members,
         });
@@ -1433,10 +1439,13 @@ impl<'src> Checker<'src> {
             declaration,
             alias.name.range(),
         );
+        let type_scope = self.new_scope(ScopeKind::Block, Some(scope));
+        self.bind_type_parameter_names(alias.type_parameters.as_ref(), type_scope);
         self.type_defs.insert(
             id,
             TypeDef::Alias {
-                scope,
+                scope: type_scope,
+                type_parameters: alias.type_parameters.as_ref(),
                 node: &alias.type_node,
             },
         );
@@ -1681,7 +1690,7 @@ impl<'src> Checker<'src> {
             let initializer_type = declarator
                 .initializer
                 .as_ref()
-                .map(|initializer| self.type_of_expr(initializer));
+                .map(|initializer| self.type_of_expr(initializer, scope));
 
             // Only a plain identifier binding carries a checkable declared type.
             if let BindingPattern::Identifier(name) = declarator.binding.data() {
@@ -1706,6 +1715,33 @@ impl<'src> Checker<'src> {
 
     fn resolve_function(&mut self, function: &'src FunctionLike, parent: ScopeId) {
         let scope = self.new_scope(ScopeKind::Function, Some(parent));
+        for name in ["arguments", "this"] {
+            let explicitly_bound = function.parameters.iter().any(|parameter| {
+                matches!(
+                    parameter.data().binding.data(),
+                    BindingPattern::Identifier(identifier)
+                        if self.identifier_text(identifier) == name
+                )
+            });
+            if !explicitly_bound {
+                self.declare(
+                    name,
+                    SymbolKind::Parameter,
+                    scope,
+                    NodeId::default(),
+                    NodeId::default_range(),
+                );
+            }
+        }
+        if let Some(name) = &function.name {
+            self.declare(
+                self.identifier_text(name),
+                SymbolKind::Function,
+                scope,
+                name.id(),
+                name.range(),
+            );
+        }
         self.bind_type_parameters(function.type_parameters.as_ref(), scope);
         for parameter in &function.parameters {
             self.resolve_parameter(parameter, scope);
@@ -1729,6 +1765,15 @@ impl<'src> Checker<'src> {
         list: Option<&'src crate::syntax::TypeParameterList>,
         scope: ScopeId,
     ) {
+        self.bind_type_parameter_names(list, scope);
+        self.resolve_type_parameter_bounds(list, scope);
+    }
+
+    fn bind_type_parameter_names(
+        &mut self,
+        list: Option<&'src crate::syntax::TypeParameterList>,
+        scope: ScopeId,
+    ) {
         let Some(list) = list else {
             return;
         };
@@ -1741,6 +1786,19 @@ impl<'src> Checker<'src> {
                 parameter.id(),
                 data.name.range(),
             );
+        }
+    }
+
+    fn resolve_type_parameter_bounds(
+        &mut self,
+        list: Option<&'src crate::syntax::TypeParameterList>,
+        scope: ScopeId,
+    ) {
+        let Some(list) = list else {
+            return;
+        };
+        for parameter in &list.parameters {
+            let data = parameter.data();
             if let Some(constraint) = &data.constraint {
                 let _ = self.resolve_type(constraint, scope);
             }
@@ -1794,6 +1852,24 @@ impl<'src> Checker<'src> {
             }
             ClassMember::Constructor(constructor) => {
                 let child = self.new_scope(ScopeKind::Function, Some(scope));
+                for name in ["arguments", "this"] {
+                    let explicitly_bound = constructor.parameters.iter().any(|parameter| {
+                        matches!(
+                            parameter.data().binding.data(),
+                            BindingPattern::Identifier(identifier)
+                                if self.identifier_text(identifier) == name
+                        )
+                    });
+                    if !explicitly_bound {
+                        self.declare(
+                            name,
+                            SymbolKind::Parameter,
+                            child,
+                            NodeId::default(),
+                            NodeId::default_range(),
+                        );
+                    }
+                }
                 for parameter in &constructor.parameters {
                     self.resolve_parameter(parameter, child);
                 }
@@ -2181,12 +2257,23 @@ impl<'src> Checker<'src> {
         };
         self.type_state[symbol.get() as usize] = TypeState::InProgress;
         let resolved = match definition {
-            TypeDef::Alias { scope, node } => self.resolve_type(node, scope),
+            TypeDef::Alias {
+                scope,
+                type_parameters,
+                node,
+            } => {
+                self.resolve_type_parameter_bounds(type_parameters, scope);
+                self.resolve_type(node, scope)
+            }
             TypeDef::Interface {
                 scope,
+                type_parameters,
                 extends,
                 members,
-            } => self.resolve_interface_type(scope, extends, members),
+            } => {
+                self.resolve_type_parameter_bounds(type_parameters, scope);
+                self.resolve_interface_type(scope, extends, members)
+            }
         };
         self.type_state[symbol.get() as usize] = TypeState::Done(resolved);
         resolved
@@ -2283,7 +2370,7 @@ impl<'src> Checker<'src> {
 
     // -- expression typing (bounded, permissive) -------------------------------
 
-    fn type_of_expr(&mut self, expression: &'src Expr) -> TypeId {
+    fn type_of_expr(&mut self, expression: &'src Expr, scope: ScopeId) -> TypeId {
         match expression.data() {
             Expression::Identifier(identifier) => {
                 self.references.get(&identifier.id()).map_or_else(
@@ -2292,15 +2379,15 @@ impl<'src> Checker<'src> {
                 )
             }
             Expression::Literal(literal) => self.type_of_literal(literal),
-            Expression::Parenthesized(inner) => self.type_of_expr(inner),
-            Expression::NonNull(non_null) => self.type_of_expr(&non_null.expression),
-            Expression::As(cast) => self.type_of_type_node(&cast.type_node),
-            Expression::TypeAssertion(assertion) => self.type_of_type_node(&assertion.type_node),
+            Expression::Parenthesized(inner) => self.type_of_expr(inner, scope),
+            Expression::NonNull(non_null) => self.type_of_expr(&non_null.expression, scope),
+            Expression::As(cast) => self.resolve_type(&cast.type_node, scope),
+            Expression::TypeAssertion(assertion) => self.resolve_type(&assertion.type_node, scope),
             Expression::Array(array) => {
                 let mut element_types = Vec::new();
                 for element in &array.elements {
                     if let ArrayElement::Expression(inner) = element {
-                        let inner_type = self.type_of_expr(inner);
+                        let inner_type = self.type_of_expr(inner, scope);
                         element_types.push(inner_type);
                     }
                 }
@@ -2314,11 +2401,21 @@ impl<'src> Checker<'src> {
             Expression::Object(object) => {
                 let mut properties = Vec::new();
                 for member in &object.members {
-                    if let ObjectMember::Property(property) = member.data()
-                        && let Some(name) = self.property_key(&property.name)
-                    {
-                        let value_type = self.type_of_expr(&property.value);
-                        properties.push(PropertyType::new(name, false, value_type));
+                    match member.data() {
+                        ObjectMember::Property(property) => {
+                            if let Some(name) = self.property_key(&property.name) {
+                                let value_type = self.type_of_expr(&property.value, scope);
+                                properties.push(PropertyType::new(name, false, value_type));
+                            }
+                        }
+                        ObjectMember::Method(method) => {
+                            if let Some(name) = self.property_key(&method.name) {
+                                let method_type =
+                                    self.type_of_function_like(&method.function, scope);
+                                properties.push(PropertyType::new(name, false, method_type));
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 self.types.object_type(properties)
@@ -2327,11 +2424,22 @@ impl<'src> Checker<'src> {
         }
     }
 
-    fn type_of_type_node(&mut self, node: &'src Ty) -> TypeId {
-        // Cast targets are resolved in module scope; a value cast expression does
-        // not introduce new type bindings.
-        let scope = self.module_scope;
-        self.resolve_type(node, scope)
+    fn type_of_function_like(&mut self, function: &'src FunctionLike, parent: ScopeId) -> TypeId {
+        let scope = self.new_scope(ScopeKind::Function, Some(parent));
+        self.bind_type_parameters(function.type_parameters.as_ref(), scope);
+        let mut parameters = Vec::with_capacity(function.parameters.len());
+        for parameter in &function.parameters {
+            let parameter_type = match &parameter.data().type_annotation {
+                Some(annotation) => self.resolve_type(&annotation.data().type_node, scope),
+                None => self.types.any(),
+            };
+            parameters.push(parameter_type);
+        }
+        let return_type = match &function.return_type {
+            Some(annotation) => self.resolve_type(&annotation.data().type_node, scope),
+            None => self.types.any(),
+        };
+        self.types.function(parameters, return_type)
     }
 
     fn type_of_literal(&mut self, literal: &Literal) -> TypeId {
@@ -2384,6 +2492,7 @@ mod tests {
         NodeKind, NumericLiteral, Parameter, ParameterNode, SourceFile, Statement, Stmt,
         StringLiteral, Token, TokenKind, TypeAnnotation, TypeNode,
     };
+    use crate::{parser, scanner};
     use std::sync::Arc;
 
     // ---- direct algebra tests -------------------------------------------------
@@ -2531,6 +2640,24 @@ mod tests {
 
     fn source(text: &str) -> Arc<SourceText> {
         Arc::new(SourceText::new(text))
+    }
+
+    fn check_text(text: &str) -> Recovered<super::SemanticModel> {
+        let parsed = parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            source(text),
+        ));
+        check(&parsed)
+    }
+
+    fn checker_codes(result: &Recovered<super::SemanticModel>) -> Vec<&'static str> {
+        result
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| diagnostic.code().as_str())
+            .filter(|code| code.starts_with("BAMTS-C"))
+            .collect()
     }
 
     fn range(start: usize, end: usize) -> TextRange {
@@ -2922,6 +3049,85 @@ mod tests {
         )];
         let result = check(&file("const x: Foo;", statements));
         assert_eq!(semantic_codes(&result), [CANNOT_FIND_TYPE.as_str()]);
+    }
+
+    #[test]
+    fn generic_declarations_bind_their_type_parameters() {
+        let result = check_text(
+            "type Box<T> = { value: T };\
+             interface Pair<T> { left: T; map<U>(value: U): T; }\
+             class Store<T> { value: T; method<U>(value: U): T { return this.value; } }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn imported_names_bind_in_the_type_namespace_through_exports() {
+        let result = check_text(
+            "import type { Remote } from './remote.ts';\
+             export type Local<T> = Remote;\
+             export interface Public<T> { value: Local<T>; remote: Remote; }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn standard_iterator_and_generator_interfaces_are_bound() {
+        let result = check_text(
+            "declare let iterator: IterableIterator<number>;\
+             async function* values(): AsyncGenerator<number> { yield 1; }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn functions_bind_arguments_this_and_their_local_name() {
+        let result = check_text(
+            "const recursive = function self(this: void) { arguments; return self; };\
+             class C { method() { arguments; return this; } }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn ambient_declarations_bind_before_their_uses() {
+        let result = check_text(
+            "const before: Box<number> = make<number>();\
+             declare interface Box<T> { value: T; }\
+             declare function make<T>(): Box<T>;",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn local_generic_casts_resolve_in_the_enclosing_function() {
+        let result = check_text(
+            "function copy<T>(value: T): T { const result = value as T; return result; }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn object_methods_satisfy_structural_function_members() {
+        let result = check_text(
+            "interface Service { compute(value: number): Promise<number>; }\
+             const service: Service = { async compute(value: number) { return value; } };",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn unknown_names_and_real_initializer_mismatches_remain_errors() {
+        let result =
+            check_text("missingValue; let missing: MissingType; const count: number = 'wrong';");
+        assert_eq!(
+            checker_codes(&result),
+            [
+                CANNOT_FIND_NAME.as_str(),
+                CANNOT_FIND_TYPE.as_str(),
+                TYPE_NOT_ASSIGNABLE.as_str(),
+            ]
+        );
     }
 
     #[test]

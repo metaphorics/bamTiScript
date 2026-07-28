@@ -294,9 +294,13 @@ pub(crate) fn collect_facts(source: &SourceFile, model: &SemanticModel) -> Analy
         }
     }
     for (index, _) in text.match_indices("function ") {
-        let line = line_at(text, index);
-        if let (Some(open), Some(close)) = (line.find('('), line.find(')')) {
-            let params = &line[open + 1..close];
+        let (_, line_end) = line_bounds(text, index);
+        let function_text = &text[index..line_end];
+        if let Some(open) = function_text.find('(')
+            && let Some(close_offset) = function_text[open + 1..].find(')')
+        {
+            let close = open + 1 + close_offset;
+            let params = &function_text[open + 1..close];
             for parameter in params
                 .split(',')
                 .map(str::trim)
@@ -1005,6 +1009,25 @@ mod tests {
             .iter()
             .map(|diagnostic| diagnostic.code().as_str())
             .collect()
+    }
+
+    #[test]
+    fn implicit_any_ranges_stay_ordered_after_non_ascii_prefixes() {
+        let source = "const café = call(); function plain(value) {}";
+        let parsed = parsed(0, source, ScriptKind::TypeScript);
+        let result = check_with_lints(&parsed, &LintTable::new(LintProfile::Pedantic));
+        let diagnostic = result
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.code().as_str() == "BAMTS-W018")
+            .expect("untyped parameter is diagnosed");
+        let expected_start = parsed
+            .product()
+            .source_text()
+            .byte_to_utf16(source.find("value").expect("parameter is present"))
+            .expect("parameter starts on a UTF-8 boundary");
+        assert_eq!(diagnostic.range().start(), expected_start);
+        assert!(diagnostic.range().start() <= diagnostic.range().end());
     }
 
     #[test]
