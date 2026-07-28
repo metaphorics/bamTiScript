@@ -1,6 +1,9 @@
+pub mod semantic;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
+    checker::{ProgramSemanticModel, SemanticModel},
     diagnostic::Diagnostic,
     lint::{LintProfile, LintTable, SourceDialect, rule_by_code},
     source::{ScriptKind, TextRange},
@@ -98,6 +101,17 @@ pub fn analyze(source: &SourceFile, levels: &LintTable) -> Vec<Diagnostic> {
         .collect::<Vec<_>>();
     diagnostics.sort();
     diagnostics
+}
+
+/// Runs every checker-dependent rule over the frozen semantic model.
+#[must_use]
+pub fn analyze_semantic(
+    source: &SourceFile,
+    model: &SemanticModel,
+    program: Option<&ProgramSemanticModel>,
+    levels: &LintTable,
+) -> Vec<Diagnostic> {
+    semantic::analyze(source, model, program, levels)
 }
 
 /// Runs syntax rules with their settled default levels.

@@ -13,7 +13,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
-use crate::source::TextRange;
+use crate::lint::{LintProfile, LintTable};
+use crate::source::{SourceId, TextRange};
 use crate::syntax::{
     ArrayElement, AssignmentTarget, BindingPattern, CallArgument, ClassDeclaration, ClassMember,
     EntityName, Expr, Expression, ForBinding, ForInitializer, FunctionBody, FunctionLike,
@@ -22,7 +23,7 @@ use crate::syntax::{
     TypeAliasDeclaration, TypeLiteral, TypeMember, TypeNode, TypeReference, VariableDeclaration,
     VariableKind,
 };
-use crate::warning::analyze_hard_warnings;
+use crate::warning::analyze_warnings;
 
 /// Diagnostic emitted when a block-scoped name redeclares an existing binding.
 pub const DUPLICATE_DECLARATION: DiagnosticCode = DiagnosticCode::new("BAMTS-C001");
@@ -376,6 +377,8 @@ pub enum Type {
     Function(FunctionSignature),
     /// A nominal named type (type parameter, class, or enum) compared by identity.
     Named(SymbolId),
+    /// A numeric enum value, distinct from both its runtime enum object and number.
+    NumericEnum(SymbolId),
 }
 
 /// An interning table for structural types plus the assignability relation.
@@ -539,6 +542,11 @@ impl TypeTable {
         self.intern(Type::Named(symbol))
     }
 
+    /// Interns a numeric enum value type.
+    pub fn numeric_enum(&mut self, symbol: SymbolId) -> TypeId {
+        self.intern(Type::NumericEnum(symbol))
+    }
+
     /// Interns an array type over `element`.
     pub fn array(&mut self, element: TypeId) -> TypeId {
         self.intern(Type::Array(element))
@@ -603,6 +611,7 @@ impl TypeTable {
             (Type::NumberLiteral(_), Type::Number) => true,
             (Type::BooleanLiteral(_), Type::Boolean) => true,
             (Type::BigIntLiteral(_), Type::BigInt) => true,
+            (Type::NumericEnum(_), Type::Number) | (Type::Number, Type::NumericEnum(_)) => true,
             (Type::Union(sources), _) => sources.iter().all(|s| self.assignable(*s, target)),
             (_, Type::Union(targets)) => targets.iter().any(|t| self.assignable(source, *t)),
             (Type::Array(source_element), Type::Array(target_element)) => {
@@ -618,12 +627,79 @@ impl TypeTable {
         }
     }
 
+    /// Computes compatibility once while retaining every accepted unsound
+    /// concession for rule consumers.
+    #[must_use]
+    pub fn relation(&self, source: TypeId, target: TypeId) -> TypeRelation {
+        let compatible = self.assignable(source, target);
+        if !compatible {
+            return TypeRelation {
+                compatible,
+                hazards: Box::new([]),
+            };
+        }
+
+        let mut hazards = Vec::new();
+        if let (Type::Function(from), Type::Function(to)) = (self.get(source), self.get(target)) {
+            if from.parameters.len() < to.parameters.len() {
+                hazards.push(RelationHazard::FewerCallbackParameters);
+            }
+            if matches!(self.get(to.return_type), Type::Void)
+                && !matches!(self.get(from.return_type), Type::Void | Type::Never)
+            {
+                hazards.push(RelationHazard::ValueReturnedToVoid);
+            }
+        }
+        if matches!(
+            (self.get(source), self.get(target)),
+            (Type::NumericEnum(_), Type::Number) | (Type::Number, Type::NumericEnum(_))
+        ) {
+            hazards.push(RelationHazard::NumericEnumNumber);
+        }
+        if let (Type::ObjectType(from), Type::ObjectType(to)) =
+            (self.get(source), self.get(target))
+        {
+            for target_property in to.iter().filter(|property| property.optional) {
+                let Some(source_property) = from
+                    .iter()
+                    .find(|property| property.name == target_property.name)
+                else {
+                    continue;
+                };
+                if matches!(self.get(source_property.type_id), Type::Undefined)
+                    && !self.contains_undefined(target_property.type_id)
+                {
+                    hazards.push(RelationHazard::ExplicitUndefinedForOptional);
+                    break;
+                }
+            }
+        }
+        TypeRelation {
+            compatible,
+            hazards: hazards.into_boxed_slice(),
+        }
+    }
+
+    fn contains_undefined(&self, type_id: TypeId) -> bool {
+        match self.get(type_id) {
+            Type::Undefined => true,
+            Type::Union(members) => members
+                .iter()
+                .any(|member| self.contains_undefined(*member)),
+            _ => false,
+        }
+    }
+
     fn object_assignable(&self, source: &[PropertyType], target: &[PropertyType]) -> bool {
         // Excess source properties are allowed; each target property must be
         // satisfied. Members are name-sorted, so a merge walk suffices.
         target.iter().all(
             |want| match source.iter().find(|have| have.name == want.name) {
-                Some(have) => self.assignable(have.type_id, want.type_id),
+                Some(have) => {
+                    self.assignable(have.type_id, want.type_id)
+                        || (want.optional
+                            && matches!(self.get(have.type_id), Type::Undefined))
+                }
                 None => want.optional,
             },
         )
@@ -645,6 +721,112 @@ impl TypeTable {
     }
 }
 
+/// A compatibility decision plus the intentional TypeScript hazards that made
+/// the conversion possible.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypeRelation {
+    compatible: bool,
+    hazards: Box<[RelationHazard]>,
+}
+
+impl TypeRelation {
+    #[must_use]
+    pub const fn compatible(&self) -> bool {
+        self.compatible
+    }
+
+    #[must_use]
+    pub fn hazards(&self) -> &[RelationHazard] {
+        &self.hazards
+    }
+}
+
+/// A type-system concession retained for the semantic lint pass.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum RelationHazard {
+    ExplicitUndefinedForOptional,
+    FewerCallbackParameters,
+    ValueReturnedToVoid,
+    NumericEnumNumber,
+}
+
+/// Compact identity for one allocated object literal and its aliases.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ObjectId(u32);
+
+/// Source-qualified syntax identity used by cross-file facts.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct NodeKey {
+    pub source_id: SourceId,
+    pub node_id: NodeId,
+}
+
+/// One checker-derived condition consumed by a semantic rule.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum SemanticHazard {
+    UncheckedIndexRead,
+    ExplicitUndefinedOptional,
+    DetachedMethod,
+    DivergentAccessor,
+    ReadonlyAliasMutation,
+    FewerCallbackParameters,
+    ValueReturnedToVoid,
+    OpenObjectKeys,
+    IndexSignatureDotAccess,
+    ImplicitAny,
+    UncheckedAssertion,
+    DeclarationInferenceDependency,
+    TypeImportedAsValue,
+    TypeReexportedAsValue,
+    VirtualCallInConstructor,
+    InitializedFieldShadowsAccessor,
+    ImplicitOverride,
+    NumericEnumNumber,
+    NumericEnumReverseLookup,
+    NonExhaustiveSwitch,
+    InvalidNumberFormatting,
+    NumericKeyOrder,
+    JsonStringifyUnserializable,
+    UncheckedJsonParse,
+    NumericDefaultSort,
+    LooseEqualityCoercion,
+    ObjectToPrimitive,
+    SymbolInterpolation,
+    UnsafeToStringTag,
+    UninitializedFieldShadowsAccessor,
+}
+
+/// Immutable evidence for one semantic lint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HazardFact {
+    pub hazard: SemanticHazard,
+    pub range: TextRange,
+    pub note: Option<Box<str>>,
+}
+
+/// Frozen checker facts. Rule implementations only query this product.
+#[derive(Clone, Debug, Default)]
+pub struct AnalysisFacts {
+    hazards: Vec<HazardFact>,
+}
+
+impl AnalysisFacts {
+    #[must_use]
+    pub fn hazards(&self) -> &[HazardFact] {
+        &self.hazards
+    }
+
+    pub(crate) fn push(&mut self, fact: HazardFact) {
+        if !self
+            .hazards
+            .iter()
+            .any(|existing| existing.hazard == fact.hazard && existing.range == fact.range)
+        {
+            self.hazards.push(fact);
+        }
+    }
+}
+
 /// The immutable product of semantic analysis.
 #[derive(Clone, Debug)]
 pub struct SemanticModel {
@@ -654,6 +836,7 @@ pub struct SemanticModel {
     references: HashMap<NodeId, SymbolId>,
     types: TypeTable,
     module_scope: ScopeId,
+    facts: AnalysisFacts,
 }
 
 impl SemanticModel {
@@ -699,6 +882,16 @@ impl SemanticModel {
         &self.types
     }
 
+    /// Returns the immutable semantic evidence consumed by lint rules.
+    #[must_use]
+    pub const fn facts(&self) -> &AnalysisFacts {
+        &self.facts
+    }
+
+    pub(crate) fn replace_facts(&mut self, facts: AnalysisFacts) {
+        self.facts = facts;
+    }
+
     /// Returns the symbol an identifier reference resolved to, if any.
     #[must_use]
     pub fn reference(&self, node: NodeId) -> Option<SymbolId> {
@@ -740,19 +933,102 @@ impl SemanticModel {
     }
 }
 
-/// Analyzes a recovered parse product into an immutable [`SemanticModel`].
-///
-/// The returned diagnostics merge the checker's semantic errors with the
-/// front-end hard warnings in canonical order. Existing parser diagnostics stay
-/// with the [`SourceFile`]; the parent compiler owns their integration.
+/// Analyzes one source with the default lint profile.
 #[must_use]
 pub fn check(source_file: &Recovered<SourceFile>) -> Recovered<SemanticModel> {
-    let warnings = analyze_hard_warnings(source_file);
-    let mut checker = Checker::new(source_file.product());
-    checker.run();
-    let (model, mut diagnostics) = checker.finish();
-    diagnostics.extend(warnings);
+    check_with_lints(source_file, &LintTable::new(LintProfile::Default))
+}
+
+/// Analyzes one source using an already-resolved lint table.
+#[must_use]
+pub fn check_with_lints(
+    source_file: &Recovered<SourceFile>,
+    levels: &LintTable,
+) -> Recovered<SemanticModel> {
+    let source = source_file.product();
+    let (mut model, mut diagnostics) = check_core(source);
+    model.replace_facts(crate::rules::semantic::collect_facts(source, &model));
+    diagnostics.extend(analyze_warnings(source_file, levels));
+    diagnostics.extend(crate::rules::analyze_semantic(
+        source, &model, None, levels,
+    ));
     Recovered::new(model, diagnostics)
+}
+
+/// One resolved module edge supplied by the project loader.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ResolvedModuleEdge {
+    pub from: SourceId,
+    pub specifier: NodeId,
+    pub to: SourceId,
+}
+
+/// Borrowed input for a linked multi-file checker run.
+#[derive(Clone, Copy)]
+pub struct ProgramCheckInput<'a> {
+    pub files: &'a [Recovered<SourceFile>],
+    pub edges: &'a [ResolvedModuleEdge],
+}
+
+/// Immutable linked checker product.
+#[derive(Clone, Debug)]
+pub struct ProgramSemanticModel {
+    files: BTreeMap<SourceId, SemanticModel>,
+    edges: Box<[ResolvedModuleEdge]>,
+}
+
+impl ProgramSemanticModel {
+    #[must_use]
+    pub fn file(&self, source_id: SourceId) -> Option<&SemanticModel> {
+        self.files.get(&source_id)
+    }
+
+    #[must_use]
+    pub fn edges(&self) -> &[ResolvedModuleEdge] {
+        &self.edges
+    }
+}
+
+/// Checks a set of loaded files after module resolution.
+#[must_use]
+pub fn check_program(
+    input: ProgramCheckInput<'_>,
+    levels: &LintTable,
+) -> Recovered<ProgramSemanticModel> {
+    let mut files = BTreeMap::new();
+    let mut diagnostics = Vec::new();
+    for recovered in input.files {
+        let source = recovered.product();
+        let (mut model, core_diagnostics) = check_core(source);
+        model.replace_facts(crate::rules::semantic::collect_facts(source, &model));
+        diagnostics.extend(core_diagnostics);
+        diagnostics.extend(analyze_warnings(recovered, levels));
+        files.insert(source.source_id(), model);
+    }
+    crate::rules::semantic::collect_program_facts(input.files, input.edges, &mut files);
+    let program = ProgramSemanticModel {
+        files,
+        edges: input.edges.into(),
+    };
+    for recovered in input.files {
+        let source = recovered.product();
+        let model = program
+            .file(source.source_id())
+            .expect("program model contains every input source");
+        diagnostics.extend(crate::rules::analyze_semantic(
+            source,
+            model,
+            Some(&program),
+            levels,
+        ));
+    }
+    Recovered::new(program, diagnostics)
+}
+
+fn check_core(source: &SourceFile) -> (SemanticModel, Vec<Diagnostic>) {
+    let mut checker = Checker::new(source);
+    checker.run();
+    checker.finish()
 }
 
 /// Lazy resolution state for a type-declaring symbol.
@@ -823,6 +1099,7 @@ impl<'src> Checker<'src> {
             references: self.references,
             types: self.types,
             module_scope: self.module_scope,
+            facts: AnalysisFacts::default(),
         };
         (model, self.diagnostics)
     }
@@ -2168,6 +2445,37 @@ mod tests {
         assert!(table.assignable(returns_number, takes_none));
         // Silence unused nominal helpers when variance path above suffices.
         assert_ne!(animal, dog);
+    }
+
+    #[test]
+    fn relation_retains_optional_callback_void_and_enum_hazards() {
+        let mut table = TypeTable::new();
+        let source_object =
+            table.object_type(vec![PropertyType::new("x", false, table.undefined_type())]);
+        let target_object =
+            table.object_type(vec![PropertyType::new("x", true, table.number())]);
+        let optional = table.relation(source_object, target_object);
+        assert!(optional.compatible());
+        assert!(optional
+            .hazards()
+            .contains(&super::RelationHazard::ExplicitUndefinedForOptional));
+
+        let source_function = table.function(Vec::new(), table.number());
+        let target_function = table.function(vec![table.number()], table.void());
+        let callback = table.relation(source_function, target_function);
+        assert!(callback
+            .hazards()
+            .contains(&super::RelationHazard::FewerCallbackParameters));
+        assert!(callback
+            .hazards()
+            .contains(&super::RelationHazard::ValueReturnedToVoid));
+
+        let enum_type = table.numeric_enum(super::SymbolId::new(200));
+        let enum_boundary = table.relation(enum_type, table.number());
+        assert!(enum_boundary.compatible());
+        assert!(enum_boundary
+            .hazards()
+            .contains(&super::RelationHazard::NumericEnumNumber));
     }
 
     // ---- checker behavior tests ----------------------------------------------

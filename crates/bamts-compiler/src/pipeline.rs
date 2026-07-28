@@ -14,6 +14,7 @@ use std::sync::Arc;
 use crate::checker::{self, SemanticModel};
 use crate::diagnostic::Diagnostic;
 use crate::emitter::{self, EmitOptions, EmitOutput};
+use crate::lint::{LintProfile, LintTable};
 use crate::parser;
 use crate::scanner;
 use crate::source::{ScriptKind, SourceId, SourceText};
@@ -127,7 +128,14 @@ impl FrontendOutput {
     }
 }
 
-/// Runs the fixed scan -> parse -> check -> optional emit frontend pipeline.
+/// Runs the fixed frontend pipeline with settled default lint levels.
+#[must_use]
+pub fn compile_frontend(request: FrontendRequest) -> FrontendOutput {
+    compile_frontend_with_lints(request, &LintTable::new(LintProfile::Default))
+}
+
+/// Runs the fixed scan -> parse -> check -> optional emit frontend pipeline
+/// using the caller's resolved lint table.
 ///
 /// Every stage runs regardless of the diagnostics its predecessor produced, so
 /// the returned [`FrontendOutput`] always carries a recovered `SourceFile` and
@@ -135,7 +143,10 @@ impl FrontendOutput {
 /// stages reported errors. All stage diagnostics are merged, canonically
 /// ordered, and de-duplicated into one vector.
 #[must_use]
-pub fn compile_frontend(request: FrontendRequest) -> FrontendOutput {
+pub fn compile_frontend_with_lints(
+    request: FrontendRequest,
+    levels: &LintTable,
+) -> FrontendOutput {
     let FrontendRequest {
         source_id,
         script_kind,
@@ -145,7 +156,7 @@ pub fn compile_frontend(request: FrontendRequest) -> FrontendOutput {
 
     let scanned = scanner::scan(source_id, script_kind, source);
     let parsed = parser::parse(scanned);
-    let checked = checker::check(&parsed);
+    let checked = checker::check_with_lints(&parsed, levels);
 
     // Emit runs against the recovered tree; it never gates on prior diagnostics.
     let emit = mode
