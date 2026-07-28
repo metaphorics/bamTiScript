@@ -63,7 +63,7 @@ pub(super) fn install<H: Host>(
         unreachable!()
     };
     properties.insert(
-        PropertyKey::Private(super::heap_index(builtins.symbol_iterator()) as u32),
+        PropertyKey::Symbol(super::heap_index(builtins.symbol_iterator()) as u32),
         super::builtin_property(iterator),
     );
 }

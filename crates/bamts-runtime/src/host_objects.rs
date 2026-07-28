@@ -51,6 +51,7 @@ pub(crate) fn install<H: Host>(
             properties: PropertyMap::default(),
             prototype: Some(builtins.array_prototype()),
             extensible: true,
+            length_writable: true,
         },
     );
     let versions = object(heap, object_prototype);
@@ -300,7 +301,8 @@ impl<H: Host> Machine<'_, H> {
                     HeapEntry::String(text) if top_level => Ok(text.clone()),
                     HeapEntry::String(text) => Ok(quote(text)),
                     HeapEntry::BigInt(text) => Ok(format!("{text}n")),
-                    HeapEntry::PrivateName { description } => Ok(format!("Symbol({description})")),
+                    HeapEntry::Symbol { description } => Ok(format!("Symbol({description})")),
+                    HeapEntry::PrivateName { description } => Ok(format!("PrivateName({description})")),
                     HeapEntry::Array { elements, .. } => {
                         if depth >= 2 {
                             return Ok("[Array]".to_owned());

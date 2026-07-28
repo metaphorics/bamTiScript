@@ -49,6 +49,7 @@ pub(crate) struct BuiltinTable<H: Host> {
     error_prototypes: Vec<(BuiltinId, Value)>,
     symbol_iterator: Option<Value>,
     symbol_to_string_tag: Option<Value>,
+    symbol_prototype: Option<Value>,
     marker: PhantomData<fn() -> H>,
 }
 
@@ -72,6 +73,7 @@ impl<H: Host> BuiltinTable<H> {
             error_prototypes: Vec::new(),
             symbol_iterator: None,
             symbol_to_string_tag: None,
+            symbol_prototype: None,
             marker: PhantomData,
         }
     }
@@ -122,6 +124,14 @@ impl<H: Host> BuiltinTable<H> {
 
     pub(crate) fn set_symbol_to_string_tag(&mut self, symbol: Value) {
         self.symbol_to_string_tag = Some(symbol);
+    }
+    pub(crate) fn set_symbol_prototype(&mut self, prototype: Value) {
+        self.symbol_prototype = Some(prototype);
+    }
+
+    pub(crate) fn symbol_prototype(&self) -> Value {
+        self.symbol_prototype
+            .expect("Symbol builtins install their prototype")
     }
 
     pub(crate) fn symbol_to_string_tag(&self) -> Value {
@@ -203,6 +213,7 @@ impl<H: Host> Intrinsics<H> {
                 properties: PropertyMap::default(),
                 prototype: Some(object_prototype),
                 extensible: true,
+                length_writable: true,
             },
         );
         let string_prototype = ordinary_prototype(heap, object_prototype);
@@ -551,6 +562,7 @@ mod tests {
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.array_prototype),
                 extensible: true,
+                length_writable: true,
             })
             .unwrap();
         let is_array = call_static(&mut machine, "Array", "isArray", &[array]);

@@ -15,12 +15,13 @@ pub(super) fn install<H: Host>(
 ) {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
     let registry = super::super::ordinary_prototype(heap, builtins.object_prototype());
-    let iterator = private_name(heap, "Symbol.iterator");
-    let async_iterator = private_name(heap, "Symbol.asyncIterator");
-    let has_instance = private_name(heap, "Symbol.hasInstance");
-    let to_string_tag = private_name(heap, "Symbol.toStringTag");
+    let iterator = symbol(heap, "Symbol.iterator");
+    let async_iterator = symbol(heap, "Symbol.asyncIterator");
+    let has_instance = symbol(heap, "Symbol.hasInstance");
+    let to_string_tag = symbol(heap, "Symbol.toStringTag");
     builtins.set_symbol_iterator(iterator);
     builtins.set_symbol_to_string_tag(to_string_tag);
+    builtins.set_symbol_prototype(prototype);
 
     let constructor = install_function(heap, builtins, "Symbol", 0, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
@@ -54,7 +55,7 @@ pub(super) fn install<H: Host>(
         },
     );
     properties.insert(
-        PropertyKey::Private(heap_index(to_string_tag) as u32),
+        PropertyKey::Symbol(heap_index(to_string_tag) as u32),
         builtin_property(symbol_tag),
     );
 
@@ -62,10 +63,10 @@ pub(super) fn install<H: Host>(
     globals.insert("\0Symbol.registry".to_owned(), registry);
 }
 
-fn private_name(heap: &mut Vec<HeapEntry>, description: &str) -> Value {
+fn symbol(heap: &mut Vec<HeapEntry>, description: &str) -> Value {
     super::super::push(
         heap,
-        HeapEntry::PrivateName {
+        HeapEntry::Symbol {
             description: description.to_owned(),
         },
     )
@@ -114,7 +115,7 @@ fn constructor<H: Host>(
         .transpose()?
         .unwrap_or_default();
     let symbol = machine
-        .allocate(HeapEntry::PrivateName { description })
+        .allocate(HeapEntry::Symbol { description })
         .map_err(EvalFailure::Runtime)?;
     Ok(BuiltinOutcome::Value(symbol))
 }
@@ -135,7 +136,7 @@ fn symbol_for<H: Host>(
         return Ok(BuiltinOutcome::Value(existing));
     }
     let symbol = machine
-        .allocate(HeapEntry::PrivateName {
+        .allocate(HeapEntry::Symbol {
             description: key.clone(),
         })
         .map_err(EvalFailure::Runtime)?;
@@ -143,7 +144,7 @@ fn symbol_for<H: Host>(
     Ok(BuiltinOutcome::Value(symbol))
 }
 
-fn private_description<H: Host>(
+fn symbol_description<H: Host>(
     machine: &Machine<'_, H>,
     value: Value,
 ) -> Result<String, EvalFailure> {
@@ -152,7 +153,7 @@ fn private_description<H: Host>(
     };
     let index = id.slot() as usize - 1;
     match machine.heap.get(index) {
-        Some(HeapEntry::PrivateName { description }) => Ok(description.clone()),
+        Some(HeapEntry::Symbol { description }) => Ok(description.clone()),
         _ => Err(type_error("Symbol method called on incompatible receiver")),
     }
 }
@@ -165,7 +166,7 @@ fn description<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
-        private_description(machine, this)?,
+        symbol_description(machine, this)?,
     )?))
 }
 
@@ -175,7 +176,7 @@ fn to_string<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let text = format!("Symbol({})", private_description(machine, this)?);
+    let text = format!("Symbol({})", symbol_description(machine, this)?);
     Ok(BuiltinOutcome::Value(allocate_string(machine, text)?))
 }
 
@@ -185,6 +186,6 @@ fn value_of<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    private_description(machine, this)?;
+    symbol_description(machine, this)?;
     Ok(BuiltinOutcome::Value(this))
 }

@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 
 use bamts_native::{Decoded, Value};
 
-use super::{allocate_array, allocate_string, define_data, install_function, type_error};
+use super::{
+    allocate_array, allocate_string, define_data, install_function, range_error, type_error,
+};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
 
@@ -113,7 +115,7 @@ fn own_names<H: Host>(machine: &Machine<'_, H>, value: Value) -> Result<Vec<Stri
         .into_iter()
         .filter_map(|key| match key {
             PropertyKey::Named(name) => Some(name),
-            PropertyKey::Private(_) => None,
+            PropertyKey::Symbol(_) | PropertyKey::Private(_) => None,
         })
         .collect())
 }
@@ -233,44 +235,205 @@ fn is_frozen<H: Host>(
     )))
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PropertyDescriptor {
+    value: Option<Value>,
+    writable: Option<bool>,
+    getter: Option<Value>,
+    setter: Option<Value>,
+    enumerable: Option<bool>,
+    configurable: Option<bool>,
+}
+
+impl PropertyDescriptor {
+    fn is_accessor(self) -> bool {
+        self.getter.is_some() || self.setter.is_some()
+    }
+
+    fn is_data(self) -> bool {
+        self.value.is_some() || self.writable.is_some()
+    }
+
+    fn into_property(self, current: Option<Property>) -> Property {
+        let enumerable = self
+            .enumerable
+            .unwrap_or_else(|| current.as_ref().is_some_and(Property::enumerable));
+        let configurable = self
+            .configurable
+            .unwrap_or_else(|| current.as_ref().is_some_and(Property::configurable));
+
+        if self.is_accessor() {
+            let (current_getter, current_setter) = match current {
+                Some(Property::Accessor { getter, setter, .. }) => (getter, setter),
+                _ => (None, None),
+            };
+            return Property::Accessor {
+                getter: self
+                    .getter
+                    .map(|value| (value != Value::UNDEFINED).then_some(value))
+                    .unwrap_or(current_getter),
+                setter: self
+                    .setter
+                    .map(|value| (value != Value::UNDEFINED).then_some(value))
+                    .unwrap_or(current_setter),
+                enumerable,
+                configurable,
+            };
+        }
+
+        if self.is_data() {
+            let (current_value, current_writable) = match current {
+                Some(Property::Data {
+                    value, writable, ..
+                }) => (value, writable),
+                _ => (Value::UNDEFINED, false),
+            };
+            return Property::Data {
+                value: self.value.unwrap_or(current_value),
+                writable: self.writable.unwrap_or(current_writable),
+                enumerable,
+                configurable,
+            };
+        }
+
+        match current {
+            Some(Property::Accessor { getter, setter, .. }) => Property::Accessor {
+                getter,
+                setter,
+                enumerable,
+                configurable,
+            },
+            Some(Property::Data {
+                value, writable, ..
+            }) => Property::Data {
+                value,
+                writable,
+                enumerable,
+                configurable,
+            },
+            None => Property::Data {
+                value: Value::UNDEFINED,
+                writable: false,
+                enumerable,
+                configurable,
+            },
+        }
+    }
+}
+
+fn descriptor_field<H: Host>(
+    machine: &mut Machine<'_, H>,
+    descriptor: Value,
+    name: &str,
+) -> Result<Option<Value>, EvalFailure> {
+    let key = PropertyKey::Named(name.to_owned());
+    if !machine.has_property(descriptor, &key)? {
+        return Ok(None);
+    }
+    machine.get_property(descriptor, &key).map(Some)
+}
+
 fn descriptor_from<H: Host>(
     machine: &mut Machine<'_, H>,
     descriptor: Value,
-) -> Result<Property, EvalFailure> {
+) -> Result<PropertyDescriptor, EvalFailure> {
     if !machine.is_object(descriptor) {
         return Err(type_error("Property description must be an object"));
     }
-    let enumerable_value = machine.get_named_property(descriptor, "enumerable")?;
-    let enumerable = machine.to_boolean(enumerable_value);
-    let configurable_value = machine.get_named_property(descriptor, "configurable")?;
-    let configurable = machine.to_boolean(configurable_value);
-    let getter = machine.get_named_property(descriptor, "get")?;
-    let setter = machine.get_named_property(descriptor, "set")?;
-    let accessor = getter != Value::UNDEFINED || setter != Value::UNDEFINED;
-    if accessor {
-        if (getter != Value::UNDEFINED && !machine.is_callable(getter)?)
-            || (setter != Value::UNDEFINED && !machine.is_callable(setter)?)
-            || machine.has_own_property_key(descriptor, &PropertyKey::Named("value".to_owned()))?
-            || machine
-                .has_own_property_key(descriptor, &PropertyKey::Named("writable".to_owned()))?
-        {
-            return Err(type_error("Invalid property descriptor"));
-        }
-        return Ok(Property::Accessor {
-            getter: (getter != Value::UNDEFINED).then_some(getter),
-            setter: (setter != Value::UNDEFINED).then_some(setter),
-            enumerable,
-            configurable,
-        });
+    let enumerable =
+        descriptor_field(machine, descriptor, "enumerable")?.map(|value| machine.to_boolean(value));
+    let configurable = descriptor_field(machine, descriptor, "configurable")?
+        .map(|value| machine.to_boolean(value));
+    let value = descriptor_field(machine, descriptor, "value")?;
+    let writable =
+        descriptor_field(machine, descriptor, "writable")?.map(|value| machine.to_boolean(value));
+    let getter = descriptor_field(machine, descriptor, "get")?;
+    if let Some(getter) = getter
+        && getter != Value::UNDEFINED
+        && !machine.is_callable(getter)?
+    {
+        return Err(type_error("Invalid property descriptor"));
     }
-    let value = machine.get_named_property(descriptor, "value")?;
-    let writable_value = machine.get_named_property(descriptor, "writable")?;
-    Ok(Property::Data {
+    let setter = descriptor_field(machine, descriptor, "set")?;
+    if let Some(setter) = setter
+        && setter != Value::UNDEFINED
+        && !machine.is_callable(setter)?
+    {
+        return Err(type_error("Invalid property descriptor"));
+    }
+    if (getter.is_some() || setter.is_some()) && (value.is_some() || writable.is_some()) {
+        return Err(type_error("Invalid property descriptor"));
+    }
+    Ok(PropertyDescriptor {
         value,
-        writable: machine.to_boolean(writable_value),
+        writable,
+        getter,
+        setter,
         enumerable,
         configurable,
     })
+}
+
+fn define_array_length_descriptor<H: Host>(
+    machine: &mut Machine<'_, H>,
+    object: Value,
+    key: &PropertyKey,
+    descriptor: PropertyDescriptor,
+) -> Result<bool, EvalFailure> {
+    let Some(index) = machine.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
+        return Ok(false);
+    };
+    if !matches!(key, PropertyKey::Named(name) if name == "length")
+        || !matches!(machine.heap[index], HeapEntry::Array { .. })
+    {
+        return Ok(false);
+    }
+    if descriptor.is_accessor() {
+        return Err(type_error("Invalid property descriptor"));
+    }
+    if descriptor.enumerable == Some(true) || descriptor.configurable == Some(true) {
+        return Err(type_error("Cannot redefine array length"));
+    }
+    let length = descriptor
+        .value
+        .map(|value| {
+            crate::exact_array_length(value).ok_or_else(|| range_error("define array length"))
+        })
+        .transpose()?;
+    let HeapEntry::Array {
+        elements,
+        properties,
+        length_writable,
+        ..
+    } = &mut machine.heap[index]
+    else {
+        unreachable!("array checked above");
+    };
+    if descriptor.writable == Some(true) && !*length_writable {
+        return Err(type_error("Cannot make array length writable"));
+    }
+    let result = match length {
+        Some(length) => super::define_array_length(elements, properties, *length_writable, length),
+        None => Ok(()),
+    };
+    if descriptor.writable == Some(false) {
+        *length_writable = false;
+    }
+    result?;
+    Ok(true)
+}
+
+fn apply_property_descriptor<H: Host>(
+    machine: &mut Machine<'_, H>,
+    target: Value,
+    key: PropertyKey,
+    descriptor: PropertyDescriptor,
+) -> Result<(), EvalFailure> {
+    if define_array_length_descriptor(machine, target, &key, descriptor)? {
+        return Ok(());
+    }
+    let current = machine.own_descriptor(target, &key)?;
+    machine.define_descriptor(target, key, descriptor.into_property(current))
 }
 
 fn define_property<H: Host>(
@@ -285,7 +448,7 @@ fn define_property<H: Host>(
     }
     let key = machine.to_property_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
     let descriptor = descriptor_from(machine, args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
-    machine.define_descriptor(target, key, descriptor)?;
+    apply_property_descriptor(machine, target, key, descriptor)?;
     Ok(BuiltinOutcome::Value(target))
 }
 
@@ -306,7 +469,7 @@ fn define_properties_on<H: Host>(
         definitions.push((key, descriptor_from(machine, descriptor)?));
     }
     for (key, descriptor) in definitions {
-        machine.define_descriptor(target, key, descriptor)?;
+        apply_property_descriptor(machine, target, key, descriptor)?;
     }
     Ok(())
 }
@@ -355,11 +518,11 @@ fn get_own_property_symbols<H: Host>(
         .own_property_keys(value)?
         .into_iter()
         .filter_map(|key| match key {
-            PropertyKey::Named(_) => None,
-            PropertyKey::Private(index) => Some(Value::heap_ref(
+            PropertyKey::Symbol(index) => Some(Value::heap_ref(
                 bamts_native::SlotId::from_parts(crate::RUNTIME_HEAP_SEGMENT, index + 1)
                     .expect("property key is a valid runtime heap slot"),
             )),
+            PropertyKey::Named(_) | PropertyKey::Private(_) => None,
         })
         .collect();
     Ok(BuiltinOutcome::Value(allocate_array(machine, symbols)?))
@@ -496,7 +659,7 @@ fn prototype_to_string<H: Host>(
         _ => {
             let fallback = machine.object_to_string_tag(this)?;
             let symbol = machine.intrinsics.builtins.symbol_to_string_tag();
-            let key = PropertyKey::Private(
+            let key = PropertyKey::Symbol(
                 machine
                     .runtime_slot(symbol)
                     .map_err(EvalFailure::Runtime)?
@@ -755,7 +918,7 @@ mod tests {
 
     fn symbol(machine: &mut Machine<'_, TestHost>, description: &str) -> Value {
         machine
-            .allocate(HeapEntry::PrivateName {
+            .allocate(HeapEntry::Symbol {
                 description: description.to_owned(),
             })
             .unwrap()
@@ -777,10 +940,21 @@ mod tests {
             machine.get_property(target, &property_key).unwrap(),
             Value::int32(42)
         );
+        let child = object(&mut machine);
+        machine.set_prototype_value(child, Some(target)).unwrap();
+        assert!(machine.has_property(child, &property_key).unwrap());
         let names = call_object(&mut machine, "getOwnPropertyNames", &[target]).unwrap();
         assert!(machine.array_elements(names).unwrap().unwrap().is_empty());
         let symbols = call_object(&mut machine, "getOwnPropertySymbols", &[target]).unwrap();
         assert_eq!(machine.array_elements(symbols).unwrap().unwrap(), vec![key]);
+        let description = machine.get_named_property(key, "description").unwrap();
+        assert_eq!(machine.string_value(description).as_deref(), Some("key"));
+        let to_string = machine.get_named_property(key, "toString").unwrap();
+        let display = machine.call_value(to_string, key, &[]).unwrap();
+        assert_eq!(
+            machine.string_value(display).as_deref(),
+            Some("Symbol(key)")
+        );
     }
 
     #[test]
@@ -890,6 +1064,187 @@ mod tests {
     }
 
     #[test]
+    fn object_reflection_hides_language_private_keys() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = object(&mut machine);
+        let symbol = symbol(&mut machine, "public");
+        let private = machine
+            .allocate(HeapEntry::PrivateName {
+                description: "private".to_owned(),
+            })
+            .unwrap();
+        machine
+            .set_data_property_key(target, symbol_key(&machine, symbol), Value::int32(1))
+            .unwrap();
+        machine
+            .set_data_property_key(
+                target,
+                machine.to_property_key(private).unwrap(),
+                Value::int32(2),
+            )
+            .unwrap();
+
+        let symbols = call_object(&mut machine, "getOwnPropertySymbols", &[target]).unwrap();
+        assert_eq!(
+            machine.array_elements(symbols).unwrap().unwrap(),
+            vec![symbol]
+        );
+        let names = call_object(&mut machine, "getOwnPropertyNames", &[target]).unwrap();
+        assert!(machine.array_elements(names).unwrap().unwrap().is_empty());
+    }
+
+    #[test]
+    fn array_length_is_exotic_and_locks_index_growth() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let array = allocate_array(&mut machine, vec![Value::int32(1), Value::int32(2)]).unwrap();
+
+        machine
+            .set_data_property(array, "length", Value::int32(1))
+            .unwrap();
+        assert_eq!(
+            machine.array_elements(array).unwrap().unwrap(),
+            vec![Value::int32(1)]
+        );
+        machine
+            .set_data_property(array, "length", Value::int32(3))
+            .unwrap();
+        assert_eq!(
+            machine.array_elements(array).unwrap().unwrap(),
+            vec![Value::int32(1), Value::HOLE, Value::HOLE]
+        );
+        let length = machine
+            .own_descriptor(array, &PropertyKey::Named("length".to_owned()))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            length,
+            Property::Data {
+                value,
+                writable: true,
+                enumerable: false,
+                configurable: false,
+            } if value == crate::number_value(3.0)
+        ));
+        assert!(
+            machine
+                .set_data_property(array, "length", crate::number_value(1.5))
+                .is_err()
+        );
+        assert!(
+            machine
+                .set_data_property(array, "length", crate::number_value(u32::MAX as f64 + 1.0))
+                .is_err()
+        );
+
+        let locked = object(&mut machine);
+        machine
+            .set_data_property(locked, "writable", Value::FALSE)
+            .unwrap();
+        let length_key = allocate_string(&mut machine, "length".to_owned()).unwrap();
+        call_object(&mut machine, "defineProperty", &[array, length_key, locked]).unwrap();
+        let same_length = object(&mut machine);
+        machine
+            .set_data_property(same_length, "value", Value::int32(3))
+            .unwrap();
+        call_object(
+            &mut machine,
+            "defineProperty",
+            &[array, length_key, same_length],
+        )
+        .unwrap();
+        assert!(
+            machine
+                .set_data_property(array, "length", Value::int32(1))
+                .is_err()
+        );
+        assert!(
+            machine
+                .set_data_property(array, "3", Value::int32(3))
+                .is_err()
+        );
+        let index_descriptor = data_descriptor(&mut machine, Value::int32(3));
+        assert!(
+            call_object(
+                &mut machine,
+                "defineProperty",
+                &[array, Value::int32(3), index_descriptor]
+            )
+            .is_err()
+        );
+        let unlock = object(&mut machine);
+        machine
+            .set_data_property(unlock, "writable", Value::TRUE)
+            .unwrap();
+        assert!(call_object(&mut machine, "defineProperty", &[array, length_key, unlock]).is_err());
+    }
+
+    #[test]
+    fn array_index_definitions_update_length_atomically() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let array = allocate_array(&mut machine, Vec::new()).unwrap();
+        let accessor = object(&mut machine);
+        let getter = machine.intrinsics.global("Object").unwrap();
+        machine.set_data_property(accessor, "get", getter).unwrap();
+
+        call_object(
+            &mut machine,
+            "defineProperty",
+            &[array, Value::int32(3), accessor],
+        )
+        .unwrap();
+        assert_eq!(machine.array_elements(array).unwrap().unwrap().len(), 4);
+        assert!(matches!(
+            machine
+                .own_descriptor(array, &PropertyKey::Named("3".to_owned()))
+                .unwrap(),
+            Some(Property::Accessor { .. })
+        ));
+
+        let lock = object(&mut machine);
+        machine
+            .set_data_property(lock, "writable", Value::FALSE)
+            .unwrap();
+        let length_key = allocate_string(&mut machine, "length".to_owned()).unwrap();
+        call_object(&mut machine, "defineProperty", &[array, length_key, lock]).unwrap();
+        let blocked_accessor = object(&mut machine);
+        machine
+            .set_data_property(blocked_accessor, "get", getter)
+            .unwrap();
+        assert!(
+            call_object(
+                &mut machine,
+                "defineProperty",
+                &[array, Value::int32(4), blocked_accessor],
+            )
+            .is_err()
+        );
+        assert_eq!(machine.array_elements(array).unwrap().unwrap().len(), 4);
+
+        let fixed = allocate_array(&mut machine, Vec::new()).unwrap();
+        let fixed_index = machine.runtime_slot(fixed).unwrap().unwrap();
+        let HeapEntry::Array { extensible, .. } = &mut machine.heap[fixed_index] else {
+            unreachable!("allocate_array returns an array");
+        };
+        *extensible = false;
+        let descriptor = data_descriptor(&mut machine, Value::int32(1));
+        assert!(
+            call_object(
+                &mut machine,
+                "defineProperty",
+                &[fixed, Value::int32(2), descriptor],
+            )
+            .is_err()
+        );
+        assert!(machine.array_elements(fixed).unwrap().unwrap().is_empty());
+    }
+
+    #[test]
     fn define_properties_rejects_later_invalid_getter_without_mutating_target() {
         let module = module();
         let mut host = TestHost;
@@ -989,5 +1344,234 @@ mod tests {
             machine.get_named_property(target, "second").unwrap(),
             Value::int32(2)
         );
+    }
+
+    #[test]
+    fn array_length_descriptor_reads_inherited_fields() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let array = allocate_array(
+            &mut machine,
+            vec![Value::int32(1), Value::int32(2), Value::int32(3)],
+        )
+        .unwrap();
+        let prototype = object(&mut machine);
+        machine
+            .set_data_property(prototype, "value", Value::int32(1))
+            .unwrap();
+        let descriptor = call_object(&mut machine, "create", &[prototype]).unwrap();
+        let length_key = allocate_string(&mut machine, "length".to_owned()).unwrap();
+
+        call_object(
+            &mut machine,
+            "defineProperty",
+            &[array, length_key, descriptor],
+        )
+        .unwrap();
+
+        assert_eq!(
+            machine.array_elements(array).unwrap().unwrap(),
+            vec![Value::int32(1)]
+        );
+    }
+
+    #[test]
+    fn define_properties_converts_each_descriptor_once() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = object(&mut machine);
+        let descriptors = object(&mut machine);
+        let descriptor =
+            allocate_array(&mut machine, vec![Value::int32(1), Value::int32(2)]).unwrap();
+        let array_prototype = machine.intrinsics.array_prototype;
+        let pop = machine.get_named_property(array_prototype, "pop").unwrap();
+        machine
+            .define_descriptor(
+                descriptor,
+                PropertyKey::Named("value".to_owned()),
+                Property::Accessor {
+                    getter: Some(pop),
+                    setter: None,
+                    enumerable: false,
+                    configurable: true,
+                },
+            )
+            .unwrap();
+        machine
+            .set_data_property(descriptors, "answer", descriptor)
+            .unwrap();
+
+        call_define_properties(&mut machine, target, descriptors).unwrap();
+
+        assert_eq!(
+            machine.get_named_property(target, "answer").unwrap(),
+            Value::int32(2)
+        );
+        assert_eq!(
+            machine.array_elements(descriptor).unwrap().unwrap(),
+            vec![Value::int32(1)]
+        );
+    }
+
+    #[test]
+    fn partial_redefinitions_preserve_omitted_fields() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = object(&mut machine);
+        machine
+            .set_data_property(target, "data", Value::int32(7))
+            .unwrap();
+        let data_descriptor = object(&mut machine);
+        machine
+            .set_data_property(data_descriptor, "writable", Value::FALSE)
+            .unwrap();
+        let data_key = allocate_string(&mut machine, "data".to_owned()).unwrap();
+
+        call_object(
+            &mut machine,
+            "defineProperty",
+            &[target, data_key, data_descriptor],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            machine
+                .own_descriptor(target, &PropertyKey::Named("data".to_owned()))
+                .unwrap(),
+            Some(Property::Data {
+                value,
+                writable: false,
+                enumerable: true,
+                configurable: true,
+            }) if value == Value::int32(7)
+        ));
+
+        let getter = machine.intrinsics.global("Object").unwrap();
+        let setter = machine.intrinsics.global("Array").unwrap();
+        machine
+            .define_descriptor(
+                target,
+                PropertyKey::Named("accessor".to_owned()),
+                Property::Accessor {
+                    getter: Some(getter),
+                    setter: Some(setter),
+                    enumerable: true,
+                    configurable: true,
+                },
+            )
+            .unwrap();
+        let accessor_descriptor = object(&mut machine);
+        machine
+            .set_data_property(accessor_descriptor, "set", Value::UNDEFINED)
+            .unwrap();
+        let accessor_key = allocate_string(&mut machine, "accessor".to_owned()).unwrap();
+
+        call_object(
+            &mut machine,
+            "defineProperty",
+            &[target, accessor_key, accessor_descriptor],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            machine
+                .own_descriptor(target, &PropertyKey::Named("accessor".to_owned()))
+                .unwrap(),
+            Some(Property::Accessor {
+                getter: Some(actual_getter),
+                setter: None,
+                enumerable: true,
+                configurable: true,
+            }) if actual_getter == getter
+        ));
+    }
+
+    #[test]
+    fn shrinking_array_length_processes_descriptor_indices() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let getter = machine.intrinsics.global("Object").unwrap();
+        let length_key = allocate_string(&mut machine, "length".to_owned()).unwrap();
+
+        let array = allocate_array(&mut machine, Vec::new()).unwrap();
+        let configurable_index = object(&mut machine);
+        machine
+            .set_data_property(configurable_index, "get", getter)
+            .unwrap();
+        machine
+            .set_data_property(configurable_index, "configurable", Value::TRUE)
+            .unwrap();
+        call_object(
+            &mut machine,
+            "defineProperty",
+            &[array, Value::int32(3), configurable_index],
+        )
+        .unwrap();
+        let shrink = object(&mut machine);
+        machine
+            .set_data_property(shrink, "value", Value::int32(0))
+            .unwrap();
+
+        call_object(&mut machine, "defineProperty", &[array, length_key, shrink]).unwrap();
+
+        assert!(machine.array_elements(array).unwrap().unwrap().is_empty());
+        assert!(
+            machine
+                .own_descriptor(array, &PropertyKey::Named("3".to_owned()))
+                .unwrap()
+                .is_none()
+        );
+
+        let blocked = allocate_array(&mut machine, Vec::new()).unwrap();
+        let fixed_index = object(&mut machine);
+        machine
+            .set_data_property(fixed_index, "get", getter)
+            .unwrap();
+        call_object(
+            &mut machine,
+            "defineProperty",
+            &[blocked, Value::int32(3), fixed_index],
+        )
+        .unwrap();
+        let blocked_shrink = object(&mut machine);
+        machine
+            .set_data_property(blocked_shrink, "value", Value::int32(0))
+            .unwrap();
+        machine
+            .set_data_property(blocked_shrink, "writable", Value::FALSE)
+            .unwrap();
+
+        assert!(
+            call_object(
+                &mut machine,
+                "defineProperty",
+                &[blocked, length_key, blocked_shrink],
+            )
+            .is_err()
+        );
+        assert_eq!(machine.array_elements(blocked).unwrap().unwrap().len(), 4);
+        assert!(matches!(
+            machine
+                .own_descriptor(blocked, &PropertyKey::Named("3".to_owned()))
+                .unwrap(),
+            Some(Property::Accessor {
+                configurable: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            machine
+                .own_descriptor(blocked, &PropertyKey::Named("length".to_owned()))
+                .unwrap(),
+            Some(Property::Data {
+                value,
+                writable: false,
+                ..
+            }) if value == crate::number_value(4.0)
+        ));
     }
 }

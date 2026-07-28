@@ -83,7 +83,7 @@ pub(super) fn define_to_string_tag(
         panic!("namespace tag target must be an ordinary object");
     };
     properties.insert(
-        PropertyKey::Private(heap_index(symbol) as u32),
+        PropertyKey::Symbol(heap_index(symbol) as u32),
         builtin_property(value),
     );
 }
@@ -124,6 +124,7 @@ fn allocate_array<H: Host>(
             properties: PropertyMap::default(),
             prototype: Some(machine.intrinsics.array_prototype),
             extensible: true,
+            length_writable: true,
         })
         .map_err(EvalFailure::Runtime)
 }
@@ -154,6 +155,18 @@ fn type_error(operation: &'static str) -> EvalFailure {
 
 fn range_error(operation: &'static str) -> EvalFailure {
     EvalFailure::Throw(ThrowOrigin::RangeError { operation })
+}
+
+fn define_array_length(
+    elements: &mut Vec<Value>,
+    properties: &mut PropertyMap,
+    length_writable: bool,
+    length: usize,
+) -> Result<(), EvalFailure> {
+    if !length_writable && length != elements.len() {
+        return Err(type_error("Cannot redefine non-writable array length"));
+    }
+    crate::apply_array_length(elements, properties, length, "define array length")
 }
 
 fn install_boolean<H: Host>(
@@ -757,8 +770,17 @@ impl<'a, H: Host> Machine<'a, H> {
             HeapEntry::Array {
                 elements,
                 properties,
+                length_writable,
                 ..
             } => {
+                if matches!(key, PropertyKey::Named(name) if name == "length") {
+                    return Ok(Some(Property::Data {
+                        value: crate::number_value(elements.len() as f64),
+                        writable: *length_writable,
+                        enumerable: false,
+                        configurable: false,
+                    }));
+                }
                 if let Some(property) = properties.get(key) {
                     return Ok(Some(property.clone()));
                 }
@@ -794,6 +816,39 @@ impl<'a, H: Host> Machine<'a, H> {
         let Some(index) = self.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
             return Err(type_error("Object.defineProperty called on non-object"));
         };
+        if matches!(key, PropertyKey::Named(ref name) if name == "length")
+            && matches!(self.heap[index], HeapEntry::Array { .. })
+        {
+            let Property::Data {
+                value,
+                writable,
+                enumerable: false,
+                configurable: false,
+            } = descriptor
+            else {
+                return Err(type_error("Cannot redefine array length"));
+            };
+            let length = crate::exact_array_length(value)
+                .ok_or_else(|| range_error("define array length"))?;
+            let HeapEntry::Array {
+                elements,
+                properties,
+                length_writable,
+                ..
+            } = &mut self.heap[index]
+            else {
+                unreachable!("array checked above");
+            };
+            if writable && !*length_writable {
+                return Err(type_error("Cannot make array length writable"));
+            }
+            let result = define_array_length(elements, properties, *length_writable, length);
+            if !writable {
+                *length_writable = false;
+            }
+            result?;
+            return Ok(());
+        }
         let (properties, extensible, exists) = match &mut self.heap[index] {
             HeapEntry::Object {
                 properties,
@@ -822,6 +877,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 elements,
                 properties,
                 extensible,
+                length_writable,
                 ..
             } => {
                 let array_index = key
@@ -840,8 +896,19 @@ impl<'a, H: Host> Machine<'a, H> {
                     ));
                 }
                 if let Some(offset) = array_index {
+                    if offset >= elements.len() && !*length_writable {
+                        return Err(type_error(
+                            "Cannot define index beyond non-writable array length",
+                        ));
+                    }
                     if elements.len() <= offset {
-                        elements.resize(offset + 1, Value::HOLE);
+                        crate::array_set_length(
+                            elements,
+                            properties,
+                            *length_writable,
+                            crate::number_value((offset + 1) as f64),
+                            "define array index",
+                        )?;
                     }
                     elements[offset] = Value::HOLE;
                 }

@@ -724,7 +724,7 @@ fn define_symbol(heap: &mut [HeapEntry], object: Value, symbol: Value, value: Va
         unreachable!()
     };
     properties.insert(
-        PropertyKey::Private(heap_index(symbol) as u32),
+        PropertyKey::Symbol(heap_index(symbol) as u32),
         builtin_property(value),
     );
 }

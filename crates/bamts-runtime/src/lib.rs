@@ -303,13 +303,13 @@ pub fn constant_value(constant: &Constant) -> Option<Value> {
     }
 }
 
-/// A normalized property key: a string name (which may parse as an array index)
-/// or a private name identified by its heap slot. Two `CreatePrivateName`
-/// instructions with the same description yield distinct slots, hence distinct
-/// keys, matching private-name identity.
+/// A normalized property key: a string name (which may parse as an array index),
+/// a public symbol, or a language private name, each identified by its heap slot.
+/// Two identity-bearing allocations with the same description remain distinct keys.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum PropertyKey {
     Named(String),
+    Symbol(u32),
     Private(u32),
 }
 
@@ -317,14 +317,14 @@ impl PropertyKey {
     fn as_str(&self) -> Option<&str> {
         match self {
             PropertyKey::Named(text) => Some(text),
-            PropertyKey::Private(_) => None,
+            PropertyKey::Symbol(_) | PropertyKey::Private(_) => None,
         }
     }
 
     fn charge_bytes(&self) -> usize {
         match self {
             PropertyKey::Named(text) => text.len() + 8,
-            PropertyKey::Private(_) => 16,
+            PropertyKey::Symbol(_) | PropertyKey::Private(_) => 16,
         }
     }
 }
@@ -429,6 +429,7 @@ enum HeapEntry {
         properties: PropertyMap,
         prototype: Option<Value>,
         extensible: bool,
+        length_writable: bool,
     },
     Function {
         module: ModuleId,
@@ -450,6 +451,9 @@ enum HeapEntry {
         digested: bool,
         update: Value,
         digest: Value,
+    },
+    Symbol {
+        description: String,
     },
     PrivateName {
         description: String,
@@ -480,9 +484,10 @@ enum HeapEntry {
 impl HeapEntry {
     fn initial_bytes(&self) -> usize {
         match self {
-            Self::String(text) | Self::BigInt(text) | Self::PrivateName { description: text } => {
-                text.len()
-            }
+            Self::String(text)
+            | Self::BigInt(text)
+            | Self::Symbol { description: text }
+            | Self::PrivateName { description: text } => text.len(),
             Self::RegExp { pattern, flags, .. } => pattern.len() + flags.len(),
             Self::HashState {
                 algorithm, data, ..
@@ -1307,6 +1312,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             properties: PropertyMap::default(),
                             prototype: Some(self.intrinsics.array_prototype),
                             extensible: true,
+                            length_writable: true,
                         })
                         .map_err(|kind| self.error_at(kind, function_index, pc))?;
                     self.write_register(frame_index, dst.get(), value);
@@ -1966,6 +1972,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 properties: PropertyMap::default(),
                 prototype: Some(self.intrinsics.array_prototype),
                 extensible: true,
+                length_writable: true,
             })
             .map_err(|kind| self.error_at(kind, function, pc))?;
         self.frames[frame].arguments_object = Some(value);
@@ -2518,6 +2525,7 @@ impl<'a, H: Host> Machine<'a, H> {
         match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
             Some(index) => match &self.heap[index] {
                 HeapEntry::String(text) => Ok(PropertyKey::Named(text.clone())),
+                HeapEntry::Symbol { .. } => Ok(PropertyKey::Symbol(index as u32)),
                 HeapEntry::PrivateName { .. } => Ok(PropertyKey::Private(index as u32)),
                 _ => Ok(PropertyKey::Named(self.value_to_string(value, 0)?)),
             },
@@ -2553,6 +2561,9 @@ impl<'a, H: Host> Machine<'a, H> {
                         .map_err(EvalFailure::Runtime)?,
                     HeapEntry::BigInt(_) | HeapEntry::PrivateName { .. } => self
                         .runtime_slot(self.intrinsics.object_prototype)
+                        .map_err(EvalFailure::Runtime)?,
+                    HeapEntry::Symbol { .. } => self
+                        .runtime_slot(self.intrinsics.builtins.symbol_prototype())
                         .map_err(EvalFailure::Runtime)?,
                     _ => Some(index),
                 }
@@ -2740,6 +2751,7 @@ impl<'a, H: Host> Machine<'a, H> {
             HeapEntry::ProcessEnv { .. }
             | HeapEntry::String(_)
             | HeapEntry::BigInt(_)
+            | HeapEntry::Symbol { .. }
             | HeapEntry::PrivateName { .. }
             | HeapEntry::Iterator { .. } => None,
         }
@@ -2920,6 +2932,39 @@ impl<'a, H: Host> Machine<'a, H> {
         key: PropertyKey,
         value: Value,
     ) -> Result<(), EvalFailure> {
+        if matches!(key, PropertyKey::Named(ref name) if name == "length")
+            && matches!(self.heap[index], HeapEntry::Array { .. })
+        {
+            let HeapEntry::Array {
+                elements,
+                properties,
+                length_writable,
+                ..
+            } = &mut self.heap[index]
+            else {
+                unreachable!("array checked above");
+            };
+            return array_set_length(
+                elements,
+                properties,
+                *length_writable,
+                value,
+                "set array length",
+            );
+        }
+        if let HeapEntry::Array {
+            elements,
+            length_writable,
+            ..
+        } = &self.heap[index]
+            && let Some(offset) = key.as_str().and_then(array_index)
+            && offset as usize >= elements.len()
+            && !*length_writable
+        {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "add index beyond non-writable array length",
+            }));
+        }
         let (properties, extensible, virtual_exists) = match &self.heap[index] {
             HeapEntry::Object {
                 properties,
@@ -2997,7 +3042,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         usize::from(!properties.contains_key(&key)) * key.charge_bytes()
                     }
                 }
-                PropertyKey::Private(_) => {
+                PropertyKey::Symbol(_) | PropertyKey::Private(_) => {
                     usize::from(!properties.contains_key(&key)) * key.charge_bytes()
                 }
             },
@@ -3006,7 +3051,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     operation: "set property on primitive",
                 }));
             }
-            HeapEntry::PrivateName { .. } | HeapEntry::Iterator { .. } => {
+            HeapEntry::Symbol { .. }
+            | HeapEntry::PrivateName { .. }
+            | HeapEntry::Iterator { .. } => {
                 return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                     operation: "set property on non-object",
                 }));
@@ -3047,22 +3094,21 @@ impl<'a, H: Host> Machine<'a, H> {
             HeapEntry::Array {
                 elements,
                 properties,
+                length_writable,
                 ..
             } => {
                 match key {
-                    PropertyKey::Named(name) if name == "length" => {
-                        let length = exact_array_length(value).ok_or(EvalFailure::Throw(
-                            ThrowOrigin::RangeError {
-                                operation: "set array length",
-                            },
-                        ))?;
-                        elements.resize(length, Value::HOLE);
-                    }
                     PropertyKey::Named(name) => {
                         if let Some(offset) = array_index(&name) {
                             let offset = offset as usize;
                             if elements.len() <= offset {
-                                elements.resize(offset + 1, Value::HOLE);
+                                array_set_length(
+                                    elements,
+                                    properties,
+                                    *length_writable,
+                                    number_value((offset + 1) as f64),
+                                    "set array index",
+                                )?;
                             }
                             elements[offset] = value;
                         } else {
@@ -3077,9 +3123,9 @@ impl<'a, H: Host> Machine<'a, H> {
                             );
                         }
                     }
-                    private @ PropertyKey::Private(_) => {
+                    identity @ (PropertyKey::Symbol(_) | PropertyKey::Private(_)) => {
                         properties.insert(
-                            private,
+                            identity,
                             Property::Data {
                                 value,
                                 writable: true,
@@ -3231,6 +3277,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 HeapEntry::String(_)
                 | HeapEntry::BigInt(_)
+                | HeapEntry::Symbol { .. }
                 | HeapEntry::PrivateName { .. }
                 | HeapEntry::Iterator { .. }
                 | HeapEntry::HashState { .. } => Ok(true),
@@ -3289,8 +3336,22 @@ impl<'a, H: Host> Machine<'a, H> {
                     }));
                 }
                 self.charge_heap(8).map_err(EvalFailure::Runtime)?;
-                if let HeapEntry::Array { elements, .. } = &mut self.heap[index] {
-                    elements.push(value);
+                if let HeapEntry::Array {
+                    elements,
+                    properties,
+                    length_writable,
+                    ..
+                } = &mut self.heap[index]
+                {
+                    let offset = elements.len();
+                    array_set_length(
+                        elements,
+                        properties,
+                        *length_writable,
+                        number_value((offset + 1) as f64),
+                        "push beyond non-writable array length",
+                    )?;
+                    elements[offset] = value;
                 }
                 Ok(())
             }
@@ -3311,8 +3372,22 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 self.charge_heap(8usize.saturating_mul(values.len()))
                     .map_err(EvalFailure::Runtime)?;
-                if let HeapEntry::Array { elements, .. } = &mut self.heap[index] {
-                    elements.extend(values);
+                if let HeapEntry::Array {
+                    elements,
+                    properties,
+                    length_writable,
+                    ..
+                } = &mut self.heap[index]
+                {
+                    let offset = elements.len();
+                    array_set_length(
+                        elements,
+                        properties,
+                        *length_writable,
+                        number_value((offset + values.len()) as f64),
+                        "spread beyond non-writable array length",
+                    )?;
+                    elements[offset..].copy_from_slice(&values);
                 }
                 Ok(())
             }
@@ -3558,6 +3633,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     .collect()),
                 HeapEntry::ProcessEnv { .. }
                 | HeapEntry::BigInt(_)
+                | HeapEntry::Symbol { .. }
                 | HeapEntry::PrivateName { .. }
                 | HeapEntry::HashState { .. }
                 | HeapEntry::Iterator { .. } => Ok(Vec::new()),
@@ -3893,9 +3969,9 @@ impl<'a, H: Host> Machine<'a, H> {
                         HeapEntry::Array { elements, .. } if elements.len() == 1 => {
                             self.to_number(elements[0])
                         }
-                        HeapEntry::PrivateName { .. } => {
+                        HeapEntry::Symbol { .. } | HeapEntry::PrivateName { .. } => {
                             Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                                operation: "convert private name to number",
+                                operation: "convert symbol to number",
                             }))
                         }
                         HeapEntry::Object { .. }
@@ -3938,6 +4014,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::ExternalModuleNamespace { .. }
                     | HeapEntry::HashState { .. }
                     | HeapEntry::NativeFunction { .. }
+                    | HeapEntry::Symbol { .. }
                     | HeapEntry::PrivateName { .. }
                     | HeapEntry::RegExp { .. }
                     | HeapEntry::ProcessEnv { .. }
@@ -3960,7 +4037,8 @@ impl<'a, H: Host> Machine<'a, H> {
                     HeapEntry::String(_) => "string",
                     HeapEntry::BigInt(_) => "bigint",
                     HeapEntry::Function { .. } | HeapEntry::NativeFunction { .. } => "function",
-                    HeapEntry::PrivateName { .. } => "symbol",
+                    HeapEntry::Symbol { .. } => "symbol",
+                    HeapEntry::PrivateName { .. } => "object",
                     HeapEntry::Object { .. }
                     | HeapEntry::Array { .. }
                     | HeapEntry::ModuleNamespace { .. }
@@ -4096,6 +4174,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::RegExp { .. }
                 | HeapEntry::Iterator { .. }
                 | HeapEntry::ProcessEnv { .. }
+                | HeapEntry::Symbol { .. }
                 | HeapEntry::PrivateName { .. }
                 | HeapEntry::HashState { .. } => self.value_to_string(value, 0).map(Some),
                 HeapEntry::BigInt(_) => Ok(None),
@@ -4127,6 +4206,11 @@ impl<'a, H: Host> Machine<'a, H> {
                         | HeapEntry::HashState { .. } => Ok("[object Object]".to_owned()),
                         HeapEntry::RegExp { pattern, flags, .. } => {
                             Ok(format!("/{pattern}/{flags}"))
+                        }
+                        HeapEntry::Symbol { .. } => {
+                            Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                                operation: "convert symbol to string",
+                            }))
                         }
                         HeapEntry::PrivateName { .. } => {
                             Err(EvalFailure::Throw(ThrowOrigin::TypeError {
@@ -4215,7 +4299,7 @@ fn ordered_property_keys(properties: &PropertyMap) -> Vec<PropertyKey> {
                 Some(index) => indices.push((index, key.clone())),
                 None => strings.push(key.clone()),
             },
-            PropertyKey::Private(_) => symbols.push(key.clone()),
+            PropertyKey::Symbol(_) | PropertyKey::Private(_) => symbols.push(key.clone()),
         }
     }
     indices.sort_unstable_by_key(|(index, _)| *index);
@@ -4374,6 +4458,54 @@ fn exact_array_length(value: Value) -> Option<usize> {
     } else {
         None
     }
+}
+
+pub(crate) fn apply_array_length(
+    elements: &mut Vec<Value>,
+    properties: &mut PropertyMap,
+    length: usize,
+    operation: &'static str,
+) -> Result<(), EvalFailure> {
+    if length >= elements.len() {
+        elements.resize(length, Value::HOLE);
+        return Ok(());
+    }
+    let blocked = properties
+        .iter()
+        .filter_map(|(key, property)| {
+            (!property.configurable())
+                .then(|| key.as_str().and_then(array_index))
+                .flatten()
+        })
+        .map(|offset| offset as usize)
+        .filter(|offset| *offset >= length)
+        .max();
+    let effective_length = blocked.map_or(length, |offset| offset + 1);
+    properties.0.retain(|(key, _)| {
+        key.as_str()
+            .and_then(array_index)
+            .is_none_or(|offset| (offset as usize) < effective_length)
+    });
+    elements.resize(effective_length, Value::HOLE);
+    if blocked.is_some() {
+        return Err(EvalFailure::Throw(ThrowOrigin::TypeError { operation }));
+    }
+    Ok(())
+}
+
+pub(crate) fn array_set_length(
+    elements: &mut Vec<Value>,
+    properties: &mut PropertyMap,
+    length_writable: bool,
+    value: Value,
+    operation: &'static str,
+) -> Result<(), EvalFailure> {
+    let length = exact_array_length(value)
+        .ok_or(EvalFailure::Throw(ThrowOrigin::RangeError { operation }))?;
+    if !length_writable {
+        return Err(EvalFailure::Throw(ThrowOrigin::TypeError { operation }));
+    }
+    apply_array_length(elements, properties, length, operation)
 }
 
 fn bigint_i128(text: &str) -> Result<i128, EvalFailure> {
@@ -6042,6 +6174,7 @@ mod tests {
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.array_prototype),
                 extensible: true,
+                length_writable: true,
             })
             .unwrap();
         let object = machine
@@ -6117,6 +6250,7 @@ mod tests {
                     properties: PropertyMap::default(),
                     prototype: Some(machine.intrinsics.array_prototype),
                     extensible: true,
+                    length_writable: true,
                 })
                 .unwrap();
             let mut inner_properties = PropertyMap::default();
@@ -6156,7 +6290,7 @@ mod tests {
                 })
                 .unwrap();
             let symbol = machine
-                .allocate(HeapEntry::PrivateName {
+                .allocate(HeapEntry::Symbol {
                     description: "token".to_owned(),
                 })
                 .unwrap();

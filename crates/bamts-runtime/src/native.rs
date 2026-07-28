@@ -1196,6 +1196,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             properties: PropertyMap::default(),
             prototype: Some(prototype),
             extensible: true,
+            length_writable: true,
         });
         let value = match allocated {
             Ok(value) => value,
@@ -1503,6 +1504,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     properties: PropertyMap::default(),
                     prototype: Some(prototype),
                     extensible: true,
+                    length_writable: true,
                 })
             }
             HelperCall::CreateClosure {
