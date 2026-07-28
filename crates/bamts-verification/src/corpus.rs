@@ -1,5 +1,5 @@
 //! Strict parsing and validation for the vendored corpus manifest and per-case
-//! specs, plus a bounded raw-byte Node oracle runner.
+//! specs, plus bounded raw-byte Node and BamTS differential runners.
 //!
 //! This module owns the corpus verification contract:
 //!
@@ -15,8 +15,8 @@
 //!
 //! The oracle never invokes package managers, project scripts, or transpilers:
 //! it runs `node <entrypoint>` and relies on the interpreter's own execution.
-//! BamTS is deliberately not invoked yet; the records and functions here are the
-//! reusable substrate a later differential harness builds on.
+//! The BamTS runner executes the same validated entrypoint through the public
+//! CLI driver in JIT mode or compiles, links, and spawns it in AOT mode.
 
 use std::{
     collections::BTreeSet,
@@ -32,6 +32,11 @@ use std::{
 
 use serde::Deserialize;
 
+use bamts_cli::{
+    args::{CliArgs, ExecutionTarget, Mode, parse_args},
+    driver,
+};
+
 use crate::{ErrorCode, Result, VerificationError};
 
 /// Canonical corpus schema version accepted by this validator.
@@ -42,6 +47,30 @@ pub const NODE_VERSION: &str = "24.18.0";
 pub const NODE_VERSION_OUTPUT: &str = "v24.18.0";
 /// Repository-relative path to the corpus manifest.
 pub const MANIFEST_PATH: &str = "corpus/manifest.toml";
+
+/// The complete pinned corpus, in manifest order.
+pub const PINNED_CASE_IDS: [&str; 20] = [
+    "citty",
+    "defu",
+    "destr",
+    "dot-prop",
+    "escape-string-regexp",
+    "hookable",
+    "is-plain-obj",
+    "mitt",
+    "ohash",
+    "p-defer",
+    "p-map",
+    "p-queue",
+    "pathe",
+    "perfect-debounce",
+    "rou3",
+    "tiny-invariant",
+    "tslib",
+    "ufo",
+    "valita",
+    "yocto-queue",
+];
 
 /// The only environment variables the oracle exposes to a case.  Everything
 /// inherited from the parent process is cleared before these are set.
@@ -524,6 +553,195 @@ impl NodeOracle {
     }
 }
 
+/// BamTS execution paths covered by the differential harness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionMode {
+    Jit,
+    Aot,
+}
+
+impl ExecutionMode {
+    pub const ALL: [Self; 2] = [Self::Jit, Self::Aot];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Jit => "jit",
+            Self::Aot => "aot",
+        }
+    }
+}
+
+/// Runs validated corpus cases through the public `bamts_cli` driver.
+#[derive(Debug, Clone)]
+pub struct BamtsRunner {
+    root: PathBuf,
+    max_output_bytes: usize,
+}
+
+impl BamtsRunner {
+    pub fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+        }
+    }
+
+    /// Overrides the captured-output ceiling (default 1 MiB per stream).
+    pub fn with_max_output_bytes(mut self, cap: usize) -> Self {
+        self.max_output_bytes = cap;
+        self
+    }
+
+    /// Runs one validated case through either JIT or AOT under the case bound.
+    pub fn run_case(&self, spec: &CaseSpec, mode: ExecutionMode) -> Result<OracleOutcome> {
+        let manifest = self.root.join(MANIFEST_PATH);
+        require_clean_relative(&manifest, "entrypoint", &spec.entrypoint)?;
+        match mode {
+            ExecutionMode::Jit => self.run_jit(spec),
+            ExecutionMode::Aot => self.run_aot(spec),
+        }
+    }
+
+    fn run_jit(&self, spec: &CaseSpec) -> Result<OracleOutcome> {
+        let args = cli_args(
+            Mode::Run,
+            ExecutionTarget::Jit,
+            self.root.join(&spec.entrypoint),
+            None,
+        )?;
+        let started = Instant::now();
+        let outcome = driver::execute(&args)
+            .map_err(|error| cli_error(spec, ExecutionMode::Jit, error))?;
+        Ok(driver_outcome(
+            outcome,
+            started.elapsed() >= spec.timeout(),
+            self.max_output_bytes,
+        ))
+    }
+
+    fn run_aot(&self, spec: &CaseSpec) -> Result<OracleOutcome> {
+        let artifacts = ArtifactDirectory::create(&self.root, spec)?;
+        let executable = artifacts.executable(spec);
+        let args = cli_args(
+            Mode::Compile,
+            ExecutionTarget::Aot,
+            self.root.join(&spec.entrypoint),
+            Some(&executable),
+        )?;
+        let started = Instant::now();
+        let compile = driver::execute(&args)
+            .map_err(|error| cli_error(spec, ExecutionMode::Aot, error))?;
+        let elapsed = started.elapsed();
+        if elapsed >= spec.timeout() {
+            return Ok(driver_outcome(compile, true, self.max_output_bytes));
+        }
+
+        let limits = OracleLimits {
+            timeout: spec.timeout() - elapsed,
+            max_output_bytes: self.max_output_bytes,
+        };
+        let mut outcome = run_process(
+            "BamTS AOT executable",
+            &executable,
+            &self.root,
+            &normalized_env(),
+            &[],
+            &limits,
+        )?;
+        if !compile.stderr.is_empty() {
+            let remaining = self.max_output_bytes.saturating_sub(outcome.stderr.len());
+            let take = remaining.min(compile.stderr.len());
+            outcome.stderr.extend_from_slice(&compile.stderr[..take]);
+            outcome.stderr_truncated |= take < compile.stderr.len();
+        }
+        Ok(outcome)
+    }
+}
+
+fn cli_args(
+    mode: Mode,
+    target: ExecutionTarget,
+    entrypoint: PathBuf,
+    output: Option<&Path>,
+) -> Result<CliArgs> {
+    let mut raw = vec![
+        mode.to_string(),
+        entrypoint.to_string_lossy().into_owned(),
+        "--target".to_owned(),
+        target.to_string(),
+    ];
+    if let Some(path) = output {
+        raw.push("--output".to_owned());
+        raw.push(path.to_string_lossy().into_owned());
+    }
+    parse_args(raw).map_err(|error| {
+        VerificationError::new(
+            ErrorCode::Usage,
+            format!("cannot construct corpus CLI invocation: {error}"),
+        )
+    })
+}
+
+fn driver_outcome(
+    outcome: driver::CommandOutcome,
+    timed_out: bool,
+    cap: usize,
+) -> OracleOutcome {
+    let mut stdout = outcome.stdout;
+    let mut stderr = outcome.stderr;
+    let stdout_truncated = stdout.len() > cap;
+    let stderr_truncated = stderr.len() > cap;
+    stdout.truncate(cap);
+    stderr.truncate(cap);
+    OracleOutcome {
+        timed_out,
+        exit_code: Some(outcome.exit_code),
+        signal: None,
+        stdout,
+        stdout_truncated,
+        stderr,
+        stderr_truncated,
+    }
+}
+
+struct ArtifactDirectory(PathBuf);
+
+impl ArtifactDirectory {
+    fn create(root: &Path, spec: &CaseSpec) -> Result<Self> {
+        let path = root
+            .join("target/corpus-differential")
+            .join(&spec.id)
+            .join(ExecutionMode::Aot.as_str());
+        if path.exists() {
+            fs::remove_dir_all(&path).map_err(|error| io_error(&path, &error))?;
+        }
+        fs::create_dir_all(&path).map_err(|error| io_error(&path, &error))?;
+        Ok(Self(path))
+    }
+
+    fn executable(&self, spec: &CaseSpec) -> PathBuf {
+        self.0
+            .join(format!("{}{}", spec.id, env::consts::EXE_SUFFIX))
+    }
+}
+
+impl Drop for ArtifactDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn cli_error(
+    spec: &CaseSpec,
+    mode: ExecutionMode,
+    error: driver::DriverError,
+) -> VerificationError {
+    VerificationError::new(
+        ErrorCode::ToolFailed,
+        format!("case `{}` failed in {} mode: {error}", spec.id, mode.as_str()),
+    )
+}
+
 /// Verifies that `node` runs and reports exactly [`NODE_VERSION_OUTPUT`].
 pub fn verify_node_version(node: &Path) -> Result<()> {
     let limits = OracleLimits {
@@ -571,7 +789,18 @@ fn run_node(
     args: &[OsString],
     limits: &OracleLimits,
 ) -> Result<OracleOutcome> {
-    let mut command = Command::new(node);
+    run_process("Node oracle", node, cwd, environment, args, limits)
+}
+
+fn run_process(
+    label: &str,
+    program: &Path,
+    cwd: &Path,
+    environment: &[(String, String)],
+    args: &[OsString],
+    limits: &OracleLimits,
+) -> Result<OracleOutcome> {
+    let mut command = Command::new(program);
     command.env_clear();
     for (key, value) in environment {
         command.env(key, value);
@@ -582,10 +811,17 @@ fn run_node(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
 
-    let mut child = command.spawn().map_err(|error| spawn_error(node, &error))?;
-    let stdout = child.stdout.take().ok_or_else(|| pipe_error("stdout"))?;
-    let stderr = child.stderr.take().ok_or_else(|| pipe_error("stderr"))?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| spawn_error(label, program, &error))?;
+    let stdout = child.stdout.take().ok_or_else(|| pipe_error(label, "stdout"))?;
+    let stderr = child.stderr.take().ok_or_else(|| pipe_error(label, "stderr"))?;
 
     let cap = limits.max_output_bytes;
     let stdout_handle = drain_stream(stdout, cap);
@@ -593,20 +829,28 @@ fn run_node(
 
     let start = Instant::now();
     let mut timed_out = false;
+    let mut termination_error = None;
     let status = loop {
-        if let Some(status) = child.try_wait().map_err(wait_error)? {
+        if let Some(status) = child.try_wait().map_err(|error| wait_error(label, error))? {
             break status;
         }
         if start.elapsed() >= limits.timeout {
-            let _ = child.kill();
+            termination_error = terminate_process_group(&mut child, label).err();
             timed_out = true;
-            break child.wait().map_err(wait_error)?;
+            break child.wait().map_err(|error| wait_error(label, error))?;
         }
         thread::sleep(POLL_INTERVAL);
     };
 
-    let (stdout, stdout_truncated) = stdout_handle.join().map_err(|_| thread_error("stdout"))?;
-    let (stderr, stderr_truncated) = stderr_handle.join().map_err(|_| thread_error("stderr"))?;
+    let (stdout, stdout_truncated) = stdout_handle
+        .join()
+        .map_err(|_| thread_error(label, "stdout"))?;
+    let (stderr, stderr_truncated) = stderr_handle
+        .join()
+        .map_err(|_| thread_error(label, "stderr"))?;
+    if let Some(error) = termination_error {
+        return Err(error);
+    }
 
     Ok(OracleOutcome {
         timed_out,
@@ -616,6 +860,38 @@ fn run_node(
         stdout_truncated,
         stderr,
         stderr_truncated,
+    })
+}
+
+#[cfg(unix)]
+fn terminate_process_group(child: &mut std::process::Child, label: &str) -> Result<()> {
+    let group = format!("-{}", child.id());
+    let status = Command::new("kill")
+        .args(["-KILL", "--", &group])
+        .status()
+        .map_err(|error| {
+            VerificationError::new(
+                ErrorCode::ToolFailed,
+                format!("cannot terminate {label} process group {group}: {error}"),
+            )
+        })?;
+    if status.success() {
+        return Ok(());
+    }
+    let _ = child.kill();
+    Err(VerificationError::new(
+        ErrorCode::ToolFailed,
+        format!("cannot terminate {label} process group {group}: kill exited with {status}"),
+    ))
+}
+
+#[cfg(not(unix))]
+fn terminate_process_group(child: &mut std::process::Child, label: &str) -> Result<()> {
+    child.kill().map_err(|error| {
+        VerificationError::new(
+            ErrorCode::ToolFailed,
+            format!("cannot terminate {label}: {error}"),
+        )
     })
 }
 
@@ -893,7 +1169,7 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
-fn spawn_error(node: &Path, error: &std::io::Error) -> VerificationError {
+fn spawn_error(label: &str, program: &Path, error: &std::io::Error) -> VerificationError {
     let code = if error.kind() == ErrorKind::NotFound {
         ErrorCode::ToolMissing
     } else {
@@ -901,28 +1177,28 @@ fn spawn_error(node: &Path, error: &std::io::Error) -> VerificationError {
     };
     VerificationError::new(
         code,
-        format!("cannot spawn Node oracle `{}`: {error}", node.display()),
+        format!("cannot spawn {label} `{}`: {error}", program.display()),
     )
 }
 
-fn pipe_error(stream: &str) -> VerificationError {
+fn pipe_error(label: &str, stream: &str) -> VerificationError {
     VerificationError::new(
         ErrorCode::Io,
-        format!("Node oracle {stream} pipe was not captured"),
+        format!("{label} {stream} pipe was not captured"),
     )
 }
 
-fn wait_error(error: std::io::Error) -> VerificationError {
+fn wait_error(label: &str, error: std::io::Error) -> VerificationError {
     VerificationError::new(
         ErrorCode::Io,
-        format!("cannot wait on Node oracle: {error}"),
+        format!("cannot wait on {label}: {error}"),
     )
 }
 
-fn thread_error(stream: &str) -> VerificationError {
+fn thread_error(label: &str, stream: &str) -> VerificationError {
     VerificationError::new(
         ErrorCode::ToolFailed,
-        format!("Node oracle {stream} reader thread panicked"),
+        format!("{label} {stream} reader thread panicked"),
     )
 }
 
