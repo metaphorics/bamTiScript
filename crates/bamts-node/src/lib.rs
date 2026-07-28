@@ -414,9 +414,9 @@ pub extern "C" fn main() -> i32 {
 #[cfg(any(feature = "aot-main", test))]
 #[derive(Debug, PartialEq, Eq)]
 enum AotProcessContextError {
-    ArgumentNotUnicode,
-    EnvironmentNameNotUnicode,
-    EnvironmentValueNotUnicode,
+    Argument,
+    EnvironmentName,
+    EnvironmentValue,
 }
 
 /// Populate an AOT host from an explicit process snapshot.
@@ -435,7 +435,7 @@ fn initialize_aot_process_context(
         argv.push(
             argument
                 .into_string()
-                .map_err(|_| AotProcessContextError::ArgumentNotUnicode)?,
+                .map_err(|_| AotProcessContextError::Argument)?,
         );
     }
 
@@ -443,10 +443,10 @@ fn initialize_aot_process_context(
     for (name, value) in environment {
         let name = name
             .into_string()
-            .map_err(|_| AotProcessContextError::EnvironmentNameNotUnicode)?;
+            .map_err(|_| AotProcessContextError::EnvironmentName)?;
         let value = value
             .into_string()
-            .map_err(|_| AotProcessContextError::EnvironmentValueNotUnicode)?;
+            .map_err(|_| AotProcessContextError::EnvironmentValue)?;
         env.insert(name, value);
     }
 
@@ -543,7 +543,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error, AotProcessContextError::ArgumentNotUnicode);
+        assert_eq!(error, AotProcessContextError::Argument);
         assert!(host.argv().is_empty());
         assert_eq!(host.env("SAFE"), None);
     }
@@ -575,7 +575,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error, AotProcessContextError::EnvironmentValueNotUnicode);
+        assert_eq!(error, AotProcessContextError::EnvironmentValue);
         assert!(host.argv().is_empty());
         assert_eq!(host.env("SAFE"), None);
     }
