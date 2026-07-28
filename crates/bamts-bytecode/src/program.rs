@@ -11,7 +11,7 @@ use crate::{
 /// `BMTPC\0\0\1`: the canonical whole-program container, distinct from module magic.
 pub const PROGRAM_MAGIC: [u8; 8] = [66, 77, 84, 80, 67, 0, 0, 1];
 /// The sole supported program-envelope version.
-pub const PROGRAM_VERSION: u8 = 2;
+pub const PROGRAM_VERSION: u8 = 3;
 
 index_type!(
     /// Index of a module within a program.
@@ -33,12 +33,44 @@ pub enum EdgeTarget {
     External,
 }
 
+/// The runtime roles represented by one canonicalized module dependency.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum EdgeKind {
+    Static,
+    Dynamic,
+    StaticAndDynamic,
+}
+
+impl EdgeKind {
+    #[must_use]
+    pub const fn has_static(self) -> bool {
+        matches!(self, Self::Static | Self::StaticAndDynamic)
+    }
+
+    #[must_use]
+    pub const fn has_dynamic(self) -> bool {
+        matches!(self, Self::Dynamic | Self::StaticAndDynamic)
+    }
+
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Static, Self::Static) => Self::Static,
+            (Self::Dynamic, Self::Dynamic) => Self::Dynamic,
+            (Self::StaticAndDynamic, _)
+            | (_, Self::StaticAndDynamic)
+            | (Self::Static, Self::Dynamic)
+            | (Self::Dynamic, Self::Static) => Self::StaticAndDynamic,
+        }
+    }
+}
+
 /// One canonicalized module dependency.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Edge {
     pub specifier: ConstantId,
     pub target: EdgeTarget,
-    pub eager: bool,
+    pub kind: EdgeKind,
 }
 
 /// The initialization and linkage role of a module binding.
@@ -222,7 +254,11 @@ impl Program<Verified> {
                     }
                     EdgeTarget::External => output.push(1),
                 }
-                output.push(u8::from(edge.eager));
+                output.push(match edge.kind {
+                    EdgeKind::Static => 0,
+                    EdgeKind::Dynamic => 1,
+                    EdgeKind::StaticAndDynamic => 2,
+                });
             }
             write_u32(module.bindings.len() as u32, &mut output);
             for binding in &module.bindings {
@@ -383,8 +419,8 @@ pub enum ProgramDecodeErrorKind {
     InvalidEdgeTarget {
         tag: u8,
     },
-    InvalidBoolean {
-        value: u8,
+    InvalidEdgeKind {
+        tag: u8,
     },
     InvalidBindingKind {
         tag: u8,
@@ -433,8 +469,8 @@ impl fmt::Display for ProgramDecodeError {
             ProgramDecodeErrorKind::InvalidEdgeTarget { tag } => {
                 write!(formatter, "invalid edge target tag {tag}")
             }
-            ProgramDecodeErrorKind::InvalidBoolean { value } => {
-                write!(formatter, "invalid boolean {value}")
+            ProgramDecodeErrorKind::InvalidEdgeKind { tag } => {
+                write!(formatter, "invalid edge kind tag {tag}")
             }
             ProgramDecodeErrorKind::InvalidBindingKind { tag } => {
                 write!(formatter, "invalid binding kind tag {tag}")
@@ -547,7 +583,7 @@ pub enum ProgramVerifyErrorKind {
         first: BindingId,
         second: BindingId,
     },
-    StaticBindingRequiresEagerEdge {
+    StaticBindingRequiresStaticEdge {
         binding: BindingId,
         edge: EdgeId,
     },
@@ -764,11 +800,21 @@ impl<'a> ProgramDecoder<'a> {
                     );
                 }
             };
-            let eager = self.boolean()?;
+            let kind_at = self.offset;
+            let kind = match self.byte()? {
+                0 => EdgeKind::Static,
+                1 => EdgeKind::Dynamic,
+                2 => EdgeKind::StaticAndDynamic,
+                tag => {
+                    return Err(
+                        self.error_at(kind_at, ProgramDecodeErrorKind::InvalidEdgeKind { tag })
+                    );
+                }
+            };
             edges.push(Edge {
                 specifier,
                 target,
-                eager,
+                kind,
             });
         }
 
@@ -884,15 +930,6 @@ impl<'a> ProgramDecoder<'a> {
             }));
         }
         Ok(actual)
-    }
-
-    fn boolean(&mut self) -> Result<bool, ProgramDecodeError> {
-        let at = self.offset;
-        match self.byte()? {
-            0 => Ok(false),
-            1 => Ok(true),
-            value => Err(self.error_at(at, ProgramDecodeErrorKind::InvalidBoolean { value })),
-        }
     }
 
     fn byte(&mut self) -> Result<u8, ProgramDecodeError> {
@@ -1118,10 +1155,10 @@ fn verify_module_metadata(
                         constant: name,
                     },
                 )?;
-                if !dependency.eager {
+                if !dependency.kind.has_static() {
                     return Err(module_error(
                         module_id,
-                        ProgramVerifyErrorKind::StaticBindingRequiresEagerEdge {
+                        ProgramVerifyErrorKind::StaticBindingRequiresStaticEdge {
                             binding: binding_id,
                             edge,
                         },
@@ -1130,10 +1167,10 @@ fn verify_module_metadata(
             }
             BindingKind::Namespace { edge } => {
                 let dependency = require_edge(module_id, module, binding_id, edge)?;
-                if !dependency.eager {
+                if !dependency.kind.has_static() {
                     return Err(module_error(
                         module_id,
-                        ProgramVerifyErrorKind::StaticBindingRequiresEagerEdge {
+                        ProgramVerifyErrorKind::StaticBindingRequiresStaticEdge {
                             binding: binding_id,
                             edge,
                         },
@@ -1216,7 +1253,7 @@ fn verify_module_metadata(
                         string(&module.code, specifier).expect("module verifier checked string");
                     if !specifiers
                         .get(import_name)
-                        .is_some_and(|edge| !module.edges[edge.get() as usize].eager)
+                        .is_some_and(|edge| module.edges[edge.get() as usize].kind.has_dynamic())
                     {
                         return Err(module_error(
                             module_id,
@@ -1597,6 +1634,51 @@ mod tests {
     }
 
     #[test]
+    fn canonical_edge_kind_tags_and_version_round_trip() {
+        let mut module = program_module("main");
+        module.edges = vec![
+            Edge {
+                specifier: ConstantId::new(1),
+                target: EdgeTarget::External,
+                kind: EdgeKind::Static,
+            },
+            Edge {
+                specifier: ConstantId::new(2),
+                target: EdgeTarget::External,
+                kind: EdgeKind::Dynamic,
+            },
+            Edge {
+                specifier: ConstantId::new(3),
+                target: EdgeTarget::External,
+                kind: EdgeKind::StaticAndDynamic,
+            },
+        ];
+        let program = Program::link(vec![module], ModuleId::new(0)).unwrap();
+        let encoded = program.encode();
+        assert_eq!(encoded[PROGRAM_MAGIC.len()], PROGRAM_VERSION);
+
+        let mut offset = PROGRAM_MAGIC.len() + 1;
+        assert_eq!(read_u32(&encoded, &mut offset), 0);
+        assert_eq!(read_u32(&encoded, &mut offset), 1);
+        assert_eq!(read_u32(&encoded, &mut offset), 0);
+        offset += read_u32(&encoded, &mut offset) as usize;
+        assert_eq!(read_u32(&encoded, &mut offset), 3);
+        for (specifier, kind) in [(1, 0), (2, 1), (3, 2)] {
+            assert_eq!(read_u32(&encoded, &mut offset), specifier);
+            assert_eq!(encoded[offset], 1);
+            offset += 1;
+            assert_eq!(encoded[offset], kind);
+            offset += 1;
+        }
+        assert_eq!(
+            decode_verified_program(&encoded, &ProgramDecodeLimits::default())
+                .unwrap()
+                .encode(),
+            encoded
+        );
+    }
+
+    #[test]
     fn oversized_counts_lengths_and_input_are_rejected() {
         let mut limits = ProgramDecodeLimits {
             max_modules: 0,
@@ -1646,7 +1728,7 @@ mod tests {
         with_edge.edges.push(Edge {
             specifier: ConstantId::new(2),
             target: EdgeTarget::External,
-            eager: false,
+            kind: EdgeKind::Static,
         });
         let edge_bytes = Program::link(vec![with_edge], ModuleId::new(0))
             .unwrap()
@@ -1700,7 +1782,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_envelope_tags_booleans_and_integers_are_rejected() {
+    fn invalid_envelope_tags_and_integers_are_rejected() {
         let code = verified_module("main", &["x"]);
 
         let mut edge_tag = raw_module_prefix(&code);
@@ -1715,14 +1797,14 @@ mod tests {
             })
         ));
 
-        let mut boolean = raw_module_prefix(&code);
-        write_u32(1, &mut boolean);
-        write_u32(1, &mut boolean);
-        boolean.extend_from_slice(&[1, 2]);
+        let mut edge_kind = raw_module_prefix(&code);
+        write_u32(1, &mut edge_kind);
+        write_u32(1, &mut edge_kind);
+        edge_kind.extend_from_slice(&[1, 9]);
         assert!(matches!(
-            decode_program(&boolean, &ProgramDecodeLimits::default()),
+            decode_program(&edge_kind, &ProgramDecodeLimits::default()),
             Err(ProgramDecodeError {
-                kind: ProgramDecodeErrorKind::InvalidBoolean { value: 2 },
+                kind: ProgramDecodeErrorKind::InvalidEdgeKind { tag: 9 },
                 ..
             })
         ));
@@ -1820,7 +1902,7 @@ mod tests {
             module.edges.push(Edge {
                 specifier: ConstantId::new(1),
                 target: EdgeTarget::External,
-                eager: false,
+                kind: EdgeKind::Static,
             });
             assert!(matches!(
                 Program::link(vec![module], ModuleId::new(0))
@@ -1840,7 +1922,7 @@ mod tests {
         module.edges.push(Edge {
             specifier: ConstantId::new(1),
             target: EdgeTarget::External,
-            eager: false,
+            kind: EdgeKind::Static,
         });
         Program::link(vec![module], ModuleId::new(0)).unwrap();
     }
@@ -1852,12 +1934,12 @@ mod tests {
             Edge {
                 specifier: ConstantId::new(2),
                 target: EdgeTarget::External,
-                eager: false,
+                kind: EdgeKind::Static,
             },
             Edge {
                 specifier: ConstantId::new(2),
                 target: EdgeTarget::External,
-                eager: true,
+                kind: EdgeKind::Static,
             },
         ];
         assert!(matches!(
@@ -1892,7 +1974,7 @@ mod tests {
         module.edges.push(Edge {
             specifier: ConstantId::new(2),
             target: EdgeTarget::Local(ModuleId::new(1)),
-            eager: true,
+            kind: EdgeKind::Static,
         });
         assert!(matches!(
             Program::link(vec![module], ModuleId::new(0))
@@ -1980,7 +2062,7 @@ mod tests {
             module.edges.push(Edge {
                 specifier,
                 target: EdgeTarget::External,
-                eager: false,
+                kind: EdgeKind::Static,
             });
             let kind = Program::link(vec![module], ModuleId::new(0))
                 .unwrap_err()
@@ -2037,7 +2119,7 @@ mod tests {
         module.edges.push(Edge {
             specifier: ConstantId::new(0),
             target: EdgeTarget::External,
-            eager: false,
+            kind: EdgeKind::Static,
         });
         module.bindings.push(Binding {
             name: ConstantId::new(0),
@@ -2057,7 +2139,7 @@ mod tests {
         module.edges.push(Edge {
             specifier: ConstantId::new(0),
             target: EdgeTarget::External,
-            eager: false,
+            kind: EdgeKind::Static,
         });
         module.exports.push(Export {
             name: ConstantId::new(0),
@@ -2081,12 +2163,12 @@ mod tests {
         left.edges.push(Edge {
             specifier: ConstantId::new(2),
             target: EdgeTarget::Local(ModuleId::new(1)),
-            eager: false,
+            kind: EdgeKind::Static,
         });
         right.edges.push(Edge {
             specifier: ConstantId::new(2),
             target: EdgeTarget::Local(ModuleId::new(0)),
-            eager: false,
+            kind: EdgeKind::Static,
         });
         left.exports[0].source = ExportSource::Indirect {
             edge: EdgeId::new(0),
@@ -2108,7 +2190,7 @@ mod tests {
         left.edges.push(Edge {
             specifier: ConstantId::new(2),
             target: EdgeTarget::Local(ModuleId::new(1)),
-            eager: false,
+            kind: EdgeKind::Static,
         });
         left.exports[0].source = ExportSource::Indirect {
             edge: EdgeId::new(0),
@@ -2128,7 +2210,7 @@ mod tests {
         module.edges.push(Edge {
             specifier: ConstantId::new(2),
             target: EdgeTarget::External,
-            eager: false,
+            kind: EdgeKind::Static,
         });
         module.exports[0].source = ExportSource::Indirect {
             edge: EdgeId::new(0),
@@ -2169,7 +2251,7 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_imports_require_non_eager_edges() {
+    fn dynamic_imports_require_dynamic_capability() {
         let code = Module::new(
             vec![
                 Constant::String("main".to_owned()),
@@ -2194,25 +2276,107 @@ mod tests {
         )
         .verify()
         .unwrap();
-        let dynamic_module = |eager| ProgramModule {
+        let dynamic_module = |kind| ProgramModule {
             name: ConstantId::new(0),
             code: code.clone(),
             edges: vec![Edge {
                 specifier: ConstantId::new(1),
                 target: EdgeTarget::External,
-                eager,
+                kind,
             }],
             bindings: Vec::new(),
             exports: Vec::new(),
         };
 
-        Program::link(vec![dynamic_module(false)], ModuleId::new(0)).unwrap();
+        Program::link(vec![dynamic_module(EdgeKind::Dynamic)], ModuleId::new(0)).unwrap();
+        Program::link(
+            vec![dynamic_module(EdgeKind::StaticAndDynamic)],
+            ModuleId::new(0),
+        )
+        .unwrap();
         assert!(matches!(
-            Program::link(vec![dynamic_module(true)], ModuleId::new(0))
+            Program::link(vec![dynamic_module(EdgeKind::Static)], ModuleId::new(0))
                 .unwrap_err()
                 .kind,
             ProgramVerifyErrorKind::DynamicImportMissingEdge { .. }
         ));
+    }
+
+    #[test]
+    fn static_bindings_require_static_capability() {
+        for kind in [
+            BindingKind::Imported {
+                edge: EdgeId::new(0),
+                name: ConstantId::new(1),
+            },
+            BindingKind::Namespace {
+                edge: EdgeId::new(0),
+            },
+        ] {
+            let mut module = program_module("main");
+            module.edges.push(Edge {
+                specifier: ConstantId::new(2),
+                target: EdgeTarget::External,
+                kind: EdgeKind::Dynamic,
+            });
+            module.bindings[0].kind = kind;
+            assert!(matches!(
+                Program::link(vec![module], ModuleId::new(0))
+                    .unwrap_err()
+                    .kind,
+                ProgramVerifyErrorKind::StaticBindingRequiresStaticEdge { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn static_and_dynamic_edge_satisfies_both_linkage_capabilities() {
+        let code = Module::new(
+            vec![
+                Constant::String("main".to_owned()),
+                Constant::String("./dep".to_owned()),
+                Constant::String("value".to_owned()),
+            ],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                1,
+                FunctionFlags::default(),
+                vec![
+                    Instruction::Import {
+                        dst: Register::new(0),
+                        specifier: ConstantId::new(1),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .unwrap();
+        Program::link(
+            vec![ProgramModule {
+                name: ConstantId::new(0),
+                code,
+                edges: vec![Edge {
+                    specifier: ConstantId::new(1),
+                    target: EdgeTarget::External,
+                    kind: EdgeKind::StaticAndDynamic,
+                }],
+                bindings: vec![Binding {
+                    name: ConstantId::new(2),
+                    kind: BindingKind::Imported {
+                        edge: EdgeId::new(0),
+                        name: ConstantId::new(2),
+                    },
+                }],
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2293,7 +2457,7 @@ mod tests {
                 edges: vec![Edge {
                     specifier: ConstantId::new(2),
                     target: EdgeTarget::External,
-                    eager: true,
+                    kind: EdgeKind::Static,
                 }],
                 bindings: vec![Binding {
                     name: ConstantId::new(1),
@@ -2319,7 +2483,7 @@ mod tests {
         module.edges.push(Edge {
             specifier: ConstantId::new(2),
             target: EdgeTarget::External,
-            eager: true,
+            kind: EdgeKind::Static,
         });
         module.bindings[0].kind = BindingKind::Imported {
             edge: EdgeId::new(0),
@@ -2337,39 +2501,12 @@ mod tests {
     }
 
     #[test]
-    fn lazy_static_bindings_are_rejected() {
-        for kind in [
-            BindingKind::Imported {
-                edge: EdgeId::new(0),
-                name: ConstantId::new(1),
-            },
-            BindingKind::Namespace {
-                edge: EdgeId::new(0),
-            },
-        ] {
-            let mut module = program_module("main");
-            module.edges.push(Edge {
-                specifier: ConstantId::new(2),
-                target: EdgeTarget::External,
-                eager: false,
-            });
-            module.bindings[0].kind = kind;
-            assert!(matches!(
-                Program::link(vec![module], ModuleId::new(0))
-                    .unwrap_err()
-                    .kind,
-                ProgramVerifyErrorKind::StaticBindingRequiresEagerEdge { .. }
-            ));
-        }
-    }
-
-    #[test]
     fn imported_export_cycles_are_rejected() {
         let mut left = program_module("left");
         left.edges.push(Edge {
             specifier: ConstantId::new(2),
             target: EdgeTarget::Local(ModuleId::new(1)),
-            eager: true,
+            kind: EdgeKind::Static,
         });
         left.bindings[0].kind = BindingKind::Imported {
             edge: EdgeId::new(0),
@@ -2380,7 +2517,7 @@ mod tests {
         right.edges.push(Edge {
             specifier: ConstantId::new(2),
             target: EdgeTarget::Local(ModuleId::new(0)),
-            eager: true,
+            kind: EdgeKind::Static,
         });
         right.bindings[0].kind = BindingKind::Imported {
             edge: EdgeId::new(0),
@@ -2401,7 +2538,7 @@ mod tests {
         importer.edges.push(Edge {
             specifier: ConstantId::new(2),
             target: EdgeTarget::Local(ModuleId::new(1)),
-            eager: true,
+            kind: EdgeKind::Static,
         });
         importer.bindings[0].kind = BindingKind::Imported {
             edge: EdgeId::new(0),
@@ -2412,7 +2549,7 @@ mod tests {
         relay.edges.push(Edge {
             specifier: ConstantId::new(2),
             target: EdgeTarget::Local(ModuleId::new(2)),
-            eager: true,
+            kind: EdgeKind::Static,
         });
         relay.exports[0].source = ExportSource::Indirect {
             edge: EdgeId::new(0),
@@ -2434,7 +2571,7 @@ mod tests {
         importer.edges.push(Edge {
             specifier: ConstantId::new(2),
             target: EdgeTarget::Local(ModuleId::new(1)),
-            eager: true,
+            kind: EdgeKind::Static,
         });
         importer.bindings[0].kind = BindingKind::Imported {
             edge: EdgeId::new(0),

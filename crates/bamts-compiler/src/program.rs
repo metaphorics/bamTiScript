@@ -8,8 +8,8 @@ use std::{
 };
 
 use bamts_bytecode::{
-    Binding, BindingId, BindingKind, Constant, ConstantId, Edge, EdgeId, EdgeTarget, Export,
-    ExportSource, ModuleId, Program as BytecodeProgram, ProgramModule, ProgramVerifyError,
+    Binding, BindingId, BindingKind, Constant, ConstantId, Edge, EdgeId, EdgeKind, EdgeTarget,
+    Export, ExportSource, ModuleId, Program as BytecodeProgram, ProgramModule, ProgramVerifyError,
     Verified,
 };
 
@@ -1507,7 +1507,7 @@ struct RawEdge {
     specifier: String,
     target: EdgeTarget,
     external_identity: Option<String>,
-    eager: bool,
+    kind: EdgeKind,
 }
 
 #[derive(Clone)]
@@ -1554,7 +1554,7 @@ enum ExportOrigin {
 /// Lowers one canonical resolved program and its matching frontend products.
 ///
 /// Static linkage becomes live metadata only. Dynamic imports remain instructions
-/// backed by non-eager edges.
+/// backed by dynamic-capable edges.
 ///
 /// # Errors
 /// Returns a path- and phase-typed failure for frontend mismatch, metadata construction,
@@ -1681,10 +1681,18 @@ fn collect_raw_module(
         .iter()
         .filter(|edge| edge.kind() != ModuleEdgeKind::TypeOnly)
     {
-        let eager = dependency.kind() == ModuleEdgeKind::StaticRuntime;
+        let kind = match dependency.kind() {
+            ModuleEdgeKind::StaticRuntime => EdgeKind::Static,
+            ModuleEdgeKind::DynamicRuntime => EdgeKind::Dynamic,
+            ModuleEdgeKind::TypeOnly => unreachable!("type-only edges were filtered"),
+        };
+        let (target, external_identity) = match dependency.target() {
+            ModuleTarget::Local(source) => (EdgeTarget::Local(module_ids[source]), None),
+            ModuleTarget::External(identity) => (EdgeTarget::External, Some(identity.to_string())),
+        };
         if let Some(existing) = edge_ids.get(dependency.specifier()).copied() {
             let edge: &mut RawEdge = &mut edges[existing.get() as usize];
-            if edge.eager != eager {
+            if edge.target != target || edge.external_identity != external_identity {
                 return Err(program_lower_error(
                     module.path(),
                     ProgramLowerPhase::Metadata,
@@ -1693,19 +1701,16 @@ fn collect_raw_module(
                     },
                 ));
             }
+            edge.kind = edge.kind.union(kind);
             continue;
         }
-        let (target, external_identity) = match dependency.target() {
-            ModuleTarget::Local(source) => (EdgeTarget::Local(module_ids[source]), None),
-            ModuleTarget::External(identity) => (EdgeTarget::External, Some(identity.to_string())),
-        };
         let id = EdgeId::new(edges.len() as u32);
         edge_ids.insert(dependency.specifier().to_owned(), id);
         edges.push(RawEdge {
             specifier: dependency.specifier().to_owned(),
             target,
             external_identity,
-            eager,
+            kind,
         });
     }
 
@@ -2153,7 +2158,7 @@ fn materialize_program_module(
         .map(|edge| Edge {
             specifier: constant(&edge.specifier),
             target: edge.target,
-            eager: edge.eager,
+            kind: edge.kind,
         })
         .collect();
     let bindings = raw
@@ -2246,7 +2251,10 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
     };
 
     use super::{
@@ -2259,8 +2267,8 @@ mod tests {
         project::{ProjectConfig, ProjectRoot},
     };
     use bamts_bytecode::{
-        BindingKind, EdgeTarget, ExportSource, Instruction, ProgramModule, ProgramVerifyErrorKind,
-        ResolvedExport, Verified,
+        BindingKind, EdgeKind, EdgeTarget, ExportSource, Instruction, ProgramModule,
+        ProgramVerifyErrorKind, ResolvedExport, Verified,
     };
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -2360,6 +2368,8 @@ mod tests {
 
         let executable = lower_fixture(&fixture, "main.ts");
         let main = module(&executable, "main.ts");
+        assert_eq!(main.edges().len(), 1);
+        assert_eq!(main.edges()[0].kind, EdgeKind::Static);
         let binding = main
             .bindings()
             .iter()
@@ -2605,12 +2615,12 @@ mod tests {
         assert!(b.bindings().iter().any(|binding| {
             constant_string(b, binding.name) == "fromB" && binding.kind == BindingKind::Hoisted
         }));
-        assert!(a.edges().iter().all(|edge| edge.eager));
-        assert!(b.edges().iter().all(|edge| edge.eager));
+        assert!(a.edges().iter().all(|edge| edge.kind == EdgeKind::Static));
+        assert!(b.edges().iter().all(|edge| edge.kind == EdgeKind::Static));
     }
 
     #[test]
-    fn program_lowering_keeps_dynamic_import_as_non_eager_instruction_edge() {
+    fn program_lowering_keeps_dynamic_import_as_dynamic_instruction_edge() {
         let fixture = Fixture::new();
         fixture.write("dep.ts", "export const value = 1;");
         fixture.write("main.ts", "const pending = import('./dep.js');");
@@ -2618,9 +2628,70 @@ mod tests {
         let executable = lower_fixture(&fixture, "main.ts");
         let main = module(&executable, "main.ts");
         assert_eq!(main.edges().len(), 1);
-        assert!(!main.edges()[0].eager);
+        assert_eq!(main.edges()[0].kind, EdgeKind::Dynamic);
         assert!(
             instructions(main).any(|instruction| matches!(instruction, Instruction::Import { .. }))
+        );
+    }
+
+    #[test]
+    fn program_lowering_coalesces_static_and_dynamic_imports_of_one_target() {
+        let fixture = Fixture::new();
+        fixture.write("dep.ts", "export const value = 1;");
+        fixture.write(
+            "main.ts",
+            "import { value } from './dep.js'; const pending = import('./dep.js'); value;",
+        );
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        assert_eq!(main.edges().len(), 1);
+        assert_eq!(main.edges()[0].kind, EdgeKind::StaticAndDynamic);
+        assert!(main.bindings().iter().any(|binding| {
+            constant_string(main, binding.name) == "value"
+                && matches!(binding.kind, BindingKind::Imported { .. })
+        }));
+        assert!(
+            instructions(main).any(|instruction| matches!(instruction, Instruction::Import { .. }))
+        );
+    }
+
+    #[test]
+    fn program_lowering_rejects_same_specifier_with_different_targets() {
+        let fixture = Fixture::new();
+        fixture.write("dep.ts", "export const value = 1;");
+        fixture.write("other.ts", "export const other = 2;");
+        fixture.write(
+            "main.ts",
+            "import { value } from './dep.js'; const pending = import('./dep.js'); import './other.js'; value;",
+        );
+        let mut resolved = fixture.loader().load("main.ts").unwrap();
+        let other = resolved
+            .modules()
+            .iter()
+            .find(|module| module.path().ends_with("other.ts"))
+            .unwrap()
+            .source_id();
+        let modules = Arc::get_mut(&mut resolved.modules).unwrap();
+        let main = modules
+            .iter_mut()
+            .find(|module| module.path().ends_with("main.ts"))
+            .unwrap();
+        let dependencies = Arc::make_mut(&mut main.dependencies);
+        dependencies
+            .iter_mut()
+            .find(|edge| edge.kind == ModuleEdgeKind::DynamicRuntime)
+            .unwrap()
+            .target = ModuleTarget::Local(other);
+
+        let frontend = compile_program_frontend(&resolved, FrontendMode::Check);
+        let error = lower_program(&resolved, &frontend, LowerOptions::default()).unwrap_err();
+        assert_eq!(error.phase, ProgramLowerPhase::Metadata);
+        assert_eq!(
+            error.kind,
+            ProgramLowerErrorKind::ConflictingRuntimeEdge {
+                specifier: "./dep.js".to_owned(),
+            }
         );
     }
 

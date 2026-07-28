@@ -172,8 +172,8 @@ index_type!(
 mod program;
 
 pub use program::{
-    Binding, BindingId, BindingKind, Edge, EdgeId, EdgeTarget, Export, ExportSource, ModuleId,
-    PROGRAM_MAGIC, PROGRAM_VERSION, Program, ProgramDecodeError, ProgramDecodeErrorKind,
+    Binding, BindingId, BindingKind, Edge, EdgeId, EdgeKind, EdgeTarget, Export, ExportSource,
+    ModuleId, PROGRAM_MAGIC, PROGRAM_VERSION, Program, ProgramDecodeError, ProgramDecodeErrorKind,
     ProgramDecodeLimits, ProgramLoadError, ProgramModule, ProgramVerifyError,
     ProgramVerifyErrorKind, ResolvedExport, decode_program, decode_verified_program,
 };
