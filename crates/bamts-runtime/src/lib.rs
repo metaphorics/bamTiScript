@@ -30,6 +30,11 @@ use bamts_bytecode::{
 };
 use bamts_native::{Decoded, SlotId, Value};
 
+mod intrinsics;
+mod native;
+
+pub use native::{NativeEngine, NativeError, run_linked_program};
+
 const RUNTIME_HEAP_SEGMENT: u16 = 1;
 
 /// The observable result of a terminated execution.
@@ -84,6 +89,19 @@ pub struct HostThrow {
     pub value: Value,
 }
 
+/// A host-owned entity resolved into a runtime-local heap reference.
+///
+/// Entity identifiers stay opaque to the runtime. `Function`/`Object` bindings
+/// are wrapped in segment-1 heap entries here, so the host never chooses a
+/// runtime slot id and cannot forge one. A `Primitive` may echo a value the
+/// host previously received; it is validated before it crosses back in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostBinding {
+    Function(u32),
+    Object(u32),
+    Primitive(Value),
+}
+
 /// External operations. Segment-1 heap values belong to this runtime and may be
 /// passed to or echoed by the host, but the host must not forge new segment-1
 /// slot ids. These methods cover only operations against *foreign* values and
@@ -91,6 +109,70 @@ pub struct HostThrow {
 /// names are never routed here. Default methods fail by throwing `undefined`,
 /// never by succeeding with placeholder behavior.
 pub trait Host {
+    /// Resolve an ambient global to a host entity, materialized into an
+    /// unforgeable runtime-local reference before bytecode observes it.
+    fn resolve_global(&mut self, _name: &str) -> Option<HostBinding> {
+        None
+    }
+
+    /// `entity[key]` on a host object, by opaque entity id.
+    fn entity_get(&mut self, _entity: u32, _key: &str) -> Result<HostBinding, HostThrow> {
+        Err(HostThrow {
+            value: Value::UNDEFINED,
+        })
+    }
+
+    /// `entity[key] = value` on a host object.
+    fn entity_set(&mut self, _entity: u32, _key: &str, _value: Value) -> Result<(), HostThrow> {
+        Err(HostThrow {
+            value: Value::UNDEFINED,
+        })
+    }
+
+    /// `delete entity[key]` on a host object.
+    fn entity_delete(&mut self, _entity: u32, _key: &str) -> Result<bool, HostThrow> {
+        Err(HostThrow {
+            value: Value::UNDEFINED,
+        })
+    }
+
+    /// `key in entity` on a host object.
+    fn entity_has(&mut self, _entity: u32, _key: &str) -> Result<bool, HostThrow> {
+        Err(HostThrow {
+            value: Value::UNDEFINED,
+        })
+    }
+
+    /// Call a host function entity with receiver `this` over `arguments`.
+    fn entity_call(
+        &mut self,
+        _entity: u32,
+        _this: Value,
+        _arguments: &[Value],
+    ) -> Result<HostBinding, HostThrow> {
+        Err(HostThrow {
+            value: Value::UNDEFINED,
+        })
+    }
+
+    /// Construct with a host function entity over `arguments`.
+    fn entity_construct(
+        &mut self,
+        _entity: u32,
+        _arguments: &[Value],
+    ) -> Result<HostBinding, HostThrow> {
+        Err(HostThrow {
+            value: Value::UNDEFINED,
+        })
+    }
+
+    /// `value instanceof entity`, where `entity` is a host constructor.
+    fn entity_instance_of(&mut self, _entity: u32, _value: Value) -> Result<bool, HostThrow> {
+        Err(HostThrow {
+            value: Value::UNDEFINED,
+        })
+    }
+
     fn property_get(&mut self, _object: Value, _key: &str) -> Result<Value, HostThrow> {
         Err(HostThrow {
             value: Value::UNDEFINED,
@@ -299,23 +381,78 @@ enum Property {
     },
 }
 
+/// Own properties in creation order. ECMAScript enumerates array-index keys
+/// separately, but preserves this order for all other string and symbol keys.
+#[derive(Clone, Debug, Default)]
+struct PropertyMap(Vec<(PropertyKey, Property)>);
+
+impl PropertyMap {
+    fn get(&self, key: &PropertyKey) -> Option<&Property> {
+        self.0
+            .iter()
+            .find_map(|(candidate, property)| (candidate == key).then_some(property))
+    }
+
+    fn get_mut(&mut self, key: &PropertyKey) -> Option<&mut Property> {
+        self.0
+            .iter_mut()
+            .find_map(|(candidate, property)| (candidate == key).then_some(property))
+    }
+
+    fn contains_key(&self, key: &PropertyKey) -> bool {
+        self.get(key).is_some()
+    }
+
+    fn insert(&mut self, key: PropertyKey, property: Property) -> Option<Property> {
+        if let Some(existing) = self.get_mut(&key) {
+            return Some(std::mem::replace(existing, property));
+        }
+        self.0.push((key, property));
+        None
+    }
+
+    fn remove(&mut self, key: &PropertyKey) -> Option<Property> {
+        let index = self.0.iter().position(|(candidate, _)| candidate == key)?;
+        Some(self.0.remove(index).1)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&PropertyKey, &Property)> {
+        self.0.iter().map(|(key, property)| (key, property))
+    }
+}
+
+impl<'a> IntoIterator for &'a PropertyMap {
+    type Item = (&'a PropertyKey, &'a Property);
+    type IntoIter = std::iter::Map<
+        std::slice::Iter<'a, (PropertyKey, Property)>,
+        fn(&(PropertyKey, Property)) -> (&PropertyKey, &Property),
+    >;
+
+    fn into_iter(self) -> Self::IntoIter {
+        fn pair_refs(pair: &(PropertyKey, Property)) -> (&PropertyKey, &Property) {
+            (&pair.0, &pair.1)
+        }
+        self.0.iter().map(pair_refs)
+    }
+}
+
 #[derive(Clone, Debug)]
 enum HeapEntry {
     String(String),
     BigInt(String),
     Object {
-        properties: BTreeMap<PropertyKey, Property>,
+        properties: PropertyMap,
         prototype: Option<Value>,
     },
     Array {
         elements: Vec<Value>,
-        properties: BTreeMap<PropertyKey, Property>,
+        properties: PropertyMap,
         prototype: Option<Value>,
     },
     Function {
         function: FunctionId,
         captures: Vec<Value>,
-        properties: BTreeMap<PropertyKey, Property>,
+        properties: PropertyMap,
         prototype: Option<Value>,
     },
     PrivateName {
@@ -324,13 +461,23 @@ enum HeapEntry {
     RegExp {
         pattern: String,
         flags: String,
-        properties: BTreeMap<PropertyKey, Property>,
+        properties: PropertyMap,
     },
     Iterator {
         source: Value,
         index: usize,
         keys: Option<Vec<String>>,
     },
+    NativeFunction {
+        id: intrinsics::BuiltinId,
+        name: &'static str,
+        length: u32,
+        bound_this: Option<Value>,
+    },
+    /// Runtime-local wrapper for an opaque callable owned by the host.
+    HostFunction(u32),
+    /// Runtime-local wrapper for an opaque object owned by the host.
+    HostObject(u32),
 }
 
 impl HeapEntry {
@@ -343,7 +490,10 @@ impl HeapEntry {
             Self::Object { .. }
             | Self::Array { .. }
             | Self::Function { .. }
-            | Self::Iterator { .. } => 1,
+            | Self::NativeFunction { .. }
+            | Self::Iterator { .. }
+            | Self::HostFunction(_)
+            | Self::HostObject(_) => 1,
         }
     }
 }
@@ -452,6 +602,24 @@ enum Found {
     NoGetter,
 }
 
+/// A classified callee, shared by the interpreter and the native engine so both
+/// route calls through one decision. The native engine reimplements the frame
+/// push but consumes this classifier verbatim.
+#[derive(Clone, Debug)]
+enum CalleeKind {
+    Runtime {
+        function: FunctionId,
+        captures: Vec<Value>,
+    },
+    Builtin {
+        id: intrinsics::BuiltinId,
+        bound_this: Option<Value>,
+    },
+    HostEntity(u32),
+    HostValue,
+    NotCallable,
+}
+
 /// The production bytecode interpreter.
 pub struct Machine<'a, H: Host> {
     module: &'a Module<Verified>,
@@ -459,10 +627,12 @@ pub struct Machine<'a, H: Host> {
     limits: Limits,
     frames: Vec<Frame>,
     heap: Vec<HeapEntry>,
+    intrinsic_slots: usize,
     heap_bytes: usize,
     live_registers: usize,
     fuel: u64,
     globals: BTreeMap<String, Value>,
+    intrinsics: intrinsics::Intrinsics,
 }
 
 pub fn run<H: Host>(
@@ -489,16 +659,21 @@ impl<'a, H: Host> Machine<'a, H> {
             None,
         );
         let live_registers = frame.registers.len();
+        let mut heap = Vec::new();
+        let intrinsics = intrinsics::Intrinsics::initialize(&mut heap);
+        let intrinsic_slots = heap.len();
         Self {
             fuel: limits.fuel,
             module,
             host,
             limits,
             frames: vec![frame],
-            heap: Vec::new(),
+            heap,
             heap_bytes: 0,
+            intrinsic_slots,
             live_registers,
             globals: BTreeMap::new(),
+            intrinsics,
         }
     }
 
@@ -572,8 +747,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 Instruction::CreateObject { dst } => {
                     let value = self
                         .allocate(HeapEntry::Object {
-                            properties: BTreeMap::new(),
-                            prototype: None,
+                            properties: PropertyMap::default(),
+                            prototype: Some(self.intrinsics.object_prototype),
                         })
                         .map_err(|kind| self.error_at(kind, function_index, pc))?;
                     self.write_register(frame_index, dst.get(), value);
@@ -583,8 +758,8 @@ impl<'a, H: Host> Machine<'a, H> {
                     let value = self
                         .allocate(HeapEntry::Array {
                             elements: Vec::new(),
-                            properties: BTreeMap::new(),
-                            prototype: None,
+                            properties: PropertyMap::default(),
+                            prototype: Some(self.intrinsics.array_prototype),
                         })
                         .map_err(|kind| self.error_at(kind, function_index, pc))?;
                     self.write_register(frame_index, dst.get(), value);
@@ -600,8 +775,8 @@ impl<'a, H: Host> Machine<'a, H> {
                             .allocate(HeapEntry::Function {
                                 function,
                                 captures,
-                                properties: BTreeMap::new(),
-                                prototype: None,
+                                properties: PropertyMap::default(),
+                                prototype: Some(self.intrinsics.function_prototype),
                             })
                             .map_err(|kind| self.error_at(kind, function_index, pc))?;
                         self.write_register(frame_index, dst.get(), value);
@@ -612,7 +787,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 Instruction::GetProperty { dst, object, key } => {
                     let object = self.read_register(frame_index, object.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.coerce_property_key(key_value) {
+                    let key = match self.to_property_key(key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -652,7 +827,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     let object = self.read_register(frame_index, object.get());
                     let value = self.read_register(frame_index, value.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.coerce_property_key(key_value) {
+                    let key = match self.to_property_key(key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -679,7 +854,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 Instruction::DeleteProperty { dst, object, key } => {
                     let object = self.read_register(frame_index, object.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.coerce_property_key(key_value) {
+                    let key = match self.to_property_key(key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -703,7 +878,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     let object = self.read_register(frame_index, object.get());
                     let accessor = self.read_register(frame_index, accessor.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.coerce_property_key(key_value) {
+                    let key = match self.to_property_key(key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -755,7 +930,10 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 Instruction::LoadGlobal { dst, name } => {
                     let name = self.constant_string(name).to_owned();
-                    match self.globals.get(&name).copied() {
+                    match self
+                        .resolve_global_binding(&name)
+                        .map_err(|kind| self.error_at(kind, function_index, pc))?
+                    {
                         Some(value) => {
                             self.validate_host_value(value)
                                 .map_err(|kind| self.error_at(kind, function_index, pc))?;
@@ -779,7 +957,10 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 Instruction::TypeOfGlobal { dst, name } => {
                     let name = self.constant_string(name).to_owned();
-                    let text = match self.globals.get(&name).copied() {
+                    let text = match self
+                        .resolve_global_binding(&name)
+                        .map_err(|kind| self.error_at(kind, function_index, pc))?
+                    {
                         Some(value) => self.type_of(value).to_owned(),
                         None => "undefined".to_owned(),
                     };
@@ -855,7 +1036,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         .allocate(HeapEntry::RegExp {
                             pattern,
                             flags,
-                            properties: BTreeMap::new(),
+                            properties: PropertyMap::default(),
                         })
                         .map_err(|kind| self.error_at(kind, function_index, pc))?;
                     self.write_register(frame_index, dst.get(), value);
@@ -979,19 +1160,14 @@ impl<'a, H: Host> Machine<'a, H> {
         function: usize,
         pc: usize,
     ) -> Result<Value, RuntimeError> {
-        match &self.module.constants()[id.get() as usize] {
-            Constant::String(text) => self
-                .allocate(HeapEntry::String(text.clone()))
-                .map_err(|kind| self.error_at(kind, function, pc)),
-            Constant::BigInt(value) => self
-                .allocate(HeapEntry::BigInt(value.as_str().to_owned()))
-                .map_err(|kind| self.error_at(kind, function, pc)),
-            constant => Ok(constant_value(constant).expect("non-heap constant")),
-        }
+        self.load_constant_value(id)
+            .map_err(|kind| self.error_at(kind, function, pc))
     }
 
     fn allocate(&mut self, entry: HeapEntry) -> Result<Value, RuntimeErrorKind> {
-        if self.heap.len() >= self.limits.max_heap_slots || self.heap.len() == u32::MAX as usize {
+        if self.heap.len().saturating_sub(self.intrinsic_slots) >= self.limits.max_heap_slots
+            || self.heap.len() == u32::MAX as usize
+        {
             return Err(RuntimeErrorKind::HeapSlotLimitExceeded {
                 limit: self.limits.max_heap_slots,
             });
@@ -1040,11 +1216,82 @@ impl<'a, H: Host> Machine<'a, H> {
         self.runtime_slot(value).map(|_| ())
     }
 
+    /// Materializes a host binding into an ABI value. `Function`/`Object`
+    /// bindings become fresh segment-1 wrappers (so the host never chooses a
+    /// runtime slot id); a `Primitive` is validated before it crosses back in,
+    /// rejecting any forged or nonexistent segment-1 reference.
+    fn materialize_binding(&mut self, binding: HostBinding) -> Result<Value, RuntimeErrorKind> {
+        match binding {
+            HostBinding::Function(id) => self.allocate(HeapEntry::HostFunction(id)),
+            HostBinding::Object(id) => self.allocate(HeapEntry::HostObject(id)),
+            HostBinding::Primitive(value) => {
+                self.validate_host_value(value)?;
+                Ok(value)
+            }
+        }
+    }
+
+    /// Resolves a global: a declared runtime global shadows realm intrinsics,
+    /// and realm intrinsics shadow ambient host bindings.
+    fn resolve_global_binding(&mut self, name: &str) -> Result<Option<Value>, RuntimeErrorKind> {
+        if let Some(value) = self.globals.get(name).copied() {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.intrinsics.global(name) {
+            return Ok(Some(value));
+        }
+        match self.host.resolve_global(name) {
+            Some(binding) => self.materialize_binding(binding).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Classifies a callee into the shared dispatch categories.
+    fn callee_kind(&self, callee: Value) -> Result<CalleeKind, RuntimeErrorKind> {
+        match self.runtime_slot(callee)? {
+            Some(index) => match &self.heap[index] {
+                HeapEntry::Function {
+                    function, captures, ..
+                } => Ok(CalleeKind::Runtime {
+                    function: *function,
+                    captures: captures.clone(),
+                }),
+                HeapEntry::HostFunction(id) => Ok(CalleeKind::HostEntity(*id)),
+                HeapEntry::NativeFunction { id, bound_this, .. } => Ok(CalleeKind::Builtin {
+                    id: *id,
+                    bound_this: *bound_this,
+                }),
+                _ => Ok(CalleeKind::NotCallable),
+            },
+            None => match callee.decode() {
+                Some(Decoded::HeapRef(_)) => Ok(CalleeKind::HostValue),
+                _ => Ok(CalleeKind::NotCallable),
+            },
+        }
+    }
+
+    /// Materializes a constant into an ABI value, interning strings and bigints
+    /// into the slot heap. Shared with the native engine.
+    fn load_constant_value(&mut self, id: ConstantId) -> Result<Value, RuntimeErrorKind> {
+        match &self.module.constants()[id.get() as usize] {
+            Constant::String(text) => self.allocate(HeapEntry::String(text.clone())),
+            Constant::BigInt(value) => self.allocate(HeapEntry::BigInt(value.as_str().to_owned())),
+            constant => Ok(constant_value(constant).expect("non-heap constant")),
+        }
+    }
+
     /// Reads a call/construct arguments array from a register: it must hold a
     /// runtime array, whose length is capped by `max_argument_count`.
     fn read_arguments(&self, frame: usize, register: u32) -> Result<Vec<Value>, EvalFailure> {
         let value = self.read_register(frame, register);
-        match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
+        self.arguments_from_array(value)
+    }
+
+    /// Validates a call/construct arguments array value: it must be a runtime
+    /// array whose length is capped by `max_argument_count`, with holes read as
+    /// `undefined`. Shared with the native engine.
+    fn arguments_from_array(&self, arguments: Value) -> Result<Vec<Value>, EvalFailure> {
+        match self.runtime_slot(arguments).map_err(EvalFailure::Runtime)? {
             Some(index) => match &self.heap[index] {
                 HeapEntry::Array { elements, .. } => {
                     if elements.len() as u64 > u64::from(self.limits.max_argument_count) {
@@ -1084,9 +1331,20 @@ impl<'a, H: Host> Machine<'a, H> {
         register: u32,
         function: FunctionId,
     ) -> Result<Vec<Value>, EvalFailure> {
-        let expected = self.module.functions()[function.get() as usize].capture_count() as usize;
         let value = self.read_register(frame, register);
-        match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
+        self.captures_from_array(value, function)
+    }
+
+    /// Validates a `CreateClosure` captures array value: it must be a runtime
+    /// array whose length matches the target function's capture count, with
+    /// holes read as `undefined`. Shared with the native engine.
+    fn captures_from_array(
+        &self,
+        captures: Value,
+        function: FunctionId,
+    ) -> Result<Vec<Value>, EvalFailure> {
+        let expected = self.module.functions()[function.get() as usize].capture_count() as usize;
+        match self.runtime_slot(captures).map_err(EvalFailure::Runtime)? {
             Some(index) => match &self.heap[index] {
                 HeapEntry::Array { elements, .. } => {
                     if elements.len() != expected {
@@ -1128,8 +1386,8 @@ impl<'a, H: Host> Machine<'a, H> {
         let value = self
             .allocate(HeapEntry::Array {
                 elements: args,
-                properties: BTreeMap::new(),
-                prototype: None,
+                properties: PropertyMap::default(),
+                prototype: Some(self.intrinsics.array_prototype),
             })
             .map_err(|kind| self.error_at(kind, function, pc))?;
         self.frames[frame].arguments_object = Some(value);
@@ -1188,31 +1446,49 @@ impl<'a, H: Host> Machine<'a, H> {
             constructed,
             new_target,
         } = request;
-        match self.runtime_slot(callee) {
-            Ok(Some(index)) => {
-                let (function, captures) = match &self.heap[index] {
-                    HeapEntry::Function {
-                        function, captures, ..
-                    } => (*function, captures.clone()),
-                    _ => return self.throw_type("call", call_pc),
-                };
-                self.push_frame(
-                    function,
-                    &captures,
-                    this_value,
-                    new_target,
-                    arguments,
-                    ReturnTo {
-                        destination: destination.map(|register| register as usize),
+        match self.callee_kind(callee) {
+            Ok(CalleeKind::Runtime { function, captures }) => self.push_frame(
+                function,
+                &captures,
+                this_value,
+                new_target,
+                arguments,
+                ReturnTo {
+                    destination: destination.map(|register| register as usize),
+                    call_pc,
+                    constructed,
+                },
+            ),
+            Ok(CalleeKind::Builtin { id, bound_this }) => {
+                let this_value = bound_this.unwrap_or(this_value);
+                match self.call_builtin(id, this_value, arguments, false) {
+                    Ok(intrinsics::BuiltinOutcome::Value(value)) => {
+                        if let Some(register) = destination {
+                            self.write_register(self.frames.len() - 1, register, value);
+                        }
+                        Ok(())
+                    }
+                    Ok(intrinsics::BuiltinOutcome::Call {
+                        callee,
+                        this_value,
+                        argument_start,
+                    }) => self.execute_call(CallRequest {
+                        callee,
+                        this_value,
+                        arguments: &arguments[argument_start..],
+                        destination,
                         call_pc,
                         constructed,
-                    },
-                )
+                        new_target,
+                    }),
+                    Err(failure) => self.resolve_failure(failure, call_pc),
+                }
             }
-            Ok(None) => match callee.decode() {
-                Some(Decoded::HeapRef(_)) => match self.host.call(callee, this_value, arguments) {
-                    Ok(value) => {
-                        self.validate_host_value(value)
+            Ok(CalleeKind::HostEntity(entity)) => {
+                match self.host.entity_call(entity, this_value, arguments) {
+                    Ok(binding) => {
+                        let value = self
+                            .materialize_binding(binding)
                             .map_err(|kind| self.error_here_at(kind, call_pc))?;
                         if let Some(register) = destination {
                             self.write_register(self.frames.len() - 1, register, value);
@@ -1220,9 +1496,20 @@ impl<'a, H: Host> Machine<'a, H> {
                         Ok(())
                     }
                     Err(thrown) => self.host_throw(thrown, call_pc),
-                },
-                _ => self.throw_type("call", call_pc),
+                }
+            }
+            Ok(CalleeKind::HostValue) => match self.host.call(callee, this_value, arguments) {
+                Ok(value) => {
+                    self.validate_host_value(value)
+                        .map_err(|kind| self.error_here_at(kind, call_pc))?;
+                    if let Some(register) = destination {
+                        self.write_register(self.frames.len() - 1, register, value);
+                    }
+                    Ok(())
+                }
+                Err(thrown) => self.host_throw(thrown, call_pc),
             },
+            Ok(CalleeKind::NotCallable) => self.throw_type("call", call_pc),
             Err(kind) => Err(self.error_here_at(kind, call_pc)),
         }
     }
@@ -1236,18 +1523,46 @@ impl<'a, H: Host> Machine<'a, H> {
     ) -> Result<(), RuntimeError> {
         match self.runtime_slot(callee) {
             Ok(Some(index)) => {
-                if !matches!(self.heap[index], HeapEntry::Function { .. }) {
+                if let HeapEntry::NativeFunction { id, .. } = self.heap[index] {
+                    match self.call_builtin(id, Value::UNDEFINED, arguments, true) {
+                        Ok(intrinsics::BuiltinOutcome::Value(value)) => {
+                            self.write_register(self.frames.len() - 1, destination, value);
+                            return Ok(());
+                        }
+                        Ok(intrinsics::BuiltinOutcome::Call { .. }) => {
+                            return self.throw_type("construct", call_pc);
+                        }
+                        Err(failure) => return self.resolve_failure(failure, call_pc),
+                    }
+                }
+                if let HeapEntry::HostFunction(id) = &self.heap[index] {
+                    let entity = *id;
+                    match self.host.entity_construct(entity, arguments) {
+                        Ok(binding) => {
+                            let value = self
+                                .materialize_binding(binding)
+                                .map_err(|kind| self.error_here_at(kind, call_pc))?;
+                            self.write_register(self.frames.len() - 1, destination, value);
+                            return Ok(());
+                        }
+                        Err(thrown) => return self.host_throw(thrown, call_pc),
+                    }
+                }
+                if !matches!(
+                    self.heap[index],
+                    HeapEntry::Function { .. } | HeapEntry::NativeFunction { .. }
+                ) {
                     return self.throw_type("construct", call_pc);
                 }
                 // The instance's [[Prototype]] is the constructor's own
                 // `prototype` data property when it is an object.
                 let instance_prototype = match self.own_data_property(index, "prototype") {
                     Some(value) if self.is_object(value) => Some(value),
-                    _ => None,
+                    _ => Some(self.intrinsics.object_prototype),
                 };
                 let object = self
                     .allocate(HeapEntry::Object {
-                        properties: BTreeMap::new(),
+                        properties: PropertyMap::default(),
                         prototype: instance_prototype,
                     })
                     .map_err(|kind| self.error_here_at(kind, call_pc))?;
@@ -1401,7 +1716,7 @@ impl<'a, H: Host> Machine<'a, H> {
     /// Normalizes a register value into a property key. A runtime string borrows
     /// its text; a private name yields its slot identity; everything else is
     /// coerced with `ToString`.
-    fn coerce_property_key(&self, value: Value) -> Result<PropertyKey, EvalFailure> {
+    fn to_property_key(&self, value: Value) -> Result<PropertyKey, EvalFailure> {
         match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
             Some(index) => match &self.heap[index] {
                 HeapEntry::String(text) => Ok(PropertyKey::Named(text.clone())),
@@ -1430,9 +1745,22 @@ impl<'a, H: Host> Machine<'a, H> {
                 HeapEntry::PrivateName { .. } | HeapEntry::Iterator { .. } => {
                     Ok(GetOutcome::Value(Value::UNDEFINED))
                 }
+                HeapEntry::HostFunction(id) | HeapEntry::HostObject(id) => {
+                    let entity = *id;
+                    let name = self.host_key(key)?;
+                    let binding = self
+                        .host
+                        .entity_get(entity, &name)
+                        .map_err(EvalFailure::HostThrow)?;
+                    let value = self
+                        .materialize_binding(binding)
+                        .map_err(EvalFailure::Runtime)?;
+                    Ok(GetOutcome::Value(value))
+                }
                 HeapEntry::Object { .. }
                 | HeapEntry::Array { .. }
                 | HeapEntry::Function { .. }
+                | HeapEntry::NativeFunction { .. }
                 | HeapEntry::RegExp { .. } => {
                     let mut node = index;
                     let mut guard = 0;
@@ -1495,6 +1823,22 @@ impl<'a, H: Host> Machine<'a, H> {
     /// Looks up an own property of the heap entry at `index`, returning `None`
     /// when the key is absent so the caller may continue up the prototype chain.
     fn own_get(&self, index: usize, key: &PropertyKey) -> Option<Found> {
+        if let PropertyKey::Named(name) = key {
+            let slot = |value| self.runtime_slot(value).ok().flatten();
+            if slot(self.intrinsics.object_prototype) == Some(index) && name == "toString" {
+                return Some(Found::Value(self.intrinsics.object_to_string()));
+            }
+            if slot(self.intrinsics.function_prototype) == Some(index) && name == "call" {
+                return Some(Found::Value(self.intrinsics.function_call()));
+            }
+            if matches!(
+                self.heap[index],
+                HeapEntry::Function { .. } | HeapEntry::NativeFunction { .. }
+            ) && name == "call"
+            {
+                return Some(Found::Value(self.intrinsics.function_call()));
+            }
+        }
         match &self.heap[index] {
             HeapEntry::Object { properties, .. } => property_lookup(properties, key),
             HeapEntry::Array {
@@ -1544,6 +1888,19 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 None
             }
+            HeapEntry::NativeFunction {
+                id, name, length, ..
+            } => {
+                let PropertyKey::Named(key) = key else {
+                    return None;
+                };
+                match key.as_str() {
+                    "length" => Some(Found::Value(number_value(f64::from(*length)))),
+                    "name" => Some(Found::Text((*name).to_owned())),
+                    "prototype" => self.intrinsics.constructor_prototype(*id).map(Found::Value),
+                    _ => None,
+                }
+            }
             HeapEntry::RegExp {
                 pattern,
                 flags,
@@ -1572,7 +1929,9 @@ impl<'a, H: Host> Machine<'a, H> {
             HeapEntry::String(_)
             | HeapEntry::BigInt(_)
             | HeapEntry::PrivateName { .. }
-            | HeapEntry::Iterator { .. } => None,
+            | HeapEntry::Iterator { .. }
+            | HeapEntry::HostFunction(_)
+            | HeapEntry::HostObject(_) => None,
         }
     }
 
@@ -1595,6 +1954,8 @@ impl<'a, H: Host> Machine<'a, H> {
             HeapEntry::Object { prototype, .. }
             | HeapEntry::Array { prototype, .. }
             | HeapEntry::Function { prototype, .. } => *prototype,
+            HeapEntry::NativeFunction { .. } => Some(self.intrinsics.function_prototype),
+            HeapEntry::RegExp { .. } => Some(self.intrinsics.object_prototype),
             _ => None,
         };
         match prototype {
@@ -1613,6 +1974,14 @@ impl<'a, H: Host> Machine<'a, H> {
     ) -> Result<SetOutcome, EvalFailure> {
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => {
+                if let HeapEntry::HostFunction(id) | HeapEntry::HostObject(id) = &self.heap[index] {
+                    let entity = *id;
+                    let name = self.host_key(&key)?;
+                    self.host
+                        .entity_set(entity, &name, value)
+                        .map_err(EvalFailure::HostThrow)?;
+                    return Ok(SetOutcome::Done);
+                }
                 if let Some(setter) = self.find_setter(index, &key)? {
                     return Ok(match setter {
                         Some(setter) => SetOutcome::Setter(setter),
@@ -1750,6 +2119,16 @@ impl<'a, H: Host> Machine<'a, H> {
                     operation: "set property on non-object",
                 }));
             }
+            HeapEntry::HostFunction(_) | HeapEntry::HostObject(_) => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "set property on host object",
+                }));
+            }
+            HeapEntry::NativeFunction { .. } => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "set property on native function",
+                }));
+            }
         };
         self.charge_heap(growth).map_err(EvalFailure::Runtime)?;
         match &mut self.heap[index] {
@@ -1816,21 +2195,18 @@ impl<'a, H: Host> Machine<'a, H> {
                         }));
                     }
                 };
-                let entry = properties.entry(key).or_insert(Property::Accessor {
-                    getter: None,
-                    setter: None,
-                });
-                match entry {
-                    Property::Accessor { getter, setter } => match kind {
+                let property = properties.get_mut(&key);
+                match property {
+                    Some(Property::Accessor { getter, setter }) => match kind {
                         AccessorKind::Getter => *getter = Some(accessor),
                         AccessorKind::Setter => *setter = Some(accessor),
                     },
-                    Property::Data(_) => {
+                    Some(Property::Data(_)) | None => {
                         let (getter, setter) = match kind {
                             AccessorKind::Getter => (Some(accessor), None),
                             AccessorKind::Setter => (None, Some(accessor)),
                         };
-                        *entry = Property::Accessor { getter, setter };
+                        properties.insert(key, Property::Accessor { getter, setter });
                     }
                 }
                 Ok(())
@@ -1872,7 +2248,15 @@ impl<'a, H: Host> Machine<'a, H> {
                 HeapEntry::String(_)
                 | HeapEntry::BigInt(_)
                 | HeapEntry::PrivateName { .. }
-                | HeapEntry::Iterator { .. } => Ok(true),
+                | HeapEntry::Iterator { .. }
+                | HeapEntry::NativeFunction { .. } => Ok(true),
+                HeapEntry::HostFunction(id) | HeapEntry::HostObject(id) => {
+                    let entity = *id;
+                    let name = self.host_key(key)?;
+                    self.host
+                        .entity_delete(entity, &name)
+                        .map_err(EvalFailure::HostThrow)
+                }
             },
             None => match object.decode() {
                 Some(Decoded::HeapRef(_)) => {
@@ -1892,6 +2276,14 @@ impl<'a, H: Host> Machine<'a, H> {
     fn has_property(&mut self, object: Value, key: &PropertyKey) -> Result<bool, EvalFailure> {
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => {
+                if let HeapEntry::HostFunction(id) | HeapEntry::HostObject(id) = &self.heap[index] {
+                    let entity = *id;
+                    let name = self.host_key(key)?;
+                    return self
+                        .host
+                        .entity_has(entity, &name)
+                        .map_err(EvalFailure::HostThrow);
+                }
                 if matches!(key, PropertyKey::Private(_)) {
                     return Ok(self.own_get(index, key).is_some());
                 }
@@ -2150,42 +2542,51 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    fn enumerable_keys(&self, src: Value) -> Result<Vec<String>, EvalFailure> {
+    fn own_property_keys(&self, src: Value) -> Result<Vec<PropertyKey>, EvalFailure> {
         match self.runtime_slot(src).map_err(EvalFailure::Runtime)? {
             Some(index) => match &self.heap[index] {
                 HeapEntry::Object { properties, .. }
                 | HeapEntry::Function { properties, .. }
-                | HeapEntry::RegExp { properties, .. } => Ok(properties
-                    .keys()
-                    .filter_map(|key| key.as_str().map(str::to_owned))
-                    .collect()),
+                | HeapEntry::RegExp { properties, .. } => Ok(ordered_property_keys(properties)),
                 HeapEntry::Array {
                     elements,
                     properties,
                     ..
                 } => {
-                    let mut keys: Vec<String> = (0..elements.len())
+                    let mut keys: Vec<PropertyKey> = (0..elements.len())
                         .filter(|offset| elements[*offset] != Value::HOLE)
-                        .map(|offset| offset.to_string())
+                        .map(|offset| PropertyKey::Named(offset.to_string()))
                         .collect();
-                    for key in properties.keys() {
-                        if let Some(name) = key.as_str()
-                            && array_index(name).is_none()
-                        {
-                            keys.push(name.to_owned());
-                        }
-                    }
+                    keys.extend(
+                        ordered_property_keys(properties)
+                            .into_iter()
+                            .filter(|key| key.as_str().and_then(array_index).is_none()),
+                    );
                     Ok(keys)
                 }
-                HeapEntry::String(text) => {
-                    Ok((0..text.chars().count()).map(|i| i.to_string()).collect())
-                }
+                HeapEntry::String(text) => Ok((0..text.chars().count())
+                    .map(|index| PropertyKey::Named(index.to_string()))
+                    .collect()),
                 HeapEntry::BigInt(_)
                 | HeapEntry::PrivateName { .. }
-                | HeapEntry::Iterator { .. } => Ok(Vec::new()),
+                | HeapEntry::Iterator { .. }
+                | HeapEntry::NativeFunction { .. }
+                | HeapEntry::HostFunction(_)
+                | HeapEntry::HostObject(_) => Ok(Vec::new()),
             },
             None => Ok(Vec::new()),
         }
+    }
+
+    fn enumerable_keys(&self, src: Value) -> Result<Vec<String>, EvalFailure> {
+        Ok(self
+            .own_property_keys(src)?
+            .into_iter()
+            .filter_map(|key| match key {
+                PropertyKey::Named(name) => Some(name),
+                PropertyKey::Private(_) => None,
+            })
+            .collect())
     }
 
     fn iterator_next(&mut self, iterator: Value) -> Result<(bool, Value), EvalFailure> {
@@ -2350,7 +2751,7 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             BinaryOp::InstanceOf => self.instance_of(left, right).map(Value::boolean),
             BinaryOp::In => {
-                let key = self.coerce_property_key(left)?;
+                let key = self.to_property_key(left)?;
                 self.has_property(right, &key).map(Value::boolean)
             }
             BinaryOp::Add => self.add(left, right),
@@ -2455,7 +2856,7 @@ impl<'a, H: Host> Machine<'a, H> {
 
     fn to_number(&self, value: Value) -> Result<Value, EvalFailure> {
         match value.decode() {
-            Some(Decoded::Number(_)) | Some(Decoded::Int32(_)) => Ok(value),
+            Some(Decoded::Number(_)) | Some(Decoded::Int32(_)) => self.to_primitive(value),
             Some(Decoded::Undefined) => Ok(Value::number(f64::NAN)),
             Some(Decoded::Null) => Ok(Value::int32(0)),
             Some(Decoded::Boolean(value)) => Ok(Value::int32(u32::from(value))),
@@ -2481,8 +2882,11 @@ impl<'a, H: Host> Machine<'a, H> {
                         HeapEntry::Object { .. }
                         | HeapEntry::Array { .. }
                         | HeapEntry::Function { .. }
+                        | HeapEntry::NativeFunction { .. }
                         | HeapEntry::RegExp { .. }
-                        | HeapEntry::Iterator { .. } => Ok(Value::number(f64::NAN)),
+                        | HeapEntry::Iterator { .. }
+                        | HeapEntry::HostFunction(_)
+                        | HeapEntry::HostObject(_) => Ok(Value::number(f64::NAN)),
                     },
                     None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                         operation: "coerce host object to number",
@@ -2504,15 +2908,17 @@ impl<'a, H: Host> Machine<'a, H> {
             Some(Decoded::Boolean(value)) => value,
             Some(Decoded::HeapRef(_)) => match self.runtime_slot(value) {
                 Ok(Some(index)) => match &self.heap[index] {
-                    HeapEntry::String(text) | HeapEntry::BigInt(text) => {
-                        !text.is_empty() && text != "0"
-                    }
+                    HeapEntry::String(text) => !text.is_empty(),
+                    HeapEntry::BigInt(text) => text != "0",
                     HeapEntry::Object { .. }
                     | HeapEntry::Array { .. }
                     | HeapEntry::Function { .. }
+                    | HeapEntry::NativeFunction { .. }
                     | HeapEntry::PrivateName { .. }
                     | HeapEntry::RegExp { .. }
-                    | HeapEntry::Iterator { .. } => true,
+                    | HeapEntry::Iterator { .. }
+                    | HeapEntry::HostFunction(_)
+                    | HeapEntry::HostObject(_) => true,
                 },
                 Ok(None) => true,
                 Err(_) => false,
@@ -2530,11 +2936,14 @@ impl<'a, H: Host> Machine<'a, H> {
                 Ok(Some(index)) => match &self.heap[index] {
                     HeapEntry::String(_) => "string",
                     HeapEntry::BigInt(_) => "bigint",
-                    HeapEntry::Function { .. } => "function",
+                    HeapEntry::Function { .. }
+                    | HeapEntry::NativeFunction { .. }
+                    | HeapEntry::HostFunction(_) => "function",
                     HeapEntry::PrivateName { .. } => "symbol",
                     HeapEntry::Object { .. }
                     | HeapEntry::Array { .. }
                     | HeapEntry::RegExp { .. }
+                    | HeapEntry::HostObject(_)
                     | HeapEntry::Iterator { .. } => "object",
                 },
                 _ => "object",
@@ -2605,13 +3014,24 @@ impl<'a, H: Host> Machine<'a, H> {
             .map_err(EvalFailure::Runtime)?
         {
             Some(index) => {
-                if !matches!(self.heap[index], HeapEntry::Function { .. }) {
+                if let HeapEntry::HostFunction(id) | HeapEntry::HostObject(id) = &self.heap[index] {
+                    let entity = *id;
+                    return self
+                        .host
+                        .entity_instance_of(entity, value)
+                        .map_err(EvalFailure::HostThrow);
+                }
+                if !matches!(
+                    self.heap[index],
+                    HeapEntry::Function { .. } | HeapEntry::NativeFunction { .. }
+                ) {
                     return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                         operation: "instanceof",
                     }));
                 }
-                let target = match self.own_data_property(index, "prototype") {
-                    Some(value) if self.is_object(value) => value,
+                let target = match self.own_get(index, &PropertyKey::Named("prototype".to_owned()))
+                {
+                    Some(Found::Value(value)) if self.is_object(value) => value,
                     _ => {
                         return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                             operation: "instanceof prototype is not an object",
@@ -2659,9 +3079,12 @@ impl<'a, H: Host> Machine<'a, H> {
                 HeapEntry::Object { .. }
                 | HeapEntry::Array { .. }
                 | HeapEntry::Function { .. }
+                | HeapEntry::NativeFunction { .. }
                 | HeapEntry::RegExp { .. }
                 | HeapEntry::Iterator { .. }
-                | HeapEntry::PrivateName { .. } => self.value_to_string(value, 0).map(Some),
+                | HeapEntry::PrivateName { .. }
+                | HeapEntry::HostFunction(_)
+                | HeapEntry::HostObject(_) => self.value_to_string(value, 0).map(Some),
                 HeapEntry::BigInt(_) => Ok(None),
             },
             None => Ok(None),
@@ -2673,7 +3096,7 @@ impl<'a, H: Host> Machine<'a, H> {
             return Ok(String::new());
         }
         match value.decode() {
-            Some(Decoded::Number(number)) => Ok(format_number(number)),
+            Some(Decoded::Number(number)) => Ok(Self::ordinary_number_to_string(number)),
             Some(Decoded::Int32(raw)) => Ok((raw as i32).to_string()),
             Some(Decoded::Undefined | Decoded::Uninitialized) => Ok("undefined".to_owned()),
             Some(Decoded::Null) => Ok("null".to_owned()),
@@ -2704,6 +3127,13 @@ impl<'a, H: Host> Machine<'a, H> {
                             }
                             .to_owned())
                         }
+                        HeapEntry::NativeFunction { .. } => {
+                            Ok("function () { [native code] }".to_owned())
+                        }
+                        HeapEntry::HostFunction(_) => {
+                            Ok("function () { [native code] }".to_owned())
+                        }
+                        HeapEntry::HostObject(_) => Ok("[object Object]".to_owned()),
                         HeapEntry::Array { elements, .. } => {
                             let mut text = String::new();
                             for (index, element) in elements.iter().copied().enumerate() {
@@ -2759,10 +3189,29 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 }
 
-fn property_lookup(
-    properties: &BTreeMap<PropertyKey, Property>,
-    key: &PropertyKey,
-) -> Option<Found> {
+fn ordered_property_keys(properties: &PropertyMap) -> Vec<PropertyKey> {
+    let mut indices = Vec::new();
+    let mut strings = Vec::new();
+    let mut symbols = Vec::new();
+    for (key, _) in properties.iter() {
+        match key {
+            PropertyKey::Named(name) => match array_index(name) {
+                Some(index) => indices.push((index, key.clone())),
+                None => strings.push(key.clone()),
+            },
+            PropertyKey::Private(_) => symbols.push(key.clone()),
+        }
+    }
+    indices.sort_unstable_by_key(|(index, _)| *index);
+    indices
+        .into_iter()
+        .map(|(_, key)| key)
+        .chain(strings)
+        .chain(symbols)
+        .collect()
+}
+
+fn property_lookup(properties: &PropertyMap, key: &PropertyKey) -> Option<Found> {
     match properties.get(key) {
         Some(Property::Data(value)) => Some(Found::Value(*value)),
         Some(Property::Accessor { getter, .. }) => Some(match getter {
@@ -2818,16 +3267,68 @@ fn parse_number(text: &str) -> f64 {
 
 fn format_number(number: f64) -> String {
     if number.is_nan() {
-        "NaN".to_owned()
-    } else if number == f64::INFINITY {
-        "Infinity".to_owned()
-    } else if number == f64::NEG_INFINITY {
-        "-Infinity".to_owned()
-    } else if number == 0.0 {
-        "0".to_owned()
-    } else {
-        number.to_string()
+        return "NaN".to_owned();
     }
+    if number == f64::INFINITY {
+        return "Infinity".to_owned();
+    }
+    if number == f64::NEG_INFINITY {
+        return "-Infinity".to_owned();
+    }
+    if number == 0.0 {
+        return "0".to_owned();
+    }
+
+    let negative = number.is_sign_negative();
+    let raw = number.abs().to_string();
+    let (mantissa, explicit_exponent) = match raw.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (
+            mantissa,
+            exponent
+                .parse::<i32>()
+                .expect("Rust formats finite f64 exponents as i32"),
+        ),
+        None => (raw.as_str(), 0),
+    };
+    let decimal = mantissa.find('.').unwrap_or(mantissa.len());
+    let untrimmed: String = mantissa.chars().filter(|ch| *ch != '.').collect();
+    let first = untrimmed
+        .find(|ch| ch != '0')
+        .expect("a nonzero number has a nonzero decimal digit");
+    let digits = untrimmed[first..].trim_end_matches('0');
+    let exponent = explicit_exponent + decimal as i32 - first as i32 - 1;
+
+    let mut result = String::new();
+    if negative {
+        result.push('-');
+    }
+    if !(-6..21).contains(&exponent) {
+        result.push(digits.as_bytes()[0] as char);
+        if digits.len() > 1 {
+            result.push('.');
+            result.push_str(&digits[1..]);
+        }
+        result.push('e');
+        if exponent >= 0 {
+            result.push('+');
+        }
+        result.push_str(&exponent.to_string());
+    } else if exponent >= 0 {
+        let integer_digits = exponent as usize + 1;
+        if digits.len() <= integer_digits {
+            result.push_str(digits);
+            result.extend(std::iter::repeat_n('0', integer_digits - digits.len()));
+        } else {
+            result.push_str(&digits[..integer_digits]);
+            result.push('.');
+            result.push_str(&digits[integer_digits..]);
+        }
+    } else {
+        result.push_str("0.");
+        result.extend(std::iter::repeat_n('0', (-exponent - 1) as usize));
+        result.push_str(digits);
+    }
+    result
 }
 
 fn to_uint32(number: f64) -> u32 {
@@ -2930,6 +3431,63 @@ fn bigint_binary(op: BinaryOp, left: &str, right: &str) -> Result<String, EvalFa
         _ => unreachable!("bigint arithmetic partition"),
     };
     Ok(result.to_string())
+}
+
+pub(crate) fn unary_from_selector(op: u32) -> Option<UnaryOp> {
+    match op {
+        0 => Some(UnaryOp::Void),
+        1 => Some(UnaryOp::TypeOf),
+        2 => Some(UnaryOp::Plus),
+        3 => Some(UnaryOp::Negate),
+        4 => Some(UnaryOp::BitwiseNot),
+        5 => Some(UnaryOp::LogicalNot),
+        _ => None,
+    }
+}
+
+pub(crate) fn binary_from_selector(op: u32) -> Option<BinaryOp> {
+    match op {
+        0 => Some(BinaryOp::Add),
+        1 => Some(BinaryOp::Subtract),
+        2 => Some(BinaryOp::Multiply),
+        3 => Some(BinaryOp::Divide),
+        4 => Some(BinaryOp::Remainder),
+        5 => Some(BinaryOp::Exponent),
+        6 => Some(BinaryOp::BitAnd),
+        7 => Some(BinaryOp::BitOr),
+        8 => Some(BinaryOp::BitXor),
+        9 => Some(BinaryOp::ShiftLeft),
+        10 => Some(BinaryOp::ShiftRight),
+        11 => Some(BinaryOp::UnsignedShiftRight),
+        12 => Some(BinaryOp::Equal),
+        13 => Some(BinaryOp::NotEqual),
+        14 => Some(BinaryOp::StrictEqual),
+        15 => Some(BinaryOp::StrictNotEqual),
+        16 => Some(BinaryOp::LessThan),
+        17 => Some(BinaryOp::LessThanOrEqual),
+        18 => Some(BinaryOp::GreaterThan),
+        19 => Some(BinaryOp::GreaterThanOrEqual),
+        20 => Some(BinaryOp::InstanceOf),
+        21 => Some(BinaryOp::In),
+        _ => None,
+    }
+}
+
+pub(crate) fn iterator_kind_from_selector(kind: u32) -> Option<IteratorKind> {
+    match kind {
+        0 => Some(IteratorKind::Sync),
+        1 => Some(IteratorKind::Async),
+        2 => Some(IteratorKind::Keys),
+        _ => None,
+    }
+}
+
+pub(crate) fn accessor_from_selector(kind: u32) -> Option<AccessorKind> {
+    match kind {
+        0 => Some(AccessorKind::Getter),
+        1 => Some(AccessorKind::Setter),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -4454,5 +5012,320 @@ mod tests {
             vec![entry, returns_object],
         );
         assert_eq!(run_ok(&module).value, Value::int32(5));
+    }
+    #[derive(Default)]
+    struct EntityHost {
+        globals: Vec<(String, HostBinding)>,
+        call_result: Option<HostBinding>,
+        seen_call_entities: Vec<u32>,
+        stored: Option<Value>,
+        set_log: Vec<(u32, String, Value)>,
+        seen_get: Vec<(u32, String)>,
+    }
+    impl Host for EntityHost {
+        fn resolve_global(&mut self, name: &str) -> Option<HostBinding> {
+            self.globals
+                .iter()
+                .find(|(candidate, _)| candidate == name)
+                .map(|(_, binding)| *binding)
+        }
+        fn entity_call(
+            &mut self,
+            entity: u32,
+            _this: Value,
+            _arguments: &[Value],
+        ) -> Result<HostBinding, HostThrow> {
+            self.seen_call_entities.push(entity);
+            Ok(self.call_result.expect("scripted entity_call result"))
+        }
+        fn entity_get(&mut self, entity: u32, key: &str) -> Result<HostBinding, HostThrow> {
+            self.seen_get.push((entity, key.to_owned()));
+            Ok(HostBinding::Primitive(
+                self.stored.expect("entity_get before entity_set"),
+            ))
+        }
+        fn entity_set(&mut self, entity: u32, key: &str, value: Value) -> Result<(), HostThrow> {
+            self.set_log.push((entity, key.to_owned(), value));
+            self.stored = Some(value);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn resolve_global_materializes_unforgeable_host_function_and_call_routes() {
+        // LoadGlobal f -> host function ref; call it with empty args; the host's
+        // returned primitive is delivered to the destination register.
+        let module = verified(
+            vec![Constant::String("f".into())],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::CreateArray { dst: reg(1) },
+                    Instruction::Call {
+                        dst: reg(2),
+                        callee: reg(0),
+                        this_value: reg(1),
+                        arguments: reg(1),
+                    },
+                    Instruction::Return { value: reg(2) },
+                ],
+                vec![],
+            )],
+        );
+        let mut host = EntityHost {
+            globals: vec![("f".to_owned(), HostBinding::Function(7))],
+            call_result: Some(HostBinding::Primitive(Value::int32(42))),
+            ..EntityHost::default()
+        };
+        let execution = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap();
+        assert_eq!(execution.value, Value::int32(42));
+        assert_eq!(host.seen_call_entities, vec![7]);
+        // The materialized callee is a runtime-owned segment-1 reference the host
+        // never chose: unforgeable.
+        match execution.entry_registers[0].decode() {
+            Some(Decoded::HeapRef(id)) => assert_eq!(id.segment(), 1),
+            other => panic!("expected runtime heap ref, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_object_get_set_route_by_entity_and_key() {
+        let module = verified(
+            vec![
+                Constant::String("g".into()),
+                Constant::String("k".into()),
+                Constant::Int32(99),
+            ],
+            vec![function(
+                0,
+                4,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(1),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(2),
+                    },
+                    Instruction::SetProperty {
+                        object: reg(0),
+                        key: reg(1),
+                        value: reg(2),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(3),
+                        object: reg(0),
+                        key: reg(1),
+                    },
+                    Instruction::Return { value: reg(3) },
+                ],
+                vec![],
+            )],
+        );
+        let mut host = EntityHost {
+            globals: vec![("g".to_owned(), HostBinding::Object(3))],
+            ..EntityHost::default()
+        };
+        let execution = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap();
+        assert_eq!(execution.value, Value::int32(99));
+        assert_eq!(host.set_log, vec![(3, "k".to_owned(), Value::int32(99))]);
+        assert_eq!(host.seen_get, vec![(3, "k".to_owned())]);
+    }
+
+    #[test]
+    fn host_cannot_forge_a_runtime_slot_it_did_not_receive() {
+        // A host that echoes a segment-1 value it never received (a forged slot)
+        // cannot inject it: validation rejects the nonexistent runtime slot.
+        let module = verified(
+            vec![Constant::String("bad".into())],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                vec![],
+            )],
+        );
+        let forged = Value::heap_ref(SlotId::from_parts(1, 9999).unwrap());
+        let mut host = EntityHost {
+            globals: vec![("bad".to_owned(), HostBinding::Primitive(forged))],
+            ..EntityHost::default()
+        };
+        let error = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap_err();
+        assert_eq!(
+            error.kind,
+            RuntimeErrorKind::InvalidRuntimeHeapReference { slot: 9999 }
+        );
+    }
+
+    #[test]
+    fn materialized_host_entity_id_round_trips_exactly() {
+        let module = verified(
+            vec![Constant::String("fn".into())],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::CreateArray { dst: reg(1) },
+                    Instruction::Call {
+                        dst: reg(2),
+                        callee: reg(0),
+                        this_value: reg(1),
+                        arguments: reg(1),
+                    },
+                    Instruction::Return { value: reg(2) },
+                ],
+                vec![],
+            )],
+        );
+        let id = 0x0DED_BEEF;
+        let mut host = EntityHost {
+            globals: vec![("fn".to_owned(), HostBinding::Function(id))],
+            call_result: Some(HostBinding::Primitive(Value::UNDEFINED)),
+            ..EntityHost::default()
+        };
+        Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap();
+        assert_eq!(host.seen_call_entities, vec![id]);
+    }
+    #[test]
+    fn ecmascript_number_formatting_is_shortest_round_trip() {
+        let cases = [
+            (0.1 + 0.2, "0.30000000000000004"),
+            (1e21, "1e+21"),
+            (-0.0, "0"),
+            (1.0 / 3.0, "0.3333333333333333"),
+            (1e-6, "0.000001"),
+            (1e-7, "1e-7"),
+        ];
+        for (number, expected) in cases {
+            assert_eq!(
+                Machine::<TestHost>::ordinary_number_to_string(number),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn own_keys_put_indices_before_insertion_ordered_strings() {
+        let module = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost::default();
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let object = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+            })
+            .unwrap();
+        let index = machine.runtime_slot(object).unwrap().unwrap();
+        for (key, value) in [("b", 1), ("2", 2), ("a", 3), ("1", 4)] {
+            machine
+                .set_own_data(
+                    index,
+                    PropertyKey::Named(key.to_owned()),
+                    Value::int32(value),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            machine.enumerable_keys(object).unwrap(),
+            ["1", "2", "b", "a"]
+        );
+    }
+
+    #[test]
+    fn object_prototype_to_string_uses_realm_tags() {
+        let module = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost::default();
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let array = machine
+            .allocate(HeapEntry::Array {
+                elements: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.array_prototype),
+            })
+            .unwrap();
+        let object = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+            })
+            .unwrap();
+        let function = machine.intrinsics.global("Object").unwrap();
+        for (value, expected) in [
+            (Value::UNDEFINED, "[object Undefined]"),
+            (Value::NULL, "[object Null]"),
+            (Value::TRUE, "[object Boolean]"),
+            (array, "[object Array]"),
+            (object, "[object Object]"),
+            (function, "[object Function]"),
+        ] {
+            let intrinsics::BuiltinOutcome::Value(tag) = machine
+                .call_builtin(
+                    intrinsics::BuiltinId::ObjectPrototypeToString,
+                    value,
+                    &[],
+                    false,
+                )
+                .unwrap()
+            else {
+                panic!("toString returns directly");
+            };
+            assert_eq!(machine.string_text(tag), Some(expected));
+        }
+    }
+    #[test]
+    fn intrinsic_globals_shadow_host_bindings() {
+        struct ShadowHost(bool);
+        impl Host for ShadowHost {
+            fn resolve_global(&mut self, _name: &str) -> Option<HostBinding> {
+                self.0 = true;
+                Some(HostBinding::Primitive(Value::FALSE))
+            }
+        }
+
+        let module = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = ShadowHost(false);
+        {
+            let mut machine = Machine::new(&module, &mut host, Limits::default());
+            let object = machine.resolve_global_binding("Object").unwrap().unwrap();
+            assert_eq!(machine.type_of(object), "function");
+        }
+        assert!(!host.0, "intrinsic lookup must not consult the host");
     }
 }
