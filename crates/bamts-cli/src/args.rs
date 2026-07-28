@@ -709,10 +709,11 @@ where
         return Err(ArgsError::MissingExplainRule);
     }
 
-    // Run mode requires exactly one entrypoint regardless of where `run`
-    // appears relative to positional inputs. Check after the effective mode is
-    // resolved so the constraint is order-independent.
-    if effective_mode == Mode::Run
+    // Every program command resolves one canonical graph from exactly one entrypoint.
+    // Check after the effective mode is resolved so the constraint is order-independent.
+    if !help
+        && !version
+        && effective_mode != Mode::Explain
         && let Some(first) = &entrypoint
         && let Some(second) = extra_inputs.first()
     {
@@ -934,6 +935,9 @@ mod tests {
         let args = parse_args(["check", "-h"]).unwrap();
         assert!(args.help);
         assert_eq!(args.mode, Mode::Check);
+
+        let args = parse_args(["check", "a.ts", "b.ts", "--help"]).unwrap();
+        assert!(args.help);
 
         let args = parse_args(["-V"]).unwrap();
         assert!(args.version);
@@ -1206,27 +1210,19 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_check_multiple_inputs_preserved() {
-        // compile and check modes keep multiple-input semantics in any order.
-        let args = parse_args(["compile", "a.ts", "b.ts", "c.ts"]).unwrap();
-        assert_eq!(args.mode, Mode::Compile);
-        assert_eq!(args.entrypoint.as_deref(), Some("a.ts"));
-        assert_eq!(args.extra_inputs, vec!["b.ts", "c.ts"]);
-
-        let args = parse_args(["a.ts", "b.ts", "compile"]).unwrap();
-        assert_eq!(args.mode, Mode::Compile);
-        assert_eq!(args.entrypoint.as_deref(), Some("a.ts"));
-        assert_eq!(args.extra_inputs, vec!["b.ts"]);
-
-        let args = parse_args(["check", "a.ts", "b.ts"]).unwrap();
-        assert_eq!(args.mode, Mode::Check);
-        assert_eq!(args.entrypoint.as_deref(), Some("a.ts"));
-        assert_eq!(args.extra_inputs, vec!["b.ts"]);
-
-        let args = parse_args(["a.ts", "b.ts", "check"]).unwrap();
-        assert_eq!(args.mode, Mode::Check);
-        assert_eq!(args.entrypoint.as_deref(), Some("a.ts"));
-        assert_eq!(args.extra_inputs, vec!["b.ts"]);
+    fn test_program_modes_reject_multiple_entrypoints() {
+        for arguments in [
+            ["compile", "a.ts", "b.ts"],
+            ["a.ts", "b.ts", "compile"],
+            ["check", "a.ts", "b.ts"],
+            ["a.ts", "b.ts", "check"],
+        ] {
+            assert!(matches!(
+                parse_args(arguments),
+                Err(ArgsError::MultipleEntrypoints { first, second })
+                    if first == "a.ts" && second == "b.ts"
+            ));
+        }
     }
 
     #[test]

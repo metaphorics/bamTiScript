@@ -5,15 +5,17 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
-use std::sync::Arc;
 
 use bamts_compiler::lower::{LowerError, LowerOptions, lower};
-use bamts_compiler::pipeline::{FrontendMode, FrontendRequest, compile_frontend_with_lints};
+use bamts_compiler::pipeline::{
+    FrontendMode, ProgramFrontendOutput, compile_program_frontend_with_lints,
+};
+use bamts_compiler::program::{ProgramLoadError, ProgramLoader, ResolvedProgram};
 use bamts_compiler::{
     diagnostic::DiagnosticReport,
     lint::{LintOverride, LintProfile, LintTable},
-    project::parse_bamts_toml,
-    source::{ScriptKind, SourceId, SourceText},
+    project::{ProjectConfig, ProjectRoot, parse_bamts_toml},
+    source::ScriptKind,
 };
 use bamts_runtime::{Limits, run_linked_program};
 
@@ -50,6 +52,11 @@ pub enum DriverError {
         path: PathBuf,
         message: String,
     },
+    ProjectConfig {
+        path: PathBuf,
+        message: String,
+    },
+    ProgramLoad(ProgramLoadError),
     Lower(LowerError),
     Jit(bamts_codegen::JitError),
     Native(bamts_runtime::NativeError),
@@ -135,13 +142,19 @@ impl fmt::Display for DriverError {
                     path.display()
                 )
             }
+            Self::ProjectConfig { path, message } => write!(
+                formatter,
+                "could not load project configuration `{}`: {message}",
+                path.display()
+            ),
+            Self::ProgramLoad(error) => write!(formatter, "could not load program: {error}"),
             Self::Lower(error) => write!(formatter, "source cannot be lowered: {error}"),
             Self::Jit(error) => write!(formatter, "JIT compilation failed: {error}"),
             Self::Native(error) => write!(formatter, "program execution failed: {error}"),
             Self::Aot(error) => write!(formatter, "AOT object emission failed: {error}"),
             Self::MissingEntrypoint => formatter.write_str("command requires an entrypoint"),
             Self::MultipleCompileInputs => {
-                formatter.write_str("native compilation accepts exactly one entrypoint")
+                formatter.write_str("program commands accept exactly one entrypoint")
             }
             Self::UnsupportedCompileTarget(target) => write!(
                 formatter,
@@ -224,6 +237,7 @@ impl Error for DriverError {
             | Self::LinkStart { source, .. }
             | Self::PublishExecutable { source, .. } => Some(source),
             Self::Lower(error) => Some(error),
+            Self::ProgramLoad(error) => Some(error),
             Self::Jit(error) => Some(error),
             Self::Native(error) => Some(error),
             Self::Aot(error) => Some(error),
@@ -232,6 +246,7 @@ impl Error for DriverError {
             | Self::UnsupportedSourceExtension { .. }
             | Self::Diagnostics { .. }
             | Self::LintConfig { .. }
+            | Self::ProjectConfig { .. }
             | Self::MultipleCompileInputs
             | Self::UnsupportedCompileTarget(_)
             | Self::UnsupportedOutputOption(_)
@@ -246,9 +261,15 @@ impl Error for DriverError {
 /// Executes one already-parsed CLI command.
 pub fn execute(args: &CliArgs) -> Result<CommandOutcome, DriverError> {
     match args.mode {
-        Mode::Check => check(args),
-        Mode::Compile => compile(args),
-        Mode::Run => run(args),
+        Mode::Check | Mode::Compile | Mode::Run => {
+            let frontend = load_program_frontend(args)?;
+            match args.mode {
+                Mode::Check => check(args, &frontend),
+                Mode::Compile => compile(args, &frontend),
+                Mode::Run => run(args, &frontend),
+                Mode::Explain => unreachable!("explain handled without a program"),
+            }
+        }
         Mode::Explain => {
             let rule = args
                 .explain_rule
@@ -333,39 +354,14 @@ fn lint_config_path(args: &CliArgs) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-fn check(args: &CliArgs) -> Result<CommandOutcome, DriverError> {
-    let paths = input_paths(args);
-    let levels = levels(args)?;
-    let mut units = Vec::with_capacity(paths.len());
-    for (index, path) in paths.iter().enumerate() {
-        let source_id = SourceId::new(u32::try_from(index).unwrap_or(u32::MAX));
-        units.push(frontend(path, source_id, &levels)?);
-    }
-
-    let diagnostics = units
+fn check(args: &CliArgs, frontend: &LoadedProgramFrontend) -> Result<CommandOutcome, DriverError> {
+    let rendered = render_program_diagnostics(args, frontend);
+    if frontend
+        .output
+        .modules()
         .iter()
-        .flat_map(|unit| unit.output.diagnostics().iter().cloned())
-        .collect::<Vec<_>>();
-    let names = units
-        .iter()
-        .map(|unit| unit.path.to_string_lossy())
-        .collect::<Vec<_>>();
-    let sources = units
-        .iter()
-        .zip(&names)
-        .map(|(unit, name)| DiagnosticSource {
-            id: unit.source_id,
-            name,
-            text: &unit.source,
-        })
-        .collect::<Vec<_>>();
-    let rendered = diagnostics::render_report(
-        args.diagnostics_format,
-        &DiagnosticReport::new(&diagnostics),
-        &sources,
-        args.error_limit,
-    );
-    if units.iter().any(|unit| unit.output.has_errors()) {
+        .any(|module| module.has_errors())
+    {
         return Err(DriverError::Diagnostics { rendered });
     }
     Ok(CommandOutcome {
@@ -374,7 +370,10 @@ fn check(args: &CliArgs) -> Result<CommandOutcome, DriverError> {
     })
 }
 
-fn compile(args: &CliArgs) -> Result<CommandOutcome, DriverError> {
+fn compile(
+    args: &CliArgs,
+    frontend: &LoadedProgramFrontend,
+) -> Result<CommandOutcome, DriverError> {
     if !args.extra_inputs.is_empty() {
         return Err(DriverError::MultipleCompileInputs);
     }
@@ -389,13 +388,16 @@ fn compile(args: &CliArgs) -> Result<CommandOutcome, DriverError> {
     }
 
     let entrypoint = required_entrypoint(args)?;
-    let levels = levels(args)?;
-    let unit = frontend(entrypoint, SourceId::new(0), &levels)?;
-    let warnings = require_clean_frontend(args, &unit)?;
+    let warnings = require_clean_frontend(args, frontend)?;
+    let entry = frontend.program.entrypoint();
+    let output = frontend
+        .output
+        .module(entry.source_id())
+        .expect("program frontend contains its entrypoint");
     let bytecode = lower(
-        unit.output.source_file(),
+        output.source_file(),
         LowerOptions {
-            javascript_compatibility: is_javascript(unit.script_kind),
+            javascript_compatibility: is_javascript(entry.script_kind()),
         },
     )
     .map_err(DriverError::Lower)?;
@@ -414,15 +416,18 @@ fn compile(args: &CliArgs) -> Result<CommandOutcome, DriverError> {
     })
 }
 
-fn run(args: &CliArgs) -> Result<CommandOutcome, DriverError> {
+fn run(args: &CliArgs, frontend: &LoadedProgramFrontend) -> Result<CommandOutcome, DriverError> {
     let entrypoint = required_entrypoint(args)?;
-    let levels = levels(args)?;
-    let unit = frontend(entrypoint, SourceId::new(0), &levels)?;
-    let warnings = require_clean_frontend(args, &unit)?;
+    let warnings = require_clean_frontend(args, frontend)?;
+    let entry = frontend.program.entrypoint();
+    let output = frontend
+        .output
+        .module(entry.source_id())
+        .expect("program frontend contains its entrypoint");
     let bytecode = lower(
-        unit.output.source_file(),
+        output.source_file(),
         LowerOptions {
-            javascript_compatibility: is_javascript(unit.script_kind),
+            javascript_compatibility: is_javascript(entry.script_kind()),
         },
     )
     .map_err(DriverError::Lower)?;
@@ -451,88 +456,11 @@ fn run(args: &CliArgs) -> Result<CommandOutcome, DriverError> {
     })
 }
 
-struct FrontendUnit {
-    path: PathBuf,
-    source_id: SourceId,
-    source: Arc<SourceText>,
-    script_kind: ScriptKind,
-    output: bamts_compiler::pipeline::FrontendOutput,
-}
-
-fn frontend(
-    path: &Path,
-    source_id: SourceId,
-    levels: &LintTable,
-) -> Result<FrontendUnit, DriverError> {
-    let source = fs::read_to_string(path).map_err(|source| DriverError::ReadSource {
-        path: path.to_owned(),
-        source,
-    })?;
-    let script_kind = script_kind(path)?;
-    let source = Arc::new(SourceText::new(source));
-    let output = compile_frontend_with_lints(
-        FrontendRequest {
-            source_id,
-            script_kind,
-            source: Arc::clone(&source),
-            mode: FrontendMode::Check,
-        },
-        levels,
-    );
-    Ok(FrontendUnit {
-        path: path.to_owned(),
-        source_id,
-        source,
-        script_kind,
-        output,
-    })
-}
-
-fn require_clean_frontend(args: &CliArgs, unit: &FrontendUnit) -> Result<String, DriverError> {
-    let source_name = unit.path.to_string_lossy();
-    let rendered = diagnostics::render_report(
-        args.diagnostics_format,
-        &DiagnosticReport::new(unit.output.diagnostics()),
-        &[DiagnosticSource {
-            id: unit.source_id,
-            name: &source_name,
-            text: &unit.source,
-        }],
-        args.error_limit,
-    );
-    if unit.output.has_errors() {
-        Err(DriverError::Diagnostics { rendered })
-    } else {
-        Ok(rendered)
-    }
-}
-
-fn input_paths(args: &CliArgs) -> Vec<PathBuf> {
-    args.entrypoint
-        .iter()
-        .chain(&args.extra_inputs)
-        .map(PathBuf::from)
-        .collect()
-}
-
 fn required_entrypoint(args: &CliArgs) -> Result<&Path, DriverError> {
     args.entrypoint
         .as_deref()
         .map(Path::new)
         .ok_or(DriverError::MissingEntrypoint)
-}
-
-fn script_kind(path: &Path) -> Result<ScriptKind, DriverError> {
-    match path.extension().and_then(OsStr::to_str) {
-        Some("js" | "mjs" | "cjs") => Ok(ScriptKind::JavaScript),
-        Some("jsx") => Ok(ScriptKind::JavaScriptReact),
-        Some("ts" | "mts" | "cts") => Ok(ScriptKind::TypeScript),
-        Some("tsx") => Ok(ScriptKind::TypeScriptReact),
-        Some("json") => Ok(ScriptKind::Json),
-        _ => Err(DriverError::UnsupportedSourceExtension {
-            path: path.to_owned(),
-        }),
-    }
 }
 
 const fn is_javascript(kind: ScriptKind) -> bool {
@@ -770,6 +698,134 @@ fn publish_linked_executable(temporary: &Path, destination: &Path) -> Result<(),
             path: destination.to_owned(),
             source,
         }),
+    }
+}
+
+struct LoadedProgramFrontend {
+    program: ResolvedProgram,
+    output: ProgramFrontendOutput,
+}
+
+fn load_program_frontend(args: &CliArgs) -> Result<LoadedProgramFrontend, DriverError> {
+    if !args.extra_inputs.is_empty() {
+        return Err(DriverError::MultipleCompileInputs);
+    }
+    let entrypoint = required_entrypoint(args)?;
+    let current_directory = std::env::current_dir().map_err(|source| DriverError::ReadSource {
+        path: PathBuf::from("."),
+        source,
+    })?;
+    let absolute_entrypoint = if entrypoint.is_absolute() {
+        entrypoint.to_path_buf()
+    } else {
+        current_directory.join(entrypoint)
+    };
+    let root_path = discover_project_root(&absolute_entrypoint).unwrap_or_else(|| {
+        if absolute_entrypoint.starts_with(&current_directory) {
+            current_directory
+        } else {
+            absolute_entrypoint
+                .parent()
+                .unwrap_or_else(|| Path::new("/"))
+                .to_path_buf()
+        }
+    });
+    let canonical_root = fs::canonicalize(&root_path)
+        .map_err(|error| DriverError::ProgramLoad(ProgramLoadError::InvalidRoot(error)))?;
+    let root = ProjectRoot::new(canonical_root).map_err(|error| {
+        DriverError::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            error,
+        )))
+    })?;
+    let config_path = project_config_path(&absolute_entrypoint, root.path())
+        .unwrap_or_else(|| root.path().join("tsconfig.json"));
+    let config_source = if config_path.is_file() {
+        fs::read_to_string(&config_path).map_err(|source| DriverError::ReadSource {
+            path: config_path.clone(),
+            source,
+        })?
+    } else {
+        "{}".to_owned()
+    };
+    let config = ProjectConfig::parse(&root, &config_path, &config_source).map_err(|error| {
+        DriverError::ProjectConfig {
+            path: config_path,
+            message: error.to_string(),
+        }
+    })?;
+    let loader = ProgramLoader::new(&root, config.options()).map_err(DriverError::ProgramLoad)?;
+    let program = loader
+        .load(&absolute_entrypoint)
+        .map_err(DriverError::ProgramLoad)?;
+    let levels = levels(args)?;
+    let output = compile_program_frontend_with_lints(&program, FrontendMode::Check, &levels);
+    Ok(LoadedProgramFrontend { program, output })
+}
+
+fn discover_project_root(entrypoint: &Path) -> Option<PathBuf> {
+    let ancestors = || entrypoint.parent().into_iter().flat_map(Path::ancestors);
+    ancestors()
+        .find(|directory| directory.join("bamts.toml").is_file())
+        .or_else(|| ancestors().find(|directory| directory.join("tsconfig.json").is_file()))
+        .map(Path::to_path_buf)
+}
+
+fn project_config_path(entrypoint: &Path, root: &Path) -> Option<PathBuf> {
+    entrypoint
+        .parent()?
+        .ancestors()
+        .take_while(|directory| directory.starts_with(root))
+        .map(|directory| directory.join("tsconfig.json"))
+        .find(|path| path.is_file())
+}
+
+fn render_program_diagnostics(args: &CliArgs, frontend: &LoadedProgramFrontend) -> String {
+    let diagnostics = frontend
+        .output
+        .modules()
+        .iter()
+        .flat_map(|module| module.diagnostics().iter().cloned())
+        .collect::<Vec<_>>();
+    let names = frontend
+        .program
+        .modules()
+        .iter()
+        .map(|module| module.path().to_string_lossy())
+        .collect::<Vec<_>>();
+    let sources = frontend
+        .program
+        .modules()
+        .iter()
+        .zip(&names)
+        .map(|(module, name)| DiagnosticSource {
+            id: module.source_id(),
+            name,
+            text: module.source(),
+        })
+        .collect::<Vec<_>>();
+    diagnostics::render_report(
+        args.diagnostics_format,
+        &DiagnosticReport::new(&diagnostics),
+        &sources,
+        args.error_limit,
+    )
+}
+
+fn require_clean_frontend(
+    args: &CliArgs,
+    frontend: &LoadedProgramFrontend,
+) -> Result<String, DriverError> {
+    let rendered = render_program_diagnostics(args, frontend);
+    if frontend
+        .output
+        .modules()
+        .iter()
+        .any(|module| module.has_errors())
+    {
+        Err(DriverError::Diagnostics { rendered })
+    } else {
+        Ok(rendered)
     }
 }
 

@@ -39,6 +39,89 @@ fn aot_fixture_matches_jit_stdout_and_exit_code() {
     assert_eq!(output.stdout, EXPECTED_STDOUT);
 }
 
+#[test]
+fn check_reports_dependency_errors() {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", "import './dependency.ts';\n");
+    project.write("dependency.ts", "const = 1;\n");
+
+    let output = project.check("main.ts");
+
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("dependency.ts"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn check_loads_type_only_dependencies() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        "import type { Shape } from './types.ts';\nexport const loaded = true;\n",
+    );
+    project.write("types.ts", "export interface Shape { value: string }\n");
+
+    assert_success(&project.check("main.ts"), "bamts check type-only graph");
+}
+
+#[test]
+fn check_loads_diamond_graph_once() {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", "import './left.ts';\nimport './right.ts';\n");
+    project.write("left.ts", "import './leaf.ts';\nexport const left = 1;\n");
+    project.write("right.ts", "import './leaf.ts';\nexport const right = 2;\n");
+    project.write("leaf.ts", "export const leaf = 3;\n");
+
+    assert_success(&project.check("main.ts"), "bamts check diamond graph");
+}
+
+#[test]
+fn check_accepts_module_cycles() {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", "import './a.ts';\n");
+    project.write("a.ts", "import './b.ts';\nexport const a = 1;\n");
+    project.write("b.ts", "import './a.ts';\nexport const b = 2;\n");
+
+    assert_success(&project.check("main.ts"), "bamts check cyclic graph");
+}
+
+#[test]
+fn check_applies_project_lint_config_to_dependencies() {
+    let project = ScratchDirectory::new();
+    project.write("bamts.toml", "[lints.rules]\nexplicit-any = \"deny\"\n");
+    project.write("src/tsconfig.json", "{}\n");
+    project.write("src/main.ts", "import '../dependency.ts';\n");
+    project.write("dependency.ts", "export const value: any = 1;\n");
+
+    let output = project.check_from("src", "main.ts");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.contains("dependency.ts"), "{stderr}");
+    assert!(stderr.contains("BAMTS-W017"), "{stderr}");
+}
+
+#[test]
+fn check_renders_multi_file_diagnostics_in_stable_source_order() {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", "import './first.ts';\nimport './second.ts';\n");
+    project.write("first.ts", "const = 1;\n");
+    project.write("second.ts", "const = 2;\n");
+
+    let first = project.check("main.ts");
+    let second = project.check("main.ts");
+
+    assert!(!first.status.success());
+    assert_eq!(first.stderr, second.stderr);
+    let stderr = stderr(&first);
+    let first_position = stderr.find("first.ts").expect("first diagnostic");
+    let second_position = stderr.find("second.ts").expect("second diagnostic");
+    assert!(first_position < second_position, "{stderr}");
+}
+
 fn bamts_binary() -> &'static str {
     env!("CARGO_BIN_EXE_bamts")
 }
@@ -55,6 +138,10 @@ fn assert_success(output: &Output, command: &str) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
 struct ScratchDirectory {
@@ -74,6 +161,29 @@ impl ScratchDirectory {
             }
         }
         panic!("could not allocate a unique CLI test directory");
+    }
+
+    fn write(&self, relative: &str, source: &str) {
+        let path = self.path.join(relative);
+        fs::create_dir_all(path.parent().expect("fixture path has a parent"))
+            .expect("fixture directory is created");
+        fs::write(path, source).expect("fixture source is written");
+    }
+
+    fn check(&self, entrypoint: &str) -> Output {
+        Command::new(bamts_binary())
+            .args(["check", "--diagnostics-format", "text", entrypoint])
+            .current_dir(&self.path)
+            .output()
+            .expect("bamts check starts")
+    }
+
+    fn check_from(&self, directory: &str, entrypoint: &str) -> Output {
+        Command::new(bamts_binary())
+            .args(["check", "--diagnostics-format", "text", entrypoint])
+            .current_dir(self.path.join(directory))
+            .output()
+            .expect("bamts check starts")
     }
 }
 
