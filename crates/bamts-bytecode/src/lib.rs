@@ -168,6 +168,15 @@ index_type!(
     Pc
 );
 
+mod program;
+
+pub use program::{
+    Binding, BindingId, BindingKind, Edge, EdgeId, EdgeTarget, Export, ExportSource, ModuleId,
+    PROGRAM_MAGIC, PROGRAM_VERSION, Program, ProgramDecodeError, ProgramDecodeErrorKind,
+    ProgramDecodeLimits, ProgramLoadError, ProgramModule, ProgramVerifyError,
+    ProgramVerifyErrorKind, ResolvedExport, decode_program, decode_verified_program,
+};
+
 /// Canonical IEEE-754 bits. Every positive or negative NaN payload collapses
 /// to the unique arithmetic NaN from `Bamti.canonical_nan`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
