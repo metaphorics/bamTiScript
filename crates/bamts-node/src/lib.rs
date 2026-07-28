@@ -1,6 +1,6 @@
 //! Node-compatible host capabilities for BamTS.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 use std::collections::BTreeMap;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -401,6 +401,7 @@ fn run_aot_main() -> i32 {
 
 /// C process entry for a linked BamTS AOT image.
 #[cfg(feature = "aot-main")]
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i32 {
     run_aot_main()
