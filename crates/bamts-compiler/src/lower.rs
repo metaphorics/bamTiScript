@@ -50,6 +50,11 @@ use bamts_bytecode::{
     VerifyError,
 };
 
+pub use crate::program::{
+    ExecutableModuleProvenance, ExecutableProgram, ProgramLowerError, ProgramLowerErrorKind,
+    ProgramLowerPhase, lower_program,
+};
+
 use crate::source::{ScriptKind, SourceId, TextRange, Utf16Pos};
 use crate::syntax::{
     ArrayBindingElement, ArrayElement, ArrowFunction, AssignmentArrayElement, AssignmentExpression,
@@ -283,6 +288,23 @@ pub(crate) fn assemble(
     file: &SourceFile,
     options: LowerOptions,
 ) -> Result<Module<bamts_bytecode::Unverified>, LowerError> {
+    assemble_with_linkage_strings(file, options, &[], false)
+}
+
+pub(crate) fn assemble_program_module(
+    file: &SourceFile,
+    options: LowerOptions,
+    linkage_strings: &[String],
+) -> Result<Module<bamts_bytecode::Unverified>, LowerError> {
+    assemble_with_linkage_strings(file, options, linkage_strings, true)
+}
+
+fn assemble_with_linkage_strings(
+    file: &SourceFile,
+    options: LowerOptions,
+    linkage_strings: &[String],
+    program_mode: bool,
+) -> Result<Module<bamts_bytecode::Unverified>, LowerError> {
     validate_script_kind(file, options)?;
 
     let mut builder = ModuleBuilder {
@@ -290,9 +312,12 @@ pub(crate) fn assemble(
         constants: Vec::new(),
         functions: Vec::new(),
     };
+    for value in linkage_strings {
+        builder.intern(Constant::String(value.clone()), file.range())?;
+    }
     let entry = builder.reserve_function(file.range())?;
 
-    let mut context = FunctionContext::new_top_level(file);
+    let mut context = FunctionContext::new_top_level(file, program_mode);
     context.lower_top_level(&mut builder, file.statements())?;
     context.emit(file.range(), Instruction::Halt)?;
     let assembled = context.into_function(None, FunctionFlags::default());
@@ -451,6 +476,7 @@ struct FunctionContext<'a> {
     /// `true` for the module entry function, whose bindings are the module
     /// environment (named globals) rather than register homes.
     top_level: bool,
+    program_mode: bool,
     /// `Some(reg)` when `this` is a captured cell (arrow); `None` when the
     /// activation owns `this` (`LoadThis`).
     this_capture: Option<Register>,
@@ -461,7 +487,7 @@ struct FunctionContext<'a> {
 }
 
 impl<'a> FunctionContext<'a> {
-    fn new_top_level(file: &'a SourceFile) -> Self {
+    fn new_top_level(file: &'a SourceFile, program_mode: bool) -> Self {
         Self {
             file,
             code: Vec::new(),
@@ -473,6 +499,7 @@ impl<'a> FunctionContext<'a> {
             handlers: Vec::new(),
             finally_stack: Vec::new(),
             top_level: true,
+            program_mode,
             this_capture: None,
             new_target_capture: None,
             arguments_source: ArgumentsSource::None,
@@ -3050,7 +3077,7 @@ impl<'a> FunctionContext<'a> {
         range: TextRange,
         import: &ImportDeclaration,
     ) -> Result<(), LowerError> {
-        if import.type_only {
+        if import.type_only || self.program_mode {
             return Ok(());
         }
         let specifier = self.string_literal_value(&import.source)?;
@@ -3139,6 +3166,9 @@ impl<'a> FunctionContext<'a> {
         local: &str,
         exported: &str,
     ) -> Result<(), LowerError> {
+        if self.program_mode {
+            return Ok(());
+        }
         let src = self.read_name(builder, local, range)?;
         let name = builder.intern(Constant::String(exported.to_owned()), range)?;
         self.emit(range, Instruction::Export { name, src })?;
@@ -3152,6 +3182,10 @@ impl<'a> FunctionContext<'a> {
         exported: &str,
         src: Register,
     ) -> Result<(), LowerError> {
+        if self.program_mode {
+            debug_assert_eq!(exported, "default");
+            return self.store_binding(builder, "*default*", src, range, false);
+        }
         let name = builder.intern(Constant::String(exported.to_owned()), range)?;
         self.emit(range, Instruction::Export { name, src })?;
         Ok(())
@@ -3177,7 +3211,7 @@ impl<'a> FunctionContext<'a> {
                 source,
                 ..
             }) => {
-                if *type_only {
+                if *type_only || self.program_mode {
                     return Ok(());
                 }
                 if let Some(source) = source {
@@ -3216,7 +3250,7 @@ impl<'a> FunctionContext<'a> {
                 Ok(())
             }
             ExportDeclaration::All(all) => {
-                if all.type_only {
+                if all.type_only || self.program_mode {
                     Ok(())
                 } else {
                     Err(self.unsupported(range, UnsupportedConstruct::RuntimeExportAll))
@@ -3244,6 +3278,10 @@ impl<'a> FunctionContext<'a> {
                 }
                 ExportDefaultValue::Class(class) => {
                     let value = self.lower_class_value(builder, range, class, None)?;
+                    if let Some(identifier) = &class.name {
+                        let name = self.identifier_text(identifier)?;
+                        self.store_binding(builder, &name, value, range, false)?;
+                    }
                     self.export_value(builder, range, "default", value)
                 }
                 ExportDefaultValue::Missing(missing) => {
@@ -3710,6 +3748,7 @@ impl<'a> FunctionContext<'a> {
             handlers: Vec::new(),
             finally_stack: Vec::new(),
             top_level: false,
+            program_mode: self.program_mode,
             this_capture: None,
             new_target_capture: None,
             arguments_source: if is_arrow {
@@ -4145,6 +4184,7 @@ impl<'a> FunctionContext<'a> {
             handlers: Vec::new(),
             finally_stack: Vec::new(),
             top_level: false,
+            program_mode: self.program_mode,
             this_capture: None,
             new_target_capture: None,
             arguments_source: ArgumentsSource::Own,
@@ -4854,7 +4894,7 @@ fn head_range(for_statement: &ForStatement) -> TextRange {
 }
 
 /// The runtime names a statement declares (for `export` linkage).
-fn declared_names(file: &SourceFile, statement: &Stmt) -> Vec<String> {
+pub(crate) fn declared_names(file: &SourceFile, statement: &Stmt) -> Vec<String> {
     let mut names = Vec::new();
     match statement.data() {
         Statement::Variable(declaration) => {
@@ -4883,7 +4923,7 @@ fn declared_names(file: &SourceFile, statement: &Stmt) -> Vec<String> {
 
 /// Collects every `var`-scoped binding name in a statement list, not descending
 /// into nested function or class bodies (which have their own `var` scope).
-fn collect_var_names(file: &SourceFile, statements: &[Stmt], names: &mut Vec<String>) {
+pub(crate) fn collect_var_names(file: &SourceFile, statements: &[Stmt], names: &mut Vec<String>) {
     for statement in statements {
         collect_var_names_stmt(file, statement, names);
     }
@@ -4963,7 +5003,7 @@ fn collect_for_binding_var(file: &SourceFile, binding: &ForBinding, names: &mut 
     }
 }
 
-fn collect_pattern_names(file: &SourceFile, pattern: &Pattern, names: &mut Vec<String>) {
+pub(crate) fn collect_pattern_names(file: &SourceFile, pattern: &Pattern, names: &mut Vec<String>) {
     match pattern.data() {
         BindingPattern::Identifier(identifier) => {
             if let Some(text) = identifier_name(file, identifier) {

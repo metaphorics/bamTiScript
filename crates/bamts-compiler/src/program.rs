@@ -1,14 +1,22 @@
 //! Compiler-owned whole-program loading and canonical module identity.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt, fs, io,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
+use bamts_bytecode::{
+    Binding, BindingId, BindingKind, Constant, ConstantId, Edge, EdgeId, EdgeTarget, Export,
+    ExportSource, ModuleId, Program as BytecodeProgram, ProgramModule, ProgramVerifyError,
+    Verified,
+};
+
 use crate::{
+    lower::{self, LowerError, LowerOptions},
     parser,
+    pipeline::ProgramFrontendOutput,
     project::{
         CompilerOptions, ModuleResolutionError, PackageError, PackageJson, PackageMode,
         PackageTarget, ProjectRoot, ResolutionConditions, ResolutionFlavor, plan_relative_module,
@@ -16,8 +24,9 @@ use crate::{
     scanner,
     source::{ScriptKind, SourceId, SourceIdentity, SourceText, TextRange, Utf16Pos},
     syntax::{
-        ExportDeclaration, ExportNamedDeclaration, ExportSpecifierMode, ImportBinding,
-        ImportSpecifierMode, SourceFile, Statement, TokenKind,
+        ExportDeclaration, ExportDefaultValue, ExportNamedDeclaration, ExportSpecifierMode,
+        ImportBinding, ImportSpecifierMode, ModuleExportName, SourceFile, Statement, TokenKind,
+        VariableKind,
     },
 };
 
@@ -401,31 +410,42 @@ impl ProgramLoader {
             ),
             source,
         })?;
-        self.canonical_selection(plan.candidates())
+        self.canonical_selection(plan.candidates(), flavor)
     }
 
     fn canonical_selection(
         &self,
         candidates: &[PathBuf],
+        flavor: ResolutionFlavor,
     ) -> Result<Option<PathBuf>, ProgramLoadError> {
+        if flavor == ResolutionFlavor::Runtime {
+            for candidate in candidates {
+                if is_declaration_path(candidate) || !candidate.is_file() {
+                    continue;
+                }
+                return self.canonical_candidate(candidate).map(Some);
+            }
+        }
         for candidate in candidates {
-            if !candidate.is_file() {
-                continue;
+            if candidate.is_file() {
+                return self.canonical_candidate(candidate).map(Some);
             }
-            let canonical =
-                fs::canonicalize(candidate).map_err(|source| ProgramLoadError::Read {
-                    path: candidate.clone(),
-                    source,
-                })?;
-            if !canonical.starts_with(self.root.path()) {
-                return Err(ProgramLoadError::TraversalRejected {
-                    path: canonical,
-                    root: self.root.path().to_path_buf(),
-                });
-            }
-            return Ok(Some(canonical));
         }
         Ok(None)
+    }
+
+    fn canonical_candidate(&self, candidate: &Path) -> Result<PathBuf, ProgramLoadError> {
+        let canonical = fs::canonicalize(candidate).map_err(|source| ProgramLoadError::Read {
+            path: candidate.to_path_buf(),
+            source,
+        })?;
+        if !canonical.starts_with(self.root.path()) {
+            return Err(ProgramLoadError::TraversalRejected {
+                path: canonical,
+                root: self.root.path().to_path_buf(),
+            });
+        }
+        Ok(canonical)
     }
 
     fn resolve_edge(
@@ -455,7 +475,7 @@ impl ProgramLoader {
                 diagnostic: diagnostic(importer, &edge.specifier, edge.kind, edge.range),
                 source,
             })?;
-            self.canonical_selection(plan.candidates())?
+            self.canonical_selection(plan.candidates(), flavor)?
                 .map(ResolvedEdgeTarget::Local)
         } else if edge.specifier.starts_with('#') {
             self.resolve_package_import(importer, edge, flavor)?
@@ -1309,6 +1329,14 @@ fn script_kind(path: &Path) -> Option<ScriptKind> {
     }
 }
 
+fn is_declaration_path(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    name.ends_with(".d.ts") || name.ends_with(".d.mts") || name.ends_with(".d.cts")
+}
+
 fn pattern_capture<'a>(pattern: &str, specifier: &'a str) -> Option<&'a str> {
     let Some(star) = pattern.find('*') else {
         return (pattern == specifier).then_some("");
@@ -1362,6 +1390,857 @@ const fn edge_kind(flavor: ResolutionFlavor) -> ModuleEdgeKind {
     }
 }
 
+/// Compiler-only identity and resolved-edge provenance for one executable module.
+#[derive(Clone, Debug)]
+pub struct ExecutableModuleProvenance {
+    module: ModuleId,
+    source: SourceIdentity,
+    edges: Arc<[ModuleEdge]>,
+}
+
+impl ExecutableModuleProvenance {
+    #[must_use]
+    pub const fn module(&self) -> ModuleId {
+        self.module
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> &SourceIdentity {
+        &self.source
+    }
+
+    /// Canonical compiler edges, including identities intentionally absent from the wire format.
+    #[must_use]
+    pub fn edges(&self) -> &[ModuleEdge] {
+        &self.edges
+    }
+
+    pub fn type_only_edges(&self) -> impl Iterator<Item = &ModuleEdge> {
+        self.edges
+            .iter()
+            .filter(|edge| edge.kind() == ModuleEdgeKind::TypeOnly)
+    }
+}
+
+/// The compiler's sole executable product: one verified wire program plus non-wire provenance.
+#[derive(Clone, Debug)]
+pub struct ExecutableProgram {
+    wire: BytecodeProgram<Verified>,
+    provenance: Vec<ExecutableModuleProvenance>,
+}
+
+impl ExecutableProgram {
+    #[must_use]
+    pub const fn wire(&self) -> &BytecodeProgram<Verified> {
+        &self.wire
+    }
+
+    #[must_use]
+    pub fn provenance(&self) -> &[ExecutableModuleProvenance] {
+        &self.provenance
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgramLowerPhase {
+    Frontend,
+    Metadata,
+    Module,
+    Link,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProgramLowerErrorKind {
+    FrontendEntrypointMismatch {
+        resolved: SourceId,
+        frontend: SourceId,
+    },
+    MissingFrontend {
+        source: SourceId,
+    },
+    UnexpectedFrontend {
+        source: SourceId,
+    },
+    InvalidModuleName,
+    MissingRuntimeEdge {
+        specifier: String,
+    },
+    ConflictingRuntimeEdge {
+        specifier: String,
+    },
+    Lower(LowerError),
+    Link(ProgramVerifyError),
+}
+
+/// A whole-program lowering failure anchored to a canonical module path and phase.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgramLowerError {
+    pub module: PathBuf,
+    pub phase: ProgramLowerPhase,
+    pub kind: ProgramLowerErrorKind,
+}
+
+impl fmt::Display for ProgramLowerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "program lowering failed in {} during {:?}: {:?}",
+            self.module.display(),
+            self.phase,
+            self.kind
+        )
+    }
+}
+
+impl std::error::Error for ProgramLowerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            ProgramLowerErrorKind::Lower(error) => Some(error),
+            ProgramLowerErrorKind::Link(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RawEdge {
+    specifier: String,
+    target: EdgeTarget,
+    external_identity: Option<String>,
+    eager: bool,
+}
+
+#[derive(Clone)]
+enum RawBindingKind {
+    Hoisted,
+    Lexical,
+    Imported { edge: EdgeId, name: String },
+    Namespace { edge: EdgeId },
+}
+
+#[derive(Clone)]
+struct RawBinding {
+    name: String,
+    kind: RawBindingKind,
+}
+
+#[derive(Clone)]
+enum RawExportSource {
+    Local(String),
+    Indirect { edge: EdgeId, name: String },
+}
+
+#[derive(Clone)]
+struct RawExport {
+    name: String,
+    source: RawExportSource,
+}
+
+struct RawModule {
+    name: String,
+    edges: Vec<RawEdge>,
+    bindings: Vec<RawBinding>,
+    exports: Vec<RawExport>,
+    stars: Vec<EdgeId>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ExportOrigin {
+    Local(ModuleId, String),
+    Indirect(ModuleId, String),
+    External(String, String),
+}
+
+/// Lowers one canonical resolved program and its matching frontend products.
+///
+/// Static linkage becomes live metadata only. Dynamic imports remain instructions
+/// backed by non-eager edges.
+///
+/// # Errors
+/// Returns a path- and phase-typed failure for frontend mismatch, metadata construction,
+/// module lowering/verification, or final program linking.
+pub fn lower_program(
+    resolved: &ResolvedProgram,
+    frontend: &ProgramFrontendOutput,
+    options: LowerOptions,
+) -> Result<ExecutableProgram, ProgramLowerError> {
+    if frontend.entrypoint_id() != resolved.entrypoint_id() {
+        return Err(program_lower_error(
+            resolved.entrypoint().path(),
+            ProgramLowerPhase::Frontend,
+            ProgramLowerErrorKind::FrontendEntrypointMismatch {
+                resolved: resolved.entrypoint_id(),
+                frontend: frontend.entrypoint_id(),
+            },
+        ));
+    }
+    for output in frontend.modules() {
+        let source = output.source_file().source_id();
+        if resolved.module(source).is_none() {
+            return Err(program_lower_error(
+                resolved.entrypoint().path(),
+                ProgramLowerPhase::Frontend,
+                ProgramLowerErrorKind::UnexpectedFrontend { source },
+            ));
+        }
+    }
+
+    let module_ids: HashMap<_, _> = resolved
+        .modules()
+        .iter()
+        .enumerate()
+        .map(|(index, module)| (module.source_id(), ModuleId::new(index as u32)))
+        .collect();
+    let mut raw_modules = Vec::with_capacity(resolved.modules().len());
+    for module in resolved.modules() {
+        let output = frontend.module(module.source_id()).ok_or_else(|| {
+            program_lower_error(
+                module.path(),
+                ProgramLowerPhase::Frontend,
+                ProgramLowerErrorKind::MissingFrontend {
+                    source: module.source_id(),
+                },
+            )
+        })?;
+        let name = normalized_module_name(resolved.root(), module.path()).ok_or_else(|| {
+            program_lower_error(
+                module.path(),
+                ProgramLowerPhase::Metadata,
+                ProgramLowerErrorKind::InvalidModuleName,
+            )
+        })?;
+        raw_modules.push(collect_raw_module(
+            module,
+            output.source_file(),
+            name,
+            &module_ids,
+        )?);
+    }
+    expand_star_exports(&mut raw_modules);
+
+    let mut linked_modules = Vec::with_capacity(raw_modules.len());
+    let mut provenance = Vec::with_capacity(raw_modules.len());
+    for (index, (resolved_module, raw)) in resolved
+        .modules()
+        .iter()
+        .zip(raw_modules.iter())
+        .enumerate()
+    {
+        let file = frontend
+            .module(resolved_module.source_id())
+            .expect("frontend presence checked above")
+            .source_file();
+        let strings = linkage_strings(raw);
+        let code = lower::assemble_program_module(file, options, &strings)
+            .and_then(|module| {
+                module.verify().map_err(|error| LowerError {
+                    source: file.source_id(),
+                    range: file.range(),
+                    kind: lower::LowerErrorKind::Verify(error),
+                })
+            })
+            .map_err(|error| {
+                program_lower_error(
+                    resolved_module.path(),
+                    ProgramLowerPhase::Module,
+                    ProgramLowerErrorKind::Lower(error),
+                )
+            })?;
+        linked_modules.push(materialize_program_module(code, raw));
+        provenance.push(ExecutableModuleProvenance {
+            module: ModuleId::new(index as u32),
+            source: resolved_module.identity().clone(),
+            edges: Arc::from(resolved_module.dependencies()),
+        });
+    }
+    let entry = module_ids[&resolved.entrypoint_id()];
+    let wire = BytecodeProgram::link(linked_modules, entry).map_err(|error| {
+        let path = error
+            .module
+            .and_then(|module| resolved.modules().get(module.get() as usize))
+            .map_or_else(|| resolved.entrypoint().path(), ResolvedModule::path);
+        program_lower_error(
+            path,
+            ProgramLowerPhase::Link,
+            ProgramLowerErrorKind::Link(error),
+        )
+    })?;
+    Ok(ExecutableProgram { wire, provenance })
+}
+
+fn collect_raw_module(
+    module: &ResolvedModule,
+    file: &SourceFile,
+    name: String,
+    module_ids: &HashMap<SourceId, ModuleId>,
+) -> Result<RawModule, ProgramLowerError> {
+    let mut edges: Vec<RawEdge> = Vec::new();
+    let mut edge_ids: HashMap<String, EdgeId> = HashMap::new();
+    for dependency in module
+        .dependencies()
+        .iter()
+        .filter(|edge| edge.kind() != ModuleEdgeKind::TypeOnly)
+    {
+        let eager = dependency.kind() == ModuleEdgeKind::StaticRuntime;
+        if let Some(existing) = edge_ids.get(dependency.specifier()).copied() {
+            let edge: &mut RawEdge = &mut edges[existing.get() as usize];
+            if edge.eager != eager {
+                return Err(program_lower_error(
+                    module.path(),
+                    ProgramLowerPhase::Metadata,
+                    ProgramLowerErrorKind::ConflictingRuntimeEdge {
+                        specifier: dependency.specifier().to_owned(),
+                    },
+                ));
+            }
+            continue;
+        }
+        let (target, external_identity) = match dependency.target() {
+            ModuleTarget::Local(source) => (EdgeTarget::Local(module_ids[source]), None),
+            ModuleTarget::External(identity) => (EdgeTarget::External, Some(identity.to_string())),
+        };
+        let id = EdgeId::new(edges.len() as u32);
+        edge_ids.insert(dependency.specifier().to_owned(), id);
+        edges.push(RawEdge {
+            specifier: dependency.specifier().to_owned(),
+            target,
+            external_identity,
+            eager,
+        });
+    }
+
+    let edge = |specifier: String| {
+        edge_ids.get(&specifier).copied().ok_or_else(|| {
+            program_lower_error(
+                module.path(),
+                ProgramLowerPhase::Metadata,
+                ProgramLowerErrorKind::MissingRuntimeEdge { specifier },
+            )
+        })
+    };
+    let mut bindings = Vec::new();
+    let mut hoisted = Vec::new();
+    lower::collect_var_names(file, file.statements(), &mut hoisted);
+    bindings.extend(hoisted.into_iter().map(|name| RawBinding {
+        name,
+        kind: RawBindingKind::Hoisted,
+    }));
+    let mut exports = Vec::new();
+    let mut stars = Vec::new();
+    for statement in file.statements() {
+        collect_top_level_statement(
+            file,
+            statement.data(),
+            &edge,
+            &mut bindings,
+            &mut exports,
+            &mut stars,
+        )?;
+    }
+    let mut hoisted_names = HashSet::new();
+    bindings.retain(|binding| {
+        !matches!(binding.kind, RawBindingKind::Hoisted)
+            || hoisted_names.insert(binding.name.clone())
+    });
+    let binding_names: HashSet<_> = bindings
+        .iter()
+        .map(|binding| binding.name.as_str())
+        .collect();
+    exports.retain(|export| match &export.source {
+        RawExportSource::Local(name) => binding_names.contains(name.as_str()),
+        RawExportSource::Indirect { .. } => true,
+    });
+    Ok(RawModule {
+        name,
+        edges,
+        bindings,
+        exports,
+        stars,
+    })
+}
+
+fn collect_top_level_statement(
+    file: &SourceFile,
+    statement: &Statement,
+    edge: &impl Fn(String) -> Result<EdgeId, ProgramLowerError>,
+    bindings: &mut Vec<RawBinding>,
+    exports: &mut Vec<RawExport>,
+    stars: &mut Vec<EdgeId>,
+) -> Result<(), ProgramLowerError> {
+    match statement {
+        Statement::Import(import) if !import.type_only => {
+            let runtime = import.clause.as_ref().is_none_or(|clause| {
+                clause.default.is_some()
+                    || !matches!(
+                        &clause.binding,
+                        Some(ImportBinding::Named(specifiers))
+                            if specifiers.iter().all(|specifier| {
+                                specifier.data().mode == ImportSpecifierMode::TypeOnly
+                            })
+                    )
+            });
+            if !runtime {
+                return Ok(());
+            }
+            let edge_id = edge(string_literal(file, &import.source))?;
+            if let Some(clause) = &import.clause {
+                if let Some(default) = &clause.default {
+                    bindings.push(RawBinding {
+                        name: identifier(file, default),
+                        kind: RawBindingKind::Imported {
+                            edge: edge_id,
+                            name: "default".to_owned(),
+                        },
+                    });
+                }
+                match &clause.binding {
+                    Some(ImportBinding::Namespace(local)) => bindings.push(RawBinding {
+                        name: identifier(file, local),
+                        kind: RawBindingKind::Namespace { edge: edge_id },
+                    }),
+                    Some(ImportBinding::Named(specifiers)) => {
+                        for specifier in specifiers {
+                            let specifier = specifier.data();
+                            if specifier.mode == ImportSpecifierMode::TypeOnly {
+                                continue;
+                            }
+                            bindings.push(RawBinding {
+                                name: identifier(file, &specifier.local),
+                                kind: RawBindingKind::Imported {
+                                    edge: edge_id,
+                                    name: module_export_name(file, &specifier.imported),
+                                },
+                            });
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+        Statement::Variable(declaration)
+            if matches!(declaration.kind, VariableKind::Let | VariableKind::Const) =>
+        {
+            for declarator in &declaration.declarations {
+                let mut names = Vec::new();
+                lower::collect_pattern_names(file, &declarator.data().binding, &mut names);
+                bindings.extend(names.into_iter().map(|name| RawBinding {
+                    name,
+                    kind: RawBindingKind::Lexical,
+                }));
+            }
+        }
+        Statement::Function(declaration) => {
+            if declaration.function.body.is_some()
+                && let Some(name) = &declaration.function.name
+            {
+                bindings.push(RawBinding {
+                    name: identifier(file, name),
+                    kind: RawBindingKind::Hoisted,
+                });
+            }
+        }
+        Statement::Class(class) => {
+            if let Some(name) = &class.name {
+                bindings.push(RawBinding {
+                    name: identifier(file, name),
+                    kind: RawBindingKind::Lexical,
+                });
+            }
+        }
+        Statement::Export(export) => collect_export(file, export, edge, bindings, exports, stars)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn collect_export(
+    file: &SourceFile,
+    declaration: &ExportDeclaration,
+    edge: &impl Fn(String) -> Result<EdgeId, ProgramLowerError>,
+    bindings: &mut Vec<RawBinding>,
+    exports: &mut Vec<RawExport>,
+    stars: &mut Vec<EdgeId>,
+) -> Result<(), ProgramLowerError> {
+    match declaration {
+        ExportDeclaration::Named(ExportNamedDeclaration::Declaration(statement)) => {
+            collect_top_level_statement(file, statement.data(), edge, bindings, exports, stars)?;
+            let has_runtime_value = !matches!(
+                statement.data(),
+                Statement::Function(declaration) if declaration.function.body.is_none()
+            );
+            if has_runtime_value {
+                for name in lower::declared_names(file, statement) {
+                    exports.push(RawExport {
+                        name: name.clone(),
+                        source: RawExportSource::Local(name),
+                    });
+                }
+            }
+        }
+        ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
+            type_only,
+            specifiers,
+            source,
+            ..
+        }) if !type_only => {
+            if let Some(source) = source {
+                let edge_id = edge(string_literal(file, source))?;
+                for specifier in specifiers {
+                    let specifier = specifier.data();
+                    if specifier.mode == ExportSpecifierMode::TypeOnly {
+                        continue;
+                    }
+                    exports.push(RawExport {
+                        name: module_export_name(file, &specifier.exported),
+                        source: RawExportSource::Indirect {
+                            edge: edge_id,
+                            name: module_export_name(file, &specifier.local),
+                        },
+                    });
+                }
+            } else {
+                for specifier in specifiers {
+                    let specifier = specifier.data();
+                    if specifier.mode == ExportSpecifierMode::TypeOnly {
+                        continue;
+                    }
+                    exports.push(RawExport {
+                        name: module_export_name(file, &specifier.exported),
+                        source: RawExportSource::Local(module_export_name(file, &specifier.local)),
+                    });
+                }
+            }
+        }
+        ExportDeclaration::All(all) if !all.type_only => {
+            let edge_id = edge(string_literal(file, &all.source))?;
+            if let Some(exported) = &all.exported {
+                let exported = module_export_name(file, exported);
+                let binding = format!("*namespace:{exported}*");
+                bindings.push(RawBinding {
+                    name: binding.clone(),
+                    kind: RawBindingKind::Namespace { edge: edge_id },
+                });
+                exports.push(RawExport {
+                    name: exported,
+                    source: RawExportSource::Local(binding),
+                });
+            } else {
+                stars.push(edge_id);
+            }
+        }
+        ExportDeclaration::Default(default) => {
+            let kind = match &default.value {
+                ExportDefaultValue::Function(function) if function.body.is_some() => {
+                    if let Some(name) = &function.name {
+                        bindings.push(RawBinding {
+                            name: identifier(file, name),
+                            kind: RawBindingKind::Hoisted,
+                        });
+                    }
+                    RawBindingKind::Hoisted
+                }
+                ExportDefaultValue::Class(class) => {
+                    if let Some(name) = &class.name {
+                        bindings.push(RawBinding {
+                            name: identifier(file, name),
+                            kind: RawBindingKind::Lexical,
+                        });
+                    }
+                    RawBindingKind::Lexical
+                }
+                ExportDefaultValue::Expression(_) => RawBindingKind::Lexical,
+                _ => return Ok(()),
+            };
+            bindings.push(RawBinding {
+                name: "*default*".to_owned(),
+                kind,
+            });
+            exports.push(RawExport {
+                name: "default".to_owned(),
+                source: RawExportSource::Local("*default*".to_owned()),
+            });
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn expand_star_exports(modules: &mut [RawModule]) {
+    let explicit: Vec<BTreeSet<String>> = modules
+        .iter()
+        .map(|module| {
+            module
+                .exports
+                .iter()
+                .map(|export| export.name.clone())
+                .collect()
+        })
+        .collect();
+    let mut origins: Vec<BTreeMap<String, BTreeSet<ExportOrigin>>> = modules
+        .iter()
+        .enumerate()
+        .map(|(index, module)| {
+            module
+                .exports
+                .iter()
+                .map(|export| {
+                    (
+                        export.name.clone(),
+                        BTreeSet::from([canonical_export_origin(
+                            modules,
+                            export_origin(ModuleId::new(index as u32), module, export),
+                            &mut BTreeSet::new(),
+                        )]),
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    loop {
+        let previous = origins.clone();
+        let mut changed = false;
+        for (index, module) in modules.iter().enumerate() {
+            for star in &module.stars {
+                let EdgeTarget::Local(target) = module.edges[star.get() as usize].target else {
+                    continue;
+                };
+                for (name, candidates) in &previous[target.get() as usize] {
+                    if name == "default" || explicit[index].contains(name) {
+                        continue;
+                    }
+                    let entry = origins[index].entry(name.clone()).or_default();
+                    let before = entry.len();
+                    entry.extend(candidates.iter().cloned());
+                    changed |= entry.len() != before;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for (index, module) in modules.iter_mut().enumerate() {
+        for (name, candidates) in &origins[index] {
+            if explicit[index].contains(name) || candidates.len() != 1 {
+                continue;
+            }
+            let origin = candidates.first().expect("singleton candidate");
+            if let Some(edge) = module.stars.iter().copied().find(|edge| {
+                let EdgeTarget::Local(target) = module.edges[edge.get() as usize].target else {
+                    return false;
+                };
+                origins[target.get() as usize]
+                    .get(name)
+                    .is_some_and(|origins| origins.contains(origin))
+            }) {
+                module.exports.push(RawExport {
+                    name: name.clone(),
+                    source: RawExportSource::Indirect {
+                        edge,
+                        name: name.clone(),
+                    },
+                });
+            }
+        }
+    }
+}
+
+fn export_origin(module_id: ModuleId, module: &RawModule, export: &RawExport) -> ExportOrigin {
+    match &export.source {
+        RawExportSource::Local(name) => {
+            if let Some(binding) = module.bindings.iter().find(|binding| binding.name == *name) {
+                match &binding.kind {
+                    RawBindingKind::Imported { edge, name } => match module.edges
+                        [edge.get() as usize]
+                        .target
+                    {
+                        EdgeTarget::Local(target) => ExportOrigin::Indirect(target, name.clone()),
+                        EdgeTarget::External => ExportOrigin::External(
+                            module.edges[edge.get() as usize]
+                                .external_identity
+                                .clone()
+                                .unwrap_or_else(|| {
+                                    module.edges[edge.get() as usize].specifier.clone()
+                                }),
+                            name.clone(),
+                        ),
+                    },
+                    _ => ExportOrigin::Local(module_id, name.clone()),
+                }
+            } else {
+                ExportOrigin::Local(module_id, name.clone())
+            }
+        }
+        RawExportSource::Indirect { edge, name } => {
+            match module.edges[edge.get() as usize].target {
+                EdgeTarget::Local(target) => ExportOrigin::Indirect(target, name.clone()),
+                EdgeTarget::External => ExportOrigin::External(
+                    module.edges[edge.get() as usize]
+                        .external_identity
+                        .clone()
+                        .unwrap_or_else(|| module.edges[edge.get() as usize].specifier.clone()),
+                    name.clone(),
+                ),
+            }
+        }
+    }
+}
+
+fn canonical_export_origin(
+    modules: &[RawModule],
+    origin: ExportOrigin,
+    visited: &mut BTreeSet<(ModuleId, String)>,
+) -> ExportOrigin {
+    let ExportOrigin::Indirect(module_id, name) = &origin else {
+        return origin;
+    };
+    if !visited.insert((*module_id, name.clone())) {
+        return origin;
+    }
+    let module = &modules[module_id.get() as usize];
+    let Some(export) = module.exports.iter().find(|export| export.name == *name) else {
+        return origin;
+    };
+    let next = export_origin(*module_id, module, export);
+    if next == origin {
+        origin
+    } else {
+        canonical_export_origin(modules, next, visited)
+    }
+}
+
+fn linkage_strings(module: &RawModule) -> Vec<String> {
+    let mut strings = Vec::new();
+    strings.push(module.name.clone());
+    strings.extend(module.edges.iter().map(|edge| edge.specifier.clone()));
+    for binding in &module.bindings {
+        strings.push(binding.name.clone());
+        if let RawBindingKind::Imported { name, .. } = &binding.kind {
+            strings.push(name.clone());
+        }
+    }
+    for export in &module.exports {
+        strings.push(export.name.clone());
+        if let RawExportSource::Indirect { name, .. } = &export.source {
+            strings.push(name.clone());
+        }
+    }
+    strings
+}
+
+fn materialize_program_module(
+    code: bamts_bytecode::Module<Verified>,
+    raw: &RawModule,
+) -> ProgramModule<Verified> {
+    let constant = |value: &str| {
+        ConstantId::new(
+            code.constants()
+                .iter()
+                .position(|constant| matches!(constant, Constant::String(text) if text == value))
+                .expect("all linkage strings were interned before verification") as u32,
+        )
+    };
+    let binding_ids: HashMap<_, _> = raw
+        .bindings
+        .iter()
+        .enumerate()
+        .map(|(index, binding)| (binding.name.as_str(), BindingId::new(index as u32)))
+        .collect();
+    let name = constant(&raw.name);
+    let edges = raw
+        .edges
+        .iter()
+        .map(|edge| Edge {
+            specifier: constant(&edge.specifier),
+            target: edge.target,
+            eager: edge.eager,
+        })
+        .collect();
+    let bindings = raw
+        .bindings
+        .iter()
+        .map(|binding| Binding {
+            name: constant(&binding.name),
+            kind: match &binding.kind {
+                RawBindingKind::Hoisted => BindingKind::Hoisted,
+                RawBindingKind::Lexical => BindingKind::Lexical,
+                RawBindingKind::Imported { edge, name } => BindingKind::Imported {
+                    edge: *edge,
+                    name: constant(name),
+                },
+                RawBindingKind::Namespace { edge } => BindingKind::Namespace { edge: *edge },
+            },
+        })
+        .collect();
+    let exports = raw
+        .exports
+        .iter()
+        .map(|export| Export {
+            name: constant(&export.name),
+            source: match &export.source {
+                RawExportSource::Local(name) => ExportSource::Local(binding_ids[name.as_str()]),
+                RawExportSource::Indirect { edge, name } => ExportSource::Indirect {
+                    edge: *edge,
+                    name: constant(name),
+                },
+            },
+        })
+        .collect();
+    ProgramModule {
+        name,
+        code,
+        edges,
+        bindings,
+        exports,
+    }
+}
+
+fn normalized_module_name(root: &ProjectRoot, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(root.path()).ok()?;
+    let mut name = String::new();
+    for component in relative.components() {
+        if !name.is_empty() {
+            name.push('/');
+        }
+        name.push_str(component.as_os_str().to_str()?);
+    }
+    (!name.is_empty()).then_some(name)
+}
+
+fn identifier(file: &SourceFile, node: &crate::syntax::IdentifierNode) -> String {
+    file.token_text(node.data().token())
+        .expect("parser identifier range belongs to its source")
+        .to_owned()
+}
+
+fn string_literal(file: &SourceFile, node: &crate::syntax::StringLiteralNode) -> String {
+    unquote(
+        file.token_text(node.data().token())
+            .expect("parser string range belongs to its source"),
+    )
+    .expect("parser string literal has delimiters")
+}
+
+fn module_export_name(file: &SourceFile, name: &ModuleExportName) -> String {
+    match name {
+        ModuleExportName::Identifier(identifier_node) => identifier(file, identifier_node),
+        ModuleExportName::String(string) => string_literal(file, string),
+        ModuleExportName::Missing(_) => String::new(),
+    }
+}
+
+fn program_lower_error(
+    module: &Path,
+    phase: ProgramLowerPhase,
+    kind: ProgramLowerErrorKind,
+) -> ProgramLowerError {
+    ProgramLowerError {
+        module: module.to_path_buf(),
+        phase,
+        kind,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1370,8 +2249,19 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use super::{ModuleEdgeKind, ModuleTarget, ProgramLoadError, ProgramLoader};
-    use crate::project::{ProjectConfig, ProjectRoot};
+    use super::{
+        ExecutableProgram, ModuleEdgeKind, ModuleTarget, ProgramLoadError, ProgramLoader,
+        ProgramLowerErrorKind, ProgramLowerPhase, lower_program,
+    };
+    use crate::{
+        lower::LowerOptions,
+        pipeline::{FrontendMode, compile_program_frontend},
+        project::{ProjectConfig, ProjectRoot},
+    };
+    use bamts_bytecode::{
+        BindingKind, EdgeTarget, ExportSource, Instruction, ProgramModule, ProgramVerifyErrorKind,
+        ResolvedExport, Verified,
+    };
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
@@ -1407,12 +2297,394 @@ mod tests {
         }
     }
 
+    fn lower_fixture(fixture: &Fixture, entrypoint: &str) -> ExecutableProgram {
+        let resolved = fixture.loader().load(entrypoint).unwrap();
+        let frontend = compile_program_frontend(&resolved, FrontendMode::Check);
+        lower_program(
+            &resolved,
+            &frontend,
+            LowerOptions {
+                javascript_compatibility: true,
+            },
+        )
+        .unwrap()
+    }
+
+    fn module_name(module: &ProgramModule<Verified>) -> &str {
+        match &module.code().constants()[module.name().get() as usize] {
+            bamts_bytecode::Constant::String(name) => name,
+            _ => panic!("verified module name is a string"),
+        }
+    }
+
+    fn module<'a>(program: &'a ExecutableProgram, name: &str) -> &'a ProgramModule<Verified> {
+        program
+            .wire()
+            .modules()
+            .iter()
+            .find(|module| module_name(module) == name)
+            .unwrap_or_else(|| panic!("missing module {name}"))
+    }
+
+    fn constant_string(module: &ProgramModule<Verified>, id: bamts_bytecode::ConstantId) -> &str {
+        match &module.code().constants()[id.get() as usize] {
+            bamts_bytecode::Constant::String(value) => value,
+            _ => panic!("verified linkage constant is a string"),
+        }
+    }
+
+    fn instructions(module: &ProgramModule<Verified>) -> impl Iterator<Item = Instruction> + '_ {
+        module
+            .code()
+            .functions()
+            .iter()
+            .flat_map(|function| function.code().iter().copied())
+    }
+
     fn names(program: &super::ResolvedProgram) -> Vec<&str> {
         program
             .modules()
             .iter()
             .map(|module| module.path().file_name().unwrap().to_str().unwrap())
             .collect()
+    }
+
+    #[test]
+    fn program_lowering_keeps_static_imports_live_without_snapshot_opcodes() {
+        let fixture = Fixture::new();
+        fixture.write("dep.ts", "export let value = 1; value = 2;");
+        fixture.write(
+            "main.ts",
+            "import { value as observed } from './dep.js'; export { observed };",
+        );
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        let binding = main
+            .bindings()
+            .iter()
+            .find(|binding| constant_string(main, binding.name) == "observed")
+            .unwrap();
+        assert!(matches!(binding.kind, BindingKind::Imported { .. }));
+        assert!(!instructions(main).any(|instruction| matches!(
+            instruction,
+            Instruction::Import { .. }
+                | Instruction::GetProperty { .. }
+                | Instruction::Export { .. }
+        )));
+
+        let main_id = executable.wire().entry();
+        let export = main
+            .exports()
+            .iter()
+            .find(|export| constant_string(main, export.name) == "observed")
+            .unwrap();
+        assert!(matches!(export.source, ExportSource::Local(_)));
+        assert!(matches!(
+            executable.wire().resolve_export(main_id, "observed"),
+            Some(ResolvedExport::Local { module, .. })
+                if module != main_id
+        ));
+    }
+
+    #[test]
+    fn program_lowering_records_namespace_imports() {
+        let fixture = Fixture::new();
+        fixture.write("dep.ts", "export const value = 1; export default 2;");
+        fixture.write(
+            "main.ts",
+            "import fallback, * as namespace from './dep.js'; fallback; namespace.value;",
+        );
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        assert!(main.bindings().iter().any(|binding| {
+            constant_string(main, binding.name) == "namespace"
+                && matches!(binding.kind, BindingKind::Namespace { .. })
+        }));
+        assert!(main.bindings().iter().any(|binding| {
+            constant_string(main, binding.name) == "fallback"
+                && matches!(
+                    binding.kind,
+                    BindingKind::Imported { name, .. }
+                        if constant_string(main, name) == "default"
+                )
+        }));
+    }
+
+    #[test]
+    fn program_lowering_resolves_alias_reexports() {
+        let fixture = Fixture::new();
+        fixture.write("dep.ts", "export const original = 1;");
+        fixture.write("main.ts", "export { original as renamed } from './dep.js';");
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        let export = main
+            .exports()
+            .iter()
+            .find(|export| constant_string(main, export.name) == "renamed")
+            .unwrap();
+        assert!(matches!(export.source, ExportSource::Indirect { .. }));
+        assert!(matches!(
+            executable
+                .wire()
+                .resolve_export(executable.wire().entry(), "renamed"),
+            Some(ResolvedExport::Local { module, .. })
+                if module != executable.wire().entry()
+        ));
+    }
+
+    #[test]
+    fn program_lowering_omits_ambiguous_star_exports() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "a.ts",
+            "export const collision = 1; export const onlyA = 1;",
+        );
+        fixture.write(
+            "b.ts",
+            "export const collision = 2; export const onlyB = 2;",
+        );
+        fixture.write("main.ts", "export * from './a.js'; export * from './b.js';");
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        let names: Vec<_> = main
+            .exports()
+            .iter()
+            .map(|export| constant_string(main, export.name))
+            .collect();
+        assert!(names.contains(&"onlyA"));
+        assert!(names.contains(&"onlyB"));
+        assert!(!names.contains(&"collision"));
+    }
+
+    #[test]
+    fn program_lowering_keeps_diamond_star_reexports_unambiguous() {
+        let fixture = Fixture::new();
+        fixture.write("a.ts", "export const value = 1;");
+        fixture.write("b.ts", "export { value } from './a.js';");
+        fixture.write("main.ts", "export * from './a.js'; export * from './b.js';");
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        assert_eq!(
+            main.exports()
+                .iter()
+                .filter(|export| constant_string(main, export.name) == "value")
+                .count(),
+            1
+        );
+        assert!(
+            executable
+                .wire()
+                .resolve_export(executable.wire().entry(), "value")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn program_lowering_canonicalizes_external_reexport_identity() {
+        let fixture = Fixture::new();
+        fixture.write("a.ts", "export { readFile } from 'node:fs';");
+        fixture.write("b.ts", "export { readFile } from 'node:fs';");
+        fixture.write("main.ts", "export * from './a.js'; export * from './b.js';");
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        assert_eq!(
+            main.exports()
+                .iter()
+                .filter(|export| constant_string(main, export.name) == "readFile")
+                .count(),
+            1
+        );
+        assert!(matches!(
+            executable
+                .wire()
+                .resolve_export(executable.wire().entry(), "readFile"),
+            Some(ResolvedExport::External { .. })
+        ));
+    }
+
+    #[test]
+    fn program_lowering_materializes_default_expression_binding() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "export default 1 + 2;");
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        let binding_index = main
+            .bindings()
+            .iter()
+            .position(|binding| constant_string(main, binding.name) == "*default*")
+            .unwrap();
+        assert_eq!(main.bindings()[binding_index].kind, BindingKind::Lexical);
+        assert!(main.exports().iter().any(|export| {
+            constant_string(main, export.name) == "default"
+                && export.source
+                    == ExportSource::Local(bamts_bytecode::BindingId::new(binding_index as u32))
+        }));
+        assert!(
+            !instructions(main)
+                .any(|instruction| matches!(instruction, Instruction::Export { .. }))
+        );
+    }
+
+    #[test]
+    fn program_lowering_initializes_default_named_class_binding() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "export default class Foo {}; Foo;");
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        assert!(main.bindings().iter().any(|binding| {
+            constant_string(main, binding.name) == "Foo" && binding.kind == BindingKind::Lexical
+        }));
+        let stored: Vec<_> = instructions(main)
+            .filter_map(|instruction| match instruction {
+                Instruction::StoreGlobal { name, .. } => Some(constant_string(main, name)),
+                _ => None,
+            })
+            .collect();
+        assert!(stored.contains(&"Foo"));
+        assert!(stored.contains(&"*default*"));
+    }
+
+    #[test]
+    fn program_lowering_erases_type_only_edges_from_wire_but_retains_provenance() {
+        let fixture = Fixture::new();
+        fixture.write("types.ts", "export interface Shape { value: number }");
+        fixture.write(
+            "main.ts",
+            "import type { Shape } from './types.js'; let x: Shape;",
+        );
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        assert!(main.edges().is_empty());
+        assert!(
+            main.bindings()
+                .iter()
+                .all(|binding| { constant_string(main, binding.name) != "Shape" })
+        );
+        let provenance = executable
+            .provenance()
+            .iter()
+            .find(|item| item.source().path().ends_with("main.ts"))
+            .unwrap();
+        assert_eq!(provenance.type_only_edges().count(), 1);
+    }
+
+    #[test]
+    fn program_lowering_links_cycles_with_hoisted_and_tdz_bindings() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "a.ts",
+            "import { fromB } from './b.js'; export let fromA = fromB; export var hoistedVar; export class LexicalClass {}",
+        );
+        fixture.write(
+            "b.ts",
+            "import { fromA } from './a.js'; export function fromB() { return fromA; }",
+        );
+
+        let executable = lower_fixture(&fixture, "a.ts");
+        let a = module(&executable, "a.ts");
+        let b = module(&executable, "b.ts");
+        assert!(a.bindings().iter().any(|binding| {
+            constant_string(a, binding.name) == "fromA" && binding.kind == BindingKind::Lexical
+        }));
+        assert!(a.bindings().iter().any(|binding| {
+            constant_string(a, binding.name) == "hoistedVar" && binding.kind == BindingKind::Hoisted
+        }));
+        assert!(a.bindings().iter().any(|binding| {
+            constant_string(a, binding.name) == "LexicalClass"
+                && binding.kind == BindingKind::Lexical
+        }));
+        assert!(b.bindings().iter().any(|binding| {
+            constant_string(b, binding.name) == "fromB" && binding.kind == BindingKind::Hoisted
+        }));
+        assert!(a.edges().iter().all(|edge| edge.eager));
+        assert!(b.edges().iter().all(|edge| edge.eager));
+    }
+
+    #[test]
+    fn program_lowering_keeps_dynamic_import_as_non_eager_instruction_edge() {
+        let fixture = Fixture::new();
+        fixture.write("dep.ts", "export const value = 1;");
+        fixture.write("main.ts", "const pending = import('./dep.js');");
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        assert_eq!(main.edges().len(), 1);
+        assert!(!main.edges()[0].eager);
+        assert!(
+            instructions(main).any(|instruction| matches!(instruction, Instruction::Import { .. }))
+        );
+    }
+
+    #[test]
+    fn program_lowering_rejects_duplicate_exports_during_link() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "main.ts",
+            "const value = 1; export { value }; export { value };",
+        );
+        let resolved = fixture.loader().load("main.ts").unwrap();
+        let frontend = compile_program_frontend(&resolved, FrontendMode::Check);
+        let error = lower_program(&resolved, &frontend, LowerOptions::default()).unwrap_err();
+        assert_eq!(error.phase, ProgramLowerPhase::Link);
+        assert!(matches!(
+            error.kind,
+            ProgramLowerErrorKind::Link(bamts_bytecode::ProgramVerifyError {
+                kind: ProgramVerifyErrorKind::DuplicateExport { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn program_lowering_preserves_external_identity_only_in_provenance() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "import * as fs from 'node:fs'; fs.readFile;");
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        assert_eq!(main.edges().len(), 1);
+        assert_eq!(main.edges()[0].target, EdgeTarget::External);
+        let provenance = executable
+            .provenance()
+            .iter()
+            .find(|item| item.source().path().ends_with("main.ts"))
+            .unwrap();
+        assert!(matches!(
+            provenance.edges()[0].target(),
+            ModuleTarget::External(specifier) if specifier.as_ref() == "node:fs"
+        ));
+    }
+
+    #[test]
+    fn program_lowering_is_deterministic_and_names_modules_root_relatively() {
+        let fixture = Fixture::new();
+        fixture.write("lib/dep.ts", "export const value = 1;");
+        fixture.write("src/main.ts", "export { value } from '../lib/dep.js';");
+
+        let first = lower_fixture(&fixture, "src/main.ts");
+        let second = lower_fixture(&fixture, "src/main.ts");
+        assert_eq!(first.wire().encode(), second.wire().encode());
+        assert_eq!(
+            first
+                .wire()
+                .modules()
+                .iter()
+                .map(module_name)
+                .collect::<Vec<_>>(),
+            ["lib/dep.ts", "src/main.ts"]
+        );
+        for (left, right) in first.wire().modules().iter().zip(second.wire().modules()) {
+            assert_eq!(left.code().encode(), right.code().encode());
+        }
     }
 
     #[test]
@@ -1682,7 +2954,7 @@ mod tests {
     }
 
     #[test]
-    fn loads_every_declared_corpus_program_graph() {
+    fn lowers_and_verifies_exactly_the_twenty_pinned_corpus_programs() {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .canonicalize()
@@ -1701,9 +2973,19 @@ mod tests {
         let config = ProjectConfig::parse(&root, root.path().join("tsconfig.json"), "{}").unwrap();
         let loader = ProgramLoader::new(&root, config.options()).unwrap();
         for entrypoint in entrypoints {
-            loader
+            let resolved = loader
                 .load(entrypoint)
                 .unwrap_or_else(|error| panic!("{entrypoint}: {error}"));
+            let frontend = compile_program_frontend(&resolved, FrontendMode::Check);
+            let executable = lower_program(
+                &resolved,
+                &frontend,
+                LowerOptions {
+                    javascript_compatibility: true,
+                },
+            )
+            .unwrap_or_else(|error| panic!("{entrypoint}: {error}"));
+            assert_eq!(executable.wire().modules().len(), resolved.modules().len());
         }
     }
 }
