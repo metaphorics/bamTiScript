@@ -5,6 +5,7 @@ pub mod lint;
 pub mod lower;
 pub mod parser;
 pub mod pipeline;
+pub mod program;
 pub mod project;
 pub mod rules;
 pub mod scanner;

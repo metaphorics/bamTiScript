@@ -17,6 +17,7 @@ use crate::emitter::{self, EmitOptions, EmitOutput};
 use crate::lint::{LintProfile, LintTable};
 use crate::parser;
 use crate::scanner;
+use crate::program::ResolvedProgram;
 use crate::source::{ScriptKind, SourceId, SourceText};
 use crate::syntax::SourceFile;
 
@@ -125,6 +126,73 @@ impl FrontendOutput {
             self.emit,
             self.diagnostics,
         )
+    }
+}
+
+/// Frontend products for every module of one canonical resolved program.
+pub struct ProgramFrontendOutput {
+    entrypoint: SourceId,
+    modules: Vec<FrontendOutput>,
+}
+
+impl ProgramFrontendOutput {
+    #[must_use]
+    pub const fn entrypoint_id(&self) -> SourceId {
+        self.entrypoint
+    }
+
+    /// Products in the same dependency-first order as the resolved program.
+    #[must_use]
+    pub fn modules(&self) -> &[FrontendOutput] {
+        &self.modules
+    }
+
+    #[must_use]
+    pub fn module(&self, source_id: SourceId) -> Option<&FrontendOutput> {
+        self.modules
+            .iter()
+            .find(|output| output.source_file().source_id() == source_id)
+    }
+}
+
+/// Runs the frontend for every module while preserving the graph's canonical identities.
+#[must_use]
+pub fn compile_program_frontend(
+    program: &ResolvedProgram,
+    mode: FrontendMode,
+) -> ProgramFrontendOutput {
+    compile_program_frontend_with_lints(
+        program,
+        mode,
+        &LintTable::new(LintProfile::Default),
+    )
+}
+
+/// Runs the frontend for every module with caller-resolved lint levels.
+#[must_use]
+pub fn compile_program_frontend_with_lints(
+    program: &ResolvedProgram,
+    mode: FrontendMode,
+    levels: &LintTable,
+) -> ProgramFrontendOutput {
+    let modules = program
+        .modules()
+        .iter()
+        .map(|module| {
+            compile_frontend_with_lints(
+                FrontendRequest {
+                    source_id: module.source_id(),
+                    script_kind: module.script_kind(),
+                    source: Arc::clone(module.source()),
+                    mode,
+                },
+                levels,
+            )
+        })
+        .collect();
+    ProgramFrontendOutput {
+        entrypoint: program.entrypoint_id(),
+        modules,
     }
 }
 
