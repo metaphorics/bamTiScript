@@ -231,30 +231,18 @@ mod tests {
         Module, Register,
     };
     use bamts_native::{AbiError, Completion, NativeEntryTable, NativeHelper, ShadowFrame, Value};
-    use bamts_runtime::{Host, HostThrow, Limits, run_linked_program};
+    use bamts_runtime::{Host, Limits, run_linked_program};
 
     use crate::Helper;
 
     use super::compile_jit;
 
-    #[derive(Default)]
-    struct TestHost {
-        exported: Option<(String, Value)>,
-    }
-
-    impl Host for TestHost {
-        fn export(&mut self, name: &str, value: Value) -> Result<(), HostThrow> {
-            self.exported = Some((name.to_owned(), value));
-            Ok(())
-        }
-    }
+    struct TestHost;
+    impl Host for TestHost {}
 
     fn returning_constant(value: i32) -> Module<bamts_bytecode::Verified> {
         Module::new(
-            vec![
-                Constant::Int32(value),
-                Constant::String("answer".to_owned()),
-            ],
+            vec![Constant::Int32(value)],
             vec![BytecodeFunction::new(
                 None,
                 0,
@@ -265,10 +253,6 @@ mod tests {
                     Instruction::LoadConst {
                         dst: Register::new(0),
                         constant: ConstantId::new(0),
-                    },
-                    Instruction::Export {
-                        name: ConstantId::new(1),
-                        src: Register::new(0),
                     },
                     Instruction::Return {
                         value: Register::new(0),
@@ -296,15 +280,12 @@ mod tests {
     fn jit_program_runs_through_the_native_runtime() {
         let bytecode = returning_constant(42);
         let program = compile_jit(&bytecode).expect("host JIT compiles the verified module");
-        let mut host = TestHost::default();
+        let mut host = TestHost;
         let outcome = run_linked_program(&bytecode, &program, &mut host, &Limits::default())
             .expect("compiled program runs");
 
         assert_eq!(program.entry_function(), 0);
-        assert_eq!(outcome.exit_code, 0);
-        let (name, value) = host.exported.expect("compiled export reached the host");
-        assert_eq!(name, "answer");
-        assert_eq!(value.as_int32(), Some(42));
+        assert_eq!(outcome, bamts_runtime::ExecutionOutcome { stdout: Vec::new(), exit_code: 0 });
     }
 
     #[test]
