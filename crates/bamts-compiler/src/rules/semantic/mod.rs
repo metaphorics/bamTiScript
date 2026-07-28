@@ -6,7 +6,7 @@ use crate::{
         SemanticModel,
     },
     diagnostic::{Diagnostic, Recovered},
-    lint::{rule_by_code, LintTable, SourceDialect},
+    lint::{LintTable, SourceDialect, rule_by_code},
     source::{SourceId, TextRange, Utf16Pos},
     syntax::{
         ExportDeclaration, ImportBinding, ModuleExportName, SourceFile, Statement, TokenKind,
@@ -194,7 +194,14 @@ pub(crate) fn collect_facts(source: &SourceFile, model: &SemanticModel) -> Analy
                 && !statement.contains(" in ")
                 && !statement.contains("!== undefined")
             {
-                push_at(&mut facts, source, SemanticHazard::UncheckedIndexRead, index, 1, None);
+                push_at(
+                    &mut facts,
+                    source,
+                    SemanticHazard::UncheckedIndexRead,
+                    index,
+                    1,
+                    None,
+                );
             }
         }
         for (index, _) in text.match_indices('.') {
@@ -263,16 +270,26 @@ pub(crate) fn collect_facts(source: &SourceFile, model: &SemanticModel) -> Analy
                 );
             }
         }
-        if line.contains('.') && (line.trim_start().starts_with("const ") || line.trim_start().starts_with("let ")) {
+        if line.contains('.')
+            && (line.trim_start().starts_with("const ") || line.trim_start().starts_with("let "))
+        {
             let alias = line
                 .split_whitespace()
                 .nth(1)
                 .map(|word| word.trim_end_matches(':'))
                 .unwrap_or("");
-            if !alias.is_empty() && text[index + 3..].contains(&format!("{alias}("))
+            if !alias.is_empty()
+                && text[index + 3..].contains(&format!("{alias}("))
                 && !line.contains(".bind(")
             {
-                push_at(&mut facts, source, SemanticHazard::DetachedMethod, index, 1, None);
+                push_at(
+                    &mut facts,
+                    source,
+                    SemanticHazard::DetachedMethod,
+                    index,
+                    1,
+                    None,
+                );
             }
         }
     }
@@ -280,8 +297,15 @@ pub(crate) fn collect_facts(source: &SourceFile, model: &SemanticModel) -> Analy
         let line = line_at(text, index);
         if let (Some(open), Some(close)) = (line.find('('), line.find(')')) {
             let params = &line[open + 1..close];
-            for parameter in params.split(',').map(str::trim).filter(|value| !value.is_empty()) {
-                if !parameter.contains(':') && !parameter.starts_with('_') && !parameter.contains('=') {
+            for parameter in params
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                if !parameter.contains(':')
+                    && !parameter.starts_with('_')
+                    && !parameter.contains('=')
+                {
                     push_at(
                         &mut facts,
                         source,
@@ -333,7 +357,8 @@ pub(crate) fn collect_facts(source: &SourceFile, model: &SemanticModel) -> Analy
     // Assertions and tainted built-ins.
     for (index, _) in text.match_indices(" as ") {
         let suffix = &text[index + 4..];
-        if !suffix.trim_start().starts_with("const") && !line_at(text, index).contains("JSON.parse") {
+        if !suffix.trim_start().starts_with("const") && !line_at(text, index).contains("JSON.parse")
+        {
             push_at(
                 &mut facts,
                 source,
@@ -348,7 +373,14 @@ pub(crate) fn collect_facts(source: &SourceFile, model: &SemanticModel) -> Analy
         for index in find_all(text, "Object.keys(") {
             let line = line_at(text, index);
             if line.contains("keyof") {
-                push_at(&mut facts, source, SemanticHazard::OpenObjectKeys, index, 11, None);
+                push_at(
+                    &mut facts,
+                    source,
+                    SemanticHazard::OpenObjectKeys,
+                    index,
+                    11,
+                    None,
+                );
             }
             if (line.contains('{') && line.contains("\"") && line.contains(':'))
                 && (line.contains("\"0\"")
@@ -357,20 +389,39 @@ pub(crate) fn collect_facts(source: &SourceFile, model: &SemanticModel) -> Analy
                     || line.contains("\"3\""))
                 && !line.contains(".sort(")
             {
-                push_at(&mut facts, source, SemanticHazard::NumericKeyOrder, index, 11, None);
+                push_at(
+                    &mut facts,
+                    source,
+                    SemanticHazard::NumericKeyOrder,
+                    index,
+                    11,
+                    None,
+                );
             }
         }
     }
     if unshadowed(text, "JSON") {
         for index in find_all(text, "JSON.parse(") {
             let line = line_at(text, index);
-            if line.contains(':') && !line.contains(": unknown") && !line.contains("validate(") && !line.contains("decode(") {
-                push_at(&mut facts, source, SemanticHazard::UncheckedJsonParse, index, 10, None);
+            if line.contains(':')
+                && !line.contains(": unknown")
+                && !line.contains("validate(")
+                && !line.contains("decode(")
+            {
+                push_at(
+                    &mut facts,
+                    source,
+                    SemanticHazard::UncheckedJsonParse,
+                    index,
+                    10,
+                    None,
+                );
             }
         }
         for index in find_all(text, "JSON.stringify(") {
             let line = line_at(text, index);
-            let unsafe_value = line.contains('n') && line.chars().any(|character| character.is_ascii_digit())
+            let unsafe_value = line.contains('n')
+                && line.chars().any(|character| character.is_ascii_digit())
                 || line.contains("undefined")
                 || line.contains("Symbol(")
                 || line.contains("function");
@@ -403,16 +454,40 @@ pub(crate) fn collect_facts(source: &SourceFile, model: &SemanticModel) -> Analy
                 _ => false,
             };
             if invalid {
-                push_at(&mut facts, source, SemanticHazard::InvalidNumberFormatting, index, method.len(), None);
+                push_at(
+                    &mut facts,
+                    source,
+                    SemanticHazard::InvalidNumberFormatting,
+                    index,
+                    method.len(),
+                    None,
+                );
             }
         }
     }
     for index in find_all(text, ".sort(") {
         let line = line_at(text, index);
-        let argument = line.split(".sort(").nth(1).and_then(|tail| tail.split(')').next()).unwrap_or("").trim();
-        let numeric = line.contains('[') && line.chars().any(|character| character.is_ascii_digit());
-        if (argument.is_empty() || argument == "undefined") && numeric && !line.contains('"') && !line.contains('\'') {
-            push_at(&mut facts, source, SemanticHazard::NumericDefaultSort, index, 6, None);
+        let argument = line
+            .split(".sort(")
+            .nth(1)
+            .and_then(|tail| tail.split(')').next())
+            .unwrap_or("")
+            .trim();
+        let numeric =
+            line.contains('[') && line.chars().any(|character| character.is_ascii_digit());
+        if (argument.is_empty() || argument == "undefined")
+            && numeric
+            && !line.contains('"')
+            && !line.contains('\'')
+        {
+            push_at(
+                &mut facts,
+                source,
+                SemanticHazard::NumericDefaultSort,
+                index,
+                6,
+                None,
+            );
         }
     }
 
@@ -429,7 +504,14 @@ pub(crate) fn collect_facts(source: &SourceFile, model: &SemanticModel) -> Analy
                     || right.contains("true")
                     || right.contains("false");
                 if domains_differ || left.contains("any") || right.contains("any") {
-                    push_at(&mut facts, source, SemanticHazard::LooseEqualityCoercion, index, operator.len(), None);
+                    push_at(
+                        &mut facts,
+                        source,
+                        SemanticHazard::LooseEqualityCoercion,
+                        index,
+                        operator.len(),
+                        None,
+                    );
                 }
             }
         }
@@ -437,9 +519,21 @@ pub(crate) fn collect_facts(source: &SourceFile, model: &SemanticModel) -> Analy
     for operator in [" + ", " - ", " * ", " / "] {
         for index in find_all(text, operator) {
             let line = line_at(text, index);
-            let object_like = line.contains("Object.create(") || line.contains("{}") || line.contains("[]");
-            if object_like && !line.contains("String(") && !line.contains("Number(") && !text.contains("Symbol.toPrimitive") {
-                push_at(&mut facts, source, SemanticHazard::ObjectToPrimitive, index, operator.len(), None);
+            let object_like =
+                line.contains("Object.create(") || line.contains("{}") || line.contains("[]");
+            if object_like
+                && !line.contains("String(")
+                && !line.contains("Number(")
+                && !text.contains("Symbol.toPrimitive")
+            {
+                push_at(
+                    &mut facts,
+                    source,
+                    SemanticHazard::ObjectToPrimitive,
+                    index,
+                    operator.len(),
+                    None,
+                );
             }
         }
     }
@@ -450,14 +544,28 @@ pub(crate) fn collect_facts(source: &SourceFile, model: &SemanticModel) -> Analy
                 .and_then(|tick| text[..tick].chars().last())
                 .is_some_and(|character| character.is_ascii_alphanumeric() || character == ')');
             if !tagged {
-                push_at(&mut facts, source, SemanticHazard::SymbolInterpolation, index, 2, None);
+                push_at(
+                    &mut facts,
+                    source,
+                    SemanticHazard::SymbolInterpolation,
+                    index,
+                    2,
+                    None,
+                );
             }
         }
         for index in find_all(text, "[Symbol.toStringTag]") {
             let line = line_at(text, index);
             let value = line.split(':').nth(1).unwrap_or("").trim();
             if !value.starts_with('"') && !value.starts_with('\'') && !value.starts_with('`') {
-                push_at(&mut facts, source, SemanticHazard::UnsafeToStringTag, index, 20, None);
+                push_at(
+                    &mut facts,
+                    source,
+                    SemanticHazard::UnsafeToStringTag,
+                    index,
+                    20,
+                    None,
+                );
             }
         }
     }
@@ -476,16 +584,20 @@ fn collect_class_and_enum_facts(source: &SourceFile, text: &str, facts: &mut Ana
         if let Some(call) = tail.find("this.") {
             let line = line_at(text, index + call);
             if line.contains("this.") && line.contains("()") && !line.contains("super.") {
-                push_at(facts, source, SemanticHazard::VirtualCallInConstructor, index + call, 5, None);
+                push_at(
+                    facts,
+                    source,
+                    SemanticHazard::VirtualCallInConstructor,
+                    index + call,
+                    5,
+                    None,
+                );
             }
         }
     }
     for (get_index, _) in text.match_indices("get ") {
         let getter_tail = &text[get_index..];
-        let getter_head = getter_tail
-            .split(['{', '\n'])
-            .next()
-            .unwrap_or(getter_tail);
+        let getter_head = getter_tail.split(['{', '\n']).next().unwrap_or(getter_tail);
         let name = getter_head
             .split_whitespace()
             .nth(1)
@@ -497,9 +609,20 @@ fn collect_class_and_enum_facts(source: &SourceFile, text: &str, facts: &mut Ana
         if let Some(set_index) = text.find(&format!("set {name}(")) {
             let setter_line = &text[set_index..];
             let get_type = getter_head.split("():").nth(1).map(str::trim);
-            let set_type = setter_line.split(':').nth(1).and_then(|tail| tail.split(')').next()).map(str::trim);
+            let set_type = setter_line
+                .split(':')
+                .nth(1)
+                .and_then(|tail| tail.split(')').next())
+                .map(str::trim);
             if get_type.is_some() && set_type.is_some() && get_type != set_type {
-                push_at(facts, source, SemanticHazard::DivergentAccessor, set_index, name.len() + 4, None);
+                push_at(
+                    facts,
+                    source,
+                    SemanticHazard::DivergentAccessor,
+                    set_index,
+                    name.len() + 4,
+                    None,
+                );
             }
         }
         if text.contains(" extends ") {
@@ -509,13 +632,27 @@ fn collect_class_and_enum_facts(source: &SourceFile, text: &str, facts: &mut Ana
                     && !statement.contains("get ")
                     && !statement.contains("set ")
                 {
-                    push_at(facts, source, SemanticHazard::InitializedFieldShadowsAccessor, name_index, name.len(), None);
+                    push_at(
+                        facts,
+                        source,
+                        SemanticHazard::InitializedFieldShadowsAccessor,
+                        name_index,
+                        name.len(),
+                        None,
+                    );
                 } else if statement.contains(':')
                     && !statement.contains('=')
                     && !statement.contains("declare ")
                     && !statement.contains("get ")
                 {
-                    push_at(facts, source, SemanticHazard::UninitializedFieldShadowsAccessor, name_index, name.len(), None);
+                    push_at(
+                        facts,
+                        source,
+                        SemanticHazard::UninitializedFieldShadowsAccessor,
+                        name_index,
+                        name.len(),
+                        None,
+                    );
                 }
             }
         }
@@ -532,8 +669,18 @@ fn collect_class_and_enum_facts(source: &SourceFile, text: &str, facts: &mut Ana
                 for (index, _) in text[extends..].match_indices(&format!("{method}(")) {
                     let absolute = extends + index;
                     let line = line_at(text, absolute);
-                    if !line.contains("override") && !line.contains("private") && !line.contains("static") {
-                        push_at(facts, source, SemanticHazard::ImplicitOverride, absolute, method.len(), None);
+                    if !line.contains("override")
+                        && !line.contains("private")
+                        && !line.contains("static")
+                    {
+                        push_at(
+                            facts,
+                            source,
+                            SemanticHazard::ImplicitOverride,
+                            absolute,
+                            method.len(),
+                            None,
+                        );
                     }
                 }
             }
@@ -541,15 +688,33 @@ fn collect_class_and_enum_facts(source: &SourceFile, text: &str, facts: &mut Ana
     }
     for (enum_index, _) in text.match_indices("enum ") {
         let line = line_at(text, enum_index);
-        let enum_name = line.split_whitespace().nth(1).and_then(|part| part.split('{').next()).unwrap_or("");
-        let enum_annotation = text.contains(&format!(": {enum_name}"))
-            || text.contains(&format!(":{enum_name}"));
+        let enum_name = line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|part| part.split('{').next())
+            .unwrap_or("");
+        let enum_annotation =
+            text.contains(&format!(": {enum_name}")) || text.contains(&format!(":{enum_name}"));
         let number_annotation = text.contains(": number") || text.contains(":number");
         if !enum_name.is_empty() && enum_annotation && number_annotation {
-            push_at(facts, source, SemanticHazard::NumericEnumNumber, enum_index, enum_name.len() + 5, None);
+            push_at(
+                facts,
+                source,
+                SemanticHazard::NumericEnumNumber,
+                enum_index,
+                enum_name.len() + 5,
+                None,
+            );
         }
         for (index, _) in text.match_indices(&format!("{enum_name}[")) {
-            push_at(facts, source, SemanticHazard::NumericEnumReverseLookup, index, enum_name.len(), None);
+            push_at(
+                facts,
+                source,
+                SemanticHazard::NumericEnumReverseLookup,
+                index,
+                enum_name.len(),
+                None,
+            );
         }
     }
 }
@@ -557,7 +722,9 @@ fn collect_class_and_enum_facts(source: &SourceFile, text: &str, facts: &mut Ana
 fn collect_switch_facts(source: &SourceFile, text: &str, facts: &mut AnalysisFacts) {
     for (switch_index, _) in text.match_indices("switch (") {
         let before = &text[..switch_index];
-        let Some(type_index) = before.rfind("type ") else { continue };
+        let Some(type_index) = before.rfind("type ") else {
+            continue;
+        };
         let declaration = line_at(text, type_index);
         if !declaration.contains('|') || !declaration.contains("kind:") {
             continue;
@@ -602,21 +769,35 @@ pub(crate) fn collect_program_facts(
                     .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
                     .next()
                     .unwrap_or("");
-                if name.is_empty() || to_text.contains(&format!("class {name}")) || to_text.contains(&format!("enum {name}")) {
+                if name.is_empty()
+                    || to_text.contains(&format!("class {name}"))
+                    || to_text.contains(&format!("enum {name}"))
+                {
                     continue;
                 }
                 for (use_index, _) in from_text.match_indices(name) {
                     let line = line_at(from_text, use_index);
                     if line.contains("import {") && !line.contains("import type") {
-                        additions.push((SemanticHazard::TypeImportedAsValue, use_index, name.len()));
+                        additions.push((
+                            SemanticHazard::TypeImportedAsValue,
+                            use_index,
+                            name.len(),
+                        ));
                     }
                     if line.contains("export {") && !line.contains("export type") {
-                        additions.push((SemanticHazard::TypeReexportedAsValue, use_index, name.len()));
+                        additions.push((
+                            SemanticHazard::TypeReexportedAsValue,
+                            use_index,
+                            name.len(),
+                        ));
                     }
                 }
             }
         }
-        if from_text.contains("export ") && from_text.contains(" = ") && from_text.contains("import ") {
+        if from_text.contains("export ")
+            && from_text.contains(" = ")
+            && from_text.contains("import ")
+        {
             if let Some(index) = from_text.find("export ") {
                 additions.push((SemanticHazard::DeclarationInferenceDependency, index, 6));
             }
@@ -637,9 +818,9 @@ pub(crate) fn collect_program_facts(
             let Statement::Import(import) = statement.data() else {
                 continue;
             };
-            let edge = edges.iter().find(|edge| {
-                edge.from == source.source_id() && edge.specifier == statement.id()
-            });
+            let edge = edges
+                .iter()
+                .find(|edge| edge.from == source.source_id() && edge.specifier == statement.id());
             if import.clause.is_none() {
                 if edge.is_none() {
                     additions.push(HazardFact {
@@ -677,7 +858,10 @@ pub(crate) fn collect_program_facts(
                         additions.push(HazardFact {
                             hazard: SemanticHazard::CjsEsmNamedExportMismatch,
                             range: specifier.range(),
-                            note: Some(format!("CommonJS target does not statically export `{name}`").into_boxed_str()),
+                            note: Some(
+                                format!("CommonJS target does not statically export `{name}`")
+                                    .into_boxed_str(),
+                            ),
                         });
                     }
                 }
@@ -699,19 +883,29 @@ struct CommonJsExports<'a> {
 }
 
 fn commonjs_exports(source: &SourceFile) -> CommonJsExports<'_> {
-    let tokens = source.tokens().iter().filter_map(|token| {
-        if matches!(token.kind(), TokenKind::Whitespace | TokenKind::LineComment | TokenKind::BlockComment) {
-            return None;
-        }
-        Some((token.kind(), source.token_text(token)?))
-    }).collect::<Vec<_>>();
+    let tokens = source
+        .tokens()
+        .iter()
+        .filter_map(|token| {
+            if matches!(
+                token.kind(),
+                TokenKind::Whitespace | TokenKind::LineComment | TokenKind::BlockComment
+            ) {
+                return None;
+            }
+            Some((token.kind(), source.token_text(token)?))
+        })
+        .collect::<Vec<_>>();
     let mut is_commonjs = false;
     let mut named = Vec::new();
     for window in tokens.windows(3) {
         if window[0].1 == "module" && window[1].0 == TokenKind::Dot && window[2].1 == "exports" {
             is_commonjs = true;
         }
-        if window[0].1 == "exports" && window[1].0 == TokenKind::Dot && window[2].0 == TokenKind::Identifier {
+        if window[0].1 == "exports"
+            && window[1].0 == TokenKind::Dot
+            && window[2].0 == TokenKind::Identifier
+        {
             is_commonjs = true;
             named.push(window[2].1);
         }
@@ -760,7 +954,10 @@ fn commonjs_exports(source: &SourceFile) -> CommonJsExports<'_> {
 
 fn has_esm_default_export(source: &SourceFile) -> bool {
     source.statements().iter().any(|statement| {
-        matches!(statement.data(), Statement::Export(ExportDeclaration::Default(_)))
+        matches!(
+            statement.data(),
+            Statement::Export(ExportDeclaration::Default(_))
+        )
     })
 }
 
@@ -773,7 +970,9 @@ fn module_export_name<'a>(source: &'a SourceFile, name: &ModuleExportName) -> Op
     let text = source.source_text();
     let start = text.utf16_to_byte(range.start()).ok()?;
     let end = text.utf16_to_byte(range.end()).ok()?;
-    text.as_str().get(start..end).map(|value| value.trim_matches(['"', '\'']))
+    text.as_str()
+        .get(start..end)
+        .map(|value| value.trim_matches(['"', '\'']))
 }
 
 #[cfg(test)]
@@ -781,14 +980,18 @@ mod tests {
     use std::sync::Arc;
 
     use crate::{
-        checker::{check_program, check_with_lints, ProgramCheckInput, ResolvedModuleEdge},
+        checker::{ProgramCheckInput, ResolvedModuleEdge, check_program, check_with_lints},
         lint::{LintProfile, LintTable},
         parser, scanner,
         source::{ScriptKind, SourceId, SourceText},
         syntax::{NodeId, SourceFile},
     };
 
-    fn parsed(source_id: u32, source: &str, kind: ScriptKind) -> crate::diagnostic::Recovered<SourceFile> {
+    fn parsed(
+        source_id: u32,
+        source: &str,
+        kind: ScriptKind,
+    ) -> crate::diagnostic::Recovered<SourceFile> {
         parser::parse(scanner::scan(
             SourceId::new(source_id),
             kind,
@@ -808,37 +1011,139 @@ mod tests {
     #[test]
     fn every_single_file_rule_has_a_trigger_and_high_risk_near_miss() {
         let cases = [
-            ("BAMTS-W008", "interface D {[key: string]: number} declare const d:D; declare const k:string; const n=d[k];", "const colors: Record<'red', number>={red:1}; const n=colors['red'];"),
-            ("BAMTS-W009", "const o: {p?: number} = {p: undefined};", "const o: {p?: number | undefined} = {p: undefined};"),
+            (
+                "BAMTS-W008",
+                "interface D {[key: string]: number} declare const d:D; declare const k:string; const n=d[k];",
+                "const colors: Record<'red', number>={red:1}; const n=colors['red'];",
+            ),
+            (
+                "BAMTS-W009",
+                "const o: {p?: number} = {p: undefined};",
+                "const o: {p?: number | undefined} = {p: undefined};",
+            ),
             ("BAMTS-W010", "const f = obj.method; f();", "obj.method();"),
-            ("BAMTS-W011", "class C { get x(): number {return 1} set x(v: string | number) {} }", "class C { get x(): number {return 1} set x(v: number) {} }"),
-            ("BAMTS-W012", "const m={x:1}; const r:{readonly x:number}=m; m.x=2;", "const m={x:1}; const r:{readonly x:number}=m; publishReadonly(m); m.x=2;"),
-            ("BAMTS-W013", "const f: (x:number,y:string)=>void = () => {};", "const f: (x:number,y:string)=>void = (x,y) => {};"),
-            ("BAMTS-W014", "const f: () => void = () => 42;", "const f: () => void = () => { consume(42); };"),
-            ("BAMTS-W015", "const ks = Object.keys(x) as (keyof typeof x)[];", "const ks = Object.keys(x);"),
-            ("BAMTS-W016", "interface D {[key:string]: number} declare const d:D; d.username;", "interface D {[key:string]: number} declare const d:D; d['username'];"),
-            ("BAMTS-W018", "function f(value) { return value; }", "function f(value: unknown) { return value; }"),
-            ("BAMTS-W019", "const user = value as User;", "if (isUser(value)) { const user: User = value; }"),
-            ("BAMTS-W038", "class B { constructor(){ this.init() } init(){} }", "class B { constructor(){ initializeDirectly() } init(){} }"),
-            ("BAMTS-W040", "class B { get data():number{return 1} } class D extends B { data = 1; }", "class B { get data():number{return 1} } class D extends B { declare data:number; }"),
-            ("BAMTS-W041", "class B { run(){} } class D extends B { run(){} }", "class B { run(){} } class D extends B { override run(){} }"),
-            ("BAMTS-W045", "enum E { A } let e:E=E.A; let n:number=e;", "enum E { A } const e=E.A;"),
-            ("BAMTS-W048", "enum E { A } const name=E[E.A];", "enum E { A } const value=E.A;"),
-            ("BAMTS-W063", "type S={kind:'a'}|{kind:'b'}; declare const s:S; switch (s.kind) { case 'a': break; }", "type S={kind:'a'}|{kind:'b'}; declare const s:S; switch (s.kind) { case 'a': break; case 'b': break; }"),
+            (
+                "BAMTS-W011",
+                "class C { get x(): number {return 1} set x(v: string | number) {} }",
+                "class C { get x(): number {return 1} set x(v: number) {} }",
+            ),
+            (
+                "BAMTS-W012",
+                "const m={x:1}; const r:{readonly x:number}=m; m.x=2;",
+                "const m={x:1}; const r:{readonly x:number}=m; publishReadonly(m); m.x=2;",
+            ),
+            (
+                "BAMTS-W013",
+                "const f: (x:number,y:string)=>void = () => {};",
+                "const f: (x:number,y:string)=>void = (x,y) => {};",
+            ),
+            (
+                "BAMTS-W014",
+                "const f: () => void = () => 42;",
+                "const f: () => void = () => { consume(42); };",
+            ),
+            (
+                "BAMTS-W015",
+                "const ks = Object.keys(x) as (keyof typeof x)[];",
+                "const ks = Object.keys(x);",
+            ),
+            (
+                "BAMTS-W016",
+                "interface D {[key:string]: number} declare const d:D; d.username;",
+                "interface D {[key:string]: number} declare const d:D; d['username'];",
+            ),
+            (
+                "BAMTS-W018",
+                "function f(value) { return value; }",
+                "function f(value: unknown) { return value; }",
+            ),
+            (
+                "BAMTS-W019",
+                "const user = value as User;",
+                "if (isUser(value)) { const user: User = value; }",
+            ),
+            (
+                "BAMTS-W038",
+                "class B { constructor(){ this.init() } init(){} }",
+                "class B { constructor(){ initializeDirectly() } init(){} }",
+            ),
+            (
+                "BAMTS-W040",
+                "class B { get data():number{return 1} } class D extends B { data = 1; }",
+                "class B { get data():number{return 1} } class D extends B { declare data:number; }",
+            ),
+            (
+                "BAMTS-W041",
+                "class B { run(){} } class D extends B { run(){} }",
+                "class B { run(){} } class D extends B { override run(){} }",
+            ),
+            (
+                "BAMTS-W045",
+                "enum E { A } let e:E=E.A; let n:number=e;",
+                "enum E { A } const e=E.A;",
+            ),
+            (
+                "BAMTS-W048",
+                "enum E { A } const name=E[E.A];",
+                "enum E { A } const value=E.A;",
+            ),
+            (
+                "BAMTS-W063",
+                "type S={kind:'a'}|{kind:'b'}; declare const s:S; switch (s.kind) { case 'a': break; }",
+                "type S={kind:'a'}|{kind:'b'}; declare const s:S; switch (s.kind) { case 'a': break; case 'b': break; }",
+            ),
             ("BAMTS-W071", "(42).toString(1);", "(42).toString(36);"),
-            ("BAMTS-W072", "Object.keys({ b: 1, \"2\": 2 });", "Object.keys({ b: 1, \"2\": 2 }).sort();"),
-            ("BAMTS-W073", "JSON.stringify(10n);", "JSON.stringify(10n, (_key, value) => typeof value === 'bigint' ? String(value) : value);"),
-            ("BAMTS-W074", "const user: User = JSON.parse(text);", "const raw: unknown = JSON.parse(text);"),
-            ("BAMTS-W075", "[10, 2, 5].sort();", "[10, 2, 5].sort((a,b)=>a-b);"),
+            (
+                "BAMTS-W072",
+                "Object.keys({ b: 1, \"2\": 2 });",
+                "Object.keys({ b: 1, \"2\": 2 }).sort();",
+            ),
+            (
+                "BAMTS-W073",
+                "JSON.stringify(10n);",
+                "JSON.stringify(10n, (_key, value) => typeof value === 'bigint' ? String(value) : value);",
+            ),
+            (
+                "BAMTS-W074",
+                "const user: User = JSON.parse(text);",
+                "const raw: unknown = JSON.parse(text);",
+            ),
+            (
+                "BAMTS-W075",
+                "[10, 2, 5].sort();",
+                "[10, 2, 5].sort((a,b)=>a-b);",
+            ),
             ("BAMTS-W076", "\"0\" == false;", "\"0\" === String(false);"),
-            ("BAMTS-W077", "\"key_\" + Object.create(null);", "\"key_\" + String(Object.create(null));"),
-            ("BAMTS-W078", "`ID: ${Symbol('x')}`;", "tag`ID: ${Symbol('x')}`;"),
-            ("BAMTS-W080", "const tagged = { [Symbol.toStringTag]: 123 };", "const tagged = { [Symbol.toStringTag]: 'Widget' };"),
-            ("BAMTS-W081", "class B { get data():number{return 1} } class D extends B { data:number; }", "class B { get data():number{return 1} } class D extends B { declare data:number; }"),
+            (
+                "BAMTS-W077",
+                "\"key_\" + Object.create(null);",
+                "\"key_\" + String(Object.create(null));",
+            ),
+            (
+                "BAMTS-W078",
+                "`ID: ${Symbol('x')}`;",
+                "tag`ID: ${Symbol('x')}`;",
+            ),
+            (
+                "BAMTS-W080",
+                "const tagged = { [Symbol.toStringTag]: 123 };",
+                "const tagged = { [Symbol.toStringTag]: 'Widget' };",
+            ),
+            (
+                "BAMTS-W081",
+                "class B { get data():number{return 1} } class D extends B { data:number; }",
+                "class B { get data():number{return 1} } class D extends B { declare data:number; }",
+            ),
         ];
         for (code, trigger, safe) in cases {
-            assert!(codes(trigger).contains(&code), "{code} did not fire for {trigger}");
-            assert!(!codes(safe).contains(&code), "{code} fired for near miss {safe}");
+            assert!(
+                codes(trigger).contains(&code),
+                "{code} did not fire for {trigger}"
+            );
+            assert!(
+                !codes(safe).contains(&code),
+                "{code} fired for near miss {safe}"
+            );
         }
     }
 
@@ -914,14 +1219,20 @@ mod tests {
 
     #[test]
     fn javascript_only_keeps_spec_footguns_as_warnings() {
-        let parsed = parsed(0, "(42).toString(1); const x = value as User;", ScriptKind::JavaScript);
+        let parsed = parsed(
+            0,
+            "(42).toString(1); const x = value as User;",
+            ScriptKind::JavaScript,
+        );
         let result = check_with_lints(&parsed, &LintTable::new(LintProfile::Pedantic));
         assert!(result.diagnostics().iter().any(|diagnostic| {
             diagnostic.code().as_str() == "BAMTS-W071" && diagnostic.is_warning()
         }));
-        assert!(result
-            .diagnostics()
-            .iter()
-            .all(|diagnostic| diagnostic.code().as_str() != "BAMTS-W019"));
+        assert!(
+            result
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.code().as_str() != "BAMTS-W019")
+        );
     }
 }

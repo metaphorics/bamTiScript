@@ -662,7 +662,10 @@ impl std::fmt::Display for CorpusFailure {
 const FAILURE_EVIDENCE_BYTES: usize = 512;
 
 fn lower_stage(error: &bamts_compiler::lower::LowerError) -> CorpusStage {
-    if matches!(&error.kind, bamts_compiler::lower::LowerErrorKind::Verify(_)) {
+    if matches!(
+        &error.kind,
+        bamts_compiler::lower::LowerErrorKind::Verify(_)
+    ) {
         CorpusStage::Verify
     } else {
         CorpusStage::Lower
@@ -704,10 +707,7 @@ fn driver_error_evidence(error: &driver::DriverError) -> String {
         driver::DriverError::Diagnostics { rendered } => {
             let code = first_diagnostic_code(rendered);
             match code {
-                Some(code) => format!(
-                    "diagnostic={code}; rendered={}",
-                    bounded_text(rendered)
-                ),
+                Some(code) => format!("diagnostic={code}; rendered={}", bounded_text(rendered)),
                 None => format!("rendered={}", bounded_text(rendered)),
             }
         }
@@ -793,8 +793,8 @@ impl BamtsRunner {
         )
         .map_err(|error| corpus_stage_error(CorpusStage::Resolve, error))?;
         let started = Instant::now();
-        let outcome = driver::execute(&args)
-            .map_err(|error| cli_error(spec, ExecutionMode::Jit, error))?;
+        let outcome =
+            driver::execute(&args).map_err(|error| cli_error(spec, ExecutionMode::Jit, error))?;
         Ok(driver_outcome(
             outcome,
             started.elapsed() >= spec.timeout(),
@@ -814,8 +814,8 @@ impl BamtsRunner {
         )
         .map_err(|error| corpus_stage_error(CorpusStage::Resolve, error))?;
         let started = Instant::now();
-        let compile = driver::execute(&args)
-            .map_err(|error| cli_error(spec, ExecutionMode::Aot, error))?;
+        let compile =
+            driver::execute(&args).map_err(|error| cli_error(spec, ExecutionMode::Aot, error))?;
         let elapsed = started.elapsed();
         if elapsed >= spec.timeout() {
             return Ok(driver_outcome(compile, true, self.max_output_bytes));
@@ -868,11 +868,7 @@ fn cli_args(
     })
 }
 
-fn driver_outcome(
-    outcome: driver::CommandOutcome,
-    timed_out: bool,
-    cap: usize,
-) -> OracleOutcome {
+fn driver_outcome(outcome: driver::CommandOutcome, timed_out: bool, cap: usize) -> OracleOutcome {
     let mut stdout = outcome.stdout;
     let mut stderr = outcome.stderr;
     let stdout_truncated = stdout.len() > cap;
@@ -936,7 +932,11 @@ fn cli_error(
 fn corpus_stage_error(stage: CorpusStage, error: VerificationError) -> VerificationError {
     VerificationError::new(
         error.code(),
-        format!("stage={}: {}", stage.as_str(), bounded_text(&error.to_string())),
+        format!(
+            "stage={}: {}",
+            stage.as_str(),
+            bounded_text(&error.to_string())
+        ),
     )
 }
 
@@ -1018,8 +1018,14 @@ fn run_process(
     let mut child = command
         .spawn()
         .map_err(|error| spawn_error(label, program, &error))?;
-    let stdout = child.stdout.take().ok_or_else(|| pipe_error(label, "stdout"))?;
-    let stderr = child.stderr.take().ok_or_else(|| pipe_error(label, "stderr"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| pipe_error(label, "stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| pipe_error(label, "stderr"))?;
 
     let cap = limits.max_output_bytes;
     let stdout_handle = drain_stream(stdout, cap);
@@ -1387,10 +1393,7 @@ fn pipe_error(label: &str, stream: &str) -> VerificationError {
 }
 
 fn wait_error(label: &str, error: std::io::Error) -> VerificationError {
-    VerificationError::new(
-        ErrorCode::Io,
-        format!("cannot wait on {label}: {error}"),
-    )
+    VerificationError::new(ErrorCode::Io, format!("cannot wait on {label}: {error}"))
 }
 
 fn thread_error(label: &str, stream: &str) -> VerificationError {

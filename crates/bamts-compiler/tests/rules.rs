@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use bamts_compiler::{
-    checker::{check_program, check_with_lints, ProgramCheckInput, ResolvedModuleEdge},
+    checker::{ProgramCheckInput, ResolvedModuleEdge, check_program, check_with_lints},
     diagnostic::Recovered,
     lint::{
-        rule_reference, LintLevel, LintOverride, LintProfile, LintTable, RuleDefinition,
-        RuleExampleCase, RuleExampleSource, RULES,
+        LintLevel, LintOverride, LintProfile, LintTable, RULES, RuleDefinition, RuleExampleCase,
+        RuleExampleSource, rule_reference,
     },
     parser, rules, scanner,
     source::{SourceId, SourceText},
@@ -17,7 +17,11 @@ const REFERENCE: &str = include_str!("../RULES.md");
 #[test]
 fn every_registered_rule_has_complete_metadata_and_current_reference() {
     assert_eq!(RULES.len(), 86, "the adopted catalog has exactly 86 rules");
-    assert_eq!(REFERENCE, rule_reference(), "regenerate RULES.md from RULES");
+    assert_eq!(
+        REFERENCE,
+        rule_reference(),
+        "regenerate RULES.md from RULES"
+    );
 
     for rule in &RULES {
         assert_complete_metadata(rule);
@@ -39,8 +43,16 @@ fn assert_case_nonempty(case: RuleExampleCase, rule: &RuleDefinition) {
     match case {
         RuleExampleCase::Source(source) => assert!(!source.text().trim().is_empty()),
         RuleExampleCase::Program(sources) => {
-            assert!(!sources.is_empty(), "{} has an empty program example", rule.code());
-            assert!(sources.iter().all(|source| !source.text().trim().is_empty()));
+            assert!(
+                !sources.is_empty(),
+                "{} has an empty program example",
+                rule.code()
+            );
+            assert!(
+                sources
+                    .iter()
+                    .all(|source| !source.text().trim().is_empty())
+            );
         }
         RuleExampleCase::CompilerOptions(_) => {}
     }
@@ -69,7 +81,11 @@ fn every_registered_rule_triggers_and_has_a_clean_counterexample() {
             ));
         }
     }
-    assert!(failures.is_empty(), "rule contract failures:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "rule contract failures:\n{}",
+        failures.join("\n")
+    );
 }
 
 fn only_rule_enabled(rule: &'static RuleDefinition) -> LintTable {
@@ -119,8 +135,11 @@ fn run_program(sources: &[RuleExampleSource], levels: &LintTable) -> Vec<String>
             let target = source.resolves_to()?;
             let file = files[index].product();
             let specifier = file.statements().iter().find_map(|statement| {
-                matches!(statement.data(), Statement::Import(_) | Statement::Export(_))
-                    .then_some(statement.id())
+                matches!(
+                    statement.data(),
+                    Statement::Import(_) | Statement::Export(_)
+                )
+                .then_some(statement.id())
             })?;
             Some(ResolvedModuleEdge {
                 from: SourceId::new(u32::try_from(index).expect("example source index fits u32")),

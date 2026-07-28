@@ -129,7 +129,11 @@ impl fmt::Display for DriverError {
             Self::Diagnostics { .. } => formatter.write_str("source contains error diagnostics"),
             Self::Usage(error) => error.fmt(formatter),
             Self::LintConfig { path, message } => {
-                write!(formatter, "could not load lint configuration `{}`: {message}", path.display())
+                write!(
+                    formatter,
+                    "could not load lint configuration `{}`: {message}",
+                    path.display()
+                )
             }
             Self::Lower(error) => write!(formatter, "source cannot be lowered: {error}"),
             Self::Jit(error) => write!(formatter, "JIT compilation failed: {error}"),
@@ -277,7 +281,9 @@ fn levels(args: &CliArgs) -> Result<LintTable, DriverError> {
             path: path.clone(),
             message: error.to_string(),
         })?;
-        levels.apply_config(&config).map_err(forbidden_lint_override)?;
+        levels
+            .apply_config(&config)
+            .map_err(forbidden_lint_override)?;
     }
     let overrides = args.lint_overrides.iter().map(|override_arg| {
         let flag = match override_arg.level {
@@ -292,7 +298,9 @@ fn levels(args: &CliArgs) -> Result<LintTable, DriverError> {
             format!("{flag} {}", override_arg.selector),
         )
     });
-    levels.apply_cli(overrides).map_err(forbidden_lint_override)?;
+    levels
+        .apply_cli(overrides)
+        .map_err(forbidden_lint_override)?;
     Ok(levels)
 }
 
@@ -313,11 +321,16 @@ fn lint_config_path(args: &CliArgs) -> Option<PathBuf> {
             if parent.is_absolute() {
                 Some(parent.to_path_buf())
             } else {
-                std::env::current_dir().ok().map(|directory| directory.join(parent))
+                std::env::current_dir()
+                    .ok()
+                    .map(|directory| directory.join(parent))
             }
         },
     )?;
-    start.ancestors().map(|directory| directory.join("bamts.toml")).find(|path| path.is_file())
+    start
+        .ancestors()
+        .map(|directory| directory.join("bamts.toml"))
+        .find(|path| path.is_file())
 }
 
 fn check(args: &CliArgs) -> Result<CommandOutcome, DriverError> {
@@ -446,7 +459,11 @@ struct FrontendUnit {
     output: bamts_compiler::pipeline::FrontendOutput,
 }
 
-fn frontend(path: &Path, source_id: SourceId, levels: &LintTable) -> Result<FrontendUnit, DriverError> {
+fn frontend(
+    path: &Path,
+    source_id: SourceId,
+    levels: &LintTable,
+) -> Result<FrontendUnit, DriverError> {
     let source = fs::read_to_string(path).map_err(|source| DriverError::ReadSource {
         path: path.to_owned(),
         source,
@@ -758,9 +775,7 @@ fn publish_linked_executable(temporary: &Path, destination: &Path) -> Result<(),
 
 #[cfg(test)]
 mod tests {
-    use bamts_compiler::{
-        lint::{LintLevel, SourceDialect, rule_by_name},
-    };
+    use bamts_compiler::lint::{LintLevel, SourceDialect, rule_by_name};
 
     use crate::args::{ArgsError, parse_args};
 
@@ -834,7 +849,13 @@ mod tests {
             .expect("registered footgun")
             .id();
         let typescript_only = rule_by_name("explicit-any").expect("registered rule").id();
-        assert_eq!(table.level_for_source(footgun, SourceDialect::JavaScript), LintLevel::Warn);
-        assert_eq!(table.level_for_source(typescript_only, SourceDialect::JavaScript), LintLevel::Allow);
+        assert_eq!(
+            table.level_for_source(footgun, SourceDialect::JavaScript),
+            LintLevel::Warn
+        );
+        assert_eq!(
+            table.level_for_source(typescript_only, SourceDialect::JavaScript),
+            LintLevel::Allow
+        );
     }
 }

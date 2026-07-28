@@ -133,9 +133,21 @@ pub fn analyze_compiler_options(
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     for (enabled, code, message) in [
-        (options.preserve_const_enums, "BAMTS-W082", "preserveConstEnums retains runtime enum objects while inlining uses"),
-        (options.emit_decorator_metadata, "BAMTS-W083", "emitDecoratorMetadata couples runtime reflection to compiler types"),
-        (!options.use_define_for_class_fields, "BAMTS-W084", "useDefineForClassFields=false selects legacy setter-invoking semantics"),
+        (
+            options.preserve_const_enums,
+            "BAMTS-W082",
+            "preserveConstEnums retains runtime enum objects while inlining uses",
+        ),
+        (
+            options.emit_decorator_metadata,
+            "BAMTS-W083",
+            "emitDecoratorMetadata couples runtime reflection to compiler types",
+        ),
+        (
+            !options.use_define_for_class_fields,
+            "BAMTS-W084",
+            "useDefineForClassFields=false selects legacy setter-invoking semantics",
+        ),
     ] {
         if !enabled {
             continue;
@@ -862,15 +874,32 @@ fn find_catalog_completion(
     findings: &mut Vec<(&'static str, TextRange, &'static str)>,
 ) {
     let anchor = tokens.first().map_or(source.range(), |token| token.range);
-    if matches!(source.script_kind(), ScriptKind::JavaScript | ScriptKind::JavaScriptReact) {
-        findings.push(("BAMTS-W054", anchor, "JavaScript source enters the typed program"));
+    if matches!(
+        source.script_kind(),
+        ScriptKind::JavaScript | ScriptKind::JavaScriptReact
+    ) {
+        findings.push((
+            "BAMTS-W054",
+            anchor,
+            "JavaScript source enters the typed program",
+        ));
     }
     for comment in comments {
         if comment.text.contains("@type {") || comment.text.contains("@typedef {") {
-            push(findings, "BAMTS-W055", *comment, "JSDoc comment carries JavaScript type syntax");
+            push(
+                findings,
+                "BAMTS-W055",
+                *comment,
+                "JSDoc comment carries JavaScript type syntax",
+            );
         }
         if comment.text.contains("@ts-check") {
-            push(findings, "BAMTS-W057", *comment, "per-file ts-check directive changes checking policy");
+            push(
+                findings,
+                "BAMTS-W057",
+                *comment,
+                "per-file ts-check directive changes checking policy",
+            );
         }
     }
     for window in tokens.windows(7) {
@@ -882,7 +911,12 @@ fn find_catalog_completion(
             && window[5].kind == TokenKind::Eq
             && window[6].is("function")
         {
-            push(findings, "BAMTS-W056", window[2], "prototype assignment implements class-like behavior");
+            push(
+                findings,
+                "BAMTS-W056",
+                window[2],
+                "prototype assignment implements class-like behavior",
+            );
         }
     }
     visit_statement_list(source.statements(), source.script_kind(), findings);
@@ -896,7 +930,11 @@ fn visit_statement_list(
     let mut reachable = true;
     for statement in statements {
         if !reachable {
-            findings.push(("BAMTS-W067", statement.range(), "statement is unreachable after an unconditional transfer"));
+            findings.push((
+                "BAMTS-W067",
+                statement.range(),
+                "statement is unreachable after an unconditional transfer",
+            ));
         }
         visit_statement(statement, script_kind, findings);
         reachable &= can_complete_normally(statement);
@@ -910,7 +948,10 @@ fn visit_statement(
 ) {
     match statement.data() {
         Statement::Interface(interface) => {
-            if matches!(script_kind, ScriptKind::JavaScript | ScriptKind::JavaScriptReact) {
+            if matches!(
+                script_kind,
+                ScriptKind::JavaScript | ScriptKind::JavaScriptReact
+            ) {
                 findings.push((
                     "BAMTS-W085",
                     statement.range(),
@@ -919,48 +960,87 @@ fn visit_statement(
             }
             visit_interface(statement.range(), interface, findings);
         }
-        Statement::Export(export) => {
-            match export {
-                ExportDeclaration::All(_) => findings.push(("BAMTS-W061", statement.range(), "wildcard barrel export obscures the public surface")),
-                ExportDeclaration::Default(_) => findings.push(("BAMTS-W062", statement.range(), "default export permits arbitrary importer naming")),
-                ExportDeclaration::Named(crate::syntax::ExportNamedDeclaration::Declaration(inner)) => visit_statement(inner, script_kind, findings),
-                _ => {}
+        Statement::Export(export) => match export {
+            ExportDeclaration::All(_) => findings.push((
+                "BAMTS-W061",
+                statement.range(),
+                "wildcard barrel export obscures the public surface",
+            )),
+            ExportDeclaration::Default(_) => findings.push((
+                "BAMTS-W062",
+                statement.range(),
+                "default export permits arbitrary importer naming",
+            )),
+            ExportDeclaration::Named(crate::syntax::ExportNamedDeclaration::Declaration(inner)) => {
+                visit_statement(inner, script_kind, findings)
             }
+            _ => {}
+        },
+        Statement::Function(function) => {
+            visit_function(statement.range(), &function.function, script_kind, findings)
         }
-        Statement::Function(function) => visit_function(statement.range(), &function.function, script_kind, findings),
         Statement::Class(class) => {
             for member in &class.members {
                 match member.data() {
                     ClassMember::Constructor(constructor) => {
-                        flag_parameter_count(member.range(), constructor.parameters.len(), findings);
-                        visit_statement_list(&constructor.body.data().statements, script_kind, findings);
+                        flag_parameter_count(
+                            member.range(),
+                            constructor.parameters.len(),
+                            findings,
+                        );
+                        visit_statement_list(
+                            &constructor.body.data().statements,
+                            script_kind,
+                            findings,
+                        );
                     }
-                    ClassMember::Method(method) => visit_function(member.range(), &method.function, script_kind, findings),
+                    ClassMember::Method(method) => {
+                        visit_function(member.range(), &method.function, script_kind, findings)
+                    }
                     _ => {}
                 }
             }
         }
         Statement::Variable(variable) => {
-            if matches!(script_kind, ScriptKind::JavaScript | ScriptKind::JavaScriptReact) {
+            if matches!(
+                script_kind,
+                ScriptKind::JavaScript | ScriptKind::JavaScriptReact
+            ) {
                 for declaration in &variable.declarations {
                     if declaration.data().type_annotation.is_some() || declaration.data().definite {
-                        findings.push(("BAMTS-W085", declaration.range(), "TypeScript-only declaration syntax appears in JavaScript"));
+                        findings.push((
+                            "BAMTS-W085",
+                            declaration.range(),
+                            "TypeScript-only declaration syntax appears in JavaScript",
+                        ));
                     }
                 }
             }
         }
-        Statement::Block(block) => visit_statement_list(&block.data().statements, script_kind, findings),
+        Statement::Block(block) => {
+            visit_statement_list(&block.data().statements, script_kind, findings)
+        }
         Statement::If(statement) => {
             visit_statement(&statement.consequent, script_kind, findings);
-            if let Some(alternate) = &statement.alternate { visit_statement(alternate, script_kind, findings); }
+            if let Some(alternate) = &statement.alternate {
+                visit_statement(alternate, script_kind, findings);
+            }
         }
         Statement::Switch(statement) => {
             for (index, case) in statement.cases.iter().enumerate() {
                 if index + 1 < statement.cases.len()
                     && !case.data().consequent.is_empty()
-                    && case.data().consequent.last().is_some_and(can_complete_normally)
+                    && case
+                        .data()
+                        .consequent
+                        .last()
+                        .is_some_and(can_complete_normally)
                 {
-                    findings.push(("BAMTS-W066", case.range(), "non-empty switch case falls through"));
+                    findings.push((
+                        "BAMTS-W066",
+                        case.range(),
+                        "non-empty switch case falls through",
+                    ));
                 }
                 visit_statement_list(&case.data().consequent, script_kind, findings);
             }
@@ -972,15 +1052,30 @@ fn visit_statement(
         Statement::DoWhile(statement) => visit_statement(&statement.body, script_kind, findings),
         Statement::Try(statement) => {
             visit_statement_list(&statement.block.data().statements, script_kind, findings);
-            if let Some(handler) = &statement.handler { visit_statement_list(&handler.data().body.data().statements, script_kind, findings); }
-            if let Some(finalizer) = &statement.finalizer { visit_statement_list(&finalizer.data().statements, script_kind, findings); }
+            if let Some(handler) = &statement.handler {
+                visit_statement_list(
+                    &handler.data().body.data().statements,
+                    script_kind,
+                    findings,
+                );
+            }
+            if let Some(finalizer) = &statement.finalizer {
+                visit_statement_list(&finalizer.data().statements, script_kind, findings);
+            }
         }
         Statement::Labeled(statement) => visit_statement(&statement.body, script_kind, findings),
         Statement::Declare(inner) => visit_statement(inner, script_kind, findings),
         Statement::TypeAlias(_) | Statement::Enum(_) | Statement::Namespace(_)
-            if matches!(script_kind, ScriptKind::JavaScript | ScriptKind::JavaScriptReact) =>
+            if matches!(
+                script_kind,
+                ScriptKind::JavaScript | ScriptKind::JavaScriptReact
+            ) =>
         {
-            findings.push(("BAMTS-W085", statement.range(), "TypeScript-only declaration appears in JavaScript"));
+            findings.push((
+                "BAMTS-W085",
+                statement.range(),
+                "TypeScript-only declaration appears in JavaScript",
+            ));
         }
         _ => {}
     }
@@ -991,10 +1086,18 @@ fn visit_interface(
     interface: &InterfaceDeclaration,
     findings: &mut Vec<(&'static str, TextRange, &'static str)>,
 ) {
-    findings.push(("BAMTS-W058", range, "interface leaves the shape open to declaration merging"));
+    findings.push((
+        "BAMTS-W058",
+        range,
+        "interface leaves the shape open to declaration merging",
+    ));
     for member in &interface.members {
         if matches!(member.data(), TypeMember::Method(_)) {
-            findings.push(("BAMTS-W060", member.range(), "method signature retains bivariant parameter checking"));
+            findings.push((
+                "BAMTS-W060",
+                member.range(),
+                "method signature retains bivariant parameter checking",
+            ));
         }
     }
 }
@@ -1007,25 +1110,56 @@ fn visit_function(
 ) {
     flag_parameter_count(range, function.parameters.len(), findings);
     for parameter in &function.parameters {
-        if parameter.data().type_annotation.as_ref().is_some_and(|annotation| matches!(annotation.data().type_node.data(), TypeNode::Array(_))) {
-            findings.push(("BAMTS-W059", parameter.range(), "mutable array type crosses a callable boundary"));
-        }
-        if matches!(script_kind, ScriptKind::JavaScript | ScriptKind::JavaScriptReact)
-            && parameter.data().type_annotation.is_some()
+        if parameter
+            .data()
+            .type_annotation
+            .as_ref()
+            .is_some_and(|annotation| {
+                matches!(annotation.data().type_node.data(), TypeNode::Array(_))
+            })
         {
-            findings.push(("BAMTS-W085", parameter.range(), "TypeScript-only parameter type appears in JavaScript"));
+            findings.push((
+                "BAMTS-W059",
+                parameter.range(),
+                "mutable array type crosses a callable boundary",
+            ));
+        }
+        if matches!(
+            script_kind,
+            ScriptKind::JavaScript | ScriptKind::JavaScriptReact
+        ) && parameter.data().type_annotation.is_some()
+        {
+            findings.push((
+                "BAMTS-W085",
+                parameter.range(),
+                "TypeScript-only parameter type appears in JavaScript",
+            ));
         }
     }
-    if matches!(script_kind, ScriptKind::JavaScript | ScriptKind::JavaScriptReact)
-        && (function.return_type.is_some() || function.type_parameters.is_some())
+    if matches!(
+        script_kind,
+        ScriptKind::JavaScript | ScriptKind::JavaScriptReact
+    ) && (function.return_type.is_some() || function.type_parameters.is_some())
     {
-        findings.push(("BAMTS-W085", range, "TypeScript-only function type syntax appears in JavaScript"));
+        findings.push((
+            "BAMTS-W085",
+            range,
+            "TypeScript-only function type syntax appears in JavaScript",
+        ));
     }
     if let Some(FunctionBody::Block(block)) = &function.body {
         if block_contains_value_return(&block.data().statements)
-            && block.data().statements.last().is_none_or(can_complete_normally)
+            && block
+                .data()
+                .statements
+                .last()
+                .is_none_or(can_complete_normally)
         {
-            findings.push(("BAMTS-W065", range, "function has a reachable path without a returned value"));
+            findings.push((
+                "BAMTS-W065",
+                range,
+                "function has a reachable path without a returned value",
+            ));
         }
         visit_statement_list(&block.data().statements, script_kind, findings);
     }
@@ -1037,7 +1171,11 @@ fn flag_parameter_count(
     findings: &mut Vec<(&'static str, TextRange, &'static str)>,
 ) {
     if count >= 5 {
-        findings.push(("BAMTS-W064", range, "callable has five or more positional parameters"));
+        findings.push((
+            "BAMTS-W064",
+            range,
+            "callable has five or more positional parameters",
+        ));
     }
 }
 
@@ -1045,23 +1183,41 @@ fn block_contains_value_return(statements: &[Stmt]) -> bool {
     statements.iter().any(|statement| match statement.data() {
         Statement::Return(ret) => ret.argument.is_some(),
         Statement::Block(block) => block_contains_value_return(&block.data().statements),
-        Statement::If(statement) => block_contains_value_return(std::slice::from_ref(statement.consequent.as_ref()))
-            || statement.alternate.as_ref().is_some_and(|alternate| block_contains_value_return(std::slice::from_ref(alternate.as_ref()))),
-        Statement::Switch(statement) => statement.cases.iter().any(|case| block_contains_value_return(&case.data().consequent)),
+        Statement::If(statement) => {
+            block_contains_value_return(std::slice::from_ref(statement.consequent.as_ref()))
+                || statement.alternate.as_ref().is_some_and(|alternate| {
+                    block_contains_value_return(std::slice::from_ref(alternate.as_ref()))
+                })
+        }
+        Statement::Switch(statement) => statement
+            .cases
+            .iter()
+            .any(|case| block_contains_value_return(&case.data().consequent)),
         _ => false,
     })
 }
 
 fn can_complete_normally(statement: &Stmt) -> bool {
     match statement.data() {
-        Statement::Return(_) | Statement::Throw(_) | Statement::Break(_) | Statement::Continue(_) => false,
-        Statement::Block(block) => block.data().statements.last().is_none_or(can_complete_normally),
+        Statement::Return(_)
+        | Statement::Throw(_)
+        | Statement::Break(_)
+        | Statement::Continue(_) => false,
+        Statement::Block(block) => block
+            .data()
+            .statements
+            .last()
+            .is_none_or(can_complete_normally),
         Statement::If(statement) => statement.alternate.as_ref().is_none_or(|alternate| {
             can_complete_normally(&statement.consequent) || can_complete_normally(alternate)
         }),
         Statement::Try(statement) => {
             if statement.finalizer.as_ref().is_some_and(|block| {
-                !block.data().statements.last().is_none_or(can_complete_normally)
+                !block
+                    .data()
+                    .statements
+                    .last()
+                    .is_none_or(can_complete_normally)
             }) {
                 return false;
             }

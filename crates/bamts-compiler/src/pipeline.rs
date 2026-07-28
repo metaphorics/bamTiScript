@@ -143,10 +143,7 @@ pub fn compile_frontend(request: FrontendRequest) -> FrontendOutput {
 /// stages reported errors. All stage diagnostics are merged, canonically
 /// ordered, and de-duplicated into one vector.
 #[must_use]
-pub fn compile_frontend_with_lints(
-    request: FrontendRequest,
-    levels: &LintTable,
-) -> FrontendOutput {
+pub fn compile_frontend_with_lints(request: FrontendRequest, levels: &LintTable) -> FrontendOutput {
     let FrontendRequest {
         source_id,
         script_kind,

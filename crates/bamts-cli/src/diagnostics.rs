@@ -87,7 +87,10 @@ pub fn render_report(
         .cloned()
         .collect::<Vec<_>>();
     let mut rendered = render(format, &diagnostics, sources);
-    if matches!(format, DiagnosticsFormat::Text | DiagnosticsFormat::Pretty | DiagnosticsFormat::Compact) {
+    if matches!(
+        format,
+        DiagnosticsFormat::Text | DiagnosticsFormat::Pretty | DiagnosticsFormat::Compact
+    ) {
         for summary in report.summaries() {
             let _ = writeln!(
                 rendered,
@@ -927,10 +930,8 @@ mod tests {
             .expect("registered rule")
             .id();
         let diagnostics = [
-            Diagnostic::lint(LintLevel::Warn, rule, FILE, range(0, 1), "first")
-                .expect("warns"),
-            Diagnostic::lint(LintLevel::Warn, rule, FILE, range(1, 2), "second")
-                .expect("warns"),
+            Diagnostic::lint(LintLevel::Warn, rule, FILE, range(0, 1), "first").expect("warns"),
+            Diagnostic::lint(LintLevel::Warn, rule, FILE, range(1, 2), "second").expect("warns"),
         ];
         let report = DiagnosticReport::new(&diagnostics);
         let out = render_report(DiagnosticsFormat::Text, &report, &sources("a.ts", &text), 1);

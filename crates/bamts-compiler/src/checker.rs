@@ -656,8 +656,7 @@ impl TypeTable {
         ) {
             hazards.push(RelationHazard::NumericEnumNumber);
         }
-        if let (Type::ObjectType(from), Type::ObjectType(to)) =
-            (self.get(source), self.get(target))
+        if let (Type::ObjectType(from), Type::ObjectType(to)) = (self.get(source), self.get(target))
         {
             for target_property in to.iter().filter(|property| property.optional) {
                 let Some(source_property) = from
@@ -697,8 +696,7 @@ impl TypeTable {
             |want| match source.iter().find(|have| have.name == want.name) {
                 Some(have) => {
                     self.assignable(have.type_id, want.type_id)
-                        || (want.optional
-                            && matches!(self.get(have.type_id), Type::Undefined))
+                        || (want.optional && matches!(self.get(have.type_id), Type::Undefined))
                 }
                 None => want.optional,
             },
@@ -952,9 +950,7 @@ pub fn check_with_lints(
     let (mut model, mut diagnostics) = check_core(source);
     model.replace_facts(crate::rules::semantic::collect_facts(source, &model));
     diagnostics.extend(analyze_warnings(source_file, levels));
-    diagnostics.extend(crate::rules::analyze_semantic(
-        source, &model, None, levels,
-    ));
+    diagnostics.extend(crate::rules::analyze_semantic(source, &model, None, levels));
     Recovered::new(model, diagnostics)
 }
 
@@ -2455,30 +2451,37 @@ mod tests {
         let mut table = TypeTable::new();
         let source_object =
             table.object_type(vec![PropertyType::new("x", false, table.undefined_type())]);
-        let target_object =
-            table.object_type(vec![PropertyType::new("x", true, table.number())]);
+        let target_object = table.object_type(vec![PropertyType::new("x", true, table.number())]);
         let optional = table.relation(source_object, target_object);
         assert!(optional.compatible());
-        assert!(optional
-            .hazards()
-            .contains(&super::RelationHazard::ExplicitUndefinedForOptional));
+        assert!(
+            optional
+                .hazards()
+                .contains(&super::RelationHazard::ExplicitUndefinedForOptional)
+        );
 
         let source_function = table.function(Vec::new(), table.number());
         let target_function = table.function(vec![table.number()], table.void());
         let callback = table.relation(source_function, target_function);
-        assert!(callback
-            .hazards()
-            .contains(&super::RelationHazard::FewerCallbackParameters));
-        assert!(callback
-            .hazards()
-            .contains(&super::RelationHazard::ValueReturnedToVoid));
+        assert!(
+            callback
+                .hazards()
+                .contains(&super::RelationHazard::FewerCallbackParameters)
+        );
+        assert!(
+            callback
+                .hazards()
+                .contains(&super::RelationHazard::ValueReturnedToVoid)
+        );
 
         let enum_type = table.numeric_enum(super::SymbolId::new(200));
         let enum_boundary = table.relation(enum_type, table.number());
         assert!(enum_boundary.compatible());
-        assert!(enum_boundary
-            .hazards()
-            .contains(&super::RelationHazard::NumericEnumNumber));
+        assert!(
+            enum_boundary
+                .hazards()
+                .contains(&super::RelationHazard::NumericEnumNumber)
+        );
     }
 
     // ---- checker behavior tests ----------------------------------------------

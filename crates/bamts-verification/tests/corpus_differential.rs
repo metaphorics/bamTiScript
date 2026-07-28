@@ -229,7 +229,13 @@ mod formatting_tests {
         let actual = outcome(b"partial");
         let mut failures = Vec::new();
 
-        compare_case("timeout", ExecutionMode::Jit, &Ok(expected), &Ok(actual), &mut failures);
+        compare_case(
+            "timeout",
+            ExecutionMode::Jit,
+            &Ok(expected),
+            &Ok(actual),
+            &mut failures,
+        );
 
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("stage=spawn Node oracle did not produce a complete result"));

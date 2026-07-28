@@ -657,13 +657,15 @@ where
                 "--pedantic" => pedantic = true,
                 "--error-limit" => {
                     let value = get_val(flag, inline_val, &mut idx, args_slice)?;
-                    error_limit = value.parse::<usize>().ok().filter(|limit| *limit > 0).ok_or_else(|| {
-                        ArgsError::InvalidOptionValue {
+                    error_limit = value
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|limit| *limit > 0)
+                        .ok_or_else(|| ArgsError::InvalidOptionValue {
                             option: "--error-limit".to_string(),
                             value,
                             expected: "a positive integer".to_string(),
-                        }
-                    })?;
+                        })?;
                 }
                 _ => {
                     return Err(ArgsError::UnknownOption {
