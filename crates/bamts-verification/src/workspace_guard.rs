@@ -1006,7 +1006,6 @@ fn validate_feature_closures(root: &Path) -> Result<()> {
     require_present_package(&closure, "bamts-cli", "bamts-native")
 }
 
-
 fn cargo_metadata(root: &Path, feature: Option<&str>) -> Result<CargoMetadata> {
     let cargo = match env::var_os("CARGO") {
         Some(path) => path,
@@ -1053,9 +1052,6 @@ fn cargo_metadata(root: &Path, feature: Option<&str>) -> Result<CargoMetadata> {
         )
     })
 }
-
-
-
 
 fn codegen_closure(metadata: &CargoMetadata) -> Result<ResolvedClosure> {
     let resolve = metadata
@@ -1128,7 +1124,6 @@ fn codegen_closure(metadata: &CargoMetadata) -> Result<ResolvedClosure> {
     Ok(closure)
 }
 
-
 fn require_enabled_feature(closure: &ResolvedClosure, mode: &str, feature: &str) -> Result<()> {
     let active = closure
         .package_features
@@ -1143,7 +1138,6 @@ fn require_enabled_feature(closure: &ResolvedClosure, mode: &str, feature: &str)
     Ok(())
 }
 
-
 fn require_present_package(closure: &ResolvedClosure, mode: &str, package: &str) -> Result<()> {
     if !closure.package_names.contains(package) {
         return Err(workspace_error(format!(
@@ -1153,7 +1147,6 @@ fn require_present_package(closure: &ResolvedClosure, mode: &str, package: &str)
 
     Ok(())
 }
-
 
 fn root_table<'a>(value: &'a Value, context: &str) -> Result<&'a Table> {
     value

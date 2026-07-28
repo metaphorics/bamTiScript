@@ -285,7 +285,13 @@ mod tests {
             .expect("compiled program runs");
 
         assert_eq!(program.entry_function(), 0);
-        assert_eq!(outcome, bamts_runtime::ExecutionOutcome { stdout: Vec::new(), exit_code: 0 });
+        assert_eq!(
+            outcome,
+            bamts_runtime::ExecutionOutcome {
+                stdout: Vec::new(),
+                exit_code: 0
+            }
+        );
     }
 
     #[test]

@@ -371,9 +371,9 @@ fn sha512(data: &[u8]) -> [u8; 64] {
 fn run_aot_main() -> i32 {
     use std::io::Write;
 
-    use bamts_bytecode::{decode_verified, DecodeLimits};
+    use bamts_bytecode::{DecodeLimits, decode_verified};
     use bamts_native::linked_program;
-    use bamts_runtime::{run_linked_program, Limits};
+    use bamts_runtime::{Limits, run_linked_program};
 
     let linked = match linked_program() {
         Ok(linked) => linked,

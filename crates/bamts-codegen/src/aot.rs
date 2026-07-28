@@ -95,7 +95,9 @@ impl From<LowerError> for AotError {
 
 fn require_64_bit_pointer_width(bits: u8) -> Result<(), AotError> {
     if bits != 64 {
-        Err(AotError::Lower(LowerError::UnsupportedPointerWidth { bits }))
+        Err(AotError::Lower(LowerError::UnsupportedPointerWidth {
+            bits,
+        }))
     } else {
         Ok(())
     }
@@ -528,7 +530,9 @@ mod tests {
     fn require_64_bit_pointer_width_rejects_32() {
         assert!(matches!(
             require_64_bit_pointer_width(32),
-            Err(AotError::Lower(LowerError::UnsupportedPointerWidth { bits: 32 }))
+            Err(AotError::Lower(LowerError::UnsupportedPointerWidth {
+                bits: 32
+            }))
         ));
     }
 
