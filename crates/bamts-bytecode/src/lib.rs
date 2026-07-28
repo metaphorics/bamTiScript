@@ -23,15 +23,75 @@
 //! and persisted constants carry no heap or runtime identity, matching
 //! `no_serialized_runtime_identity`.
 //!
+//! # Dynamic-computation ISA
+//!
+//! Unlike a fixed-key/fixed-window shape, this ISA expresses the *dynamic*
+//! runtime kernel of the corpus without special-casing syntax:
+//!
+//! * **Property access is register-keyed.** [`Instruction::GetProperty`],
+//!   [`Instruction::SetProperty`], and [`Instruction::DeleteProperty`] take the
+//!   key in a `Register`, so computed access (`obj[e]`), string/number keys,
+//!   `Symbol` keys, and private names (via [`Instruction::CreatePrivateName`])
+//!   are one uniform operation. [`Instruction::DefineAccessor`] installs a
+//!   getter or setter descriptor under a register key.
+//! * **Calls are variadic.** [`Instruction::Call`] and
+//!   [`Instruction::Construct`] receive one *arguments-array* `Register`, so
+//!   spread (`f(...xs)`) and any arity -- far beyond 127 -- lower identically.
+//!   The runtime validates that the register holds a dynamic array.
+//! * **Closures capture explicitly.** [`Instruction::CreateClosure`] binds a
+//!   function together with a *captures-array* `Register`. On entry, a callee's
+//!   leading [`Function::capture_count`] registers are the captured cells,
+//!   followed by its [`Function::parameter_count`] parameters; both count as
+//!   definitely initialized on entry.
+//! * **Aggregate building blocks.** [`Instruction::ArrayPush`],
+//!   [`Instruction::ArrayExtend`] (iterable spread), [`Instruction::ObjectSpread`],
+//!   and [`Instruction::SetPrototype`] build non-empty arrays, objects, and
+//!   class prototype chains incrementally.
+//! * **Iteration protocol.** [`Instruction::GetIterator`] (with a closed
+//!   [`IteratorKind`]) and the two-write [`Instruction::IteratorNext`] model
+//!   `for`/`of`, `for`/`await`/`of`, `for`/`in`, destructuring, and array/call
+//!   spread against the ECMAScript iterator protocol.
+//! * **Environment access.** [`Instruction::LoadGlobal`],
+//!   [`Instruction::StoreGlobal`], [`Instruction::TypeOfGlobal`] (the last
+//!   models `typeof g` without throwing on an undeclared global),
+//!   [`Instruction::LoadThis`], [`Instruction::LoadArguments`], and
+//!   [`Instruction::LoadNewTarget`] name the ambient bindings a function body
+//!   observes.
+//! * **Modules.** [`Instruction::Import`] and [`Instruction::Export`] name a
+//!   module linkage entry by string constant.
+//! * **Regular expressions.** [`Instruction::CreateRegExp`] materializes a
+//!   `RegExp` from string-constant pattern and flags.
+//!
+//! ## Resume contract (async / generators)
+//!
+//! [`Instruction::Suspend`] `{ dst, src, resume }` is the single suspension
+//! primitive; [`FunctionFlags::is_async`] and [`FunctionFlags::is_generator`]
+//! select *how* a suspension is driven, but the wire form is identical:
+//!
+//! 1. The activation yields the value in `src` (a produced item for a
+//!    generator; an awaited operand for an async function) to its driver.
+//! 2. When the driver resumes the activation, control continues at `resume`
+//!    with the resumed value written to `dst` (the argument of `.next(v)` for a
+//!    generator; the settled result of the awaited value for `await`).
+//! 3. `resume` is a normal CFG successor and the only successor of `Suspend`, so
+//!    the definite-initialization witness treats every register live across a
+//!    suspension as it would across any join: `dst` is initialized on the
+//!    resume edge, and registers not provably initialized before the suspension
+//!    are not assumed initialized after it.
+//!
+//! A generator's completion is an ordinary [`Instruction::Return`]; an uncaught
+//! throw during drive routes to an enclosing [`ExceptionHandler`] exactly as in
+//! synchronous code.
+//!
 //! The wire format is a deliberate superset departure from the formal single
 //! seven-bit-group encoding: integer fields are canonical unsigned LEB128 `u32`
-//! (functions and modules may exceed 127 instructions, constants, and
-//! registers), bounded by explicit decode and structural resource limits. Its
-//! round-trip guarantees -- totality over hostile bytes, canonical re-encoding,
-//! and decode/encode identity -- are fresh properties of this codec, proven by
-//! the tests in this module, not the Lean single-byte theorems (`decode_total`,
-//! `decode_encode_canonical`, `encode_decode_identity`), which remain scoped to
-//! the formal five-op wire.
+//! (functions and modules may exceed 127 instructions, constants, registers,
+//! captures, and arguments), bounded by explicit decode and structural resource
+//! limits. Its round-trip guarantees -- totality over hostile bytes, canonical
+//! re-encoding, and decode/encode identity -- are fresh properties of this
+//! codec, proven by the tests in this module, not the Lean single-byte theorems
+//! (`decode_total`, `decode_encode_canonical`, `encode_decode_identity`), which
+//! remain scoped to the formal five-op wire.
 
 #![forbid(unsafe_code)]
 
@@ -195,9 +255,9 @@ fn is_canonical_bigint(text: &str) -> bool {
 }
 
 /// Persistable values. Heap references, holes, and uninitialized sentinels are
-/// intentionally absent because they are runtime identities/states. Property
-/// keys are not a distinct variant: instructions reference an existing
-/// [`Constant::String`] by [`ConstantId`], reusing the string pool.
+/// intentionally absent because they are runtime identities/states. String
+/// constants back property keys, global names, private-name descriptions,
+/// regular-expression pattern/flags, module specifiers, and export names.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Constant {
     Number(NumberBits),
@@ -329,7 +389,63 @@ impl BinaryOp {
     }
 }
 
-/// The production instruction algebra. Opcodes 0..=19 are stable wire tags.
+/// Closed set of iterator acquisition protocols for [`Instruction::GetIterator`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum IteratorKind {
+    /// `Symbol.iterator` (`for`/`of`, array/call spread, destructuring).
+    Sync,
+    /// `Symbol.asyncIterator` (`for`/`await`/`of`).
+    Async,
+    /// Enumerable string keys (`for`/`in`).
+    Keys,
+}
+
+impl IteratorKind {
+    const fn to_u8(self) -> u8 {
+        match self {
+            Self::Sync => 0,
+            Self::Async => 1,
+            Self::Keys => 2,
+        }
+    }
+
+    const fn from_u8(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::Sync),
+            1 => Some(Self::Async),
+            2 => Some(Self::Keys),
+            _ => None,
+        }
+    }
+}
+
+/// Which half of an accessor descriptor [`Instruction::DefineAccessor`] installs.
+/// A property with both a getter and a setter is defined by two instructions on
+/// the same key.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum AccessorKind {
+    Getter,
+    Setter,
+}
+
+impl AccessorKind {
+    const fn to_u8(self) -> u8 {
+        match self {
+            Self::Getter => 0,
+            Self::Setter => 1,
+        }
+    }
+
+    const fn from_u8(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::Getter),
+            1 => Some(Self::Setter),
+            _ => None,
+        }
+    }
+}
+
+/// The production instruction algebra. Opcodes 0..=35 are stable wire tags.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Instruction {
     /// Load a constant into `dst` (refines the formal `Load`).
@@ -353,42 +469,106 @@ pub enum Instruction {
     CreateObject { dst: Register },
     /// Create a fresh empty array in `dst`.
     CreateArray { dst: Register },
-    /// Materialize a closure over the named function into `dst`.
-    DefineFunction { dst: Register, function: FunctionId },
-    /// `dst = object[key]`, where `key` names a string constant.
+    /// Materialize a closure over `function`, binding the captured cells held in
+    /// the array register `captures`, into `dst`. The captured cells initialize
+    /// the callee's leading `capture_count` registers.
+    CreateClosure {
+        dst: Register,
+        function: FunctionId,
+        captures: Register,
+    },
+    /// `dst = object[key]`, with the property key taken from a register.
     GetProperty {
         dst: Register,
         object: Register,
-        key: ConstantId,
+        key: Register,
     },
-    /// `object[key] = value`, where `key` names a string constant.
+    /// `object[key] = value`, with the property key taken from a register.
     SetProperty {
         object: Register,
-        key: ConstantId,
+        key: Register,
         value: Register,
     },
-    /// `dst = delete object[key]`, where `key` names a string constant.
+    /// `dst = delete object[key]`, with the property key taken from a register.
     DeleteProperty {
         dst: Register,
         object: Register,
-        key: ConstantId,
+        key: Register,
     },
-    /// Call `callee` with `this_value` and the argument window
-    /// `[args_start, args_start + arg_count)`, writing the result to `dst`.
+    /// Install a getter or setter `accessor` under `key` on `object`.
+    DefineAccessor {
+        object: Register,
+        key: Register,
+        accessor: Register,
+        kind: AccessorKind,
+    },
+    /// Call `callee` with receiver `this_value` and the dynamic argument array
+    /// in `arguments`, writing the result to `dst`. Spread and any arity lower
+    /// through the single arguments array.
     Call {
         dst: Register,
         callee: Register,
         this_value: Register,
-        args_start: Register,
-        arg_count: u32,
+        arguments: Register,
     },
-    /// Construct with `callee` and the argument window
-    /// `[args_start, args_start + arg_count)`, writing the instance to `dst`.
+    /// Construct with `callee` and the dynamic argument array in `arguments`,
+    /// writing the instance to `dst`.
     Construct {
         dst: Register,
         callee: Register,
-        args_start: Register,
-        arg_count: u32,
+        arguments: Register,
+    },
+    /// `dst = globalThis[name]`, where `name` is a string constant. Throws a
+    /// `ReferenceError` at runtime for an undeclared global.
+    LoadGlobal { dst: Register, name: ConstantId },
+    /// `globalThis[name] = value`, where `name` is a string constant.
+    StoreGlobal { name: ConstantId, value: Register },
+    /// `dst = typeof globalThis[name]`, where `name` is a string constant.
+    /// Yields `"undefined"` for an undeclared global rather than throwing.
+    TypeOfGlobal { dst: Register, name: ConstantId },
+    /// Load the receiver binding `this` into `dst`.
+    LoadThis { dst: Register },
+    /// Load the `arguments` exotic object into `dst`.
+    LoadArguments { dst: Register },
+    /// Load `new.target` into `dst`.
+    LoadNewTarget { dst: Register },
+    /// Append `value` to the array in `array`.
+    ArrayPush { array: Register, value: Register },
+    /// Spread every element of `iterable` onto the end of the array in `array`.
+    ArrayExtend { array: Register, iterable: Register },
+    /// Copy the own enumerable properties of `source` onto `target`
+    /// (`{ ...source }`).
+    ObjectSpread { target: Register, source: Register },
+    /// Set the `[[Prototype]]` of `object` to `prototype`.
+    SetPrototype {
+        object: Register,
+        prototype: Register,
+    },
+    /// Create a fresh private name described by the string constant
+    /// `description`, writing it to `dst`. The result is used as a register key
+    /// for private-field access via the property instructions.
+    CreatePrivateName {
+        dst: Register,
+        description: ConstantId,
+    },
+    /// Create a `RegExp` from the string-constant `pattern` and `flags`.
+    CreateRegExp {
+        dst: Register,
+        pattern: ConstantId,
+        flags: ConstantId,
+    },
+    /// Acquire an iterator over `src` using protocol `kind`, writing it to `dst`.
+    GetIterator {
+        dst: Register,
+        src: Register,
+        kind: IteratorKind,
+    },
+    /// Advance `iterator` one step: write whether iteration is done to `done`
+    /// and the produced value to `value` (two writes).
+    IteratorNext {
+        done: Register,
+        value: Register,
+        iterator: Register,
     },
     /// Unconditional control transfer (identical to the formal `Jump`).
     Jump { target: Pc },
@@ -401,7 +581,7 @@ pub enum Instruction {
     /// Throw `value` (terminator; caught by an enclosing handler if any).
     Throw { value: Register },
     /// Yield `src` and resume at `resume`, receiving the resumed value in `dst`
-    /// (refines the formal `Suspend`).
+    /// (refines the formal `Suspend`). See the module-level resume contract.
     Suspend {
         dst: Register,
         src: Register,
@@ -412,6 +592,8 @@ pub enum Instruction {
         dst: Register,
         specifier: ConstantId,
     },
+    /// Export the local value in `src` under the string constant `name`.
+    Export { name: ConstantId, src: Register },
     /// Terminate the current activation (identical to the formal `Halt`).
     Halt,
 }
@@ -426,52 +608,87 @@ impl Instruction {
                 visit(left);
                 visit(right);
             }
-            Self::GetProperty { object, .. } | Self::DeleteProperty { object, .. } => visit(object),
-            Self::SetProperty { object, value, .. } => {
+            Self::CreateClosure { captures, .. } => visit(captures),
+            Self::GetProperty { object, key, .. } | Self::DeleteProperty { object, key, .. } => {
                 visit(object);
+                visit(key);
+            }
+            Self::SetProperty { object, key, value } => {
+                visit(object);
+                visit(key);
                 visit(value);
+            }
+            Self::DefineAccessor {
+                object,
+                key,
+                accessor,
+                ..
+            } => {
+                visit(object);
+                visit(key);
+                visit(accessor);
             }
             Self::Call {
                 callee,
                 this_value,
-                args_start,
-                arg_count,
+                arguments,
                 ..
             } => {
                 visit(callee);
                 visit(this_value);
-                for offset in 0..arg_count {
-                    visit(Register::new(args_start.get() + offset));
-                }
+                visit(arguments);
             }
             Self::Construct {
-                callee,
-                args_start,
-                arg_count,
-                ..
+                callee, arguments, ..
             } => {
                 visit(callee);
-                for offset in 0..arg_count {
-                    visit(Register::new(args_start.get() + offset));
-                }
+                visit(arguments);
             }
+            Self::StoreGlobal { value, .. } => visit(value),
+            Self::ArrayPush { array, value } => {
+                visit(array);
+                visit(value);
+            }
+            Self::ArrayExtend { array, iterable } => {
+                visit(array);
+                visit(iterable);
+            }
+            Self::ObjectSpread { target, source } => {
+                visit(target);
+                visit(source);
+            }
+            Self::SetPrototype { object, prototype } => {
+                visit(object);
+                visit(prototype);
+            }
+            Self::GetIterator { src, .. } => visit(src),
+            Self::IteratorNext { iterator, .. } => visit(iterator),
             Self::JumpIfTrue { condition, .. } | Self::JumpIfFalse { condition, .. } => {
                 visit(condition);
             }
-            Self::Return { value } | Self::Throw { value } => visit(value),
+            Self::Return { value } | Self::Throw { value } | Self::Export { src: value, .. } => {
+                visit(value);
+            }
             Self::Suspend { src, .. } => visit(src),
             Self::LoadConst { .. }
             | Self::CreateObject { .. }
             | Self::CreateArray { .. }
-            | Self::DefineFunction { .. }
+            | Self::LoadGlobal { .. }
+            | Self::TypeOfGlobal { .. }
+            | Self::LoadThis { .. }
+            | Self::LoadArguments { .. }
+            | Self::LoadNewTarget { .. }
+            | Self::CreatePrivateName { .. }
+            | Self::CreateRegExp { .. }
             | Self::Jump { .. }
             | Self::Import { .. }
             | Self::Halt => {}
         }
     }
 
-    /// The single register this instruction defines, if any.
-    const fn write(self) -> Option<Register> {
+    /// Visits each register this instruction defines: zero, one, or two.
+    /// [`Instruction::IteratorNext`] is the sole two-write opcode.
+    fn visit_writes(self, mut visit: impl FnMut(Register)) {
         match self {
             Self::LoadConst { dst, .. }
             | Self::Move { dst, .. }
@@ -479,20 +696,39 @@ impl Instruction {
             | Self::Binary { dst, .. }
             | Self::CreateObject { dst }
             | Self::CreateArray { dst }
-            | Self::DefineFunction { dst, .. }
+            | Self::CreateClosure { dst, .. }
             | Self::GetProperty { dst, .. }
             | Self::DeleteProperty { dst, .. }
             | Self::Call { dst, .. }
             | Self::Construct { dst, .. }
+            | Self::LoadGlobal { dst, .. }
+            | Self::TypeOfGlobal { dst, .. }
+            | Self::LoadThis { dst }
+            | Self::LoadArguments { dst }
+            | Self::LoadNewTarget { dst }
+            | Self::CreatePrivateName { dst, .. }
+            | Self::CreateRegExp { dst, .. }
+            | Self::GetIterator { dst, .. }
             | Self::Suspend { dst, .. }
-            | Self::Import { dst, .. } => Some(dst),
+            | Self::Import { dst, .. } => visit(dst),
+            Self::IteratorNext { done, value, .. } => {
+                visit(done);
+                visit(value);
+            }
             Self::SetProperty { .. }
+            | Self::DefineAccessor { .. }
+            | Self::StoreGlobal { .. }
+            | Self::ArrayPush { .. }
+            | Self::ArrayExtend { .. }
+            | Self::ObjectSpread { .. }
+            | Self::SetPrototype { .. }
+            | Self::Export { .. }
             | Self::Jump { .. }
             | Self::JumpIfTrue { .. }
             | Self::JumpIfFalse { .. }
             | Self::Return { .. }
             | Self::Throw { .. }
-            | Self::Halt => None,
+            | Self::Halt => {}
         }
     }
 
@@ -514,13 +750,29 @@ impl Instruction {
             | Self::Binary { .. }
             | Self::CreateObject { .. }
             | Self::CreateArray { .. }
-            | Self::DefineFunction { .. }
+            | Self::CreateClosure { .. }
             | Self::GetProperty { .. }
             | Self::SetProperty { .. }
             | Self::DeleteProperty { .. }
+            | Self::DefineAccessor { .. }
             | Self::Call { .. }
             | Self::Construct { .. }
-            | Self::Import { .. } => visit(Pc::new(pc + 1)),
+            | Self::LoadGlobal { .. }
+            | Self::StoreGlobal { .. }
+            | Self::TypeOfGlobal { .. }
+            | Self::LoadThis { .. }
+            | Self::LoadArguments { .. }
+            | Self::LoadNewTarget { .. }
+            | Self::ArrayPush { .. }
+            | Self::ArrayExtend { .. }
+            | Self::ObjectSpread { .. }
+            | Self::SetPrototype { .. }
+            | Self::CreatePrivateName { .. }
+            | Self::CreateRegExp { .. }
+            | Self::GetIterator { .. }
+            | Self::IteratorNext { .. }
+            | Self::Import { .. }
+            | Self::Export { .. } => visit(Pc::new(pc + 1)),
         }
     }
 }
@@ -569,11 +821,14 @@ impl FunctionFlags {
     }
 }
 
-/// An explicit function record: metadata, code, and handlers. The first
-/// `parameter_count` registers are the parameters and are initialized on entry.
+/// An explicit function record: metadata, code, and handlers. On entry the
+/// leading `capture_count` registers hold the closure's captured cells and the
+/// next `parameter_count` registers hold the parameters; all `capture_count +
+/// parameter_count` are initialized on entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Function {
     name: Option<ConstantId>,
+    capture_count: u32,
     parameter_count: u32,
     register_count: u32,
     flags: FunctionFlags,
@@ -585,6 +840,7 @@ impl Function {
     #[must_use]
     pub fn new(
         name: Option<ConstantId>,
+        capture_count: u32,
         parameter_count: u32,
         register_count: u32,
         flags: FunctionFlags,
@@ -593,6 +849,7 @@ impl Function {
     ) -> Self {
         Self {
             name,
+            capture_count,
             parameter_count,
             register_count,
             flags,
@@ -604,6 +861,11 @@ impl Function {
     #[must_use]
     pub const fn name(&self) -> Option<ConstantId> {
         self.name
+    }
+
+    #[must_use]
+    pub const fn capture_count(&self) -> u32 {
+        self.capture_count
     }
 
     #[must_use]
@@ -629,6 +891,13 @@ impl Function {
     #[must_use]
     pub fn handlers(&self) -> &[ExceptionHandler] {
         &self.handlers
+    }
+
+    /// The count of registers initialized on entry: captures followed by
+    /// parameters. Saturating, so it never wraps for hostile metadata (the
+    /// verifier separately rejects a sum exceeding `register_count`).
+    const fn entry_initialized(&self) -> u32 {
+        self.capture_count.saturating_add(self.parameter_count)
     }
 }
 
@@ -847,6 +1116,11 @@ pub enum VerifyErrorKind {
         parameter_count: u32,
         register_count: u32,
     },
+    EntryRegistersExceedRegisterCount {
+        capture_count: u32,
+        parameter_count: u32,
+        register_count: u32,
+    },
     FunctionNameOutOfBounds {
         constant: u32,
     },
@@ -861,17 +1135,12 @@ pub enum VerifyErrorKind {
         constant: ConstantId,
         constant_count: usize,
     },
-    PropertyKeyNotString {
+    StringConstantExpected {
         constant: ConstantId,
     },
     FunctionReferenceOutOfBounds {
         function: FunctionId,
         function_count: usize,
-    },
-    ArgumentWindowOutOfBounds {
-        args_start: Register,
-        arg_count: u32,
-        register_count: u32,
     },
     JumpOutOfBounds {
         target: u32,
@@ -950,6 +1219,15 @@ impl fmt::Display for VerifyError {
                 formatter,
                 "parameter count {parameter_count} exceeds register count {register_count}"
             ),
+            VerifyErrorKind::EntryRegistersExceedRegisterCount {
+                capture_count,
+                parameter_count,
+                register_count,
+            } => write!(
+                formatter,
+                "capture count {capture_count} plus parameter count {parameter_count} exceeds \
+                 register count {register_count}"
+            ),
             VerifyErrorKind::FunctionNameOutOfBounds { constant } => {
                 write!(
                     formatter,
@@ -977,11 +1255,9 @@ impl fmt::Display for VerifyError {
                 "constant {} is outside {constant_count} constants",
                 constant.get()
             ),
-            VerifyErrorKind::PropertyKeyNotString { constant } => write!(
-                formatter,
-                "property key constant {} is not a string",
-                constant.get()
-            ),
+            VerifyErrorKind::StringConstantExpected { constant } => {
+                write!(formatter, "constant {} must be a string", constant.get())
+            }
             VerifyErrorKind::FunctionReferenceOutOfBounds {
                 function,
                 function_count,
@@ -989,16 +1265,6 @@ impl fmt::Display for VerifyError {
                 formatter,
                 "function reference {} is outside {function_count} functions",
                 function.get()
-            ),
-            VerifyErrorKind::ArgumentWindowOutOfBounds {
-                args_start,
-                arg_count,
-                register_count,
-            } => write!(
-                formatter,
-                "argument window [{}, {} + {arg_count}) escapes register count {register_count}",
-                args_start.get(),
-                args_start.get()
             ),
             VerifyErrorKind::JumpOutOfBounds {
                 target,
@@ -1165,6 +1431,20 @@ fn verify_function(
             },
         ));
     }
+    // Captures and parameters share the leading register file; their sum must
+    // fit. Checked with u64 so hostile counts near u32::MAX cannot wrap.
+    if u64::from(function.capture_count) + u64::from(function.parameter_count)
+        > u64::from(function.register_count)
+    {
+        return Err(function_error(
+            function_index,
+            VerifyErrorKind::EntryRegistersExceedRegisterCount {
+                capture_count: function.capture_count,
+                parameter_count: function.parameter_count,
+                register_count: function.register_count,
+            },
+        ));
+    }
     verify_function_name(module, function_index, function)?;
     verify_handlers(function_index, function)?;
     for (pc, instruction) in function.code.iter().copied().enumerate() {
@@ -1311,7 +1591,9 @@ fn verify_instruction(
             Ok(())
         }
     };
-    let check_string_key = |constant: ConstantId| -> Result<(), VerifyError> {
+    // A string constant reference: property/global/private/regexp/export/import
+    // names must all resolve to a `Constant::String`.
+    let check_string_constant = |constant: ConstantId| -> Result<(), VerifyError> {
         check_constant(constant)?;
         if matches!(
             module.constants[constant.get() as usize],
@@ -1322,23 +1604,8 @@ fn verify_instruction(
             Err(instruction_error(
                 function_index,
                 pc,
-                VerifyErrorKind::PropertyKeyNotString { constant },
+                VerifyErrorKind::StringConstantExpected { constant },
             ))
-        }
-    };
-    let check_window = |args_start: Register, arg_count: u32| -> Result<(), VerifyError> {
-        if u64::from(args_start.get()) + u64::from(arg_count) > u64::from(register_count) {
-            Err(instruction_error(
-                function_index,
-                pc,
-                VerifyErrorKind::ArgumentWindowOutOfBounds {
-                    args_start,
-                    arg_count,
-                    register_count,
-                },
-            ))
-        } else {
-            Ok(())
         }
     };
 
@@ -1365,11 +1632,13 @@ fn verify_instruction(
         Instruction::CreateObject { dst } | Instruction::CreateArray { dst } => {
             check_register(dst)?;
         }
-        Instruction::DefineFunction {
+        Instruction::CreateClosure {
             dst,
             function: reference,
+            captures,
         } => {
             check_register(dst)?;
+            check_register(captures)?;
             if reference.get() as usize >= function_count {
                 return Err(instruction_error(
                     function_index,
@@ -1384,39 +1653,102 @@ fn verify_instruction(
         Instruction::GetProperty { dst, object, key } => {
             check_register(dst)?;
             check_register(object)?;
-            check_string_key(key)?;
+            check_register(key)?;
         }
         Instruction::SetProperty { object, key, value } => {
             check_register(object)?;
+            check_register(key)?;
             check_register(value)?;
-            check_string_key(key)?;
         }
         Instruction::DeleteProperty { dst, object, key } => {
             check_register(dst)?;
             check_register(object)?;
-            check_string_key(key)?;
+            check_register(key)?;
+        }
+        Instruction::DefineAccessor {
+            object,
+            key,
+            accessor,
+            ..
+        } => {
+            check_register(object)?;
+            check_register(key)?;
+            check_register(accessor)?;
         }
         Instruction::Call {
             dst,
             callee,
             this_value,
-            args_start,
-            arg_count,
+            arguments,
         } => {
             check_register(dst)?;
             check_register(callee)?;
             check_register(this_value)?;
-            check_window(args_start, arg_count)?;
+            check_register(arguments)?;
         }
         Instruction::Construct {
             dst,
             callee,
-            args_start,
-            arg_count,
+            arguments,
         } => {
             check_register(dst)?;
             check_register(callee)?;
-            check_window(args_start, arg_count)?;
+            check_register(arguments)?;
+        }
+        Instruction::LoadGlobal { dst, name } | Instruction::TypeOfGlobal { dst, name } => {
+            check_register(dst)?;
+            check_string_constant(name)?;
+        }
+        Instruction::StoreGlobal { name, value } => {
+            check_string_constant(name)?;
+            check_register(value)?;
+        }
+        Instruction::LoadThis { dst }
+        | Instruction::LoadArguments { dst }
+        | Instruction::LoadNewTarget { dst } => {
+            check_register(dst)?;
+        }
+        Instruction::ArrayPush { array, value } => {
+            check_register(array)?;
+            check_register(value)?;
+        }
+        Instruction::ArrayExtend { array, iterable } => {
+            check_register(array)?;
+            check_register(iterable)?;
+        }
+        Instruction::ObjectSpread { target, source } => {
+            check_register(target)?;
+            check_register(source)?;
+        }
+        Instruction::SetPrototype { object, prototype } => {
+            check_register(object)?;
+            check_register(prototype)?;
+        }
+        Instruction::CreatePrivateName { dst, description } => {
+            check_register(dst)?;
+            check_string_constant(description)?;
+        }
+        Instruction::CreateRegExp {
+            dst,
+            pattern,
+            flags,
+        } => {
+            check_register(dst)?;
+            check_string_constant(pattern)?;
+            check_string_constant(flags)?;
+        }
+        Instruction::GetIterator { dst, src, .. } => {
+            check_register(dst)?;
+            check_register(src)?;
+        }
+        Instruction::IteratorNext {
+            done,
+            value,
+            iterator,
+        } => {
+            check_register(done)?;
+            check_register(value)?;
+            check_register(iterator)?;
         }
         Instruction::Jump { target } => verify_target(function_index, pc, target, code_len)?,
         Instruction::JumpIfTrue { condition, target }
@@ -1432,7 +1764,11 @@ fn verify_instruction(
         }
         Instruction::Import { dst, specifier } => {
             check_register(dst)?;
-            check_string_key(specifier)?;
+            check_string_constant(specifier)?;
+        }
+        Instruction::Export { name, src } => {
+            check_string_constant(name)?;
+            check_register(src)?;
         }
         Instruction::Halt => {}
     }
@@ -1472,11 +1808,12 @@ fn verify_target(
 }
 
 /// Builds the greatest syntactic forward witness satisfying every transfer,
-/// with the entry fact fixed to the parameter registers. Handler entries are
-/// reached conservatively: an exception may occur at the first protected
-/// instruction, so a handler's fact is the intersection of the pre-facts across
-/// its protected range plus its catch register. This does not use semantic
-/// reachability, matching Lean's `Certificate` and `verifier_never_skips_invariant`.
+/// with the entry fact fixed to the capture and parameter registers. Handler
+/// entries are reached conservatively: an exception may occur at the first
+/// protected instruction, so a handler's fact is the intersection of the
+/// pre-facts across its protected range plus its catch register. This does not
+/// use semantic reachability, matching Lean's `Certificate` and
+/// `verifier_never_skips_invariant`.
 fn definite_initialization(
     function_index: usize,
     function: &Function,
@@ -1484,16 +1821,14 @@ fn definite_initialization(
     let register_count = function.register_count;
     let mut facts = vec![RegisterSet::full(register_count); function.code.len()];
     let mut entry = RegisterSet::empty(register_count);
-    entry.insert_prefix(function.parameter_count);
+    entry.insert_prefix(function.entry_initialized());
     facts[0] = entry;
 
     loop {
         let mut changed = false;
         for (pc, instruction) in function.code.iter().copied().enumerate() {
             let mut after = facts[pc].clone();
-            if let Some(write) = instruction.write() {
-                after.insert(write);
-            }
+            instruction.visit_writes(|write| after.insert(write));
             instruction.visit_successors(pc as u32, |successor| {
                 changed |= facts[successor.get() as usize].intersect(&after);
             });
@@ -1540,13 +1875,13 @@ pub struct DecodeLimits {
     pub max_bytes: usize,
     pub max_constants: u32,
     pub max_functions: u32,
+    pub max_capture_count: u32,
     pub max_parameter_count: u32,
     pub max_register_count: u32,
     pub max_instructions_per_function: u32,
     pub max_total_instructions: u64,
     pub max_handlers_per_function: u32,
     pub max_string_bytes: u32,
-    pub max_arg_count: u32,
 }
 
 impl Default for DecodeLimits {
@@ -1555,13 +1890,13 @@ impl Default for DecodeLimits {
             max_bytes: 16 * 1024 * 1024,
             max_constants: MAX_CONSTANTS,
             max_functions: MAX_FUNCTIONS,
+            max_capture_count: MAX_REGISTERS,
             max_parameter_count: MAX_REGISTERS,
             max_register_count: MAX_REGISTERS,
             max_instructions_per_function: MAX_INSTRUCTIONS,
             max_total_instructions: 1 << 24,
             max_handlers_per_function: MAX_HANDLERS,
             max_string_bytes: 1 << 20,
-            max_arg_count: MAX_REGISTERS,
         }
     }
 }
@@ -1604,6 +1939,12 @@ pub enum DecodeErrorKind {
         tag: u8,
     },
     InvalidBinaryOp {
+        tag: u8,
+    },
+    InvalidIteratorKind {
+        tag: u8,
+    },
+    InvalidAccessorKind {
         tag: u8,
     },
     InvalidOpcode {
@@ -1659,6 +2000,12 @@ impl fmt::Display for DecodeError {
             }
             DecodeErrorKind::InvalidBinaryOp { tag } => {
                 write!(formatter, "invalid binary operator {tag}")
+            }
+            DecodeErrorKind::InvalidIteratorKind { tag } => {
+                write!(formatter, "invalid iterator kind {tag}")
+            }
+            DecodeErrorKind::InvalidAccessorKind { tag } => {
+                write!(formatter, "invalid accessor kind {tag}")
             }
             DecodeErrorKind::InvalidOpcode { opcode } => {
                 write!(formatter, "invalid opcode {opcode}")
@@ -1825,6 +2172,7 @@ impl<'a> Decoder<'a> {
             0 => None,
             encoded => Some(ConstantId::new(encoded - 1)),
         };
+        let capture_count = self.bounded("capture count", self.limits.max_capture_count)?;
         let parameter_count = self.bounded("parameter count", self.limits.max_parameter_count)?;
         let register_count = self.bounded("register count", self.limits.max_register_count)?;
         let flags_at = self.offset;
@@ -1868,6 +2216,7 @@ impl<'a> Decoder<'a> {
         }
         Ok(Function::new(
             name,
+            capture_count,
             parameter_count,
             register_count,
             flags,
@@ -1904,65 +2253,130 @@ impl<'a> Decoder<'a> {
             5 => Ok(Instruction::CreateArray {
                 dst: Register::new(self.leb128()?),
             }),
-            6 => Ok(Instruction::DefineFunction {
+            6 => Ok(Instruction::CreateClosure {
                 dst: Register::new(self.leb128()?),
                 function: FunctionId::new(self.leb128()?),
+                captures: Register::new(self.leb128()?),
             }),
             7 => Ok(Instruction::GetProperty {
                 dst: Register::new(self.leb128()?),
                 object: Register::new(self.leb128()?),
-                key: ConstantId::new(self.leb128()?),
+                key: Register::new(self.leb128()?),
             }),
             8 => Ok(Instruction::SetProperty {
                 object: Register::new(self.leb128()?),
-                key: ConstantId::new(self.leb128()?),
+                key: Register::new(self.leb128()?),
                 value: Register::new(self.leb128()?),
             }),
             9 => Ok(Instruction::DeleteProperty {
                 dst: Register::new(self.leb128()?),
                 object: Register::new(self.leb128()?),
-                key: ConstantId::new(self.leb128()?),
+                key: Register::new(self.leb128()?),
             }),
-            10 => Ok(Instruction::Call {
+            10 => Ok(Instruction::DefineAccessor {
+                object: Register::new(self.leb128()?),
+                key: Register::new(self.leb128()?),
+                accessor: Register::new(self.leb128()?),
+                kind: self.accessor_kind()?,
+            }),
+            11 => Ok(Instruction::Call {
                 dst: Register::new(self.leb128()?),
                 callee: Register::new(self.leb128()?),
                 this_value: Register::new(self.leb128()?),
-                args_start: Register::new(self.leb128()?),
-                arg_count: self.bounded("argument count", self.limits.max_arg_count)?,
+                arguments: Register::new(self.leb128()?),
             }),
-            11 => Ok(Instruction::Construct {
+            12 => Ok(Instruction::Construct {
                 dst: Register::new(self.leb128()?),
                 callee: Register::new(self.leb128()?),
-                args_start: Register::new(self.leb128()?),
-                arg_count: self.bounded("argument count", self.limits.max_arg_count)?,
+                arguments: Register::new(self.leb128()?),
             }),
-            12 => Ok(Instruction::Jump {
+            13 => Ok(Instruction::LoadGlobal {
+                dst: Register::new(self.leb128()?),
+                name: ConstantId::new(self.leb128()?),
+            }),
+            14 => Ok(Instruction::StoreGlobal {
+                name: ConstantId::new(self.leb128()?),
+                value: Register::new(self.leb128()?),
+            }),
+            15 => Ok(Instruction::TypeOfGlobal {
+                dst: Register::new(self.leb128()?),
+                name: ConstantId::new(self.leb128()?),
+            }),
+            16 => Ok(Instruction::LoadThis {
+                dst: Register::new(self.leb128()?),
+            }),
+            17 => Ok(Instruction::LoadArguments {
+                dst: Register::new(self.leb128()?),
+            }),
+            18 => Ok(Instruction::LoadNewTarget {
+                dst: Register::new(self.leb128()?),
+            }),
+            19 => Ok(Instruction::ArrayPush {
+                array: Register::new(self.leb128()?),
+                value: Register::new(self.leb128()?),
+            }),
+            20 => Ok(Instruction::ArrayExtend {
+                array: Register::new(self.leb128()?),
+                iterable: Register::new(self.leb128()?),
+            }),
+            21 => Ok(Instruction::ObjectSpread {
+                target: Register::new(self.leb128()?),
+                source: Register::new(self.leb128()?),
+            }),
+            22 => Ok(Instruction::SetPrototype {
+                object: Register::new(self.leb128()?),
+                prototype: Register::new(self.leb128()?),
+            }),
+            23 => Ok(Instruction::CreatePrivateName {
+                dst: Register::new(self.leb128()?),
+                description: ConstantId::new(self.leb128()?),
+            }),
+            24 => Ok(Instruction::CreateRegExp {
+                dst: Register::new(self.leb128()?),
+                pattern: ConstantId::new(self.leb128()?),
+                flags: ConstantId::new(self.leb128()?),
+            }),
+            25 => Ok(Instruction::GetIterator {
+                dst: Register::new(self.leb128()?),
+                src: Register::new(self.leb128()?),
+                kind: self.iterator_kind()?,
+            }),
+            26 => Ok(Instruction::IteratorNext {
+                done: Register::new(self.leb128()?),
+                value: Register::new(self.leb128()?),
+                iterator: Register::new(self.leb128()?),
+            }),
+            27 => Ok(Instruction::Jump {
                 target: Pc::new(self.leb128()?),
             }),
-            13 => Ok(Instruction::JumpIfTrue {
+            28 => Ok(Instruction::JumpIfTrue {
                 condition: Register::new(self.leb128()?),
                 target: Pc::new(self.leb128()?),
             }),
-            14 => Ok(Instruction::JumpIfFalse {
+            29 => Ok(Instruction::JumpIfFalse {
                 condition: Register::new(self.leb128()?),
                 target: Pc::new(self.leb128()?),
             }),
-            15 => Ok(Instruction::Return {
+            30 => Ok(Instruction::Return {
                 value: Register::new(self.leb128()?),
             }),
-            16 => Ok(Instruction::Throw {
+            31 => Ok(Instruction::Throw {
                 value: Register::new(self.leb128()?),
             }),
-            17 => Ok(Instruction::Suspend {
+            32 => Ok(Instruction::Suspend {
                 dst: Register::new(self.leb128()?),
                 src: Register::new(self.leb128()?),
                 resume: Pc::new(self.leb128()?),
             }),
-            18 => Ok(Instruction::Import {
+            33 => Ok(Instruction::Import {
                 dst: Register::new(self.leb128()?),
                 specifier: ConstantId::new(self.leb128()?),
             }),
-            19 => Ok(Instruction::Halt),
+            34 => Ok(Instruction::Export {
+                name: ConstantId::new(self.leb128()?),
+                src: Register::new(self.leb128()?),
+            }),
+            35 => Ok(Instruction::Halt),
             opcode => Err(self.error(opcode_at, DecodeErrorKind::InvalidOpcode { opcode })),
         }
     }
@@ -1978,6 +2392,20 @@ impl<'a> Decoder<'a> {
         let tag = self.byte()?;
         BinaryOp::from_u8(tag)
             .ok_or_else(|| self.error(at, DecodeErrorKind::InvalidBinaryOp { tag }))
+    }
+
+    fn iterator_kind(&mut self) -> Result<IteratorKind, DecodeError> {
+        let at = self.offset;
+        let tag = self.byte()?;
+        IteratorKind::from_u8(tag)
+            .ok_or_else(|| self.error(at, DecodeErrorKind::InvalidIteratorKind { tag }))
+    }
+
+    fn accessor_kind(&mut self) -> Result<AccessorKind, DecodeError> {
+        let at = self.offset;
+        let tag = self.byte()?;
+        AccessorKind::from_u8(tag)
+            .ok_or_else(|| self.error(at, DecodeErrorKind::InvalidAccessorKind { tag }))
     }
 
     fn bounded(&mut self, field: &'static str, limit: u32) -> Result<u32, DecodeError> {
@@ -2111,6 +2539,7 @@ fn write_text(value: &str, output: &mut Vec<u8>) {
 
 fn encode_function(function: &Function, output: &mut Vec<u8>) {
     write_u32(function.name.map_or(0, |name| name.get() + 1), output);
+    write_u32(function.capture_count, output);
     write_u32(function.parameter_count, output);
     write_u32(function.register_count, output);
     output.push(function.flags.to_bits());
@@ -2165,10 +2594,15 @@ fn encode_instruction(instruction: Instruction, output: &mut Vec<u8>) {
             output.push(5);
             write_u32(dst.get(), output);
         }
-        Instruction::DefineFunction { dst, function } => {
+        Instruction::CreateClosure {
+            dst,
+            function,
+            captures,
+        } => {
             output.push(6);
             write_u32(dst.get(), output);
             write_u32(function.get(), output);
+            write_u32(captures.get(), output);
         }
         Instruction::GetProperty { dst, object, key } => {
             output.push(7);
@@ -2188,66 +2622,157 @@ fn encode_instruction(instruction: Instruction, output: &mut Vec<u8>) {
             write_u32(object.get(), output);
             write_u32(key.get(), output);
         }
+        Instruction::DefineAccessor {
+            object,
+            key,
+            accessor,
+            kind,
+        } => {
+            output.push(10);
+            write_u32(object.get(), output);
+            write_u32(key.get(), output);
+            write_u32(accessor.get(), output);
+            output.push(kind.to_u8());
+        }
         Instruction::Call {
             dst,
             callee,
             this_value,
-            args_start,
-            arg_count,
-        } => {
-            output.push(10);
-            write_u32(dst.get(), output);
-            write_u32(callee.get(), output);
-            write_u32(this_value.get(), output);
-            write_u32(args_start.get(), output);
-            write_u32(arg_count, output);
-        }
-        Instruction::Construct {
-            dst,
-            callee,
-            args_start,
-            arg_count,
+            arguments,
         } => {
             output.push(11);
             write_u32(dst.get(), output);
             write_u32(callee.get(), output);
-            write_u32(args_start.get(), output);
-            write_u32(arg_count, output);
+            write_u32(this_value.get(), output);
+            write_u32(arguments.get(), output);
+        }
+        Instruction::Construct {
+            dst,
+            callee,
+            arguments,
+        } => {
+            output.push(12);
+            write_u32(dst.get(), output);
+            write_u32(callee.get(), output);
+            write_u32(arguments.get(), output);
+        }
+        Instruction::LoadGlobal { dst, name } => {
+            output.push(13);
+            write_u32(dst.get(), output);
+            write_u32(name.get(), output);
+        }
+        Instruction::StoreGlobal { name, value } => {
+            output.push(14);
+            write_u32(name.get(), output);
+            write_u32(value.get(), output);
+        }
+        Instruction::TypeOfGlobal { dst, name } => {
+            output.push(15);
+            write_u32(dst.get(), output);
+            write_u32(name.get(), output);
+        }
+        Instruction::LoadThis { dst } => {
+            output.push(16);
+            write_u32(dst.get(), output);
+        }
+        Instruction::LoadArguments { dst } => {
+            output.push(17);
+            write_u32(dst.get(), output);
+        }
+        Instruction::LoadNewTarget { dst } => {
+            output.push(18);
+            write_u32(dst.get(), output);
+        }
+        Instruction::ArrayPush { array, value } => {
+            output.push(19);
+            write_u32(array.get(), output);
+            write_u32(value.get(), output);
+        }
+        Instruction::ArrayExtend { array, iterable } => {
+            output.push(20);
+            write_u32(array.get(), output);
+            write_u32(iterable.get(), output);
+        }
+        Instruction::ObjectSpread { target, source } => {
+            output.push(21);
+            write_u32(target.get(), output);
+            write_u32(source.get(), output);
+        }
+        Instruction::SetPrototype { object, prototype } => {
+            output.push(22);
+            write_u32(object.get(), output);
+            write_u32(prototype.get(), output);
+        }
+        Instruction::CreatePrivateName { dst, description } => {
+            output.push(23);
+            write_u32(dst.get(), output);
+            write_u32(description.get(), output);
+        }
+        Instruction::CreateRegExp {
+            dst,
+            pattern,
+            flags,
+        } => {
+            output.push(24);
+            write_u32(dst.get(), output);
+            write_u32(pattern.get(), output);
+            write_u32(flags.get(), output);
+        }
+        Instruction::GetIterator { dst, src, kind } => {
+            output.push(25);
+            write_u32(dst.get(), output);
+            write_u32(src.get(), output);
+            output.push(kind.to_u8());
+        }
+        Instruction::IteratorNext {
+            done,
+            value,
+            iterator,
+        } => {
+            output.push(26);
+            write_u32(done.get(), output);
+            write_u32(value.get(), output);
+            write_u32(iterator.get(), output);
         }
         Instruction::Jump { target } => {
-            output.push(12);
+            output.push(27);
             write_u32(target.get(), output);
         }
         Instruction::JumpIfTrue { condition, target } => {
-            output.push(13);
+            output.push(28);
             write_u32(condition.get(), output);
             write_u32(target.get(), output);
         }
         Instruction::JumpIfFalse { condition, target } => {
-            output.push(14);
+            output.push(29);
             write_u32(condition.get(), output);
             write_u32(target.get(), output);
         }
         Instruction::Return { value } => {
-            output.push(15);
+            output.push(30);
             write_u32(value.get(), output);
         }
         Instruction::Throw { value } => {
-            output.push(16);
+            output.push(31);
             write_u32(value.get(), output);
         }
         Instruction::Suspend { dst, src, resume } => {
-            output.push(17);
+            output.push(32);
             write_u32(dst.get(), output);
             write_u32(src.get(), output);
             write_u32(resume.get(), output);
         }
         Instruction::Import { dst, specifier } => {
-            output.push(18);
+            output.push(33);
             write_u32(dst.get(), output);
             write_u32(specifier.get(), output);
         }
-        Instruction::Halt => output.push(19),
+        Instruction::Export { name, src } => {
+            output.push(34);
+            write_u32(name.get(), output);
+            write_u32(src.get(), output);
+        }
+        Instruction::Halt => output.push(35),
     }
 }
 
@@ -2265,11 +2790,24 @@ mod tests {
         bytes
     }
 
-    /// A function exercising most opcodes, all references in bounds and every
-    /// read dominated by a write.
+    /// A single function exercising the dynamic-computation opcodes, all
+    /// references in bounds and every read dominated by a write. Register map:
+    ///
+    /// * r0 = 21, r1 = 1.5, r2 = r0 + r1, r3 = -r2
+    /// * r4 = {}, r5 = "main" (used as a register property key)
+    /// * r6 = r4[r5]; r7 = [] then push/extend
+    /// * r9 = {}; object-spread and set-prototype from r4
+    /// * r10 = closure(fn0, captures=r7)
+    /// * r11/r12/r13 = this / arguments / new.target
+    /// * r14 = global g; store it back; r15 = typeof g
+    /// * r16 = #p private name; r17 = /ab/gi
+    /// * r18 = iterator(r7); (r19,r20) = next(r18)
+    /// * r21 = call(r10, this=r4, args=r7); r22 = construct(r10, args=r7)
+    /// * r23 = import "./dep"; export "x" = r23; suspend yields r22, resumes r24
+    /// * handler over [0,34) catches into r25
     fn rich_module() -> Module<Unverified> {
         let constants = vec![
-            Constant::String("main".to_owned()), // 0: function name + key
+            Constant::String("main".to_owned()), // 0: function name + key string
             Constant::Int32(21),                 // 1
             Constant::Number(NumberBits::from_f64(1.5)), // 2
             Constant::BigInt(BigIntLiteral::new("-1234567890123".to_owned()).unwrap()), // 3
@@ -2277,6 +2815,11 @@ mod tests {
             Constant::Null,                      // 5
             Constant::Undefined,                 // 6
             Constant::String("./dep".to_owned()), // 7: import specifier
+            Constant::String("g".to_owned()),    // 8: global name
+            Constant::String("#p".to_owned()),   // 9: private description
+            Constant::String("ab".to_owned()),   // 10: regexp pattern
+            Constant::String("gi".to_owned()),   // 11: regexp flags
+            Constant::String("x".to_owned()),    // 12: export name
         ];
         let code = vec![
             Instruction::LoadConst {
@@ -2301,77 +2844,144 @@ mod tests {
             Instruction::CreateObject {
                 dst: Register::new(4),
             },
+            Instruction::LoadConst {
+                dst: Register::new(5),
+                constant: ConstantId::new(0),
+            },
             Instruction::SetProperty {
                 object: Register::new(4),
-                key: ConstantId::new(0),
+                key: Register::new(5),
                 value: Register::new(3),
             },
             Instruction::GetProperty {
-                dst: Register::new(5),
+                dst: Register::new(6),
                 object: Register::new(4),
-                key: ConstantId::new(0),
+                key: Register::new(5),
             },
             Instruction::CreateArray {
-                dst: Register::new(6),
-            },
-            Instruction::DefineFunction {
                 dst: Register::new(7),
-                function: FunctionId::new(0),
             },
-            Instruction::Move {
-                dst: Register::new(8),
-                src: Register::new(5),
+            Instruction::ArrayPush {
+                array: Register::new(7),
+                value: Register::new(6),
+            },
+            Instruction::ArrayExtend {
+                array: Register::new(7),
+                iterable: Register::new(7),
+            },
+            Instruction::CreateObject {
+                dst: Register::new(9),
+            },
+            Instruction::ObjectSpread {
+                target: Register::new(9),
+                source: Register::new(4),
+            },
+            Instruction::SetPrototype {
+                object: Register::new(9),
+                prototype: Register::new(4),
+            },
+            Instruction::CreateClosure {
+                dst: Register::new(10),
+                function: FunctionId::new(0),
+                captures: Register::new(7),
+            },
+            Instruction::LoadThis {
+                dst: Register::new(11),
+            },
+            Instruction::LoadArguments {
+                dst: Register::new(12),
+            },
+            Instruction::LoadNewTarget {
+                dst: Register::new(13),
+            },
+            Instruction::LoadGlobal {
+                dst: Register::new(14),
+                name: ConstantId::new(8),
+            },
+            Instruction::StoreGlobal {
+                name: ConstantId::new(8),
+                value: Register::new(14),
+            },
+            Instruction::TypeOfGlobal {
+                dst: Register::new(15),
+                name: ConstantId::new(8),
+            },
+            Instruction::CreatePrivateName {
+                dst: Register::new(16),
+                description: ConstantId::new(9),
+            },
+            Instruction::CreateRegExp {
+                dst: Register::new(17),
+                pattern: ConstantId::new(10),
+                flags: ConstantId::new(11),
+            },
+            Instruction::GetIterator {
+                dst: Register::new(18),
+                src: Register::new(7),
+                kind: IteratorKind::Sync,
+            },
+            Instruction::IteratorNext {
+                done: Register::new(19),
+                value: Register::new(20),
+                iterator: Register::new(18),
+            },
+            Instruction::DefineAccessor {
+                object: Register::new(9),
+                key: Register::new(5),
+                accessor: Register::new(10),
+                kind: AccessorKind::Getter,
             },
             Instruction::Call {
-                dst: Register::new(9),
-                callee: Register::new(7),
+                dst: Register::new(21),
+                callee: Register::new(10),
                 this_value: Register::new(4),
-                args_start: Register::new(8),
-                arg_count: 1,
+                arguments: Register::new(7),
             },
             Instruction::Construct {
-                dst: Register::new(10),
-                callee: Register::new(7),
-                args_start: Register::new(8),
-                arg_count: 1,
+                dst: Register::new(22),
+                callee: Register::new(10),
+                arguments: Register::new(7),
             },
             Instruction::Import {
-                dst: Register::new(11),
+                dst: Register::new(23),
                 specifier: ConstantId::new(7),
             },
+            Instruction::Export {
+                name: ConstantId::new(12),
+                src: Register::new(23),
+            },
             Instruction::Suspend {
-                dst: Register::new(12),
-                src: Register::new(10),
-                resume: Pc::new(14),
+                dst: Register::new(24),
+                src: Register::new(22),
+                resume: Pc::new(31),
             },
             Instruction::JumpIfTrue {
-                condition: Register::new(9),
-                target: Pc::new(16),
-            },
-            Instruction::DeleteProperty {
-                dst: Register::new(13),
-                object: Register::new(4),
-                key: ConstantId::new(0),
+                condition: Register::new(21),
+                target: Pc::new(33),
             },
             Instruction::Return {
-                value: Register::new(9),
+                value: Register::new(6),
             },
             Instruction::Return {
-                value: Register::new(13),
+                value: Register::new(24),
+            },
+            Instruction::Return {
+                value: Register::new(25),
             },
         ];
         let handlers = vec![ExceptionHandler {
             start: Pc::new(0),
-            end: Pc::new(16),
-            handler: Pc::new(17),
-            catch_register: Register::new(13),
+            end: Pc::new(34),
+            handler: Pc::new(34),
+            catch_register: Register::new(25),
         }];
         Module::new(
             constants,
             vec![Function::new(
                 Some(ConstantId::new(0)),
                 0,
-                14,
+                0,
+                26,
                 FunctionFlags {
                     is_async: true,
                     is_generator: false,
@@ -2395,12 +3005,191 @@ mod tests {
         assert_eq!(reverified.encode(), encoded, "round-trip is canonical");
     }
 
+    /// Every opcode variant survives an encode -> decode round-trip at the
+    /// instruction level, independent of CFG/reference validity. This pins the
+    /// wire tag and field order for all 36 opcodes.
+    #[test]
+    fn every_opcode_round_trips_on_the_wire() {
+        let instructions = [
+            Instruction::LoadConst {
+                dst: Register::new(1),
+                constant: ConstantId::new(2),
+            },
+            Instruction::Move {
+                dst: Register::new(3),
+                src: Register::new(4),
+            },
+            Instruction::Unary {
+                dst: Register::new(5),
+                op: UnaryOp::LogicalNot,
+                operand: Register::new(6),
+            },
+            Instruction::Binary {
+                dst: Register::new(7),
+                op: BinaryOp::StrictEqual,
+                left: Register::new(8),
+                right: Register::new(9),
+            },
+            Instruction::CreateObject {
+                dst: Register::new(10),
+            },
+            Instruction::CreateArray {
+                dst: Register::new(11),
+            },
+            Instruction::CreateClosure {
+                dst: Register::new(12),
+                function: FunctionId::new(13),
+                captures: Register::new(14),
+            },
+            Instruction::GetProperty {
+                dst: Register::new(15),
+                object: Register::new(16),
+                key: Register::new(17),
+            },
+            Instruction::SetProperty {
+                object: Register::new(18),
+                key: Register::new(19),
+                value: Register::new(20),
+            },
+            Instruction::DeleteProperty {
+                dst: Register::new(21),
+                object: Register::new(22),
+                key: Register::new(23),
+            },
+            Instruction::DefineAccessor {
+                object: Register::new(24),
+                key: Register::new(25),
+                accessor: Register::new(26),
+                kind: AccessorKind::Setter,
+            },
+            Instruction::Call {
+                dst: Register::new(27),
+                callee: Register::new(28),
+                this_value: Register::new(29),
+                arguments: Register::new(30),
+            },
+            Instruction::Construct {
+                dst: Register::new(31),
+                callee: Register::new(32),
+                arguments: Register::new(33),
+            },
+            Instruction::LoadGlobal {
+                dst: Register::new(34),
+                name: ConstantId::new(35),
+            },
+            Instruction::StoreGlobal {
+                name: ConstantId::new(36),
+                value: Register::new(37),
+            },
+            Instruction::TypeOfGlobal {
+                dst: Register::new(38),
+                name: ConstantId::new(39),
+            },
+            Instruction::LoadThis {
+                dst: Register::new(40),
+            },
+            Instruction::LoadArguments {
+                dst: Register::new(41),
+            },
+            Instruction::LoadNewTarget {
+                dst: Register::new(42),
+            },
+            Instruction::ArrayPush {
+                array: Register::new(43),
+                value: Register::new(44),
+            },
+            Instruction::ArrayExtend {
+                array: Register::new(45),
+                iterable: Register::new(46),
+            },
+            Instruction::ObjectSpread {
+                target: Register::new(47),
+                source: Register::new(48),
+            },
+            Instruction::SetPrototype {
+                object: Register::new(49),
+                prototype: Register::new(50),
+            },
+            Instruction::CreatePrivateName {
+                dst: Register::new(51),
+                description: ConstantId::new(52),
+            },
+            Instruction::CreateRegExp {
+                dst: Register::new(53),
+                pattern: ConstantId::new(54),
+                flags: ConstantId::new(55),
+            },
+            Instruction::GetIterator {
+                dst: Register::new(56),
+                src: Register::new(57),
+                kind: IteratorKind::Async,
+            },
+            Instruction::IteratorNext {
+                done: Register::new(58),
+                value: Register::new(59),
+                iterator: Register::new(60),
+            },
+            Instruction::Jump {
+                target: Pc::new(61),
+            },
+            Instruction::JumpIfTrue {
+                condition: Register::new(62),
+                target: Pc::new(63),
+            },
+            Instruction::JumpIfFalse {
+                condition: Register::new(64),
+                target: Pc::new(65),
+            },
+            Instruction::Return {
+                value: Register::new(66),
+            },
+            Instruction::Throw {
+                value: Register::new(67),
+            },
+            Instruction::Suspend {
+                dst: Register::new(68),
+                src: Register::new(69),
+                resume: Pc::new(70),
+            },
+            Instruction::Import {
+                dst: Register::new(71),
+                specifier: ConstantId::new(72),
+            },
+            Instruction::Export {
+                name: ConstantId::new(73),
+                src: Register::new(74),
+            },
+            Instruction::Halt,
+        ];
+        assert_eq!(instructions.len(), 36, "one case per opcode");
+        let limits = DecodeLimits::default();
+        for (opcode, instruction) in instructions.into_iter().enumerate() {
+            let mut bytes = Vec::new();
+            encode_instruction(instruction, &mut bytes);
+            assert_eq!(
+                bytes.first().copied(),
+                Some(opcode as u8),
+                "opcode tag is its table index"
+            );
+            let mut decoder = Decoder {
+                bytes: &bytes,
+                offset: 0,
+                limits: &limits,
+                total_instructions: 0,
+            };
+            let decoded = decoder.instruction().expect("opcode decodes");
+            assert_eq!(decoded, instruction, "{instruction:?} round-trips");
+            assert_eq!(decoder.offset, bytes.len(), "consumes exactly its bytes");
+        }
+    }
+
     #[test]
     fn minimal_module_has_exact_canonical_wire() {
         let module = Module::new(
             vec![Constant::Int32(7)],
             vec![Function::new(
                 None,
+                0,
                 0,
                 1,
                 flags(),
@@ -2425,12 +3214,13 @@ mod tests {
             1, // function count
             0, // entry
             0, // name none
+            0, // capture count
             0, // parameter count
             1, // register count
             0, // flags
             2, // code length
             0, 0, 0, // LoadConst dst0 const0
-            15, 0, // Return value0
+            30, 0, // Return value0
             0, // handler count
         ]);
         assert_eq!(encoded, expected);
@@ -2460,6 +3250,7 @@ mod tests {
             vec![Function::new(
                 None,
                 0,
+                0,
                 register_count,
                 flags(),
                 code,
@@ -2478,6 +3269,54 @@ mod tests {
         let decoded = decode(&encoded, &DecodeLimits::default()).expect("round trip");
         assert_eq!(decoded, module);
         assert_eq!(decoded.verify().expect("reverify").encode(), encoded,);
+    }
+
+    /// A call whose arguments array holds far more than the old 127/fixed-window
+    /// ceiling: a single arguments register, no window, no arg-count field.
+    #[test]
+    fn calls_scale_past_fixed_window_via_arguments_array() {
+        let mut code = vec![
+            Instruction::CreateObject {
+                dst: Register::new(0),
+            }, // callee stand-in
+            Instruction::CreateObject {
+                dst: Register::new(1),
+            }, // this
+            Instruction::CreateArray {
+                dst: Register::new(2),
+            }, // arguments array
+        ];
+        // Push 500 elements into the arguments array: arity is unbounded by the
+        // ISA shape, limited only by structural register/instruction ceilings.
+        for _ in 0..500 {
+            code.push(Instruction::ArrayPush {
+                array: Register::new(2),
+                value: Register::new(1),
+            });
+        }
+        code.push(Instruction::Call {
+            dst: Register::new(3),
+            callee: Register::new(0),
+            this_value: Register::new(1),
+            arguments: Register::new(2),
+        });
+        code.push(Instruction::Return {
+            value: Register::new(3),
+        });
+        let module = Module::new(
+            vec![],
+            vec![Function::new(None, 0, 0, 4, flags(), code, vec![])],
+            FunctionId::new(0),
+        );
+        let verified = module.clone().verify().expect("variadic call verifies");
+        assert_eq!(
+            decode(&verified.encode(), &DecodeLimits::default())
+                .expect("round trip")
+                .verify()
+                .expect("reverify")
+                .encode(),
+            verified.encode()
+        );
     }
 
     fn decode_leb(bytes: &[u8]) -> Result<u32, DecodeError> {
@@ -2655,6 +3494,23 @@ mod tests {
         }
     }
 
+    /// A module builder for the flags/opcode/operator hostile tests: one
+    /// function with `body` as its raw code bytes.
+    fn one_function_bytes(body: &[u8]) -> Vec<u8> {
+        let mut bytes = prefix();
+        write_u32(0, &mut bytes); // constants
+        write_u32(1, &mut bytes); // functions
+        write_u32(0, &mut bytes); // entry
+        write_u32(0, &mut bytes); // name none
+        write_u32(0, &mut bytes); // capture count
+        write_u32(0, &mut bytes); // parameter count
+        write_u32(1, &mut bytes); // register count
+        bytes.push(0); // flags
+        write_u32(1, &mut bytes); // code length
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
     #[test]
     fn decoder_rejects_unknown_tags_flags_and_operators() {
         // Invalid constant tag.
@@ -2675,6 +3531,7 @@ mod tests {
         write_u32(1, &mut bad_flags); // functions
         write_u32(0, &mut bad_flags); // entry
         write_u32(0, &mut bad_flags); // name none
+        write_u32(0, &mut bad_flags); // capture count
         write_u32(0, &mut bad_flags); // params
         write_u32(1, &mut bad_flags); // registers
         bad_flags.push(0b100); // unknown flag bit
@@ -2686,40 +3543,55 @@ mod tests {
             })
         ));
 
-        // Invalid opcode and invalid operator.
-        let base = |body: &[u8]| {
-            let mut bytes = prefix();
-            write_u32(0, &mut bytes); // constants
-            write_u32(1, &mut bytes); // functions
-            write_u32(0, &mut bytes); // entry
-            write_u32(0, &mut bytes); // name
-            write_u32(0, &mut bytes); // params
-            write_u32(1, &mut bytes); // registers
-            bytes.push(0); // flags
-            write_u32(1, &mut bytes); // code length
-            bytes.extend_from_slice(body);
-            bytes
-        };
+        // Invalid opcode.
         assert!(matches!(
-            decode(&base(&[250]), &DecodeLimits::default()),
+            decode(&one_function_bytes(&[250]), &DecodeLimits::default()),
             Err(DecodeError {
                 kind: DecodeErrorKind::InvalidOpcode { opcode: 250 },
                 ..
             })
         ));
-        // Unary with a bad operator tag (opcode 2, dst 0, op 99, ...).
+        // Unary with a bad operator tag (opcode 2, dst 0, op 99, operand 0).
         assert!(matches!(
-            decode(&base(&[2, 0, 99, 0]), &DecodeLimits::default()),
+            decode(
+                &one_function_bytes(&[2, 0, 99, 0]),
+                &DecodeLimits::default()
+            ),
             Err(DecodeError {
                 kind: DecodeErrorKind::InvalidUnaryOp { tag: 99 },
                 ..
             })
         ));
-        // Binary with a bad operator tag (opcode 3, dst 0, op 99, ...).
+        // Binary with a bad operator tag (opcode 3, dst 0, op 99, l 0, r 0).
         assert!(matches!(
-            decode(&base(&[3, 0, 99, 0, 0]), &DecodeLimits::default()),
+            decode(
+                &one_function_bytes(&[3, 0, 99, 0, 0]),
+                &DecodeLimits::default()
+            ),
             Err(DecodeError {
                 kind: DecodeErrorKind::InvalidBinaryOp { tag: 99 },
+                ..
+            })
+        ));
+        // GetIterator with a bad kind tag (opcode 25, dst 0, src 0, kind 9).
+        assert!(matches!(
+            decode(
+                &one_function_bytes(&[25, 0, 0, 9]),
+                &DecodeLimits::default()
+            ),
+            Err(DecodeError {
+                kind: DecodeErrorKind::InvalidIteratorKind { tag: 9 },
+                ..
+            })
+        ));
+        // DefineAccessor with a bad kind tag (opcode 10, obj 0, key 0, acc 0, kind 9).
+        assert!(matches!(
+            decode(
+                &one_function_bytes(&[10, 0, 0, 0, 9]),
+                &DecodeLimits::default()
+            ),
+            Err(DecodeError {
+                kind: DecodeErrorKind::InvalidAccessorKind { tag: 9 },
                 ..
             })
         ));
@@ -2782,6 +3654,7 @@ mod tests {
                 None,
                 0,
                 0,
+                0,
                 flags(),
                 vec![Instruction::Halt],
                 vec![],
@@ -2801,7 +3674,7 @@ mod tests {
     fn verifier_rejects_bad_function_metadata() {
         let empty_function = Module::new(
             vec![],
-            vec![Function::new(None, 0, 0, flags(), vec![], vec![])],
+            vec![Function::new(None, 0, 0, 0, flags(), vec![], vec![])],
             FunctionId::new(0),
         );
         assert!(matches!(
@@ -2816,6 +3689,7 @@ mod tests {
             vec![],
             vec![Function::new(
                 None,
+                0,
                 2,
                 1,
                 flags(),
@@ -2832,10 +3706,34 @@ mod tests {
             })
         ));
 
+        // Captures plus parameters overflow the register file even though each
+        // alone fits: 1 capture + 1 parameter = 2 > 1 register.
+        let captures_and_params_overflow = Module::new(
+            vec![],
+            vec![Function::new(
+                None,
+                1,
+                1,
+                1,
+                flags(),
+                vec![Instruction::Halt],
+                vec![],
+            )],
+            FunctionId::new(0),
+        );
+        assert!(matches!(
+            captures_and_params_overflow.verify(),
+            Err(VerifyError {
+                kind: VerifyErrorKind::EntryRegistersExceedRegisterCount { .. },
+                ..
+            })
+        ));
+
         let bad_name = Module::new(
             vec![Constant::Int32(0)],
             vec![Function::new(
                 Some(ConstantId::new(0)),
+                0,
                 0,
                 0,
                 flags(),
@@ -2860,6 +3758,7 @@ mod tests {
             vec![Function::new(
                 None,
                 0,
+                0,
                 1,
                 flags(),
                 vec![Instruction::LoadConst {
@@ -2883,6 +3782,7 @@ mod tests {
             vec![Function::new(
                 None,
                 0,
+                0,
                 1,
                 flags(),
                 vec![Instruction::LoadConst {
@@ -2901,49 +3801,22 @@ mod tests {
             })
         ));
 
-        let non_string_key = Module::new(
-            vec![Constant::Int32(0)],
-            vec![Function::new(
-                None,
-                0,
-                2,
-                flags(),
-                vec![
-                    Instruction::CreateObject {
-                        dst: Register::new(0),
-                    },
-                    Instruction::GetProperty {
-                        dst: Register::new(1),
-                        object: Register::new(0),
-                        key: ConstantId::new(0),
-                    },
-                    Instruction::Return {
-                        value: Register::new(1),
-                    },
-                ],
-                vec![],
-            )],
-            FunctionId::new(0),
-        );
-        assert!(matches!(
-            non_string_key.verify(),
-            Err(VerifyError {
-                kind: VerifyErrorKind::PropertyKeyNotString { .. },
-                ..
-            })
-        ));
-
         let bad_function_ref = Module::new(
             vec![],
             vec![Function::new(
                 None,
                 0,
+                0,
                 1,
                 flags(),
                 vec![
-                    Instruction::DefineFunction {
+                    Instruction::CreateArray {
+                        dst: Register::new(0),
+                    },
+                    Instruction::CreateClosure {
                         dst: Register::new(0),
                         function: FunctionId::new(5),
+                        captures: Register::new(0),
                     },
                     Instruction::Return {
                         value: Register::new(0),
@@ -2962,28 +3835,95 @@ mod tests {
         ));
     }
 
+    /// Global/private/regexp/export/import names must resolve to string
+    /// constants; a non-string constant is rejected.
     #[test]
-    fn verifier_rejects_argument_window_escape() {
-        let module = Module::new(
-            vec![],
+    fn verifier_requires_string_constants_for_named_refs() {
+        let cases: Vec<(&str, Instruction)> = vec![
+            (
+                "LoadGlobal",
+                Instruction::LoadGlobal {
+                    dst: Register::new(0),
+                    name: ConstantId::new(0),
+                },
+            ),
+            (
+                "TypeOfGlobal",
+                Instruction::TypeOfGlobal {
+                    dst: Register::new(0),
+                    name: ConstantId::new(0),
+                },
+            ),
+            (
+                "CreatePrivateName",
+                Instruction::CreatePrivateName {
+                    dst: Register::new(0),
+                    description: ConstantId::new(0),
+                },
+            ),
+            (
+                "CreateRegExp",
+                Instruction::CreateRegExp {
+                    dst: Register::new(0),
+                    pattern: ConstantId::new(0),
+                    flags: ConstantId::new(0),
+                },
+            ),
+            (
+                "Import",
+                Instruction::Import {
+                    dst: Register::new(0),
+                    specifier: ConstantId::new(0),
+                },
+            ),
+        ];
+        for (label, instruction) in cases {
+            let module = Module::new(
+                vec![Constant::Int32(0)], // constant 0 is NOT a string
+                vec![Function::new(
+                    None,
+                    0,
+                    0,
+                    1,
+                    flags(),
+                    vec![
+                        instruction,
+                        Instruction::Return {
+                            value: Register::new(0),
+                        },
+                    ],
+                    vec![],
+                )],
+                FunctionId::new(0),
+            );
+            assert!(
+                matches!(
+                    module.verify(),
+                    Err(VerifyError {
+                        kind: VerifyErrorKind::StringConstantExpected { .. },
+                        ..
+                    })
+                ),
+                "{label} must require a string constant"
+            );
+        }
+
+        // Export with a non-string name is likewise rejected.
+        let export = Module::new(
+            vec![Constant::Int32(0)],
             vec![Function::new(
                 None,
                 0,
-                2,
+                0,
+                1,
                 flags(),
                 vec![
                     Instruction::CreateObject {
                         dst: Register::new(0),
                     },
-                    Instruction::CreateObject {
-                        dst: Register::new(1),
-                    },
-                    Instruction::Call {
-                        dst: Register::new(0),
-                        callee: Register::new(1),
-                        this_value: Register::new(0),
-                        args_start: Register::new(1),
-                        arg_count: 5, // 1 + 5 = 6 > register_count 2
+                    Instruction::Export {
+                        name: ConstantId::new(0),
+                        src: Register::new(0),
                     },
                     Instruction::Return {
                         value: Register::new(0),
@@ -2994,12 +3934,92 @@ mod tests {
             FunctionId::new(0),
         );
         assert!(matches!(
-            module.verify(),
+            export.verify(),
             Err(VerifyError {
-                kind: VerifyErrorKind::ArgumentWindowOutOfBounds { .. },
+                kind: VerifyErrorKind::StringConstantExpected { .. },
                 ..
             })
         ));
+    }
+
+    /// A `CreateClosure` capture-array register and a `Call`/`Construct`
+    /// arguments register must be definitely initialized before use.
+    #[test]
+    fn verifier_requires_capture_and_argument_registers_initialized() {
+        // captures register (r0) read before any write.
+        let uninit_captures = Module::new(
+            vec![],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                2,
+                flags(),
+                vec![
+                    Instruction::CreateClosure {
+                        dst: Register::new(1),
+                        function: FunctionId::new(0),
+                        captures: Register::new(0),
+                    },
+                    Instruction::Return {
+                        value: Register::new(1),
+                    },
+                ],
+                vec![],
+            )],
+            FunctionId::new(0),
+        );
+        assert_eq!(
+            uninit_captures.verify(),
+            Err(VerifyError {
+                function: Some(FunctionId::new(0)),
+                instruction: Some(Pc::new(0)),
+                kind: VerifyErrorKind::ReadBeforeWrite {
+                    register: Register::new(0),
+                },
+            })
+        );
+
+        // arguments register (r2) read before any write in a Call.
+        let uninit_args = Module::new(
+            vec![],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                4,
+                flags(),
+                vec![
+                    Instruction::CreateObject {
+                        dst: Register::new(0),
+                    },
+                    Instruction::CreateObject {
+                        dst: Register::new(1),
+                    },
+                    Instruction::Call {
+                        dst: Register::new(3),
+                        callee: Register::new(0),
+                        this_value: Register::new(1),
+                        arguments: Register::new(2),
+                    },
+                    Instruction::Return {
+                        value: Register::new(3),
+                    },
+                ],
+                vec![],
+            )],
+            FunctionId::new(0),
+        );
+        assert_eq!(
+            uninit_args.verify(),
+            Err(VerifyError {
+                function: Some(FunctionId::new(0)),
+                instruction: Some(Pc::new(2)),
+                kind: VerifyErrorKind::ReadBeforeWrite {
+                    register: Register::new(2),
+                },
+            })
+        );
     }
 
     #[test]
@@ -3008,6 +4028,7 @@ mod tests {
             vec![],
             vec![Function::new(
                 None,
+                0,
                 0,
                 1,
                 flags(),
@@ -3041,6 +4062,7 @@ mod tests {
                 vec![],
                 vec![Function::new(
                     None,
+                    0,
                     1, // register 0 is a parameter so the condition read is valid
                     1,
                     flags(),
@@ -3065,6 +4087,7 @@ mod tests {
             vec![],
             vec![Function::new(
                 None,
+                0,
                 0,
                 3,
                 flags(),
@@ -3096,21 +4119,84 @@ mod tests {
     }
 
     #[test]
-    fn parameters_are_initialized_on_entry() {
-        // Two parameters read immediately with no preceding write must verify.
+    fn captures_and_parameters_are_initialized_on_entry() {
+        // One capture (r0) and two parameters (r1, r2) read immediately with no
+        // preceding write must verify; captures precede parameters.
         let module = Module::new(
             vec![],
             vec![Function::new(
                 None,
+                1,
                 2,
-                3,
+                4,
                 flags(),
                 vec![
                     Instruction::Binary {
-                        dst: Register::new(2),
+                        dst: Register::new(3),
                         op: BinaryOp::Add,
-                        left: Register::new(0),
-                        right: Register::new(1),
+                        left: Register::new(0),  // capture
+                        right: Register::new(2), // parameter
+                    },
+                    Instruction::Return {
+                        value: Register::new(1), // parameter
+                    },
+                ],
+                vec![],
+            )],
+            FunctionId::new(0),
+        );
+        let verified = module.verify().expect("captures and params initialized");
+        let certificate = verified.certificate(FunctionId::new(0)).unwrap();
+        assert_eq!(
+            certificate.initialized_before(Pc::new(0), Register::new(0)),
+            Some(true),
+            "capture is initialized on entry"
+        );
+        assert_eq!(
+            certificate.initialized_before(Pc::new(0), Register::new(2)),
+            Some(true),
+            "parameter is initialized on entry"
+        );
+        assert_eq!(
+            certificate.initialized_before(Pc::new(0), Register::new(3)),
+            Some(false),
+            "a non-entry register is not initialized on entry"
+        );
+    }
+
+    /// `IteratorNext` writes both `done` and `value`; both are initialized after
+    /// it, letting a subsequent instruction read them without a separate write.
+    #[test]
+    fn iterator_next_initializes_both_written_registers() {
+        let module = Module::new(
+            vec![],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                4,
+                flags(),
+                vec![
+                    Instruction::CreateArray {
+                        dst: Register::new(0),
+                    },
+                    Instruction::GetIterator {
+                        dst: Register::new(1),
+                        src: Register::new(0),
+                        kind: IteratorKind::Sync,
+                    },
+                    Instruction::IteratorNext {
+                        done: Register::new(2),
+                        value: Register::new(3),
+                        iterator: Register::new(1),
+                    },
+                    // Read BOTH results: sound only because IteratorNext defines
+                    // two registers.
+                    Instruction::Binary {
+                        dst: Register::new(2),
+                        op: BinaryOp::StrictEqual,
+                        left: Register::new(2),
+                        right: Register::new(3),
                     },
                     Instruction::Return {
                         value: Register::new(2),
@@ -3120,15 +4206,15 @@ mod tests {
             )],
             FunctionId::new(0),
         );
-        let verified = module.verify().expect("parameters count as initialized");
+        let verified = module.verify().expect("two-write dataflow verifies");
         let certificate = verified.certificate(FunctionId::new(0)).unwrap();
         assert_eq!(
-            certificate.initialized_before(Pc::new(0), Register::new(0)),
+            certificate.initialized_before(Pc::new(3), Register::new(2)),
             Some(true)
         );
         assert_eq!(
-            certificate.initialized_before(Pc::new(0), Register::new(2)),
-            Some(false)
+            certificate.initialized_before(Pc::new(3), Register::new(3)),
+            Some(true)
         );
     }
 
@@ -3140,6 +4226,7 @@ mod tests {
             vec![],
             vec![Function::new(
                 None,
+                0,
                 0,
                 1,
                 flags(),
@@ -3180,6 +4267,7 @@ mod tests {
             vec![Function::new(
                 None,
                 0,
+                0,
                 1,
                 flags(),
                 vec![Instruction::Halt, Instruction::Halt],
@@ -3204,6 +4292,7 @@ mod tests {
             vec![],
             vec![Function::new(
                 None,
+                0,
                 0,
                 1,
                 flags(),
@@ -3232,6 +4321,7 @@ mod tests {
             vec![],
             vec![Function::new(
                 None,
+                0,
                 0,
                 1,
                 flags(),
@@ -3278,6 +4368,7 @@ mod tests {
             vec![Function::new(
                 None,
                 0,
+                0,
                 1,
                 flags(),
                 vec![Instruction::Halt; 10],
@@ -3302,6 +4393,7 @@ mod tests {
             vec![],
             vec![Function::new(
                 None,
+                0,
                 0,
                 1,
                 flags(),
@@ -3352,6 +4444,7 @@ mod tests {
             vec![Function::new(
                 None,
                 0,
+                0,
                 1,
                 flags(),
                 vec![Instruction::Halt; (DEPTH * 2) as usize],
@@ -3379,6 +4472,7 @@ mod tests {
             vec![Function::new(
                 None,
                 0,
+                0,
                 MAX_REGISTERS,
                 flags(),
                 vec![Instruction::Halt; over_cap],
@@ -3405,6 +4499,7 @@ mod tests {
             vec![Function::new(
                 None,
                 0,
+                0,
                 MAX_REGISTERS,
                 flags(),
                 vec![Instruction::Halt; MAX_REGISTERS as usize],
@@ -3427,6 +4522,7 @@ mod tests {
             vec![Constant::Int32(0)],
             vec![Function::new(
                 None,
+                0,
                 0,
                 2,
                 flags(),

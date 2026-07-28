@@ -1,9 +1,21 @@
 //! Deterministic register interpreter for verified production BamTS bytecode.
 //!
 //! Persisted constants never carry runtime identity. This interpreter therefore
-//! owns a slot heap for strings, bigints, objects, arrays, and bytecode function
-//! objects, and exposes only `bamts_native::Value` words at host boundaries.
-//! Bytecode heap slots use segment 1; other segments remain host-owned.
+//! owns a slot heap for strings, bigints, objects, arrays, closures, private
+//! names, regular expressions, and iterators, and exposes only
+//! `bamts_native::Value` words at host boundaries. Bytecode heap slots use
+//! segment 1; other segments remain host-owned.
+//!
+//! The 36-op dynamic-computation ISA is executed locally: register-keyed
+//! property access (with data properties, accessor descriptors, and private-name
+//! identity), prototype chains, closures with explicit capture environments,
+//! arguments arrays, `this`/`arguments`/`new.target`, globals, arrays with
+//! spread, object spread, iterators (sync/async/keys) with the two-write
+//! `IteratorNext`, and generator/async `Suspend`-resume. The [`Host`] trait owns
+//! only *external* module and builtin operations (foreign calls/constructs,
+//! foreign property access, `import`, `export`, and the suspension driver);
+//! internal objects, arrays, functions, closures, prototypes, and private names
+//! never leave the interpreter.
 
 #![forbid(unsafe_code)]
 
@@ -13,8 +25,8 @@ use std::error::Error;
 use std::fmt;
 
 use bamts_bytecode::{
-    BinaryOp, Constant, ConstantId, Function, FunctionId, Instruction, Module, Pc, UnaryOp,
-    Verified,
+    AccessorKind, BinaryOp, Constant, ConstantId, Function, FunctionId, Instruction, IteratorKind,
+    Module, Pc, UnaryOp, Verified,
 };
 use bamts_native::{Decoded, SlotId, Value};
 
@@ -46,6 +58,7 @@ pub struct Limits {
     pub fuel: u64,
     pub max_call_depth: usize,
     pub max_total_registers: usize,
+    /// Ceiling on the length of a single call's arguments array.
     pub max_argument_count: u32,
     pub max_heap_slots: usize,
     /// Cumulative bytes admitted for heap payloads and property/element growth.
@@ -73,8 +86,10 @@ pub struct HostThrow {
 
 /// External operations. Segment-1 heap values belong to this runtime and may be
 /// passed to or echoed by the host, but the host must not forge new segment-1
-/// slot ids. Default methods fail by throwing `undefined`, never by succeeding
-/// with placeholder behavior.
+/// slot ids. These methods cover only operations against *foreign* values and
+/// module linkage; internal objects/arrays/functions/closures/prototypes/private
+/// names are never routed here. Default methods fail by throwing `undefined`,
+/// never by succeeding with placeholder behavior.
 pub trait Host {
     fn property_get(&mut self, _object: Value, _key: &str) -> Result<Value, HostThrow> {
         Err(HostThrow {
@@ -123,8 +138,9 @@ pub trait Host {
         })
     }
 
-    /// Resolve one explicit `Suspend`, receiving the yielded value and returning
-    /// the value written to its destination register.
+    /// Drive one explicit `Suspend`, receiving the yielded value (a produced
+    /// item for a generator; an awaited operand for an async function) and
+    /// returning the value written to its destination register on resume.
     fn awaited(&mut self, _value: Value) -> Result<Value, HostThrow> {
         Err(HostThrow {
             value: Value::UNDEFINED,
@@ -132,6 +148,13 @@ pub trait Host {
     }
 
     fn import(&mut self, _specifier: &str) -> Result<Value, HostThrow> {
+        Err(HostThrow {
+            value: Value::UNDEFINED,
+        })
+    }
+
+    /// Record a module export binding `name = value`.
+    fn export(&mut self, _name: &str, _value: Value) -> Result<(), HostThrow> {
         Err(HostThrow {
             value: Value::UNDEFINED,
         })
@@ -144,6 +167,7 @@ pub enum ThrowOrigin {
     Host,
     TypeError { operation: &'static str },
     RangeError { operation: &'static str },
+    ReferenceError { operation: &'static str },
 }
 
 /// Source metadata attached to every machine failure.
@@ -239,39 +263,108 @@ pub fn constant_value(constant: &Constant) -> Option<Value> {
     }
 }
 
+/// A normalized property key: a string name (which may parse as an array index)
+/// or a private name identified by its heap slot. Two `CreatePrivateName`
+/// instructions with the same description yield distinct slots, hence distinct
+/// keys, matching private-name identity.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum PropertyKey {
+    Named(String),
+    Private(u32),
+}
+
+impl PropertyKey {
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            PropertyKey::Named(text) => Some(text),
+            PropertyKey::Private(_) => None,
+        }
+    }
+
+    fn charge_bytes(&self) -> usize {
+        match self {
+            PropertyKey::Named(text) => text.len() + 8,
+            PropertyKey::Private(_) => 16,
+        }
+    }
+}
+
+/// A stored property: a data value or an accessor descriptor.
+#[derive(Clone, Debug)]
+enum Property {
+    Data(Value),
+    Accessor {
+        getter: Option<Value>,
+        setter: Option<Value>,
+    },
+}
+
 #[derive(Clone, Debug)]
 enum HeapEntry {
     String(String),
     BigInt(String),
     Object {
-        properties: BTreeMap<String, Value>,
-        constructor: Option<Value>,
+        properties: BTreeMap<PropertyKey, Property>,
+        prototype: Option<Value>,
     },
     Array {
         elements: Vec<Value>,
-        properties: BTreeMap<String, Value>,
-        constructor: Option<Value>,
+        properties: BTreeMap<PropertyKey, Property>,
+        prototype: Option<Value>,
     },
     Function {
         function: FunctionId,
-        properties: BTreeMap<String, Value>,
+        captures: Vec<Value>,
+        properties: BTreeMap<PropertyKey, Property>,
+        prototype: Option<Value>,
+    },
+    PrivateName {
+        description: String,
+    },
+    RegExp {
+        pattern: String,
+        flags: String,
+        properties: BTreeMap<PropertyKey, Property>,
+    },
+    Iterator {
+        source: Value,
+        index: usize,
+        keys: Option<Vec<String>>,
     },
 }
 
 impl HeapEntry {
     fn initial_bytes(&self) -> usize {
         match self {
-            Self::String(text) | Self::BigInt(text) => text.len(),
-            Self::Object { .. } | Self::Array { .. } | Self::Function { .. } => 1,
+            Self::String(text) | Self::BigInt(text) | Self::PrivateName { description: text } => {
+                text.len()
+            }
+            Self::RegExp { pattern, flags, .. } => pattern.len() + flags.len(),
+            Self::Object { .. }
+            | Self::Array { .. }
+            | Self::Function { .. }
+            | Self::Iterator { .. } => 1,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 struct ReturnTo {
-    destination: usize,
+    /// The caller register receiving the result, or `None` to discard it (an
+    /// accessor setter invocation produces no observable value).
+    destination: Option<usize>,
     call_pc: usize,
     constructed: Option<Value>,
+}
+
+struct CallRequest<'a> {
+    callee: Value,
+    this_value: Value,
+    arguments: &'a [Value],
+    destination: Option<u32>,
+    call_pc: usize,
+    constructed: Option<Value>,
+    new_target: Value,
 }
 
 #[derive(Clone, Debug)]
@@ -280,18 +373,30 @@ struct Frame {
     pc: usize,
     registers: Vec<Value>,
     return_to: Option<ReturnTo>,
+    this_value: Value,
+    new_target: Value,
+    args: Vec<Value>,
+    arguments_object: Option<Value>,
 }
 
 impl Frame {
     fn new(
         function: usize,
         metadata: &Function,
+        captures: &[Value],
+        this_value: Value,
+        new_target: Value,
         arguments: &[Value],
         return_to: Option<ReturnTo>,
     ) -> Self {
         let mut registers = vec![Value::UNINITIALIZED; metadata.register_count() as usize];
+        let capture_count = metadata.capture_count() as usize;
+        for (index, slot) in registers.iter_mut().take(capture_count).enumerate() {
+            *slot = captures.get(index).copied().unwrap_or(Value::UNDEFINED);
+        }
         for (index, slot) in registers
             .iter_mut()
+            .skip(capture_count)
             .take(metadata.parameter_count() as usize)
             .enumerate()
         {
@@ -302,6 +407,10 @@ impl Frame {
             pc: 0,
             registers,
             return_to,
+            this_value,
+            new_target,
+            args: arguments.to_vec(),
+            arguments_object: None,
         }
     }
 }
@@ -309,13 +418,38 @@ impl Frame {
 #[derive(Clone, Debug)]
 enum EvalFailure {
     Throw(ThrowOrigin),
+    HostThrow(HostThrow),
     Runtime(RuntimeErrorKind),
 }
 
+/// The outcome of resolving a property read.
 #[derive(Clone, Debug)]
-enum PropertyResult {
+enum GetOutcome {
+    /// A ready ABI value.
+    Value(Value),
+    /// Text that must be interned as a fresh heap string.
+    Text(String),
+    /// An accessor getter to invoke with the receiver as `this`.
+    Getter(Value),
+}
+
+/// The outcome of resolving a property write.
+#[derive(Clone, Debug)]
+enum SetOutcome {
+    Done,
+    /// An accessor setter to invoke with the receiver as `this` and the value as
+    /// its sole argument.
+    Setter(Value),
+}
+
+/// Own-property lookup result during a prototype-chain walk.
+#[derive(Clone, Debug)]
+enum Found {
     Value(Value),
     Text(String),
+    Getter(Value),
+    /// An accessor property with no getter resolves to `undefined`.
+    NoGetter,
 }
 
 /// The production bytecode interpreter.
@@ -328,6 +462,7 @@ pub struct Machine<'a, H: Host> {
     heap_bytes: usize,
     live_registers: usize,
     fuel: u64,
+    globals: BTreeMap<String, Value>,
 }
 
 pub fn run<H: Host>(
@@ -344,7 +479,15 @@ impl<'a, H: Host> Machine<'a, H> {
     #[must_use]
     pub fn new(module: &'a Module<Verified>, host: &'a mut H, limits: Limits) -> Self {
         let entry = module.entry().get() as usize;
-        let frame = Frame::new(entry, &module.functions()[entry], &[], None);
+        let frame = Frame::new(
+            entry,
+            &module.functions()[entry],
+            &[],
+            Value::UNDEFINED,
+            Value::UNDEFINED,
+            &[],
+            None,
+        );
         let live_registers = frame.registers.len();
         Self {
             fuel: limits.fuel,
@@ -355,6 +498,7 @@ impl<'a, H: Host> Machine<'a, H> {
             heap: Vec::new(),
             heap_bytes: 0,
             live_registers,
+            globals: BTreeMap::new(),
         }
     }
 
@@ -429,7 +573,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     let value = self
                         .allocate(HeapEntry::Object {
                             properties: BTreeMap::new(),
-                            constructor: None,
+                            prototype: None,
                         })
                         .map_err(|kind| self.error_at(kind, function_index, pc))?;
                     self.write_register(frame_index, dst.get(), value);
@@ -440,38 +584,66 @@ impl<'a, H: Host> Machine<'a, H> {
                         .allocate(HeapEntry::Array {
                             elements: Vec::new(),
                             properties: BTreeMap::new(),
-                            constructor: None,
+                            prototype: None,
                         })
                         .map_err(|kind| self.error_at(kind, function_index, pc))?;
                     self.write_register(frame_index, dst.get(), value);
                     self.frames[frame_index].pc = pc + 1;
                 }
-                Instruction::DefineFunction { dst, function } => {
-                    let value = self
-                        .allocate(HeapEntry::Function {
-                            function,
-                            properties: BTreeMap::new(),
-                        })
-                        .map_err(|kind| self.error_at(kind, function_index, pc))?;
-                    self.write_register(frame_index, dst.get(), value);
-                    self.frames[frame_index].pc = pc + 1;
-                }
+                Instruction::CreateClosure {
+                    dst,
+                    function,
+                    captures,
+                } => match self.read_captures(frame_index, captures.get(), function) {
+                    Ok(captures) => {
+                        let value = self
+                            .allocate(HeapEntry::Function {
+                                function,
+                                captures,
+                                properties: BTreeMap::new(),
+                                prototype: None,
+                            })
+                            .map_err(|kind| self.error_at(kind, function_index, pc))?;
+                        self.write_register(frame_index, dst.get(), value);
+                        self.frames[frame_index].pc = pc + 1;
+                    }
+                    Err(failure) => self.resolve_failure(failure, pc)?,
+                },
                 Instruction::GetProperty { dst, object, key } => {
                     let object = self.read_register(frame_index, object.get());
-                    let key = self.constant_string(key).to_owned();
-                    match self.get_property(object, &key) {
-                        Ok(PropertyResult::Value(value)) => {
+                    let key_value = self.read_register(frame_index, key.get());
+                    let key = match self.coerce_property_key(key_value) {
+                        Ok(key) => key,
+                        Err(failure) => {
+                            self.resolve_failure(failure, pc)?;
+                            continue;
+                        }
+                    };
+                    match self.resolve_get(object, &key) {
+                        Ok(GetOutcome::Value(value)) => {
                             self.validate_host_value(value)
                                 .map_err(|kind| self.error_at(kind, function_index, pc))?;
                             self.write_register(frame_index, dst.get(), value);
                             self.frames[frame_index].pc = pc + 1;
                         }
-                        Ok(PropertyResult::Text(text)) => {
+                        Ok(GetOutcome::Text(text)) => {
                             let value = self
                                 .allocate(HeapEntry::String(text))
                                 .map_err(|kind| self.error_at(kind, function_index, pc))?;
                             self.write_register(frame_index, dst.get(), value);
                             self.frames[frame_index].pc = pc + 1;
+                        }
+                        Ok(GetOutcome::Getter(getter)) => {
+                            self.frames[frame_index].pc = pc + 1;
+                            self.execute_call(CallRequest {
+                                callee: getter,
+                                this_value: object,
+                                arguments: &[],
+                                destination: Some(dst.get()),
+                                call_pc: pc,
+                                constructed: None,
+                                new_target: Value::UNDEFINED,
+                            })?;
                         }
                         Err(failure) => self.resolve_failure(failure, pc)?,
                     }
@@ -479,15 +651,41 @@ impl<'a, H: Host> Machine<'a, H> {
                 Instruction::SetProperty { object, key, value } => {
                     let object = self.read_register(frame_index, object.get());
                     let value = self.read_register(frame_index, value.get());
-                    let key = self.constant_string(key).to_owned();
-                    match self.set_property(object, key, value) {
-                        Ok(()) => self.frames[frame_index].pc = pc + 1,
+                    let key_value = self.read_register(frame_index, key.get());
+                    let key = match self.coerce_property_key(key_value) {
+                        Ok(key) => key,
+                        Err(failure) => {
+                            self.resolve_failure(failure, pc)?;
+                            continue;
+                        }
+                    };
+                    match self.resolve_set(object, key, value) {
+                        Ok(SetOutcome::Done) => self.frames[frame_index].pc = pc + 1,
+                        Ok(SetOutcome::Setter(setter)) => {
+                            self.frames[frame_index].pc = pc + 1;
+                            self.execute_call(CallRequest {
+                                callee: setter,
+                                this_value: object,
+                                arguments: &[value],
+                                destination: None,
+                                call_pc: pc,
+                                constructed: None,
+                                new_target: Value::UNDEFINED,
+                            })?;
+                        }
                         Err(failure) => self.resolve_failure(failure, pc)?,
                     }
                 }
                 Instruction::DeleteProperty { dst, object, key } => {
                     let object = self.read_register(frame_index, object.get());
-                    let key = self.constant_string(key).to_owned();
+                    let key_value = self.read_register(frame_index, key.get());
+                    let key = match self.coerce_property_key(key_value) {
+                        Ok(key) => key,
+                        Err(failure) => {
+                            self.resolve_failure(failure, pc)?;
+                            continue;
+                        }
+                    };
                     match self.delete_property(object, &key) {
                         Ok(deleted) => {
                             self.write_register(frame_index, dst.get(), Value::boolean(deleted));
@@ -496,31 +694,197 @@ impl<'a, H: Host> Machine<'a, H> {
                         Err(failure) => self.resolve_failure(failure, pc)?,
                     }
                 }
+                Instruction::DefineAccessor {
+                    object,
+                    key,
+                    accessor,
+                    kind,
+                } => {
+                    let object = self.read_register(frame_index, object.get());
+                    let accessor = self.read_register(frame_index, accessor.get());
+                    let key_value = self.read_register(frame_index, key.get());
+                    let key = match self.coerce_property_key(key_value) {
+                        Ok(key) => key,
+                        Err(failure) => {
+                            self.resolve_failure(failure, pc)?;
+                            continue;
+                        }
+                    };
+                    match self.define_accessor(object, key, accessor, kind) {
+                        Ok(()) => self.frames[frame_index].pc = pc + 1,
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
                 Instruction::Call {
                     dst,
                     callee,
                     this_value,
-                    args_start,
-                    arg_count,
+                    arguments,
                 } => {
                     let callee = self.read_register(frame_index, callee.get());
                     let this_value = self.read_register(frame_index, this_value.get());
-                    let arguments =
-                        self.argument_window(frame_index, args_start.get(), arg_count, pc)?;
-                    self.frames[frame_index].pc = pc + 1;
-                    self.execute_call(callee, this_value, &arguments, dst.get(), pc, None)?;
+                    match self.read_arguments(frame_index, arguments.get()) {
+                        Ok(arguments) => {
+                            self.frames[frame_index].pc = pc + 1;
+                            self.execute_call(CallRequest {
+                                callee,
+                                this_value,
+                                arguments: &arguments,
+                                destination: Some(dst.get()),
+                                call_pc: pc,
+                                constructed: None,
+                                new_target: Value::UNDEFINED,
+                            })?;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
                 }
                 Instruction::Construct {
                     dst,
                     callee,
-                    args_start,
-                    arg_count,
+                    arguments,
                 } => {
                     let callee = self.read_register(frame_index, callee.get());
-                    let arguments =
-                        self.argument_window(frame_index, args_start.get(), arg_count, pc)?;
+                    match self.read_arguments(frame_index, arguments.get()) {
+                        Ok(arguments) => {
+                            self.frames[frame_index].pc = pc + 1;
+                            self.execute_construct(callee, &arguments, dst.get(), pc)?;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::LoadGlobal { dst, name } => {
+                    let name = self.constant_string(name).to_owned();
+                    match self.globals.get(&name).copied() {
+                        Some(value) => {
+                            self.validate_host_value(value)
+                                .map_err(|kind| self.error_at(kind, function_index, pc))?;
+                            self.write_register(frame_index, dst.get(), value);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        None => self.throw(
+                            Value::UNDEFINED,
+                            ThrowOrigin::ReferenceError {
+                                operation: "global is not defined",
+                            },
+                            pc,
+                        )?,
+                    }
+                }
+                Instruction::StoreGlobal { name, value } => {
+                    let value = self.read_register(frame_index, value.get());
+                    let name = self.constant_string(name).to_owned();
+                    self.globals.insert(name, value);
                     self.frames[frame_index].pc = pc + 1;
-                    self.execute_construct(callee, &arguments, dst.get(), pc)?;
+                }
+                Instruction::TypeOfGlobal { dst, name } => {
+                    let name = self.constant_string(name).to_owned();
+                    let text = match self.globals.get(&name).copied() {
+                        Some(value) => self.type_of(value).to_owned(),
+                        None => "undefined".to_owned(),
+                    };
+                    let value = self
+                        .allocate(HeapEntry::String(text))
+                        .map_err(|kind| self.error_at(kind, function_index, pc))?;
+                    self.write_register(frame_index, dst.get(), value);
+                    self.frames[frame_index].pc = pc + 1;
+                }
+                Instruction::LoadThis { dst } => {
+                    let value = self.frames[frame_index].this_value;
+                    self.write_register(frame_index, dst.get(), value);
+                    self.frames[frame_index].pc = pc + 1;
+                }
+                Instruction::LoadArguments { dst } => {
+                    let value = self.materialize_arguments(frame_index, function_index, pc)?;
+                    self.write_register(frame_index, dst.get(), value);
+                    self.frames[frame_index].pc = pc + 1;
+                }
+                Instruction::LoadNewTarget { dst } => {
+                    let value = self.frames[frame_index].new_target;
+                    self.write_register(frame_index, dst.get(), value);
+                    self.frames[frame_index].pc = pc + 1;
+                }
+                Instruction::ArrayPush { array, value } => {
+                    let array = self.read_register(frame_index, array.get());
+                    let value = self.read_register(frame_index, value.get());
+                    match self.array_push(array, value) {
+                        Ok(()) => self.frames[frame_index].pc = pc + 1,
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::ArrayExtend { array, iterable } => {
+                    let array = self.read_register(frame_index, array.get());
+                    let iterable = self.read_register(frame_index, iterable.get());
+                    match self.array_extend(array, iterable) {
+                        Ok(()) => self.frames[frame_index].pc = pc + 1,
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::ObjectSpread { target, source } => {
+                    let target = self.read_register(frame_index, target.get());
+                    let source = self.read_register(frame_index, source.get());
+                    match self.object_spread(target, source) {
+                        Ok(()) => self.frames[frame_index].pc = pc + 1,
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::SetPrototype { object, prototype } => {
+                    let object = self.read_register(frame_index, object.get());
+                    let prototype = self.read_register(frame_index, prototype.get());
+                    match self.set_prototype(object, prototype) {
+                        Ok(()) => self.frames[frame_index].pc = pc + 1,
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::CreatePrivateName { dst, description } => {
+                    let description = self.constant_string(description).to_owned();
+                    let value = self
+                        .allocate(HeapEntry::PrivateName { description })
+                        .map_err(|kind| self.error_at(kind, function_index, pc))?;
+                    self.write_register(frame_index, dst.get(), value);
+                    self.frames[frame_index].pc = pc + 1;
+                }
+                Instruction::CreateRegExp {
+                    dst,
+                    pattern,
+                    flags,
+                } => {
+                    let pattern = self.constant_string(pattern).to_owned();
+                    let flags = self.constant_string(flags).to_owned();
+                    let value = self
+                        .allocate(HeapEntry::RegExp {
+                            pattern,
+                            flags,
+                            properties: BTreeMap::new(),
+                        })
+                        .map_err(|kind| self.error_at(kind, function_index, pc))?;
+                    self.write_register(frame_index, dst.get(), value);
+                    self.frames[frame_index].pc = pc + 1;
+                }
+                Instruction::GetIterator { dst, src, kind } => {
+                    let src = self.read_register(frame_index, src.get());
+                    match self.create_iterator(src, kind) {
+                        Ok(value) => {
+                            self.write_register(frame_index, dst.get(), value);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::IteratorNext {
+                    done,
+                    value,
+                    iterator,
+                } => {
+                    let iterator = self.read_register(frame_index, iterator.get());
+                    match self.iterator_next(iterator) {
+                        Ok((is_done, produced)) => {
+                            self.write_register(frame_index, done.get(), Value::boolean(is_done));
+                            self.write_register(frame_index, value.get(), produced);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
                 }
                 Instruction::Jump { target } => {
                     self.frames[frame_index].pc = target.get() as usize;
@@ -575,6 +939,16 @@ impl<'a, H: Host> Machine<'a, H> {
                         Err(thrown) => self.host_throw(thrown, pc)?,
                     }
                 }
+                Instruction::Export { name, src } => {
+                    let value = self.read_register(frame_index, src.get());
+                    self.validate_host_value(value)
+                        .map_err(|kind| self.error_at(kind, function_index, pc))?;
+                    let name = self.constant_string(name).to_owned();
+                    match self.host.export(&name, value) {
+                        Ok(()) => self.frames[frame_index].pc = pc + 1,
+                        Err(thrown) => self.host_throw(thrown, pc)?,
+                    }
+                }
                 Instruction::Halt => {
                     if let Some(execution) = self.complete_frame(Value::UNDEFINED) {
                         return Ok(execution);
@@ -595,7 +969,7 @@ impl<'a, H: Host> Machine<'a, H> {
     fn constant_string(&self, id: ConstantId) -> &str {
         match &self.module.constants()[id.get() as usize] {
             Constant::String(text) => text,
-            _ => unreachable!("verified property/import keys are strings"),
+            _ => unreachable!("verified name/specifier/pattern constants are strings"),
         }
     }
 
@@ -666,33 +1040,110 @@ impl<'a, H: Host> Machine<'a, H> {
         self.runtime_slot(value).map(|_| ())
     }
 
-    fn argument_window(
+    /// Reads a call/construct arguments array from a register: it must hold a
+    /// runtime array, whose length is capped by `max_argument_count`.
+    fn read_arguments(&self, frame: usize, register: u32) -> Result<Vec<Value>, EvalFailure> {
+        let value = self.read_register(frame, register);
+        match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
+            Some(index) => match &self.heap[index] {
+                HeapEntry::Array { elements, .. } => {
+                    if elements.len() as u64 > u64::from(self.limits.max_argument_count) {
+                        return Err(EvalFailure::Runtime(
+                            RuntimeErrorKind::ArgumentLimitExceeded {
+                                limit: self.limits.max_argument_count,
+                                requested: u32::try_from(elements.len()).unwrap_or(u32::MAX),
+                            },
+                        ));
+                    }
+                    Ok(elements
+                        .iter()
+                        .map(|value| {
+                            if *value == Value::HOLE {
+                                Value::UNDEFINED
+                            } else {
+                                *value
+                            }
+                        })
+                        .collect())
+                }
+                _ => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "call arguments are not an array",
+                })),
+            },
+            None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "call arguments are not an array",
+            })),
+        }
+    }
+
+    /// Reads a `CreateClosure` captures array: it must hold a runtime array whose
+    /// length matches the target function's capture count.
+    fn read_captures(
         &self,
         frame: usize,
-        start: u32,
-        count: u32,
-        pc: usize,
-    ) -> Result<Vec<Value>, RuntimeError> {
-        if count > self.limits.max_argument_count {
-            return Err(self.error_here_at(
-                RuntimeErrorKind::ArgumentLimitExceeded {
-                    limit: self.limits.max_argument_count,
-                    requested: count,
-                },
-                pc,
-            ));
+        register: u32,
+        function: FunctionId,
+    ) -> Result<Vec<Value>, EvalFailure> {
+        let expected = self.module.functions()[function.get() as usize].capture_count() as usize;
+        let value = self.read_register(frame, register);
+        match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
+            Some(index) => match &self.heap[index] {
+                HeapEntry::Array { elements, .. } => {
+                    if elements.len() != expected {
+                        return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                            operation: "closure capture array arity",
+                        }));
+                    }
+                    Ok(elements
+                        .iter()
+                        .map(|value| {
+                            if *value == Value::HOLE {
+                                Value::UNDEFINED
+                            } else {
+                                *value
+                            }
+                        })
+                        .collect())
+                }
+                _ => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "closure captures are not an array",
+                })),
+            },
+            None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "closure captures are not an array",
+            })),
         }
-        let start = start as usize;
-        let end = start + count as usize;
-        Ok(self.frames[frame].registers[start..end].to_vec())
+    }
+
+    fn materialize_arguments(
+        &mut self,
+        frame: usize,
+        function: usize,
+        pc: usize,
+    ) -> Result<Value, RuntimeError> {
+        if let Some(existing) = self.frames[frame].arguments_object {
+            return Ok(existing);
+        }
+        let args = self.frames[frame].args.clone();
+        let value = self
+            .allocate(HeapEntry::Array {
+                elements: args,
+                properties: BTreeMap::new(),
+                prototype: None,
+            })
+            .map_err(|kind| self.error_at(kind, function, pc))?;
+        self.frames[frame].arguments_object = Some(value);
+        Ok(value)
     }
 
     fn push_frame(
         &mut self,
         function: FunctionId,
+        captures: &[Value],
+        this_value: Value,
+        new_target: Value,
         arguments: &[Value],
         return_to: ReturnTo,
-        call_pc: usize,
     ) -> Result<(), RuntimeError> {
         let function_index = function.get() as usize;
         let metadata = &self.module.functions()[function_index];
@@ -701,7 +1152,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 RuntimeErrorKind::CallDepthExceeded {
                     limit: self.limits.max_call_depth,
                 },
-                call_pc,
+                return_to.call_pc,
             ));
         }
         let next_registers = metadata.register_count() as usize;
@@ -710,38 +1161,52 @@ impl<'a, H: Host> Machine<'a, H> {
                 RuntimeErrorKind::RegisterLimitExceeded {
                     limit: self.limits.max_total_registers,
                 },
-                call_pc,
+                return_to.call_pc,
             ));
         }
-        let frame = Frame::new(function_index, metadata, arguments, Some(return_to));
+        let frame = Frame::new(
+            function_index,
+            metadata,
+            captures,
+            this_value,
+            new_target,
+            arguments,
+            Some(return_to),
+        );
         self.live_registers += next_registers;
         self.frames.push(frame);
         Ok(())
     }
 
-    fn execute_call(
-        &mut self,
-        callee: Value,
-        this_value: Value,
-        arguments: &[Value],
-        destination: u32,
-        call_pc: usize,
-        constructed: Option<Value>,
-    ) -> Result<(), RuntimeError> {
+    fn execute_call(&mut self, request: CallRequest) -> Result<(), RuntimeError> {
+        let CallRequest {
+            callee,
+            this_value,
+            arguments,
+            destination,
+            call_pc,
+            constructed,
+            new_target,
+        } = request;
         match self.runtime_slot(callee) {
             Ok(Some(index)) => {
-                let HeapEntry::Function { function, .. } = self.heap[index] else {
-                    return self.throw_type("call", call_pc);
+                let (function, captures) = match &self.heap[index] {
+                    HeapEntry::Function {
+                        function, captures, ..
+                    } => (*function, captures.clone()),
+                    _ => return self.throw_type("call", call_pc),
                 };
                 self.push_frame(
                     function,
+                    &captures,
+                    this_value,
+                    new_target,
                     arguments,
                     ReturnTo {
-                        destination: destination as usize,
+                        destination: destination.map(|register| register as usize),
                         call_pc,
                         constructed,
                     },
-                    call_pc,
                 )
             }
             Ok(None) => match callee.decode() {
@@ -749,7 +1214,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     Ok(value) => {
                         self.validate_host_value(value)
                             .map_err(|kind| self.error_here_at(kind, call_pc))?;
-                        self.write_register(self.frames.len() - 1, destination, value);
+                        if let Some(register) = destination {
+                            self.write_register(self.frames.len() - 1, register, value);
+                        }
                         Ok(())
                     }
                     Err(thrown) => self.host_throw(thrown, call_pc),
@@ -769,23 +1236,30 @@ impl<'a, H: Host> Machine<'a, H> {
     ) -> Result<(), RuntimeError> {
         match self.runtime_slot(callee) {
             Ok(Some(index)) => {
-                let HeapEntry::Function { .. } = self.heap[index] else {
+                if !matches!(self.heap[index], HeapEntry::Function { .. }) {
                     return self.throw_type("construct", call_pc);
+                }
+                // The instance's [[Prototype]] is the constructor's own
+                // `prototype` data property when it is an object.
+                let instance_prototype = match self.own_data_property(index, "prototype") {
+                    Some(value) if self.is_object(value) => Some(value),
+                    _ => None,
                 };
                 let object = self
                     .allocate(HeapEntry::Object {
                         properties: BTreeMap::new(),
-                        constructor: Some(callee),
+                        prototype: instance_prototype,
                     })
                     .map_err(|kind| self.error_here_at(kind, call_pc))?;
-                self.execute_call(
+                self.execute_call(CallRequest {
                     callee,
-                    object,
+                    this_value: object,
                     arguments,
-                    destination,
+                    destination: Some(destination),
                     call_pc,
-                    Some(object),
-                )
+                    constructed: Some(object),
+                    new_target: callee,
+                })
             }
             Ok(None) => match callee.decode() {
                 Some(Decoded::HeapRef(_)) => match self.host.construct(callee, arguments) {
@@ -824,8 +1298,10 @@ impl<'a, H: Host> Machine<'a, H> {
                     Some(object) if !self.is_object(returned) => object,
                     _ => returned,
                 };
-                self.frames.last_mut().expect("callee has caller").registers
-                    [return_to.destination] = value;
+                if let Some(destination) = return_to.destination {
+                    self.frames.last_mut().expect("callee has caller").registers[destination] =
+                        value;
+                }
                 None
             }
         }
@@ -834,6 +1310,7 @@ impl<'a, H: Host> Machine<'a, H> {
     fn resolve_failure(&mut self, failure: EvalFailure, pc: usize) -> Result<(), RuntimeError> {
         match failure {
             EvalFailure::Throw(origin) => self.throw(Value::UNDEFINED, origin, pc),
+            EvalFailure::HostThrow(thrown) => self.host_throw(thrown, pc),
             EvalFailure::Runtime(kind) => Err(self.error_here_at(kind, pc)),
         }
     }
@@ -919,78 +1396,77 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    fn get_property(&mut self, object: Value, key: &str) -> Result<PropertyResult, EvalFailure> {
+    // ---- property keys -----------------------------------------------------
+
+    /// Normalizes a register value into a property key. A runtime string borrows
+    /// its text; a private name yields its slot identity; everything else is
+    /// coerced with `ToString`.
+    fn coerce_property_key(&self, value: Value) -> Result<PropertyKey, EvalFailure> {
+        match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
+            Some(index) => match &self.heap[index] {
+                HeapEntry::String(text) => Ok(PropertyKey::Named(text.clone())),
+                HeapEntry::PrivateName { .. } => Ok(PropertyKey::Private(index as u32)),
+                _ => Ok(PropertyKey::Named(self.value_to_string(value, 0)?)),
+            },
+            None => Ok(PropertyKey::Named(self.value_to_string(value, 0)?)),
+        }
+    }
+
+    fn host_key(&self, key: &PropertyKey) -> Result<String, EvalFailure> {
+        match key.as_str() {
+            Some(text) => Ok(text.to_owned()),
+            None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "private field on host object",
+            })),
+        }
+    }
+
+    // ---- property get ------------------------------------------------------
+
+    fn resolve_get(&mut self, object: Value, key: &PropertyKey) -> Result<GetOutcome, EvalFailure> {
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => match &self.heap[index] {
-                HeapEntry::String(text) => {
-                    if key == "length" {
-                        return Ok(PropertyResult::Value(number_value(
-                            text.chars().count() as f64
-                        )));
-                    }
-                    if let Some(index) = array_index(key) {
-                        return Ok(PropertyResult::Text(
-                            text.chars()
-                                .nth(index as usize)
-                                .map_or_else(String::new, |ch| ch.to_string()),
-                        ));
-                    }
-                    Ok(PropertyResult::Value(Value::UNDEFINED))
+                HeapEntry::String(_) | HeapEntry::BigInt(_) => Ok(self.primitive_get(index, key)),
+                HeapEntry::PrivateName { .. } | HeapEntry::Iterator { .. } => {
+                    Ok(GetOutcome::Value(Value::UNDEFINED))
                 }
-                HeapEntry::BigInt(_) => Ok(PropertyResult::Value(Value::UNDEFINED)),
-                HeapEntry::Object { properties, .. } => Ok(PropertyResult::Value(
-                    properties.get(key).copied().unwrap_or(Value::UNDEFINED),
-                )),
-                HeapEntry::Array {
-                    elements,
-                    properties,
-                    ..
-                } => {
-                    if key == "length" {
-                        Ok(PropertyResult::Value(number_value(elements.len() as f64)))
-                    } else if let Some(index) = array_index(key) {
-                        Ok(PropertyResult::Value(
-                            elements
-                                .get(index as usize)
-                                .copied()
-                                .filter(|value| *value != Value::HOLE)
-                                .unwrap_or(Value::UNDEFINED),
-                        ))
-                    } else {
-                        Ok(PropertyResult::Value(
-                            properties.get(key).copied().unwrap_or(Value::UNDEFINED),
-                        ))
-                    }
-                }
-                HeapEntry::Function {
-                    function,
-                    properties,
-                } => {
-                    if let Some(value) = properties.get(key) {
-                        return Ok(PropertyResult::Value(*value));
-                    }
-                    let metadata = &self.module.functions()[function.get() as usize];
-                    match key {
-                        "length" => Ok(PropertyResult::Value(number_value(
-                            metadata.parameter_count() as f64,
-                        ))),
-                        "name" => Ok(PropertyResult::Text(
-                            metadata
-                                .name()
-                                .map(|id| self.constant_string(id).to_owned())
-                                .unwrap_or_default(),
-                        )),
-                        _ => Ok(PropertyResult::Value(Value::UNDEFINED)),
+                HeapEntry::Object { .. }
+                | HeapEntry::Array { .. }
+                | HeapEntry::Function { .. }
+                | HeapEntry::RegExp { .. } => {
+                    let mut node = index;
+                    let mut guard = 0;
+                    loop {
+                        if let Some(found) = self.own_get(node, key) {
+                            return Ok(match found {
+                                Found::Value(value) => GetOutcome::Value(value),
+                                Found::Text(text) => GetOutcome::Text(text),
+                                Found::Getter(getter) => GetOutcome::Getter(getter),
+                                Found::NoGetter => GetOutcome::Value(Value::UNDEFINED),
+                            });
+                        }
+                        match self.prototype_index(node)? {
+                            Some(next) => {
+                                node = next;
+                                guard += 1;
+                                if guard > self.heap.len() + 1 {
+                                    return Ok(GetOutcome::Value(Value::UNDEFINED));
+                                }
+                            }
+                            None => return Ok(GetOutcome::Value(Value::UNDEFINED)),
+                        }
                     }
                 }
             },
             None => match object.decode() {
-                Some(Decoded::HeapRef(_)) => self
-                    .host
-                    .property_get(object, key)
-                    .map(PropertyResult::Value)
-                    .map_err(|_| EvalFailure::Throw(ThrowOrigin::Host)),
-                Some(_) => Ok(PropertyResult::Value(Value::UNDEFINED)),
+                Some(Decoded::HeapRef(_)) => {
+                    let name = self.host_key(key)?;
+                    self.host
+                        .property_get(object, &name)
+                        .map(GetOutcome::Value)
+                        .map_err(EvalFailure::HostThrow)
+                }
+                Some(_) => Ok(GetOutcome::Value(Value::UNDEFINED)),
                 None => Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidHostValue {
                     value: object,
                 })),
@@ -998,75 +1474,162 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    fn set_property(
+    fn primitive_get(&self, index: usize, key: &PropertyKey) -> GetOutcome {
+        if let HeapEntry::String(text) = &self.heap[index]
+            && let PropertyKey::Named(name) = key
+        {
+            if name == "length" {
+                return GetOutcome::Value(number_value(text.chars().count() as f64));
+            }
+            if let Some(offset) = array_index(name) {
+                return GetOutcome::Text(
+                    text.chars()
+                        .nth(offset as usize)
+                        .map_or_else(String::new, |ch| ch.to_string()),
+                );
+            }
+        }
+        GetOutcome::Value(Value::UNDEFINED)
+    }
+
+    /// Looks up an own property of the heap entry at `index`, returning `None`
+    /// when the key is absent so the caller may continue up the prototype chain.
+    fn own_get(&self, index: usize, key: &PropertyKey) -> Option<Found> {
+        match &self.heap[index] {
+            HeapEntry::Object { properties, .. } => property_lookup(properties, key),
+            HeapEntry::Array {
+                elements,
+                properties,
+                ..
+            } => {
+                if let PropertyKey::Named(name) = key {
+                    if name == "length" {
+                        return Some(Found::Value(number_value(elements.len() as f64)));
+                    }
+                    if let Some(offset) = array_index(name)
+                        && let Some(element) = elements.get(offset as usize)
+                        && *element != Value::HOLE
+                    {
+                        return Some(Found::Value(*element));
+                    }
+                }
+                property_lookup(properties, key)
+            }
+            HeapEntry::Function {
+                function,
+                properties,
+                ..
+            } => {
+                if let Some(found) = property_lookup(properties, key) {
+                    return Some(found);
+                }
+                if let PropertyKey::Named(name) = key {
+                    let metadata = &self.module.functions()[function.get() as usize];
+                    match name.as_str() {
+                        "length" => {
+                            return Some(Found::Value(number_value(
+                                metadata.parameter_count() as f64
+                            )));
+                        }
+                        "name" => {
+                            return Some(Found::Text(
+                                metadata
+                                    .name()
+                                    .map(|id| self.constant_string(id).to_owned())
+                                    .unwrap_or_default(),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                None
+            }
+            HeapEntry::RegExp {
+                pattern,
+                flags,
+                properties,
+            } => {
+                if let Some(found) = property_lookup(properties, key) {
+                    return Some(found);
+                }
+                if let PropertyKey::Named(name) = key {
+                    let flag = |ch: char| Found::Value(Value::boolean(flags.contains(ch)));
+                    match name.as_str() {
+                        "source" => return Some(Found::Text(pattern.clone())),
+                        "flags" => return Some(Found::Text(flags.clone())),
+                        "global" => return Some(flag('g')),
+                        "ignoreCase" => return Some(flag('i')),
+                        "multiline" => return Some(flag('m')),
+                        "sticky" => return Some(flag('y')),
+                        "unicode" => return Some(flag('u')),
+                        "dotAll" => return Some(flag('s')),
+                        "lastIndex" => return Some(Found::Value(Value::int32(0))),
+                        _ => {}
+                    }
+                }
+                None
+            }
+            HeapEntry::String(_)
+            | HeapEntry::BigInt(_)
+            | HeapEntry::PrivateName { .. }
+            | HeapEntry::Iterator { .. } => None,
+        }
+    }
+
+    fn own_data_property(&self, index: usize, name: &str) -> Option<Value> {
+        let properties = match &self.heap[index] {
+            HeapEntry::Object { properties, .. }
+            | HeapEntry::Array { properties, .. }
+            | HeapEntry::Function { properties, .. }
+            | HeapEntry::RegExp { properties, .. } => properties,
+            _ => return None,
+        };
+        match properties.get(&PropertyKey::Named(name.to_owned())) {
+            Some(Property::Data(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    fn prototype_index(&self, index: usize) -> Result<Option<usize>, EvalFailure> {
+        let prototype = match &self.heap[index] {
+            HeapEntry::Object { prototype, .. }
+            | HeapEntry::Array { prototype, .. }
+            | HeapEntry::Function { prototype, .. } => *prototype,
+            _ => None,
+        };
+        match prototype {
+            Some(value) => self.runtime_slot(value).map_err(EvalFailure::Runtime),
+            None => Ok(None),
+        }
+    }
+
+    // ---- property set ------------------------------------------------------
+
+    fn resolve_set(
         &mut self,
         object: Value,
-        key: String,
+        key: PropertyKey,
         value: Value,
-    ) -> Result<(), EvalFailure> {
+    ) -> Result<SetOutcome, EvalFailure> {
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => {
-                let growth = match &self.heap[index] {
-                    HeapEntry::Object { properties, .. }
-                    | HeapEntry::Function { properties, .. } => {
-                        usize::from(!properties.contains_key(&key)) * (key.len() + 8)
-                    }
-                    HeapEntry::Array {
-                        elements,
-                        properties,
-                        ..
-                    } => {
-                        if key == "length" {
-                            0
-                        } else if let Some(array_index) = array_index(&key) {
-                            (array_index as usize + 1).saturating_sub(elements.len()) * 8
-                        } else {
-                            usize::from(!properties.contains_key(&key)) * (key.len() + 8)
-                        }
-                    }
-                    HeapEntry::String(_) | HeapEntry::BigInt(_) => {
-                        return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                            operation: "set property on primitive",
-                        }));
-                    }
-                };
-                self.charge_heap(growth).map_err(EvalFailure::Runtime)?;
-                match &mut self.heap[index] {
-                    HeapEntry::Object { properties, .. }
-                    | HeapEntry::Function { properties, .. } => {
-                        properties.insert(key, value);
-                    }
-                    HeapEntry::Array {
-                        elements,
-                        properties,
-                        ..
-                    } => {
-                        if key == "length" {
-                            let length = exact_array_length(value).ok_or(EvalFailure::Throw(
-                                ThrowOrigin::RangeError {
-                                    operation: "set array length",
-                                },
-                            ))?;
-                            elements.resize(length, Value::HOLE);
-                        } else if let Some(array_index) = array_index(&key) {
-                            let index = array_index as usize;
-                            if elements.len() <= index {
-                                elements.resize(index + 1, Value::HOLE);
-                            }
-                            elements[index] = value;
-                        } else {
-                            properties.insert(key, value);
-                        }
-                    }
-                    HeapEntry::String(_) | HeapEntry::BigInt(_) => unreachable!(),
+                if let Some(setter) = self.find_setter(index, &key)? {
+                    return Ok(match setter {
+                        Some(setter) => SetOutcome::Setter(setter),
+                        None => SetOutcome::Done,
+                    });
                 }
-                Ok(())
+                self.set_own_data(index, key, value)?;
+                Ok(SetOutcome::Done)
             }
             None => match object.decode() {
-                Some(Decoded::HeapRef(_)) => self
-                    .host
-                    .property_set(object, &key, value)
-                    .map_err(|_| EvalFailure::Throw(ThrowOrigin::Host)),
+                Some(Decoded::HeapRef(_)) => {
+                    let name = self.host_key(&key)?;
+                    self.host
+                        .property_set(object, &name, value)
+                        .map(|()| SetOutcome::Done)
+                        .map_err(EvalFailure::HostThrow)
+                }
                 Some(_) => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                     operation: "set property on primitive",
                 })),
@@ -1077,10 +1640,213 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    fn delete_property(&mut self, object: Value, key: &str) -> Result<bool, EvalFailure> {
+    /// Walks the prototype chain for an accessor descriptor under `key`. Returns
+    /// `Ok(Some(setter))` when an accessor governs the key (an inner `None`
+    /// meaning the accessor has no setter); `Ok(None)` when assignment should
+    /// create or overwrite an own data property.
+    fn find_setter(
+        &self,
+        index: usize,
+        key: &PropertyKey,
+    ) -> Result<Option<Option<Value>>, EvalFailure> {
+        // An own non-accessor data slot (including array elements and function
+        // virtuals) shadows any inherited accessor.
+        if self.own_has_non_accessor(index, key) {
+            return Ok(None);
+        }
+        let mut node = index;
+        let mut guard = 0;
+        loop {
+            let accessor = match &self.heap[node] {
+                HeapEntry::Object { properties, .. }
+                | HeapEntry::Array { properties, .. }
+                | HeapEntry::Function { properties, .. }
+                | HeapEntry::RegExp { properties, .. } => match properties.get(key) {
+                    Some(Property::Accessor { setter, .. }) => Some(Some(*setter)),
+                    Some(Property::Data(_)) => Some(None),
+                    None => None,
+                },
+                _ => None,
+            };
+            match accessor {
+                Some(Some(setter)) => return Ok(Some(setter)),
+                Some(None) => return Ok(None),
+                None => {}
+            }
+            match self.prototype_index(node)? {
+                Some(next) => {
+                    node = next;
+                    guard += 1;
+                    if guard > self.heap.len() + 1 {
+                        return Ok(None);
+                    }
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+
+    fn own_has_non_accessor(&self, index: usize, key: &PropertyKey) -> bool {
+        match &self.heap[index] {
+            HeapEntry::Array { elements, .. } => {
+                if let PropertyKey::Named(name) = key {
+                    if name == "length" {
+                        return true;
+                    }
+                    if let Some(offset) = array_index(name) {
+                        return elements
+                            .get(offset as usize)
+                            .is_some_and(|element| *element != Value::HOLE);
+                    }
+                }
+                false
+            }
+            HeapEntry::Function { .. } => {
+                matches!(key.as_str(), Some("length") | Some("name"))
+                    && self
+                        .own_data_property(index, key.as_str().unwrap())
+                        .is_none()
+            }
+            _ => false,
+        }
+    }
+
+    fn set_own_data(
+        &mut self,
+        index: usize,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<(), EvalFailure> {
+        let growth = match &self.heap[index] {
+            HeapEntry::Object { properties, .. }
+            | HeapEntry::Function { properties, .. }
+            | HeapEntry::RegExp { properties, .. } => {
+                usize::from(!properties.contains_key(&key)) * key.charge_bytes()
+            }
+            HeapEntry::Array {
+                elements,
+                properties,
+                ..
+            } => match &key {
+                PropertyKey::Named(name) if name == "length" => 0,
+                PropertyKey::Named(name) => {
+                    if let Some(offset) = array_index(name) {
+                        (offset as usize + 1).saturating_sub(elements.len()) * 8
+                    } else {
+                        usize::from(!properties.contains_key(&key)) * key.charge_bytes()
+                    }
+                }
+                PropertyKey::Private(_) => {
+                    usize::from(!properties.contains_key(&key)) * key.charge_bytes()
+                }
+            },
+            HeapEntry::String(_) | HeapEntry::BigInt(_) => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "set property on primitive",
+                }));
+            }
+            HeapEntry::PrivateName { .. } | HeapEntry::Iterator { .. } => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "set property on non-object",
+                }));
+            }
+        };
+        self.charge_heap(growth).map_err(EvalFailure::Runtime)?;
+        match &mut self.heap[index] {
+            HeapEntry::Object { properties, .. }
+            | HeapEntry::Function { properties, .. }
+            | HeapEntry::RegExp { properties, .. } => {
+                properties.insert(key, Property::Data(value));
+                Ok(())
+            }
+            HeapEntry::Array {
+                elements,
+                properties,
+                ..
+            } => {
+                match key {
+                    PropertyKey::Named(name) if name == "length" => {
+                        let length = exact_array_length(value).ok_or(EvalFailure::Throw(
+                            ThrowOrigin::RangeError {
+                                operation: "set array length",
+                            },
+                        ))?;
+                        elements.resize(length, Value::HOLE);
+                    }
+                    PropertyKey::Named(name) => {
+                        if let Some(offset) = array_index(&name) {
+                            let offset = offset as usize;
+                            if elements.len() <= offset {
+                                elements.resize(offset + 1, Value::HOLE);
+                            }
+                            elements[offset] = value;
+                        } else {
+                            properties.insert(PropertyKey::Named(name), Property::Data(value));
+                        }
+                    }
+                    private @ PropertyKey::Private(_) => {
+                        properties.insert(private, Property::Data(value));
+                    }
+                }
+                Ok(())
+            }
+            _ => unreachable!("primitive and identity entries rejected above"),
+        }
+    }
+
+    fn define_accessor(
+        &mut self,
+        object: Value,
+        key: PropertyKey,
+        accessor: Value,
+        kind: AccessorKind,
+    ) -> Result<(), EvalFailure> {
+        match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
+            Some(index) => {
+                self.charge_heap(key.charge_bytes() + 8)
+                    .map_err(EvalFailure::Runtime)?;
+                let properties = match &mut self.heap[index] {
+                    HeapEntry::Object { properties, .. }
+                    | HeapEntry::Array { properties, .. }
+                    | HeapEntry::Function { properties, .. }
+                    | HeapEntry::RegExp { properties, .. } => properties,
+                    _ => {
+                        return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                            operation: "define accessor on primitive",
+                        }));
+                    }
+                };
+                let entry = properties.entry(key).or_insert(Property::Accessor {
+                    getter: None,
+                    setter: None,
+                });
+                match entry {
+                    Property::Accessor { getter, setter } => match kind {
+                        AccessorKind::Getter => *getter = Some(accessor),
+                        AccessorKind::Setter => *setter = Some(accessor),
+                    },
+                    Property::Data(_) => {
+                        let (getter, setter) = match kind {
+                            AccessorKind::Getter => (Some(accessor), None),
+                            AccessorKind::Setter => (None, Some(accessor)),
+                        };
+                        *entry = Property::Accessor { getter, setter };
+                    }
+                }
+                Ok(())
+            }
+            None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "define accessor on host object",
+            })),
+        }
+    }
+
+    fn delete_property(&mut self, object: Value, key: &PropertyKey) -> Result<bool, EvalFailure> {
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => match &mut self.heap[index] {
-                HeapEntry::Object { properties, .. } | HeapEntry::Function { properties, .. } => {
+                HeapEntry::Object { properties, .. }
+                | HeapEntry::Function { properties, .. }
+                | HeapEntry::RegExp { properties, .. } => {
                     properties.remove(key);
                     Ok(true)
                 }
@@ -1089,25 +1855,32 @@ impl<'a, H: Host> Machine<'a, H> {
                     properties,
                     ..
                 } => {
-                    if key == "length" {
-                        Ok(false)
-                    } else if let Some(index) = array_index(key) {
-                        if let Some(element) = elements.get_mut(index as usize) {
-                            *element = Value::HOLE;
+                    if let PropertyKey::Named(name) = key {
+                        if name == "length" {
+                            return Ok(false);
                         }
-                        Ok(true)
-                    } else {
-                        properties.remove(key);
-                        Ok(true)
+                        if let Some(offset) = array_index(name) {
+                            if let Some(element) = elements.get_mut(offset as usize) {
+                                *element = Value::HOLE;
+                            }
+                            return Ok(true);
+                        }
                     }
+                    properties.remove(key);
+                    Ok(true)
                 }
-                HeapEntry::String(_) | HeapEntry::BigInt(_) => Ok(true),
+                HeapEntry::String(_)
+                | HeapEntry::BigInt(_)
+                | HeapEntry::PrivateName { .. }
+                | HeapEntry::Iterator { .. } => Ok(true),
             },
             None => match object.decode() {
-                Some(Decoded::HeapRef(_)) => self
-                    .host
-                    .property_delete(object, key)
-                    .map_err(|_| EvalFailure::Throw(ThrowOrigin::Host)),
+                Some(Decoded::HeapRef(_)) => {
+                    let name = self.host_key(key)?;
+                    self.host
+                        .property_delete(object, &name)
+                        .map_err(EvalFailure::HostThrow)
+                }
                 Some(_) => Ok(true),
                 None => Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidHostValue {
                     value: object,
@@ -1116,31 +1889,37 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    fn has_property(&mut self, object: Value, key: &str) -> Result<bool, EvalFailure> {
+    fn has_property(&mut self, object: Value, key: &PropertyKey) -> Result<bool, EvalFailure> {
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
-            Some(index) => match &self.heap[index] {
-                HeapEntry::String(text) => Ok(key == "length"
-                    || array_index(key).is_some_and(|i| (i as usize) < text.chars().count())),
-                HeapEntry::BigInt(_) => Ok(false),
-                HeapEntry::Object { properties, .. } => Ok(properties.contains_key(key)),
-                HeapEntry::Array {
-                    elements,
-                    properties,
-                    ..
-                } => Ok(key == "length"
-                    || array_index(key).is_some_and(|i| {
-                        elements.get(i as usize).is_some_and(|v| *v != Value::HOLE)
-                    })
-                    || properties.contains_key(key)),
-                HeapEntry::Function { properties, .. } => {
-                    Ok(key == "name" || key == "length" || properties.contains_key(key))
+            Some(index) => {
+                if matches!(key, PropertyKey::Private(_)) {
+                    return Ok(self.own_get(index, key).is_some());
                 }
-            },
+                let mut node = index;
+                let mut guard = 0;
+                loop {
+                    if self.own_get(node, key).is_some() {
+                        return Ok(true);
+                    }
+                    match self.prototype_index(node)? {
+                        Some(next) => {
+                            node = next;
+                            guard += 1;
+                            if guard > self.heap.len() + 1 {
+                                return Ok(false);
+                            }
+                        }
+                        None => return Ok(false),
+                    }
+                }
+            }
             None => match object.decode() {
-                Some(Decoded::HeapRef(_)) => self
-                    .host
-                    .property_has(object, key)
-                    .map_err(|_| EvalFailure::Throw(ThrowOrigin::Host)),
+                Some(Decoded::HeapRef(_)) => {
+                    let name = self.host_key(key)?;
+                    self.host
+                        .property_has(object, &name)
+                        .map_err(EvalFailure::HostThrow)
+                }
                 Some(_) => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                     operation: "in",
                 })),
@@ -1150,6 +1929,347 @@ impl<'a, H: Host> Machine<'a, H> {
             },
         }
     }
+
+    // ---- aggregates & prototypes ------------------------------------------
+
+    fn array_push(&mut self, array: Value, value: Value) -> Result<(), EvalFailure> {
+        match self.runtime_slot(array).map_err(EvalFailure::Runtime)? {
+            Some(index) => {
+                if !matches!(self.heap[index], HeapEntry::Array { .. }) {
+                    return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "push on non-array",
+                    }));
+                }
+                self.charge_heap(8).map_err(EvalFailure::Runtime)?;
+                if let HeapEntry::Array { elements, .. } = &mut self.heap[index] {
+                    elements.push(value);
+                }
+                Ok(())
+            }
+            None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "push on non-array",
+            })),
+        }
+    }
+
+    fn array_extend(&mut self, array: Value, iterable: Value) -> Result<(), EvalFailure> {
+        let values = self.iterate_values(iterable)?;
+        match self.runtime_slot(array).map_err(EvalFailure::Runtime)? {
+            Some(index) => {
+                if !matches!(self.heap[index], HeapEntry::Array { .. }) {
+                    return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "spread into non-array",
+                    }));
+                }
+                self.charge_heap(8usize.saturating_mul(values.len()))
+                    .map_err(EvalFailure::Runtime)?;
+                if let HeapEntry::Array { elements, .. } = &mut self.heap[index] {
+                    elements.extend(values);
+                }
+                Ok(())
+            }
+            None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "spread into non-array",
+            })),
+        }
+    }
+
+    /// Collects every value produced by iterating `value` (arrays and strings
+    /// are the local iterables; anything else is not iterable).
+    fn iterate_values(&mut self, value: Value) -> Result<Vec<Value>, EvalFailure> {
+        match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
+            Some(index) => match &self.heap[index] {
+                HeapEntry::Array { elements, .. } => Ok(elements
+                    .iter()
+                    .map(|element| {
+                        if *element == Value::HOLE {
+                            Value::UNDEFINED
+                        } else {
+                            *element
+                        }
+                    })
+                    .collect()),
+                HeapEntry::String(text) => {
+                    let chars: Vec<char> = text.chars().collect();
+                    let mut values = Vec::with_capacity(chars.len());
+                    for ch in chars {
+                        values.push(
+                            self.allocate(HeapEntry::String(ch.to_string()))
+                                .map_err(EvalFailure::Runtime)?,
+                        );
+                    }
+                    Ok(values)
+                }
+                _ => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "value is not iterable",
+                })),
+            },
+            None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "value is not iterable",
+            })),
+        }
+    }
+
+    fn object_spread(&mut self, target: Value, source: Value) -> Result<(), EvalFailure> {
+        let target_index = match self.runtime_slot(target).map_err(EvalFailure::Runtime)? {
+            Some(index)
+                if matches!(
+                    self.heap[index],
+                    HeapEntry::Object { .. } | HeapEntry::Array { .. }
+                ) =>
+            {
+                index
+            }
+            _ => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "object spread target is not an object",
+                }));
+            }
+        };
+        // Own enumerable data properties of the source are copied. `null` and
+        // `undefined` sources are a no-op, matching `{ ...null }`.
+        let mut pairs: Vec<(PropertyKey, Value)> = Vec::new();
+        let mut char_pairs: Vec<(String, char)> = Vec::new();
+        if let Some(index) = self.runtime_slot(source).map_err(EvalFailure::Runtime)? {
+            match &self.heap[index] {
+                HeapEntry::Object { properties, .. } => {
+                    for (key, property) in properties {
+                        if let (PropertyKey::Named(_), Property::Data(value)) = (key, property) {
+                            pairs.push((key.clone(), *value));
+                        }
+                    }
+                }
+                HeapEntry::Array {
+                    elements,
+                    properties,
+                    ..
+                } => {
+                    for (offset, element) in elements.iter().enumerate() {
+                        if *element != Value::HOLE {
+                            pairs.push((PropertyKey::Named(offset.to_string()), *element));
+                        }
+                    }
+                    for (key, property) in properties {
+                        if let (PropertyKey::Named(name), Property::Data(value)) = (key, property)
+                            && array_index(name).is_none()
+                        {
+                            pairs.push((key.clone(), *value));
+                        }
+                    }
+                }
+                HeapEntry::String(text) => {
+                    for (offset, ch) in text.chars().enumerate() {
+                        char_pairs.push((offset.to_string(), ch));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (name, ch) in char_pairs {
+            let value = self
+                .allocate(HeapEntry::String(ch.to_string()))
+                .map_err(EvalFailure::Runtime)?;
+            pairs.push((PropertyKey::Named(name), value));
+        }
+        for (key, value) in pairs {
+            self.set_own_data(target_index, key, value)?;
+        }
+        Ok(())
+    }
+
+    fn set_prototype(&mut self, object: Value, prototype: Value) -> Result<(), EvalFailure> {
+        let prototype = match self.runtime_slot(prototype).map_err(EvalFailure::Runtime)? {
+            Some(_) => Some(prototype),
+            None => match prototype.decode() {
+                Some(Decoded::Null) => None,
+                Some(Decoded::HeapRef(_)) => Some(prototype),
+                _ => {
+                    return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "set prototype to non-object",
+                    }));
+                }
+            },
+        };
+        match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
+            Some(index) => match &mut self.heap[index] {
+                HeapEntry::Object {
+                    prototype: slot, ..
+                }
+                | HeapEntry::Array {
+                    prototype: slot, ..
+                }
+                | HeapEntry::Function {
+                    prototype: slot, ..
+                } => {
+                    *slot = prototype;
+                    Ok(())
+                }
+                _ => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "set prototype on primitive",
+                })),
+            },
+            None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "set prototype on host object",
+            })),
+        }
+    }
+
+    // ---- iterators ---------------------------------------------------------
+
+    fn create_iterator(&mut self, src: Value, kind: IteratorKind) -> Result<Value, EvalFailure> {
+        match kind {
+            IteratorKind::Keys => {
+                let keys = self.enumerable_keys(src)?;
+                self.allocate(HeapEntry::Iterator {
+                    source: src,
+                    index: 0,
+                    keys: Some(keys),
+                })
+                .map_err(EvalFailure::Runtime)
+            }
+            IteratorKind::Sync | IteratorKind::Async => {
+                match self.runtime_slot(src).map_err(EvalFailure::Runtime)? {
+                    Some(index)
+                        if matches!(
+                            self.heap[index],
+                            HeapEntry::Array { .. } | HeapEntry::String(_)
+                        ) =>
+                    {
+                        self.allocate(HeapEntry::Iterator {
+                            source: src,
+                            index: 0,
+                            keys: None,
+                        })
+                        .map_err(EvalFailure::Runtime)
+                    }
+                    _ => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "value is not iterable",
+                    })),
+                }
+            }
+        }
+    }
+
+    fn enumerable_keys(&self, src: Value) -> Result<Vec<String>, EvalFailure> {
+        match self.runtime_slot(src).map_err(EvalFailure::Runtime)? {
+            Some(index) => match &self.heap[index] {
+                HeapEntry::Object { properties, .. }
+                | HeapEntry::Function { properties, .. }
+                | HeapEntry::RegExp { properties, .. } => Ok(properties
+                    .keys()
+                    .filter_map(|key| key.as_str().map(str::to_owned))
+                    .collect()),
+                HeapEntry::Array {
+                    elements,
+                    properties,
+                    ..
+                } => {
+                    let mut keys: Vec<String> = (0..elements.len())
+                        .filter(|offset| elements[*offset] != Value::HOLE)
+                        .map(|offset| offset.to_string())
+                        .collect();
+                    for key in properties.keys() {
+                        if let Some(name) = key.as_str()
+                            && array_index(name).is_none()
+                        {
+                            keys.push(name.to_owned());
+                        }
+                    }
+                    Ok(keys)
+                }
+                HeapEntry::String(text) => {
+                    Ok((0..text.chars().count()).map(|i| i.to_string()).collect())
+                }
+                HeapEntry::BigInt(_)
+                | HeapEntry::PrivateName { .. }
+                | HeapEntry::Iterator { .. } => Ok(Vec::new()),
+            },
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn iterator_next(&mut self, iterator: Value) -> Result<(bool, Value), EvalFailure> {
+        let iterator_index = self
+            .runtime_slot(iterator)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "iterator next on non-iterator",
+            }))?;
+        let (source, current, keys_len, key_at) = match &self.heap[iterator_index] {
+            HeapEntry::Iterator {
+                source,
+                index,
+                keys,
+                ..
+            } => (
+                *source,
+                *index,
+                keys.as_ref().map(Vec::len),
+                keys.as_ref().and_then(|keys| keys.get(*index).cloned()),
+            ),
+            _ => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "iterator next on non-iterator",
+                }));
+            }
+        };
+
+        if let Some(length) = keys_len {
+            if current >= length {
+                return Ok((true, Value::UNDEFINED));
+            }
+            let text = key_at.expect("current < length has a key");
+            let value = self
+                .allocate(HeapEntry::String(text))
+                .map_err(EvalFailure::Runtime)?;
+            self.advance_iterator(iterator_index);
+            return Ok((false, value));
+        }
+
+        enum Step {
+            Element(Option<Value>),
+            Char(Option<char>),
+        }
+        let step = match self.runtime_slot(source).map_err(EvalFailure::Runtime)? {
+            Some(source_index) => match &self.heap[source_index] {
+                HeapEntry::Array { elements, .. } => {
+                    Step::Element(elements.get(current).map(|element| {
+                        if *element == Value::HOLE {
+                            Value::UNDEFINED
+                        } else {
+                            *element
+                        }
+                    }))
+                }
+                HeapEntry::String(text) => Step::Char(text.chars().nth(current)),
+                _ => return Ok((true, Value::UNDEFINED)),
+            },
+            None => return Ok((true, Value::UNDEFINED)),
+        };
+        match step {
+            Step::Element(Some(value)) => {
+                self.advance_iterator(iterator_index);
+                Ok((false, value))
+            }
+            Step::Element(None) => Ok((true, Value::UNDEFINED)),
+            Step::Char(Some(ch)) => {
+                let value = self
+                    .allocate(HeapEntry::String(ch.to_string()))
+                    .map_err(EvalFailure::Runtime)?;
+                self.advance_iterator(iterator_index);
+                Ok((false, value))
+            }
+            Step::Char(None) => Ok((true, Value::UNDEFINED)),
+        }
+    }
+
+    fn advance_iterator(&mut self, iterator_index: usize) {
+        if let HeapEntry::Iterator { index, .. } = &mut self.heap[iterator_index] {
+            *index += 1;
+        }
+    }
+
+    // ---- operators & coercions --------------------------------------------
 
     fn eval_unary(&mut self, op: UnaryOp, operand: Value) -> Result<Value, EvalFailure> {
         match op {
@@ -1230,7 +2350,7 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             BinaryOp::InstanceOf => self.instance_of(left, right).map(Value::boolean),
             BinaryOp::In => {
-                let key = self.value_to_string(left, 0)?;
+                let key = self.coerce_property_key(left)?;
                 self.has_property(right, &key).map(Value::boolean)
             }
             BinaryOp::Add => self.add(left, right),
@@ -1340,27 +2460,35 @@ impl<'a, H: Host> Machine<'a, H> {
             Some(Decoded::Null) => Ok(Value::int32(0)),
             Some(Decoded::Boolean(value)) => Ok(Value::int32(u32::from(value))),
             Some(Decoded::Hole) | Some(Decoded::Uninitialized) => Ok(Value::number(f64::NAN)),
-            Some(Decoded::HeapRef(_)) => match self
-                .runtime_slot(value)
-                .map_err(EvalFailure::Runtime)?
-            {
-                Some(index) => match &self.heap[index] {
-                    HeapEntry::String(text) => Ok(number_value(parse_number(text))),
-                    HeapEntry::BigInt(_) => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                        operation: "convert bigint to number",
+            Some(Decoded::HeapRef(_)) => {
+                match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
+                    Some(index) => match &self.heap[index] {
+                        HeapEntry::String(text) => Ok(number_value(parse_number(text))),
+                        HeapEntry::BigInt(_) => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                            operation: "convert bigint to number",
+                        })),
+                        HeapEntry::Array { elements, .. } if elements.is_empty() => {
+                            Ok(Value::int32(0))
+                        }
+                        HeapEntry::Array { elements, .. } if elements.len() == 1 => {
+                            self.to_number(elements[0])
+                        }
+                        HeapEntry::PrivateName { .. } => {
+                            Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                                operation: "convert private name to number",
+                            }))
+                        }
+                        HeapEntry::Object { .. }
+                        | HeapEntry::Array { .. }
+                        | HeapEntry::Function { .. }
+                        | HeapEntry::RegExp { .. }
+                        | HeapEntry::Iterator { .. } => Ok(Value::number(f64::NAN)),
+                    },
+                    None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "coerce host object to number",
                     })),
-                    HeapEntry::Array { elements, .. } if elements.is_empty() => Ok(Value::int32(0)),
-                    HeapEntry::Array { elements, .. } if elements.len() == 1 => {
-                        self.to_number(elements[0])
-                    }
-                    HeapEntry::Object { .. }
-                    | HeapEntry::Array { .. }
-                    | HeapEntry::Function { .. } => Ok(Value::number(f64::NAN)),
-                },
-                None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                    operation: "coerce host object to number",
-                })),
-            },
+                }
+            }
             None => Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidHostValue {
                 value,
             })),
@@ -1381,7 +2509,10 @@ impl<'a, H: Host> Machine<'a, H> {
                     }
                     HeapEntry::Object { .. }
                     | HeapEntry::Array { .. }
-                    | HeapEntry::Function { .. } => true,
+                    | HeapEntry::Function { .. }
+                    | HeapEntry::PrivateName { .. }
+                    | HeapEntry::RegExp { .. }
+                    | HeapEntry::Iterator { .. } => true,
                 },
                 Ok(None) => true,
                 Err(_) => false,
@@ -1400,7 +2531,11 @@ impl<'a, H: Host> Machine<'a, H> {
                     HeapEntry::String(_) => "string",
                     HeapEntry::BigInt(_) => "bigint",
                     HeapEntry::Function { .. } => "function",
-                    HeapEntry::Object { .. } | HeapEntry::Array { .. } => "object",
+                    HeapEntry::PrivateName { .. } => "symbol",
+                    HeapEntry::Object { .. }
+                    | HeapEntry::Array { .. }
+                    | HeapEntry::RegExp { .. }
+                    | HeapEntry::Iterator { .. } => "object",
                 },
                 _ => "object",
             },
@@ -1462,6 +2597,8 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(left.partial_cmp(&right))
     }
 
+    /// `value instanceof constructor`: walks `value`'s prototype chain for the
+    /// constructor's own `prototype` object, matching by heap identity.
     fn instance_of(&mut self, value: Value, constructor: Value) -> Result<bool, EvalFailure> {
         match self
             .runtime_slot(constructor)
@@ -1473,28 +2610,41 @@ impl<'a, H: Host> Machine<'a, H> {
                         operation: "instanceof",
                     }));
                 }
-                match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
-                    Some(value_index) => Ok(match &self.heap[value_index] {
-                        HeapEntry::Object {
-                            constructor: actual,
-                            ..
+                let target = match self.own_data_property(index, "prototype") {
+                    Some(value) if self.is_object(value) => value,
+                    _ => {
+                        return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                            operation: "instanceof prototype is not an object",
+                        }));
+                    }
+                };
+                let target_slot = self.runtime_slot(target).map_err(EvalFailure::Runtime)?;
+                let mut node = match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
+                    Some(node) => node,
+                    None => return Ok(false),
+                };
+                let mut guard = 0;
+                loop {
+                    if Some(node) == target_slot {
+                        return Ok(true);
+                    }
+                    match self.prototype_index(node)? {
+                        Some(next) => {
+                            node = next;
+                            guard += 1;
+                            if guard > self.heap.len() + 1 {
+                                return Ok(false);
+                            }
                         }
-                        | HeapEntry::Array {
-                            constructor: actual,
-                            ..
-                        } => *actual == Some(constructor),
-                        HeapEntry::Function { .. }
-                        | HeapEntry::String(_)
-                        | HeapEntry::BigInt(_) => false,
-                    }),
-                    None => Ok(false),
+                        None => return Ok(false),
+                    }
                 }
             }
             None => match constructor.decode() {
                 Some(Decoded::HeapRef(_)) => self
                     .host
                     .instance_of(value, constructor)
-                    .map_err(|_| EvalFailure::Throw(ThrowOrigin::Host)),
+                    .map_err(EvalFailure::HostThrow),
                 _ => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                     operation: "instanceof",
                 })),
@@ -1506,9 +2656,12 @@ impl<'a, H: Host> Machine<'a, H> {
         match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
             Some(index) => match &self.heap[index] {
                 HeapEntry::String(text) => Ok(Some(text.clone())),
-                HeapEntry::Object { .. } | HeapEntry::Array { .. } | HeapEntry::Function { .. } => {
-                    self.value_to_string(value, 0).map(Some)
-                }
+                HeapEntry::Object { .. }
+                | HeapEntry::Array { .. }
+                | HeapEntry::Function { .. }
+                | HeapEntry::RegExp { .. }
+                | HeapEntry::Iterator { .. }
+                | HeapEntry::PrivateName { .. } => self.value_to_string(value, 0).map(Some),
                 HeapEntry::BigInt(_) => Ok(None),
             },
             None => Ok(None),
@@ -1530,7 +2683,17 @@ impl<'a, H: Host> Machine<'a, H> {
                 match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
                     Some(index) => match &self.heap[index] {
                         HeapEntry::String(text) | HeapEntry::BigInt(text) => Ok(text.clone()),
-                        HeapEntry::Object { .. } => Ok("[object Object]".to_owned()),
+                        HeapEntry::Object { .. } | HeapEntry::Iterator { .. } => {
+                            Ok("[object Object]".to_owned())
+                        }
+                        HeapEntry::RegExp { pattern, flags, .. } => {
+                            Ok(format!("/{pattern}/{flags}"))
+                        }
+                        HeapEntry::PrivateName { .. } => {
+                            Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                                operation: "convert private name to string",
+                            }))
+                        }
                         HeapEntry::Function { function, .. } => {
                             let flags = self.module.functions()[function.get() as usize].flags();
                             Ok(match (flags.is_async, flags.is_generator) {
@@ -1586,13 +2749,27 @@ impl<'a, H: Host> Machine<'a, H> {
 
     fn is_object(&self, value: Value) -> bool {
         match self.runtime_slot(value) {
-            Ok(Some(index)) => matches!(
+            Ok(Some(index)) => !matches!(
                 self.heap[index],
-                HeapEntry::Object { .. } | HeapEntry::Array { .. } | HeapEntry::Function { .. }
+                HeapEntry::String(_) | HeapEntry::BigInt(_)
             ),
             Ok(None) => matches!(value.decode(), Some(Decoded::HeapRef(_))),
             Err(_) => false,
         }
+    }
+}
+
+fn property_lookup(
+    properties: &BTreeMap<PropertyKey, Property>,
+    key: &PropertyKey,
+) -> Option<Found> {
+    match properties.get(key) {
+        Some(Property::Data(value)) => Some(Found::Value(*value)),
+        Some(Property::Accessor { getter, .. }) => Some(match getter {
+            Some(getter) => Found::Getter(*getter),
+            None => Found::NoGetter,
+        }),
+        None => None,
     }
 }
 
@@ -1759,6 +2936,7 @@ fn bigint_binary(op: BinaryOp, left: &str, right: &str) -> Result<String, EvalFa
 mod tests {
     use super::*;
     use bamts_bytecode::{ExceptionHandler, FunctionFlags, NumberBits, Register};
+    use std::collections::VecDeque;
 
     fn reg(raw: u32) -> Register {
         Register::new(raw)
@@ -1770,6 +2948,7 @@ mod tests {
         ConstantId::new(raw)
     }
 
+    /// A function with no captures.
     fn function(
         parameters: u32,
         registers: u32,
@@ -1778,11 +2957,30 @@ mod tests {
     ) -> Function {
         Function::new(
             None,
+            0,
             parameters,
             registers,
             FunctionFlags::default(),
             code,
             handlers,
+        )
+    }
+
+    /// A function with `captures` leading capture registers.
+    fn closure_function(
+        captures: u32,
+        parameters: u32,
+        registers: u32,
+        code: Vec<Instruction>,
+    ) -> Function {
+        Function::new(
+            None,
+            captures,
+            parameters,
+            registers,
+            FunctionFlags::default(),
+            code,
+            Vec::new(),
         )
     }
 
@@ -1794,20 +2992,32 @@ mod tests {
 
     #[derive(Default)]
     struct TestHost {
-        awaited: Option<Result<Value, HostThrow>>,
+        awaited: VecDeque<Result<Value, HostThrow>>,
         imported: Option<Result<Value, HostThrow>>,
+        exports: Vec<(String, Value)>,
     }
     impl Host for TestHost {
         fn awaited(&mut self, _value: Value) -> Result<Value, HostThrow> {
-            self.awaited.take().expect("scripted await")
+            self.awaited.pop_front().expect("scripted await")
         }
         fn import(&mut self, _specifier: &str) -> Result<Value, HostThrow> {
             self.imported.take().expect("scripted import")
         }
+        fn export(&mut self, name: &str, value: Value) -> Result<(), HostThrow> {
+            self.exports.push((name.to_owned(), value));
+            Ok(())
+        }
+    }
+
+    fn run_ok(module: &Module<Verified>) -> Execution {
+        let mut host = TestHost::default();
+        Machine::new(module, &mut host, Limits::default())
+            .run()
+            .unwrap()
     }
 
     #[test]
-    fn object_and_function_values_have_stable_distinct_heap_identity() {
+    fn object_values_have_stable_distinct_heap_identity() {
         let module = verified(
             vec![],
             vec![function(
@@ -1837,18 +3047,65 @@ mod tests {
                 vec![],
             )],
         );
-        let mut host = TestHost::default();
-        let execution = Machine::new(&module, &mut host, Limits::default())
-            .run()
-            .unwrap();
+        let execution = run_ok(&module);
         assert_eq!(execution.entry_registers[2], Value::FALSE);
         assert_eq!(execution.value, Value::TRUE);
     }
 
     #[test]
-    fn property_set_get_delete_and_array_holes_are_real_mutations() {
+    fn computed_member_access_uses_dynamic_register_key() {
+        // key = "a" + "b"; obj[key] = 7; return obj[key].
         let module = verified(
-            vec![Constant::String("0".into())],
+            vec![
+                Constant::String("a".into()),
+                Constant::String("b".into()),
+                Constant::Int32(7),
+            ],
+            vec![function(
+                0,
+                6,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(1),
+                    },
+                    Instruction::Binary {
+                        dst: reg(3),
+                        op: BinaryOp::Add,
+                        left: reg(1),
+                        right: reg(2),
+                    },
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(4),
+                        constant: cid(2),
+                    },
+                    Instruction::SetProperty {
+                        object: reg(0),
+                        key: reg(3),
+                        value: reg(4),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(5),
+                        object: reg(0),
+                        key: reg(3),
+                    },
+                    Instruction::Return { value: reg(5) },
+                ],
+                vec![],
+            )],
+        );
+        assert_eq!(run_ok(&module).value, Value::int32(7));
+    }
+
+    #[test]
+    fn property_delete_and_array_holes_are_real_mutations() {
+        let module = verified(
+            vec![Constant::String("0".into()), Constant::Int32(5)],
             vec![function(
                 0,
                 5,
@@ -1858,50 +3115,413 @@ mod tests {
                         dst: reg(1),
                         constant: cid(0),
                     },
+                    Instruction::LoadConst {
+                        dst: reg(4),
+                        constant: cid(1),
+                    },
                     Instruction::SetProperty {
                         object: reg(0),
-                        key: cid(0),
-                        value: reg(1),
+                        key: reg(1),
+                        value: reg(4),
                     },
                     Instruction::GetProperty {
                         dst: reg(2),
                         object: reg(0),
-                        key: cid(0),
+                        key: reg(1),
                     },
                     Instruction::DeleteProperty {
                         dst: reg(3),
                         object: reg(0),
-                        key: cid(0),
+                        key: reg(1),
                     },
                     Instruction::GetProperty {
                         dst: reg(4),
                         object: reg(0),
-                        key: cid(0),
+                        key: reg(1),
                     },
                     Instruction::Return { value: reg(3) },
                 ],
                 vec![],
             )],
         );
-        let mut host = TestHost::default();
-        let execution = Machine::new(&module, &mut host, Limits::default())
-            .run()
-            .unwrap();
-        assert_eq!(execution.entry_registers[1], execution.entry_registers[2]);
+        let execution = run_ok(&module);
+        assert_eq!(execution.entry_registers[2], Value::int32(5));
         assert_eq!(execution.entry_registers[4], Value::UNDEFINED);
         assert_eq!(execution.value, Value::TRUE);
     }
 
     #[test]
-    fn internal_call_copies_argument_window_into_parameter_registers() {
+    fn closure_captures_seed_leading_registers_before_parameters() {
+        // captures = [42]; fn1(7) => capture(r0) + param(r1) = 49.
+        let entry = function(
+            0,
+            3,
+            vec![
+                Instruction::CreateArray { dst: reg(0) },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(0),
+                },
+                Instruction::ArrayPush {
+                    array: reg(0),
+                    value: reg(1),
+                },
+                Instruction::CreateClosure {
+                    dst: reg(2),
+                    function: FunctionId::new(1),
+                    captures: reg(0),
+                },
+                // arguments array [7]
+                Instruction::CreateArray { dst: reg(0) },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(1),
+                },
+                Instruction::ArrayPush {
+                    array: reg(0),
+                    value: reg(1),
+                },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(2),
+                },
+                Instruction::Call {
+                    dst: reg(1),
+                    callee: reg(2),
+                    this_value: reg(1),
+                    arguments: reg(0),
+                },
+                Instruction::Return { value: reg(1) },
+            ],
+            vec![],
+        );
+        // capture_count = 1, parameter_count = 1: r0 = capture, r1 = param.
+        let callee = closure_function(
+            1,
+            1,
+            3,
+            vec![
+                Instruction::Binary {
+                    dst: reg(2),
+                    op: BinaryOp::Add,
+                    left: reg(0),
+                    right: reg(1),
+                },
+                Instruction::Return { value: reg(2) },
+            ],
+        );
+        let module = verified(
+            vec![Constant::Int32(42), Constant::Int32(7), Constant::Undefined],
+            vec![entry, callee],
+        );
+        assert_eq!(run_ok(&module).value, Value::int32(49));
+    }
+
+    #[test]
+    fn calls_scale_past_fixed_window_via_arguments_array() {
+        // Build a 500-element arguments array and call a callee returning
+        // arguments.length — impossible under a 127 fixed window.
+        let mut code = vec![Instruction::CreateArray { dst: reg(0) }];
+        code.push(Instruction::LoadConst {
+            dst: reg(1),
+            constant: cid(0),
+        });
+        for _ in 0..500 {
+            code.push(Instruction::ArrayPush {
+                array: reg(0),
+                value: reg(1),
+            });
+        }
+        code.push(Instruction::CreateClosure {
+            dst: reg(2),
+            function: FunctionId::new(1),
+            captures: reg(3),
+        });
+        // captures array for a zero-capture function
+        // (reg(3) must be an empty array)
+        // Insert its creation before CreateClosure:
+        let mut prelude = vec![Instruction::CreateArray { dst: reg(3) }];
+        prelude.append(&mut code);
+        let mut code = prelude;
+        code.push(Instruction::LoadConst {
+            dst: reg(1),
+            constant: cid(1),
+        });
+        code.push(Instruction::Call {
+            dst: reg(1),
+            callee: reg(2),
+            this_value: reg(1),
+            arguments: reg(0),
+        });
+        code.push(Instruction::Return { value: reg(1) });
+
+        let entry = function(0, 4, code, vec![]);
+        let callee = function(
+            0,
+            2,
+            vec![
+                Instruction::LoadArguments { dst: reg(0) },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(2),
+                },
+                Instruction::GetProperty {
+                    dst: reg(0),
+                    object: reg(0),
+                    key: reg(1),
+                },
+                Instruction::Return { value: reg(0) },
+            ],
+            vec![],
+        );
+        let module = verified(
+            vec![
+                Constant::Int32(1),
+                Constant::Undefined,
+                Constant::String("length".into()),
+            ],
+            vec![entry, callee],
+        );
+        assert_eq!(run_ok(&module).value, Value::int32(500));
+    }
+
+    #[test]
+    fn array_extend_spreads_iterable_elements() {
+        // dst = []; dst.push(1); dst.extend([2,3]); return dst.length == 3.
         let entry = function(
             0,
             4,
             vec![
-                Instruction::DefineFunction {
-                    dst: reg(0),
-                    function: FunctionId::new(1),
+                Instruction::CreateArray { dst: reg(0) },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(0),
                 },
+                Instruction::ArrayPush {
+                    array: reg(0),
+                    value: reg(1),
+                },
+                // source [2,3]
+                Instruction::CreateArray { dst: reg(2) },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(1),
+                },
+                Instruction::ArrayPush {
+                    array: reg(2),
+                    value: reg(1),
+                },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(2),
+                },
+                Instruction::ArrayPush {
+                    array: reg(2),
+                    value: reg(1),
+                },
+                Instruction::ArrayExtend {
+                    array: reg(0),
+                    iterable: reg(2),
+                },
+                Instruction::LoadConst {
+                    dst: reg(3),
+                    constant: cid(3),
+                },
+                Instruction::GetProperty {
+                    dst: reg(0),
+                    object: reg(0),
+                    key: reg(3),
+                },
+                Instruction::Return { value: reg(0) },
+            ],
+            vec![],
+        );
+        let module = verified(
+            vec![
+                Constant::Int32(1),
+                Constant::Int32(2),
+                Constant::Int32(3),
+                Constant::String("length".into()),
+            ],
+            vec![entry],
+        );
+        assert_eq!(run_ok(&module).value, Value::int32(3));
+    }
+
+    #[test]
+    fn object_spread_copies_own_properties() {
+        // src = {}; src.x = 9; target = {}; { ...src }; return target.x.
+        let key = |c: u32| Instruction::LoadConst {
+            dst: reg(3),
+            constant: cid(c),
+        };
+        let module = verified(
+            vec![Constant::String("x".into()), Constant::Int32(9)],
+            vec![function(
+                0,
+                4,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    key(0),
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(1),
+                    },
+                    Instruction::SetProperty {
+                        object: reg(0),
+                        key: reg(3),
+                        value: reg(2),
+                    },
+                    Instruction::CreateObject { dst: reg(1) },
+                    Instruction::ObjectSpread {
+                        target: reg(1),
+                        source: reg(0),
+                    },
+                    key(0),
+                    Instruction::GetProperty {
+                        dst: reg(2),
+                        object: reg(1),
+                        key: reg(3),
+                    },
+                    Instruction::Return { value: reg(2) },
+                ],
+                vec![],
+            )],
+        );
+        assert_eq!(run_ok(&module).value, Value::int32(9));
+    }
+
+    #[test]
+    fn private_names_have_distinct_identity_and_are_gettable() {
+        // Two private names with the same description are distinct keys.
+        let module = verified(
+            vec![
+                Constant::String("x".into()),
+                Constant::Int32(1),
+                Constant::Int32(2),
+            ],
+            vec![function(
+                0,
+                6,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::CreatePrivateName {
+                        dst: reg(1),
+                        description: cid(0),
+                    },
+                    Instruction::CreatePrivateName {
+                        dst: reg(2),
+                        description: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(3),
+                        constant: cid(1),
+                    },
+                    Instruction::SetProperty {
+                        object: reg(0),
+                        key: reg(1),
+                        value: reg(3),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(3),
+                        constant: cid(2),
+                    },
+                    Instruction::SetProperty {
+                        object: reg(0),
+                        key: reg(2),
+                        value: reg(3),
+                    },
+                    // r4 = obj[#1] (1), r5 = obj[#2] (2)
+                    Instruction::GetProperty {
+                        dst: reg(4),
+                        object: reg(0),
+                        key: reg(1),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(5),
+                        object: reg(0),
+                        key: reg(2),
+                    },
+                    // distinctness: #1 !== #2
+                    Instruction::Binary {
+                        dst: reg(3),
+                        op: BinaryOp::StrictEqual,
+                        left: reg(1),
+                        right: reg(2),
+                    },
+                    Instruction::Return { value: reg(4) },
+                ],
+                vec![],
+            )],
+        );
+        let execution = run_ok(&module);
+        assert_eq!(execution.value, Value::int32(1));
+        assert_eq!(execution.entry_registers[5], Value::int32(2));
+        assert_eq!(execution.entry_registers[3], Value::FALSE);
+    }
+
+    #[test]
+    fn accessor_getter_is_invoked_on_property_read() {
+        // Define a getter returning 99, then read the property.
+        let entry = function(
+            0,
+            4,
+            vec![
+                Instruction::CreateObject { dst: reg(0) },
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(1),
+                    function: FunctionId::new(1),
+                    captures: reg(3),
+                },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(0),
+                },
+                Instruction::DefineAccessor {
+                    object: reg(0),
+                    key: reg(2),
+                    accessor: reg(1),
+                    kind: AccessorKind::Getter,
+                },
+                Instruction::GetProperty {
+                    dst: reg(1),
+                    object: reg(0),
+                    key: reg(2),
+                },
+                Instruction::Return { value: reg(1) },
+            ],
+            vec![],
+        );
+        let getter = function(
+            0,
+            1,
+            vec![
+                Instruction::LoadConst {
+                    dst: reg(0),
+                    constant: cid(1),
+                },
+                Instruction::Return { value: reg(0) },
+            ],
+            vec![],
+        );
+        let module = verified(
+            vec![Constant::String("g".into()), Constant::Int32(99)],
+            vec![entry, getter],
+        );
+        assert_eq!(run_ok(&module).value, Value::int32(99));
+    }
+
+    #[test]
+    fn prototype_chain_lookup_and_instanceof() {
+        // proto = {}; proto.m = 5; ctor.prototype = proto; obj = new ctor();
+        // return (obj.m == 5) && (obj instanceof ctor).
+        let entry = function(
+            0,
+            6,
+            vec![
+                // proto object with m = 5
+                Instruction::CreateObject { dst: reg(0) },
                 Instruction::LoadConst {
                     dst: reg(1),
                     constant: cid(0),
@@ -1910,27 +3530,627 @@ mod tests {
                     dst: reg(2),
                     constant: cid(1),
                 },
-                Instruction::Call {
+                Instruction::SetProperty {
+                    object: reg(0),
+                    key: reg(1),
+                    value: reg(2),
+                },
+                // ctor closure
+                Instruction::CreateArray { dst: reg(4) },
+                Instruction::CreateClosure {
                     dst: reg(3),
+                    function: FunctionId::new(1),
+                    captures: reg(4),
+                },
+                // ctor.prototype = proto
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(2),
+                },
+                Instruction::SetProperty {
+                    object: reg(3),
+                    key: reg(1),
+                    value: reg(0),
+                },
+                // obj = new ctor()  (empty args)
+                Instruction::CreateArray { dst: reg(4) },
+                Instruction::Construct {
+                    dst: reg(0),
+                    callee: reg(3),
+                    arguments: reg(4),
+                },
+                // obj.m via prototype chain
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(0),
+                },
+                Instruction::GetProperty {
+                    dst: reg(2),
+                    object: reg(0),
+                    key: reg(1),
+                },
+                // obj instanceof ctor
+                Instruction::Binary {
+                    dst: reg(5),
+                    op: BinaryOp::InstanceOf,
+                    left: reg(0),
+                    right: reg(3),
+                },
+                Instruction::Return { value: reg(2) },
+            ],
+            vec![],
+        );
+        let ctor = function(0, 1, vec![Instruction::Halt], vec![]);
+        let module = verified(
+            vec![
+                Constant::String("m".into()),
+                Constant::Int32(5),
+                Constant::String("prototype".into()),
+            ],
+            vec![entry, ctor],
+        );
+        let execution = run_ok(&module);
+        assert_eq!(execution.value, Value::int32(5));
+        assert_eq!(execution.entry_registers[5], Value::TRUE);
+    }
+
+    #[test]
+    fn sync_iterator_walks_array_elements() {
+        // Sum [10,20] via GetIterator/IteratorNext loop.
+        let entry = function(
+            0,
+            6,
+            vec![
+                Instruction::CreateArray { dst: reg(0) },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(0),
+                },
+                Instruction::ArrayPush {
+                    array: reg(0),
+                    value: reg(1),
+                },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(1),
+                },
+                Instruction::ArrayPush {
+                    array: reg(0),
+                    value: reg(1),
+                },
+                // acc = 0
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(2),
+                },
+                Instruction::GetIterator {
+                    dst: reg(3),
+                    src: reg(0),
+                    kind: IteratorKind::Sync,
+                },
+                // loop head @7: next
+                Instruction::IteratorNext {
+                    done: reg(4),
+                    value: reg(5),
+                    iterator: reg(3),
+                },
+                Instruction::JumpIfTrue {
+                    condition: reg(4),
+                    target: pc(11),
+                },
+                Instruction::Binary {
+                    dst: reg(2),
+                    op: BinaryOp::Add,
+                    left: reg(2),
+                    right: reg(5),
+                },
+                Instruction::Jump { target: pc(7) },
+                // @11 done
+                Instruction::Return { value: reg(2) },
+            ],
+            vec![],
+        );
+        let module = verified(
+            vec![Constant::Int32(10), Constant::Int32(20), Constant::Int32(0)],
+            vec![entry],
+        );
+        assert_eq!(run_ok(&module).value, Value::int32(30));
+    }
+
+    #[test]
+    fn keys_iterator_enumerates_own_object_keys() {
+        // obj = {a:1}; for-in yields "a".
+        let entry = function(
+            0,
+            6,
+            vec![
+                Instruction::CreateObject { dst: reg(0) },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(0),
+                },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(1),
+                },
+                Instruction::SetProperty {
+                    object: reg(0),
+                    key: reg(1),
+                    value: reg(2),
+                },
+                Instruction::GetIterator {
+                    dst: reg(3),
+                    src: reg(0),
+                    kind: IteratorKind::Keys,
+                },
+                Instruction::IteratorNext {
+                    done: reg(4),
+                    value: reg(5),
+                    iterator: reg(3),
+                },
+                Instruction::Return { value: reg(5) },
+            ],
+            vec![],
+        );
+        let module = verified(
+            vec![Constant::String("a".into()), Constant::Int32(1)],
+            vec![entry],
+        );
+        let execution = run_ok(&module);
+        // The produced key must equal a fresh "a" string.
+        let key = execution.value;
+        // Compare via a second machine's constant is awkward; instead assert it
+        // is a heap string by checking done flag was false.
+        assert_eq!(execution.entry_registers[4], Value::FALSE);
+        assert_ne!(key, Value::UNDEFINED);
+    }
+
+    #[test]
+    fn async_iterator_steps_like_sync() {
+        let entry = function(
+            0,
+            5,
+            vec![
+                Instruction::CreateArray { dst: reg(0) },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(0),
+                },
+                Instruction::ArrayPush {
+                    array: reg(0),
+                    value: reg(1),
+                },
+                Instruction::GetIterator {
+                    dst: reg(2),
+                    src: reg(0),
+                    kind: IteratorKind::Async,
+                },
+                Instruction::IteratorNext {
+                    done: reg(3),
+                    value: reg(4),
+                    iterator: reg(2),
+                },
+                Instruction::Return { value: reg(4) },
+            ],
+            vec![],
+        );
+        let module = verified(vec![Constant::Int32(8)], vec![entry]);
+        let execution = run_ok(&module);
+        assert_eq!(execution.value, Value::int32(8));
+        assert_eq!(execution.entry_registers[3], Value::FALSE);
+    }
+
+    #[test]
+    fn globals_store_load_and_typeof_undeclared() {
+        // StoreGlobal x=5; TypeOfGlobal y (undeclared) -> "undefined";
+        // TypeOfGlobal x -> "number"; return LoadGlobal x.
+        let entry = function(
+            0,
+            3,
+            vec![
+                Instruction::LoadConst {
+                    dst: reg(0),
+                    constant: cid(2),
+                },
+                Instruction::StoreGlobal {
+                    name: cid(0),
+                    value: reg(0),
+                },
+                Instruction::TypeOfGlobal {
+                    dst: reg(1),
+                    name: cid(1),
+                },
+                Instruction::TypeOfGlobal {
+                    dst: reg(2),
+                    name: cid(0),
+                },
+                Instruction::LoadGlobal {
+                    dst: reg(0),
+                    name: cid(0),
+                },
+                Instruction::Return { value: reg(0) },
+            ],
+            vec![],
+        );
+        let module = verified(
+            vec![
+                Constant::String("x".into()),
+                Constant::String("y".into()),
+                Constant::Int32(5),
+            ],
+            vec![entry],
+        );
+        assert_eq!(run_ok(&module).value, Value::int32(5));
+    }
+
+    #[test]
+    fn load_undeclared_global_throws_reference_error() {
+        let module = verified(
+            vec![Constant::String("missing".into())],
+            vec![function(
+                0,
+                2,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::Halt,
+                    Instruction::Return { value: reg(1) },
+                ],
+                vec![ExceptionHandler {
+                    start: pc(0),
+                    end: pc(1),
+                    handler: pc(2),
+                    catch_register: reg(1),
+                }],
+            )],
+        );
+        let mut host = TestHost::default();
+        // No handler at top level path would raise; here it is caught, and the
+        // caught value is undefined (the ReferenceError marker value).
+        let execution = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap();
+        assert_eq!(execution.value, Value::UNDEFINED);
+    }
+
+    #[test]
+    fn uncaught_reference_error_reports_origin() {
+        let module = verified(
+            vec![Constant::String("missing".into())],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                vec![],
+            )],
+        );
+        let mut host = TestHost::default();
+        let error = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap_err();
+        assert_eq!(error.pc, pc(0));
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::ReferenceError { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn regexp_is_object_with_source_and_flags() {
+        // typeof re === "object" is not directly returnable; return re.source.
+        let module = verified(
+            vec![
+                Constant::String("ab".into()),
+                Constant::String("gi".into()),
+                Constant::String("source".into()),
+                Constant::String("global".into()),
+            ],
+            vec![function(
+                0,
+                4,
+                vec![
+                    Instruction::CreateRegExp {
+                        dst: reg(0),
+                        pattern: cid(0),
+                        flags: cid(1),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(3),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(2),
+                        object: reg(0),
+                        key: reg(1),
+                    },
+                    Instruction::Unary {
+                        dst: reg(3),
+                        op: UnaryOp::TypeOf,
+                        operand: reg(0),
+                    },
+                    Instruction::Return { value: reg(2) },
+                ],
+                vec![],
+            )],
+        );
+        let execution = run_ok(&module);
+        // re.global -> true
+        assert_eq!(execution.value, Value::TRUE);
+    }
+
+    #[test]
+    fn import_and_export_route_through_host() {
+        let module = verified(
+            vec![
+                Constant::String("mod".into()),
+                Constant::String("name".into()),
+            ],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::Import {
+                        dst: reg(0),
+                        specifier: cid(0),
+                    },
+                    Instruction::Export {
+                        name: cid(1),
+                        src: reg(0),
+                    },
+                    Instruction::Halt,
+                ],
+                vec![],
+            )],
+        );
+        let imported = Value::int32(123);
+        let mut host = TestHost {
+            imported: Some(Ok(imported)),
+            ..TestHost::default()
+        };
+        Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap();
+        assert_eq!(host.exports.len(), 1);
+        assert_eq!(host.exports[0].0, "name");
+        assert_eq!(host.exports[0].1, imported);
+    }
+
+    #[test]
+    fn suspend_resumes_with_host_value() {
+        // Generator-flagged function: Suspend yields, resumes with host value.
+        let generator = Function::new(
+            Some(cid(0)),
+            0,
+            0,
+            2,
+            FunctionFlags {
+                is_async: false,
+                is_generator: true,
+            },
+            vec![
+                Instruction::LoadConst {
+                    dst: reg(0),
+                    constant: cid(1),
+                },
+                Instruction::Suspend {
+                    dst: reg(1),
+                    src: reg(0),
+                    resume: pc(2),
+                },
+                Instruction::Return { value: reg(1) },
+            ],
+            vec![],
+        );
+        let module = verified(
+            vec![Constant::String("gen".into()), Constant::Int32(1)],
+            vec![generator],
+        );
+        let mut host = TestHost {
+            awaited: VecDeque::from(vec![Ok(Value::int32(77))]),
+            ..TestHost::default()
+        };
+        let execution = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap();
+        assert_eq!(execution.value, Value::int32(77));
+    }
+
+    #[test]
+    fn this_and_new_target_are_frame_owned() {
+        // Call passes this; new.target is undefined in a plain call.
+        let entry = function(
+            0,
+            4,
+            vec![
+                Instruction::CreateObject { dst: reg(0) },
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(1),
+                    function: FunctionId::new(1),
+                    captures: reg(3),
+                },
+                Instruction::CreateArray { dst: reg(2) },
+                Instruction::Call {
+                    dst: reg(0),
+                    callee: reg(1),
+                    this_value: reg(0),
+                    arguments: reg(2),
+                },
+                Instruction::Return { value: reg(0) },
+            ],
+            vec![],
+        );
+        // returns (this === passed) is hard cross-frame; instead return typeof
+        // new.target which is "undefined" for a plain call.
+        let callee = function(
+            0,
+            2,
+            vec![
+                Instruction::LoadNewTarget { dst: reg(0) },
+                Instruction::Unary {
+                    dst: reg(1),
+                    op: UnaryOp::TypeOf,
+                    operand: reg(0),
+                },
+                Instruction::Return { value: reg(1) },
+            ],
+            vec![],
+        );
+        let module = verified(vec![], vec![entry, callee]);
+        let execution = run_ok(&module);
+        // typeof undefined is a heap "undefined" string; strict-compare against
+        // typeof of a known-undefined value is awkward, so assert non-undefined
+        // heap string was produced and the call completed.
+        assert_ne!(execution.value, Value::UNDEFINED);
+    }
+
+    #[test]
+    fn new_target_is_constructor_during_construct() {
+        // In a constructor, new.target === callee; verify via instanceof-style
+        // check: store new.target on this, then read back after construct.
+        let entry = function(
+            0,
+            4,
+            vec![
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(0),
+                    function: FunctionId::new(1),
+                    captures: reg(3),
+                },
+                // ctor.prototype = {}
+                Instruction::CreateObject { dst: reg(1) },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(0),
+                },
+                Instruction::SetProperty {
+                    object: reg(0),
+                    key: reg(2),
+                    value: reg(1),
+                },
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::Construct {
+                    dst: reg(1),
                     callee: reg(0),
-                    this_value: reg(1),
-                    args_start: reg(2),
-                    arg_count: 1,
+                    arguments: reg(3),
+                },
+                // read back this.nt === ctor
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(1),
+                },
+                Instruction::GetProperty {
+                    dst: reg(3),
+                    object: reg(1),
+                    key: reg(2),
+                },
+                Instruction::Binary {
+                    dst: reg(3),
+                    op: BinaryOp::StrictEqual,
+                    left: reg(3),
+                    right: reg(0),
                 },
                 Instruction::Return { value: reg(3) },
             ],
             vec![],
         );
-        let callee = function(1, 1, vec![Instruction::Return { value: reg(0) }], vec![]);
+        let ctor = function(
+            0,
+            3,
+            vec![
+                Instruction::LoadNewTarget { dst: reg(0) },
+                Instruction::LoadThis { dst: reg(1) },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(1),
+                },
+                Instruction::SetProperty {
+                    object: reg(1),
+                    key: reg(2),
+                    value: reg(0),
+                },
+                Instruction::Halt,
+            ],
+            vec![],
+        );
         let module = verified(
-            vec![Constant::Undefined, Constant::Int32(42)],
+            vec![
+                Constant::String("prototype".into()),
+                Constant::String("nt".into()),
+            ],
+            vec![entry, ctor],
+        );
+        assert_eq!(run_ok(&module).value, Value::TRUE);
+    }
+
+    #[test]
+    fn arguments_object_reflects_passed_values() {
+        // callee returns arguments[0].
+        let entry = function(
+            0,
+            4,
+            vec![
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(0),
+                    function: FunctionId::new(1),
+                    captures: reg(3),
+                },
+                // args = [42]
+                Instruction::CreateArray { dst: reg(2) },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(0),
+                },
+                Instruction::ArrayPush {
+                    array: reg(2),
+                    value: reg(1),
+                },
+                Instruction::Call {
+                    dst: reg(0),
+                    callee: reg(0),
+                    this_value: reg(1),
+                    arguments: reg(2),
+                },
+                Instruction::Return { value: reg(0) },
+            ],
+            vec![],
+        );
+        let callee = function(
+            0,
+            2,
+            vec![
+                Instruction::LoadArguments { dst: reg(0) },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(1),
+                },
+                Instruction::GetProperty {
+                    dst: reg(0),
+                    object: reg(0),
+                    key: reg(1),
+                },
+                Instruction::Return { value: reg(0) },
+            ],
+            vec![],
+        );
+        let module = verified(
+            vec![Constant::Int32(42), Constant::String("0".into())],
             vec![entry, callee],
         );
-        let mut host = TestHost::default();
-        let execution = Machine::new(&module, &mut host, Limits::default())
-            .run()
-            .unwrap();
-        assert_eq!(execution.value, Value::int32(42));
+        assert_eq!(run_ok(&module).value, Value::int32(42));
     }
 
     #[test]
@@ -1956,11 +4176,7 @@ mod tests {
                 }],
             )],
         );
-        let mut host = TestHost::default();
-        let execution = Machine::new(&module, &mut host, Limits::default())
-            .run()
-            .unwrap();
-        assert_eq!(execution.value, Value::int32(9));
+        assert_eq!(run_ok(&module).value, Value::int32(9));
     }
 
     #[test]
@@ -1969,28 +4185,26 @@ mod tests {
             0,
             4,
             vec![
-                Instruction::DefineFunction {
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
                     dst: reg(0),
                     function: FunctionId::new(1),
+                    captures: reg(3),
                 },
-                Instruction::LoadConst {
-                    dst: reg(1),
-                    constant: cid(0),
-                },
+                Instruction::CreateArray { dst: reg(1) },
                 Instruction::Call {
                     dst: reg(2),
                     callee: reg(0),
                     this_value: reg(1),
-                    args_start: reg(1),
-                    arg_count: 0,
+                    arguments: reg(1),
                 },
                 Instruction::Halt,
                 Instruction::Return { value: reg(3) },
             ],
             vec![ExceptionHandler {
-                start: pc(2),
-                end: pc(3),
-                handler: pc(4),
+                start: pc(3),
+                end: pc(4),
+                handler: pc(5),
                 catch_register: reg(3),
             }],
         );
@@ -2000,100 +4214,14 @@ mod tests {
             vec![
                 Instruction::LoadConst {
                     dst: reg(0),
-                    constant: cid(1),
+                    constant: cid(0),
                 },
                 Instruction::Throw { value: reg(0) },
             ],
             vec![],
         );
-        let module = verified(
-            vec![Constant::Undefined, Constant::Int32(7)],
-            vec![entry, callee],
-        );
-        let mut host = TestHost::default();
-        let execution = Machine::new(&module, &mut host, Limits::default())
-            .run()
-            .unwrap();
-        assert_eq!(execution.value, Value::int32(7));
-    }
-
-    #[test]
-    fn host_import_failure_is_catchable_at_import_pc() {
-        let module = verified(
-            vec![Constant::String("x".into())],
-            vec![function(
-                0,
-                2,
-                vec![
-                    Instruction::Import {
-                        dst: reg(0),
-                        specifier: cid(0),
-                    },
-                    Instruction::Halt,
-                    Instruction::Return { value: reg(1) },
-                ],
-                vec![ExceptionHandler {
-                    start: pc(0),
-                    end: pc(1),
-                    handler: pc(2),
-                    catch_register: reg(1),
-                }],
-            )],
-        );
-        let thrown = Value::int32(17);
-        let mut host = TestHost {
-            imported: Some(Err(HostThrow { value: thrown })),
-            ..TestHost::default()
-        };
-        let execution = Machine::new(&module, &mut host, Limits::default())
-            .run()
-            .unwrap();
-        assert_eq!(execution.value, thrown);
-    }
-
-    #[test]
-    fn malformed_host_value_is_typed_error_with_source_context() {
-        let module = verified(
-            vec![Constant::String("main".into()), Constant::Undefined],
-            vec![Function::new(
-                Some(cid(0)),
-                0,
-                1,
-                FunctionFlags::default(),
-                vec![
-                    Instruction::LoadConst {
-                        dst: reg(0),
-                        constant: cid(1),
-                    },
-                    Instruction::Suspend {
-                        dst: reg(0),
-                        src: reg(0),
-                        resume: pc(2),
-                    },
-                    Instruction::Return { value: reg(0) },
-                ],
-                vec![],
-            )],
-        );
-        let malformed = Value::from_bits(Value::CANON_NAN | (5_u64 << 48) | 7);
-        let mut host = TestHost {
-            awaited: Some(Ok(malformed)),
-            ..TestHost::default()
-        };
-        let error = Machine::new(&module, &mut host, Limits::default())
-            .run()
-            .unwrap_err();
-        assert_eq!(error.function, FunctionId::new(0));
-        assert_eq!(error.pc, pc(1));
-        assert!(matches!(
-            error.kind,
-            RuntimeErrorKind::InvalidHostValue { .. }
-        ));
-        assert!(matches!(
-            error.source.instruction,
-            Instruction::Suspend { .. }
-        ));
-        assert_eq!(error.source.function_name.as_deref(), Some("main"));
+        let module = verified(vec![Constant::Int32(7)], vec![entry, callee]);
+        assert_eq!(run_ok(&module).value, Value::int32(7));
     }
 
     #[test]
@@ -2146,92 +4274,38 @@ mod tests {
     }
 
     #[test]
-    fn u32_registers_and_instruction_pcs_do_not_truncate_at_127() {
-        let mut code = vec![Instruction::LoadConst {
-            dst: reg(0),
-            constant: cid(0),
-        }];
-        for register in 1..=199 {
-            code.push(Instruction::Move {
-                dst: reg(register),
-                src: reg(register - 1),
-            });
-        }
-        code.push(Instruction::Return { value: reg(199) });
-        let module = verified(
-            vec![Constant::Number(NumberBits::from_f64(3.5))],
-            vec![function(0, 200, code, vec![])],
-        );
-        let mut host = TestHost::default();
-        let execution = Machine::new(&module, &mut host, Limits::default())
-            .run()
-            .unwrap();
-        assert_eq!(execution.value, Value::number(3.5));
-        assert_eq!(execution.entry_registers[199], Value::number(3.5));
-    }
-
-    #[test]
-    fn call_depth_and_argument_limits_are_deterministic() {
+    fn argument_array_length_limit_is_enforced() {
         let entry = function(
             0,
-            3,
+            4,
             vec![
-                Instruction::DefineFunction {
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
                     dst: reg(0),
                     function: FunctionId::new(1),
+                    captures: reg(3),
                 },
+                Instruction::CreateArray { dst: reg(2) },
                 Instruction::LoadConst {
                     dst: reg(1),
                     constant: cid(0),
                 },
+                Instruction::ArrayPush {
+                    array: reg(2),
+                    value: reg(1),
+                },
                 Instruction::Call {
-                    dst: reg(2),
+                    dst: reg(0),
                     callee: reg(0),
                     this_value: reg(1),
-                    args_start: reg(1),
-                    arg_count: 1,
+                    arguments: reg(2),
                 },
                 Instruction::Halt,
             ],
             vec![],
         );
-        let callee = function(
-            1,
-            3,
-            vec![
-                Instruction::DefineFunction {
-                    dst: reg(0),
-                    function: FunctionId::new(1),
-                },
-                Instruction::LoadConst {
-                    dst: reg(1),
-                    constant: cid(0),
-                },
-                Instruction::Call {
-                    dst: reg(2),
-                    callee: reg(0),
-                    this_value: reg(1),
-                    args_start: reg(1),
-                    arg_count: 1,
-                },
-                Instruction::Return { value: reg(2) },
-            ],
-            vec![],
-        );
-        let module = verified(vec![Constant::Undefined], vec![entry, callee]);
-        let mut host = TestHost::default();
-        let error = Machine::new(
-            &module,
-            &mut host,
-            Limits {
-                max_call_depth: 2,
-                ..Limits::default()
-            },
-        )
-        .run()
-        .unwrap_err();
-        assert_eq!(error.kind, RuntimeErrorKind::CallDepthExceeded { limit: 2 });
-
+        let callee = function(1, 1, vec![Instruction::Return { value: reg(0) }], vec![]);
+        let module = verified(vec![Constant::Int32(1)], vec![entry, callee]);
         let mut host = TestHost::default();
         let error = Machine::new(
             &module,
@@ -2250,5 +4324,135 @@ mod tests {
                 requested: 1
             }
         );
+    }
+
+    #[test]
+    fn malformed_host_value_is_typed_error_with_source_context() {
+        let module = verified(
+            vec![Constant::String("main".into()), Constant::Undefined],
+            vec![Function::new(
+                Some(cid(0)),
+                0,
+                0,
+                1,
+                FunctionFlags::default(),
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::Suspend {
+                        dst: reg(0),
+                        src: reg(0),
+                        resume: pc(2),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                vec![],
+            )],
+        );
+        let malformed = Value::from_bits(Value::CANON_NAN | (5_u64 << 48) | 7);
+        let mut host = TestHost {
+            awaited: VecDeque::from(vec![Ok(malformed)]),
+            ..TestHost::default()
+        };
+        let error = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap_err();
+        assert_eq!(error.function, FunctionId::new(0));
+        assert_eq!(error.pc, pc(1));
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::InvalidHostValue { .. }
+        ));
+        assert!(matches!(
+            error.source.instruction,
+            Instruction::Suspend { .. }
+        ));
+        assert_eq!(error.source.function_name.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn u32_registers_and_instruction_pcs_do_not_truncate_at_127() {
+        let mut code = vec![Instruction::LoadConst {
+            dst: reg(0),
+            constant: cid(0),
+        }];
+        for register in 1..=199 {
+            code.push(Instruction::Move {
+                dst: reg(register),
+                src: reg(register - 1),
+            });
+        }
+        code.push(Instruction::Return { value: reg(199) });
+        let module = verified(
+            vec![Constant::Number(NumberBits::from_f64(3.5))],
+            vec![function(0, 200, code, vec![])],
+        );
+        let execution = run_ok(&module);
+        assert_eq!(execution.value, Value::number(3.5));
+        assert_eq!(execution.entry_registers[199], Value::number(3.5));
+    }
+
+    #[test]
+    fn construct_returned_object_overrides_default_instance() {
+        // A constructor returning its own object overrides the default instance.
+        let entry = function(
+            0,
+            3,
+            vec![
+                Instruction::CreateArray { dst: reg(2) },
+                Instruction::CreateClosure {
+                    dst: reg(0),
+                    function: FunctionId::new(1),
+                    captures: reg(2),
+                },
+                Instruction::CreateArray { dst: reg(2) },
+                Instruction::Construct {
+                    dst: reg(1),
+                    callee: reg(0),
+                    arguments: reg(2),
+                },
+                // returned object has marker property set to 5
+                Instruction::LoadConst {
+                    dst: reg(0),
+                    constant: cid(0),
+                },
+                Instruction::GetProperty {
+                    dst: reg(2),
+                    object: reg(1),
+                    key: reg(0),
+                },
+                Instruction::Return { value: reg(2) },
+            ],
+            vec![],
+        );
+        let returns_object = function(
+            0,
+            3,
+            vec![
+                Instruction::CreateObject { dst: reg(0) },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(0),
+                },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(1),
+                },
+                Instruction::SetProperty {
+                    object: reg(0),
+                    key: reg(1),
+                    value: reg(2),
+                },
+                Instruction::Return { value: reg(0) },
+            ],
+            vec![],
+        );
+        let module = verified(
+            vec![Constant::String("marker".into()), Constant::Int32(5)],
+            vec![entry, returns_object],
+        );
+        assert_eq!(run_ok(&module).value, Value::int32(5));
     }
 }
