@@ -10,8 +10,12 @@
 //! are merged with the front-end hard warnings and returned in canonical order
 //! alongside the [`SemanticModel`], following the crate's `Recovered` contract.
 
+#[path = "checker/intrinsic_environment.rs"]
+mod intrinsic_environment;
+
 use std::collections::{BTreeMap, HashMap};
 
+use intrinsic_environment::GlobalEnvironment;
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
 use crate::lint::{LintProfile, LintTable};
 use crate::source::{SourceId, TextRange};
@@ -38,95 +42,6 @@ const DUPLICATE_MESSAGE: &str = "A block-scoped declaration cannot redeclare an 
 const CANNOT_FIND_NAME_MESSAGE: &str = "Cannot find name in any enclosing scope.";
 const CANNOT_FIND_TYPE_MESSAGE: &str = "Cannot find type name in any enclosing scope.";
 const NOT_ASSIGNABLE_MESSAGE: &str = "Initializer type is not assignable to the annotated type.";
-
-/// Value names always in scope, so free references to them are not unresolved.
-static GLOBAL_VALUES: &[&str] = &[
-    "undefined",
-    "NaN",
-    "Infinity",
-    "globalThis",
-    "console",
-    "Math",
-    "JSON",
-    "Object",
-    "Array",
-    "String",
-    "Number",
-    "Boolean",
-    "Symbol",
-    "BigInt",
-    "Function",
-    "Promise",
-    "Error",
-    "TypeError",
-    "RangeError",
-    "SyntaxError",
-    "Map",
-    "Set",
-    "WeakMap",
-    "WeakSet",
-    "Date",
-    "RegExp",
-    "Reflect",
-    "Proxy",
-    "Intl",
-    "parseInt",
-    "parseFloat",
-    "isNaN",
-    "isFinite",
-    "encodeURIComponent",
-    "decodeURIComponent",
-    "require",
-    "module",
-    "exports",
-    "process",
-    "Buffer",
-    "globalThis",
-    "setTimeout",
-    "setInterval",
-    "clearTimeout",
-    "clearInterval",
-    "queueMicrotask",
-    "structuredClone",
-];
-
-/// Type names always in scope, so references to them are not unresolved types.
-static GLOBAL_TYPES: &[&str] = &[
-    "Array",
-    "ReadonlyArray",
-    "Readonly",
-    "Partial",
-    "Required",
-    "Record",
-    "Pick",
-    "Omit",
-    "Exclude",
-    "Extract",
-    "NonNullable",
-    "ReturnType",
-    "Parameters",
-    "InstanceType",
-    "Awaited",
-    "Promise",
-    "Map",
-    "Set",
-    "WeakMap",
-    "WeakSet",
-    "Date",
-    "RegExp",
-    "Error",
-    "Object",
-    "Function",
-    "Iterable",
-    "Iterator",
-    "AsyncIterable",
-    "ArrayLike",
-    "ThisType",
-    "Uppercase",
-    "Lowercase",
-    "Capitalize",
-    "Uncapitalize",
-];
 
 /// A lexical scope's identity within a [`SemanticModel`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -169,6 +84,7 @@ impl TypeId {
 /// The kind of lexical scope, used only to describe the model to callers.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ScopeKind {
+    Global,
     Module,
     Function,
     Block,
@@ -214,6 +130,8 @@ impl Scope {
 /// redeclaration is a legal merge or a duplicate error.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SymbolKind {
+    IntrinsicValue,
+    IntrinsicType,
     Variable(VariableKind),
     Function,
     Parameter,
@@ -230,7 +148,8 @@ impl SymbolKind {
     const fn occupies_value(self) -> bool {
         matches!(
             self,
-            Self::Variable(_)
+            Self::IntrinsicValue
+                | Self::Variable(_)
                 | Self::Function
                 | Self::Parameter
                 | Self::Class
@@ -243,7 +162,12 @@ impl SymbolKind {
     const fn occupies_type(self) -> bool {
         matches!(
             self,
-            Self::Class | Self::Enum | Self::Interface | Self::TypeAlias | Self::TypeParameter
+            Self::IntrinsicType
+                | Self::Class
+                | Self::Enum
+                | Self::Interface
+                | Self::TypeAlias
+                | Self::TypeParameter
         )
     }
 
@@ -1054,6 +978,7 @@ enum TypeDef<'src> {
 
 struct Checker<'src> {
     source: &'src SourceFile,
+    intrinsics: GlobalEnvironment,
     scopes: Vec<Scope>,
     symbols: Vec<Symbol>,
     symbol_types: Vec<TypeId>,
@@ -1069,6 +994,7 @@ impl<'src> Checker<'src> {
     fn new(source: &'src SourceFile) -> Self {
         let mut checker = Self {
             source,
+            intrinsics: GlobalEnvironment::standard(),
             scopes: Vec::new(),
             symbols: Vec::new(),
             symbol_types: Vec::new(),
@@ -1079,14 +1005,38 @@ impl<'src> Checker<'src> {
             types: TypeTable::new(),
             module_scope: ScopeId(0),
         };
-        checker.module_scope = checker.new_scope(ScopeKind::Module, None);
+        let global_scope = checker.new_scope(ScopeKind::Global, None);
+        checker.module_scope = checker.new_scope(ScopeKind::Module, Some(global_scope));
+        checker.bind_intrinsic_environment(global_scope);
         checker
+    }
+
+    fn bind_intrinsic_environment(&mut self, scope: ScopeId) {
+        for name in self.intrinsics.values() {
+            self.declare(
+                name,
+                SymbolKind::IntrinsicValue,
+                scope,
+                NodeId::default(),
+                NodeId::default_range(),
+            );
+        }
+        for name in self.intrinsics.types() {
+            self.declare(
+                name,
+                SymbolKind::IntrinsicType,
+                scope,
+                NodeId::default(),
+                NodeId::default_range(),
+            );
+        }
     }
 
     fn run(&mut self) {
         let statements = self.source.statements();
         let scope = self.module_scope;
         self.bind_statements(statements, scope);
+        self.bind_hoisted_statements(statements, scope);
         self.resolve_statements(statements, scope);
     }
 
@@ -1173,6 +1123,13 @@ impl<'src> Checker<'src> {
         } else {
             scope
         };
+        if kind.occupies_value()
+            && let Some(existing) = self.scopes[scope.0 as usize].values.get(name)
+            && kind.value_mergeable()
+            && self.symbols[existing.get() as usize].kind.value_mergeable()
+        {
+            return *existing;
+        }
         let id = SymbolId(u32::try_from(self.symbols.len()).expect("symbol count fits in u32"));
         self.symbols.push(Symbol {
             name: name.to_owned(),
@@ -1230,6 +1187,91 @@ impl<'src> Checker<'src> {
     fn bind_statements(&mut self, statements: &'src [crate::syntax::Stmt], scope: ScopeId) {
         for statement in statements {
             self.bind_statement(statement, scope);
+        }
+    }
+
+    /// Pre-binds `var` and function names that occur beneath lexical child
+    /// scopes. The traversal never enters a function body: its own call to this
+    /// pass supplies the correct function hoist target.
+    fn bind_hoisted_statements(&mut self, statements: &'src [crate::syntax::Stmt], scope: ScopeId) {
+        for statement in statements {
+            self.bind_hoisted_statement(statement, scope);
+        }
+    }
+
+    fn bind_hoisted_statement(&mut self, statement: &'src crate::syntax::Stmt, scope: ScopeId) {
+        match statement.data() {
+            Statement::Variable(variable) if variable.kind == VariableKind::Var => {
+                self.bind_variable(variable, scope, statement.id());
+            }
+            Statement::Function(function) => {
+                if let Some(name) = &function.function.name {
+                    self.declare(
+                        self.identifier_text(name),
+                        SymbolKind::Function,
+                        scope,
+                        statement.id(),
+                        name.range(),
+                    );
+                }
+            }
+            Statement::Block(block) => self.bind_hoisted_statements(&block.data().statements, scope),
+            Statement::If(statement) => {
+                self.bind_hoisted_statement(&statement.consequent, scope);
+                if let Some(alternate) = &statement.alternate {
+                    self.bind_hoisted_statement(alternate, scope);
+                }
+            }
+            Statement::Switch(statement) => {
+                for case in &statement.cases {
+                    self.bind_hoisted_statements(&case.data().consequent, scope);
+                }
+            }
+            Statement::For(for_statement) => {
+                if let Some(ForInitializer::Variable(variable)) = &for_statement.initializer
+                    && variable.kind == VariableKind::Var
+                {
+                    self.bind_variable(variable, scope, NodeId::default());
+                }
+                self.bind_hoisted_statement(&for_statement.body, scope);
+            }
+            Statement::ForIn(for_statement) => {
+                if let ForBinding::Variable(variable) = &for_statement.binding
+                    && variable.kind == VariableKind::Var
+                {
+                    self.bind_variable(variable, scope, NodeId::default());
+                }
+                self.bind_hoisted_statement(&for_statement.body, scope);
+            }
+            Statement::ForOf(for_statement) => {
+                if let ForBinding::Variable(variable) = &for_statement.binding
+                    && variable.kind == VariableKind::Var
+                {
+                    self.bind_variable(variable, scope, NodeId::default());
+                }
+                self.bind_hoisted_statement(&for_statement.body, scope);
+            }
+            Statement::While(statement) => self.bind_hoisted_statement(&statement.body, scope),
+            Statement::DoWhile(statement) => self.bind_hoisted_statement(&statement.body, scope),
+            Statement::Try(statement) => {
+                self.bind_hoisted_statements(&statement.block.data().statements, scope);
+                if let Some(handler) = &statement.handler {
+                    self.bind_hoisted_statements(&handler.data().body.data().statements, scope);
+                }
+                if let Some(finalizer) = &statement.finalizer {
+                    self.bind_hoisted_statements(&finalizer.data().statements, scope);
+                }
+            }
+            Statement::With(statement) => self.bind_hoisted_statement(&statement.body, scope),
+            Statement::Labeled(statement) => self.bind_hoisted_statement(&statement.body, scope),
+            Statement::Namespace(namespace) => {
+                self.bind_hoisted_statements(&namespace.body.data().statements, scope);
+            }
+            Statement::Declare(inner) => self.bind_hoisted_statement(inner, scope),
+            Statement::Export(crate::syntax::ExportDeclaration::Named(
+                crate::syntax::ExportNamedDeclaration::Declaration(inner),
+            )) => self.bind_hoisted_statement(inner, scope),
+            _ => {}
         }
     }
 
@@ -1499,30 +1541,30 @@ impl<'src> Checker<'src> {
                     self.resolve_statements(&case.data().consequent, child);
                 }
             }
-            Statement::For(statement) => {
+            Statement::For(for_statement) => {
                 let child = self.new_scope(ScopeKind::For, Some(scope));
-                if let Some(initializer) = &statement.initializer {
+                if let Some(initializer) = &for_statement.initializer {
                     self.resolve_for_initializer(initializer, child);
                 }
-                if let Some(test) = &statement.test {
+                if let Some(test) = &for_statement.test {
                     self.resolve_expr(test, child);
                 }
-                if let Some(update) = &statement.update {
+                if let Some(update) = &for_statement.update {
                     self.resolve_expr(update, child);
                 }
-                self.resolve_statement(&statement.body, child);
+                self.resolve_statement(&for_statement.body, child);
             }
-            Statement::ForIn(statement) => {
+            Statement::ForIn(for_statement) => {
                 let child = self.new_scope(ScopeKind::For, Some(scope));
-                self.resolve_for_binding(&statement.binding, child);
-                self.resolve_expr(&statement.object, child);
-                self.resolve_statement(&statement.body, child);
+                self.resolve_for_binding(&for_statement.binding, child);
+                self.resolve_expr(&for_statement.object, child);
+                self.resolve_statement(&for_statement.body, child);
             }
-            Statement::ForOf(statement) => {
+            Statement::ForOf(for_statement) => {
                 let child = self.new_scope(ScopeKind::For, Some(scope));
-                self.resolve_for_binding(&statement.binding, child);
-                self.resolve_expr(&statement.iterable, child);
-                self.resolve_statement(&statement.body, child);
+                self.resolve_for_binding(&for_statement.binding, child);
+                self.resolve_expr(&for_statement.iterable, child);
+                self.resolve_statement(&for_statement.body, child);
             }
             Statement::While(statement) => {
                 self.resolve_expr(&statement.test, scope);
@@ -1672,6 +1714,7 @@ impl<'src> Checker<'src> {
         match &function.body {
             Some(FunctionBody::Block(block)) => {
                 self.bind_statements(&block.data().statements, scope);
+                self.bind_hoisted_statements(&block.data().statements, scope);
                 self.resolve_statements(&block.data().statements, scope);
             }
             Some(FunctionBody::Expression(expression)) => self.resolve_expr(expression, scope),
@@ -1982,7 +2025,7 @@ impl<'src> Checker<'src> {
         }
         if let Some(symbol) = self.lookup_value(scope, name) {
             self.references.insert(identifier.id(), symbol);
-        } else if !GLOBAL_VALUES.contains(&name) {
+        } else {
             self.emit(
                 CANNOT_FIND_NAME,
                 identifier.range(),
@@ -2117,9 +2160,7 @@ impl<'src> Checker<'src> {
                 _ => self.types.error_type(),
             },
             None => {
-                if !GLOBAL_TYPES.contains(&name) {
-                    self.emit(CANNOT_FIND_TYPE, range, CANNOT_FIND_TYPE_MESSAGE);
-                }
+                self.emit(CANNOT_FIND_TYPE, range, CANNOT_FIND_TYPE_MESSAGE);
                 self.types.error_type()
             }
         }
@@ -2671,6 +2712,76 @@ mod tests {
     }
 
     #[test]
+    fn standard_global_families_bind_as_intrinsics() {
+        let names = [
+            // ECMAScript values and constructors.
+            "JSON", "Math", "Object", "Array", "Promise", "Error", "TypeError",
+            // Collections, reflection, shared-memory, and typed-array families.
+            "Map", "Set", "Symbol", "Reflect", "Atomics", "Int8Array",
+            "BigUint64Array",
+            // Timers and URL/text host APIs.
+            "setTimeout", "clearInterval", "queueMicrotask", "URL", "URLSearchParams",
+            "TextEncoder", "TextDecoder",
+            // Node host globals that the runtime installs.
+            "console", "process", "globalThis",
+        ];
+        let text = names.join(";");
+        let mut start = 0;
+        let statements = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let statement = expression_statement(
+                    u32::try_from(index * 2 + 30).expect("test node id fits u32"),
+                    identifier_expr(
+                        u32::try_from(index * 2 + 31).expect("test node id fits u32"),
+                        name,
+                        start,
+                    ),
+                );
+                start += name.len() + 1;
+                statement
+            })
+            .collect();
+        let result = check(&file(&text, statements));
+        assert!(
+            semantic_codes(&result).is_empty(),
+            "intrinsic diagnostics: {:?}",
+            result.diagnostics()
+        );
+        assert_eq!(result.product().resolved_reference_count(), names.len());
+    }
+
+    #[test]
+    fn local_bindings_shadow_intrinsics() {
+        let statements = vec![
+            variable(
+                10,
+                "const console = 1;",
+                "console",
+                6,
+                None,
+                Some(number_expr(20, "1", 16)),
+            ),
+            expression_statement(30, identifier_expr(31, "console", 19)),
+        ];
+        let result = check(&file("const console = 1; console;", statements));
+        assert!(semantic_codes(&result).is_empty());
+        let model = result.product();
+        let local = model
+            .lookup_value(model.module_scope(), "console")
+            .expect("local console binding exists");
+        assert_eq!(model.reference(NodeId::new(32)), Some(local));
+    }
+
+    #[test]
+    fn reports_an_unknown_name_even_with_intrinsics() {
+        let statements = vec![expression_statement(30, identifier_expr(31, "notAGlobal", 0))];
+        let result = check(&file("notAGlobal;", statements));
+        assert_eq!(semantic_codes(&result), [CANNOT_FIND_NAME.as_str()]);
+    }
+
+    #[test]
     fn reports_a_duplicate_block_scoped_declaration() {
         let statements = vec![
             variable(
@@ -2989,6 +3100,25 @@ mod tests {
     }
 
     #[test]
+    fn a_var_in_a_nested_block_binds_before_its_declaration() {
+        let inner = variable_kind(
+            crate::syntax::VariableKind::Var,
+            40,
+            "var a = 1;",
+            "a",
+            9,
+            Some(number_expr(50, "1", 13)),
+        );
+        let statements = vec![
+            expression_statement(30, identifier_expr(31, "a", 0)),
+            block_statement(60, vec![inner]),
+        ];
+        let result = check(&file("a; { var a = 1; }", statements));
+        assert!(semantic_codes(&result).is_empty());
+        assert_eq!(result.product().resolved_reference_count(), 1);
+    }
+
+    #[test]
     fn a_for_initializer_var_hoists_to_the_module() {
         let for_stmt = Node::new(
             NodeId::new(60),
@@ -3069,7 +3199,7 @@ mod tests {
     fn a_function_declaration_in_a_block_hoists_to_the_module() {
         let function = crate::syntax::FunctionLike {
             decorators: Vec::new(),
-            name: Some(identifier(81, "g", 11)),
+            name: Some(identifier(81, "g", 14)),
             is_async: false,
             is_generator: false,
             type_parameters: None,
@@ -3089,10 +3219,10 @@ mod tests {
             Statement::Function(crate::syntax::FunctionDeclaration { function }),
         );
         let statements = vec![
+            expression_statement(70, identifier_expr(71, "g", 0)),
             block_statement(90, vec![declaration]),
-            expression_statement(100, identifier_expr(101, "g", 20)),
         ];
-        let result = check(&file("{ function g() {} } g;", statements));
+        let result = check(&file("g; { function g() {} }", statements));
         assert!(semantic_codes(&result).is_empty());
         let model = result.product();
         assert!(
