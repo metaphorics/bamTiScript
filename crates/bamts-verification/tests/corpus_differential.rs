@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use bamts_verification::corpus::{
-    BamtsRunner, ExecutionMode, NodeOracle, OracleOutcome, PINNED_CASE_IDS, load_corpus,
+    BamtsRunner, CorpusFailure, CorpusStage, ExecutionMode, NodeOracle, OracleOutcome,
+    PINNED_CASE_IDS, load_corpus,
 };
 
 #[test]
@@ -48,13 +49,13 @@ fn compare_case(
     let (expected, actual) = match (expected, actual) {
         (Err(error), Err(actual_error)) => {
             failures.push(format!(
-                "{label}: Node oracle failed: {error}\n{label}: BamTS failed: {actual_error}"
+                "{label}: stage=spawn Node oracle failed: {error}\n{label}: BamTS failed: {actual_error}"
             ));
             return;
         }
         (Err(error), Ok(actual)) => {
             failures.push(format!(
-                "{label}: Node oracle failed: {error}\nBamTS evidence: {}",
+                "{label}: stage=spawn Node oracle failed: {error}\nBamTS evidence: {}",
                 evidence(actual)
             ));
             return;
@@ -71,25 +72,34 @@ fn compare_case(
 
     if !expected.is_reliable() {
         failures.push(format!(
-            "{label}: Node oracle did not produce a complete result: {}",
+            "{label}: stage=spawn Node oracle did not produce a complete result: {}",
             evidence(expected)
         ));
         return;
     }
     if !actual.is_reliable() {
         failures.push(format!(
-            "{label}: BamTS did not produce a complete result: {}",
+            "{label}: stage={} BamTS did not produce a complete result: {}",
+            bamts_outcome_stage(mode).as_str(),
             evidence(actual)
         ));
         return;
     }
     if expected.exit_code != actual.exit_code || expected.stdout != actual.stdout {
         failures.push(format!(
-            "{label}: stdout bytes or exit code differ\nNode: {}\nBamTS: {}\nfirst stdout difference: {}",
+            "{label}: stage=compare stdout bytes or exit code differ\nNode: {}\nBamTS: {}\nfirst stdout difference: {}",
             evidence(expected),
             evidence(actual),
             first_difference(&expected.stdout, &actual.stdout),
         ));
+    }
+}
+
+fn bamts_outcome_stage(mode: ExecutionMode) -> CorpusStage {
+    if matches!(mode, ExecutionMode::Aot) {
+        CorpusStage::Spawn
+    } else {
+        CorpusStage::Evaluate
     }
 }
 
@@ -135,4 +145,111 @@ fn preview(bytes: &[u8]) -> String {
         rendered.push_str("...");
     }
     rendered
+}
+
+#[cfg(test)]
+mod formatting_tests {
+    use std::ffi::OsString;
+
+    use bamts_bytecode::{ConstantId, FunctionId, Instruction, Pc, Register};
+    use bamts_cli::driver::DriverError;
+    use bamts_runtime::{NativeError, RuntimeError, RuntimeErrorKind, RuntimeSource};
+
+    use super::*;
+
+    fn outcome(stdout: &[u8]) -> OracleOutcome {
+        OracleOutcome {
+            timed_out: false,
+            exit_code: Some(0),
+            signal: None,
+            stdout: stdout.to_vec(),
+            stdout_truncated: false,
+            stderr: Vec::new(),
+            stderr_truncated: false,
+        }
+    }
+
+    #[test]
+    fn formats_check_failure_with_its_first_diagnostic_code() {
+        let failure = CorpusFailure::from_driver_error(&DriverError::Diagnostics {
+            rendered: "error BAMTS-C004: unresolved name".to_owned(),
+        });
+
+        assert_eq!(failure.stage, CorpusStage::Check);
+        assert!(
+            failure
+                .to_string()
+                .contains("stage=check: diagnostic=BAMTS-C004")
+        );
+    }
+
+    #[test]
+    fn formats_import_at_pc_zero_as_runtime_evaluation() {
+        let failure = CorpusFailure::from_driver_error(&DriverError::Native(NativeError::Runtime(
+            RuntimeError {
+                kind: RuntimeErrorKind::FuelExhausted { limit: 1 },
+                function: FunctionId::new(0),
+                pc: Pc::new(0),
+                source: RuntimeSource {
+                    function_name: None,
+                    instruction: Instruction::Import {
+                        dst: Register::new(0),
+                        specifier: ConstantId::new(0),
+                    },
+                },
+            },
+        )));
+
+        let rendered = failure.to_string();
+        assert_eq!(failure.stage, CorpusStage::Evaluate);
+        assert!(rendered.contains("runtime function=0 pc=0 opcode=Import"));
+    }
+
+    #[test]
+    fn formats_link_failure_at_link_stage() {
+        let failure = CorpusFailure::from_driver_error(&DriverError::ToolchainMissing {
+            program: OsString::from("missing-cc"),
+        });
+
+        assert_eq!(failure.stage, CorpusStage::Link);
+        assert!(failure.to_string().starts_with("stage=link:"));
+    }
+
+    #[test]
+    fn formats_timeout_at_the_execution_stage() {
+        let expected = OracleOutcome {
+            timed_out: true,
+            exit_code: None,
+            signal: Some(9),
+            stdout: b"partial".to_vec(),
+            stdout_truncated: false,
+            stderr: Vec::new(),
+            stderr_truncated: false,
+        };
+        let actual = outcome(b"partial");
+        let mut failures = Vec::new();
+
+        compare_case("timeout", ExecutionMode::Jit, &Ok(expected), &Ok(actual), &mut failures);
+
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("stage=spawn Node oracle did not produce a complete result"));
+        assert!(failures[0].contains("stdout=`partial`"));
+    }
+
+    #[test]
+    fn formats_byte_difference_at_compare_stage() {
+        let mut failures = Vec::new();
+
+        compare_case(
+            "bytes",
+            ExecutionMode::Aot,
+            &Ok(outcome(b"a")),
+            &Ok(outcome(b"b")),
+            &mut failures,
+        );
+
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("stage=compare stdout bytes or exit code differ"));
+        assert!(failures[0].contains("byte 0: Node=0x61, BamTS=0x62"));
+    }
 }

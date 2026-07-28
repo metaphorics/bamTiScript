@@ -539,7 +539,8 @@ impl NodeOracle {
     /// Runs a validated case entrypoint and returns its bounded outcome.
     pub fn run_case(&self, spec: &CaseSpec) -> Result<OracleOutcome> {
         let entrypoint_root = self.root.join(MANIFEST_PATH);
-        require_clean_relative(&entrypoint_root, "entrypoint", &spec.entrypoint)?;
+        require_clean_relative(&entrypoint_root, "entrypoint", &spec.entrypoint)
+            .map_err(|error| corpus_stage_error(CorpusStage::Resolve, error))?;
         let mut args: Vec<OsString> = Vec::with_capacity(spec.node_args.len() + 1);
         for arg in &spec.node_args {
             args.push(OsString::from(arg));
@@ -550,6 +551,7 @@ impl NodeOracle {
             max_output_bytes: self.max_output_bytes,
         };
         run_node(&self.node, &self.root, &self.environment, &args, &limits)
+            .map_err(|error| corpus_stage_error(CorpusStage::Spawn, error))
     }
 }
 
@@ -569,6 +571,185 @@ impl ExecutionMode {
             Self::Aot => "aot",
         }
     }
+}
+
+/// The first corpus-harness stage at which execution could not continue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorpusStage {
+    Load,
+    Resolve,
+    Check,
+    Lower,
+    Verify,
+    Instantiate,
+    Evaluate,
+    Link,
+    Spawn,
+    Compare,
+}
+
+impl CorpusStage {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Load => "load",
+            Self::Resolve => "resolve",
+            Self::Check => "check",
+            Self::Lower => "lower",
+            Self::Verify => "verify",
+            Self::Instantiate => "instantiate",
+            Self::Evaluate => "evaluate",
+            Self::Link => "link",
+            Self::Spawn => "spawn",
+            Self::Compare => "compare",
+        }
+    }
+}
+
+/// A classified driver failure with bounded, directly-observed evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorpusFailure {
+    pub stage: CorpusStage,
+    pub evidence: String,
+}
+
+impl CorpusFailure {
+    #[must_use]
+    pub fn from_driver_error(error: &driver::DriverError) -> Self {
+        let stage = match error {
+            driver::DriverError::ReadSource { .. } => CorpusStage::Load,
+            driver::DriverError::UnsupportedSourceExtension { .. }
+            | driver::DriverError::Usage(_)
+            | driver::DriverError::LintConfig { .. }
+            | driver::DriverError::MissingEntrypoint
+            | driver::DriverError::MultipleCompileInputs
+            | driver::DriverError::UnsupportedCompileTarget(_)
+            | driver::DriverError::UnsupportedOutputOption(_) => CorpusStage::Resolve,
+            driver::DriverError::Diagnostics { .. } => CorpusStage::Check,
+            driver::DriverError::Lower(error) => lower_stage(error),
+            driver::DriverError::Jit(error) => jit_stage(error),
+            driver::DriverError::Native(error) => native_stage(error),
+            driver::DriverError::Aot(error) => aot_stage(error),
+            driver::DriverError::CreateDirectory { .. }
+            | driver::DriverError::CacheArchive { .. }
+            | driver::DriverError::WriteObject { .. }
+            | driver::DriverError::ToolchainMissing { .. }
+            | driver::DriverError::ToolchainProbe { .. }
+            | driver::DriverError::ToolchainRejected { .. }
+            | driver::DriverError::LinkStart { .. }
+            | driver::DriverError::LinkFailed { .. }
+            | driver::DriverError::PublishExecutable { .. }
+            | driver::DriverError::CrossTargetLink { .. } => CorpusStage::Link,
+        };
+        Self {
+            stage,
+            evidence: driver_error_evidence(error),
+        }
+    }
+}
+
+impl std::fmt::Display for CorpusFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "stage={}: {}",
+            self.stage.as_str(),
+            self.evidence
+        )
+    }
+}
+
+const FAILURE_EVIDENCE_BYTES: usize = 512;
+
+fn lower_stage(error: &bamts_compiler::lower::LowerError) -> CorpusStage {
+    if matches!(&error.kind, bamts_compiler::lower::LowerErrorKind::Verify(_)) {
+        CorpusStage::Verify
+    } else {
+        CorpusStage::Lower
+    }
+}
+
+fn jit_stage(error: &bamts_codegen::JitError) -> CorpusStage {
+    match error {
+        bamts_codegen::JitError::Lower(error) => lower_stage(error),
+        bamts_codegen::JitError::Module(_) | bamts_codegen::JitError::UnknownHelper { .. } => {
+            CorpusStage::Instantiate
+        }
+    }
+}
+
+fn aot_stage(error: &bamts_codegen::AotError) -> CorpusStage {
+    match error {
+        bamts_codegen::AotError::Lower(error) => lower_stage(error),
+        bamts_codegen::AotError::TargetLookup(_)
+        | bamts_codegen::AotError::TargetBuild(_)
+        | bamts_codegen::AotError::TargetEndianness(_)
+        | bamts_codegen::AotError::InvalidLoweredModule(_)
+        | bamts_codegen::AotError::Module(_)
+        | bamts_codegen::AotError::Emit(_) => CorpusStage::Instantiate,
+    }
+}
+
+fn native_stage(error: &bamts_runtime::NativeError) -> CorpusStage {
+    match error {
+        bamts_runtime::NativeError::Runtime(_) | bamts_runtime::NativeError::FatalTrap { .. } => {
+            CorpusStage::Evaluate
+        }
+        bamts_runtime::NativeError::Abi(_) => CorpusStage::Link,
+    }
+}
+
+fn driver_error_evidence(error: &driver::DriverError) -> String {
+    match error {
+        driver::DriverError::Diagnostics { rendered } => {
+            let code = first_diagnostic_code(rendered);
+            match code {
+                Some(code) => format!(
+                    "diagnostic={code}; rendered={}",
+                    bounded_text(rendered)
+                ),
+                None => format!("rendered={}", bounded_text(rendered)),
+            }
+        }
+        driver::DriverError::Native(bamts_runtime::NativeError::Runtime(error)) => format!(
+            "runtime function={} pc={} opcode={:?}; error={}",
+            error.function.get(),
+            error.pc.get(),
+            error.source.instruction,
+            bounded_text(&error.to_string())
+        ),
+        _ => bounded_text(&error.to_string()),
+    }
+}
+
+fn first_diagnostic_code(rendered: &str) -> Option<&str> {
+    let bytes = rendered.as_bytes();
+    if bytes.len() < 10 {
+        return None;
+    }
+    for start in 0..=bytes.len() - 10 {
+        let candidate = &bytes[start..start + 10];
+        if candidate.starts_with(b"BAMTS-")
+            && candidate[6].is_ascii_uppercase()
+            && candidate[7..].iter().all(u8::is_ascii_digit)
+        {
+            return rendered.get(start..start + 10);
+        }
+    }
+    None
+}
+
+fn bounded_text(text: &str) -> String {
+    let mut evidence = text
+        .bytes()
+        .take(FAILURE_EVIDENCE_BYTES)
+        .flat_map(|byte| byte.escape_ascii())
+        .map(char::from)
+        .collect::<String>();
+    if text.len() > FAILURE_EVIDENCE_BYTES {
+        evidence.push_str("...");
+    }
+    evidence
 }
 
 /// Runs validated corpus cases through the public `bamts_cli` driver.
@@ -595,7 +776,8 @@ impl BamtsRunner {
     /// Runs one validated case through either JIT or AOT under the case bound.
     pub fn run_case(&self, spec: &CaseSpec, mode: ExecutionMode) -> Result<OracleOutcome> {
         let manifest = self.root.join(MANIFEST_PATH);
-        require_clean_relative(&manifest, "entrypoint", &spec.entrypoint)?;
+        require_clean_relative(&manifest, "entrypoint", &spec.entrypoint)
+            .map_err(|error| corpus_stage_error(CorpusStage::Resolve, error))?;
         match mode {
             ExecutionMode::Jit => self.run_jit(spec),
             ExecutionMode::Aot => self.run_aot(spec),
@@ -608,7 +790,8 @@ impl BamtsRunner {
             ExecutionTarget::Jit,
             self.root.join(&spec.entrypoint),
             None,
-        )?;
+        )
+        .map_err(|error| corpus_stage_error(CorpusStage::Resolve, error))?;
         let started = Instant::now();
         let outcome = driver::execute(&args)
             .map_err(|error| cli_error(spec, ExecutionMode::Jit, error))?;
@@ -620,14 +803,16 @@ impl BamtsRunner {
     }
 
     fn run_aot(&self, spec: &CaseSpec) -> Result<OracleOutcome> {
-        let artifacts = ArtifactDirectory::create(&self.root, spec)?;
+        let artifacts = ArtifactDirectory::create(&self.root, spec)
+            .map_err(|error| corpus_stage_error(CorpusStage::Link, error))?;
         let executable = artifacts.executable(spec);
         let args = cli_args(
             Mode::Compile,
             ExecutionTarget::Aot,
             self.root.join(&spec.entrypoint),
             Some(&executable),
-        )?;
+        )
+        .map_err(|error| corpus_stage_error(CorpusStage::Resolve, error))?;
         let started = Instant::now();
         let compile = driver::execute(&args)
             .map_err(|error| cli_error(spec, ExecutionMode::Aot, error))?;
@@ -647,7 +832,8 @@ impl BamtsRunner {
             &normalized_env(),
             &[],
             &limits,
-        )?;
+        )
+        .map_err(|error| corpus_stage_error(CorpusStage::Spawn, error))?;
         if !compile.stderr.is_empty() {
             let remaining = self.max_output_bytes.saturating_sub(outcome.stderr.len());
             let take = remaining.min(compile.stderr.len());
@@ -736,9 +922,21 @@ fn cli_error(
     mode: ExecutionMode,
     error: driver::DriverError,
 ) -> VerificationError {
+    let failure = CorpusFailure::from_driver_error(&error);
     VerificationError::new(
         ErrorCode::ToolFailed,
-        format!("case `{}` failed in {} mode: {error}", spec.id, mode.as_str()),
+        format!(
+            "case `{}` failed in {} mode: {failure}",
+            spec.id,
+            mode.as_str()
+        ),
+    )
+}
+
+fn corpus_stage_error(stage: CorpusStage, error: VerificationError) -> VerificationError {
+    VerificationError::new(
+        error.code(),
+        format!("stage={}: {}", stage.as_str(), bounded_text(&error.to_string())),
     )
 }
 
