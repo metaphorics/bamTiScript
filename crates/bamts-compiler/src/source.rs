@@ -50,7 +50,6 @@ impl SourceIdentity {
     }
 }
 
-
 /// A zero-based offset measured in UTF-16 code units.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]

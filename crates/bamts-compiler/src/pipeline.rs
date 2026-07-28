@@ -16,8 +16,8 @@ use crate::diagnostic::Diagnostic;
 use crate::emitter::{self, EmitOptions, EmitOutput};
 use crate::lint::{LintProfile, LintTable};
 use crate::parser;
-use crate::scanner;
 use crate::program::ResolvedProgram;
+use crate::scanner;
 use crate::source::{ScriptKind, SourceId, SourceText};
 use crate::syntax::SourceFile;
 
@@ -161,11 +161,7 @@ pub fn compile_program_frontend(
     program: &ResolvedProgram,
     mode: FrontendMode,
 ) -> ProgramFrontendOutput {
-    compile_program_frontend_with_lints(
-        program,
-        mode,
-        &LintTable::new(LintProfile::Default),
-    )
+    compile_program_frontend_with_lints(program, mode, &LintTable::new(LintProfile::Default))
 }
 
 /// Runs the frontend for every module with caller-resolved lint levels.

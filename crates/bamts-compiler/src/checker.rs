@@ -15,7 +15,6 @@ mod intrinsic_environment;
 
 use std::collections::{BTreeMap, HashMap};
 
-use intrinsic_environment::GlobalEnvironment;
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
 use crate::lint::{LintProfile, LintTable};
 use crate::source::{SourceId, TextRange};
@@ -28,6 +27,7 @@ use crate::syntax::{
     VariableKind,
 };
 use crate::warning::analyze_warnings;
+use intrinsic_environment::GlobalEnvironment;
 
 /// Diagnostic emitted when a block-scoped name redeclares an existing binding.
 pub const DUPLICATE_DECLARATION: DiagnosticCode = DiagnosticCode::new("BAMTS-C001");
@@ -1215,7 +1215,9 @@ impl<'src> Checker<'src> {
                     );
                 }
             }
-            Statement::Block(block) => self.bind_hoisted_statements(&block.data().statements, scope),
+            Statement::Block(block) => {
+                self.bind_hoisted_statements(&block.data().statements, scope)
+            }
             Statement::If(statement) => {
                 self.bind_hoisted_statement(&statement.consequent, scope);
                 if let Some(alternate) = &statement.alternate {
@@ -2715,15 +2717,33 @@ mod tests {
     fn standard_global_families_bind_as_intrinsics() {
         let names = [
             // ECMAScript values and constructors.
-            "JSON", "Math", "Object", "Array", "Promise", "Error", "TypeError",
+            "JSON",
+            "Math",
+            "Object",
+            "Array",
+            "Promise",
+            "Error",
+            "TypeError",
             // Collections, reflection, shared-memory, and typed-array families.
-            "Map", "Set", "Symbol", "Reflect", "Atomics", "Int8Array",
+            "Map",
+            "Set",
+            "Symbol",
+            "Reflect",
+            "Atomics",
+            "Int8Array",
             "BigUint64Array",
             // Timers and URL/text host APIs.
-            "setTimeout", "clearInterval", "queueMicrotask", "URL", "URLSearchParams",
-            "TextEncoder", "TextDecoder",
+            "setTimeout",
+            "clearInterval",
+            "queueMicrotask",
+            "URL",
+            "URLSearchParams",
+            "TextEncoder",
+            "TextDecoder",
             // Node host globals that the runtime installs.
-            "console", "process", "globalThis",
+            "console",
+            "process",
+            "globalThis",
         ];
         let text = names.join(";");
         let mut start = 0;
@@ -2776,7 +2796,10 @@ mod tests {
 
     #[test]
     fn reports_an_unknown_name_even_with_intrinsics() {
-        let statements = vec![expression_statement(30, identifier_expr(31, "notAGlobal", 0))];
+        let statements = vec![expression_statement(
+            30,
+            identifier_expr(31, "notAGlobal", 0),
+        )];
         let result = check(&file("notAGlobal;", statements));
         assert_eq!(semantic_codes(&result), [CANNOT_FIND_NAME.as_str()]);
     }

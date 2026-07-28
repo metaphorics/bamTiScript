@@ -206,8 +206,14 @@ impl UnresolvedModuleDiagnostic {
 pub enum ProgramLoadError {
     InvalidRoot(io::Error),
     EntryOutsideRoot(PathBuf),
-    TraversalRejected { path: PathBuf, root: PathBuf },
-    Read { path: PathBuf, source: io::Error },
+    TraversalRejected {
+        path: PathBuf,
+        root: PathBuf,
+    },
+    Read {
+        path: PathBuf,
+        source: io::Error,
+    },
     UnsupportedSource(PathBuf),
     TooManySources,
     InvalidSpecifier {
@@ -224,9 +230,15 @@ pub enum ProgramLoadError {
 impl fmt::Display for ProgramLoadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidRoot(error) => write!(formatter, "cannot canonicalize project root: {error}"),
+            Self::InvalidRoot(error) => {
+                write!(formatter, "cannot canonicalize project root: {error}")
+            }
             Self::EntryOutsideRoot(path) => {
-                write!(formatter, "entrypoint {} is outside the project root", path.display())
+                write!(
+                    formatter,
+                    "entrypoint {} is outside the project root",
+                    path.display()
+                )
             }
             Self::TraversalRejected { path, root } => write!(
                 formatter,
@@ -234,11 +246,19 @@ impl fmt::Display for ProgramLoadError {
                 path.display(),
                 root.display()
             ),
-            Self::Read { path, source } => write!(formatter, "cannot read {}: {source}", path.display()),
-            Self::UnsupportedSource(path) => {
-                write!(formatter, "unsupported source extension: {}", path.display())
+            Self::Read { path, source } => {
+                write!(formatter, "cannot read {}: {source}", path.display())
             }
-            Self::TooManySources => formatter.write_str("program contains more than u32::MAX sources"),
+            Self::UnsupportedSource(path) => {
+                write!(
+                    formatter,
+                    "unsupported source extension: {}",
+                    path.display()
+                )
+            }
+            Self::TooManySources => {
+                formatter.write_str("program contains more than u32::MAX sources")
+            }
             Self::InvalidSpecifier { diagnostic, source } => write!(
                 formatter,
                 "invalid module specifier {:?} in {}: {source}",
@@ -358,15 +378,19 @@ impl ProgramLoader {
         self.canonical_selection(plan.candidates())
     }
 
-    fn canonical_selection(&self, candidates: &[PathBuf]) -> Result<Option<PathBuf>, ProgramLoadError> {
+    fn canonical_selection(
+        &self,
+        candidates: &[PathBuf],
+    ) -> Result<Option<PathBuf>, ProgramLoadError> {
         for candidate in candidates {
             if !candidate.is_file() {
                 continue;
             }
-            let canonical = fs::canonicalize(candidate).map_err(|source| ProgramLoadError::Read {
-                path: candidate.clone(),
-                source,
-            })?;
+            let canonical =
+                fs::canonicalize(candidate).map_err(|source| ProgramLoadError::Read {
+                    path: candidate.clone(),
+                    source,
+                })?;
             if !canonical.starts_with(self.root.path()) {
                 return Err(ProgramLoadError::TraversalRejected {
                     path: canonical,
@@ -385,7 +409,9 @@ impl ProgramLoader {
     ) -> Result<PathBuf, ProgramLoadError> {
         let flavor = match edge.kind {
             ModuleEdgeKind::TypeOnly => ResolutionFlavor::Types,
-            ModuleEdgeKind::StaticRuntime | ModuleEdgeKind::DynamicRuntime => ResolutionFlavor::Runtime,
+            ModuleEdgeKind::StaticRuntime | ModuleEdgeKind::DynamicRuntime => {
+                ResolutionFlavor::Runtime
+            }
         };
         let selected = if edge.specifier.starts_with("./") || edge.specifier.starts_with("../") {
             let plan = plan_relative_module(
@@ -454,12 +480,11 @@ impl ProgramLoader {
             let package_directory = current.join("node_modules").join(package_name);
             let package_path = package_directory.join("package.json");
             if package_path.is_file() {
-                let package_source = fs::read_to_string(&package_path).map_err(|source| {
-                    ProgramLoadError::Read {
+                let package_source =
+                    fs::read_to_string(&package_path).map_err(|source| ProgramLoadError::Read {
                         path: package_path.clone(),
                         source,
-                    }
-                })?;
+                    })?;
                 let package = PackageJson::parse(&self.root, &package_path, &package_source)
                     .map_err(|source| ProgramLoadError::InvalidPackage {
                         diagnostic: diagnostic(importer, &edge.specifier, edge.kind, edge.range),
@@ -499,12 +524,11 @@ impl ProgramLoader {
             }
             let package_path = current.join("package.json");
             if package_path.is_file() {
-                let package_source = fs::read_to_string(&package_path).map_err(|source| {
-                    ProgramLoadError::Read {
+                let package_source =
+                    fs::read_to_string(&package_path).map_err(|source| ProgramLoadError::Read {
                         path: package_path.clone(),
                         source,
-                    }
-                })?;
+                    })?;
                 let package = PackageJson::parse(&self.root, &package_path, &package_source)
                     .map_err(|source| ProgramLoadError::InvalidPackage {
                         diagnostic: diagnostic(importer, &edge.specifier, edge.kind, edge.range),
@@ -544,7 +568,6 @@ impl ProgramLoader {
         }
         Ok(None)
     }
-
 }
 
 struct LoadState<'a> {
@@ -563,7 +586,8 @@ impl LoadState<'_> {
         );
         self.identities.insert(path.clone(), source_id);
 
-        let script_kind = script_kind(&path).ok_or_else(|| ProgramLoadError::UnsupportedSource(path.clone()))?;
+        let script_kind =
+            script_kind(&path).ok_or_else(|| ProgramLoadError::UnsupportedSource(path.clone()))?;
         let text = fs::read_to_string(&path).map_err(|source| ProgramLoadError::Read {
             path: path.clone(),
             source,
@@ -604,7 +628,8 @@ fn collect_edges(source: &SourceFile) -> Vec<UnresolvedEdge> {
     for statement in source.statements() {
         match statement.data() {
             Statement::Import(import) => {
-                let kind = if import.type_only || import_clause_is_type_only(import.clause.as_ref()) {
+                let kind = if import.type_only || import_clause_is_type_only(import.clause.as_ref())
+                {
                     ModuleEdgeKind::TypeOnly
                 } else {
                     ModuleEdgeKind::StaticRuntime
@@ -612,7 +637,9 @@ fn collect_edges(source: &SourceFile) -> Vec<UnresolvedEdge> {
                 push_literal_edge(source, &mut edges, kind, &import.source);
             }
             Statement::ImportEquals(import) => {
-                if let crate::syntax::ExternalModuleReference::Require(specifier) = &import.reference {
+                if let crate::syntax::ExternalModuleReference::Require(specifier) =
+                    &import.reference
+                {
                     let kind = if import.is_type_only {
                         ModuleEdgeKind::TypeOnly
                     } else {
@@ -637,9 +664,9 @@ fn collect_edges(source: &SourceFile) -> Vec<UnresolvedEdge> {
             })) => {
                 let only_types = *type_only
                     || (!specifiers.is_empty()
-                        && specifiers
-                            .iter()
-                            .all(|specifier| specifier.data().mode == ExportSpecifierMode::TypeOnly));
+                        && specifiers.iter().all(|specifier| {
+                            specifier.data().mode == ExportSpecifierMode::TypeOnly
+                        }));
                 push_literal_edge(
                     source,
                     &mut edges,
@@ -654,7 +681,11 @@ fn collect_edges(source: &SourceFile) -> Vec<UnresolvedEdge> {
             _ => {}
         }
     }
-    DynamicEdgeCollector { source, edges: &mut edges }.scan_statements(source.statements());
+    DynamicEdgeCollector {
+        source,
+        edges: &mut edges,
+    }
+    .scan_statements(source.statements());
     let tokens: Vec<_> = source
         .tokens()
         .iter()
@@ -713,19 +744,28 @@ impl DynamicEdgeCollector<'_> {
             }
             Statement::Function(declaration) => self.scan_function(&declaration.function),
             Statement::Class(class) => self.scan_class(class),
-            Statement::Namespace(namespace) => self.scan_statements(&namespace.body.data().statements),
-            Statement::Declare(inner) | Statement::Labeled(crate::syntax::LabeledStatement { body: inner, .. }) => self.scan_statement(inner),
+            Statement::Namespace(namespace) => {
+                self.scan_statements(&namespace.body.data().statements)
+            }
+            Statement::Declare(inner)
+            | Statement::Labeled(crate::syntax::LabeledStatement { body: inner, .. }) => {
+                self.scan_statement(inner)
+            }
             Statement::Block(block) => self.scan_statements(&block.data().statements),
             Statement::Expression(expression) => self.scan_expression(&expression.expression),
             Statement::If(value) => {
                 self.scan_expression(&value.test);
                 self.scan_statement(&value.consequent);
-                if let Some(alternate) = &value.alternate { self.scan_statement(alternate); }
+                if let Some(alternate) = &value.alternate {
+                    self.scan_statement(alternate);
+                }
             }
             Statement::Switch(value) => {
                 self.scan_expression(&value.discriminant);
                 for case in &value.cases {
-                    if let Some(test) = &case.data().test { self.scan_expression(test); }
+                    if let Some(test) = &case.data().test {
+                        self.scan_expression(test);
+                    }
                     self.scan_statements(&case.data().consequent);
                 }
             }
@@ -735,14 +775,20 @@ impl DynamicEdgeCollector<'_> {
                         ForInitializer::Variable(declaration) => {
                             for declarator in &declaration.declarations {
                                 self.scan_pattern(&declarator.data().binding);
-                                if let Some(initializer) = &declarator.data().initializer { self.scan_expression(initializer); }
+                                if let Some(initializer) = &declarator.data().initializer {
+                                    self.scan_expression(initializer);
+                                }
                             }
                         }
                         ForInitializer::Expression(expression) => self.scan_expression(expression),
                     }
                 }
-                if let Some(test) = &value.test { self.scan_expression(test); }
-                if let Some(update) = &value.update { self.scan_expression(update); }
+                if let Some(test) = &value.test {
+                    self.scan_expression(test);
+                }
+                if let Some(update) = &value.update {
+                    self.scan_expression(update);
+                }
                 self.scan_statement(&value.body);
             }
             Statement::ForIn(value) => {
@@ -755,27 +801,48 @@ impl DynamicEdgeCollector<'_> {
                 self.scan_expression(&value.iterable);
                 self.scan_statement(&value.body);
             }
-            Statement::While(value) => { self.scan_expression(&value.test); self.scan_statement(&value.body); }
-            Statement::DoWhile(value) => { self.scan_statement(&value.body); self.scan_expression(&value.test); }
+            Statement::While(value) => {
+                self.scan_expression(&value.test);
+                self.scan_statement(&value.body);
+            }
+            Statement::DoWhile(value) => {
+                self.scan_statement(&value.body);
+                self.scan_expression(&value.test);
+            }
             Statement::Try(value) => {
                 self.scan_statements(&value.block.data().statements);
                 if let Some(handler) = &value.handler {
-                    if let Some(binding) = &handler.data().binding { self.scan_pattern(binding); }
+                    if let Some(binding) = &handler.data().binding {
+                        self.scan_pattern(binding);
+                    }
                     self.scan_statements(&handler.data().body.data().statements);
                 }
-                if let Some(finalizer) = &value.finalizer { self.scan_statements(&finalizer.data().statements); }
+                if let Some(finalizer) = &value.finalizer {
+                    self.scan_statements(&finalizer.data().statements);
+                }
             }
-            Statement::With(value) => { self.scan_expression(&value.object); self.scan_statement(&value.body); }
-            Statement::Return(value) => { if let Some(argument) = &value.argument { self.scan_expression(argument); } }
+            Statement::With(value) => {
+                self.scan_expression(&value.object);
+                self.scan_statement(&value.body);
+            }
+            Statement::Return(value) => {
+                if let Some(argument) = &value.argument {
+                    self.scan_expression(argument);
+                }
+            }
             Statement::Throw(value) => self.scan_expression(&value.argument),
-            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner))) => self.scan_statement(inner),
+            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
+                inner,
+            ))) => self.scan_statement(inner),
             Statement::Export(ExportDeclaration::Default(value)) => match &value.value {
                 ExportDefaultValue::Function(function) => self.scan_function(function),
                 ExportDefaultValue::Class(class) => self.scan_class(class),
                 ExportDefaultValue::Expression(expression) => self.scan_expression(expression),
                 ExportDefaultValue::Missing(_) => {}
             },
-            Statement::Export(ExportDeclaration::Assignment(expression)) => self.scan_expression(expression),
+            Statement::Export(ExportDeclaration::Assignment(expression)) => {
+                self.scan_expression(expression)
+            }
             _ => {}
         }
     }
@@ -785,7 +852,9 @@ impl DynamicEdgeCollector<'_> {
             crate::syntax::ForBinding::Variable(declaration) => {
                 for declarator in &declaration.declarations {
                     self.scan_pattern(&declarator.data().binding);
-                    if let Some(initializer) = &declarator.data().initializer { self.scan_expression(initializer); }
+                    if let Some(initializer) = &declarator.data().initializer {
+                        self.scan_expression(initializer);
+                    }
                 }
             }
             crate::syntax::ForBinding::Target(target) => self.scan_target(target),
@@ -794,25 +863,42 @@ impl DynamicEdgeCollector<'_> {
 
     fn scan_parameters(&mut self, parameters: &[crate::syntax::ParameterNode]) {
         for parameter in parameters {
-            for decorator in &parameter.data().decorators { self.scan_expression(&decorator.data().expression); }
+            for decorator in &parameter.data().decorators {
+                self.scan_expression(&decorator.data().expression);
+            }
             self.scan_pattern(&parameter.data().binding);
-            if let Some(initializer) = &parameter.data().initializer { self.scan_expression(initializer); }
+            if let Some(initializer) = &parameter.data().initializer {
+                self.scan_expression(initializer);
+            }
         }
     }
 
     fn scan_pattern(&mut self, pattern: &crate::syntax::Pattern) {
         use crate::syntax::{ArrayBindingElement, BindingPattern, PropertyName};
         match pattern.data() {
-            BindingPattern::Object(object) => for property in &object.properties {
-                if let PropertyName::Computed(expression) = &property.name { self.scan_expression(expression); }
-                if let Some(initializer) = &property.initializer { self.scan_expression(initializer); }
-                self.scan_pattern(&property.binding);
-            },
-            BindingPattern::Array(array) => for element in &array.elements {
-                if let ArrayBindingElement::Binding(inner) = element { self.scan_pattern(inner); }
-            },
+            BindingPattern::Object(object) => {
+                for property in &object.properties {
+                    if let PropertyName::Computed(expression) = &property.name {
+                        self.scan_expression(expression);
+                    }
+                    if let Some(initializer) = &property.initializer {
+                        self.scan_expression(initializer);
+                    }
+                    self.scan_pattern(&property.binding);
+                }
+            }
+            BindingPattern::Array(array) => {
+                for element in &array.elements {
+                    if let ArrayBindingElement::Binding(inner) = element {
+                        self.scan_pattern(inner);
+                    }
+                }
+            }
             BindingPattern::Rest(rest) => self.scan_pattern(&rest.argument),
-            BindingPattern::Assignment(value) => { self.scan_pattern(&value.left); self.scan_expression(&value.right); }
+            BindingPattern::Assignment(value) => {
+                self.scan_pattern(&value.left);
+                self.scan_expression(&value.right);
+            }
             BindingPattern::Identifier(_) | BindingPattern::Missing(_) => {}
         }
     }
@@ -821,8 +907,12 @@ impl DynamicEdgeCollector<'_> {
         self.scan_parameters(&function.parameters);
         if let Some(body) = &function.body {
             match body {
-                crate::syntax::FunctionBody::Block(block) => self.scan_statements(&block.data().statements),
-                crate::syntax::FunctionBody::Expression(expression) => self.scan_expression(expression),
+                crate::syntax::FunctionBody::Block(block) => {
+                    self.scan_statements(&block.data().statements)
+                }
+                crate::syntax::FunctionBody::Expression(expression) => {
+                    self.scan_expression(expression)
+                }
                 crate::syntax::FunctionBody::Missing(_) => {}
             }
         }
@@ -830,8 +920,12 @@ impl DynamicEdgeCollector<'_> {
 
     fn scan_class(&mut self, class: &crate::syntax::ClassDeclaration) {
         use crate::syntax::{ClassMember, PropertyName};
-        for decorator in &class.decorators { self.scan_expression(&decorator.data().expression); }
-        if let Some(heritage) = &class.extends { self.scan_expression(&heritage.expression); }
+        for decorator in &class.decorators {
+            self.scan_expression(&decorator.data().expression);
+        }
+        if let Some(heritage) = &class.extends {
+            self.scan_expression(&heritage.expression);
+        }
         for member in &class.members {
             match member.data() {
                 ClassMember::Constructor(value) => {
@@ -839,16 +933,26 @@ impl DynamicEdgeCollector<'_> {
                     self.scan_statements(&value.body.data().statements);
                 }
                 ClassMember::Method(value) => {
-                    if let PropertyName::Computed(expression) = &value.name { self.scan_expression(expression); }
+                    if let PropertyName::Computed(expression) = &value.name {
+                        self.scan_expression(expression);
+                    }
                     self.scan_function(&value.function);
                 }
                 ClassMember::Property(value) => {
-                    if let PropertyName::Computed(expression) = &value.name { self.scan_expression(expression); }
-                    if let Some(initializer) = &value.initializer { self.scan_expression(initializer); }
+                    if let PropertyName::Computed(expression) = &value.name {
+                        self.scan_expression(expression);
+                    }
+                    if let Some(initializer) = &value.initializer {
+                        self.scan_expression(initializer);
+                    }
                 }
                 ClassMember::AutoAccessor(value) => {
-                    if let PropertyName::Computed(expression) = &value.name { self.scan_expression(expression); }
-                    if let Some(initializer) = &value.initializer { self.scan_expression(initializer); }
+                    if let PropertyName::Computed(expression) = &value.name {
+                        self.scan_expression(expression);
+                    }
+                    if let Some(initializer) = &value.initializer {
+                        self.scan_expression(initializer);
+                    }
                 }
                 ClassMember::StaticBlock(block) => self.scan_statements(&block.data().statements),
                 ClassMember::IndexSignature(_) | ClassMember::Missing(_) => {}
@@ -857,32 +961,106 @@ impl DynamicEdgeCollector<'_> {
     }
 
     fn scan_expression(&mut self, expression: &crate::syntax::Expr) {
-        use crate::syntax::{ArrayElement, Expression, Literal, MemberProperty, ObjectMember, PropertyName};
+        use crate::syntax::{
+            ArrayElement, Expression, Literal, MemberProperty, ObjectMember, PropertyName,
+        };
         match expression.data() {
-            Expression::Template(value) => for expression in &value.expressions { self.scan_expression(expression); },
-            Expression::TaggedTemplate(value) => { self.scan_expression(&value.tag); for expression in &value.template.expressions { self.scan_expression(expression); } }
-            Expression::Array(value) => for element in &value.elements { match element { ArrayElement::Expression(value) => self.scan_expression(value), ArrayElement::Spread(value) => self.scan_expression(&value.argument), _ => {} } },
-            Expression::Object(value) => for member in &value.members { match member.data() {
-                ObjectMember::Property(value) => { if let PropertyName::Computed(key) = &value.name { self.scan_expression(key); } self.scan_expression(&value.value); }
-                ObjectMember::Method(value) => { if let PropertyName::Computed(key) = &value.name { self.scan_expression(key); } self.scan_function(&value.function); }
-                ObjectMember::Spread(value) => self.scan_expression(&value.argument),
-                ObjectMember::Missing(_) => {}
-            } },
+            Expression::Template(value) => {
+                for expression in &value.expressions {
+                    self.scan_expression(expression);
+                }
+            }
+            Expression::TaggedTemplate(value) => {
+                self.scan_expression(&value.tag);
+                for expression in &value.template.expressions {
+                    self.scan_expression(expression);
+                }
+            }
+            Expression::Array(value) => {
+                for element in &value.elements {
+                    match element {
+                        ArrayElement::Expression(value) => self.scan_expression(value),
+                        ArrayElement::Spread(value) => self.scan_expression(&value.argument),
+                        _ => {}
+                    }
+                }
+            }
+            Expression::Object(value) => {
+                for member in &value.members {
+                    match member.data() {
+                        ObjectMember::Property(value) => {
+                            if let PropertyName::Computed(key) = &value.name {
+                                self.scan_expression(key);
+                            }
+                            self.scan_expression(&value.value);
+                        }
+                        ObjectMember::Method(value) => {
+                            if let PropertyName::Computed(key) = &value.name {
+                                self.scan_expression(key);
+                            }
+                            self.scan_function(&value.function);
+                        }
+                        ObjectMember::Spread(value) => self.scan_expression(&value.argument),
+                        ObjectMember::Missing(_) => {}
+                    }
+                }
+            }
             Expression::Function(value) => self.scan_function(&value.function),
             Expression::Class(value) => self.scan_class(&value.class),
-            Expression::Arrow(value) => { self.scan_parameters(&value.parameters); match &value.body { crate::syntax::FunctionBody::Block(block) => self.scan_statements(&block.data().statements), crate::syntax::FunctionBody::Expression(value) => self.scan_expression(value), crate::syntax::FunctionBody::Missing(_) => {} } }
-            Expression::Call(value) => { self.scan_expression(&value.callee); self.scan_arguments(&value.arguments); }
-            Expression::New(value) => { self.scan_expression(&value.callee); self.scan_arguments(&value.arguments); }
-            Expression::Member(value) => { self.scan_expression(&value.object); if let MemberProperty::Computed(value) = &value.property { self.scan_expression(value); } }
+            Expression::Arrow(value) => {
+                self.scan_parameters(&value.parameters);
+                match &value.body {
+                    crate::syntax::FunctionBody::Block(block) => {
+                        self.scan_statements(&block.data().statements)
+                    }
+                    crate::syntax::FunctionBody::Expression(value) => self.scan_expression(value),
+                    crate::syntax::FunctionBody::Missing(_) => {}
+                }
+            }
+            Expression::Call(value) => {
+                self.scan_expression(&value.callee);
+                self.scan_arguments(&value.arguments);
+            }
+            Expression::New(value) => {
+                self.scan_expression(&value.callee);
+                self.scan_arguments(&value.arguments);
+            }
+            Expression::Member(value) => {
+                self.scan_expression(&value.object);
+                if let MemberProperty::Computed(value) = &value.property {
+                    self.scan_expression(value);
+                }
+            }
             Expression::Await(value) => self.scan_expression(&value.argument),
-            Expression::Yield(value) => { if let Some(argument) = &value.argument { self.scan_expression(argument); } }
+            Expression::Yield(value) => {
+                if let Some(argument) = &value.argument {
+                    self.scan_expression(argument);
+                }
+            }
             Expression::Unary(value) => self.scan_expression(&value.argument),
             Expression::Update(value) => self.scan_target(&value.argument),
-            Expression::Binary(value) => { self.scan_expression(&value.left); self.scan_expression(&value.right); }
-            Expression::Logical(value) => { self.scan_expression(&value.left); self.scan_expression(&value.right); }
-            Expression::Conditional(value) => { self.scan_expression(&value.test); self.scan_expression(&value.consequent); self.scan_expression(&value.alternate); }
-            Expression::Assignment(value) => { self.scan_target(&value.left); self.scan_expression(&value.right); }
-            Expression::Sequence(value) => for expression in &value.expressions { self.scan_expression(expression); },
+            Expression::Binary(value) => {
+                self.scan_expression(&value.left);
+                self.scan_expression(&value.right);
+            }
+            Expression::Logical(value) => {
+                self.scan_expression(&value.left);
+                self.scan_expression(&value.right);
+            }
+            Expression::Conditional(value) => {
+                self.scan_expression(&value.test);
+                self.scan_expression(&value.consequent);
+                self.scan_expression(&value.alternate);
+            }
+            Expression::Assignment(value) => {
+                self.scan_target(&value.left);
+                self.scan_expression(&value.right);
+            }
+            Expression::Sequence(value) => {
+                for expression in &value.expressions {
+                    self.scan_expression(expression);
+                }
+            }
             Expression::Parenthesized(value) => self.scan_expression(value),
             Expression::As(value) => self.scan_expression(&value.expression),
             Expression::Satisfies(value) => self.scan_expression(&value.expression),
@@ -890,12 +1068,24 @@ impl DynamicEdgeCollector<'_> {
             Expression::NonNull(value) => self.scan_expression(&value.expression),
             Expression::Import(value) => {
                 if let Expression::Literal(Literal::String(literal)) = value.source.data() {
-                    push_literal_edge(self.source, self.edges, ModuleEdgeKind::DynamicRuntime, literal);
+                    push_literal_edge(
+                        self.source,
+                        self.edges,
+                        ModuleEdgeKind::DynamicRuntime,
+                        literal,
+                    );
                 }
                 self.scan_expression(&value.source);
-                if let Some(options) = &value.options { self.scan_expression(options); }
+                if let Some(options) = &value.options {
+                    self.scan_expression(options);
+                }
             }
-            Expression::Identifier(_) | Expression::This | Expression::Super | Expression::Literal(_) | Expression::Meta(_) | Expression::Missing(_) => {}
+            Expression::Identifier(_)
+            | Expression::This
+            | Expression::Super
+            | Expression::Literal(_)
+            | Expression::Meta(_)
+            | Expression::Missing(_) => {}
         }
     }
 
@@ -910,15 +1100,34 @@ impl DynamicEdgeCollector<'_> {
     }
 
     fn scan_target(&mut self, target: &crate::syntax::AssignmentTargetNode) {
-        use crate::syntax::{AssignmentArrayElement, AssignmentTarget, MemberProperty, PropertyName};
+        use crate::syntax::{
+            AssignmentArrayElement, AssignmentTarget, MemberProperty, PropertyName,
+        };
         match target.data() {
-            AssignmentTarget::Member(value) => { self.scan_expression(&value.object); if let MemberProperty::Computed(value) = &value.property { self.scan_expression(value); } }
-            AssignmentTarget::Object(value) => for property in &value.properties {
-                if let PropertyName::Computed(key) = &property.name { self.scan_expression(key); }
-                if let Some(initializer) = &property.initializer { self.scan_expression(initializer); }
-                self.scan_target(&property.target);
-            },
-            AssignmentTarget::Array(value) => for element in &value.elements { if let AssignmentArrayElement::Target(value) = element { self.scan_target(value); } },
+            AssignmentTarget::Member(value) => {
+                self.scan_expression(&value.object);
+                if let MemberProperty::Computed(value) = &value.property {
+                    self.scan_expression(value);
+                }
+            }
+            AssignmentTarget::Object(value) => {
+                for property in &value.properties {
+                    if let PropertyName::Computed(key) = &property.name {
+                        self.scan_expression(key);
+                    }
+                    if let Some(initializer) = &property.initializer {
+                        self.scan_expression(initializer);
+                    }
+                    self.scan_target(&property.target);
+                }
+            }
+            AssignmentTarget::Array(value) => {
+                for element in &value.elements {
+                    if let AssignmentArrayElement::Target(value) = element {
+                        self.scan_target(value);
+                    }
+                }
+            }
             AssignmentTarget::Identifier(_) | AssignmentTarget::Missing(_) => {}
         }
     }
@@ -1001,8 +1210,7 @@ fn unquote(text: &str) -> Option<String> {
             b'u' => {
                 let first = parse_hex(bytes.get(index..index + 4)?)?;
                 index += 4;
-                if (0xd800..=0xdbff).contains(&first)
-                    && bytes.get(index..index + 2) == Some(b"\\u")
+                if (0xd800..=0xdbff).contains(&first) && bytes.get(index..index + 2) == Some(b"\\u")
                 {
                     let second = parse_hex(bytes.get(index + 2..index + 6)?)?;
                     if (0xdc00..=0xdfff).contains(&second) {
@@ -1053,9 +1261,7 @@ fn pattern_capture<'a>(pattern: &str, specifier: &'a str) -> Option<&'a str> {
     };
     let (prefix, suffix_with_star) = pattern.split_at(star);
     let suffix = &suffix_with_star[1..];
-    specifier
-        .strip_prefix(prefix)?
-        .strip_suffix(suffix)
+    specifier.strip_prefix(prefix)?.strip_suffix(suffix)
 }
 
 fn split_package_specifier(specifier: &str) -> Option<(&str, String)> {
@@ -1070,7 +1276,10 @@ fn split_package_specifier(specifier: &str) -> Option<(&str, String)> {
         boundaries.nth(1)
     };
     match boundary {
-        Some(index) => Some((&specifier[..index], format!("./{}", &specifier[index + 1..]))),
+        Some(index) => Some((
+            &specifier[..index],
+            format!("./{}", &specifier[index + 1..]),
+        )),
         None if component_count == 1 || specifier.matches('/').count() == 1 => {
             Some((specifier, ".".to_owned()))
         }
@@ -1078,7 +1287,12 @@ fn split_package_specifier(specifier: &str) -> Option<(&str, String)> {
     }
 }
 
-fn diagnostic(importer: &Path, specifier: &str, kind: ModuleEdgeKind, range: TextRange) -> UnresolvedModuleDiagnostic {
+fn diagnostic(
+    importer: &Path,
+    specifier: &str,
+    kind: ModuleEdgeKind,
+    range: TextRange,
+) -> UnresolvedModuleDiagnostic {
     UnresolvedModuleDiagnostic {
         importer: Arc::from(importer),
         specifier: Arc::from(specifier),
@@ -1192,7 +1406,10 @@ mod tests {
 
         let program = fixture.loader().load("main.ts").unwrap();
 
-        assert_eq!(names(&program), ["shared.ts", "left.ts", "right.ts", "main.ts"]);
+        assert_eq!(
+            names(&program),
+            ["shared.ts", "left.ts", "right.ts", "main.ts"]
+        );
         assert_eq!(program.modules().len(), 4);
     }
 
@@ -1217,7 +1434,10 @@ mod tests {
             "node_modules/waybread/package.json",
             r#"{"name":"waybread","exports":{".":{"import":"./src/entry.js"}}}"#,
         );
-        fixture.write("node_modules/waybread/src/entry.ts", "export const answer = 42;");
+        fixture.write(
+            "node_modules/waybread/src/entry.ts",
+            "export const answer = 42;",
+        );
 
         let program = fixture.loader().load("main.ts").unwrap();
 
@@ -1230,7 +1450,10 @@ mod tests {
             "package.json",
             r##"{"name":"root","imports":{"#waybread":"./src/alias.js"}}"##,
         );
-        fixture.write("main.ts", "import { answer } from '#waybread'; void answer;");
+        fixture.write(
+            "main.ts",
+            "import { answer } from '#waybread'; void answer;",
+        );
         fixture.write("src/alias.ts", "export const answer = 42;");
 
         let program = fixture.loader().load("main.ts").unwrap();
@@ -1249,7 +1472,6 @@ mod tests {
         assert_eq!(names(&program), ["foo.ts", "main.ts"]);
     }
 
-
     #[test]
     fn rejects_relative_traversal_before_loading() {
         let fixture = Fixture::new();
@@ -1266,7 +1488,10 @@ mod tests {
     #[test]
     fn retains_literal_dynamic_import_edges() {
         let fixture = Fixture::new();
-        fixture.write("main.ts", "async function load() { return import('./later'); }");
+        fixture.write(
+            "main.ts",
+            "async function load() { return import('./later'); }",
+        );
         fixture.write("later.ts", "export const later = 1;");
 
         let program = fixture.loader().load("main.ts").unwrap();
@@ -1294,7 +1519,6 @@ mod tests {
         assert_eq!(program.runtime_modules().len(), 1);
     }
 
-
     #[test]
     fn unresolved_runtime_edge_reports_typed_diagnostic() {
         let fixture = Fixture::new();
@@ -1308,6 +1532,9 @@ mod tests {
 
         assert_eq!(diagnostic.kind(), ModuleEdgeKind::StaticRuntime);
         assert_eq!(diagnostic.specifier(), "./missing");
-        assert_eq!(diagnostic.importer().file_name(), Some(Path::new("main.ts").as_os_str()));
+        assert_eq!(
+            diagnostic.importer().file_name(),
+            Some(Path::new("main.ts").as_os_str())
+        );
     }
 }
