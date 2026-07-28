@@ -40,6 +40,54 @@ fn aot_fixture_matches_jit_stdout_and_exit_code() {
 }
 
 #[test]
+fn jit_runs_two_module_program_with_live_imported_mutation() {
+    let project = ScratchDirectory::new();
+    project.write("dependency.ts", "export let value = 1; value = 2;\n");
+    project.write(
+        "main.ts",
+        "import { value } from './dependency.js'; console.log(value);\n",
+    );
+
+    let output = Command::new(bamts_binary())
+        .args(["run", "--target", "jit", "main.ts"])
+        .current_dir(&project.path)
+        .output()
+        .expect("bamts JIT run starts");
+
+    assert_success(&output, "bamts run two-module JIT");
+    assert_eq!(output.stdout, b"2\n");
+}
+
+#[test]
+fn aot_runs_two_module_program_with_live_imported_mutation() {
+    let project = ScratchDirectory::new();
+    project.write("dependency.ts", "export let value = 1; value = 2;\n");
+    project.write(
+        "main.ts",
+        "import { value } from './dependency.js'; console.log(value);\n",
+    );
+    let executable = project
+        .path
+        .join(format!("two-module{}", std::env::consts::EXE_SUFFIX));
+
+    let compile = Command::new(bamts_binary())
+        .args(["compile", "--target", "aot", "--output"])
+        .arg(&executable)
+        .arg("main.ts")
+        .current_dir(&project.path)
+        .env("BAMTS_CACHE_DIR", project.path.join("cache"))
+        .output()
+        .expect("bamts AOT compile starts");
+    assert_success(&compile, "bamts compile two-module AOT");
+
+    let output = Command::new(&executable)
+        .output()
+        .expect("two-module AOT executable starts");
+    assert_success(&output, "compiled two-module program");
+    assert_eq!(output.stdout, b"2\n");
+}
+
+#[test]
 fn check_reports_dependency_errors() {
     let project = ScratchDirectory::new();
     project.write("main.ts", "import './dependency.ts';\n");

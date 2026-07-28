@@ -368,10 +368,16 @@ fn sha512(data: &[u8]) -> [u8; 64] {
 }
 
 #[cfg(feature = "aot-main")]
+fn decode_aot_program(
+    bytes: &[u8],
+) -> Result<bamts_bytecode::Program<bamts_bytecode::Verified>, bamts_bytecode::ProgramLoadError> {
+    bamts_bytecode::decode_verified_program(bytes, &bamts_bytecode::ProgramDecodeLimits::default())
+}
+
+#[cfg(feature = "aot-main")]
 fn run_aot_main() -> i32 {
     use std::io::Write;
 
-    use bamts_bytecode::{DecodeLimits, decode_verified};
     use bamts_native::linked_program;
     use bamts_runtime::{Limits, run_linked_program};
 
@@ -379,8 +385,8 @@ fn run_aot_main() -> i32 {
         Ok(linked) => linked,
         Err(_) => return 1,
     };
-    let module = match decode_verified(linked.bytecode(), &DecodeLimits::default()) {
-        Ok(module) => module,
+    let program = match decode_aot_program(linked.bytecode()) {
+        Ok(program) => program,
         Err(_) => return 1,
     };
     let mut host = NodeHost::new();
@@ -388,7 +394,7 @@ fn run_aot_main() -> i32 {
     {
         return 1;
     }
-    let outcome = match run_linked_program(&module, &linked, &mut host, &Limits::default()) {
+    let outcome = match run_linked_program(&program, &linked, &mut host, &Limits::default()) {
         Ok(outcome) => outcome,
         Err(_) => return 1,
     };
@@ -404,7 +410,7 @@ fn run_aot_main() -> i32 {
 }
 
 /// C process entry for a linked BamTS AOT image.
-#[cfg(feature = "aot-main")]
+#[cfg(all(feature = "aot-main", not(test)))]
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i32 {
@@ -458,6 +464,52 @@ fn initialize_aot_process_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "aot-main")]
+    #[test]
+    fn linked_descriptor_decodes_whole_program_and_tuple_entry() {
+        use bamts_bytecode::{
+            Constant, ConstantId, Function, FunctionFlags, FunctionId, Instruction, Module,
+            ModuleId, Program, ProgramModule,
+        };
+
+        let module = |name: &str| ProgramModule {
+            name: ConstantId::new(0),
+            code: Module::new(
+                vec![Constant::String(name.to_owned())],
+                vec![Function::new(
+                    None,
+                    0,
+                    0,
+                    0,
+                    FunctionFlags::default(),
+                    vec![Instruction::Halt],
+                    Vec::new(),
+                )],
+                FunctionId::new(0),
+            )
+            .verify()
+            .expect("descriptor test module verifies"),
+            edges: Vec::new(),
+            bindings: Vec::new(),
+            exports: Vec::new(),
+        };
+        let program = Program::link(
+            vec![module("dependency"), module("entry")],
+            ModuleId::new(1),
+        )
+        .expect("descriptor test program links");
+
+        let decoded = decode_aot_program(&program.encode()).expect("descriptor program decodes");
+
+        assert_eq!(decoded.entry(), ModuleId::new(1));
+        assert_eq!(decoded.modules().len(), 2);
+        assert!(
+            decoded
+                .modules()
+                .iter()
+                .all(|module| module.code().entry() == FunctionId::new(0))
+        );
+    }
 
     fn hex(bytes: &[u8]) -> String {
         const DIGITS: &[u8; 16] = b"0123456789abcdef";

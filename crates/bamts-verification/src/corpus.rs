@@ -617,16 +617,19 @@ impl CorpusFailure {
     #[must_use]
     pub fn from_driver_error(error: &driver::DriverError) -> Self {
         let stage = match error {
-            driver::DriverError::ReadSource { .. } => CorpusStage::Load,
+            driver::DriverError::ReadSource { .. } | driver::DriverError::ProgramLoad(_) => {
+                CorpusStage::Load
+            }
             driver::DriverError::UnsupportedSourceExtension { .. }
             | driver::DriverError::Usage(_)
             | driver::DriverError::LintConfig { .. }
+            | driver::DriverError::ProjectConfig { .. }
             | driver::DriverError::MissingEntrypoint
             | driver::DriverError::MultipleCompileInputs
             | driver::DriverError::UnsupportedCompileTarget(_)
             | driver::DriverError::UnsupportedOutputOption(_) => CorpusStage::Resolve,
             driver::DriverError::Diagnostics { .. } => CorpusStage::Check,
-            driver::DriverError::Lower(error) => lower_stage(error),
+            driver::DriverError::Lower(error) => program_lower_stage(error),
             driver::DriverError::Jit(error) => jit_stage(error),
             driver::DriverError::Native(error) => native_stage(error),
             driver::DriverError::Aot(error) => aot_stage(error),
@@ -660,6 +663,14 @@ impl std::fmt::Display for CorpusFailure {
 }
 
 const FAILURE_EVIDENCE_BYTES: usize = 512;
+
+fn program_lower_stage(error: &bamts_compiler::program::ProgramLowerError) -> CorpusStage {
+    match &error.kind {
+        bamts_compiler::program::ProgramLowerErrorKind::Lower(error) => lower_stage(error),
+        bamts_compiler::program::ProgramLowerErrorKind::Link(_) => CorpusStage::Verify,
+        _ => CorpusStage::Lower,
+    }
+}
 
 fn lower_stage(error: &bamts_compiler::lower::LowerError) -> CorpusStage {
     if matches!(

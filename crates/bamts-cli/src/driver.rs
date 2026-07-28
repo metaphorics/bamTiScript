@@ -6,16 +6,17 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
-use bamts_compiler::lower::{LowerError, LowerOptions, lower};
+use bamts_compiler::lower::LowerOptions;
 use bamts_compiler::pipeline::{
     FrontendMode, ProgramFrontendOutput, compile_program_frontend_with_lints,
 };
-use bamts_compiler::program::{ProgramLoadError, ProgramLoader, ResolvedProgram};
+use bamts_compiler::program::{
+    ProgramLoadError, ProgramLoader, ProgramLowerError, ResolvedProgram, lower_program,
+};
 use bamts_compiler::{
     diagnostic::DiagnosticReport,
     lint::{LintOverride, LintProfile, LintTable},
     project::{ProjectConfig, ProjectRoot, parse_bamts_toml},
-    source::ScriptKind,
 };
 use bamts_runtime::{Limits, run_linked_program};
 
@@ -57,7 +58,7 @@ pub enum DriverError {
         message: String,
     },
     ProgramLoad(ProgramLoadError),
-    Lower(LowerError),
+    Lower(ProgramLowerError),
     Jit(bamts_codegen::JitError),
     Native(bamts_runtime::NativeError),
     Aot(bamts_codegen::AotError),
@@ -389,15 +390,11 @@ fn compile(
 
     let entrypoint = required_entrypoint(args)?;
     let warnings = require_clean_frontend(args, frontend)?;
-    let entry = frontend.program.entrypoint();
-    let output = frontend
-        .output
-        .module(entry.source_id())
-        .expect("program frontend contains its entrypoint");
-    let bytecode = lower(
-        output.source_file(),
+    let executable = lower_program(
+        &frontend.program,
+        &frontend.output,
         LowerOptions {
-            javascript_compatibility: is_javascript(entry.script_kind()),
+            javascript_compatibility: true,
         },
     )
     .map_err(DriverError::Lower)?;
@@ -407,7 +404,8 @@ fn compile(
             target: BUILD_TARGET,
         });
     }
-    let object = bamts_codegen::compile_aot(&bytecode, HOST_TARGET).map_err(DriverError::Aot)?;
+    let object =
+        bamts_codegen::compile_aot(executable.wire(), HOST_TARGET).map_err(DriverError::Aot)?;
     let destination = output_path(args, entrypoint)?;
     link_executable(&object.bytes, &destination)?;
     Ok(CommandOutcome {
@@ -419,26 +417,22 @@ fn compile(
 fn run(args: &CliArgs, frontend: &LoadedProgramFrontend) -> Result<CommandOutcome, DriverError> {
     let entrypoint = required_entrypoint(args)?;
     let warnings = require_clean_frontend(args, frontend)?;
-    let entry = frontend.program.entrypoint();
-    let output = frontend
-        .output
-        .module(entry.source_id())
-        .expect("program frontend contains its entrypoint");
-    let bytecode = lower(
-        output.source_file(),
+    let executable = lower_program(
+        &frontend.program,
+        &frontend.output,
         LowerOptions {
-            javascript_compatibility: is_javascript(entry.script_kind()),
+            javascript_compatibility: true,
         },
     )
     .map_err(DriverError::Lower)?;
-    let program = bamts_codegen::compile_jit(&bytecode).map_err(DriverError::Jit)?;
+    let program = bamts_codegen::compile_jit(executable.wire()).map_err(DriverError::Jit)?;
     let mut host = bamts_node::NodeHost::new();
     host.set_argv(
         ["bamts".to_owned(), entrypoint.display().to_string()]
             .into_iter()
             .chain(args.program_args.iter().cloned()),
     );
-    let outcome = run_linked_program(&bytecode, &program, &mut host, &Limits::default())
+    let outcome = run_linked_program(executable.wire(), &program, &mut host, &Limits::default())
         .map_err(DriverError::Native)?;
     let mut stdout = host.stdout().to_vec();
     stdout.extend_from_slice(&outcome.stdout);
@@ -461,10 +455,6 @@ fn required_entrypoint(args: &CliArgs) -> Result<&Path, DriverError> {
         .as_deref()
         .map(Path::new)
         .ok_or(DriverError::MissingEntrypoint)
-}
-
-const fn is_javascript(kind: ScriptKind) -> bool {
-    matches!(kind, ScriptKind::JavaScript | ScriptKind::JavaScriptReact)
 }
 
 fn output_path(args: &CliArgs, entrypoint: &Path) -> Result<PathBuf, DriverError> {
@@ -715,11 +705,18 @@ fn load_program_frontend(args: &CliArgs) -> Result<LoadedProgramFrontend, Driver
         path: PathBuf::from("."),
         source,
     })?;
+    let current_directory = fs::canonicalize(&current_directory)
+        .map_err(|error| DriverError::ProgramLoad(ProgramLoadError::InvalidRoot(error)))?;
     let absolute_entrypoint = if entrypoint.is_absolute() {
         entrypoint.to_path_buf()
     } else {
         current_directory.join(entrypoint)
     };
+    let absolute_entrypoint =
+        fs::canonicalize(&absolute_entrypoint).map_err(|source| DriverError::ReadSource {
+            path: absolute_entrypoint,
+            source,
+        })?;
     let root_path = discover_project_root(&absolute_entrypoint).unwrap_or_else(|| {
         if absolute_entrypoint.starts_with(&current_directory) {
             current_directory
