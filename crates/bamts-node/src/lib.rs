@@ -1,89 +1,24 @@
-//! Deterministic Node-compatible host bindings for BamTS.
-//!
-//! This crate never launches Node or another JavaScript engine. Host objects
-//! use stable numeric identities; the runtime materializes those identities as
-//! local host-function and host-object heap entries.
+//! Node-compatible host capabilities for BamTS.
 
-use std::collections::{BTreeMap, BTreeSet};
+#![forbid(unsafe_code)]
 
-use bamts_native::{Decoded, SlotId, Value};
-use bamts_runtime::{Host, HostBinding, HostThrow};
+use std::collections::BTreeMap;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-const HOST_SEGMENT: u16 = 2;
-const FIRST_DYNAMIC_ENTITY: u32 = 1_024;
+use bamts_runtime::Host;
 
-/// Stable entity identities. Values below [`FIRST_DYNAMIC_ENTITY`] are part of
-/// the bamts-node/runtime contract and must not depend on allocation order.
-pub mod entity {
-    pub const PROCESS: u32 = 1;
-    pub const PROCESS_STDOUT: u32 = 2;
-    pub const PROCESS_ENV: u32 = 3;
-    pub const PROCESS_EXIT: u32 = 4;
-    pub const PROCESS_GET_BUILTIN_MODULE: u32 = 5;
-    pub const STDOUT_WRITE: u32 = 6;
-    pub const PROCESS_VERSIONS: u32 = 7;
-
-    pub const CONSOLE: u32 = 16;
-    pub const CONSOLE_LOG: u32 = 17;
-    pub const CONSOLE_WARN: u32 = 18;
-    pub const CONSOLE_ERROR: u32 = 19;
-
-    pub const JSON: u32 = 32;
-    pub const JSON_STRINGIFY: u32 = 33;
-
-    pub const SET_TIMEOUT: u32 = 48;
-
-    pub const NODE_UTIL: u32 = 64;
-    pub const UTIL_PARSE_ARGS: u32 = 65;
-    pub const NODE_CRYPTO: u32 = 80;
-    pub const CRYPTO_CREATE_HASH: u32 = 81;
-    pub const NODE_VM: u32 = 96;
-    pub const VM_RUN_IN_NEW_CONTEXT: u32 = 97;
-
-    pub const GLOBAL_THIS: u32 = 112;
-}
-
-/// A deterministic module namespace owned by the host.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ModuleRecord {
-    exports: BTreeMap<String, Value>,
-}
-
-impl ModuleRecord {
-    #[must_use]
-    pub fn get(&self, name: &str) -> Option<Value> {
-        self.exports.get(name).copied()
-    }
-
-    pub fn set(&mut self, name: impl Into<String>, value: Value) {
-        self.exports.insert(name.into(), value);
-    }
-
-    pub fn delete(&mut self, name: &str) -> bool {
-        self.exports.remove(name).is_some()
-    }
-
-    #[must_use]
-    pub fn contains(&self, name: &str) -> bool {
-        self.exports.contains_key(name)
-    }
-}
-
-/// Concrete, deterministic Node-compatible host state.
+/// Concrete Node-compatible capability state.
 ///
-/// Environment input is explicit rather than inherited from the embedding
-/// process. This keeps corpus results independent of the machine running them.
+/// Environment and arguments are explicit rather than inherited from the
+/// embedding process, keeping executions independent of the invoking machine.
 pub struct NodeHost {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     exit_code: i32,
+    argv: Vec<String>,
     env: BTreeMap<String, String>,
-    entity_values: BTreeMap<(u32, String), Value>,
-    deleted_properties: BTreeSet<(u32, String)>,
-    modules: BTreeMap<String, u32>,
-    module_records: BTreeMap<u32, ModuleRecord>,
-    exports: ModuleRecord,
-    next_entity: u32,
+    started: Instant,
+    random_state: u64,
 }
 
 impl Default for NodeHost {
@@ -99,17 +34,10 @@ impl NodeHost {
             stdout: Vec::new(),
             stderr: Vec::new(),
             exit_code: 0,
+            argv: Vec::new(),
             env: BTreeMap::new(),
-            entity_values: BTreeMap::new(),
-            deleted_properties: BTreeSet::new(),
-            modules: BTreeMap::from([
-                ("node:crypto".to_owned(), entity::NODE_CRYPTO),
-                ("node:util".to_owned(), entity::NODE_UTIL),
-                ("node:vm".to_owned(), entity::NODE_VM),
-            ]),
-            module_records: BTreeMap::new(),
-            exports: ModuleRecord::default(),
-            next_entity: FIRST_DYNAMIC_ENTITY,
+            started: Instant::now(),
+            random_state: 0x6a09_e667_f3bc_c909,
         }
     }
 
@@ -128,16 +56,13 @@ impl NodeHost {
         self.exit_code
     }
 
-    pub fn write_stdout(&mut self, bytes: &[u8]) {
-        self.stdout.extend_from_slice(bytes);
+    pub fn set_argv(&mut self, argv: impl IntoIterator<Item = String>) {
+        self.argv = argv.into_iter().collect();
     }
 
-    pub fn write_stderr(&mut self, bytes: &[u8]) {
-        self.stderr.extend_from_slice(bytes);
-    }
-
-    pub fn set_exit_code(&mut self, exit_code: i32) {
-        self.exit_code = exit_code;
+    #[must_use]
+    pub fn argv(&self) -> &[String] {
+        &self.argv
     }
 
     #[must_use]
@@ -149,393 +74,297 @@ impl NodeHost {
         self.env.insert(name.into(), value.into());
     }
 
-    pub fn remove_env(&mut self, name: &str) -> bool {
+    pub fn delete_env(&mut self, name: &str) -> bool {
         self.env.remove(name).is_some()
-    }
-
-    #[must_use]
-    pub fn exports(&self) -> &ModuleRecord {
-        &self.exports
-    }
-
-    /// Defines or replaces an export in a deterministic host module record.
-    /// Newly registered module namespace ids are monotonic from 1024.
-    pub fn define_module_export(
-        &mut self,
-        specifier: impl Into<String>,
-        name: impl Into<String>,
-        value: Value,
-    ) -> u32 {
-        let specifier = specifier.into();
-        let entity = match self.modules.get(&specifier) {
-            Some(entity) => *entity,
-            None => {
-                let entity = self.allocate_entity();
-                self.modules.insert(specifier, entity);
-                entity
-            }
-        };
-        self.module_records
-            .entry(entity)
-            .or_default()
-            .set(name, value);
-        entity
-    }
-
-    fn allocate_entity(&mut self) -> u32 {
-        let entity = self.next_entity;
-        self.next_entity = self
-            .next_entity
-            .checked_add(1)
-            .expect("host entity id space exhausted");
-        self.module_records.entry(entity).or_default();
-        entity
-    }
-
-    fn is_object(&self, entity: u32) -> bool {
-        matches!(
-            entity,
-            entity::PROCESS
-                | entity::PROCESS_STDOUT
-                | entity::PROCESS_ENV
-                | entity::PROCESS_VERSIONS
-                | entity::CONSOLE
-                | entity::JSON
-                | entity::NODE_UTIL
-                | entity::NODE_CRYPTO
-                | entity::NODE_VM
-                | entity::GLOBAL_THIS
-        ) || self.module_records.contains_key(&entity)
-    }
-
-    fn static_property(entity: u32, key: &str) -> Option<HostBinding> {
-        match (entity, key) {
-            (entity::PROCESS, "stdout") => Some(HostBinding::Object(entity::PROCESS_STDOUT)),
-            (entity::PROCESS, "env") => Some(HostBinding::Object(entity::PROCESS_ENV)),
-            (entity::PROCESS, "versions") => Some(HostBinding::Object(entity::PROCESS_VERSIONS)),
-            (entity::PROCESS, "exit") => Some(HostBinding::Function(entity::PROCESS_EXIT)),
-            // Deliberately absent: the ohash driver uses optional chaining and
-            // falls back to the statically imported node:crypto module.
-            (entity::PROCESS, "getBuiltinModule") => Some(HostBinding::Primitive(Value::UNDEFINED)),
-            (entity::PROCESS_STDOUT, "write") => Some(HostBinding::Function(entity::STDOUT_WRITE)),
-            (entity::CONSOLE, "log") => Some(HostBinding::Function(entity::CONSOLE_LOG)),
-            (entity::CONSOLE, "warn") => Some(HostBinding::Function(entity::CONSOLE_WARN)),
-            (entity::CONSOLE, "error") => Some(HostBinding::Function(entity::CONSOLE_ERROR)),
-            (entity::JSON, "stringify") => Some(HostBinding::Function(entity::JSON_STRINGIFY)),
-            (entity::NODE_UTIL, "parseArgs") => {
-                Some(HostBinding::Function(entity::UTIL_PARSE_ARGS))
-            }
-            (entity::NODE_CRYPTO, "createHash") => {
-                Some(HostBinding::Function(entity::CRYPTO_CREATE_HASH))
-            }
-            (entity::NODE_VM, "runInNewContext") => {
-                Some(HostBinding::Function(entity::VM_RUN_IN_NEW_CONTEXT))
-            }
-            (entity::GLOBAL_THIS, "process") => Some(HostBinding::Object(entity::PROCESS)),
-            _ => None,
-        }
-    }
-
-    fn primitive_text(value: Value) -> Option<String> {
-        match value.decode()? {
-            Decoded::Number(number) => Some(if number.is_nan() {
-                "NaN".to_owned()
-            } else if number == f64::INFINITY {
-                "Infinity".to_owned()
-            } else if number == f64::NEG_INFINITY {
-                "-Infinity".to_owned()
-            } else {
-                number.to_string()
-            }),
-            Decoded::Int32(bits) => Some((bits as i32).to_string()),
-            Decoded::Undefined => Some("undefined".to_owned()),
-            Decoded::Null => Some("null".to_owned()),
-            Decoded::Boolean(value) => Some(value.to_string()),
-            Decoded::HeapRef(id) if id.segment() == HOST_SEGMENT => {
-                Some("[object Object]".to_owned())
-            }
-            Decoded::HeapRef(_) | Decoded::Hole | Decoded::Uninitialized => None,
-        }
-    }
-
-    fn append_arguments(
-        output: &mut Vec<u8>,
-        arguments: &[Value],
-        separator: &[u8],
-    ) -> Result<(), HostThrow> {
-        for (index, value) in arguments.iter().copied().enumerate() {
-            if index != 0 {
-                output.extend_from_slice(separator);
-            }
-            let text = Self::primitive_text(value).ok_or_else(undefined_throw)?;
-            output.extend_from_slice(text.as_bytes());
-        }
-        Ok(())
-    }
-
-    fn entity_from_value(&self, value: Value) -> Result<u32, HostThrow> {
-        let Some(id) = value.as_heap_ref() else {
-            return Err(undefined_throw());
-        };
-        if id.segment() != HOST_SEGMENT {
-            return Err(undefined_throw());
-        }
-        let entity = id.slot();
-        if self.is_object(entity) || is_function(entity) {
-            Ok(entity)
-        } else {
-            Err(undefined_throw())
-        }
-    }
-}
-
-fn undefined_throw() -> HostThrow {
-    HostThrow {
-        value: Value::UNDEFINED,
-    }
-}
-
-fn is_function(entity: u32) -> bool {
-    matches!(
-        entity,
-        entity::PROCESS_EXIT
-            | entity::PROCESS_GET_BUILTIN_MODULE
-            | entity::STDOUT_WRITE
-            | entity::CONSOLE_LOG
-            | entity::CONSOLE_WARN
-            | entity::CONSOLE_ERROR
-            | entity::JSON_STRINGIFY
-            | entity::SET_TIMEOUT
-            | entity::UTIL_PARSE_ARGS
-            | entity::CRYPTO_CREATE_HASH
-            | entity::VM_RUN_IN_NEW_CONTEXT
-    )
-}
-
-fn foreign_value(entity: u32) -> Value {
-    let id = SlotId::from_parts(HOST_SEGMENT, entity).expect("entity ids are nonzero");
-    Value::heap_ref(id)
-}
-
-fn binding_value(binding: HostBinding) -> Value {
-    match binding {
-        HostBinding::Function(entity) | HostBinding::Object(entity) => foreign_value(entity),
-        HostBinding::Primitive(value) => value,
     }
 }
 
 impl Host for NodeHost {
-    fn resolve_global(&mut self, name: &str) -> Option<HostBinding> {
-        match name {
-            "process" => Some(HostBinding::Object(entity::PROCESS)),
-            "console" => Some(HostBinding::Object(entity::CONSOLE)),
-            "JSON" => Some(HostBinding::Object(entity::JSON)),
-            "setTimeout" => Some(HostBinding::Function(entity::SET_TIMEOUT)),
-            "globalThis" => Some(HostBinding::Object(entity::GLOBAL_THIS)),
+    fn write_stdout(&mut self, bytes: &[u8]) {
+        self.stdout.extend_from_slice(bytes);
+    }
+
+    fn write_stderr(&mut self, bytes: &[u8]) {
+        self.stderr.extend_from_slice(bytes);
+    }
+
+    fn exit_code(&self) -> i32 {
+        self.exit_code
+    }
+
+    fn set_exit_code(&mut self, exit_code: i32) {
+        self.exit_code = exit_code;
+    }
+
+    fn argv(&self) -> &[String] {
+        &self.argv
+    }
+
+    fn env(&self, name: &str) -> Option<&str> {
+        self.env.get(name).map(String::as_str)
+    }
+
+    fn set_env(&mut self, name: &str, value: &str) {
+        self.env.insert(name.to_owned(), value.to_owned());
+    }
+
+    fn delete_env(&mut self, name: &str) -> bool {
+        self.env.remove(name).is_some()
+    }
+
+    fn now_ms(&mut self) -> u64 {
+        let elapsed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn monotonic_ns(&mut self) -> u64 {
+        u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    fn random(&mut self) -> f64 {
+        // xorshift64*: deterministic, non-cryptographic entropy for Math.random.
+        let mut state = self.random_state;
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        self.random_state = state;
+        let bits = state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11;
+        (bits as f64) * (1.0 / ((1_u64 << 53) as f64))
+    }
+
+    fn hash(&mut self, algorithm: &str, data: &[u8]) -> Option<Vec<u8>> {
+        match algorithm.to_ascii_lowercase().replace('-', "").as_str() {
+            "sha256" => Some(sha256(data).to_vec()),
+            "sha512" => Some(sha512(data).to_vec()),
             _ => None,
         }
     }
+}
 
-    fn entity_get(&mut self, entity: u32, key: &str) -> Result<HostBinding, HostThrow> {
-        if !self.is_object(entity) && !is_function(entity) {
-            return Err(undefined_throw());
-        }
-        let owned_key = (entity, key.to_owned());
-        if self.deleted_properties.contains(&owned_key) {
-            return Ok(HostBinding::Primitive(Value::UNDEFINED));
-        }
-        if let Some(value) = self.entity_values.get(&owned_key).copied() {
-            return Ok(HostBinding::Primitive(value));
-        }
-        if entity == entity::PROCESS_ENV {
-            // Environment strings cannot be represented as Primitive(Value)
-            // by the fixed host contract. A missing binding is still exact.
-            return if self.env.contains_key(key) {
-                Err(undefined_throw())
-            } else {
-                Ok(HostBinding::Primitive(Value::UNDEFINED))
-            };
-        }
-        if let Some(value) = self
-            .module_records
-            .get(&entity)
-            .and_then(|record| record.get(key))
-        {
-            return Ok(HostBinding::Primitive(value));
-        }
-        Ok(Self::static_property(entity, key).unwrap_or(HostBinding::Primitive(Value::UNDEFINED)))
+fn sha256(data: &[u8]) -> [u8; 32] {
+    const INITIAL: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut padded = data.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
     }
-
-    fn entity_set(&mut self, entity: u32, key: &str, value: Value) -> Result<(), HostThrow> {
-        if !self.is_object(entity) {
-            return Err(undefined_throw());
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+    let mut state = INITIAL;
+    for block in padded.chunks_exact(64) {
+        let mut words = [0_u32; 64];
+        for (word, bytes) in words[..16].iter_mut().zip(block.chunks_exact(4)) {
+            *word = u32::from_be_bytes(bytes.try_into().expect("four bytes"));
         }
-        let owned_key = (entity, key.to_owned());
-        self.deleted_properties.remove(&owned_key);
-        if let Some(record) = self.module_records.get_mut(&entity) {
-            record.set(key, value);
-        } else {
-            self.entity_values.insert(owned_key, value);
+        for index in 16..64 {
+            let s0 = words[index - 15].rotate_right(7)
+                ^ words[index - 15].rotate_right(18)
+                ^ (words[index - 15] >> 3);
+            let s1 = words[index - 2].rotate_right(17)
+                ^ words[index - 2].rotate_right(19)
+                ^ (words[index - 2] >> 10);
+            words[index] = words[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(words[index - 7])
+                .wrapping_add(s1);
         }
-        Ok(())
-    }
-
-    fn entity_delete(&mut self, entity: u32, key: &str) -> Result<bool, HostThrow> {
-        if !self.is_object(entity) {
-            return Err(undefined_throw());
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        for index in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choice = (e & f) ^ (!e & g);
+            let t1 = h
+                .wrapping_add(s1)
+                .wrapping_add(choice)
+                .wrapping_add(K[index])
+                .wrapping_add(words[index]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(majority);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
         }
-        if entity == entity::PROCESS_ENV {
-            let removed = self.env.remove(key).is_some()
-                | self
-                    .entity_values
-                    .remove(&(entity, key.to_owned()))
-                    .is_some();
-            return Ok(removed);
-        }
-        if let Some(record) = self.module_records.get_mut(&entity) {
-            return Ok(record.delete(key));
-        }
-        let owned_key = (entity, key.to_owned());
-        let removed = self.entity_values.remove(&owned_key).is_some()
-            || Self::static_property(entity, key).is_some();
-        if removed {
-            self.deleted_properties.insert(owned_key);
-        }
-        Ok(removed)
-    }
-
-    fn entity_has(&mut self, entity: u32, key: &str) -> Result<bool, HostThrow> {
-        if !self.is_object(entity) {
-            return Err(undefined_throw());
-        }
-        let owned_key = (entity, key.to_owned());
-        if self.deleted_properties.contains(&owned_key) {
-            return Ok(false);
-        }
-        Ok(self.entity_values.contains_key(&owned_key)
-            || (entity == entity::PROCESS_ENV && self.env.contains_key(key))
-            || self
-                .module_records
-                .get(&entity)
-                .is_some_and(|record| record.contains(key))
-            || Self::static_property(entity, key).is_some())
-    }
-
-    fn entity_call(
-        &mut self,
-        entity: u32,
-        _this: Value,
-        arguments: &[Value],
-    ) -> Result<HostBinding, HostThrow> {
-        match entity {
-            entity::STDOUT_WRITE => {
-                Self::append_arguments(&mut self.stdout, arguments, b"")?;
-                Ok(HostBinding::Primitive(Value::TRUE))
-            }
-            entity::CONSOLE_LOG => {
-                Self::append_arguments(&mut self.stdout, arguments, b" ")?;
-                self.stdout.push(b'\n');
-                Ok(HostBinding::Primitive(Value::UNDEFINED))
-            }
-            entity::CONSOLE_WARN | entity::CONSOLE_ERROR => {
-                Self::append_arguments(&mut self.stderr, arguments, b" ")?;
-                self.stderr.push(b'\n');
-                Ok(HostBinding::Primitive(Value::UNDEFINED))
-            }
-            entity::PROCESS_EXIT => {
-                self.exit_code = arguments
-                    .first()
-                    .and_then(|value| value.as_int32())
-                    .map_or(0, |bits| bits as i32);
-                Ok(HostBinding::Primitive(Value::UNDEFINED))
-            }
-            // JSON.stringify must return a freshly allocated runtime string,
-            // which the fixed HostBinding contract cannot mint. Left as an
-            // explicit throw rather than silently wrong output; requires a
-            // runtime value-allocation bridge (escalated cross-crate).
-            entity::JSON_STRINGIFY => Err(undefined_throw()),
-            entity::VM_RUN_IN_NEW_CONTEXT => {
-                let object = self.allocate_entity();
-                Ok(HostBinding::Object(object))
-            }
-            // These APIs require reading runtime strings/arrays and allocating
-            // runtime strings/objects, which HostBinding intentionally cannot do.
-            entity::PROCESS_GET_BUILTIN_MODULE
-            | entity::SET_TIMEOUT
-            | entity::UTIL_PARSE_ARGS
-            | entity::CRYPTO_CREATE_HASH => Err(undefined_throw()),
-            _ => Err(undefined_throw()),
+        for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *slot = slot.wrapping_add(value);
         }
     }
-
-    fn entity_construct(
-        &mut self,
-        _entity: u32,
-        _arguments: &[Value],
-    ) -> Result<HostBinding, HostThrow> {
-        Err(undefined_throw())
+    let mut digest = [0_u8; 32];
+    for (chunk, value) in digest.chunks_exact_mut(4).zip(state) {
+        chunk.copy_from_slice(&value.to_be_bytes());
     }
+    digest
+}
 
-    fn entity_instance_of(&mut self, _entity: u32, _value: Value) -> Result<bool, HostThrow> {
-        Ok(false)
+fn sha512(data: &[u8]) -> [u8; 64] {
+    const INITIAL: [u64; 8] = [
+        0x6a09e667f3bcc908,
+        0xbb67ae8584caa73b,
+        0x3c6ef372fe94f82b,
+        0xa54ff53a5f1d36f1,
+        0x510e527fade682d1,
+        0x9b05688c2b3e6c1f,
+        0x1f83d9abfb41bd6b,
+        0x5be0cd19137e2179,
+    ];
+    const K: [u64; 80] = [
+        0x428a2f98d728ae22,
+        0x7137449123ef65cd,
+        0xb5c0fbcfec4d3b2f,
+        0xe9b5dba58189dbbc,
+        0x3956c25bf348b538,
+        0x59f111f1b605d019,
+        0x923f82a4af194f9b,
+        0xab1c5ed5da6d8118,
+        0xd807aa98a3030242,
+        0x12835b0145706fbe,
+        0x243185be4ee4b28c,
+        0x550c7dc3d5ffb4e2,
+        0x72be5d74f27b896f,
+        0x80deb1fe3b1696b1,
+        0x9bdc06a725c71235,
+        0xc19bf174cf692694,
+        0xe49b69c19ef14ad2,
+        0xefbe4786384f25e3,
+        0x0fc19dc68b8cd5b5,
+        0x240ca1cc77ac9c65,
+        0x2de92c6f592b0275,
+        0x4a7484aa6ea6e483,
+        0x5cb0a9dcbd41fbd4,
+        0x76f988da831153b5,
+        0x983e5152ee66dfab,
+        0xa831c66d2db43210,
+        0xb00327c898fb213f,
+        0xbf597fc7beef0ee4,
+        0xc6e00bf33da88fc2,
+        0xd5a79147930aa725,
+        0x06ca6351e003826f,
+        0x142929670a0e6e70,
+        0x27b70a8546d22ffc,
+        0x2e1b21385c26c926,
+        0x4d2c6dfc5ac42aed,
+        0x53380d139d95b3df,
+        0x650a73548baf63de,
+        0x766a0abb3c77b2a8,
+        0x81c2c92e47edaee6,
+        0x92722c851482353b,
+        0xa2bfe8a14cf10364,
+        0xa81a664bbc423001,
+        0xc24b8b70d0f89791,
+        0xc76c51a30654be30,
+        0xd192e819d6ef5218,
+        0xd69906245565a910,
+        0xf40e35855771202a,
+        0x106aa07032bbd1b8,
+        0x19a4c116b8d2d0c8,
+        0x1e376c085141ab53,
+        0x2748774cdf8eeb99,
+        0x34b0bcb5e19b48a8,
+        0x391c0cb3c5c95a63,
+        0x4ed8aa4ae3418acb,
+        0x5b9cca4f7763e373,
+        0x682e6ff3d6b2b8a3,
+        0x748f82ee5defb2fc,
+        0x78a5636f43172f60,
+        0x84c87814a1f0ab72,
+        0x8cc702081a6439ec,
+        0x90befffa23631e28,
+        0xa4506cebde82bde9,
+        0xbef9a3f7b2c67915,
+        0xc67178f2e372532b,
+        0xca273eceea26619c,
+        0xd186b8c721c0c207,
+        0xeada7dd6cde0eb1e,
+        0xf57d4f7fee6ed178,
+        0x06f067aa72176fba,
+        0x0a637dc5a2c898a6,
+        0x113f9804bef90dae,
+        0x1b710b35131c471b,
+        0x28db77f523047d84,
+        0x32caab7b40c72493,
+        0x3c9ebe0a15c9bebc,
+        0x431d67c49c100d4c,
+        0x4cc5d4becb3e42b6,
+        0x597f299cfc657e2a,
+        0x5fcb6fab3ad6faec,
+        0x6c44198c4a475817,
+    ];
+    let bit_len = (data.len() as u128).wrapping_mul(8);
+    let mut padded = data.to_vec();
+    padded.push(0x80);
+    while padded.len() % 128 != 112 {
+        padded.push(0);
     }
-
-    fn property_get(&mut self, object: Value, key: &str) -> Result<Value, HostThrow> {
-        let entity = self.entity_from_value(object)?;
-        self.entity_get(entity, key).map(binding_value)
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+    let mut state = INITIAL;
+    for block in padded.chunks_exact(128) {
+        let mut words = [0_u64; 80];
+        for (word, bytes) in words[..16].iter_mut().zip(block.chunks_exact(8)) {
+            *word = u64::from_be_bytes(bytes.try_into().expect("eight bytes"));
+        }
+        for index in 16..80 {
+            let s0 = words[index - 15].rotate_right(1)
+                ^ words[index - 15].rotate_right(8)
+                ^ (words[index - 15] >> 7);
+            let s1 = words[index - 2].rotate_right(19)
+                ^ words[index - 2].rotate_right(61)
+                ^ (words[index - 2] >> 6);
+            words[index] = words[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(words[index - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        for index in 0..80 {
+            let s1 = e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
+            let choice = (e & f) ^ (!e & g);
+            let t1 = h
+                .wrapping_add(s1)
+                .wrapping_add(choice)
+                .wrapping_add(K[index])
+                .wrapping_add(words[index]);
+            let s0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(majority);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *slot = slot.wrapping_add(value);
+        }
     }
-
-    fn property_set(&mut self, object: Value, key: &str, value: Value) -> Result<(), HostThrow> {
-        let entity = self.entity_from_value(object)?;
-        self.entity_set(entity, key, value)
+    let mut digest = [0_u8; 64];
+    for (chunk, value) in digest.chunks_exact_mut(8).zip(state) {
+        chunk.copy_from_slice(&value.to_be_bytes());
     }
-
-    fn property_delete(&mut self, object: Value, key: &str) -> Result<bool, HostThrow> {
-        let entity = self.entity_from_value(object)?;
-        self.entity_delete(entity, key)
-    }
-
-    fn property_has(&mut self, object: Value, key: &str) -> Result<bool, HostThrow> {
-        let entity = self.entity_from_value(object)?;
-        self.entity_has(entity, key)
-    }
-
-    fn call(
-        &mut self,
-        callee: Value,
-        this: Value,
-        arguments: &[Value],
-    ) -> Result<Value, HostThrow> {
-        let entity = self.entity_from_value(callee)?;
-        self.entity_call(entity, this, arguments).map(binding_value)
-    }
-
-    fn construct(&mut self, callee: Value, arguments: &[Value]) -> Result<Value, HostThrow> {
-        let entity = self.entity_from_value(callee)?;
-        self.entity_construct(entity, arguments).map(binding_value)
-    }
-
-    fn instance_of(&mut self, value: Value, constructor: Value) -> Result<bool, HostThrow> {
-        let entity = self.entity_from_value(constructor)?;
-        self.entity_instance_of(entity, value)
-    }
-
-    fn awaited(&mut self, value: Value) -> Result<Value, HostThrow> {
-        Ok(value)
-    }
-
-    fn import(&mut self, specifier: &str) -> Result<Value, HostThrow> {
-        self.modules
-            .get(specifier)
-            .copied()
-            .map(foreign_value)
-            .ok_or_else(undefined_throw)
-    }
-
-    fn export(&mut self, name: &str, value: Value) -> Result<(), HostThrow> {
-        self.exports.set(name, value);
-        Ok(())
-    }
+    digest
 }
 
 #[cfg(feature = "aot-main")]
@@ -559,9 +388,7 @@ fn run_aot_main() -> i32 {
         Ok(outcome) => outcome,
         Err(_) => return 1,
     };
-
-    let stdout = std::io::stdout();
-    let mut stdout = stdout.lock();
+    let mut stdout = std::io::stdout().lock();
     if stdout.write_all(host.stdout()).is_err() || stdout.write_all(&outcome.stdout).is_err() {
         return 1;
     }
@@ -574,7 +401,6 @@ fn run_aot_main() -> i32 {
 
 /// C process entry for a linked BamTS AOT image.
 #[cfg(feature = "aot-main")]
-#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i32 {
     run_aot_main()
@@ -584,165 +410,55 @@ pub extern "C" fn main() -> i32 {
 mod tests {
     use super::*;
 
-    fn object(binding: HostBinding) -> u32 {
-        match binding {
-            HostBinding::Object(entity) => entity,
-            _ => panic!("expected object binding"),
+    fn hex(bytes: &[u8]) -> String {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut text = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            text.push(char::from(DIGITS[usize::from(byte >> 4)]));
+            text.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
         }
-    }
-
-    fn function(binding: HostBinding) -> u32 {
-        match binding {
-            HostBinding::Function(entity) => entity,
-            _ => panic!("expected function binding"),
-        }
+        text
     }
 
     #[test]
-    fn global_and_nested_entity_ids_are_stable() {
-        let mut first = NodeHost::new();
-        let mut second = NodeHost::new();
-        assert_eq!(
-            object(first.resolve_global("process").unwrap()),
-            object(second.resolve_global("process").unwrap())
-        );
-        assert_eq!(
-            object(first.entity_get(entity::PROCESS, "stdout").unwrap()),
-            entity::PROCESS_STDOUT
-        );
-        assert_eq!(
-            function(first.entity_get(entity::PROCESS_STDOUT, "write").unwrap()),
-            entity::STDOUT_WRITE
-        );
-        assert_eq!(
-            function(second.entity_get(entity::CONSOLE, "log").unwrap()),
-            entity::CONSOLE_LOG
-        );
-    }
-
-    #[test]
-    fn console_and_process_capture_deterministic_bytes_and_exit() {
+    fn capabilities_capture_bytes_and_mutate_process_state() {
         let mut host = NodeHost::new();
-        host.entity_call(
-            entity::CONSOLE_LOG,
-            Value::UNDEFINED,
-            &[Value::int32(42), Value::TRUE],
-        )
-        .unwrap();
-        host.entity_call(entity::STDOUT_WRITE, Value::UNDEFINED, &[Value::FALSE])
-            .unwrap();
-        host.entity_call(
-            entity::PROCESS_EXIT,
-            Value::UNDEFINED,
-            &[Value::int32((-7_i32) as u32)],
-        )
-        .unwrap();
-        assert_eq!(host.stdout(), b"42 true\nfalse");
-        assert_eq!(host.exit_code(), -7);
-    }
-
-    #[test]
-    fn environment_is_explicit_ordered_and_deletable() {
-        let mut host = NodeHost::new();
-        assert_eq!(host.env("NODE_ENV"), None);
-        host.set_env("NODE_ENV", "production");
-        host.set_env("A", "first");
-        assert_eq!(host.env("NODE_ENV"), Some("production"));
-        assert!(host.entity_has(entity::PROCESS_ENV, "NODE_ENV").unwrap());
-        assert!(host.entity_delete(entity::PROCESS_ENV, "NODE_ENV").unwrap());
+        Host::write_stdout(&mut host, b"out");
+        Host::write_stderr(&mut host, b"err");
+        Host::set_exit_code(&mut host, 23);
+        host.set_argv(["bamts".to_owned(), "file.ts".to_owned()]);
+        Host::set_env(&mut host, "NODE_ENV", "test");
+        assert_eq!(host.stdout(), b"out");
+        assert_eq!(host.stderr(), b"err");
+        assert_eq!(host.exit_code(), 23);
+        assert_eq!(host.argv(), ["bamts", "file.ts"]);
+        assert_eq!(host.env("NODE_ENV"), Some("test"));
+        assert!(Host::delete_env(&mut host, "NODE_ENV"));
         assert_eq!(host.env("NODE_ENV"), None);
     }
 
     #[test]
-    fn writable_console_properties_round_trip_runtime_values() {
-        let mut host = NodeHost::new();
-        host.entity_set(entity::CONSOLE, "warn", Value::int32(91))
-            .unwrap();
-        assert!(matches!(
-            host.entity_get(entity::CONSOLE, "warn").unwrap(),
-            HostBinding::Primitive(value) if value == Value::int32(91)
-        ));
-        assert!(host.entity_delete(entity::CONSOLE, "warn").unwrap());
-        assert!(!host.entity_has(entity::CONSOLE, "warn").unwrap());
-    }
-
-    #[test]
-    fn builtin_and_user_module_records_are_deterministic() {
-        let mut first = NodeHost::new();
-        let mut second = NodeHost::new();
-        assert_eq!(
-            first.import("node:vm").unwrap(),
-            foreign_value(entity::NODE_VM)
-        );
-        let first_id = first.define_module_export("local:a", "default", Value::TRUE);
-        let second_id = second.define_module_export("local:a", "default", Value::TRUE);
-        assert_eq!(first_id, FIRST_DYNAMIC_ENTITY);
-        assert_eq!(first_id, second_id);
-        assert_eq!(first.import("local:a").unwrap(), foreign_value(first_id));
-        assert!(matches!(
-            first.entity_get(first_id, "default").unwrap(),
-            HostBinding::Primitive(Value::TRUE)
-        ));
-        first.export("answer", Value::int32(42)).unwrap();
-        assert_eq!(first.exports().get("answer"), Some(Value::int32(42)));
-    }
-
-    #[test]
-    fn vm_returns_fresh_deterministic_host_objects() {
-        let mut first = NodeHost::new();
-        let mut second = NodeHost::new();
-        let first_object = object(
-            first
-                .entity_call(entity::VM_RUN_IN_NEW_CONTEXT, Value::UNDEFINED, &[])
-                .unwrap(),
-        );
-        let second_object = object(
-            second
-                .entity_call(entity::VM_RUN_IN_NEW_CONTEXT, Value::UNDEFINED, &[])
-                .unwrap(),
-        );
-        assert_eq!(first_object, FIRST_DYNAMIC_ENTITY);
-        assert_eq!(first_object, second_object);
-    }
-
-    #[test]
-    fn corpus_external_surface_is_exact() {
+    fn sha2_matches_standard_vectors() {
         let mut host = NodeHost::new();
         assert_eq!(
-            host.resolve_global("globalThis"),
-            Some(HostBinding::Object(entity::GLOBAL_THIS))
+            hex(&Host::hash(&mut host, "sha-256", b"abc").unwrap()),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         assert_eq!(
-            host.resolve_global("setTimeout"),
-            Some(HostBinding::Function(entity::SET_TIMEOUT))
+            hex(&Host::hash(&mut host, "SHA512", b"abc").unwrap()),
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
         );
-        assert_eq!(
-            object(host.entity_get(entity::GLOBAL_THIS, "process").unwrap()),
-            entity::PROCESS
-        );
-        assert_eq!(
-            function(host.entity_get(entity::NODE_UTIL, "parseArgs").unwrap()),
-            entity::UTIL_PARSE_ARGS
-        );
-        assert_eq!(
-            function(host.entity_get(entity::NODE_CRYPTO, "createHash").unwrap()),
-            entity::CRYPTO_CREATE_HASH
-        );
-        assert_eq!(
-            function(host.entity_get(entity::NODE_VM, "runInNewContext").unwrap()),
-            entity::VM_RUN_IN_NEW_CONTEXT
-        );
-        assert!(host.import("node:util").is_ok());
-        assert!(host.import("node:crypto").is_ok());
-        assert!(host.import("node:vm").is_ok());
-        assert!(host.import("node:fs").is_err());
+        assert_eq!(Host::hash(&mut host, "md5", b"abc"), None);
     }
 
     #[test]
-    fn forged_entity_ids_are_rejected() {
+    fn clocks_and_random_are_capabilities() {
         let mut host = NodeHost::new();
-        assert!(host.entity_get(u32::MAX, "x").is_err());
-        assert!(host.entity_set(u32::MAX, "x", Value::TRUE).is_err());
-        assert!(host.entity_call(u32::MAX, Value::UNDEFINED, &[]).is_err());
+        assert!(Host::now_ms(&mut host) > 0);
+        let first = Host::monotonic_ns(&mut host);
+        let second = Host::monotonic_ns(&mut host);
+        assert!(second >= first);
+        let random = Host::random(&mut host);
+        assert!((0.0..1.0).contains(&random));
     }
 }

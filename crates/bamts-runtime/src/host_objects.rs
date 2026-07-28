@@ -1,0 +1,370 @@
+use std::collections::BTreeMap;
+
+use bamts_native::{Decoded, Value};
+
+use crate::intrinsics::{self, BuiltinDef, BuiltinOutcome, BuiltinTable};
+use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
+
+pub(crate) fn install<H: Host>(
+    heap: &mut Vec<HeapEntry>,
+    globals: &mut BTreeMap<String, Value>,
+    builtins: &mut BuiltinTable<H>,
+) {
+    let object_prototype = builtins.object_prototype();
+    let console = object(heap, object_prototype);
+    for (name, handler) in [
+        ("log", console_log::<H> as _),
+        ("warn", console_warn::<H> as _),
+        ("error", console_error::<H> as _),
+        ("debug", console_debug::<H> as _),
+        ("info", console_info::<H> as _),
+    ] {
+        let function = register(heap, builtins, name, 0, handler);
+        put(heap, console, name, function);
+    }
+
+    let stdout = stream(
+        heap,
+        builtins,
+        object_prototype,
+        "stdout",
+        stdout_write::<H>,
+    );
+    let stderr = stream(
+        heap,
+        builtins,
+        object_prototype,
+        "stderr",
+        stderr_write::<H>,
+    );
+    let env = intrinsics::push(
+        heap,
+        HeapEntry::ProcessEnv {
+            prototype: Some(object_prototype),
+            extensible: true,
+        },
+    );
+    let argv = intrinsics::push(
+        heap,
+        HeapEntry::Array {
+            elements: Vec::new(),
+            properties: PropertyMap::default(),
+            prototype: Some(builtins.array_prototype()),
+            extensible: true,
+        },
+    );
+    let versions = object(heap, object_prototype);
+    put_text(heap, versions, "node", "22.0.0");
+
+    let process = object(heap, object_prototype);
+    put(heap, process, "stdout", stdout);
+    put(heap, process, "stderr", stderr);
+    put(heap, process, "env", env);
+    put(heap, process, "argv", argv);
+    put_text(heap, process, "platform", std::env::consts::OS);
+    put_text(heap, process, "version", "v22.0.0");
+    put(heap, process, "versions", versions);
+    for (name, length, handler) in [
+        ("exit", 1, process_exit::<H> as _),
+        ("nextTick", 1, process_next_tick::<H> as _),
+    ] {
+        let function = register(heap, builtins, name, length, handler);
+        put(heap, process, name, function);
+    }
+
+    globals.insert("console".to_owned(), console);
+    globals.insert("process".to_owned(), process);
+
+    let global_this = object(heap, object_prototype);
+    for (name, value) in globals.iter() {
+        put(heap, global_this, name, *value);
+    }
+    put(heap, global_this, "globalThis", global_this);
+    globals.insert("globalThis".to_owned(), global_this);
+}
+
+fn stream<H: Host>(
+    heap: &mut Vec<HeapEntry>,
+    builtins: &mut BuiltinTable<H>,
+    object_prototype: Value,
+    name: &'static str,
+    handler: crate::intrinsics::BuiltinHandler<H>,
+) -> Value {
+    let stream = object(heap, object_prototype);
+    let write = register(heap, builtins, "write", 1, handler);
+    put(heap, stream, "write", write);
+    put_text(heap, stream, "_name", name);
+    stream
+}
+
+fn register<H: Host>(
+    heap: &mut Vec<HeapEntry>,
+    builtins: &mut BuiltinTable<H>,
+    name: &'static str,
+    length: u32,
+    handler: crate::intrinsics::BuiltinHandler<H>,
+) -> Value {
+    let id = builtins.register(BuiltinDef {
+        name,
+        length,
+        handler,
+    });
+    intrinsics::native_function(heap, id, name, length)
+}
+
+fn object(heap: &mut Vec<HeapEntry>, prototype: Value) -> Value {
+    intrinsics::push(
+        heap,
+        HeapEntry::Object {
+            properties: PropertyMap::default(),
+            prototype: Some(prototype),
+            boxed_primitive: None,
+            extensible: true,
+        },
+    )
+}
+
+fn put(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) {
+    let index = heap_index(object);
+    let properties = match &mut heap[index] {
+        HeapEntry::Object { properties, .. }
+        | HeapEntry::Array { properties, .. }
+        | HeapEntry::NativeFunction { properties, .. } => properties,
+        _ => unreachable!("host object installation target owns properties"),
+    };
+    properties.insert(
+        PropertyKey::Named(name.to_owned()),
+        Property::Data {
+            value,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        },
+    );
+}
+
+fn put_text(heap: &mut Vec<HeapEntry>, object: Value, name: &str, text: &str) {
+    let value = intrinsics::push(heap, HeapEntry::String(text.to_owned()));
+    put(heap, object, name, value);
+}
+
+fn heap_index(value: Value) -> usize {
+    let Some(Decoded::HeapRef(id)) = value.decode() else {
+        unreachable!("installer values are heap references");
+    };
+    id.slot() as usize - 1
+}
+
+fn console_log<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    console_write(machine, args, false)
+}
+
+fn console_warn<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    console_write(machine, args, true)
+}
+
+fn console_error<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    console_warn(machine, this, args, constructing)
+}
+
+fn console_debug<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    console_log(machine, this, args, constructing)
+}
+
+fn console_info<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    console_log(machine, this, args, constructing)
+}
+
+fn console_write<H: Host>(
+    machine: &mut Machine<'_, H>,
+    args: &[Value],
+    stderr: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let mut line = String::new();
+    for (index, value) in args.iter().copied().enumerate() {
+        if index != 0 {
+            line.push(' ');
+        }
+        line.push_str(&machine.console_format(value, true, 0)?);
+    }
+    line.push('\n');
+    if stderr {
+        machine.host.write_stderr(line.as_bytes());
+    } else {
+        machine.host.write_stdout(line.as_bytes());
+    }
+    Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+}
+
+fn stdout_write<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let text = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    machine.host.write_stdout(text.as_bytes());
+    Ok(BuiltinOutcome::Value(Value::TRUE))
+}
+
+fn stderr_write<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let text = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    machine.host.write_stderr(text.as_bytes());
+    Ok(BuiltinOutcome::Value(Value::TRUE))
+}
+
+fn process_exit<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let code = args
+        .first()
+        .copied()
+        .and_then(Value::as_int32)
+        .map_or(machine.host.exit_code(), |raw| raw as i32);
+    machine.host.set_exit_code(code);
+    Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+}
+
+fn process_next_tick<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let Some((&callback, rest)) = args.split_first() else {
+        return Ok(BuiltinOutcome::Value(Value::UNDEFINED));
+    };
+    machine
+        .call_value(callback, Value::UNDEFINED, rest)
+        .map(BuiltinOutcome::Value)
+}
+
+impl<H: Host> Machine<'_, H> {
+    fn console_format(
+        &self,
+        value: Value,
+        top_level: bool,
+        depth: usize,
+    ) -> Result<String, EvalFailure> {
+        match value.decode() {
+            Some(Decoded::Undefined | Decoded::Uninitialized | Decoded::Hole) | None => {
+                Ok("undefined".to_owned())
+            }
+            Some(Decoded::Null) => Ok("null".to_owned()),
+            Some(Decoded::Boolean(value)) => Ok(value.to_string()),
+            Some(Decoded::Int32(value)) => Ok((value as i32).to_string()),
+            Some(Decoded::Number(value)) => Ok(crate::format_number(value)),
+            Some(Decoded::HeapRef(_)) => {
+                let index = self
+                    .runtime_slot(value)
+                    .map_err(EvalFailure::Runtime)?
+                    .ok_or(EvalFailure::Runtime(
+                        crate::RuntimeErrorKind::InvalidValue { value },
+                    ))?;
+                match &self.heap[index] {
+                    HeapEntry::String(text) if top_level => Ok(text.clone()),
+                    HeapEntry::String(text) => Ok(quote(text)),
+                    HeapEntry::BigInt(text) => Ok(format!("{text}n")),
+                    HeapEntry::PrivateName { description } => Ok(format!("Symbol({description})")),
+                    HeapEntry::Array { elements, .. } => {
+                        if depth >= 2 {
+                            return Ok("[Array]".to_owned());
+                        }
+                        let mut parts = Vec::with_capacity(elements.len());
+                        for element in elements {
+                            if *element == Value::HOLE {
+                                parts.push("<1 empty item>".to_owned());
+                            } else {
+                                parts.push(self.console_format(*element, false, depth + 1)?);
+                            }
+                        }
+                        Ok(format!("[ {} ]", parts.join(", ")))
+                    }
+                    HeapEntry::Object { properties, .. } => {
+                        if depth >= 2 {
+                            return Ok("[Object]".to_owned());
+                        }
+                        let mut parts = Vec::new();
+                        for (key, property) in properties {
+                            let (
+                                PropertyKey::Named(name),
+                                Property::Data {
+                                    value,
+                                    enumerable: true,
+                                    ..
+                                },
+                            ) = (key, property)
+                            else {
+                                continue;
+                            };
+                            parts.push(format!(
+                                "{}: {}",
+                                inspect_key(name),
+                                self.console_format(*value, false, depth + 1)?
+                            ));
+                        }
+                        Ok(format!("{{ {} }}", parts.join(", ")))
+                    }
+                    HeapEntry::NativeFunction { .. } | HeapEntry::Function { .. } => {
+                        Ok("[Function]".to_owned())
+                    }
+                    HeapEntry::RegExp { pattern, flags, .. } => Ok(format!("/{pattern}/{flags}")),
+                    HeapEntry::Iterator { .. } | HeapEntry::ProcessEnv { .. } => {
+                        Ok("{}".to_owned())
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn quote(text: &str) -> String {
+    let escaped = text.replace('\\', "\\\\").replace('\'', "\\'");
+    format!("'{escaped}'")
+}
+
+fn inspect_key(key: &str) -> String {
+    let mut chars = key.chars();
+    let identifier = chars
+        .next()
+        .is_some_and(|first| first == '_' || first == '$' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric());
+    if identifier {
+        key.to_owned()
+    } else {
+        quote(key)
+    }
+}

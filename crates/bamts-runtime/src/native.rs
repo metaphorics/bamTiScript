@@ -60,8 +60,8 @@ use bamts_native::{
 
 use crate::intrinsics::BuiltinOutcome;
 use crate::{
-    CalleeKind, EvalFailure, Execution, ExecutionOutcome, GetOutcome, HeapEntry, Host, HostThrow,
-    Limits, Machine, PropertyMap, RuntimeError, RuntimeErrorKind, SetOutcome, ThrowOrigin,
+    CalleeKind, EvalFailure, Execution, ExecutionOutcome, GetOutcome, HeapEntry, Host, Limits,
+    Machine, PropertyMap, RuntimeError, RuntimeErrorKind, SetOutcome, ThrowOrigin,
     accessor_from_selector, binary_from_selector, iterator_kind_from_selector, unary_from_selector,
 };
 
@@ -193,7 +193,7 @@ struct Activation {
     args: Vec<Value>,
     arguments_object: Option<Value>,
     /// The resumed value delivered to a pending `ResumeValue` (linked backend).
-    pending_resume: Option<Result<Value, HostThrow>>,
+    pending_resume: Option<Value>,
 }
 
 /// A thrown value together with its origin, threaded out of `dispatch` through
@@ -451,7 +451,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         let mut frame =
             NativeFrame::new(&mut shadow, registers.as_mut_slice()).ok_or_else(|| {
                 self.error_at(
-                    RuntimeErrorKind::InvalidHostValue {
+                    RuntimeErrorKind::InvalidValue {
                         value: Value::UNDEFINED,
                     },
                     function,
@@ -508,37 +508,20 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         }
                     }
                 }
-                Instruction::Suspend { dst, src, resume } => {
-                    let yielded = frame.register(src.get());
-                    // The suspension driver may re-enter; take no borrow across it.
-                    let awaited = self.machine.borrow_mut().host.awaited(yielded);
-                    match awaited {
-                        Ok(value) => {
-                            if let Err(kind) = self.machine.borrow().validate_host_value(value) {
-                                return Err(self.error_at(kind, function, pc));
-                            }
-                            frame.set_register(dst.get(), value);
-                            pc = resume.get() as usize;
-                        }
-                        Err(thrown) => {
-                            if let Err(kind) =
-                                self.machine.borrow().validate_host_value(thrown.value)
-                            {
-                                return Err(self.error_at(kind, function, pc));
-                            }
-                            match self.raise(
-                                &mut frame,
-                                function,
-                                pc,
-                                thrown.value,
-                                ThrowOrigin::Host,
-                            ) {
-                                Flow::Next => pc += 1,
-                                Flow::Goto(target) => pc = target,
-                                Flow::Unwind(value, origin) => {
-                                    return Ok(FrameCompletion::Unwind(value, origin));
-                                }
-                            }
+                Instruction::Suspend { .. } => {
+                    match self.raise(
+                        &mut frame,
+                        function,
+                        pc,
+                        Value::UNDEFINED,
+                        ThrowOrigin::TypeError {
+                            operation: "suspend outside an engine-owned event loop",
+                        },
+                    ) {
+                        Flow::Next => pc += 1,
+                        Flow::Goto(target) => pc = target,
+                        Flow::Unwind(value, origin) => {
+                            return Ok(FrameCompletion::Unwind(value, origin));
                         }
                     }
                 }
@@ -794,7 +777,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             CompletionTag::Throw => {
                 let (value, origin) = match self.pending_throw.take() {
                     Some(pending) => (pending.value, pending.origin),
-                    None => (result.value, ThrowOrigin::Host),
+                    None => (result.value, ThrowOrigin::Bytecode),
                 };
                 Ok(self.raise(frame, function, pc, value, origin))
             }
@@ -802,7 +785,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 // The reference driver drives `Suspend` inline; a helper never
                 // returns it. Treat as a malformed completion.
                 Err(self.error_at(
-                    RuntimeErrorKind::InvalidHostValue {
+                    RuntimeErrorKind::InvalidValue {
                         value: result.value,
                     },
                     function,
@@ -814,7 +797,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     return Err(error);
                 }
                 let kind = self.pending_fatal_kind.take().unwrap_or({
-                    RuntimeErrorKind::InvalidHostValue {
+                    RuntimeErrorKind::InvalidValue {
                         value: result.value,
                     }
                 });
@@ -880,40 +863,13 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     Err(EvalFailure::Throw(origin)) => {
                         InvokeOutcome::Threw(Value::UNDEFINED, origin)
                     }
-                    Err(EvalFailure::HostThrow(throw)) => self.host_threw(throw),
+                    Err(EvalFailure::ThrowValue(value)) => {
+                        InvokeOutcome::Threw(value, ThrowOrigin::Bytecode)
+                    }
                     Err(EvalFailure::Runtime(kind)) => {
                         self.pending_fatal_kind.set(Some(kind));
                         InvokeOutcome::Fatal
                     }
-                }
-            }
-            Ok(CalleeKind::HostEntity(id)) => {
-                let reply = self.machine.borrow_mut().host.entity_call(id, this, args);
-                match reply {
-                    Ok(binding) => {
-                        let materialized = self.machine.borrow_mut().materialize_binding(binding);
-                        match materialized {
-                            Ok(value) => InvokeOutcome::Value(value),
-                            Err(kind) => {
-                                self.pending_fatal_kind.set(Some(kind));
-                                InvokeOutcome::Fatal
-                            }
-                        }
-                    }
-                    Err(thrown) => self.host_threw(thrown),
-                }
-            }
-            Ok(CalleeKind::HostValue) => {
-                let reply = self.machine.borrow_mut().host.call(callee, this, args);
-                match reply {
-                    Ok(value) => match self.machine.borrow().validate_host_value(value) {
-                        Ok(()) => InvokeOutcome::Value(value),
-                        Err(kind) => {
-                            self.pending_fatal_kind.set(Some(kind));
-                            InvokeOutcome::Fatal
-                        }
-                    },
-                    Err(thrown) => self.host_threw(thrown),
                 }
             }
             Ok(CalleeKind::NotCallable) => InvokeOutcome::Threw(
@@ -1012,29 +968,17 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             .set(self.live_registers.get() - register_count);
         match tag {
             Ok(CompletionTag::Normal) => InvokeOutcome::Value(out.value),
-            Ok(CompletionTag::Throw) => InvokeOutcome::Threw(out.value, ThrowOrigin::Host),
+            Ok(CompletionTag::Throw) => InvokeOutcome::Threw(out.value, ThrowOrigin::Bytecode),
             Ok(CompletionTag::Suspend | CompletionTag::FatalTrap) => {
                 self.pending_fatal_kind
-                    .set(Some(RuntimeErrorKind::InvalidHostValue {
-                        value: out.value,
-                    }));
+                    .set(Some(RuntimeErrorKind::InvalidValue { value: out.value }));
                 InvokeOutcome::Fatal
             }
             Err(_) => {
                 self.pending_fatal_kind
-                    .set(Some(RuntimeErrorKind::InvalidHostValue {
+                    .set(Some(RuntimeErrorKind::InvalidValue {
                         value: Value::UNDEFINED,
                     }));
-                InvokeOutcome::Fatal
-            }
-        }
-    }
-
-    fn host_threw(&self, thrown: HostThrow) -> InvokeOutcome {
-        match self.machine.borrow().validate_host_value(thrown.value) {
-            Ok(()) => InvokeOutcome::Threw(thrown.value, ThrowOrigin::Host),
-            Err(kind) => {
-                self.pending_fatal_kind.set(Some(kind));
                 InvokeOutcome::Fatal
             }
         }
@@ -1059,17 +1003,12 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 }));
                 HelperResult::throw(Value::UNDEFINED)
             }
-            EvalFailure::HostThrow(thrown) => {
-                match self.machine.borrow().validate_host_value(thrown.value) {
-                    Ok(()) => {
-                        self.pending_throw.set(Some(PendingThrow {
-                            value: thrown.value,
-                            origin: ThrowOrigin::Host,
-                        }));
-                        HelperResult::throw(thrown.value)
-                    }
-                    Err(kind) => self.fatal(kind),
-                }
+            EvalFailure::ThrowValue(value) => {
+                self.pending_throw.set(Some(PendingThrow {
+                    value,
+                    origin: ThrowOrigin::Bytecode,
+                }));
+                HelperResult::throw(value)
             }
             EvalFailure::Runtime(kind) => self.fatal(kind),
         }
@@ -1097,10 +1036,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     }
 
     fn validated(&self, value: Value) -> HelperResult {
-        match self.machine.borrow().validate_host_value(value) {
-            Ok(()) => HelperResult::normal(value),
-            Err(kind) => self.fatal(kind),
-        }
+        HelperResult::normal(value)
     }
 
     fn allocated(&self, entry: HeapEntry) -> HelperResult {
@@ -1137,6 +1073,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             elements: args,
             properties: PropertyMap::default(),
             prototype: Some(prototype),
+            extensible: true,
         });
         let value = match allocated {
             Ok(value) => value,
@@ -1183,8 +1120,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         },
                         _ => {
                             drop(machine);
-                            return self
-                                .fatal(RuntimeErrorKind::InvalidHostValue { value: callee });
+                            return self.fatal(RuntimeErrorKind::InvalidValue { value: callee });
                         }
                     }
                 };
@@ -1192,6 +1128,8 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     let allocated = self.machine.borrow_mut().allocate(HeapEntry::Object {
                         properties: PropertyMap::default(),
                         prototype,
+                        boxed_primitive: None,
+                        extensible: true,
                     });
                     match allocated {
                         Ok(value) => value,
@@ -1205,30 +1143,6 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         HelperResult::normal(if is_object { returned } else { instance })
                     }
                     other => self.outcome_result(other),
-                }
-            }
-            Ok(CalleeKind::HostEntity(id)) => {
-                let reply = self
-                    .machine
-                    .borrow_mut()
-                    .host
-                    .entity_construct(id, arguments);
-                match reply {
-                    Ok(binding) => {
-                        let materialized = self.machine.borrow_mut().materialize_binding(binding);
-                        match materialized {
-                            Ok(value) => HelperResult::normal(value),
-                            Err(kind) => self.fatal(kind),
-                        }
-                    }
-                    Err(thrown) => self.fail(EvalFailure::HostThrow(thrown)),
-                }
-            }
-            Ok(CalleeKind::HostValue) => {
-                let reply = self.machine.borrow_mut().host.construct(callee, arguments);
-                match reply {
-                    Ok(value) => self.validated(value),
-                    Err(thrown) => self.fail(EvalFailure::HostThrow(thrown)),
                 }
             }
             Ok(CalleeKind::NotCallable) => {
@@ -1287,7 +1201,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             Ok(CompletionTag::Throw) => Err(NativeError::Runtime(self.error_at(
                 RuntimeErrorKind::UncaughtThrow {
                     value: out.value,
-                    origin: ThrowOrigin::Host,
+                    origin: ThrowOrigin::Bytecode,
                 },
                 function,
                 0,
@@ -1324,7 +1238,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     let result = self.machine.borrow_mut().eval_unary(op, operand);
                     self.eval_result(result)
                 }
-                None => self.fatal(RuntimeErrorKind::InvalidHostValue {
+                None => self.fatal(RuntimeErrorKind::InvalidValue {
                     value: Value::UNDEFINED,
                 }),
             },
@@ -1333,7 +1247,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     let result = self.machine.borrow_mut().eval_binary(op, left, right);
                     self.eval_result(result)
                 }
-                None => self.fatal(RuntimeErrorKind::InvalidHostValue {
+                None => self.fatal(RuntimeErrorKind::InvalidValue {
                     value: Value::UNDEFINED,
                 }),
             },
@@ -1342,6 +1256,8 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 self.allocated(HeapEntry::Object {
                     properties: PropertyMap::default(),
                     prototype: Some(prototype),
+                    boxed_primitive: None,
+                    extensible: true,
                 })
             }
             HelperCall::CreateArray => {
@@ -1350,6 +1266,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     elements: Vec::new(),
                     properties: PropertyMap::default(),
                     prototype: Some(prototype),
+                    extensible: true,
                 })
             }
             HelperCall::CreateClosure {
@@ -1369,6 +1286,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                             captures,
                             properties: PropertyMap::default(),
                             prototype: Some(prototype),
+                            extensible: true,
                         })
                     }
                     Err(failure) => self.fail(failure),
@@ -1438,7 +1356,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 let kind = match accessor_from_selector(kind) {
                     Some(kind) => kind,
                     None => {
-                        return self.fatal(RuntimeErrorKind::InvalidHostValue {
+                        return self.fatal(RuntimeErrorKind::InvalidValue {
                             value: Value::UNDEFINED,
                         });
                     }
@@ -1484,14 +1402,9 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 };
                 self.construct(callee, &arguments)
             }
-            HelperCall::Import { specifier } => {
-                let specifier = self.constant_text(specifier);
-                let imported = self.machine.borrow_mut().host.import(&specifier);
-                match imported {
-                    Ok(value) => self.validated(value),
-                    Err(thrown) => self.fail(EvalFailure::HostThrow(thrown)),
-                }
-            }
+            HelperCall::Import { .. } => self.fail(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "import outside an engine-owned module registry",
+            })),
             HelperCall::Truthy { value } => {
                 HelperResult::normal(Value::boolean(self.machine.borrow().truthy(value)))
             }
@@ -1502,9 +1415,8 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     .last_mut()
                     .and_then(|activation| activation.pending_resume.take());
                 match resumed {
-                    Some(Ok(value)) => self.validated(value),
-                    Some(Err(thrown)) => self.fail(EvalFailure::HostThrow(thrown)),
-                    None => self.fatal(RuntimeErrorKind::InvalidHostValue {
+                    Some(value) => self.validated(value),
+                    None => self.fatal(RuntimeErrorKind::InvalidValue {
                         value: Value::UNDEFINED,
                     }),
                 }
@@ -1513,8 +1425,8 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 let name = self.constant_text(name);
                 let resolved = self.machine.borrow_mut().resolve_global_binding(&name);
                 match resolved {
-                    Ok(Some(value)) => self.validated(value),
-                    Ok(None) => {
+                    Some(value) => self.validated(value),
+                    None => {
                         self.pending_throw.set(Some(PendingThrow {
                             value: Value::UNDEFINED,
                             origin: ThrowOrigin::ReferenceError {
@@ -1523,7 +1435,6 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                         }));
                         HelperResult::throw(Value::UNDEFINED)
                     }
-                    Err(kind) => self.fatal(kind),
                 }
             }
             HelperCall::StoreGlobal { name, value } => {
@@ -1535,9 +1446,8 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 let name = self.constant_text(name);
                 let resolved = self.machine.borrow_mut().resolve_global_binding(&name);
                 let text = match resolved {
-                    Ok(Some(value)) => self.machine.borrow().type_of(value).to_owned(),
-                    Ok(None) => "undefined".to_owned(),
-                    Err(kind) => return self.fatal(kind),
+                    Some(value) => self.machine.borrow().type_of(value).to_owned(),
+                    None => "undefined".to_owned(),
                 };
                 self.allocated(HeapEntry::String(text))
             }
@@ -1593,6 +1503,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     pattern,
                     flags,
                     properties: PropertyMap::default(),
+                    extensible: true,
                 })
             }
             HelperCall::GetIterator { src, kind } => match iterator_kind_from_selector(kind) {
@@ -1600,7 +1511,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     let result = self.machine.borrow_mut().create_iterator(src, kind);
                     self.eval_result(result)
                 }
-                None => self.fatal(RuntimeErrorKind::InvalidHostValue {
+                None => self.fatal(RuntimeErrorKind::InvalidValue {
                     value: Value::UNDEFINED,
                 }),
             },
@@ -1617,7 +1528,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                         if wrote_done && wrote_value {
                             HelperResult::normal(Value::UNDEFINED)
                         } else {
-                            self.fatal(RuntimeErrorKind::InvalidHostValue {
+                            self.fatal(RuntimeErrorKind::InvalidValue {
                                 value: Value::UNDEFINED,
                             })
                         }
@@ -1625,17 +1536,9 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     Err(failure) => self.fail(failure),
                 }
             }
-            HelperCall::Export { name, src } => {
-                if let Err(kind) = self.machine.borrow().validate_host_value(src) {
-                    return self.fatal(kind);
-                }
-                let name = self.constant_text(name);
-                let exported = self.machine.borrow_mut().host.export(&name, src);
-                match exported {
-                    Ok(()) => HelperResult::normal(Value::UNDEFINED),
-                    Err(thrown) => self.fail(EvalFailure::HostThrow(thrown)),
-                }
-            }
+            HelperCall::Export { .. } => self.fail(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "export outside an engine-owned module registry",
+            })),
         }
     }
 }
@@ -1664,11 +1567,9 @@ mod tests {
         BinaryOp, Constant, ExceptionHandler, Function, FunctionFlags, FunctionId, Instruction,
         Module, Pc, Register, Verified,
     };
-    use bamts_native::{
-        AbiError, Completion, CompletionTag, NativeEntryTable, ShadowFrame, SlotId, Value,
-    };
+    use bamts_native::{AbiError, Completion, CompletionTag, NativeEntryTable, ShadowFrame, Value};
 
-    use crate::{Host, HostBinding, HostThrow, Limits, Machine, RuntimeErrorKind};
+    use crate::{Host, Limits, Machine};
 
     use super::{NativeEngine, NativeError, run_linked_program};
 
@@ -1948,120 +1849,6 @@ mod tests {
         );
         let value = assert_parity(&module, || SilentHost);
         assert_eq!(value.as_int32(), Some(99));
-    }
-
-    /// A host exposing one global function entity (id 7) that records its call
-    /// and returns a configurable binding.
-    struct EntityHost {
-        called_id: Cell<Option<u32>>,
-        reply: HostBinding,
-    }
-
-    impl EntityHost {
-        fn new(reply: HostBinding) -> Self {
-            EntityHost {
-                called_id: Cell::new(None),
-                reply,
-            }
-        }
-    }
-
-    impl Host for EntityHost {
-        fn resolve_global(&mut self, name: &str) -> Option<HostBinding> {
-            if name == "host_fn" {
-                Some(HostBinding::Function(7))
-            } else {
-                None
-            }
-        }
-
-        fn entity_call(
-            &mut self,
-            entity: u32,
-            _this: Value,
-            _arguments: &[Value],
-        ) -> Result<HostBinding, HostThrow> {
-            self.called_id.set(Some(entity));
-            Ok(self.reply)
-        }
-    }
-
-    fn host_call_module() -> Module<Verified> {
-        verified(
-            vec![
-                Constant::String("host_fn".to_owned()),
-                Constant::Int32(7),
-                Constant::Undefined,
-            ],
-            vec![entry_function(
-                3,
-                vec![
-                    Instruction::LoadGlobal {
-                        dst: reg(0),
-                        name: cid(0),
-                    },
-                    Instruction::CreateArray { dst: reg(1) },
-                    Instruction::LoadConst {
-                        dst: reg(2),
-                        constant: cid(1),
-                    },
-                    Instruction::ArrayPush {
-                        array: reg(1),
-                        value: reg(2),
-                    },
-                    Instruction::LoadConst {
-                        dst: reg(2),
-                        constant: cid(2),
-                    },
-                    Instruction::Call {
-                        dst: reg(0),
-                        callee: reg(0),
-                        this_value: reg(2),
-                        arguments: reg(1),
-                    },
-                    Instruction::Return { value: reg(0) },
-                ],
-            )],
-        )
-    }
-
-    #[test]
-    fn native_resolves_global_and_routes_host_call_by_id() {
-        let module = host_call_module();
-        let entries = NoEntries;
-        let mut host = EntityHost::new(HostBinding::Primitive(Value::int32(42)));
-        let native = NativeEngine::new(&module, &entries, &mut host, Limits::default())
-            .run()
-            .expect("native runs host call");
-        assert_eq!(native.value.as_int32(), Some(42));
-        assert_eq!(host.called_id.get(), Some(7), "call routed to entity id 7");
-    }
-
-    #[test]
-    fn native_and_interpreter_agree_on_host_call() {
-        let module = host_call_module();
-        let value = assert_parity(&module, || {
-            EntityHost::new(HostBinding::Primitive(Value::int32(42)))
-        });
-        assert_eq!(value.as_int32(), Some(42));
-    }
-
-    #[test]
-    fn host_cannot_forge_a_runtime_heap_slot() {
-        // The host echoes a segment-1 reference it never received; materialization
-        // must reject it rather than let the host inject a runtime slot.
-        let forged = Value::heap_ref(SlotId::from_parts(1, 9999).expect("nonzero parts"));
-        let module = host_call_module();
-        let entries = NoEntries;
-        let mut host = EntityHost::new(HostBinding::Primitive(forged));
-        let error = NativeEngine::new(&module, &entries, &mut host, Limits::default())
-            .run()
-            .expect_err("forged host slot is rejected");
-        assert_eq!(
-            error.kind,
-            RuntimeErrorKind::InvalidRuntimeHeapReference { slot: 9999 },
-            "forged segment-1 ref is rejected as a nonexistent runtime slot"
-        );
     }
 
     /// A synthetic entry table standing in for a compiled AOT image: it records

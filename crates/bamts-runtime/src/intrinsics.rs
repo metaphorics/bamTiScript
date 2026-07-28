@@ -1,26 +1,15 @@
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
 
 use bamts_native::{Decoded, Value};
 
 use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyMap, ThrowOrigin};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BuiltinId {
-    Object,
-    Array,
-    String,
-    Number,
-    Boolean,
-    Error,
-    EvalError,
-    RangeError,
-    ReferenceError,
-    SyntaxError,
-    TypeError,
-    UriError,
-    FunctionCall,
-    ObjectPrototypeToString,
-}
+#[path = "builtins/mod.rs"]
+mod builtins;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct BuiltinId(usize);
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum BuiltinOutcome {
@@ -32,106 +21,199 @@ pub(crate) enum BuiltinOutcome {
     },
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct Intrinsics {
+pub(crate) type BuiltinHandler<H> = fn(
+    &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure>;
+
+#[derive(Clone, Copy)]
+pub(crate) struct BuiltinDef<H: Host> {
+    pub(crate) name: &'static str,
+    pub(crate) length: u32,
+    pub(crate) handler: BuiltinHandler<H>,
+}
+
+pub(crate) struct BuiltinTable<H: Host> {
+    defs: Vec<BuiltinDef<H>>,
+    object_prototype: Value,
+    function_prototype: Value,
+    array_prototype: Value,
+    string_prototype: Value,
+    number_prototype: Value,
+    boolean_prototype: Value,
+    error_prototypes: Vec<(BuiltinId, Value)>,
+    marker: PhantomData<fn() -> H>,
+}
+
+impl<H: Host> BuiltinTable<H> {
+    fn new(
+        object_prototype: Value,
+        function_prototype: Value,
+        array_prototype: Value,
+        string_prototype: Value,
+        number_prototype: Value,
+        boolean_prototype: Value,
+    ) -> Self {
+        Self {
+            defs: Vec::new(),
+            object_prototype,
+            function_prototype,
+            array_prototype,
+            string_prototype,
+            number_prototype,
+            boolean_prototype,
+            error_prototypes: Vec::new(),
+            marker: PhantomData,
+        }
+    }
+
+    pub(crate) fn register(&mut self, def: BuiltinDef<H>) -> BuiltinId {
+        let id = BuiltinId(self.defs.len());
+        self.defs.push(def);
+        id
+    }
+
+    pub(crate) fn get(&self, id: BuiltinId) -> &BuiltinDef<H> {
+        self.defs
+            .get(id.0)
+            .expect("BuiltinId is minted by this realm's table")
+    }
+
+    pub(crate) fn object_prototype(&self) -> Value {
+        self.object_prototype
+    }
+
+    pub(crate) fn function_prototype(&self) -> Value {
+        self.function_prototype
+    }
+
+    pub(crate) fn array_prototype(&self) -> Value {
+        self.array_prototype
+    }
+
+    pub(crate) fn string_prototype(&self) -> Value {
+        self.string_prototype
+    }
+
+    pub(crate) fn number_prototype(&self) -> Value {
+        self.number_prototype
+    }
+
+    pub(crate) fn boolean_prototype(&self) -> Value {
+        self.boolean_prototype
+    }
+
+    pub(crate) fn set_constructor_prototype(
+        &mut self,
+        heap: &mut [HeapEntry],
+        constructor: Value,
+        prototype: Value,
+    ) {
+        let index = heap_index(constructor);
+        let HeapEntry::NativeFunction { properties, .. } = &mut heap[index] else {
+            panic!("builtin constructor is a native function");
+        };
+        properties.insert(
+            crate::PropertyKey::Named("prototype".to_owned()),
+            crate::Property::Data {
+                value: prototype,
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+    }
+
+    pub(crate) fn set_error_prototype(
+        &mut self,
+        heap: &mut [HeapEntry],
+        constructor: Value,
+        prototype: Value,
+    ) {
+        let index = heap_index(constructor);
+        let HeapEntry::NativeFunction { id, .. } = heap[index] else {
+            panic!("error constructor is a native function");
+        };
+        self.error_prototypes.push((id, prototype));
+    }
+
+    pub(crate) fn id_named(&self, name: &str) -> Option<BuiltinId> {
+        self.defs
+            .iter()
+            .position(|definition| definition.name == name)
+            .map(BuiltinId)
+    }
+}
+
+pub(crate) struct Intrinsics<H: Host> {
     globals: BTreeMap<String, Value>,
     pub(crate) object_prototype: Value,
     pub(crate) function_prototype: Value,
     pub(crate) array_prototype: Value,
-    error_prototypes: [(BuiltinId, Value); 7],
+    pub(crate) string_prototype: Value,
+    pub(crate) number_prototype: Value,
+    pub(crate) boolean_prototype: Value,
+    builtins: BuiltinTable<H>,
     function_call: Value,
     object_to_string: Value,
-    constructor_prototypes: Vec<(BuiltinId, Value)>,
 }
 
-impl Intrinsics {
+impl<H: Host> Intrinsics<H> {
     pub(crate) fn initialize(heap: &mut Vec<HeapEntry>) -> Self {
         let object_prototype = push(
             heap,
             HeapEntry::Object {
                 properties: PropertyMap::default(),
                 prototype: None,
+                extensible: true,
+                boxed_primitive: None,
             },
         );
-        let function_prototype = push(
-            heap,
-            HeapEntry::Object {
-                properties: PropertyMap::default(),
-                prototype: Some(object_prototype),
-            },
-        );
+        let function_prototype = ordinary_prototype(heap, object_prototype);
         let array_prototype = push(
             heap,
             HeapEntry::Array {
                 elements: Vec::new(),
                 properties: PropertyMap::default(),
                 prototype: Some(object_prototype),
+                extensible: true,
             },
         );
         let string_prototype = ordinary_prototype(heap, object_prototype);
         let number_prototype = ordinary_prototype(heap, object_prototype);
         let boolean_prototype = ordinary_prototype(heap, object_prototype);
-
-        let error_prototypes = [
-            BuiltinId::Error,
-            BuiltinId::EvalError,
-            BuiltinId::RangeError,
-            BuiltinId::ReferenceError,
-            BuiltinId::SyntaxError,
-            BuiltinId::TypeError,
-            BuiltinId::UriError,
-        ]
-        .map(|id| (id, ordinary_prototype(heap, object_prototype)));
-
-        let constructor_specs = [
-            (BuiltinId::Object, "Object", 1, object_prototype),
-            (BuiltinId::Array, "Array", 1, array_prototype),
-            (BuiltinId::String, "String", 1, string_prototype),
-            (BuiltinId::Number, "Number", 1, number_prototype),
-            (BuiltinId::Boolean, "Boolean", 1, boolean_prototype),
-            (BuiltinId::Error, "Error", 1, error_prototypes[0].1),
-            (BuiltinId::EvalError, "EvalError", 1, error_prototypes[1].1),
-            (
-                BuiltinId::RangeError,
-                "RangeError",
-                1,
-                error_prototypes[2].1,
-            ),
-            (
-                BuiltinId::ReferenceError,
-                "ReferenceError",
-                1,
-                error_prototypes[3].1,
-            ),
-            (
-                BuiltinId::SyntaxError,
-                "SyntaxError",
-                1,
-                error_prototypes[4].1,
-            ),
-            (BuiltinId::TypeError, "TypeError", 1, error_prototypes[5].1),
-            (BuiltinId::UriError, "URIError", 1, error_prototypes[6].1),
-        ];
         let mut globals = BTreeMap::new();
-        let mut constructor_prototypes = Vec::with_capacity(constructor_specs.len());
-        for (id, name, length, prototype) in constructor_specs {
-            let value = native_function(heap, id, name, length);
-            globals.insert(name.to_owned(), value);
-            constructor_prototypes.push((id, prototype));
-        }
-        let function_call = native_function(heap, BuiltinId::FunctionCall, "call", 1);
-        let object_to_string =
-            native_function(heap, BuiltinId::ObjectPrototypeToString, "toString", 0);
+        let mut builtins = BuiltinTable::new(
+            object_prototype,
+            function_prototype,
+            array_prototype,
+            string_prototype,
+            number_prototype,
+            boolean_prototype,
+        );
+        builtins::install(heap, &mut globals, &mut builtins);
+        crate::host_objects::install(heap, &mut globals, &mut builtins);
+
+        let function_call = globals
+            .remove("\0Function.prototype.call")
+            .expect("core builtins install Function.prototype.call");
+        let object_to_string = globals
+            .remove("\0Object.prototype.toString")
+            .expect("core builtins install Object.prototype.toString");
 
         Self {
             globals,
             object_prototype,
             function_prototype,
             array_prototype,
-            error_prototypes,
+            string_prototype,
+            number_prototype,
+            boolean_prototype,
+            builtins,
             function_call,
             object_to_string,
-            constructor_prototypes,
         }
     }
 
@@ -139,14 +221,9 @@ impl Intrinsics {
         self.globals.get(name).copied()
     }
 
-    pub(crate) fn constructor_prototype(&self, id: BuiltinId) -> Option<Value> {
-        self.constructor_prototypes
-            .iter()
-            .find_map(|(candidate, prototype)| (*candidate == id).then_some(*prototype))
-    }
-
     pub(crate) fn error_prototype(&self, id: BuiltinId) -> Value {
-        self.error_prototypes
+        self.builtins
+            .error_prototypes
             .iter()
             .find_map(|(candidate, prototype)| (*candidate == id).then_some(*prototype))
             .expect("every error builtin has a realm prototype")
@@ -167,34 +244,62 @@ fn ordinary_prototype(heap: &mut Vec<HeapEntry>, object_prototype: Value) -> Val
         HeapEntry::Object {
             properties: PropertyMap::default(),
             prototype: Some(object_prototype),
+            extensible: true,
+            boxed_primitive: None,
         },
     )
 }
 
-fn native_function(
+pub(crate) fn native_function(
     heap: &mut Vec<HeapEntry>,
     id: BuiltinId,
     name: &'static str,
     length: u32,
 ) -> Value {
+    let name_value = push(heap, HeapEntry::String(name.to_owned()));
+    let mut properties = PropertyMap::default();
+    properties.insert(
+        crate::PropertyKey::Named("length".to_owned()),
+        crate::Property::Data {
+            value: crate::number_value(f64::from(length)),
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        },
+    );
+    properties.insert(
+        crate::PropertyKey::Named("name".to_owned()),
+        crate::Property::Data {
+            value: name_value,
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        },
+    );
     push(
         heap,
         HeapEntry::NativeFunction {
             id,
-            name,
-            length,
+            properties,
             bound_this: None,
+            extensible: true,
         },
     )
 }
 
-fn push(heap: &mut Vec<HeapEntry>, entry: HeapEntry) -> Value {
+pub(crate) fn push(heap: &mut Vec<HeapEntry>, entry: HeapEntry) -> Value {
     heap.push(entry);
     let slot = u32::try_from(heap.len()).expect("intrinsic heap fits in a u32 slot");
     Value::heap_ref(
         bamts_native::SlotId::from_parts(crate::RUNTIME_HEAP_SEGMENT, slot)
             .expect("intrinsic slot is nonzero"),
     )
+}
+fn heap_index(value: Value) -> usize {
+    let Some(Decoded::HeapRef(id)) = value.decode() else {
+        panic!("intrinsic value is a heap reference");
+    };
+    id.slot() as usize - 1
 }
 
 impl<'a, H: Host> Machine<'a, H> {
@@ -205,119 +310,11 @@ impl<'a, H: Host> Machine<'a, H> {
         arguments: &[Value],
         constructing: bool,
     ) -> Result<BuiltinOutcome, EvalFailure> {
-        let first = arguments.first().copied().unwrap_or(Value::UNDEFINED);
-        let value = match id {
-            BuiltinId::FunctionCall => {
-                return Ok(BuiltinOutcome::Call {
-                    callee: this_value,
-                    this_value: first,
-                    argument_start: usize::from(!arguments.is_empty()),
-                });
-            }
-            BuiltinId::ObjectPrototypeToString => {
-                let tag = self.object_to_string_tag(this_value)?;
-                self.allocate(HeapEntry::String(format!("[object {tag}]")))
-                    .map_err(EvalFailure::Runtime)?
-            }
-            BuiltinId::Object => {
-                if self.is_object(first) {
-                    first
-                } else {
-                    self.allocate(HeapEntry::Object {
-                        properties: PropertyMap::default(),
-                        prototype: Some(self.intrinsics.object_prototype),
-                    })
-                    .map_err(EvalFailure::Runtime)?
-                }
-            }
-            BuiltinId::Array => {
-                let elements = if arguments.len() == 1 {
-                    match first.decode() {
-                        Some(Decoded::Int32(length)) => vec![Value::HOLE; length as usize],
-                        Some(Decoded::Number(length)) if length >= 0.0 && length.fract() == 0.0 => {
-                            vec![Value::HOLE; length as usize]
-                        }
-                        _ => arguments.to_vec(),
-                    }
-                } else {
-                    arguments.to_vec()
-                };
-                self.allocate(HeapEntry::Array {
-                    elements,
-                    properties: PropertyMap::default(),
-                    prototype: Some(self.intrinsics.array_prototype),
-                })
-                .map_err(EvalFailure::Runtime)?
-            }
-            BuiltinId::String => {
-                let text = if arguments.is_empty() {
-                    String::new()
-                } else {
-                    self.to_string(first)?
-                };
-                self.allocate(HeapEntry::String(text))
-                    .map_err(EvalFailure::Runtime)?
-            }
-            BuiltinId::Number => {
-                if arguments.is_empty() {
-                    Value::int32(0)
-                } else {
-                    self.to_number(first)?
-                }
-            }
-            BuiltinId::Boolean => Value::boolean(self.to_boolean(first)),
-            error @ (BuiltinId::Error
-            | BuiltinId::EvalError
-            | BuiltinId::RangeError
-            | BuiltinId::ReferenceError
-            | BuiltinId::SyntaxError
-            | BuiltinId::TypeError
-            | BuiltinId::UriError) => {
-                let prototype = self.intrinsics.error_prototype(error);
-                let object = self
-                    .allocate(HeapEntry::Object {
-                        properties: PropertyMap::default(),
-                        prototype: Some(prototype),
-                    })
-                    .map_err(EvalFailure::Runtime)?;
-                if !arguments.is_empty() {
-                    let message = self.to_string(first)?;
-                    let message = self
-                        .allocate(HeapEntry::String(message))
-                        .map_err(EvalFailure::Runtime)?;
-                    let index = self
-                        .runtime_slot(object)
-                        .map_err(EvalFailure::Runtime)?
-                        .expect("fresh object");
-                    self.set_own_data(
-                        index,
-                        crate::PropertyKey::Named("message".to_owned()),
-                        message,
-                    )?;
-                }
-                object
-            }
-        };
-
-        if constructing
-            && matches!(
-                id,
-                BuiltinId::String | BuiltinId::Number | BuiltinId::Boolean
-            )
-        {
-            let prototype = self
-                .intrinsics
-                .constructor_prototype(id)
-                .expect("primitive constructor has a prototype");
-            return self
-                .allocate(HeapEntry::Object {
-                    properties: PropertyMap::default(),
-                    prototype: Some(prototype),
-                })
-                .map(BuiltinOutcome::Value)
-                .map_err(EvalFailure::Runtime);
-        }
-        Ok(BuiltinOutcome::Value(value))
+        let handler = self.intrinsics.builtins.get(id).handler;
+        let previous = self.current_builtin_id.replace(id);
+        let outcome = handler(self, this_value, arguments, constructing);
+        self.current_builtin_id = previous;
+        outcome
     }
 
     fn object_to_string_tag(&self, value: Value) -> Result<&'static str, EvalFailure> {
@@ -335,9 +332,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 Ok(match &self.heap[index] {
                     HeapEntry::String(_) => "String",
                     HeapEntry::Array { .. } => "Array",
-                    HeapEntry::Function { .. }
-                    | HeapEntry::NativeFunction { .. }
-                    | HeapEntry::HostFunction(_) => "Function",
+                    HeapEntry::Function { .. } | HeapEntry::NativeFunction { .. } => "Function",
                     HeapEntry::RegExp { .. } => "RegExp",
                     HeapEntry::BigInt(_) => "BigInt",
                     HeapEntry::PrivateName { .. } => "Symbol",
@@ -359,6 +354,7 @@ impl<'a, H: Host> Machine<'a, H> {
             );
             if self
                 .intrinsics
+                .builtins
                 .error_prototypes
                 .iter()
                 .any(|(_, prototype)| *prototype == value)
@@ -403,5 +399,132 @@ impl<'a, H: Host> Machine<'a, H> {
         Err(EvalFailure::Throw(ThrowOrigin::TypeError {
             operation: "cannot convert object to primitive without invoking user code",
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bamts_bytecode::{Function, FunctionFlags, FunctionId, Instruction, Module, Verified};
+
+    use super::*;
+    use crate::{Limits, Property, PropertyKey};
+
+    #[derive(Default)]
+    struct TestHost;
+    impl Host for TestHost {}
+
+    fn module() -> Module<Verified> {
+        Module::new(
+            Vec::new(),
+            vec![Function::new(
+                None,
+                0,
+                0,
+                1,
+                FunctionFlags::default(),
+                vec![Instruction::Halt],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("valid test module")
+    }
+
+    fn call_static(
+        machine: &mut Machine<'_, TestHost>,
+        constructor: &str,
+        method: &str,
+        arguments: &[Value],
+    ) -> Value {
+        let constructor = machine
+            .intrinsics
+            .global(constructor)
+            .expect("global exists");
+        let method = machine
+            .get_named_property(constructor, method)
+            .expect("method exists");
+        machine
+            .call_value(method, constructor, arguments)
+            .expect("builtin call succeeds")
+    }
+
+    #[test]
+    fn corpus_value_builtin_oracles_match_node_24_bytes() {
+        // Byte-exact outputs captured with Node v24.18.0. The labels name the
+        // corpus programs whose observable operation each row exercises.
+        let expected = [
+            ("destr: JSON.stringify parsed object", "{\"test\":123}"),
+            ("dot-prop: Object.hasOwn", "true"),
+            ("defu: Object.assign key order", "1,2,b,a"),
+            ("valita: Array.isArray", "true"),
+        ];
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let object = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .unwrap();
+        machine
+            .set_data_property(object, "test", Value::int32(123))
+            .unwrap();
+        let json = machine.intrinsics.global("JSON").unwrap();
+        let stringify = machine.get_named_property(json, "stringify").unwrap();
+        let json_text = machine.call_value(stringify, json, &[object]).unwrap();
+
+        let test_key = machine
+            .allocate(HeapEntry::String("test".to_owned()))
+            .unwrap();
+        let has_own = call_static(&mut machine, "Object", "hasOwn", &[object, test_key]);
+
+        let ordered = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .unwrap();
+        for (key, value) in [("b", 1), ("2", 2), ("a", 3), ("1", 4)] {
+            let index = machine.runtime_slot(ordered).unwrap().unwrap();
+            let HeapEntry::Object { properties, .. } = &mut machine.heap[index] else {
+                unreachable!()
+            };
+            properties.insert(
+                PropertyKey::Named(key.to_owned()),
+                Property::Data {
+                    value: Value::int32(value),
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                },
+            );
+        }
+        let keys = call_static(&mut machine, "Object", "keys", &[ordered]);
+        let array = machine
+            .allocate(HeapEntry::Array {
+                elements: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.array_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        let is_array = call_static(&mut machine, "Array", "isArray", &[array]);
+
+        let actual = [
+            machine.to_string(json_text).unwrap(),
+            machine.to_string(has_own).unwrap(),
+            machine.to_string(keys).unwrap(),
+            machine.to_string(is_array).unwrap(),
+        ];
+        for ((label, expected), actual) in expected.into_iter().zip(actual) {
+            assert_eq!(actual.as_bytes(), expected.as_bytes(), "{label}");
+        }
     }
 }
