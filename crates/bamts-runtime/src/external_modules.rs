@@ -174,7 +174,7 @@ fn parse_args<H: Host>(
                         let Some(text) = config.args.get(index) else {
                             return Err(type_error("string parseArgs option is missing its value"));
                         };
-                        if text.starts_with('-') {
+                        if config.strict && text.starts_with('-') {
                             return Err(type_error("ERR_PARSE_ARGS_INVALID_OPTION_VALUE"));
                         }
                         (text.clone(), Some(false))
@@ -236,7 +236,7 @@ fn parse_args<H: Host>(
                                     "string parseArgs option is missing its value",
                                 ));
                             };
-                            if text.starts_with('-') {
+                            if config.strict && text.starts_with('-') {
                                 return Err(type_error("ERR_PARSE_ARGS_INVALID_OPTION_VALUE"));
                             }
                             (text.clone(), false)
@@ -1424,15 +1424,47 @@ mod tests {
             Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
         ));
 
+        let loose_long = config(
+            &mut machine,
+            &["--name", "-bar"],
+            &[("name", name)],
+            &[("strict", false)],
+        );
+        let result = call_parse_args(&mut machine, loose_long).unwrap();
+        let values = machine_value(&machine, result, "values");
+        assert_eq!(
+            text(&machine, machine_value(&machine, values, "name")),
+            "-bar"
+        );
+
+        let loose_short = config(
+            &mut machine,
+            &["-f", "-bar"],
+            &[("file", file)],
+            &[("strict", false)],
+        );
+        let result = call_parse_args(&mut machine, loose_short).unwrap();
+        let values = machine_value(&machine, result, "values");
+        assert_eq!(
+            text(&machine, machine_value(&machine, values, "file")),
+            "-bar"
+        );
+
         let inline_long = config(&mut machine, &["--name=-bar"], &[("name", name)], &[]);
         let result = call_parse_args(&mut machine, inline_long).unwrap();
         let values = machine_value(&machine, result, "values");
-        assert_eq!(text(&machine, machine_value(&machine, values, "name")), "-bar");
+        assert_eq!(
+            text(&machine, machine_value(&machine, values, "name")),
+            "-bar"
+        );
 
         let inline_short = config(&mut machine, &["-f-bar"], &[("file", file)], &[]);
         let result = call_parse_args(&mut machine, inline_short).unwrap();
         let values = machine_value(&machine, result, "values");
-        assert_eq!(text(&machine, machine_value(&machine, values, "file")), "-bar");
+        assert_eq!(
+            text(&machine, machine_value(&machine, values, "file")),
+            "-bar"
+        );
     }
 
     #[test]
