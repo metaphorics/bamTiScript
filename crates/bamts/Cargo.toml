@@ -11,7 +11,7 @@ host-jit = ["dep:bamts-codegen", "bamts-codegen/host-jit"]
 
 [dependencies]
 bamts-bytecode = { path = "../bamts-bytecode" }
-bamts-codegen = { path = "../bamts-codegen", optional = true, default-features = false }
+bamts-codegen = { path = "../bamts-codegen", optional = true }
 bamts-compiler = { path = "../bamts-compiler" }
 bamts-node = { path = "../bamts-node" }
 bamts-runtime = { path = "../bamts-runtime" }
