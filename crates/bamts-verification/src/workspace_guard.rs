@@ -476,7 +476,7 @@ fn validate_cli_features(manifest: &Value, context: &str) -> Result<()> {
 fn validate_facade_manifest_features(manifest: &Value, context: &str) -> Result<()> {
     let root = root_table(manifest, context)?;
     let features = required_table(root, "features", context)?;
-    let expected_keys: BTreeSet<String> = ["default", "aot", "host-jit"]
+    let expected_keys: BTreeSet<String> = ["default", "aot", "host-jit", "node-host"]
         .into_iter()
         .map(str::to_owned)
         .collect();
@@ -499,6 +499,12 @@ fn validate_facade_manifest_features(manifest: &Value, context: &str) -> Result<
         features,
         "host-jit",
         &["dep:bamts-codegen", "bamts-codegen/host-jit"],
+        context,
+    )?;
+    require_feature_set(
+        features,
+        "node-host",
+        &["dep:bamts-node", "bamts-node/node-host"],
         context,
     )
 }
@@ -898,7 +904,7 @@ fn expected_internal_graph() -> InternalGraph {
             ("bamts-bytecode".to_owned(), internal_dependency(false, &[])),
             ("bamts-codegen".to_owned(), internal_dependency(true, &[])),
             ("bamts-compiler".to_owned(), internal_dependency(false, &[])),
-            ("bamts-node".to_owned(), internal_dependency(false, &[])),
+            ("bamts-node".to_owned(), internal_dependency(true, &[])),
             ("bamts-runtime".to_owned(), internal_dependency(false, &[])),
         ]),
     );
