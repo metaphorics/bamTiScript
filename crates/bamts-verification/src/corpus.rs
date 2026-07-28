@@ -671,7 +671,7 @@ fn lower_stage(error: &bamts_compiler::lower::LowerError) -> CorpusStage {
 
 fn jit_stage(error: &bamts_codegen::JitError) -> CorpusStage {
     match error {
-        bamts_codegen::JitError::Lower(error) => lower_stage(error),
+        bamts_codegen::JitError::Lower(_) => CorpusStage::Lower,
         bamts_codegen::JitError::Module(_) | bamts_codegen::JitError::UnknownHelper { .. } => {
             CorpusStage::Instantiate
         }
@@ -680,7 +680,7 @@ fn jit_stage(error: &bamts_codegen::JitError) -> CorpusStage {
 
 fn aot_stage(error: &bamts_codegen::AotError) -> CorpusStage {
     match error {
-        bamts_codegen::AotError::Lower(error) => lower_stage(error),
+        bamts_codegen::AotError::Lower(_) => CorpusStage::Lower,
         bamts_codegen::AotError::TargetLookup(_)
         | bamts_codegen::AotError::TargetBuild(_)
         | bamts_codegen::AotError::TargetEndianness(_)
