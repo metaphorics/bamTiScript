@@ -292,9 +292,12 @@ fn define_properties_on<H: Host>(
     target: Value,
     descriptors: Value,
 ) -> Result<(), EvalFailure> {
+    let mut definitions = Vec::new();
     for key in machine.enumerable_keys(descriptors)? {
         let descriptor = machine.get_named_property(descriptors, &key)?;
-        let descriptor = descriptor_from(machine, descriptor)?;
+        definitions.push((key, descriptor_from(machine, descriptor)?));
+    }
+    for (key, descriptor) in definitions {
         machine.define_named_descriptor(target, key, descriptor)?;
     }
     Ok(())
@@ -594,5 +597,179 @@ fn clone_value<H: Host>(
             Ok(clone)
         }
         _ => Err(type_error("value could not be cloned")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bamts_bytecode::{Function, FunctionFlags, FunctionId, Instruction, Module, Verified};
+
+    use super::*;
+    use crate::Limits;
+
+    #[derive(Default)]
+    struct TestHost;
+
+    impl Host for TestHost {}
+
+    fn module() -> Module<Verified> {
+        Module::new(
+            Vec::new(),
+            vec![Function::new(
+                None,
+                0,
+                0,
+                1,
+                FunctionFlags::default(),
+                vec![Instruction::Halt],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("valid test module")
+    }
+
+    fn object(machine: &mut Machine<'_, TestHost>) -> Value {
+        machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .unwrap()
+    }
+
+    fn data_descriptor(machine: &mut Machine<'_, TestHost>, value: Value) -> Value {
+        let descriptor = object(machine);
+        machine
+            .set_data_property(descriptor, "value", value)
+            .unwrap();
+        machine
+            .set_data_property(descriptor, "enumerable", Value::TRUE)
+            .unwrap();
+        descriptor
+    }
+
+    fn call_define_properties(
+        machine: &mut Machine<'_, TestHost>,
+        target: Value,
+        descriptors: Value,
+    ) -> Result<Value, EvalFailure> {
+        let constructor = machine.intrinsics.global("Object").unwrap();
+        let method = machine.get_named_property(constructor, "defineProperties")?;
+        machine.call_value(method, constructor, &[target, descriptors])
+    }
+
+    fn assert_unchanged(machine: &mut Machine<'_, TestHost>, target: Value) {
+        assert_eq!(
+            machine.get_named_property(target, "stable").unwrap(),
+            Value::int32(9)
+        );
+        assert!(!machine.has_own_named_property(target, "first").unwrap());
+        assert!(!machine.has_own_named_property(target, "second").unwrap());
+    }
+
+    #[test]
+    fn define_properties_rejects_later_invalid_getter_without_mutating_target() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = object(&mut machine);
+        machine
+            .set_data_property(target, "stable", Value::int32(9))
+            .unwrap();
+        let descriptors = object(&mut machine);
+        let first = data_descriptor(&mut machine, Value::int32(1));
+        let second = object(&mut machine);
+        machine
+            .set_data_property(second, "get", Value::int32(0))
+            .unwrap();
+        machine
+            .set_data_property(descriptors, "first", first)
+            .unwrap();
+        machine
+            .set_data_property(descriptors, "second", second)
+            .unwrap();
+
+        assert!(call_define_properties(&mut machine, target, descriptors).is_err());
+
+        assert_unchanged(&mut machine, target);
+    }
+
+    #[test]
+    fn define_properties_propagates_later_throwing_conversion_without_mutating_target() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = object(&mut machine);
+        machine
+            .set_data_property(target, "stable", Value::int32(9))
+            .unwrap();
+        let descriptors = object(&mut machine);
+        let first = data_descriptor(&mut machine, Value::int32(1));
+        let second = object(&mut machine);
+        let object_constructor = machine.intrinsics.global("Object").unwrap();
+        let throwing_getter = machine
+            .get_named_property(object_constructor, "defineProperty")
+            .unwrap();
+        machine
+            .define_named_descriptor(
+                second,
+                "get".to_owned(),
+                Property::Accessor {
+                    getter: Some(throwing_getter),
+                    setter: None,
+                    enumerable: true,
+                    configurable: true,
+                },
+            )
+            .unwrap();
+        machine
+            .set_data_property(descriptors, "first", first)
+            .unwrap();
+        machine
+            .set_data_property(descriptors, "second", second)
+            .unwrap();
+
+        assert!(call_define_properties(&mut machine, target, descriptors).is_err());
+
+        assert_unchanged(&mut machine, target);
+    }
+
+    #[test]
+    fn define_properties_applies_collected_descriptors_in_enumeration_order() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = object(&mut machine);
+        let descriptors = object(&mut machine);
+        let first = data_descriptor(&mut machine, Value::int32(1));
+        let second = data_descriptor(&mut machine, Value::int32(2));
+        machine
+            .set_data_property(descriptors, "first", first)
+            .unwrap();
+        machine
+            .set_data_property(descriptors, "second", second)
+            .unwrap();
+
+        assert_eq!(
+            call_define_properties(&mut machine, target, descriptors).unwrap(),
+            target
+        );
+
+        assert_eq!(
+            machine.enumerable_keys(target).unwrap(),
+            vec!["first".to_owned(), "second".to_owned()]
+        );
+        assert_eq!(
+            machine.get_named_property(target, "first").unwrap(),
+            Value::int32(1)
+        );
+        assert_eq!(
+            machine.get_named_property(target, "second").unwrap(),
+            Value::int32(2)
+        );
     }
 }
