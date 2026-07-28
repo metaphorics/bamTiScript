@@ -169,14 +169,16 @@ index_type!(
     Pc
 );
 
+mod string;
+
 mod program;
 
-pub use program::{
-    Binding, BindingId, BindingKind, Edge, EdgeId, EdgeKind, EdgeTarget, Export, ExportSource,
-    ModuleId, PROGRAM_MAGIC, PROGRAM_VERSION, Program, ProgramDecodeError, ProgramDecodeErrorKind,
-    ProgramDecodeLimits, ProgramLoadError, ProgramModule, ProgramVerifyError,
-    ProgramVerifyErrorKind, ResolvedExport, decode_program, decode_verified_program,
-};
+pub use string::{EcmaString, EcmaStringBuilder, IllFormedUtf16, InvalidCodePoint};
+
+pub use program::{ Binding, BindingId, BindingKind, Edge, EdgeId, EdgeKind, EdgeTarget, Export, ExportSource,
+ModuleId, PROGRAM_MAGIC, PROGRAM_VERSION, Program, ProgramDecodeError, ProgramDecodeErrorKind,
+ProgramDecodeLimits, ProgramLoadError, ProgramModule, ProgramVerifyError,
+ProgramVerifyErrorKind, ResolvedExport, decode_program, decode_verified_program, };
 
 /// Canonical IEEE-754 bits. Every positive or negative NaN payload collapses
 /// to the unique arithmetic NaN from `Bamti.canonical_nan`.
