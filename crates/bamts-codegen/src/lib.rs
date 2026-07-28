@@ -161,6 +161,11 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "host-jit")]
+mod jit;
+#[cfg(feature = "host-jit")]
+pub use jit::{JitError, JitProgram, compile_jit};
+
 #[cfg(feature = "aot")]
 mod aot;
 #[cfg(feature = "aot")]

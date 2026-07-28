@@ -55,6 +55,7 @@ version = "0.0.0"
 dependencies = [
  "bamts-bytecode",
  "bamts-native",
+ "bamts-runtime",
  "cranelift-codegen",
  "cranelift-frontend",
  "cranelift-jit",
