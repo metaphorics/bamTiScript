@@ -709,7 +709,9 @@ fn native_stage(error: &bamts_runtime::NativeError) -> CorpusStage {
         bamts_runtime::NativeError::Runtime(_) | bamts_runtime::NativeError::FatalTrap { .. } => {
             CorpusStage::Evaluate
         }
-        bamts_runtime::NativeError::Abi(_) => CorpusStage::Link,
+        bamts_runtime::NativeError::Abi(_) | bamts_runtime::NativeError::ProgramMismatch => {
+            CorpusStage::Link
+        }
     }
 }
 

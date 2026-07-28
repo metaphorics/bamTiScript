@@ -78,6 +78,7 @@ struct JitUnit {
 pub struct JitProgram {
     module: JITModule,
     functions: Vec<JitUnit>,
+    program_bytes: Vec<u8>,
     entry_module: u32,
     entry_function: u32,
 }
@@ -97,6 +98,10 @@ impl JitProgram {
 }
 
 impl NativeEntryTable for JitProgram {
+    fn program_bytes(&self) -> &[u8] {
+        &self.program_bytes
+    }
+
     fn invoke(
         &self,
         module_id: u32,
@@ -121,14 +126,19 @@ impl NativeEntryTable for JitProgram {
 /// for the current host. Module-local ids remain local and native entries are
 /// keyed by `(module_id, function_id)`.
 pub fn compile_jit(bytecode: &BytecodeProgram<Verified>) -> Result<JitProgram, JitError> {
+    let program_bytes = bytecode.encode();
     let mut builder = JITBuilder::new(default_libcall_names())?;
     bind_runtime_helpers(&mut builder);
     let module = JITModule::new(builder);
     let lowered = lower_program(bytecode, module.target_config())?;
-    compile_lowered(module, lowered)
+    compile_lowered(module, lowered, program_bytes)
 }
 
-fn compile_lowered(mut module: JITModule, lowered: LoweredProgram) -> Result<JitProgram, JitError> {
+fn compile_lowered(
+    mut module: JITModule,
+    lowered: LoweredProgram,
+    program_bytes: Vec<u8>,
+) -> Result<JitProgram, JitError> {
     let function_count = lowered
         .modules
         .iter()
@@ -175,6 +185,7 @@ fn compile_lowered(mut module: JITModule, lowered: LoweredProgram) -> Result<Jit
     Ok(JitProgram {
         module,
         functions,
+        program_bytes,
         entry_module: lowered.entry_module.get(),
         entry_function: lowered.entry_function.get(),
     })
@@ -265,10 +276,15 @@ mod tests {
     use bamts_native::{
         AbiError, Completion, CompletionTag, NativeEntryTable, NativeHelper, ShadowFrame, Value,
     };
+    use bamts_runtime::{Host, Limits, run_linked_program};
 
     use crate::Helper;
 
     use super::compile_jit;
+
+    struct SilentHost;
+
+    impl Host for SilentHost {}
 
     fn module(name: &str) -> ProgramModule<bamts_bytecode::Verified> {
         ProgramModule {
@@ -324,6 +340,19 @@ mod tests {
                 Ok(CompletionTag::Normal)
             );
         }
+    }
+
+    #[test]
+    fn matched_jit_program_runs_through_linked_runtime() {
+        let bytecode = two_module_program();
+        let program = compile_jit(&bytecode).expect("host JIT compiles every module");
+        assert_eq!(program.program_bytes(), bytecode.encode());
+
+        let mut host = SilentHost;
+        let outcome = run_linked_program(&bytecode, &program, &mut host, &Limits::default())
+            .expect("matching JIT program runs");
+        assert_eq!(outcome.exit_code, 0);
+        assert!(outcome.stdout.is_empty());
     }
 
     #[test]

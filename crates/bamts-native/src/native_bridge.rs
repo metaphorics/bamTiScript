@@ -1579,6 +1579,11 @@ pub type NativeEntryFn = unsafe extern "C" fn(*mut ShadowFrame, *mut Completion)
 /// unit table. The runtime engine stores `&dyn NativeEntryTable` and routes
 /// nested `CreateClosure` re-entry through it.
 pub trait NativeEntryTable {
+    /// The exact canonical [`bamts_bytecode::Program::encode`] bytes compiled into these entries.
+    ///
+    /// Callers must compare these bytes with the supplied program before any native entry runs.
+    fn program_bytes(&self) -> &[u8];
+
     /// Invokes the entry for `(module_id, function_id)`, returning its completion tag.
     fn invoke(
         &self,
@@ -1785,7 +1790,7 @@ impl<'a> LinkedProgram<'a> {
         })
     }
 
-    /// The embedded verified bytecode image (opaque to native code).
+    /// The embedded canonical [`bamts_bytecode::Program::encode`] bytes (opaque to native code).
     #[inline]
     #[must_use]
     pub fn bytecode(&self) -> &'a [u8] {
@@ -1826,6 +1831,10 @@ impl<'a> LinkedProgram<'a> {
 }
 
 impl NativeEntryTable for LinkedProgram<'_> {
+    fn program_bytes(&self) -> &[u8] {
+        self.bytecode
+    }
+
     fn invoke(
         &self,
         module_id: u32,
@@ -2617,6 +2626,7 @@ mod tests {
         let descriptor = program(&bytecode, &units, 3, 5);
         let linked = linked_of(&descriptor, &bytecode, &units).expect("valid image");
         assert_eq!(linked.bytecode(), &[1, 2, 3]);
+        assert_eq!(linked.program_bytes(), &[1, 2, 3]);
         assert_eq!(linked.units().len(), 3);
         assert_eq!(linked.entry_module(), 3);
         assert_eq!(linked.entry_function(), 5);

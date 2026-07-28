@@ -139,6 +139,8 @@ pub enum NativeError {
     Runtime(RuntimeError),
     /// An AOT image or entry-table linkage failure.
     Abi(AbiError),
+    /// The entry table was not compiled from the supplied program's canonical bytes.
+    ProgramMismatch,
     /// A native entry returned `FatalTrap`; `value` is the raw trap id word.
     FatalTrap { value: Value },
 }
@@ -148,6 +150,12 @@ impl fmt::Display for NativeError {
         match self {
             NativeError::Runtime(error) => write!(formatter, "{error}"),
             NativeError::Abi(error) => write!(formatter, "{error}"),
+            NativeError::ProgramMismatch => {
+                write!(
+                    formatter,
+                    "native entries were compiled from different program bytes"
+                )
+            }
             NativeError::FatalTrap { value } => {
                 write!(
                     formatter,
@@ -1789,12 +1797,19 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
 /// and the returned [`ExecutionOutcome`] carries buffered stdout and the exit
 /// code. It is always available and never feature-gated, so a downstream host
 /// crate can link against it without enabling the runtime's `aot-main` feature.
+///
+/// Returns [`NativeError::ProgramMismatch`] before constructing the engine when
+/// `entries` was not compiled from this program's exact canonical encoding.
 pub fn run_linked_program<H: Host>(
     program: &Program<Verified>,
     entries: &dyn NativeEntryTable,
     host: &mut H,
     limits: &Limits,
 ) -> Result<ExecutionOutcome, NativeError> {
+    let program_bytes = program.encode();
+    if program_bytes != entries.program_bytes() {
+        return Err(NativeError::ProgramMismatch);
+    }
     let mut engine = NativeEngine::build(program, entries, host, limits.clone(), Backend::Linked);
     engine.run_linked()
 }
@@ -1899,6 +1914,10 @@ mod tests {
     struct NoEntries;
 
     impl NativeEntryTable for NoEntries {
+        fn program_bytes(&self) -> &[u8] {
+            &[]
+        }
+
         fn invoke(
             &self,
             module_id: u32,
@@ -1915,10 +1934,15 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingEntries {
+        program_bytes: Vec<u8>,
         invoked: RefCell<Vec<(u32, u32)>>,
     }
 
     impl NativeEntryTable for RecordingEntries {
+        fn program_bytes(&self) -> &[u8] {
+            &self.program_bytes
+        }
+
         fn invoke(
             &self,
             module_id: u32,
@@ -1932,11 +1956,39 @@ mod tests {
         }
     }
 
+    struct ForeignEntries {
+        program_bytes: Vec<u8>,
+        invoked: Cell<bool>,
+    }
+
+    impl NativeEntryTable for ForeignEntries {
+        fn program_bytes(&self) -> &[u8] {
+            &self.program_bytes
+        }
+
+        fn invoke(
+            &self,
+            _module_id: u32,
+            _function_id: u32,
+            _frame: &mut ShadowFrame,
+            out: &mut Completion,
+        ) -> Result<CompletionTag, AbiError> {
+            self.invoked.set(true);
+            *out = Completion::new(Value::UNDEFINED);
+            Ok(CompletionTag::Normal)
+        }
+    }
+
     struct SmokeEntries {
+        program_bytes: Vec<u8>,
         invoked: Cell<Option<u32>>,
     }
 
     impl NativeEntryTable for SmokeEntries {
+        fn program_bytes(&self) -> &[u8] {
+            &self.program_bytes
+        }
+
         fn invoke(
             &self,
             module_id: u32,
@@ -1951,9 +2003,16 @@ mod tests {
         }
     }
 
-    struct FailingEntries;
+    #[derive(Default)]
+    struct FailingEntries {
+        program_bytes: Vec<u8>,
+    }
 
     impl NativeEntryTable for FailingEntries {
+        fn program_bytes(&self) -> &[u8] {
+            &self.program_bytes
+        }
+
         fn invoke(
             &self,
             module_id: u32,
@@ -1971,6 +2030,10 @@ mod tests {
     struct ThrowEntries;
 
     impl NativeEntryTable for ThrowEntries {
+        fn program_bytes(&self) -> &[u8] {
+            &[]
+        }
+
         fn invoke(
             &self,
             _module_id: u32,
@@ -1986,6 +2049,10 @@ mod tests {
     struct FatalEntries;
 
     impl NativeEntryTable for FatalEntries {
+        fn program_bytes(&self) -> &[u8] {
+            &[]
+        }
+
         fn invoke(
             &self,
             _module_id: u32,
@@ -2787,6 +2854,7 @@ mod tests {
     fn linked_backend_accepts_metadata_empty_single_module_program() {
         let program = trivial_program();
         let entries = SmokeEntries {
+            program_bytes: program.encode(),
             invoked: Cell::new(None),
         };
         let mut host = SilentHost;
@@ -2800,7 +2868,9 @@ mod tests {
     #[test]
     fn linked_backend_propagates_abi_error() {
         let program = trivial_program();
-        let entries = FailingEntries;
+        let entries = FailingEntries {
+            program_bytes: program.encode(),
+        };
         let mut host = SilentHost;
         let error = run_linked_program(&program, &entries, &mut host, &Limits::default())
             .expect_err("entry table failure surfaces");
@@ -2811,6 +2881,48 @@ mod tests {
                 function_id: 0
             })
         ));
+    }
+
+    #[test]
+    fn linked_backend_rejects_entries_from_same_shape_different_program_before_invocation() {
+        let program = |constant| {
+            linked(
+                vec![program_module(
+                    "entry",
+                    vec![Constant::Int32(constant)],
+                    vec![entry_function(
+                        1,
+                        vec![
+                            Instruction::LoadConst {
+                                dst: reg(0),
+                                constant: cid(1),
+                            },
+                            Instruction::Return { value: reg(0) },
+                        ],
+                    )],
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )],
+                0,
+            )
+        };
+        let compiled_program = program(1);
+        let supplied_program = program(2);
+        let entries = ForeignEntries {
+            program_bytes: compiled_program.encode(),
+            invoked: Cell::new(false),
+        };
+        let mut host = SilentHost;
+
+        assert_eq!(
+            run_linked_program(&supplied_program, &entries, &mut host, &Limits::default()),
+            Err(NativeError::ProgramMismatch)
+        );
+        assert!(
+            !entries.invoked.get(),
+            "mismatched entries must not be invoked"
+        );
     }
 
     #[test]
@@ -2830,7 +2942,10 @@ mod tests {
             Vec::new(),
         );
         let program = Program::link(vec![first, second], ModuleId::new(1)).unwrap();
-        let entries = RecordingEntries::default();
+        let entries = RecordingEntries {
+            program_bytes: program.encode(),
+            ..RecordingEntries::default()
+        };
         let mut host = SilentHost;
         run_linked_program(&program, &entries, &mut host, &Limits::default()).unwrap();
         assert_eq!(entries.invoked.borrow().as_slice(), &[(0, 0), (1, 0)]);
@@ -2981,10 +3096,11 @@ mod tests {
             ],
         );
         let program = one_module_program(&module);
+        let entries = FailingEntries::default();
         let mut host = SilentHost;
         let engine = NativeEngine::build(
             &program,
-            &FailingEntries,
+            &entries,
             &mut host,
             Limits::default(),
             Backend::Linked,
@@ -3012,10 +3128,11 @@ mod tests {
     #[test]
     fn linked_abi_failure_leaves_module_retryable() {
         let program = trivial_program();
+        let entries = FailingEntries::default();
         let mut host = SilentHost;
         let mut engine = NativeEngine::build(
             &program,
-            &FailingEntries,
+            &entries,
             &mut host,
             Limits::default(),
             Backend::Linked,
