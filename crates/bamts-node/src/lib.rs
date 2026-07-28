@@ -371,9 +371,9 @@ fn sha512(data: &[u8]) -> [u8; 64] {
 fn run_aot_main() -> i32 {
     use std::io::Write;
 
-    use bamts_bytecode::{DecodeLimits, decode_verified};
+    use bamts_bytecode::{decode_verified, DecodeLimits};
     use bamts_native::linked_program;
-    use bamts_runtime::{Limits, run_linked_program};
+    use bamts_runtime::{run_linked_program, Limits};
 
     let linked = match linked_program() {
         Ok(linked) => linked,
@@ -384,6 +384,10 @@ fn run_aot_main() -> i32 {
         Err(_) => return 1,
     };
     let mut host = NodeHost::new();
+    if initialize_aot_process_context(&mut host, std::env::args_os(), std::env::vars_os()).is_err()
+    {
+        return 1;
+    }
     let outcome = match run_linked_program(&module, &linked, &mut host, &Limits::default()) {
         Ok(outcome) => outcome,
         Err(_) => return 1,
@@ -405,6 +409,50 @@ fn run_aot_main() -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i32 {
     run_aot_main()
+}
+
+#[cfg(any(feature = "aot-main", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum AotProcessContextError {
+    ArgumentNotUnicode,
+    EnvironmentNameNotUnicode,
+    EnvironmentValueNotUnicode,
+}
+
+/// Populate an AOT host from an explicit process snapshot.
+///
+/// The leading `bamts` mirrors the JIT driver's argv convention; the AOT
+/// executable path occupies the entrypoint slot. Conversion is all-or-nothing
+/// so an invalid OS string cannot leave a partially populated host.
+#[cfg(any(feature = "aot-main", test))]
+fn initialize_aot_process_context(
+    host: &mut NodeHost,
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+    environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Result<(), AotProcessContextError> {
+    let mut argv = vec!["bamts".to_owned()];
+    for argument in args {
+        argv.push(
+            argument
+                .into_string()
+                .map_err(|_| AotProcessContextError::ArgumentNotUnicode)?,
+        );
+    }
+
+    let mut env = BTreeMap::new();
+    for (name, value) in environment {
+        let name = name
+            .into_string()
+            .map_err(|_| AotProcessContextError::EnvironmentNameNotUnicode)?;
+        let value = value
+            .into_string()
+            .map_err(|_| AotProcessContextError::EnvironmentValueNotUnicode)?;
+        env.insert(name, value);
+    }
+
+    host.argv = argv;
+    host.env = env;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -453,6 +501,54 @@ mod tests {
     }
 
     #[test]
+    fn aot_process_context_uses_jit_argv_normalization() {
+        let mut host = NodeHost::new();
+        initialize_aot_process_context(
+            &mut host,
+            [
+                std::ffi::OsString::from("/tmp/program"),
+                std::ffi::OsString::from("--flag"),
+            ],
+            [
+                (
+                    std::ffi::OsString::from("ZED"),
+                    std::ffi::OsString::from("last"),
+                ),
+                (
+                    std::ffi::OsString::from("ALPHA"),
+                    std::ffi::OsString::from("first"),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(host.argv(), ["bamts", "/tmp/program", "--flag"]);
+        assert_eq!(host.env("ALPHA"), Some("first"));
+        assert_eq!(host.env("ZED"), Some("last"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aot_process_context_rejects_non_unicode_without_mutating_host() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut host = NodeHost::new();
+        let error = initialize_aot_process_context(
+            &mut host,
+            [std::ffi::OsString::from_vec(vec![0xff])],
+            [(
+                std::ffi::OsString::from("SAFE"),
+                std::ffi::OsString::from("value"),
+            )],
+        )
+        .unwrap_err();
+
+        assert_eq!(error, AotProcessContextError::ArgumentNotUnicode);
+        assert!(host.argv().is_empty());
+        assert_eq!(host.env("SAFE"), None);
+    }
+
+    #[test]
     fn clocks_and_random_are_capabilities() {
         let mut host = NodeHost::new();
         assert!(Host::now_ms(&mut host) > 0);
@@ -461,5 +557,26 @@ mod tests {
         assert!(second >= first);
         let random = Host::random(&mut host);
         assert!((0.0..1.0).contains(&random));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aot_process_context_rejects_non_unicode_environment_without_mutating_host() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut host = NodeHost::new();
+        let error = initialize_aot_process_context(
+            &mut host,
+            [std::ffi::OsString::from("/tmp/program")],
+            [(
+                std::ffi::OsString::from("SAFE"),
+                std::ffi::OsString::from_vec(vec![0xff]),
+            )],
+        )
+        .unwrap_err();
+
+        assert_eq!(error, AotProcessContextError::EnvironmentValueNotUnicode);
+        assert!(host.argv().is_empty());
+        assert_eq!(host.env("SAFE"), None);
     }
 }
