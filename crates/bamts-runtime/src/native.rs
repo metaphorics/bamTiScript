@@ -51,7 +51,7 @@ use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::fmt;
 
-use bamts_bytecode::{ConstantId, FunctionId, Instruction, Module, Program, Verified};
+use bamts_bytecode::{ConstantId, FunctionId, Instruction, Module, ModuleId, Program, Verified};
 pub use bamts_native::AbiError;
 use bamts_native::{
     Completion, CompletionTag, HelperCall, HelperResult, NativeEntryTable, NativeFrame, NativeOps,
@@ -137,8 +137,6 @@ fn accessor_to_selector(kind: bamts_bytecode::AccessorKind) -> u32 {
 pub enum NativeError {
     /// A deterministic runtime error (throw, limit, or malformed value).
     Runtime(RuntimeError),
-    /// Native execution has not yet gained a whole-program module registry.
-    UnsupportedProgram { modules: usize },
     /// An AOT image or entry-table linkage failure.
     Abi(AbiError),
     /// A native entry returned `FatalTrap`; `value` is the raw trap id word.
@@ -149,10 +147,6 @@ impl fmt::Display for NativeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             NativeError::Runtime(error) => write!(formatter, "{error}"),
-            NativeError::UnsupportedProgram { modules } => write!(
-                formatter,
-                "native execution does not support module-linked programs ({modules} module(s))"
-            ),
             NativeError::Abi(error) => write!(formatter, "{error}"),
             NativeError::FatalTrap { value } => {
                 write!(
@@ -223,7 +217,7 @@ enum Flow {
 /// The observable result of driving one activation to termination.
 enum FrameCompletion {
     Normal(Value),
-    Unwind(Value, ThrowOrigin),
+    Unwind(Value, ThrowOrigin, usize),
 }
 
 /// The result of invoking a callee (runtime function, host entity, or foreign
@@ -235,7 +229,7 @@ enum InvokeOutcome {
     Fatal,
 }
 
-/// The native semantic engine over a verified module.
+/// The native semantic engine over a verified program.
 ///
 /// `'m` bounds the module and entry table; `'h` bounds the host borrow. The
 /// embedded [`Machine`] owns the shared heap/globals/host/limits and every
@@ -243,11 +237,11 @@ enum InvokeOutcome {
 /// state is behind [`RefCell`]/[`Cell`] because [`NativeOps`] dispatches on
 /// `&self` (see the module docs on re-entrancy).
 pub struct NativeEngine<'m, 'h, H: Host> {
-    /// The shared semantic core: heap, globals, host, limits, module, and every
-    /// value/heap/host method the interpreter uses. Its frame stack is unused.
+    /// The shared semantic core: heap, globals, host, limits, and the one live
+    /// module registry used by interpreter and native execution alike.
     machine: RefCell<Machine<'h, H>>,
-    /// The module, borrowed for the reference driver's bytecode walk.
-    module: &'m Module<Verified>,
+    /// The verified program whose module-local bytecode drives reference calls.
+    program: &'m Program<Verified>,
     /// The compiled entry table, used by the linked backend and nested calls.
     entries: &'m dyn NativeEntryTable,
     backend: Backend,
@@ -267,11 +261,13 @@ pub struct NativeEngine<'m, 'h, H: Host> {
     pending_fatal_kind: Cell<Option<RuntimeErrorKind>>,
     /// A fully-sourced error from a nested activation, propagated verbatim.
     pending_error: Cell<Option<RuntimeError>>,
+    /// A nested entry-table linkage failure, propagated through `FatalTrap`.
+    pending_abi_error: Cell<Option<AbiError>>,
 }
 
 impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     fn build(
-        module: &'m Module<Verified>,
+        program: &'m Program<Verified>,
         entries: &'m dyn NativeEntryTable,
         host: &'h mut H,
         limits: Limits,
@@ -282,8 +278,8 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     {
         let fuel = limits.fuel;
         NativeEngine {
-            machine: RefCell::new(Machine::new_native(module, host, limits)),
-            module,
+            machine: RefCell::new(Machine::new(program, host, limits)),
+            program,
             entries,
             backend,
             activations: RefCell::new(Vec::new()),
@@ -294,6 +290,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             pending_throw: Cell::new(None),
             pending_fatal_kind: Cell::new(None),
             pending_error: Cell::new(None),
+            pending_abi_error: Cell::new(None),
         }
     }
 
@@ -302,7 +299,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     /// linked backend; the reference backend recurses internally.
     #[must_use]
     pub fn new(
-        module: &'m Module<Verified>,
+        program: &'m Program<Verified>,
         entries: &'m dyn NativeEntryTable,
         host: &'h mut H,
         limits: Limits,
@@ -310,7 +307,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     where
         'm: 'h,
     {
-        Self::build(module, entries, host, limits, Backend::Reference)
+        Self::build(program, entries, host, limits, Backend::Reference)
     }
 
     /// Buffered process stdout produced during execution.
@@ -337,59 +334,131 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         self.machine.borrow().limits.fuel
     }
 
-    fn error_at(&self, kind: RuntimeErrorKind, function: usize, pc: usize) -> RuntimeError {
-        self.machine.borrow().error_at(kind, function, pc)
+    fn error_at(
+        &self,
+        module: ModuleId,
+        kind: RuntimeErrorKind,
+        function: usize,
+        pc: usize,
+    ) -> RuntimeError {
+        self.machine
+            .borrow()
+            .error_at_in_module(kind, module, function, pc)
+    }
+
+    fn module(&self, module: ModuleId) -> &Module<Verified> {
+        &self
+            .program
+            .module(module)
+            .expect("verified native module id remains in bounds")
+            .code
     }
 
     // -- Reference backend: control-flow driver ------------------------------
 
-    /// Executes `module.entry()` with the reference driver and returns the
-    /// terminated execution. Never invokes [`Machine::run`].
+    /// Executes the program entry with the reference driver. Never invokes
+    /// [`Machine::run`].
     pub fn run(self) -> Result<Execution, RuntimeError> {
-        let entry = self.module.entry();
-        let function = entry.get() as usize;
-        let register_count = self.module.functions()[function].register_count() as usize;
-        if self.max_call_depth() < 1 {
-            let limit = self.max_call_depth();
-            return Err(self.error_at(RuntimeErrorKind::CallDepthExceeded { limit }, function, 0));
+        self.machine.borrow_mut().instantiate_modules()?;
+        self.evaluate_reference_module(self.program.entry())?
+            .ok_or_else(|| {
+                let module = self.program.entry();
+                let function = self.module(module).entry().get() as usize;
+                self.error_at(
+                    module,
+                    RuntimeErrorKind::InvalidVerifiedProgram {
+                        module,
+                        instruction: Instruction::Halt,
+                    },
+                    function,
+                    0,
+                )
+            })
+    }
+
+    fn evaluate_reference_module(
+        &self,
+        module: ModuleId,
+    ) -> Result<Option<Execution>, RuntimeError> {
+        let dependencies = match self.machine.borrow_mut().begin_module_evaluation(module)? {
+            crate::ModuleEvaluation::Cycle => return Ok(None),
+            crate::ModuleEvaluation::Evaluated(result) => return result.map(Some),
+            crate::ModuleEvaluation::Ready(dependencies) => dependencies,
+        };
+        for dependency in dependencies {
+            if let Err(error) = self.evaluate_reference_module(dependency) {
+                return self
+                    .machine
+                    .borrow_mut()
+                    .finish_module_evaluation(module, Err(error))
+                    .map(Some);
+            }
         }
-        if register_count > self.max_total_registers() {
-            let limit = self.max_total_registers();
-            return Err(self.error_at(
-                RuntimeErrorKind::RegisterLimitExceeded { limit },
-                function,
-                0,
-            ));
-        }
-        let (completion, registers) = self.execute(
-            function,
-            Value::UNDEFINED,
-            Value::UNDEFINED,
-            Vec::new(),
-            &[],
-        )?;
-        match completion {
-            FrameCompletion::Normal(value) => Ok(Execution {
-                outcome: ExecutionOutcome {
-                    stdout: self.stdout.borrow().clone(),
-                    exit_code: self.exit_code.get(),
+
+        let code = self.module(module);
+        let function = code.entry().get() as usize;
+        let register_count = code.functions()[function].register_count() as usize;
+        let result = if self.max_call_depth() < 1 {
+            Err(self.error_at(
+                module,
+                RuntimeErrorKind::CallDepthExceeded {
+                    limit: self.max_call_depth(),
                 },
-                value,
-                link: value,
-                entry_registers: registers,
-            }),
-            FrameCompletion::Unwind(value, origin) => Err(self.error_at(
-                RuntimeErrorKind::UncaughtThrow { value, origin },
                 function,
                 0,
-            )),
-        }
+            ))
+        } else if register_count > self.max_total_registers() {
+            Err(self.error_at(
+                module,
+                RuntimeErrorKind::RegisterLimitExceeded {
+                    limit: self.max_total_registers(),
+                },
+                function,
+                0,
+            ))
+        } else {
+            self.execute(
+                module,
+                function,
+                Value::UNDEFINED,
+                Value::UNDEFINED,
+                Vec::new(),
+                &[],
+            )
+            .and_then(|(completion, registers)| match completion {
+                FrameCompletion::Normal(value) => Ok(Execution {
+                    outcome: ExecutionOutcome {
+                        stdout: self.stdout.borrow().clone(),
+                        exit_code: self.exit_code.get(),
+                    },
+                    value,
+                    link: value,
+                    entry_registers: registers,
+                }),
+                FrameCompletion::Unwind(value, origin, pc) => Err(self.error_at(
+                    module,
+                    RuntimeErrorKind::UncaughtThrow { value, origin },
+                    function,
+                    pc,
+                )),
+            })
+        };
+        self.machine
+            .borrow_mut()
+            .finish_module_evaluation(module, result)
+            .map(Some)
     }
 
     /// Seeds a fresh register file: leading captures, then parameters, the rest
     /// uninitialized — identical to the interpreter's frame prologue.
-    fn seed_registers(&self, function: usize, captures: &[Value], args: &[Value]) -> Vec<Value> {
-        let metadata = &self.module.functions()[function];
+    fn seed_registers(
+        &self,
+        module: ModuleId,
+        function: usize,
+        captures: &[Value],
+        args: &[Value],
+    ) -> Vec<Value> {
+        let metadata = &self.module(module).functions()[function];
         let register_count = metadata.register_count() as usize;
         let capture_count = metadata.capture_count() as usize;
         let parameter_count = metadata.parameter_count() as usize;
@@ -413,14 +482,15 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     /// registers except for the entry frame).
     fn execute(
         &self,
+        module: ModuleId,
         function: usize,
         this_value: Value,
         new_target: Value,
         args: Vec<Value>,
         captures: &[Value],
     ) -> Result<(FrameCompletion, Vec<Value>), RuntimeError> {
-        let register_count = self.module.functions()[function].register_count() as usize;
-        let mut registers = self.seed_registers(function, captures, &args);
+        let register_count = self.module(module).functions()[function].register_count() as usize;
+        let mut registers = self.seed_registers(module, function, captures, &args);
         self.live_registers
             .set(self.live_registers.get() + register_count);
         self.activations.borrow_mut().push(Activation {
@@ -430,7 +500,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             arguments_object: None,
             pending_resume: None,
         });
-        let completion = self.run_frame(function, &mut registers);
+        let completion = self.run_frame(module, function, &mut registers);
         self.activations.borrow_mut().pop();
         self.live_registers
             .set(self.live_registers.get() - register_count);
@@ -441,22 +511,25 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     /// register file; a [`NativeFrame`] borrows it disjointly from `self`.
     fn run_frame(
         &self,
+        module: ModuleId,
         function: usize,
         registers: &mut Vec<Value>,
     ) -> Result<FrameCompletion, RuntimeError> {
         let length = u16::try_from(registers.len()).map_err(|_| {
             let limit = self.max_total_registers();
             self.error_at(
+                module,
                 RuntimeErrorKind::RegisterLimitExceeded { limit },
                 function,
                 0,
             )
         })?;
         let handles = registers.as_mut_ptr();
-        let mut shadow = ShadowFrame::new(std::ptr::null_mut(), 0, handles, length);
+        let mut shadow = ShadowFrame::new(std::ptr::null_mut(), 0, module.get(), handles, length);
         let mut frame =
             NativeFrame::new(&mut shadow, registers.as_mut_slice()).ok_or_else(|| {
                 self.error_at(
+                    module,
                     RuntimeErrorKind::InvalidValue {
                         value: Value::UNDEFINED,
                     },
@@ -469,10 +542,15 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         loop {
             if self.fuel.get() == 0 {
                 let limit = self.fuel_limit();
-                return Err(self.error_at(RuntimeErrorKind::FuelExhausted { limit }, function, pc));
+                return Err(self.error_at(
+                    module,
+                    RuntimeErrorKind::FuelExhausted { limit },
+                    function,
+                    pc,
+                ));
             }
             self.fuel.set(self.fuel.get() - 1);
-            let instruction = self.module.functions()[function].code()[pc];
+            let instruction = self.module(module).functions()[function].code()[pc];
 
             // Control-flow opcodes are the driver's own responsibility (the CLIF
             // the AOT/JIT backend generates); every value/heap/host opcode is
@@ -506,17 +584,25 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 Instruction::Halt => return Ok(FrameCompletion::Normal(Value::UNDEFINED)),
                 Instruction::Throw { value } => {
                     let thrown = frame.register(value.get());
-                    match self.raise(&mut frame, function, pc, thrown, ThrowOrigin::Bytecode) {
+                    match self.raise(
+                        &mut frame,
+                        module,
+                        function,
+                        pc,
+                        thrown,
+                        ThrowOrigin::Bytecode,
+                    ) {
                         Flow::Next => pc += 1,
                         Flow::Goto(target) => pc = target,
                         Flow::Unwind(value, origin) => {
-                            return Ok(FrameCompletion::Unwind(value, origin));
+                            return Ok(FrameCompletion::Unwind(value, origin, pc));
                         }
                     }
                 }
                 Instruction::Suspend { .. } => {
                     match self.raise(
                         &mut frame,
+                        module,
                         function,
                         pc,
                         Value::UNDEFINED,
@@ -527,18 +613,18 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         Flow::Next => pc += 1,
                         Flow::Goto(target) => pc = target,
                         Flow::Unwind(value, origin) => {
-                            return Ok(FrameCompletion::Unwind(value, origin));
+                            return Ok(FrameCompletion::Unwind(value, origin, pc));
                         }
                     }
                 }
                 other => {
                     let (call, dst) = self.lower(other, &frame);
                     let result = self.dispatch(&mut frame, call);
-                    match self.apply(&mut frame, function, pc, dst, result)? {
+                    match self.apply(&mut frame, module, function, pc, dst, result)? {
                         Flow::Next => pc += 1,
                         Flow::Goto(target) => pc = target,
                         Flow::Unwind(value, origin) => {
-                            return Ok(FrameCompletion::Unwind(value, origin));
+                            return Ok(FrameCompletion::Unwind(value, origin, pc));
                         }
                     }
                 }
@@ -768,6 +854,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     fn apply(
         &self,
         frame: &mut NativeFrame<'_>,
+        module: ModuleId,
         function: usize,
         pc: usize,
         dst: Option<u32>,
@@ -785,12 +872,13 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     Some(pending) => (pending.value, pending.origin),
                     None => (result.value, ThrowOrigin::Bytecode),
                 };
-                Ok(self.raise(frame, function, pc, value, origin))
+                Ok(self.raise(frame, module, function, pc, value, origin))
             }
             CompletionTag::Suspend => {
                 // The reference driver drives `Suspend` inline; a helper never
                 // returns it. Treat as a malformed completion.
                 Err(self.error_at(
+                    module,
                     RuntimeErrorKind::InvalidValue {
                         value: result.value,
                     },
@@ -807,7 +895,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         value: result.value,
                     }
                 });
-                Err(self.error_at(kind, function, pc))
+                Err(self.error_at(module, kind, function, pc))
             }
         }
     }
@@ -817,12 +905,13 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     fn raise(
         &self,
         frame: &mut NativeFrame<'_>,
+        module: ModuleId,
         function: usize,
         pc: usize,
         value: Value,
         origin: ThrowOrigin,
     ) -> Flow {
-        match crate::innermost_handler(&self.module.functions()[function], pc) {
+        match crate::innermost_handler(&self.module(module).functions()[function], pc) {
             Some(handler) => {
                 frame.set_register(handler.catch_register.get(), value);
                 Flow::Goto(handler.handler.get() as usize)
@@ -846,7 +935,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         let kind = self.machine.borrow().callee_kind(callee);
         match kind {
             Ok(CalleeKind::Runtime { target, captures }) => {
-                self.invoke_runtime(target.function, &captures, this, new_target, args)
+                self.invoke_runtime(target, &captures, this, new_target, args)
             }
             Ok(CalleeKind::Builtin { id, bound_this }) => {
                 let this = bound_this.unwrap_or(this);
@@ -893,20 +982,21 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     /// ceilings, dispatching to the reference driver or the linked entry table.
     fn invoke_runtime(
         &self,
-        function: FunctionId,
+        target: crate::RuntimeFunction,
         captures: &[Value],
         this: Value,
         new_target: Value,
         args: &[Value],
     ) -> InvokeOutcome {
-        let index = function.get() as usize;
+        let index = target.function.get() as usize;
         if self.activations.borrow().len() >= self.max_call_depth() {
             let limit = self.max_call_depth();
             self.pending_fatal_kind
                 .set(Some(RuntimeErrorKind::CallDepthExceeded { limit }));
             return InvokeOutcome::Fatal;
         }
-        let register_count = self.module.functions()[index].register_count() as usize;
+        let register_count =
+            self.module(target.module).functions()[index].register_count() as usize;
         if self.live_registers.get().saturating_add(register_count) > self.max_total_registers() {
             let limit = self.max_total_registers();
             self.pending_fatal_kind
@@ -915,9 +1005,16 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         }
         match self.backend {
             Backend::Reference => {
-                match self.execute(index, this, new_target, args.to_vec(), captures) {
+                match self.execute(
+                    target.module,
+                    index,
+                    this,
+                    new_target,
+                    args.to_vec(),
+                    captures,
+                ) {
                     Ok((FrameCompletion::Normal(value), _)) => InvokeOutcome::Value(value),
-                    Ok((FrameCompletion::Unwind(value, origin), _)) => {
+                    Ok((FrameCompletion::Unwind(value, origin, _), _)) => {
                         InvokeOutcome::Threw(value, origin)
                     }
                     Err(error) => {
@@ -926,7 +1023,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     }
                 }
             }
-            Backend::Linked => self.invoke_linked(function, captures, this, new_target, args),
+            Backend::Linked => self.invoke_linked(target, captures, this, new_target, args),
         }
     }
 
@@ -934,15 +1031,16 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     /// building a fresh child [`ShadowFrame`] over a driver-local register file.
     fn invoke_linked(
         &self,
-        function: FunctionId,
+        target: crate::RuntimeFunction,
         captures: &[Value],
         this: Value,
         new_target: Value,
         args: &[Value],
     ) -> InvokeOutcome {
-        let index = function.get() as usize;
-        let register_count = self.module.functions()[index].register_count() as usize;
-        let mut registers = self.seed_registers(index, captures, args);
+        let index = target.function.get() as usize;
+        let register_count =
+            self.module(target.module).functions()[index].register_count() as usize;
+        let mut registers = self.seed_registers(target.module, index, captures, args);
         let length = match u16::try_from(registers.len()) {
             Ok(length) => length,
             Err(_) => {
@@ -962,29 +1060,39 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             pending_resume: None,
         });
         let handles = registers.as_mut_ptr();
-        let mut shadow = ShadowFrame::new(std::ptr::null_mut(), 0, handles, length);
+        let mut shadow = ShadowFrame::new(
+            std::ptr::null_mut(),
+            0,
+            target.module.get(),
+            handles,
+            length,
+        );
         let mut out = Completion::new(Value::UNDEFINED);
         let entries = self.entries;
         // No borrow guard is held across `invoke`: the compiled entry re-enters
         // `dispatch` on this same engine, which takes fresh short-lived borrows.
-        let tag = entries.invoke(function.get(), &mut shadow, &mut out);
+        let tag = entries.invoke(
+            target.module.get(),
+            target.function.get(),
+            &mut shadow,
+            &mut out,
+        );
         drop(registers);
         self.activations.borrow_mut().pop();
         self.live_registers
             .set(self.live_registers.get() - register_count);
         match tag {
             Ok(CompletionTag::Normal) => InvokeOutcome::Value(out.value),
-            Ok(CompletionTag::Throw) => InvokeOutcome::Threw(out.value, ThrowOrigin::Bytecode),
-            Ok(CompletionTag::Suspend | CompletionTag::FatalTrap) => {
-                self.pending_fatal_kind
-                    .set(Some(RuntimeErrorKind::InvalidValue { value: out.value }));
-                InvokeOutcome::Fatal
+            Ok(CompletionTag::Throw) => {
+                let origin = self
+                    .pending_throw
+                    .take()
+                    .map_or(ThrowOrigin::Bytecode, |pending| pending.origin);
+                InvokeOutcome::Threw(out.value, origin)
             }
-            Err(_) => {
-                self.pending_fatal_kind
-                    .set(Some(RuntimeErrorKind::InvalidValue {
-                        value: Value::UNDEFINED,
-                    }));
+            Ok(CompletionTag::Suspend | CompletionTag::FatalTrap) => InvokeOutcome::Fatal,
+            Err(error) => {
+                self.pending_abi_error.set(Some(error));
                 InvokeOutcome::Fatal
             }
         }
@@ -1053,10 +1161,10 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         }
     }
 
-    fn constant_text(&self, id: u32) -> String {
+    fn constant_text(&self, module: ModuleId, id: u32) -> String {
         self.machine
             .borrow()
-            .constant_string(ConstantId::new(id))
+            .constant_text(module, ConstantId::new(id))
             .to_owned()
     }
 
@@ -1117,7 +1225,6 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 }
             }
             Ok(CalleeKind::Runtime { target, captures }) => {
-                let function = target.function;
                 let prototype = {
                     let machine = self.machine.borrow();
                     match machine.runtime_slot(callee) {
@@ -1143,7 +1250,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         Err(kind) => return self.fatal(kind),
                     }
                 };
-                let outcome = self.invoke_runtime(function, &captures, instance, callee, arguments);
+                let outcome = self.invoke_runtime(target, &captures, instance, callee, arguments);
                 match outcome {
                     InvokeOutcome::Value(returned) => {
                         let is_object = self.machine.borrow().is_object(returned);
@@ -1167,23 +1274,111 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
 
     // -- Linked backend ------------------------------------------------------
 
-    /// Executes `module.entry()` through the compiled entry table, installing
-    /// the engine as the thread's [`NativeOps`] for the duration of the call.
-    /// Requires `&mut self` only to satisfy `with_native_ops`'s pinned
-    /// `&mut dyn NativeOps` signature; re-entrant dispatch still uses `&self`.
     fn run_linked(&mut self) -> Result<ExecutionOutcome, NativeError> {
-        let entry = self.module.entry();
-        let function = entry.get() as usize;
-        let register_count = self.module.functions()[function].register_count() as usize;
-        let length = u16::try_from(register_count).map_err(|_| {
-            let limit = self.max_total_registers();
+        self.machine.borrow_mut().instantiate_modules()?;
+        let module = self.program.entry();
+        let execution = self.evaluate_linked_module(module)?.ok_or_else(|| {
+            let function = self.module(module).entry().get() as usize;
             NativeError::Runtime(self.error_at(
-                RuntimeErrorKind::RegisterLimitExceeded { limit },
+                module,
+                RuntimeErrorKind::InvalidVerifiedProgram {
+                    module,
+                    instruction: Instruction::Halt,
+                },
                 function,
                 0,
             ))
         })?;
-        let mut registers = vec![Value::UNINITIALIZED; register_count];
+        Ok(execution.outcome)
+    }
+
+    fn evaluate_linked_module(
+        &mut self,
+        module: ModuleId,
+    ) -> Result<Option<Execution>, NativeError> {
+        let dependencies = match self.machine.borrow_mut().begin_module_evaluation(module)? {
+            crate::ModuleEvaluation::Cycle => return Ok(None),
+            crate::ModuleEvaluation::Evaluated(result) => {
+                return result.map(Some).map_err(Into::into);
+            }
+            crate::ModuleEvaluation::Ready(dependencies) => dependencies,
+        };
+        for dependency in dependencies {
+            match self.evaluate_linked_module(dependency) {
+                Ok(_) => {}
+                Err(NativeError::Runtime(error)) => {
+                    let error = self
+                        .machine
+                        .borrow_mut()
+                        .finish_module_evaluation(module, Err(error))
+                        .expect_err("dependency failure remains an error");
+                    return Err(NativeError::Runtime(error));
+                }
+                Err(error) => {
+                    self.machine.borrow_mut().abort_module_evaluation(module);
+                    return Err(error);
+                }
+            }
+        }
+
+        match self.invoke_linked_entry(module) {
+            Ok(execution) => self
+                .machine
+                .borrow_mut()
+                .finish_module_evaluation(module, Ok(execution))
+                .map(Some)
+                .map_err(Into::into),
+            Err(NativeError::Runtime(error)) => {
+                let error = self
+                    .machine
+                    .borrow_mut()
+                    .finish_module_evaluation(module, Err(error))
+                    .expect_err("module failure remains an error");
+                Err(NativeError::Runtime(error))
+            }
+            Err(error) => {
+                self.machine.borrow_mut().abort_module_evaluation(module);
+                Err(error)
+            }
+        }
+    }
+
+    fn invoke_linked_entry(&mut self, module: ModuleId) -> Result<Execution, NativeError> {
+        let function_id = self.module(module).entry();
+        let function = function_id.get() as usize;
+        let register_count = self.module(module).functions()[function].register_count() as usize;
+        if self.max_call_depth() < 1 {
+            return Err(NativeError::Runtime(self.error_at(
+                module,
+                RuntimeErrorKind::CallDepthExceeded {
+                    limit: self.max_call_depth(),
+                },
+                function,
+                0,
+            )));
+        }
+        if register_count > self.max_total_registers() {
+            return Err(NativeError::Runtime(self.error_at(
+                module,
+                RuntimeErrorKind::RegisterLimitExceeded {
+                    limit: self.max_total_registers(),
+                },
+                function,
+                0,
+            )));
+        }
+        let mut registers = self.seed_registers(module, function, &[], &[]);
+        let length = u16::try_from(register_count).map_err(|_| {
+            NativeError::Runtime(self.error_at(
+                module,
+                RuntimeErrorKind::RegisterLimitExceeded {
+                    limit: self.max_total_registers(),
+                },
+                function,
+                0,
+            ))
+        })?;
+        self.live_registers.set(register_count);
         self.activations.borrow_mut().push(Activation {
             this_value: Value::UNDEFINED,
             new_target: Value::UNDEFINED,
@@ -1192,29 +1387,54 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             pending_resume: None,
         });
         let handles = registers.as_mut_ptr();
-        let mut shadow = ShadowFrame::new(std::ptr::null_mut(), 0, handles, length);
+        let mut shadow = ShadowFrame::new(std::ptr::null_mut(), 0, module.get(), handles, length);
         let mut out = Completion::new(Value::UNDEFINED);
         let entries = self.entries;
-        let tag = with_native_ops(self, || entries.invoke(entry.get(), &mut shadow, &mut out));
-        // `registers` stays alive until here so the compiled entry's frame is
-        // valid for the whole call; it is never read back through `self`.
-        drop(registers);
+        let tag = with_native_ops(self, || {
+            entries.invoke(module.get(), function_id.get(), &mut shadow, &mut out)
+        });
         self.activations.borrow_mut().pop();
+        self.live_registers.set(0);
         match tag {
-            Ok(CompletionTag::Normal) => Ok(ExecutionOutcome {
-                stdout: self.stdout.borrow().clone(),
-                exit_code: self.exit_code.get(),
-            }),
-            Ok(CompletionTag::Throw) => Err(NativeError::Runtime(self.error_at(
-                RuntimeErrorKind::UncaughtThrow {
-                    value: out.value,
-                    origin: ThrowOrigin::Bytecode,
+            Ok(CompletionTag::Normal) => Ok(Execution {
+                outcome: ExecutionOutcome {
+                    stdout: self.stdout.borrow().clone(),
+                    exit_code: self.exit_code.get(),
                 },
-                function,
-                0,
-            ))),
+                value: out.value,
+                link: out.value,
+                entry_registers: registers,
+            }),
+            Ok(CompletionTag::Throw) => {
+                let origin = self
+                    .pending_throw
+                    .take()
+                    .map_or(ThrowOrigin::Bytecode, |pending| pending.origin);
+                Err(NativeError::Runtime(self.error_at(
+                    module,
+                    RuntimeErrorKind::UncaughtThrow {
+                        value: out.value,
+                        origin,
+                    },
+                    function,
+                    shadow.bytecode_pc as usize,
+                )))
+            }
             Ok(CompletionTag::Suspend | CompletionTag::FatalTrap) => {
-                Err(NativeError::FatalTrap { value: out.value })
+                if let Some(error) = self.pending_abi_error.take() {
+                    Err(NativeError::Abi(error))
+                } else if let Some(error) = self.pending_error.take() {
+                    Err(NativeError::Runtime(error))
+                } else if let Some(kind) = self.pending_fatal_kind.take() {
+                    Err(NativeError::Runtime(self.error_at(
+                        module,
+                        kind,
+                        function,
+                        shadow.bytecode_pc as usize,
+                    )))
+                } else {
+                    Err(NativeError::FatalTrap { value: out.value })
+                }
             }
             Err(error) => Err(NativeError::Abi(error)),
         }
@@ -1229,12 +1449,13 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
     }
 
     fn dispatch(&self, frame: &mut NativeFrame<'_>, call: HelperCall) -> HelperResult {
+        let module = ModuleId::new(frame.module_id());
         match call {
             HelperCall::LoadConstant { const_id } => {
                 let result = self
                     .machine
                     .borrow_mut()
-                    .load_constant_value(ConstantId::new(const_id));
+                    .load_constant_value(module, ConstantId::new(const_id));
                 match result {
                     Ok(value) => HelperResult::normal(value),
                     Err(kind) => self.fatal(kind),
@@ -1284,12 +1505,12 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 let materialized = self
                     .machine
                     .borrow()
-                    .captures_from_array(captures, function);
+                    .captures_from_array(module, captures, function);
                 match materialized {
                     Ok(captures) => {
                         let prototype = self.machine.borrow().intrinsics.function_prototype;
                         self.allocated(HeapEntry::Function {
-                            module: bamts_bytecode::ModuleId::new(0),
+                            module,
                             function,
                             captures,
                             properties: PropertyMap::default(),
@@ -1430,11 +1651,13 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 }
             }
             HelperCall::LoadGlobal { name } => {
-                let name = self.constant_text(name);
-                let resolved = self.machine.borrow_mut().resolve_global_binding(&name);
+                let resolved = self
+                    .machine
+                    .borrow()
+                    .load_global(module, ConstantId::new(name));
                 match resolved {
-                    Some(value) => self.validated(value),
-                    None => {
+                    Ok(Some(value)) => self.validated(value),
+                    Ok(None) => {
                         self.pending_throw.set(Some(PendingThrow {
                             value: Value::UNDEFINED,
                             origin: ThrowOrigin::ReferenceError {
@@ -1443,19 +1666,28 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                         }));
                         HelperResult::throw(Value::UNDEFINED)
                     }
+                    Err(kind) => self.fatal(kind),
                 }
             }
             HelperCall::StoreGlobal { name, value } => {
-                let name = self.constant_text(name);
-                self.machine.borrow_mut().globals.insert(name, value);
-                HelperResult::normal(Value::UNDEFINED)
+                let stored =
+                    self.machine
+                        .borrow_mut()
+                        .store_global(module, ConstantId::new(name), value);
+                match stored {
+                    Ok(()) => HelperResult::normal(Value::UNDEFINED),
+                    Err(failure) => self.fail(failure),
+                }
             }
             HelperCall::TypeOfGlobal { name } => {
-                let name = self.constant_text(name);
-                let resolved = self.machine.borrow_mut().resolve_global_binding(&name);
+                let resolved = self
+                    .machine
+                    .borrow()
+                    .load_global(module, ConstantId::new(name));
                 let text = match resolved {
-                    Some(value) => self.machine.borrow().type_of(value).to_owned(),
-                    None => "undefined".to_owned(),
+                    Ok(Some(value)) => self.machine.borrow().type_of(value).to_owned(),
+                    Ok(None) => "undefined".to_owned(),
+                    Err(kind) => return self.fatal(kind),
                 };
                 self.allocated(HeapEntry::String(text))
             }
@@ -1501,12 +1733,12 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 }
             }
             HelperCall::CreatePrivateName { description } => {
-                let description = self.constant_text(description);
+                let description = self.constant_text(module, description);
                 self.allocated(HeapEntry::PrivateName { description })
             }
             HelperCall::CreateRegExp { pattern, flags } => {
-                let pattern = self.constant_text(pattern);
-                let flags = self.constant_text(flags);
+                let pattern = self.constant_text(module, pattern);
+                let flags = self.constant_text(module, flags);
                 self.allocated(HeapEntry::RegExp {
                     pattern,
                     flags,
@@ -1563,37 +1795,26 @@ pub fn run_linked_program<H: Host>(
     host: &mut H,
     limits: &Limits,
 ) -> Result<ExecutionOutcome, NativeError> {
-    let module = &program
-        .module(program.entry())
-        .expect("verified program entry exists");
-    if program.modules().len() != 1
-        || !module.edges().is_empty()
-        || !module.bindings().is_empty()
-        || !module.exports().is_empty()
-    {
-        return Err(NativeError::UnsupportedProgram {
-            modules: program.modules().len(),
-        });
-    }
-    let module = &module.code;
-    let mut engine = NativeEngine::build(module, entries, host, limits.clone(), Backend::Linked);
+    let mut engine = NativeEngine::build(program, entries, host, limits.clone(), Backend::Linked);
     engine.run_linked()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     use bamts_bytecode::{
-        BinaryOp, Binding, BindingKind, Constant, ConstantId, Edge, EdgeId, EdgeKind, EdgeTarget,
-        ExceptionHandler, Function, FunctionFlags, FunctionId, Instruction, Module, ModuleId, Pc,
-        Program, ProgramModule, Register, Verified,
+        BinaryOp, Binding, BindingId, BindingKind, Constant, ConstantId, Edge, EdgeId, EdgeKind,
+        EdgeTarget, ExceptionHandler, Export, ExportSource, Function, FunctionFlags, FunctionId,
+        Instruction, Module, ModuleId, Pc, Program, ProgramModule, Register, Verified,
     };
     use bamts_native::{AbiError, Completion, CompletionTag, NativeEntryTable, ShadowFrame, Value};
 
-    use crate::{Host, Limits, Machine};
+    use crate::{Host, Limits, Machine, RuntimeError, RuntimeErrorKind, ThrowOrigin};
 
-    use super::{NativeEngine, NativeError, run_linked_program};
+    use super::{
+        Backend, InvokeOutcome, NativeEngine, NativeError, PendingThrow, run_linked_program,
+    };
 
     fn reg(raw: u32) -> Register {
         Register::new(raw)
@@ -1625,51 +1846,670 @@ mod tests {
             .expect("module verifies")
     }
 
+    fn module_function(captures: u32, registers: u32, code: Vec<Instruction>) -> Function {
+        Function::new(
+            None,
+            captures,
+            0,
+            registers,
+            FunctionFlags::default(),
+            code,
+            Vec::new(),
+        )
+    }
+
+    fn program_module(
+        name: &str,
+        mut constants: Vec<Constant>,
+        functions: Vec<Function>,
+        edges: Vec<Edge>,
+        bindings: Vec<Binding>,
+        exports: Vec<Export>,
+    ) -> ProgramModule<Verified> {
+        constants.insert(0, Constant::String(name.to_owned()));
+        ProgramModule {
+            name: cid(0),
+            code: Module::new(constants, functions, FunctionId::new(0))
+                .verify()
+                .expect("module fixture verifies"),
+            edges,
+            bindings,
+            exports,
+        }
+    }
+
+    fn linked(modules: Vec<ProgramModule<Verified>>, entry: u32) -> Program<Verified> {
+        Program::link(modules, ModuleId::new(entry)).expect("module fixture links")
+    }
+
+    fn assert_program_parity(
+        program: &Program<Verified>,
+    ) -> Result<crate::Execution, RuntimeError> {
+        let limits = Limits::default();
+        let mut interpreter_host = SilentHost;
+        let interpreter = Machine::new(program, &mut interpreter_host, limits.clone()).run();
+        let mut native_host = SilentHost;
+        let entries = NoEntries;
+        let native = NativeEngine::new(program, &entries, &mut native_host, limits).run();
+        assert_eq!(interpreter, native);
+        native
+    }
+
     /// A dummy entry table for the reference backend, which never invokes it.
     struct NoEntries;
 
     impl NativeEntryTable for NoEntries {
         fn invoke(
             &self,
+            module_id: u32,
             function_id: u32,
             _frame: &mut ShadowFrame,
             _out: &mut Completion,
         ) -> Result<CompletionTag, AbiError> {
-            Err(AbiError::UnknownFunction { function_id })
+            Err(AbiError::UnknownFunction {
+                module_id,
+                function_id,
+            })
         }
     }
 
-    /// Runs `module` on both the interpreter and the native reference engine
-    /// with fresh copies of `host`, asserting the observable results match.
-    fn assert_parity<H: Host, F: Fn() -> H>(module: &Module<Verified>, make_host: F) -> Value {
-        let limits = Limits::default();
+    #[derive(Default)]
+    struct RecordingEntries {
+        invoked: RefCell<Vec<(u32, u32)>>,
+    }
 
-        let mut interp_host = make_host();
-        let interpreter = Machine::new_native(module, &mut interp_host, limits.clone())
-            .run()
-            .expect("interpreter runs");
+    impl NativeEntryTable for RecordingEntries {
+        fn invoke(
+            &self,
+            module_id: u32,
+            function_id: u32,
+            _frame: &mut ShadowFrame,
+            out: &mut Completion,
+        ) -> Result<CompletionTag, AbiError> {
+            self.invoked.borrow_mut().push((module_id, function_id));
+            *out = Completion::new(Value::UNDEFINED);
+            Ok(CompletionTag::Normal)
+        }
+    }
 
-        let mut native_host = make_host();
-        let entries = NoEntries;
-        let native = NativeEngine::new(module, &entries, &mut native_host, limits)
-            .run()
-            .expect("native engine runs");
+    struct SmokeEntries {
+        invoked: Cell<Option<u32>>,
+    }
 
-        assert_eq!(
-            interpreter.value, native.value,
-            "return value parity: interpreter {:?} vs native {:?}",
-            interpreter.value, native.value
+    impl NativeEntryTable for SmokeEntries {
+        fn invoke(
+            &self,
+            module_id: u32,
+            function_id: u32,
+            _frame: &mut ShadowFrame,
+            out: &mut Completion,
+        ) -> Result<CompletionTag, AbiError> {
+            assert_eq!(module_id, 0);
+            self.invoked.set(Some(function_id));
+            *out = Completion::new(Value::UNDEFINED);
+            Ok(CompletionTag::Normal)
+        }
+    }
+
+    struct FailingEntries;
+
+    impl NativeEntryTable for FailingEntries {
+        fn invoke(
+            &self,
+            module_id: u32,
+            function_id: u32,
+            _frame: &mut ShadowFrame,
+            _out: &mut Completion,
+        ) -> Result<CompletionTag, AbiError> {
+            Err(AbiError::UnknownFunction {
+                module_id,
+                function_id,
+            })
+        }
+    }
+
+    struct ThrowEntries;
+
+    impl NativeEntryTable for ThrowEntries {
+        fn invoke(
+            &self,
+            _module_id: u32,
+            _function_id: u32,
+            _frame: &mut ShadowFrame,
+            out: &mut Completion,
+        ) -> Result<CompletionTag, AbiError> {
+            *out = Completion::new(Value::UNDEFINED);
+            Ok(CompletionTag::Throw)
+        }
+    }
+
+    struct FatalEntries;
+
+    impl NativeEntryTable for FatalEntries {
+        fn invoke(
+            &self,
+            _module_id: u32,
+            _function_id: u32,
+            _frame: &mut ShadowFrame,
+            out: &mut Completion,
+        ) -> Result<CompletionTag, AbiError> {
+            *out = Completion::new(Value::UNDEFINED);
+            Ok(CompletionTag::FatalTrap)
+        }
+    }
+
+    #[test]
+    fn native_program_keeps_same_name_globals_module_local() {
+        let dependency = |name: &str, value: i32| {
+            program_module(
+                name,
+                vec![Constant::String("x".into()), Constant::Int32(value)],
+                vec![module_function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(2),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                )],
+                Vec::new(),
+                vec![Binding {
+                    name: cid(1),
+                    kind: BindingKind::Hoisted,
+                }],
+                vec![Export {
+                    name: cid(1),
+                    source: ExportSource::Local(BindingId::new(0)),
+                }],
+            )
+        };
+        let root = program_module(
+            "root",
+            vec![
+                Constant::String("left".into()),
+                Constant::String("right".into()),
+                Constant::String("x".into()),
+                Constant::String("one".into()),
+                Constant::String("two".into()),
+            ],
+            vec![module_function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(1),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(1),
+                        name: cid(2),
+                    },
+                    Instruction::Binary {
+                        dst: reg(2),
+                        op: BinaryOp::Add,
+                        left: reg(0),
+                        right: reg(1),
+                    },
+                    Instruction::Return { value: reg(2) },
+                ],
+            )],
+            vec![
+                Edge {
+                    specifier: cid(3),
+                    target: EdgeTarget::Local(ModuleId::new(0)),
+                    kind: EdgeKind::Static,
+                },
+                Edge {
+                    specifier: cid(4),
+                    target: EdgeTarget::Local(ModuleId::new(1)),
+                    kind: EdgeKind::Static,
+                },
+            ],
+            vec![
+                Binding {
+                    name: cid(1),
+                    kind: BindingKind::Imported {
+                        edge: EdgeId::new(0),
+                        name: cid(3),
+                    },
+                },
+                Binding {
+                    name: cid(2),
+                    kind: BindingKind::Imported {
+                        edge: EdgeId::new(1),
+                        name: cid(3),
+                    },
+                },
+            ],
+            Vec::new(),
+        );
+        let execution = assert_program_parity(&linked(
+            vec![dependency("one", 1), dependency("two", 2), root],
+            2,
+        ))
+        .unwrap();
+        assert_eq!(execution.value, Value::int32(3));
+    }
+
+    #[test]
+    fn native_program_preserves_live_mutation_and_nested_closure_module() {
+        let dependency = program_module(
+            "dependency",
+            vec![
+                Constant::String("x".into()),
+                Constant::Int32(1),
+                Constant::Int32(2),
+                Constant::String("set".into()),
+            ],
+            vec![
+                module_function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(2),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::CreateArray { dst: reg(1) },
+                        Instruction::CreateClosure {
+                            dst: reg(2),
+                            function: FunctionId::new(1),
+                            captures: reg(1),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(4),
+                            value: reg(2),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                ),
+                module_function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(3),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                ),
+            ],
+            Vec::new(),
+            vec![
+                Binding {
+                    name: cid(1),
+                    kind: BindingKind::Hoisted,
+                },
+                Binding {
+                    name: cid(4),
+                    kind: BindingKind::Hoisted,
+                },
+            ],
+            vec![
+                Export {
+                    name: cid(1),
+                    source: ExportSource::Local(BindingId::new(0)),
+                },
+                Export {
+                    name: cid(4),
+                    source: ExportSource::Local(BindingId::new(1)),
+                },
+            ],
+        );
+        let root = program_module(
+            "root",
+            vec![
+                Constant::String("set".into()),
+                Constant::String("x".into()),
+                Constant::String("dependency".into()),
+            ],
+            vec![module_function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(1),
+                    },
+                    Instruction::CreateArray { dst: reg(1) },
+                    Instruction::Call {
+                        dst: reg(2),
+                        callee: reg(0),
+                        this_value: reg(1),
+                        arguments: reg(1),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(2),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+            )],
+            vec![Edge {
+                specifier: cid(3),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            vec![
+                Binding {
+                    name: cid(1),
+                    kind: BindingKind::Imported {
+                        edge: EdgeId::new(0),
+                        name: cid(1),
+                    },
+                },
+                Binding {
+                    name: cid(2),
+                    kind: BindingKind::Imported {
+                        edge: EdgeId::new(0),
+                        name: cid(2),
+                    },
+                },
+            ],
+            Vec::new(),
         );
         assert_eq!(
-            interpreter.outcome, native.outcome,
-            "outcome parity: interpreter {:?} vs native {:?}",
-            interpreter.outcome, native.outcome
+            assert_program_parity(&linked(vec![dependency, root], 1))
+                .unwrap()
+                .value,
+            Value::int32(2)
+        );
+    }
+
+    #[test]
+    fn native_program_cycle_observes_temporal_dead_zone() {
+        let first = program_module(
+            "first",
+            vec![
+                Constant::String("a".into()),
+                Constant::Int32(1),
+                Constant::String("second".into()),
+            ],
+            vec![module_function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(2),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(1),
+                        value: reg(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+            )],
+            vec![Edge {
+                specifier: cid(3),
+                target: EdgeTarget::Local(ModuleId::new(1)),
+                kind: EdgeKind::Static,
+            }],
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Lexical,
+            }],
+            vec![Export {
+                name: cid(1),
+                source: ExportSource::Local(BindingId::new(0)),
+            }],
+        );
+        let second = program_module(
+            "second",
+            vec![
+                Constant::String("a".into()),
+                Constant::String("first".into()),
+            ],
+            vec![module_function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(1),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+            )],
+            vec![Edge {
+                specifier: cid(2),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Imported {
+                    edge: EdgeId::new(0),
+                    name: cid(1),
+                },
+            }],
+            Vec::new(),
+        );
+        let error = assert_program_parity(&linked(vec![first, second], 0)).unwrap_err();
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::TemporalDeadZone { module, binding }
+                if module == ModuleId::new(1) && binding == BindingId::new(0)
+        ));
+    }
+
+    #[test]
+    fn native_program_namespace_reads_shared_export_cell() {
+        let dependency = program_module(
+            "dependency",
+            vec![Constant::String("x".into()), Constant::Int32(7)],
+            vec![module_function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(2),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(1),
+                        value: reg(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+            )],
+            Vec::new(),
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Hoisted,
+            }],
+            vec![Export {
+                name: cid(1),
+                source: ExportSource::Local(BindingId::new(0)),
+            }],
+        );
+        let root = program_module(
+            "root",
+            vec![
+                Constant::String("ns".into()),
+                Constant::String("x".into()),
+                Constant::String("dependency".into()),
+            ],
+            vec![module_function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(1),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(2),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(2),
+                        object: reg(0),
+                        key: reg(1),
+                    },
+                    Instruction::Return { value: reg(2) },
+                ],
+            )],
+            vec![Edge {
+                specifier: cid(3),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Namespace {
+                    edge: EdgeId::new(0),
+                },
+            }],
+            Vec::new(),
         );
         assert_eq!(
-            interpreter.entry_registers, native.entry_registers,
-            "entry register parity"
+            assert_program_parity(&linked(vec![dependency, root], 1))
+                .unwrap()
+                .value,
+            Value::int32(7)
         );
-        native.value
+    }
+
+    #[test]
+    fn native_program_evaluates_duplicate_static_dependency_once() {
+        let dependency = program_module(
+            "dependency",
+            vec![
+                Constant::String("count".into()),
+                Constant::Int32(0),
+                Constant::Int32(1),
+            ],
+            vec![module_function(
+                0,
+                2,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(1),
+                    },
+                    Instruction::JumpIfFalse {
+                        condition: reg(0),
+                        target: pc(4),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(3),
+                    },
+                    Instruction::Jump { target: pc(6) },
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(3),
+                    },
+                    Instruction::Binary {
+                        dst: reg(0),
+                        op: BinaryOp::Add,
+                        left: reg(0),
+                        right: reg(1),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(1),
+                        value: reg(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+            )],
+            Vec::new(),
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Hoisted,
+            }],
+            vec![Export {
+                name: cid(1),
+                source: ExportSource::Local(BindingId::new(0)),
+            }],
+        );
+        let root = program_module(
+            "root",
+            vec![
+                Constant::String("count".into()),
+                Constant::String("dependency".into()),
+                Constant::String("dependency-again".into()),
+            ],
+            vec![module_function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(1),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+            )],
+            vec![
+                Edge {
+                    specifier: cid(2),
+                    target: EdgeTarget::Local(ModuleId::new(0)),
+                    kind: EdgeKind::Static,
+                },
+                Edge {
+                    specifier: cid(3),
+                    target: EdgeTarget::Local(ModuleId::new(0)),
+                    kind: EdgeKind::Static,
+                },
+            ],
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Imported {
+                    edge: EdgeId::new(0),
+                    name: cid(1),
+                },
+            }],
+            Vec::new(),
+        );
+        assert_eq!(
+            assert_program_parity(&linked(vec![dependency, root], 1))
+                .unwrap()
+                .value,
+            Value::int32(1)
+        );
+    }
+
+    #[test]
+    fn native_program_memoizes_thrown_object_identity() {
+        let module = program_module(
+            "throws",
+            Vec::new(),
+            vec![module_function(
+                0,
+                1,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::Throw { value: reg(0) },
+                ],
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let error = assert_program_parity(&linked(vec![module], 0)).unwrap_err();
+        assert!(matches!(error.kind, RuntimeErrorKind::UncaughtThrow { .. }));
     }
 
     struct SilentHost;
@@ -1873,37 +2713,56 @@ mod tests {
         assert_eq!(value.as_int32(), Some(99));
     }
 
-    /// A synthetic entry table standing in for a compiled AOT image: it records
-    /// the invoked entry and writes a `Normal` completion without touching
-    /// registers.
-    struct SmokeEntries {
-        invoked: Cell<Option<u32>>,
+    fn one_module_program(module: &Module<Verified>) -> Program<Verified> {
+        let mut constants = module.constants().to_vec();
+        let name = ConstantId::new(constants.len() as u32);
+        constants.push(Constant::String("test-module".to_owned()));
+        let code = Module::new(constants, module.functions().to_vec(), module.entry())
+            .verify()
+            .expect("test module remains verified");
+        Program::link(
+            vec![ProgramModule {
+                name,
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect("one-module reference program links")
     }
 
-    impl NativeEntryTable for SmokeEntries {
-        fn invoke(
-            &self,
-            function_id: u32,
-            _frame: &mut ShadowFrame,
-            out: &mut Completion,
-        ) -> Result<CompletionTag, AbiError> {
-            self.invoked.set(Some(function_id));
-            out.value = Value::int32(123);
-            Ok(CompletionTag::Normal)
-        }
-    }
+    fn assert_parity<H: Host, F: Fn() -> H>(module: &Module<Verified>, make_host: F) -> Value {
+        let limits = Limits::default();
+        let program = one_module_program(module);
 
-    struct FailingEntries;
+        let mut interp_host = make_host();
+        let interpreter = Machine::new(&program, &mut interp_host, limits.clone())
+            .run()
+            .expect("interpreter runs");
 
-    impl NativeEntryTable for FailingEntries {
-        fn invoke(
-            &self,
-            function_id: u32,
-            _frame: &mut ShadowFrame,
-            _out: &mut Completion,
-        ) -> Result<CompletionTag, AbiError> {
-            Err(AbiError::UnknownFunction { function_id })
-        }
+        let mut native_host = make_host();
+        let entries = NoEntries;
+        let native = NativeEngine::new(&program, &entries, &mut native_host, limits)
+            .run()
+            .expect("native engine runs");
+
+        assert_eq!(
+            interpreter.value, native.value,
+            "return value parity: interpreter {:?} vs native {:?}",
+            interpreter.value, native.value
+        );
+        assert_eq!(
+            interpreter.outcome, native.outcome,
+            "outcome parity: interpreter {:?} vs native {:?}",
+            interpreter.outcome, native.outcome
+        );
+        assert_eq!(
+            interpreter.entry_registers, native.entry_registers,
+            "entry register parity"
+        );
+        native.value
     }
 
     fn trivial_program() -> Program<Verified> {
@@ -1922,33 +2781,6 @@ mod tests {
             ModuleId::new(0),
         )
         .expect("valid native test program")
-    }
-
-    fn metadata_program(
-        edges: Vec<Edge>,
-        bindings: Vec<Binding>,
-        exports: Vec<bamts_bytecode::Export>,
-    ) -> Program<Verified> {
-        let module = trivial_program().modules()[0].clone();
-        Program::link(
-            vec![ProgramModule {
-                name: module.name,
-                code: module.code,
-                edges,
-                bindings,
-                exports,
-            }],
-            ModuleId::new(0),
-        )
-        .expect("valid module metadata fixture")
-    }
-
-    fn external_static_edge() -> Edge {
-        Edge {
-            specifier: cid(0),
-            target: EdgeTarget::External,
-            kind: EdgeKind::Static,
-        }
     }
 
     #[test]
@@ -1974,82 +2806,34 @@ mod tests {
             .expect_err("entry table failure surfaces");
         assert!(matches!(
             error,
-            NativeError::Abi(AbiError::UnknownFunction { function_id: 0 })
-        ));
-    }
-    #[test]
-    fn linked_backend_rejects_multi_module_programs_at_typed_boundary() {
-        let single = trivial_program();
-        let first = single.modules()[0].clone();
-        let second = ProgramModule {
-            name: ConstantId::new(0),
-            code: verified(
-                vec![Constant::String("<other>".to_owned())],
-                vec![entry_function(1, vec![Instruction::Halt])],
-            ),
-            edges: Vec::new(),
-            bindings: Vec::new(),
-            exports: Vec::new(),
-        };
-        let program = Program::link(vec![first, second], ModuleId::new(0)).unwrap();
-        let entries = NoEntries;
-        let mut host = SilentHost;
-        assert!(matches!(
-            run_linked_program(&program, &entries, &mut host, &Limits::default()),
-            Err(NativeError::UnsupportedProgram { modules: 2 })
+            NativeError::Abi(AbiError::UnknownFunction {
+                module_id: 0,
+                function_id: 0
+            })
         ));
     }
 
     #[test]
-    fn linked_backend_rejects_single_module_registry_metadata() {
-        let programs = [
-            metadata_program(
-                Vec::new(),
-                vec![Binding {
-                    name: cid(0),
-                    kind: BindingKind::Lexical,
-                }],
-                Vec::new(),
-            ),
-            metadata_program(
-                Vec::new(),
-                vec![Binding {
-                    name: cid(0),
-                    kind: BindingKind::Hoisted,
-                }],
-                Vec::new(),
-            ),
-            metadata_program(
-                vec![external_static_edge()],
-                vec![Binding {
-                    name: cid(0),
-                    kind: BindingKind::Imported {
-                        edge: EdgeId::new(0),
-                        name: cid(0),
-                    },
-                }],
-                Vec::new(),
-            ),
-            metadata_program(
-                vec![external_static_edge()],
-                vec![Binding {
-                    name: cid(0),
-                    kind: BindingKind::Namespace {
-                        edge: EdgeId::new(0),
-                    },
-                }],
-                Vec::new(),
-            ),
-            metadata_program(vec![external_static_edge()], Vec::new(), Vec::new()),
-        ];
-        let entries = NoEntries;
+    fn linked_backend_invokes_static_dependencies_before_entry_by_tuple() {
+        let single = trivial_program();
+        let first = single.modules()[0].clone();
+        let second = program_module(
+            "entry",
+            vec![Constant::String("dependency".into())],
+            vec![entry_function(1, vec![Instruction::Halt])],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let program = Program::link(vec![first, second], ModuleId::new(1)).unwrap();
+        let entries = RecordingEntries::default();
         let mut host = SilentHost;
-        for program in &programs {
-            assert!(matches!(
-                run_linked_program(program, &entries, &mut host, &Limits::default()),
-                Err(NativeError::UnsupportedProgram { modules: 1 })
-            ));
-        }
+        run_linked_program(&program, &entries, &mut host, &Limits::default()).unwrap();
+        assert_eq!(entries.invoked.borrow().as_slice(), &[(0, 0), (1, 0)]);
     }
 
     #[test]
@@ -2129,5 +2913,122 @@ mod tests {
             )],
         );
         assert_eq!(assert_parity(&module, || SilentHost), Value::TRUE);
+    }
+
+    #[test]
+    fn linked_entry_preserves_pending_throw_origin() {
+        let program = trivial_program();
+        let mut host = SilentHost;
+        let mut engine = NativeEngine::build(
+            &program,
+            &ThrowEntries,
+            &mut host,
+            Limits::default(),
+            Backend::Linked,
+        );
+        engine.pending_throw.set(Some(PendingThrow {
+            value: Value::UNDEFINED,
+            origin: ThrowOrigin::ReferenceError {
+                operation: "fixture",
+            },
+        }));
+        let error = engine.run_linked().unwrap_err();
+        assert!(matches!(
+            error,
+            NativeError::Runtime(RuntimeError {
+                kind: RuntimeErrorKind::UncaughtThrow {
+                    origin: ThrowOrigin::ReferenceError {
+                        operation: "fixture"
+                    },
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn linked_entry_sources_pending_runtime_fatal_kind() {
+        let program = trivial_program();
+        let mut host = SilentHost;
+        let mut engine = NativeEngine::build(
+            &program,
+            &FatalEntries,
+            &mut host,
+            Limits::default(),
+            Backend::Linked,
+        );
+        engine
+            .pending_fatal_kind
+            .set(Some(RuntimeErrorKind::InvalidValue { value: Value::NULL }));
+        let error = engine.run_linked().unwrap_err();
+        assert!(matches!(
+            error,
+            NativeError::Runtime(RuntimeError {
+                kind: RuntimeErrorKind::InvalidValue { value },
+                ..
+            }) if value == Value::NULL
+        ));
+    }
+
+    #[test]
+    fn nested_linked_unknown_tuple_remains_abi_error() {
+        let module = verified(
+            Vec::new(),
+            vec![
+                entry_function(1, vec![Instruction::Halt]),
+                entry_function(1, vec![Instruction::Halt]),
+            ],
+        );
+        let program = one_module_program(&module);
+        let mut host = SilentHost;
+        let engine = NativeEngine::build(
+            &program,
+            &FailingEntries,
+            &mut host,
+            Limits::default(),
+            Backend::Linked,
+        );
+        let outcome = engine.invoke_runtime(
+            crate::RuntimeFunction {
+                module: ModuleId::new(0),
+                function: FunctionId::new(1),
+            },
+            &[],
+            Value::UNDEFINED,
+            Value::UNDEFINED,
+            &[],
+        );
+        assert!(matches!(outcome, InvokeOutcome::Fatal));
+        assert!(matches!(
+            engine.pending_abi_error.take(),
+            Some(AbiError::UnknownFunction {
+                module_id: 0,
+                function_id: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn linked_abi_failure_leaves_module_retryable() {
+        let program = trivial_program();
+        let mut host = SilentHost;
+        let mut engine = NativeEngine::build(
+            &program,
+            &FailingEntries,
+            &mut host,
+            Limits::default(),
+            Backend::Linked,
+        );
+        engine.machine.borrow_mut().instantiate_modules().unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                engine.evaluate_linked_module(ModuleId::new(0)),
+                Err(NativeError::Abi(AbiError::UnknownFunction {
+                    module_id: 0,
+                    function_id: 0
+                }))
+            ));
+        }
     }
 }

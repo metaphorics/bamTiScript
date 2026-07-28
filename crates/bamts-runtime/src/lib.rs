@@ -653,6 +653,13 @@ enum ModuleState {
     Evaluated(Result<Execution, RuntimeError>),
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum ModuleEvaluation {
+    Cycle,
+    Evaluated(Result<Execution, RuntimeError>),
+    Ready(Vec<ModuleId>),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CellId(usize);
 
@@ -679,14 +686,6 @@ impl<'a, H: Host> Machine<'a, H> {
             .expect("verified program entry exists")
             .code;
         Self::build(Some(program), module, host, limits)
-    }
-
-    pub(crate) fn new_native(
-        module: &'a Module<Verified>,
-        host: &'a mut H,
-        limits: Limits,
-    ) -> Self {
-        Self::build(None, module, host, limits)
     }
 
     fn build(
@@ -812,7 +811,7 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(id)
     }
 
-    fn instantiate_modules(&mut self) -> Result<(), RuntimeError> {
+    pub(crate) fn instantiate_modules(&mut self) -> Result<(), RuntimeError> {
         let program = self
             .program
             .expect("module registry operations require a whole program");
@@ -941,40 +940,14 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn evaluate_module(&mut self, module: ModuleId) -> Result<Option<Execution>, RuntimeError> {
-        match self.registry.modules[module.get() as usize].state.clone() {
-            ModuleState::Evaluating => return Ok(None),
-            ModuleState::Evaluated(result) => return result.map(Some),
-            ModuleState::Unevaluated => {}
-        }
-        self.registry.modules[module.get() as usize].state = ModuleState::Evaluating;
-
-        let edges = self.program().modules()[module.get() as usize]
-            .edges
-            .clone();
-        for (edge_index, edge) in edges.into_iter().enumerate() {
-            if !edge.kind.has_static() {
-                continue;
-            }
-            match edge.target {
-                EdgeTarget::Local(dependency) => {
-                    if let Err(error) = self.evaluate_module(dependency) {
-                        self.registry.modules[module.get() as usize].state =
-                            ModuleState::Evaluated(Err(error.clone()));
-                        return Err(error);
-                    }
-                }
-                EdgeTarget::External => {
-                    let error = self.program_error(
-                        module,
-                        RuntimeErrorKind::ExternalModuleUnavailable {
-                            module,
-                            edge: EdgeId::new(edge_index as u32),
-                        },
-                    );
-                    self.registry.modules[module.get() as usize].state =
-                        ModuleState::Evaluated(Err(error.clone()));
-                    return Err(error);
-                }
+        let dependencies = match self.begin_module_evaluation(module)? {
+            ModuleEvaluation::Cycle => return Ok(None),
+            ModuleEvaluation::Evaluated(result) => return result.map(Some),
+            ModuleEvaluation::Ready(dependencies) => dependencies,
+        };
+        for dependency in dependencies {
+            if let Err(error) = self.evaluate_module(dependency) {
+                return self.finish_module_evaluation(module, Err(error)).map(Some);
             }
         }
 
@@ -1022,15 +995,72 @@ impl<'a, H: Host> Machine<'a, H> {
                 })
             })
         };
+        self.finish_module_evaluation(module, result).map(Some)
+    }
+
+    pub(crate) fn begin_module_evaluation(
+        &mut self,
+        module: ModuleId,
+    ) -> Result<ModuleEvaluation, RuntimeError> {
+        match self.registry.modules[module.get() as usize].state.clone() {
+            ModuleState::Evaluating => return Ok(ModuleEvaluation::Cycle),
+            ModuleState::Evaluated(result) => return Ok(ModuleEvaluation::Evaluated(result)),
+            ModuleState::Unevaluated => {}
+        }
+        self.registry.modules[module.get() as usize].state = ModuleState::Evaluating;
+
+        let mut dependencies = Vec::new();
+        for (edge_index, edge) in self.program().modules()[module.get() as usize]
+            .edges
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            if !edge.kind.has_static() {
+                continue;
+            }
+            match edge.target {
+                EdgeTarget::Local(dependency) => dependencies.push(dependency),
+                EdgeTarget::External => {
+                    let error = self.program_error(
+                        module,
+                        RuntimeErrorKind::ExternalModuleUnavailable {
+                            module,
+                            edge: EdgeId::new(edge_index as u32),
+                        },
+                    );
+                    self.registry.modules[module.get() as usize].state =
+                        ModuleState::Evaluated(Err(error.clone()));
+                    return Err(error);
+                }
+            }
+        }
+        Ok(ModuleEvaluation::Ready(dependencies))
+    }
+
+    pub(crate) fn finish_module_evaluation(
+        &mut self,
+        module: ModuleId,
+        result: Result<Execution, RuntimeError>,
+    ) -> Result<Execution, RuntimeError> {
         if result.is_err() {
             self.frames.clear();
             self.live_registers = 0;
         }
         self.registry.modules[module.get() as usize].state = ModuleState::Evaluated(result.clone());
-        result.map(Some)
+        result
     }
 
-    fn constant_text(&self, module: ModuleId, id: ConstantId) -> &str {
+    pub(crate) fn abort_module_evaluation(&mut self, module: ModuleId) {
+        if matches!(
+            self.registry.modules[module.get() as usize].state,
+            ModuleState::Evaluating
+        ) {
+            self.registry.modules[module.get() as usize].state = ModuleState::Unevaluated;
+        }
+    }
+
+    pub(crate) fn constant_text(&self, module: ModuleId, id: ConstantId) -> &str {
         match &self.module_code(module).constants()[id.get() as usize] {
             Constant::String(text) => text,
             _ => unreachable!("verified module names are strings"),
@@ -1521,7 +1551,7 @@ impl<'a, H: Host> Machine<'a, H> {
         function: usize,
         pc: usize,
     ) -> Result<Value, RuntimeError> {
-        self.load_constant_value(id)
+        self.load_constant_value(self.active_module_id(), id)
             .map_err(|kind| self.error_at(kind, function, pc))
     }
 
@@ -1579,7 +1609,7 @@ impl<'a, H: Host> Machine<'a, H> {
             .map_or(ModuleId::new(0), |frame| frame.module)
     }
 
-    fn load_global(
+    pub(crate) fn load_global(
         &self,
         module: ModuleId,
         name: ConstantId,
@@ -1607,7 +1637,7 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(self.resolve_global_binding(self.constant_text(module, name)))
     }
 
-    fn store_global(
+    pub(crate) fn store_global(
         &mut self,
         module: ModuleId,
         name: ConstantId,
@@ -1678,8 +1708,12 @@ impl<'a, H: Host> Machine<'a, H> {
 
     /// Materializes a constant into an ABI value, interning strings and bigints
     /// into the slot heap. Shared with the native engine.
-    fn load_constant_value(&mut self, id: ConstantId) -> Result<Value, RuntimeErrorKind> {
-        match &self.module_code(self.active_module_id()).constants()[id.get() as usize] {
+    pub(crate) fn load_constant_value(
+        &mut self,
+        module: ModuleId,
+        id: ConstantId,
+    ) -> Result<Value, RuntimeErrorKind> {
+        match &self.module_code(module).constants()[id.get() as usize] {
             Constant::String(text) => self.allocate(HeapEntry::String(text.clone())),
             Constant::BigInt(value) => self.allocate(HeapEntry::BigInt(value.as_str().to_owned())),
             constant => Ok(constant_value(constant).expect("non-heap constant")),
@@ -1738,20 +1772,20 @@ impl<'a, H: Host> Machine<'a, H> {
         function: FunctionId,
     ) -> Result<Vec<Value>, EvalFailure> {
         let value = self.read_register(frame, register);
-        self.captures_from_array(value, function)
+        self.captures_from_array(self.active_module_id(), value, function)
     }
 
     /// Validates a `CreateClosure` captures array value: it must be a runtime
     /// array whose length matches the target function's capture count, with
     /// holes read as `undefined`. Shared with the native engine.
-    fn captures_from_array(
+    pub(crate) fn captures_from_array(
         &self,
+        module: ModuleId,
         captures: Value,
         function: FunctionId,
     ) -> Result<Vec<Value>, EvalFailure> {
-        let expected = self.module_code(self.active_module_id()).functions()
-            [function.get() as usize]
-            .capture_count() as usize;
+        let expected =
+            self.module_code(module).functions()[function.get() as usize].capture_count() as usize;
         match self.runtime_slot(captures).map_err(EvalFailure::Runtime)? {
             Some(index) => match &self.heap[index] {
                 HeapEntry::Array { elements, .. } => {
@@ -1781,7 +1815,7 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    fn materialize_arguments(
+    pub(crate) fn materialize_arguments(
         &mut self,
         frame: usize,
         function: usize,
@@ -2298,7 +2332,7 @@ impl<'a, H: Host> Machine<'a, H> {
         self.error_at_in_module(kind, self.active_module_id(), function, pc)
     }
 
-    fn error_at_in_module(
+    pub(crate) fn error_at_in_module(
         &self,
         kind: RuntimeErrorKind,
         module: ModuleId,
