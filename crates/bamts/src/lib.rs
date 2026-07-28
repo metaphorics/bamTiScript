@@ -17,6 +17,7 @@ use bamts_compiler::source::{ScriptKind, SourceId, SourceText};
 
 pub use bamts_bytecode as bytecode;
 pub use bamts_compiler as compiler;
+#[cfg(feature = "node-host")]
 pub use bamts_node as node;
 pub use bamts_runtime as runtime;
 
@@ -183,6 +184,7 @@ pub fn compile_source_file(
 /// # Ok(())
 /// # }
 /// ```
+#[cfg(feature = "node-host")]
 pub fn run_program(path: impl AsRef<Path>) -> Result<ProgramOutput> {
     let bytecode = compile_source_file(path)?;
     let mut host = bamts_node::NodeHost::new();
@@ -243,7 +245,9 @@ fn script_kind(path: &Path) -> Result<ScriptKind> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compile_source_file, run_program};
+    use super::compile_source_file;
+    #[cfg(feature = "node-host")]
+    use super::run_program;
     use std::error::Error;
     use std::path::PathBuf;
 
@@ -262,6 +266,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "node-host")]
     #[test]
     fn runs_program_and_returns_host_output() -> Result<(), Box<dyn Error>> {
         let path = fixture_path("run");
