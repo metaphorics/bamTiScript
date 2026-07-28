@@ -161,6 +161,11 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "aot")]
+mod aot;
+#[cfg(feature = "aot")]
+pub use aot::{AotError, AotObject, PROGRAM_DESCRIPTOR_SYMBOL, compile_aot};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
