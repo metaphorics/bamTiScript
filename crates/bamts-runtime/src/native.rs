@@ -151,7 +151,7 @@ impl fmt::Display for NativeError {
             NativeError::Runtime(error) => write!(formatter, "{error}"),
             NativeError::UnsupportedProgram { modules } => write!(
                 formatter,
-                "native execution does not support {modules}-module programs"
+                "native execution does not support module-linked programs ({modules} module(s))"
             ),
             NativeError::Abi(error) => write!(formatter, "{error}"),
             NativeError::FatalTrap { value } => {
@@ -1563,15 +1563,19 @@ pub fn run_linked_program<H: Host>(
     host: &mut H,
     limits: &Limits,
 ) -> Result<ExecutionOutcome, NativeError> {
-    if program.modules().len() != 1 {
+    let module = &program
+        .module(program.entry())
+        .expect("verified program entry exists");
+    if program.modules().len() != 1
+        || !module.edges().is_empty()
+        || !module.bindings().is_empty()
+        || !module.exports().is_empty()
+    {
         return Err(NativeError::UnsupportedProgram {
             modules: program.modules().len(),
         });
     }
-    let module = &program
-        .module(program.entry())
-        .expect("verified program entry exists")
-        .code;
+    let module = &module.code;
     let mut engine = NativeEngine::build(module, entries, host, limits.clone(), Backend::Linked);
     engine.run_linked()
 }
@@ -1581,8 +1585,9 @@ mod tests {
     use std::cell::Cell;
 
     use bamts_bytecode::{
-        BinaryOp, Constant, ConstantId, ExceptionHandler, Function, FunctionFlags, FunctionId,
-        Instruction, Module, ModuleId, Pc, Program, ProgramModule, Register, Verified,
+        BinaryOp, Binding, BindingKind, Constant, ConstantId, Edge, EdgeId, EdgeKind, EdgeTarget,
+        ExceptionHandler, Function, FunctionFlags, FunctionId, Instruction, Module, ModuleId, Pc,
+        Program, ProgramModule, Register, Verified,
     };
     use bamts_native::{AbiError, Completion, CompletionTag, NativeEntryTable, ShadowFrame, Value};
 
@@ -1919,8 +1924,35 @@ mod tests {
         .expect("valid native test program")
     }
 
+    fn metadata_program(
+        edges: Vec<Edge>,
+        bindings: Vec<Binding>,
+        exports: Vec<bamts_bytecode::Export>,
+    ) -> Program<Verified> {
+        let module = trivial_program().modules()[0].clone();
+        Program::link(
+            vec![ProgramModule {
+                name: module.name,
+                code: module.code,
+                edges,
+                bindings,
+                exports,
+            }],
+            ModuleId::new(0),
+        )
+        .expect("valid module metadata fixture")
+    }
+
+    fn external_static_edge() -> Edge {
+        Edge {
+            specifier: cid(0),
+            target: EdgeTarget::External,
+            kind: EdgeKind::Static,
+        }
+    }
+
     #[test]
-    fn linked_backend_invokes_entry_and_reports_outcome() {
+    fn linked_backend_accepts_metadata_empty_single_module_program() {
         let program = trivial_program();
         let entries = SmokeEntries {
             invoked: Cell::new(None),
@@ -1966,6 +1998,58 @@ mod tests {
             run_linked_program(&program, &entries, &mut host, &Limits::default()),
             Err(NativeError::UnsupportedProgram { modules: 2 })
         ));
+    }
+
+    #[test]
+    fn linked_backend_rejects_single_module_registry_metadata() {
+        let programs = [
+            metadata_program(
+                Vec::new(),
+                vec![Binding {
+                    name: cid(0),
+                    kind: BindingKind::Lexical,
+                }],
+                Vec::new(),
+            ),
+            metadata_program(
+                Vec::new(),
+                vec![Binding {
+                    name: cid(0),
+                    kind: BindingKind::Hoisted,
+                }],
+                Vec::new(),
+            ),
+            metadata_program(
+                vec![external_static_edge()],
+                vec![Binding {
+                    name: cid(0),
+                    kind: BindingKind::Imported {
+                        edge: EdgeId::new(0),
+                        name: cid(0),
+                    },
+                }],
+                Vec::new(),
+            ),
+            metadata_program(
+                vec![external_static_edge()],
+                vec![Binding {
+                    name: cid(0),
+                    kind: BindingKind::Namespace {
+                        edge: EdgeId::new(0),
+                    },
+                }],
+                Vec::new(),
+            ),
+            metadata_program(vec![external_static_edge()], Vec::new(), Vec::new()),
+        ];
+        let entries = NoEntries;
+        let mut host = SilentHost;
+        for program in &programs {
+            assert!(matches!(
+                run_linked_program(program, &entries, &mut host, &Limits::default()),
+                Err(NativeError::UnsupportedProgram { modules: 1 })
+            ));
+        }
     }
 
     #[test]

@@ -716,6 +716,19 @@ impl<'a, H: Host> Machine<'a, H> {
             return Ok(None);
         };
         let properties = match &self.heap[index] {
+            HeapEntry::ModuleNamespace { module } => {
+                return self
+                    .namespace_export(*module, name)
+                    .map(|value| {
+                        value.map(|value| Property::Data {
+                            value,
+                            writable: true,
+                            enumerable: true,
+                            configurable: false,
+                        })
+                    })
+                    .map_err(EvalFailure::Runtime);
+            }
             HeapEntry::Object { properties, .. }
             | HeapEntry::Array { properties, .. }
             | HeapEntry::Function { properties, .. }

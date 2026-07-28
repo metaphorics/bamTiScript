@@ -2498,25 +2498,10 @@ impl<'a, H: Host> Machine<'a, H> {
                 let PropertyKey::Named(name) = key else {
                     return None;
                 };
-                match self.program().resolve_export(*module, name) {
-                    Some(ResolvedExport::Local { module, binding }) => {
-                        let cell = self.registry.modules[module.get() as usize].binding_cells
-                            [binding.get() as usize]
-                            .expect("verified export resolves to a linked cell");
-                        let value = self.registry.cells[cell.0].value;
-                        if value.is_uninitialized() {
-                            Some(Found::Failure(RuntimeErrorKind::TemporalDeadZone {
-                                module,
-                                binding,
-                            }))
-                        } else {
-                            Some(Found::Value(value))
-                        }
-                    }
-                    Some(ResolvedExport::External { module, edge, .. }) => Some(Found::Failure(
-                        RuntimeErrorKind::ExternalModuleUnavailable { module, edge },
-                    )),
-                    None => None,
+                match self.namespace_export(*module, name) {
+                    Ok(Some(value)) => Some(Found::Value(value)),
+                    Ok(None) => None,
+                    Err(kind) => Some(Found::Failure(kind)),
                 }
             }
             HeapEntry::NativeFunction { properties, .. } => property_lookup(properties, key),
@@ -2551,6 +2536,30 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::BigInt(_)
             | HeapEntry::PrivateName { .. }
             | HeapEntry::Iterator { .. } => None,
+        }
+    }
+
+    fn namespace_export(
+        &self,
+        module: ModuleId,
+        name: &str,
+    ) -> Result<Option<Value>, RuntimeErrorKind> {
+        match self.program().resolve_export(module, name) {
+            Some(ResolvedExport::Local { module, binding }) => {
+                let cell = self.registry.modules[module.get() as usize].binding_cells
+                    [binding.get() as usize]
+                    .expect("verified export resolves to a linked cell");
+                let value = self.registry.cells[cell.0].value;
+                if value.is_uninitialized() {
+                    Err(RuntimeErrorKind::TemporalDeadZone { module, binding })
+                } else {
+                    Ok(Some(value))
+                }
+            }
+            Some(ResolvedExport::External { module, edge, .. }) => {
+                Err(RuntimeErrorKind::ExternalModuleUnavailable { module, edge })
+            }
+            None => Ok(None),
         }
     }
 
@@ -4345,6 +4354,53 @@ mod tests {
 
     fn linked(modules: Vec<ProgramModule<Verified>>, entry: u32) -> Program<Verified> {
         Program::link(modules, ModuleId::new(entry)).expect("valid linked test program")
+    }
+
+    fn namespace_descriptor_entry() -> Function {
+        function(
+            0,
+            7,
+            vec![
+                Instruction::LoadGlobal {
+                    dst: reg(0),
+                    name: cid(1),
+                },
+                Instruction::LoadGlobal {
+                    dst: reg(1),
+                    name: cid(3),
+                },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(4),
+                },
+                Instruction::GetProperty {
+                    dst: reg(3),
+                    object: reg(1),
+                    key: reg(2),
+                },
+                Instruction::CreateArray { dst: reg(4) },
+                Instruction::ArrayPush {
+                    array: reg(4),
+                    value: reg(0),
+                },
+                Instruction::LoadConst {
+                    dst: reg(5),
+                    constant: cid(5),
+                },
+                Instruction::ArrayPush {
+                    array: reg(4),
+                    value: reg(5),
+                },
+                Instruction::Call {
+                    dst: reg(6),
+                    callee: reg(3),
+                    this_value: reg(4),
+                    arguments: reg(4),
+                },
+                Instruction::Return { value: reg(6) },
+            ],
+            Vec::new(),
+        )
     }
 
     #[derive(Default)]
@@ -6544,10 +6600,17 @@ mod tests {
                 Constant::String("z".into()),
                 Constant::String("a".into()),
                 Constant::String("dep".into()),
+                Constant::String("Object".into()),
+                Constant::String("getOwnPropertyDescriptor".into()),
+                Constant::String("value".into()),
+                Constant::String("writable".into()),
+                Constant::String("enumerable".into()),
+                Constant::String("configurable".into()),
+                Constant::String("missing".into()),
             ],
             vec![function(
                 0,
-                15,
+                31,
                 vec![
                     Instruction::LoadGlobal {
                         dst: reg(0),
@@ -6629,7 +6692,90 @@ mod tests {
                         left: reg(10),
                         right: reg(6),
                     },
-                    Instruction::Return { value: reg(7) },
+                    Instruction::LoadGlobal {
+                        dst: reg(15),
+                        name: cid(7),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(16),
+                        constant: cid(8),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(17),
+                        object: reg(15),
+                        key: reg(16),
+                    },
+                    Instruction::CreateArray { dst: reg(18) },
+                    Instruction::ArrayPush {
+                        array: reg(18),
+                        value: reg(0),
+                    },
+                    Instruction::ArrayPush {
+                        array: reg(18),
+                        value: reg(6),
+                    },
+                    Instruction::Call {
+                        dst: reg(19),
+                        callee: reg(17),
+                        this_value: reg(18),
+                        arguments: reg(18),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(20),
+                        constant: cid(9),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(21),
+                        object: reg(19),
+                        key: reg(20),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(22),
+                        constant: cid(10),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(23),
+                        object: reg(19),
+                        key: reg(22),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(24),
+                        constant: cid(11),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(25),
+                        object: reg(19),
+                        key: reg(24),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(26),
+                        constant: cid(12),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(27),
+                        object: reg(19),
+                        key: reg(26),
+                    },
+                    Instruction::CreateArray { dst: reg(28) },
+                    Instruction::LoadConst {
+                        dst: reg(29),
+                        constant: cid(13),
+                    },
+                    Instruction::ArrayPush {
+                        array: reg(28),
+                        value: reg(0),
+                    },
+                    Instruction::ArrayPush {
+                        array: reg(28),
+                        value: reg(29),
+                    },
+                    Instruction::Call {
+                        dst: reg(30),
+                        callee: reg(17),
+                        this_value: reg(28),
+                        arguments: reg(28),
+                    },
+                    Instruction::Return { value: reg(21) },
                 ],
                 Vec::new(),
             )],
@@ -6667,6 +6813,10 @@ mod tests {
         assert_eq!(execution.entry_registers[5], Value::TRUE);
         assert_eq!(execution.entry_registers[12], Value::TRUE);
         assert_eq!(execution.entry_registers[14], Value::TRUE);
+        assert_eq!(execution.entry_registers[23], Value::TRUE);
+        assert_eq!(execution.entry_registers[25], Value::TRUE);
+        assert_eq!(execution.entry_registers[27], Value::FALSE);
+        assert_eq!(execution.entry_registers[30], Value::UNDEFINED);
     }
 
     #[test]
@@ -7009,5 +7159,137 @@ mod tests {
         assert!(machine.evaluate_module(ModuleId::new(1)).is_err());
         let exporter = machine.registry.modules[0].binding_cells[0].unwrap();
         assert_eq!(machine.registry.cells[exporter.0].value, Value::int32(1));
+    }
+
+    #[test]
+    fn namespace_descriptor_propagates_temporal_dead_zone() {
+        let root = program_module(
+            "root",
+            vec![
+                Constant::String("x".into()),
+                Constant::Int32(1),
+                Constant::String("dependency".into()),
+            ],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(2),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(1),
+                        value: reg(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(3),
+                target: EdgeTarget::Local(ModuleId::new(1)),
+                kind: EdgeKind::Static,
+            }],
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Lexical,
+            }],
+            vec![Export {
+                name: cid(1),
+                source: ExportSource::Local(BindingId::new(0)),
+            }],
+        );
+        let dependency = program_module(
+            "dependency",
+            vec![
+                Constant::String("ns".into()),
+                Constant::String("root".into()),
+                Constant::String("Object".into()),
+                Constant::String("getOwnPropertyDescriptor".into()),
+                Constant::String("x".into()),
+            ],
+            vec![namespace_descriptor_entry()],
+            vec![Edge {
+                specifier: cid(2),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Namespace {
+                    edge: EdgeId::new(0),
+                },
+            }],
+            Vec::new(),
+        );
+        let program = linked(vec![root, dependency], 0);
+        let mut host = TestHost;
+        let error = Machine::new(&program, &mut host, Limits::default())
+            .run()
+            .expect_err("descriptor reads uninitialized namespace export");
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::TemporalDeadZone { module, binding }
+                if module == ModuleId::new(0) && binding == BindingId::new(0)
+        ));
+    }
+
+    #[test]
+    fn namespace_descriptor_propagates_external_linkage_error() {
+        let exported = program_module(
+            "exported",
+            vec![
+                Constant::String("x".into()),
+                Constant::String("external".into()),
+            ],
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+            vec![Edge {
+                specifier: cid(2),
+                target: EdgeTarget::External,
+                kind: EdgeKind::Dynamic,
+            }],
+            Vec::new(),
+            vec![Export {
+                name: cid(1),
+                source: ExportSource::Indirect {
+                    edge: EdgeId::new(0),
+                    name: cid(1),
+                },
+            }],
+        );
+        let importer = program_module(
+            "importer",
+            vec![
+                Constant::String("ns".into()),
+                Constant::String("exported".into()),
+                Constant::String("Object".into()),
+                Constant::String("getOwnPropertyDescriptor".into()),
+                Constant::String("x".into()),
+            ],
+            vec![namespace_descriptor_entry()],
+            vec![Edge {
+                specifier: cid(2),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Namespace {
+                    edge: EdgeId::new(0),
+                },
+            }],
+            Vec::new(),
+        );
+        let program = linked(vec![exported, importer], 1);
+        let mut host = TestHost;
+        let error = Machine::new(&program, &mut host, Limits::default())
+            .run()
+            .expect_err("descriptor resolves external namespace export");
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::ExternalModuleUnavailable { module, edge }
+                if module == ModuleId::new(0) && edge == EdgeId::new(0)
+        ));
     }
 }
