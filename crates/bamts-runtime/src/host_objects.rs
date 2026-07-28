@@ -342,9 +342,9 @@ impl<H: Host> Machine<'_, H> {
                         Ok("[Function]".to_owned())
                     }
                     HeapEntry::RegExp { pattern, flags, .. } => Ok(format!("/{pattern}/{flags}")),
-                    HeapEntry::Iterator { .. } | HeapEntry::ProcessEnv { .. } => {
-                        Ok("{}".to_owned())
-                    }
+                    HeapEntry::Iterator { .. }
+                    | HeapEntry::ProcessEnv { .. }
+                    | HeapEntry::ModuleNamespace { .. } => Ok("{}".to_owned()),
                 }
             }
         }

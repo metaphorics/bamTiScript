@@ -564,7 +564,10 @@ fn quote_excerpt(source: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use bamts_bytecode::{Function, FunctionFlags, FunctionId, Instruction, Module, Verified};
+    use bamts_bytecode::{
+        Constant, ConstantId, Function, FunctionFlags, FunctionId, Instruction, Module, ModuleId,
+        Program, ProgramModule, Verified,
+    };
 
     use super::*;
     use crate::Limits;
@@ -575,9 +578,9 @@ mod tests {
 
     impl Host for TestHost {}
 
-    fn module() -> Module<Verified> {
-        Module::new(
-            Vec::new(),
+    fn module() -> Program<Verified> {
+        let code = Module::new(
+            vec![Constant::String("<test>".to_owned())],
             vec![Function::new(
                 None,
                 0,
@@ -590,7 +593,18 @@ mod tests {
             FunctionId::new(0),
         )
         .verify()
-        .expect("valid test module")
+        .expect("valid test module");
+        Program::link(
+            vec![ProgramModule {
+                name: ConstantId::new(0),
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect("valid test program")
     }
 
     #[test]

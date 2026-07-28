@@ -51,7 +51,7 @@ use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::fmt;
 
-use bamts_bytecode::{ConstantId, FunctionId, Instruction, Module, Verified};
+use bamts_bytecode::{ConstantId, FunctionId, Instruction, Module, Program, Verified};
 pub use bamts_native::AbiError;
 use bamts_native::{
     Completion, CompletionTag, HelperCall, HelperResult, NativeEntryTable, NativeFrame, NativeOps,
@@ -137,6 +137,8 @@ fn accessor_to_selector(kind: bamts_bytecode::AccessorKind) -> u32 {
 pub enum NativeError {
     /// A deterministic runtime error (throw, limit, or malformed value).
     Runtime(RuntimeError),
+    /// Native execution has not yet gained a whole-program module registry.
+    UnsupportedProgram { modules: usize },
     /// An AOT image or entry-table linkage failure.
     Abi(AbiError),
     /// A native entry returned `FatalTrap`; `value` is the raw trap id word.
@@ -147,6 +149,10 @@ impl fmt::Display for NativeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             NativeError::Runtime(error) => write!(formatter, "{error}"),
+            NativeError::UnsupportedProgram { modules } => write!(
+                formatter,
+                "native execution does not support {modules}-module programs"
+            ),
             NativeError::Abi(error) => write!(formatter, "{error}"),
             NativeError::FatalTrap { value } => {
                 write!(
@@ -276,7 +282,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     {
         let fuel = limits.fuel;
         NativeEngine {
-            machine: RefCell::new(Machine::new(module, host, limits)),
+            machine: RefCell::new(Machine::new_native(module, host, limits)),
             module,
             entries,
             backend,
@@ -839,8 +845,8 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     ) -> InvokeOutcome {
         let kind = self.machine.borrow().callee_kind(callee);
         match kind {
-            Ok(CalleeKind::Runtime { function, captures }) => {
-                self.invoke_runtime(function, &captures, this, new_target, args)
+            Ok(CalleeKind::Runtime { target, captures }) => {
+                self.invoke_runtime(target.function, &captures, this, new_target, args)
             }
             Ok(CalleeKind::Builtin { id, bound_this }) => {
                 let this = bound_this.unwrap_or(this);
@@ -1110,7 +1116,8 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     Err(failure) => self.fail(failure),
                 }
             }
-            Ok(CalleeKind::Runtime { function, captures }) => {
+            Ok(CalleeKind::Runtime { target, captures }) => {
+                let function = target.function;
                 let prototype = {
                     let machine = self.machine.borrow();
                     match machine.runtime_slot(callee) {
@@ -1282,6 +1289,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     Ok(captures) => {
                         let prototype = self.machine.borrow().intrinsics.function_prototype;
                         self.allocated(HeapEntry::Function {
+                            module: bamts_bytecode::ModuleId::new(0),
                             function,
                             captures,
                             properties: PropertyMap::default(),
@@ -1550,11 +1558,20 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
 /// code. It is always available and never feature-gated, so a downstream host
 /// crate can link against it without enabling the runtime's `aot-main` feature.
 pub fn run_linked_program<H: Host>(
-    module: &Module<Verified>,
+    program: &Program<Verified>,
     entries: &dyn NativeEntryTable,
     host: &mut H,
     limits: &Limits,
 ) -> Result<ExecutionOutcome, NativeError> {
+    if program.modules().len() != 1 {
+        return Err(NativeError::UnsupportedProgram {
+            modules: program.modules().len(),
+        });
+    }
+    let module = &program
+        .module(program.entry())
+        .expect("verified program entry exists")
+        .code;
     let mut engine = NativeEngine::build(module, entries, host, limits.clone(), Backend::Linked);
     engine.run_linked()
 }
@@ -1564,8 +1581,8 @@ mod tests {
     use std::cell::Cell;
 
     use bamts_bytecode::{
-        BinaryOp, Constant, ExceptionHandler, Function, FunctionFlags, FunctionId, Instruction,
-        Module, Pc, Register, Verified,
+        BinaryOp, Constant, ConstantId, ExceptionHandler, Function, FunctionFlags, FunctionId,
+        Instruction, Module, ModuleId, Pc, Program, ProgramModule, Register, Verified,
     };
     use bamts_native::{AbiError, Completion, CompletionTag, NativeEntryTable, ShadowFrame, Value};
 
@@ -1623,7 +1640,7 @@ mod tests {
         let limits = Limits::default();
 
         let mut interp_host = make_host();
-        let interpreter = Machine::new(module, &mut interp_host, limits.clone())
+        let interpreter = Machine::new_native(module, &mut interp_host, limits.clone())
             .run()
             .expect("interpreter runs");
 
@@ -1884,18 +1901,32 @@ mod tests {
         }
     }
 
-    fn trivial_module() -> Module<Verified> {
-        verified(vec![], vec![entry_function(1, vec![Instruction::Halt])])
+    fn trivial_program() -> Program<Verified> {
+        let code = verified(
+            vec![Constant::String("<test>".to_owned())],
+            vec![entry_function(1, vec![Instruction::Halt])],
+        );
+        Program::link(
+            vec![ProgramModule {
+                name: ConstantId::new(0),
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect("valid native test program")
     }
 
     #[test]
     fn linked_backend_invokes_entry_and_reports_outcome() {
-        let module = trivial_module();
+        let program = trivial_program();
         let entries = SmokeEntries {
             invoked: Cell::new(None),
         };
         let mut host = SilentHost;
-        let outcome = run_linked_program(&module, &entries, &mut host, &Limits::default())
+        let outcome = run_linked_program(&program, &entries, &mut host, &Limits::default())
             .expect("linked program runs");
         assert_eq!(entries.invoked.get(), Some(0), "entry function 0 invoked");
         assert_eq!(outcome.exit_code, 0);
@@ -1904,16 +1935,39 @@ mod tests {
 
     #[test]
     fn linked_backend_propagates_abi_error() {
-        let module = trivial_module();
+        let program = trivial_program();
         let entries = FailingEntries;
         let mut host = SilentHost;
-        let error = run_linked_program(&module, &entries, &mut host, &Limits::default())
+        let error = run_linked_program(&program, &entries, &mut host, &Limits::default())
             .expect_err("entry table failure surfaces");
         assert!(matches!(
             error,
             NativeError::Abi(AbiError::UnknownFunction { function_id: 0 })
         ));
     }
+    #[test]
+    fn linked_backend_rejects_multi_module_programs_at_typed_boundary() {
+        let single = trivial_program();
+        let first = single.modules()[0].clone();
+        let second = ProgramModule {
+            name: ConstantId::new(0),
+            code: verified(
+                vec![Constant::String("<other>".to_owned())],
+                vec![entry_function(1, vec![Instruction::Halt])],
+            ),
+            edges: Vec::new(),
+            bindings: Vec::new(),
+            exports: Vec::new(),
+        };
+        let program = Program::link(vec![first, second], ModuleId::new(0)).unwrap();
+        let entries = NoEntries;
+        let mut host = SilentHost;
+        assert!(matches!(
+            run_linked_program(&program, &entries, &mut host, &Limits::default()),
+            Err(NativeError::UnsupportedProgram { modules: 2 })
+        ));
+    }
+
     #[test]
     fn native_functions_call_and_construct_with_engine_parity() {
         let module = verified(

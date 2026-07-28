@@ -25,8 +25,9 @@ use std::error::Error;
 use std::fmt;
 
 use bamts_bytecode::{
-    AccessorKind, BinaryOp, Constant, ConstantId, Function, FunctionId, Instruction, IteratorKind,
-    Module, Pc, UnaryOp, Verified,
+    AccessorKind, BinaryOp, BindingId, BindingKind, Constant, ConstantId, EdgeId, EdgeTarget,
+    Function, FunctionId, Instruction, IteratorKind, Module, ModuleId, Pc, Program, ResolvedExport,
+    UnaryOp, Verified,
 };
 use bamts_native::{Decoded, SlotId, Value};
 
@@ -67,8 +68,9 @@ pub struct Limits {
     /// Ceiling on the length of a single call's arguments array.
     pub max_argument_count: u32,
     pub max_heap_slots: usize,
-    /// Cumulative bytes admitted for heap payloads and property/element growth.
     pub max_heap_bytes: usize,
+    /// Ceiling on engine-owned module binding cells.
+    pub max_module_cells: usize,
 }
 
 impl Default for Limits {
@@ -80,6 +82,7 @@ impl Default for Limits {
             max_argument_count: 1 << 16,
             max_heap_slots: 1 << 20,
             max_heap_bytes: 64 << 20,
+            max_module_cells: 1 << 20,
         }
     }
 }
@@ -155,15 +158,53 @@ pub struct RuntimeError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeErrorKind {
-    UncaughtThrow { value: Value, origin: ThrowOrigin },
-    FuelExhausted { limit: u64 },
-    CallDepthExceeded { limit: usize },
-    RegisterLimitExceeded { limit: usize },
-    ArgumentLimitExceeded { limit: u32, requested: u32 },
-    HeapSlotLimitExceeded { limit: usize },
-    HeapByteLimitExceeded { limit: usize },
-    InvalidValue { value: Value },
-    InvalidRuntimeHeapReference { slot: u32 },
+    UncaughtThrow {
+        value: Value,
+        origin: ThrowOrigin,
+    },
+    FuelExhausted {
+        limit: u64,
+    },
+    CallDepthExceeded {
+        limit: usize,
+    },
+    RegisterLimitExceeded {
+        limit: usize,
+    },
+    ArgumentLimitExceeded {
+        limit: u32,
+        requested: u32,
+    },
+    HeapSlotLimitExceeded {
+        limit: usize,
+    },
+    HeapByteLimitExceeded {
+        limit: usize,
+    },
+    ModuleCellLimitExceeded {
+        limit: usize,
+    },
+    TemporalDeadZone {
+        module: ModuleId,
+        binding: BindingId,
+    },
+    ExternalModuleUnavailable {
+        module: ModuleId,
+        edge: EdgeId,
+    },
+    DynamicImportUnsupported {
+        module: ModuleId,
+    },
+    InvalidVerifiedProgram {
+        module: ModuleId,
+        instruction: Instruction,
+    },
+    InvalidValue {
+        value: Value,
+    },
+    InvalidRuntimeHeapReference {
+        slot: u32,
+    },
 }
 
 impl fmt::Display for RuntimeError {
@@ -203,6 +244,34 @@ impl fmt::Display for RuntimeError {
             RuntimeErrorKind::HeapByteLimitExceeded { limit } => {
                 write!(formatter, "heap byte limit {limit} exceeded")
             }
+            RuntimeErrorKind::ModuleCellLimitExceeded { limit } => {
+                write!(formatter, "module cell limit {limit} exceeded")
+            }
+            RuntimeErrorKind::TemporalDeadZone { module, binding } => write!(
+                formatter,
+                "module {} binding {} read before initialization",
+                module.get(),
+                binding.get()
+            ),
+            RuntimeErrorKind::ExternalModuleUnavailable { module, edge } => write!(
+                formatter,
+                "external module at module {} edge {} is unavailable",
+                module.get(),
+                edge.get()
+            ),
+            RuntimeErrorKind::DynamicImportUnsupported { module } => write!(
+                formatter,
+                "dynamic import is unsupported in module {}",
+                module.get()
+            ),
+            RuntimeErrorKind::InvalidVerifiedProgram {
+                module,
+                instruction,
+            } => write!(
+                formatter,
+                "verified module {} contains impossible instruction {instruction:?}",
+                module.get()
+            ),
             RuntimeErrorKind::InvalidValue { value } => {
                 write!(
                     formatter,
@@ -361,11 +430,15 @@ enum HeapEntry {
         extensible: bool,
     },
     Function {
+        module: ModuleId,
         function: FunctionId,
         captures: Vec<Value>,
         properties: PropertyMap,
         prototype: Option<Value>,
         extensible: bool,
+    },
+    ModuleNamespace {
+        module: ModuleId,
     },
     PrivateName {
         description: String,
@@ -403,6 +476,7 @@ impl HeapEntry {
             Self::Object { .. }
             | Self::Array { .. }
             | Self::Function { .. }
+            | Self::ModuleNamespace { .. }
             | Self::NativeFunction { .. }
             | Self::ProcessEnv { .. }
             | Self::Iterator { .. } => 1,
@@ -429,8 +503,15 @@ struct CallRequest<'a> {
     new_target: Value,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RuntimeFunction {
+    module: ModuleId,
+    function: FunctionId,
+}
+
 #[derive(Clone, Debug)]
 struct Frame {
+    module: ModuleId,
     function: usize,
     pc: usize,
     registers: Vec<Value>,
@@ -443,7 +524,7 @@ struct Frame {
 
 impl Frame {
     fn new(
-        function: usize,
+        target: RuntimeFunction,
         metadata: &Function,
         captures: &[Value],
         this_value: Value,
@@ -465,7 +546,8 @@ impl Frame {
             *slot = arguments.get(index).copied().unwrap_or(Value::UNDEFINED);
         }
         Self {
-            function,
+            module: target.module,
+            function: target.function.get() as usize,
             pc: 0,
             registers,
             return_to,
@@ -510,6 +592,7 @@ enum Found {
     Value(Value),
     Text(String),
     Getter(Value),
+    Failure(RuntimeErrorKind),
     /// An accessor property with no getter resolves to `undefined`.
     NoGetter,
 }
@@ -520,7 +603,7 @@ enum Found {
 #[derive(Clone, Debug)]
 enum CalleeKind {
     Runtime {
-        function: FunctionId,
+        target: RuntimeFunction,
         captures: Vec<Value>,
     },
     Builtin {
@@ -532,6 +615,7 @@ enum CalleeKind {
 
 /// The production bytecode interpreter.
 pub struct Machine<'a, H: Host> {
+    program: Option<&'a Program<Verified>>,
     module: &'a Module<Verified>,
     host: &'a mut H,
     limits: Limits,
@@ -545,24 +629,79 @@ pub struct Machine<'a, H: Host> {
     last_completion: Option<Value>,
     intrinsics: intrinsics::Intrinsics<H>,
     current_builtin_id: Option<intrinsics::BuiltinId>,
+    registry: ModuleRegistry,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ModuleRegistry {
+    modules: Vec<ModuleInstance>,
+    cells: Vec<Cell>,
+}
+
+#[derive(Clone, Debug)]
+struct ModuleInstance {
+    binding_cells: Vec<Option<CellId>>,
+    constant_cells: Vec<Option<CellId>>,
+    namespace: Option<Value>,
+    state: ModuleState,
+}
+
+#[derive(Clone, Debug)]
+enum ModuleState {
+    Unevaluated,
+    Evaluating,
+    Evaluated(Result<Execution, RuntimeError>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CellId(usize);
+
+#[derive(Clone, Copy, Debug)]
+struct Cell {
+    value: Value,
 }
 
 pub fn run<H: Host>(
-    module: &Module<Verified>,
+    program: &Program<Verified>,
     host: &mut H,
     limits: &Limits,
 ) -> Result<ExecutionOutcome, RuntimeError> {
-    Machine::new(module, host, limits.clone())
+    Machine::new(program, host, limits.clone())
         .run()
         .map(|execution| execution.outcome)
 }
 
 impl<'a, H: Host> Machine<'a, H> {
     #[must_use]
-    pub fn new(module: &'a Module<Verified>, host: &'a mut H, limits: Limits) -> Self {
+    pub fn new(program: &'a Program<Verified>, host: &'a mut H, limits: Limits) -> Self {
+        let module = &program
+            .module(program.entry())
+            .expect("verified program entry exists")
+            .code;
+        Self::build(Some(program), module, host, limits)
+    }
+
+    pub(crate) fn new_native(
+        module: &'a Module<Verified>,
+        host: &'a mut H,
+        limits: Limits,
+    ) -> Self {
+        Self::build(None, module, host, limits)
+    }
+
+    fn build(
+        program: Option<&'a Program<Verified>>,
+        module: &'a Module<Verified>,
+        host: &'a mut H,
+        limits: Limits,
+    ) -> Self {
         let entry = module.entry().get() as usize;
+        let module_id = program.map_or(ModuleId::new(0), Program::entry);
         let frame = Frame::new(
-            entry,
+            RuntimeFunction {
+                module: module_id,
+                function: FunctionId::new(entry as u32),
+            },
             &module.functions()[entry],
             &[],
             Value::UNDEFINED,
@@ -602,11 +741,13 @@ impl<'a, H: Host> Machine<'a, H> {
         };
         *elements = argv_values;
         let intrinsic_slots = heap.len();
+        let fuel = limits.fuel;
         Self {
-            fuel: limits.fuel,
+            program,
             module,
             host,
             limits,
+            fuel,
             frames: vec![frame],
             heap,
             heap_bytes: 0,
@@ -614,15 +755,305 @@ impl<'a, H: Host> Machine<'a, H> {
             live_registers,
             last_completion: None,
             globals: BTreeMap::new(),
+            registry: ModuleRegistry::default(),
             current_builtin_id: None,
             intrinsics,
         }
     }
 
     pub fn run(mut self) -> Result<Execution, RuntimeError> {
+        if let Some(program) = self.program {
+            self.frames.clear();
+            self.live_registers = 0;
+            self.instantiate_modules()?;
+            return self.evaluate_module(program.entry())?.ok_or_else(|| {
+                self.program_error(
+                    program.entry(),
+                    RuntimeErrorKind::InvalidVerifiedProgram {
+                        module: program.entry(),
+                        instruction: Instruction::Halt,
+                    },
+                )
+            });
+        }
         Ok(self
             .run_loop(0)?
             .expect("the entry frame completes before the run loop stops"))
+    }
+
+    fn program(&self) -> &Program<Verified> {
+        self.program
+            .expect("module registry operations require a whole program")
+    }
+
+    fn module_code(&self, module: ModuleId) -> &Module<Verified> {
+        match self.program {
+            Some(program) => {
+                &program
+                    .module(module)
+                    .expect("verified module id remains in bounds")
+                    .code
+            }
+            None => self.module,
+        }
+    }
+
+    fn allocate_cell(&mut self, value: Value, module: ModuleId) -> Result<CellId, RuntimeError> {
+        if self.registry.cells.len() >= self.limits.max_module_cells {
+            return Err(self.program_error(
+                module,
+                RuntimeErrorKind::ModuleCellLimitExceeded {
+                    limit: self.limits.max_module_cells,
+                },
+            ));
+        }
+        let id = CellId(self.registry.cells.len());
+        self.registry.cells.push(Cell { value });
+        Ok(id)
+    }
+
+    fn instantiate_modules(&mut self) -> Result<(), RuntimeError> {
+        let program = self
+            .program
+            .expect("module registry operations require a whole program");
+        self.registry.modules = program
+            .modules()
+            .iter()
+            .map(|module| ModuleInstance {
+                binding_cells: vec![None; module.bindings.len()],
+                constant_cells: vec![None; module.code.constants().len()],
+                namespace: None,
+                state: ModuleState::Unevaluated,
+            })
+            .collect();
+
+        for module_index in 0..program.modules().len() {
+            let module_id = ModuleId::new(module_index as u32);
+            let bindings = program.modules()[module_index].bindings.clone();
+            for (binding_index, binding) in bindings.into_iter().enumerate() {
+                let initial = match binding.kind {
+                    BindingKind::Hoisted => Some(Value::UNDEFINED),
+                    BindingKind::Lexical => Some(Value::UNINITIALIZED),
+                    BindingKind::Imported { .. } | BindingKind::Namespace { .. } => None,
+                };
+                if let Some(value) = initial {
+                    let cell = self.allocate_cell(value, module_id)?;
+                    self.registry.modules[module_index].binding_cells[binding_index] = Some(cell);
+                }
+            }
+        }
+
+        for module_index in 0..program.modules().len() {
+            let module_id = ModuleId::new(module_index as u32);
+            let bindings = program.modules()[module_index].bindings.clone();
+            for (binding_index, binding) in bindings.into_iter().enumerate() {
+                let cell = match binding.kind {
+                    BindingKind::Hoisted | BindingKind::Lexical => continue,
+                    BindingKind::Imported { edge, name } => {
+                        let dependency = program.modules()[module_index].edges[edge.get() as usize];
+                        let EdgeTarget::Local(target) = dependency.target else {
+                            return Err(self.program_error(
+                                module_id,
+                                RuntimeErrorKind::ExternalModuleUnavailable {
+                                    module: module_id,
+                                    edge,
+                                },
+                            ));
+                        };
+                        match program.resolve_export(target, self.constant_text(module_id, name)) {
+                            Some(ResolvedExport::Local { module, binding }) => {
+                                self.registry.modules[module.get() as usize].binding_cells
+                                    [binding.get() as usize]
+                                    .expect("own cells are allocated before aliases link")
+                            }
+                            Some(ResolvedExport::External { module, edge, .. }) => {
+                                return Err(self.program_error(
+                                    module,
+                                    RuntimeErrorKind::ExternalModuleUnavailable { module, edge },
+                                ));
+                            }
+                            None => {
+                                return Err(self.program_error(
+                                    module_id,
+                                    RuntimeErrorKind::InvalidVerifiedProgram {
+                                        module: module_id,
+                                        instruction: Instruction::Import {
+                                            dst: bamts_bytecode::Register::new(0),
+                                            specifier: name,
+                                        },
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                    BindingKind::Namespace { edge } => {
+                        let dependency = program.modules()[module_index].edges[edge.get() as usize];
+                        let EdgeTarget::Local(target) = dependency.target else {
+                            return Err(self.program_error(
+                                module_id,
+                                RuntimeErrorKind::ExternalModuleUnavailable {
+                                    module: module_id,
+                                    edge,
+                                },
+                            ));
+                        };
+                        let namespace = self.module_namespace(target, module_id)?;
+                        self.allocate_cell(namespace, module_id)?
+                    }
+                };
+                self.registry.modules[module_index].binding_cells[binding_index] = Some(cell);
+            }
+        }
+
+        for module_index in 0..program.modules().len() {
+            let bindings = &program.modules()[module_index].bindings;
+            let constants = program.modules()[module_index].code.constants();
+            for (constant_index, constant) in constants.iter().enumerate() {
+                let Constant::String(name) = constant else {
+                    continue;
+                };
+                if let Some((binding_index, _)) =
+                    bindings.iter().enumerate().find(|(_, binding)| {
+                        self.constant_text(ModuleId::new(module_index as u32), binding.name) == name
+                    })
+                {
+                    self.registry.modules[module_index].constant_cells[constant_index] =
+                        self.registry.modules[module_index].binding_cells[binding_index];
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn module_namespace(
+        &mut self,
+        target: ModuleId,
+        requester: ModuleId,
+    ) -> Result<Value, RuntimeError> {
+        if let Some(value) = self.registry.modules[target.get() as usize].namespace {
+            return Ok(value);
+        }
+        let value = self
+            .allocate(HeapEntry::ModuleNamespace { module: target })
+            .map_err(|kind| self.program_error(requester, kind))?;
+        self.registry.modules[target.get() as usize].namespace = Some(value);
+        Ok(value)
+    }
+
+    fn evaluate_module(&mut self, module: ModuleId) -> Result<Option<Execution>, RuntimeError> {
+        match self.registry.modules[module.get() as usize].state.clone() {
+            ModuleState::Evaluating => return Ok(None),
+            ModuleState::Evaluated(result) => return result.map(Some),
+            ModuleState::Unevaluated => {}
+        }
+        self.registry.modules[module.get() as usize].state = ModuleState::Evaluating;
+
+        let edges = self.program().modules()[module.get() as usize]
+            .edges
+            .clone();
+        for (edge_index, edge) in edges.into_iter().enumerate() {
+            if !edge.kind.has_static() {
+                continue;
+            }
+            match edge.target {
+                EdgeTarget::Local(dependency) => {
+                    if let Err(error) = self.evaluate_module(dependency) {
+                        self.registry.modules[module.get() as usize].state =
+                            ModuleState::Evaluated(Err(error.clone()));
+                        return Err(error);
+                    }
+                }
+                EdgeTarget::External => {
+                    let error = self.program_error(
+                        module,
+                        RuntimeErrorKind::ExternalModuleUnavailable {
+                            module,
+                            edge: EdgeId::new(edge_index as u32),
+                        },
+                    );
+                    self.registry.modules[module.get() as usize].state =
+                        ModuleState::Evaluated(Err(error.clone()));
+                    return Err(error);
+                }
+            }
+        }
+
+        let code = self.module_code(module);
+        let function = code.entry().get() as usize;
+        let metadata = &code.functions()[function];
+        let register_count = metadata.register_count() as usize;
+        let result = if self.limits.max_call_depth < 1 {
+            Err(self.program_error(
+                module,
+                RuntimeErrorKind::CallDepthExceeded {
+                    limit: self.limits.max_call_depth,
+                },
+            ))
+        } else if register_count > self.limits.max_total_registers {
+            Err(self.program_error(
+                module,
+                RuntimeErrorKind::RegisterLimitExceeded {
+                    limit: self.limits.max_total_registers,
+                },
+            ))
+        } else {
+            self.frames.push(Frame::new(
+                RuntimeFunction {
+                    module,
+                    function: FunctionId::new(function as u32),
+                },
+                metadata,
+                &[],
+                Value::UNDEFINED,
+                Value::UNDEFINED,
+                &[],
+                None,
+            ));
+            self.live_registers = register_count;
+            self.run_loop(0).and_then(|execution| {
+                execution.ok_or_else(|| {
+                    self.program_error(
+                        module,
+                        RuntimeErrorKind::InvalidVerifiedProgram {
+                            module,
+                            instruction: Instruction::Halt,
+                        },
+                    )
+                })
+            })
+        };
+        if result.is_err() {
+            self.frames.clear();
+            self.live_registers = 0;
+        }
+        self.registry.modules[module.get() as usize].state = ModuleState::Evaluated(result.clone());
+        result.map(Some)
+    }
+
+    fn constant_text(&self, module: ModuleId, id: ConstantId) -> &str {
+        match &self.module_code(module).constants()[id.get() as usize] {
+            Constant::String(text) => text,
+            _ => unreachable!("verified module names are strings"),
+        }
+    }
+
+    fn program_error(&self, module: ModuleId, kind: RuntimeErrorKind) -> RuntimeError {
+        let code = self.module_code(module);
+        let function = code.entry().get() as usize;
+        let instruction = code.functions()[function]
+            .code()
+            .first()
+            .copied()
+            .unwrap_or(Instruction::Halt);
+        RuntimeError {
+            kind,
+            function: FunctionId::new(function as u32),
+            pc: Pc::new(0),
+            source: RuntimeSource {
+                function_name: None,
+                instruction,
+            },
+        }
     }
 
     fn run_loop(&mut self, stop_depth: usize) -> Result<Option<Execution>, RuntimeError> {
@@ -639,9 +1070,9 @@ impl<'a, H: Host> Machine<'a, H> {
 
         loop {
             let frame_index = self.frames.len() - 1;
-            let (function_index, pc) = {
+            let (module_id, function_index, pc) = {
                 let frame = &self.frames[frame_index];
-                (frame.function, frame.pc)
+                (frame.module, frame.function, frame.pc)
             };
             if self.fuel == 0 {
                 return Err(self.error_at(
@@ -653,7 +1084,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 ));
             }
             self.fuel -= 1;
-            let instruction = self.module.functions()[function_index].code()[pc];
+            let instruction = self.module_code(module_id).functions()[function_index].code()[pc];
 
             match instruction {
                 Instruction::LoadConst { dst, constant } => {
@@ -724,6 +1155,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     Ok(captures) => {
                         let value = self
                             .allocate(HeapEntry::Function {
+                                module: module_id,
                                 function,
                                 captures,
                                 properties: PropertyMap::default(),
@@ -878,34 +1310,33 @@ impl<'a, H: Host> Machine<'a, H> {
                         Err(failure) => self.resolve_failure(failure, pc)?,
                     }
                 }
-                Instruction::LoadGlobal { dst, name } => {
-                    let name = self.constant_string(name).to_owned();
-                    match self.resolve_global_binding(&name) {
-                        Some(value) => {
-                            self.write_register(frame_index, dst.get(), value);
-                            self.frames[frame_index].pc = pc + 1;
-                        }
-                        None => self.throw(
-                            Value::UNDEFINED,
-                            ThrowOrigin::ReferenceError {
-                                operation: "global is not defined",
-                            },
-                            pc,
-                        )?,
+                Instruction::LoadGlobal { dst, name } => match self.load_global(module_id, name) {
+                    Ok(Some(value)) => {
+                        self.write_register(frame_index, dst.get(), value);
+                        self.frames[frame_index].pc = pc + 1;
                     }
-                }
+                    Ok(None) => self.throw(
+                        Value::UNDEFINED,
+                        ThrowOrigin::ReferenceError {
+                            operation: "global is not defined",
+                        },
+                        pc,
+                    )?,
+                    Err(kind) => return Err(self.error_here_at(kind, pc)),
+                },
                 Instruction::StoreGlobal { name, value } => {
                     let value = self.read_register(frame_index, value.get());
-                    let name = self.constant_string(name).to_owned();
-                    self.globals.insert(name, value);
-                    self.frames[frame_index].pc = pc + 1;
+                    match self.store_global(module_id, name, value) {
+                        Ok(()) => self.frames[frame_index].pc = pc + 1,
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
                 }
                 Instruction::TypeOfGlobal { dst, name } => {
-                    let name = self.constant_string(name).to_owned();
-                    let text = self
-                        .resolve_global_binding(&name)
-                        .map_or("undefined", |value| self.type_of(value))
-                        .to_owned();
+                    let text = match self.load_global(module_id, name) {
+                        Ok(value) => value.map_or("undefined", |value| self.type_of(value)),
+                        Err(kind) => return Err(self.error_here_at(kind, pc)),
+                    }
+                    .to_owned();
                     let value = self
                         .allocate(HeapEntry::String(text))
                         .map_err(|kind| self.error_at(kind, function_index, pc))?;
@@ -1046,10 +1477,19 @@ impl<'a, H: Host> Machine<'a, H> {
                     self.throw_type("suspend outside an engine-owned event loop", pc)?;
                 }
                 Instruction::Import { .. } => {
-                    self.throw_type("import outside an engine-owned module registry", pc)?;
+                    return Err(self.error_here_at(
+                        RuntimeErrorKind::DynamicImportUnsupported { module: module_id },
+                        pc,
+                    ));
                 }
                 Instruction::Export { .. } => {
-                    self.throw_type("export outside an engine-owned module registry", pc)?;
+                    return Err(self.error_here_at(
+                        RuntimeErrorKind::InvalidVerifiedProgram {
+                            module: module_id,
+                            instruction,
+                        },
+                        pc,
+                    ));
                 }
                 Instruction::Halt => {
                     if let Some(execution) = self.complete_frame(Value::UNDEFINED) {
@@ -1072,10 +1512,7 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn constant_string(&self, id: ConstantId) -> &str {
-        match &self.module.constants()[id.get() as usize] {
-            Constant::String(text) => text,
-            _ => unreachable!("verified name/specifier/pattern constants are strings"),
-        }
+        self.constant_text(self.active_module_id(), id)
     }
 
     fn load_constant(
@@ -1136,7 +1573,76 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(Some(index))
     }
 
-    /// Resolves a declared runtime global before the realm's intrinsic globals.
+    fn active_module_id(&self) -> ModuleId {
+        self.frames
+            .last()
+            .map_or(ModuleId::new(0), |frame| frame.module)
+    }
+
+    fn load_global(
+        &self,
+        module: ModuleId,
+        name: ConstantId,
+    ) -> Result<Option<Value>, RuntimeErrorKind> {
+        if let Some(cell) = self
+            .registry
+            .modules
+            .get(module.get() as usize)
+            .and_then(|instance| instance.constant_cells.get(name.get() as usize))
+            .copied()
+            .flatten()
+        {
+            let value = self.registry.cells[cell.0].value;
+            if value.is_uninitialized() {
+                let binding = self.registry.modules[module.get() as usize]
+                    .binding_cells
+                    .iter()
+                    .position(|candidate| *candidate == Some(cell))
+                    .map(|index| BindingId::new(index as u32))
+                    .expect("linked cell belongs to a binding");
+                return Err(RuntimeErrorKind::TemporalDeadZone { module, binding });
+            }
+            return Ok(Some(value));
+        }
+        Ok(self.resolve_global_binding(self.constant_text(module, name)))
+    }
+
+    fn store_global(
+        &mut self,
+        module: ModuleId,
+        name: ConstantId,
+        value: Value,
+    ) -> Result<(), EvalFailure> {
+        let cell = self
+            .registry
+            .modules
+            .get(module.get() as usize)
+            .and_then(|instance| instance.constant_cells.get(name.get() as usize))
+            .copied()
+            .flatten();
+        if let Some(cell) = cell {
+            let binding = self.registry.modules[module.get() as usize]
+                .binding_cells
+                .iter()
+                .position(|candidate| *candidate == Some(cell))
+                .expect("mapped module cell belongs to a binding");
+            if matches!(
+                self.program().modules()[module.get() as usize].bindings[binding].kind,
+                BindingKind::Imported { .. } | BindingKind::Namespace { .. }
+            ) {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "assign to immutable module binding",
+                }));
+            }
+            self.registry.cells[cell.0].value = value;
+        } else {
+            let name = self.constant_text(module, name).to_owned();
+            self.globals.insert(name, value);
+        }
+        Ok(())
+    }
+
+    /// Resolves a true realm global after module bindings have been considered.
     fn resolve_global_binding(&self, name: &str) -> Option<Value> {
         self.globals
             .get(name)
@@ -1149,9 +1655,15 @@ impl<'a, H: Host> Machine<'a, H> {
         match self.runtime_slot(callee)? {
             Some(index) => match &self.heap[index] {
                 HeapEntry::Function {
-                    function, captures, ..
+                    module,
+                    function,
+                    captures,
+                    ..
                 } => Ok(CalleeKind::Runtime {
-                    function: *function,
+                    target: RuntimeFunction {
+                        module: *module,
+                        function: *function,
+                    },
                     captures: captures.clone(),
                 }),
                 HeapEntry::NativeFunction { id, bound_this, .. } => Ok(CalleeKind::Builtin {
@@ -1167,7 +1679,7 @@ impl<'a, H: Host> Machine<'a, H> {
     /// Materializes a constant into an ABI value, interning strings and bigints
     /// into the slot heap. Shared with the native engine.
     fn load_constant_value(&mut self, id: ConstantId) -> Result<Value, RuntimeErrorKind> {
-        match &self.module.constants()[id.get() as usize] {
+        match &self.module_code(self.active_module_id()).constants()[id.get() as usize] {
             Constant::String(text) => self.allocate(HeapEntry::String(text.clone())),
             Constant::BigInt(value) => self.allocate(HeapEntry::BigInt(value.as_str().to_owned())),
             constant => Ok(constant_value(constant).expect("non-heap constant")),
@@ -1237,7 +1749,9 @@ impl<'a, H: Host> Machine<'a, H> {
         captures: Value,
         function: FunctionId,
     ) -> Result<Vec<Value>, EvalFailure> {
-        let expected = self.module.functions()[function.get() as usize].capture_count() as usize;
+        let expected = self.module_code(self.active_module_id()).functions()
+            [function.get() as usize]
+            .capture_count() as usize;
         match self.runtime_slot(captures).map_err(EvalFailure::Runtime)? {
             Some(index) => match &self.heap[index] {
                 HeapEntry::Array { elements, .. } => {
@@ -1291,15 +1805,15 @@ impl<'a, H: Host> Machine<'a, H> {
 
     fn push_frame(
         &mut self,
-        function: FunctionId,
+        target: RuntimeFunction,
         captures: &[Value],
         this_value: Value,
         new_target: Value,
         arguments: &[Value],
         return_to: ReturnTo,
     ) -> Result<(), RuntimeError> {
-        let function_index = function.get() as usize;
-        let metadata = &self.module.functions()[function_index];
+        let function_index = target.function.get() as usize;
+        let metadata = &self.module_code(target.module).functions()[function_index];
         if self.frames.len() >= self.limits.max_call_depth {
             return Err(self.error_here_at(
                 RuntimeErrorKind::CallDepthExceeded {
@@ -1318,7 +1832,7 @@ impl<'a, H: Host> Machine<'a, H> {
             ));
         }
         let frame = Frame::new(
-            function_index,
+            target,
             metadata,
             captures,
             this_value,
@@ -1342,8 +1856,8 @@ impl<'a, H: Host> Machine<'a, H> {
             new_target,
         } = request;
         match self.callee_kind(callee) {
-            Ok(CalleeKind::Runtime { function, captures }) => self.push_frame(
-                function,
+            Ok(CalleeKind::Runtime { target, captures }) => self.push_frame(
+                target,
                 &captures,
                 this_value,
                 new_target,
@@ -1641,11 +2155,11 @@ impl<'a, H: Host> Machine<'a, H> {
                     } => self.call_value(callee, this_value, &arguments[argument_start..]),
                 }
             }
-            CalleeKind::Runtime { function, captures } => {
+            CalleeKind::Runtime { target, captures } => {
                 let stop_depth = self.frames.len();
                 let call_pc = self.frames.last().map_or(0, |frame| frame.pc);
                 self.push_frame(
-                    function,
+                    target,
                     &captures,
                     this_value,
                     Value::UNDEFINED,
@@ -1728,6 +2242,11 @@ impl<'a, H: Host> Machine<'a, H> {
         origin: ThrowOrigin,
         faulting_pc: usize,
     ) -> Result<(), RuntimeError> {
+        let site_module = self
+            .frames
+            .last()
+            .expect("an activation is executing")
+            .module;
         let site_function = self
             .frames
             .last()
@@ -1737,7 +2256,8 @@ impl<'a, H: Host> Machine<'a, H> {
         loop {
             let frame_index = self.frames.len() - 1;
             let function_index = self.frames[frame_index].function;
-            let function = &self.module.functions()[function_index];
+            let module = self.frames[frame_index].module;
+            let function = &self.module_code(module).functions()[function_index];
             if let Some(handler) = innermost_handler(function, search_pc) {
                 let frame = &mut self.frames[frame_index];
                 frame.registers[handler.catch_register.get() as usize] = value;
@@ -1749,8 +2269,9 @@ impl<'a, H: Host> Machine<'a, H> {
             match frame.return_to {
                 Some(return_to) => search_pc = return_to.call_pc,
                 None => {
-                    return Err(self.error_at(
+                    return Err(self.error_at_in_module(
                         RuntimeErrorKind::UncaughtThrow { value, origin },
+                        site_module,
                         site_function,
                         faulting_pc,
                     ));
@@ -1774,11 +2295,22 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn error_at(&self, kind: RuntimeErrorKind, function: usize, pc: usize) -> RuntimeError {
-        let metadata = &self.module.functions()[function];
+        self.error_at_in_module(kind, self.active_module_id(), function, pc)
+    }
+
+    fn error_at_in_module(
+        &self,
+        kind: RuntimeErrorKind,
+        module: ModuleId,
+        function: usize,
+        pc: usize,
+    ) -> RuntimeError {
+        let code = self.module_code(module);
+        let metadata = &code.functions()[function];
         let function_name =
             metadata
                 .name()
-                .and_then(|id| match &self.module.constants()[id.get() as usize] {
+                .and_then(|id| match &code.constants()[id.get() as usize] {
                     Constant::String(name) => Some(name.clone()),
                     _ => None,
                 });
@@ -1829,7 +2361,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     };
                 }
                 if let Some(found) = self.primitive_get(index, key) {
-                    return Ok(Self::found_outcome(found));
+                    return Self::found_outcome(found);
                 }
                 match self.heap[index] {
                     HeapEntry::String(_) => self
@@ -1857,7 +2389,7 @@ impl<'a, H: Host> Machine<'a, H> {
         };
         for _ in 0..=self.heap.len() {
             if let Some(found) = self.own_get(node, key) {
-                return Ok(Self::found_outcome(found));
+                return Self::found_outcome(found);
             }
             match self.prototype_index(node)? {
                 Some(next) => node = next,
@@ -1867,12 +2399,13 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(GetOutcome::Value(Value::UNDEFINED))
     }
 
-    fn found_outcome(found: Found) -> GetOutcome {
+    fn found_outcome(found: Found) -> Result<GetOutcome, EvalFailure> {
         match found {
-            Found::Value(value) => GetOutcome::Value(value),
-            Found::Text(text) => GetOutcome::Text(text),
-            Found::Getter(getter) => GetOutcome::Getter(getter),
-            Found::NoGetter => GetOutcome::Value(Value::UNDEFINED),
+            Found::Value(value) => Ok(GetOutcome::Value(value)),
+            Found::Text(text) => Ok(GetOutcome::Text(text)),
+            Found::Getter(getter) => Ok(GetOutcome::Getter(getter)),
+            Found::Failure(kind) => Err(EvalFailure::Runtime(kind)),
+            Found::NoGetter => Ok(GetOutcome::Value(Value::UNDEFINED)),
         }
     }
 
@@ -1932,6 +2465,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 property_lookup(properties, key)
             }
             HeapEntry::Function {
+                module,
                 function,
                 properties,
                 ..
@@ -1940,7 +2474,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     return Some(found);
                 }
                 if let PropertyKey::Named(name) = key {
-                    let metadata = &self.module.functions()[function.get() as usize];
+                    let metadata = &self.module_code(*module).functions()[function.get() as usize];
                     match name.as_str() {
                         "length" => {
                             return Some(Found::Value(number_value(
@@ -1951,7 +2485,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             return Some(Found::Text(
                                 metadata
                                     .name()
-                                    .map(|id| self.constant_string(id).to_owned())
+                                    .map(|id| self.constant_text(*module, id).to_owned())
                                     .unwrap_or_default(),
                             ));
                         }
@@ -1959,6 +2493,31 @@ impl<'a, H: Host> Machine<'a, H> {
                     }
                 }
                 None
+            }
+            HeapEntry::ModuleNamespace { module } => {
+                let PropertyKey::Named(name) = key else {
+                    return None;
+                };
+                match self.program().resolve_export(*module, name) {
+                    Some(ResolvedExport::Local { module, binding }) => {
+                        let cell = self.registry.modules[module.get() as usize].binding_cells
+                            [binding.get() as usize]
+                            .expect("verified export resolves to a linked cell");
+                        let value = self.registry.cells[cell.0].value;
+                        if value.is_uninitialized() {
+                            Some(Found::Failure(RuntimeErrorKind::TemporalDeadZone {
+                                module,
+                                binding,
+                            }))
+                        } else {
+                            Some(Found::Value(value))
+                        }
+                    }
+                    Some(ResolvedExport::External { module, edge, .. }) => Some(Found::Failure(
+                        RuntimeErrorKind::ExternalModuleUnavailable { module, edge },
+                    )),
+                    None => None,
+                }
             }
             HeapEntry::NativeFunction { properties, .. } => property_lookup(properties, key),
             HeapEntry::RegExp {
@@ -2036,6 +2595,11 @@ impl<'a, H: Host> Machine<'a, H> {
     ) -> Result<SetOutcome, EvalFailure> {
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => {
+                if matches!(self.heap[index], HeapEntry::ModuleNamespace { .. }) {
+                    return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "assign to module namespace",
+                    }));
+                }
                 if matches!(self.heap[index], HeapEntry::ProcessEnv { .. }) {
                     let PropertyKey::Named(name) = &key else {
                         return Ok(SetOutcome::Done);
@@ -2225,6 +2789,11 @@ impl<'a, H: Host> Machine<'a, H> {
             HeapEntry::ProcessEnv { .. } => {
                 return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                     operation: "set internal process environment",
+                }));
+            }
+            HeapEntry::ModuleNamespace { .. } => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "assign to module namespace",
                 }));
             }
         };
@@ -2432,6 +3001,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::BigInt(_)
                 | HeapEntry::PrivateName { .. }
                 | HeapEntry::Iterator { .. } => Ok(true),
+                HeapEntry::ModuleNamespace { .. } => Ok(false),
             },
             None => Ok(true),
         }
@@ -2734,6 +3304,15 @@ impl<'a, H: Host> Machine<'a, H> {
                 HeapEntry::String(text) => Ok((0..text.chars().count())
                     .map(|index| PropertyKey::Named(index.to_string()))
                     .collect()),
+                HeapEntry::ModuleNamespace { module } => {
+                    let mut names: Vec<String> = self.program().modules()[module.get() as usize]
+                        .exports
+                        .iter()
+                        .map(|export| self.constant_text(*module, export.name).to_owned())
+                        .collect();
+                    names.sort();
+                    Ok(names.into_iter().map(PropertyKey::Named).collect())
+                }
                 HeapEntry::ProcessEnv { .. }
                 | HeapEntry::BigInt(_)
                 | HeapEntry::PrivateName { .. }
@@ -2769,6 +3348,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     ),
                     HeapEntry::String(text) => array_index(name)
                         .is_some_and(|offset| (offset as usize) < text.chars().count()),
+                    HeapEntry::ModuleNamespace { .. } => true,
                     HeapEntry::Object { properties, .. }
                     | HeapEntry::Function { properties, .. }
                     | HeapEntry::NativeFunction { properties, .. }
@@ -3075,6 +3655,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         HeapEntry::Object { .. }
                         | HeapEntry::Array { .. }
                         | HeapEntry::Function { .. }
+                        | HeapEntry::ModuleNamespace { .. }
                         | HeapEntry::NativeFunction { .. }
                         | HeapEntry::RegExp { .. }
                         | HeapEntry::ProcessEnv { .. }
@@ -3105,6 +3686,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     HeapEntry::Object { .. }
                     | HeapEntry::Array { .. }
                     | HeapEntry::Function { .. }
+                    | HeapEntry::ModuleNamespace { .. }
                     | HeapEntry::NativeFunction { .. }
                     | HeapEntry::PrivateName { .. }
                     | HeapEntry::RegExp { .. }
@@ -3131,6 +3713,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     HeapEntry::PrivateName { .. } => "symbol",
                     HeapEntry::Object { .. }
                     | HeapEntry::Array { .. }
+                    | HeapEntry::ModuleNamespace { .. }
                     | HeapEntry::RegExp { .. }
                     | HeapEntry::ProcessEnv { .. }
                     | HeapEntry::Iterator { .. } => "object",
@@ -3255,6 +3838,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 HeapEntry::Object { .. }
                 | HeapEntry::Array { .. }
                 | HeapEntry::Function { .. }
+                | HeapEntry::ModuleNamespace { .. }
                 | HeapEntry::NativeFunction { .. }
                 | HeapEntry::RegExp { .. }
                 | HeapEntry::Iterator { .. }
@@ -3282,6 +3866,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     Some(index) => match &self.heap[index] {
                         HeapEntry::String(text) | HeapEntry::BigInt(text) => Ok(text.clone()),
                         HeapEntry::Object { .. }
+                        | HeapEntry::ModuleNamespace { .. }
                         | HeapEntry::ProcessEnv { .. }
                         | HeapEntry::Iterator { .. } => Ok("[object Object]".to_owned()),
                         HeapEntry::RegExp { pattern, flags, .. } => {
@@ -3292,8 +3877,12 @@ impl<'a, H: Host> Machine<'a, H> {
                                 operation: "convert private name to string",
                             }))
                         }
-                        HeapEntry::Function { function, .. } => {
-                            let flags = self.module.functions()[function.get() as usize].flags();
+                        HeapEntry::Function {
+                            module, function, ..
+                        } => {
+                            let flags = self.module_code(*module).functions()
+                                [function.get() as usize]
+                                .flags();
                             Ok(match (flags.is_async, flags.is_generator) {
                                 (true, true) => "async function* () { [bytecode] }",
                                 (true, false) => "async function () { [bytecode] }",
@@ -3664,7 +4253,10 @@ pub(crate) fn accessor_from_selector(kind: u32) -> Option<AccessorKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamts_bytecode::{ExceptionHandler, FunctionFlags, NumberBits, Register};
+    use bamts_bytecode::{
+        Binding, Edge, EdgeKind, ExceptionHandler, Export, ExportSource, FunctionFlags, NumberBits,
+        ProgramModule, Register,
+    };
 
     fn reg(raw: u32) -> Register {
         Register::new(raw)
@@ -3712,19 +4304,56 @@ mod tests {
         )
     }
 
-    fn verified(constants: Vec<Constant>, functions: Vec<Function>) -> Module<Verified> {
-        Module::new(constants, functions, FunctionId::new(0))
+    fn verified(mut constants: Vec<Constant>, functions: Vec<Function>) -> Program<Verified> {
+        let name = ConstantId::new(constants.len() as u32);
+        constants.push(Constant::String("<test>".to_owned()));
+        let code = Module::new(constants, functions, FunctionId::new(0))
             .verify()
-            .expect("valid test bytecode")
+            .expect("valid test bytecode");
+        Program::link(
+            vec![ProgramModule {
+                name,
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect("valid one-module test program")
+    }
+    fn program_module(
+        name: &str,
+        mut constants: Vec<Constant>,
+        functions: Vec<Function>,
+        edges: Vec<Edge>,
+        bindings: Vec<Binding>,
+        exports: Vec<Export>,
+    ) -> ProgramModule<Verified> {
+        constants.insert(0, Constant::String(name.to_owned()));
+        let code = Module::new(constants, functions, FunctionId::new(0))
+            .verify()
+            .expect("valid test bytecode");
+        ProgramModule {
+            name: ConstantId::new(0),
+            code,
+            edges,
+            bindings,
+            exports,
+        }
+    }
+
+    fn linked(modules: Vec<ProgramModule<Verified>>, entry: u32) -> Program<Verified> {
+        Program::link(modules, ModuleId::new(entry)).expect("valid linked test program")
     }
 
     #[derive(Default)]
     struct TestHost;
     impl Host for TestHost {}
 
-    fn run_ok(module: &Module<Verified>) -> Execution {
+    fn run_ok(program: &Program<Verified>) -> Execution {
         let mut host = TestHost;
-        Machine::new(module, &mut host, Limits::default())
+        Machine::new(program, &mut host, Limits::default())
             .run()
             .unwrap()
     }
@@ -5281,5 +5910,1104 @@ mod tests {
             );
         }
         assert_eq!(host.env("BAMTS_MODE"), None);
+    }
+
+    #[test]
+    fn independent_modules_keep_same_name_globals_isolated() {
+        let dependency = |name: &str, value: i32| {
+            program_module(
+                name,
+                vec![Constant::String("x".into()), Constant::Int32(value)],
+                vec![function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(2),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                )],
+                Vec::new(),
+                vec![Binding {
+                    name: cid(1),
+                    kind: BindingKind::Hoisted,
+                }],
+                vec![Export {
+                    name: cid(1),
+                    source: ExportSource::Local(BindingId::new(0)),
+                }],
+            )
+        };
+        let root = program_module(
+            "root",
+            vec![
+                Constant::String("left".into()),
+                Constant::String("right".into()),
+                Constant::String("x".into()),
+            ],
+            vec![function(
+                0,
+                5,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(1),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(1),
+                        name: cid(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(3),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(3),
+                        object: reg(0),
+                        key: reg(2),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(4),
+                        object: reg(1),
+                        key: reg(2),
+                    },
+                    Instruction::Binary {
+                        dst: reg(0),
+                        op: BinaryOp::Add,
+                        left: reg(3),
+                        right: reg(4),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            vec![
+                Edge {
+                    specifier: cid(1),
+                    target: EdgeTarget::Local(ModuleId::new(0)),
+                    kind: EdgeKind::Static,
+                },
+                Edge {
+                    specifier: cid(2),
+                    target: EdgeTarget::Local(ModuleId::new(1)),
+                    kind: EdgeKind::Static,
+                },
+            ],
+            vec![
+                Binding {
+                    name: cid(1),
+                    kind: BindingKind::Namespace {
+                        edge: EdgeId::new(0),
+                    },
+                },
+                Binding {
+                    name: cid(2),
+                    kind: BindingKind::Namespace {
+                        edge: EdgeId::new(1),
+                    },
+                },
+            ],
+            Vec::new(),
+        );
+        let program = linked(vec![dependency("left", 1), dependency("right", 2), root], 2);
+        assert_eq!(run_ok(&program).value, Value::int32(3));
+    }
+
+    #[test]
+    fn imported_binding_observes_post_link_mutation_live() {
+        let dependency = program_module(
+            "dependency",
+            vec![
+                Constant::String("x".into()),
+                Constant::Int32(1),
+                Constant::Int32(2),
+                Constant::String("set".into()),
+            ],
+            vec![
+                function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(2),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::CreateArray { dst: reg(1) },
+                        Instruction::CreateClosure {
+                            dst: reg(2),
+                            function: FunctionId::new(1),
+                            captures: reg(1),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(4),
+                            value: reg(2),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(3),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+            Vec::new(),
+            vec![
+                Binding {
+                    name: cid(1),
+                    kind: BindingKind::Hoisted,
+                },
+                Binding {
+                    name: cid(4),
+                    kind: BindingKind::Hoisted,
+                },
+            ],
+            vec![
+                Export {
+                    name: cid(1),
+                    source: ExportSource::Local(BindingId::new(0)),
+                },
+                Export {
+                    name: cid(4),
+                    source: ExportSource::Local(BindingId::new(1)),
+                },
+            ],
+        );
+        let root = program_module(
+            "root",
+            vec![
+                Constant::String("x".into()),
+                Constant::String("set".into()),
+                Constant::String("dep".into()),
+            ],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(2),
+                    },
+                    Instruction::CreateArray { dst: reg(1) },
+                    Instruction::Call {
+                        dst: reg(2),
+                        callee: reg(0),
+                        this_value: reg(1),
+                        arguments: reg(1),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(1),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(3),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            vec![
+                Binding {
+                    name: cid(1),
+                    kind: BindingKind::Imported {
+                        edge: EdgeId::new(0),
+                        name: cid(1),
+                    },
+                },
+                Binding {
+                    name: cid(2),
+                    kind: BindingKind::Imported {
+                        edge: EdgeId::new(0),
+                        name: cid(2),
+                    },
+                },
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            run_ok(&linked(vec![dependency, root], 1)).value,
+            Value::int32(2)
+        );
+    }
+
+    #[test]
+    fn closure_globals_resolve_in_the_defining_module() {
+        let dependency = program_module(
+            "dependency",
+            vec![
+                Constant::String("x".into()),
+                Constant::Int32(10),
+                Constant::String("read".into()),
+            ],
+            vec![
+                function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(2),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::CreateArray { dst: reg(1) },
+                        Instruction::CreateClosure {
+                            dst: reg(2),
+                            function: FunctionId::new(1),
+                            captures: reg(1),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(3),
+                            value: reg(2),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(1),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+            Vec::new(),
+            vec![
+                Binding {
+                    name: cid(1),
+                    kind: BindingKind::Hoisted,
+                },
+                Binding {
+                    name: cid(3),
+                    kind: BindingKind::Hoisted,
+                },
+            ],
+            vec![Export {
+                name: cid(3),
+                source: ExportSource::Local(BindingId::new(1)),
+            }],
+        );
+        let root = program_module(
+            "root",
+            vec![
+                Constant::String("x".into()),
+                Constant::Int32(20),
+                Constant::String("read".into()),
+                Constant::String("dep".into()),
+            ],
+            vec![function(
+                0,
+                4,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(2),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(1),
+                        value: reg(0),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(1),
+                        name: cid(3),
+                    },
+                    Instruction::CreateArray { dst: reg(2) },
+                    Instruction::Call {
+                        dst: reg(3),
+                        callee: reg(1),
+                        this_value: reg(2),
+                        arguments: reg(2),
+                    },
+                    Instruction::Return { value: reg(3) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(4),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            vec![
+                Binding {
+                    name: cid(1),
+                    kind: BindingKind::Hoisted,
+                },
+                Binding {
+                    name: cid(3),
+                    kind: BindingKind::Imported {
+                        edge: EdgeId::new(0),
+                        name: cid(3),
+                    },
+                },
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            run_ok(&linked(vec![dependency, root], 1)).value,
+            Value::int32(10)
+        );
+    }
+
+    #[test]
+    fn cycle_traps_a_lexical_read_before_initialization() {
+        let first = program_module(
+            "first",
+            vec![
+                Constant::String("a".into()),
+                Constant::Int32(1),
+                Constant::String("second".into()),
+            ],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(2),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(1),
+                        value: reg(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(3),
+                target: EdgeTarget::Local(ModuleId::new(1)),
+                kind: EdgeKind::Static,
+            }],
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Lexical,
+            }],
+            vec![Export {
+                name: cid(1),
+                source: ExportSource::Local(BindingId::new(0)),
+            }],
+        );
+        let second = program_module(
+            "second",
+            vec![
+                Constant::String("a".into()),
+                Constant::String("first".into()),
+            ],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(1),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(2),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Imported {
+                    edge: EdgeId::new(0),
+                    name: cid(1),
+                },
+            }],
+            Vec::new(),
+        );
+        let program = linked(vec![first, second], 0);
+        let mut host = TestHost;
+        let error = Machine::new(&program, &mut host, Limits::default())
+            .run()
+            .unwrap_err();
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::TemporalDeadZone { module, binding }
+                if module == ModuleId::new(1) && binding == BindingId::new(0)
+        ));
+    }
+
+    #[test]
+    fn cycle_reentry_with_a_hoisted_binding_completes() {
+        let first = program_module(
+            "first",
+            vec![
+                Constant::String("a".into()),
+                Constant::Int32(1),
+                Constant::String("second".into()),
+            ],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(2),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(1),
+                        value: reg(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(3),
+                target: EdgeTarget::Local(ModuleId::new(1)),
+                kind: EdgeKind::Static,
+            }],
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Hoisted,
+            }],
+            vec![Export {
+                name: cid(1),
+                source: ExportSource::Local(BindingId::new(0)),
+            }],
+        );
+        let second = program_module(
+            "second",
+            vec![
+                Constant::String("a".into()),
+                Constant::String("first".into()),
+            ],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(1),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(2),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Imported {
+                    edge: EdgeId::new(0),
+                    name: cid(1),
+                },
+            }],
+            Vec::new(),
+        );
+        assert_eq!(
+            run_ok(&linked(vec![first, second], 0)).value,
+            Value::int32(1)
+        );
+    }
+
+    #[test]
+    fn namespace_identity_reads_live_cells_and_enumerates_sorted_keys() {
+        let dependency = program_module(
+            "dependency",
+            vec![
+                Constant::String("z".into()),
+                Constant::String("a".into()),
+                Constant::String("mutate".into()),
+                Constant::Int32(1),
+                Constant::Int32(2),
+                Constant::Int32(3),
+            ],
+            vec![
+                function(
+                    0,
+                    4,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(4),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(5),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(2),
+                            value: reg(0),
+                        },
+                        Instruction::CreateArray { dst: reg(1) },
+                        Instruction::CreateClosure {
+                            dst: reg(2),
+                            function: FunctionId::new(1),
+                            captures: reg(1),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(3),
+                            value: reg(2),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(6),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+            Vec::new(),
+            vec![
+                Binding {
+                    name: cid(1),
+                    kind: BindingKind::Hoisted,
+                },
+                Binding {
+                    name: cid(2),
+                    kind: BindingKind::Hoisted,
+                },
+                Binding {
+                    name: cid(3),
+                    kind: BindingKind::Hoisted,
+                },
+            ],
+            vec![
+                Export {
+                    name: cid(1),
+                    source: ExportSource::Local(BindingId::new(0)),
+                },
+                Export {
+                    name: cid(2),
+                    source: ExportSource::Local(BindingId::new(1)),
+                },
+                Export {
+                    name: cid(3),
+                    source: ExportSource::Local(BindingId::new(2)),
+                },
+            ],
+        );
+        let root = program_module(
+            "root",
+            vec![
+                Constant::String("ns1".into()),
+                Constant::String("ns2".into()),
+                Constant::String("mutate".into()),
+                Constant::String("z".into()),
+                Constant::String("a".into()),
+                Constant::String("dep".into()),
+            ],
+            vec![function(
+                0,
+                15,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(1),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(1),
+                        name: cid(2),
+                    },
+                    Instruction::Binary {
+                        dst: reg(2),
+                        op: BinaryOp::StrictEqual,
+                        left: reg(0),
+                        right: reg(1),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(3),
+                        name: cid(3),
+                    },
+                    Instruction::CreateArray { dst: reg(4) },
+                    Instruction::Call {
+                        dst: reg(5),
+                        callee: reg(3),
+                        this_value: reg(4),
+                        arguments: reg(4),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(6),
+                        constant: cid(4),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(7),
+                        object: reg(0),
+                        key: reg(6),
+                    },
+                    Instruction::GetIterator {
+                        dst: reg(8),
+                        src: reg(0),
+                        kind: IteratorKind::Keys,
+                    },
+                    Instruction::IteratorNext {
+                        done: reg(9),
+                        value: reg(10),
+                        iterator: reg(8),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(11),
+                        constant: cid(5),
+                    },
+                    Instruction::Binary {
+                        dst: reg(12),
+                        op: BinaryOp::StrictEqual,
+                        left: reg(10),
+                        right: reg(11),
+                    },
+                    Instruction::IteratorNext {
+                        done: reg(9),
+                        value: reg(10),
+                        iterator: reg(8),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(13),
+                        constant: cid(3),
+                    },
+                    Instruction::Binary {
+                        dst: reg(5),
+                        op: BinaryOp::StrictEqual,
+                        left: reg(10),
+                        right: reg(13),
+                    },
+                    Instruction::IteratorNext {
+                        done: reg(9),
+                        value: reg(10),
+                        iterator: reg(8),
+                    },
+                    Instruction::Binary {
+                        dst: reg(14),
+                        op: BinaryOp::StrictEqual,
+                        left: reg(10),
+                        right: reg(6),
+                    },
+                    Instruction::Return { value: reg(7) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(6),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            vec![
+                Binding {
+                    name: cid(1),
+                    kind: BindingKind::Namespace {
+                        edge: EdgeId::new(0),
+                    },
+                },
+                Binding {
+                    name: cid(2),
+                    kind: BindingKind::Namespace {
+                        edge: EdgeId::new(0),
+                    },
+                },
+                Binding {
+                    name: cid(3),
+                    kind: BindingKind::Imported {
+                        edge: EdgeId::new(0),
+                        name: cid(3),
+                    },
+                },
+            ],
+            Vec::new(),
+        );
+        let execution = run_ok(&linked(vec![dependency, root], 1));
+        assert_eq!(execution.value, Value::int32(3));
+        assert_eq!(execution.entry_registers[2], Value::TRUE);
+        assert_eq!(execution.entry_registers[5], Value::TRUE);
+        assert_eq!(execution.entry_registers[12], Value::TRUE);
+        assert_eq!(execution.entry_registers[14], Value::TRUE);
+    }
+
+    #[test]
+    fn side_effect_module_runs_once_with_single_or_duplicate_static_edges() {
+        for duplicate in [false, true] {
+            let dependency = program_module(
+                "dependency",
+                vec![
+                    Constant::String("count".into()),
+                    Constant::Int32(0),
+                    Constant::Int32(1),
+                ],
+                vec![function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(1),
+                        },
+                        Instruction::JumpIfFalse {
+                            condition: reg(0),
+                            target: pc(3),
+                        },
+                        Instruction::Jump { target: pc(5) },
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(2),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(3),
+                        },
+                        Instruction::Binary {
+                            dst: reg(0),
+                            op: BinaryOp::Add,
+                            left: reg(0),
+                            right: reg(1),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                )],
+                Vec::new(),
+                vec![Binding {
+                    name: cid(1),
+                    kind: BindingKind::Hoisted,
+                }],
+                vec![Export {
+                    name: cid(1),
+                    source: ExportSource::Local(BindingId::new(0)),
+                }],
+            );
+            let mut edges = vec![Edge {
+                specifier: cid(2),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }];
+            if duplicate {
+                edges.push(Edge {
+                    specifier: cid(3),
+                    target: EdgeTarget::Local(ModuleId::new(0)),
+                    kind: EdgeKind::Static,
+                });
+            }
+            let root = program_module(
+                "root",
+                vec![
+                    Constant::String("count".into()),
+                    Constant::String("dep-one".into()),
+                    Constant::String("dep-two".into()),
+                ],
+                vec![function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(1),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                )],
+                edges,
+                vec![Binding {
+                    name: cid(1),
+                    kind: BindingKind::Imported {
+                        edge: EdgeId::new(0),
+                        name: cid(1),
+                    },
+                }],
+                Vec::new(),
+            );
+            assert_eq!(
+                run_ok(&linked(vec![dependency, root], 1)).value,
+                Value::int32(1)
+            );
+        }
+    }
+
+    #[test]
+    fn failed_module_rethrows_the_identical_stored_value() {
+        let module = program_module(
+            "throws",
+            Vec::new(),
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::Throw { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let program = linked(vec![module], 0);
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        machine.instantiate_modules().unwrap();
+        let first = machine.evaluate_module(ModuleId::new(0)).unwrap_err();
+        let second = machine.evaluate_module(ModuleId::new(0)).unwrap_err();
+        let RuntimeErrorKind::UncaughtThrow { value: first, .. } = first.kind else {
+            panic!("module must fail by throwing");
+        };
+        let RuntimeErrorKind::UncaughtThrow { value: second, .. } = second.kind else {
+            panic!("stored failure must remain a throw");
+        };
+        assert_eq!(first, second);
+        assert!(first.as_heap_ref().is_some());
+    }
+
+    #[test]
+    fn external_static_edge_is_a_typed_runtime_error() {
+        let module = program_module(
+            "root",
+            vec![Constant::String("external".into())],
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::External,
+                kind: EdgeKind::Static,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let program = linked(vec![module], 0);
+        let mut host = TestHost;
+        let error = Machine::new(&program, &mut host, Limits::default())
+            .run()
+            .unwrap_err();
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::ExternalModuleUnavailable { module, edge }
+                if module == ModuleId::new(0) && edge == EdgeId::new(0)
+        ));
+    }
+
+    #[test]
+    fn dynamic_import_is_a_typed_runtime_error() {
+        let module = program_module(
+            "root",
+            vec![Constant::String("dynamic".into())],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::Import {
+                        dst: reg(0),
+                        specifier: cid(1),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::External,
+                kind: EdgeKind::Dynamic,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let program = linked(vec![module], 0);
+        let mut host = TestHost;
+        let error = Machine::new(&program, &mut host, Limits::default())
+            .run()
+            .unwrap_err();
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::DynamicImportUnsupported { module } if module == ModuleId::new(0)
+        ));
+    }
+
+    #[test]
+    fn unbound_global_names_fall_back_to_the_realm_global_map() {
+        let program = verified(
+            vec![Constant::String("realmOnly".into()), Constant::Int32(7)],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(0),
+                        value: reg(0),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+        );
+        assert_eq!(run_ok(&program).value, Value::int32(7));
+    }
+
+    #[test]
+    fn module_cell_limit_is_enforced_before_evaluation() {
+        let module = program_module(
+            "root",
+            vec![Constant::String("x".into())],
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+            Vec::new(),
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Hoisted,
+            }],
+            Vec::new(),
+        );
+        let program = linked(vec![module], 0);
+        let mut host = TestHost;
+        let error = Machine::new(
+            &program,
+            &mut host,
+            Limits {
+                max_module_cells: 0,
+                ..Limits::default()
+            },
+        )
+        .run()
+        .unwrap_err();
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::ModuleCellLimitExceeded { limit: 0 }
+        ));
+    }
+    #[test]
+    fn imported_binding_store_throws_without_mutating_the_exporter() {
+        let dependency = program_module(
+            "dependency",
+            vec![Constant::String("x".into()), Constant::Int32(1)],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(2),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(1),
+                        value: reg(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            Vec::new(),
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Hoisted,
+            }],
+            vec![Export {
+                name: cid(1),
+                source: ExportSource::Local(BindingId::new(0)),
+            }],
+        );
+        let root = program_module(
+            "root",
+            vec![
+                Constant::String("x".into()),
+                Constant::Int32(2),
+                Constant::String("dep".into()),
+            ],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(2),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(1),
+                        value: reg(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(3),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Imported {
+                    edge: EdgeId::new(0),
+                    name: cid(1),
+                },
+            }],
+            Vec::new(),
+        );
+        let program = linked(vec![dependency, root], 1);
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        machine.instantiate_modules().unwrap();
+        assert!(machine.evaluate_module(ModuleId::new(1)).is_err());
+        let exporter = machine.registry.modules[0].binding_cells[0].unwrap();
+        assert_eq!(machine.registry.cells[exporter.0].value, Value::int32(1));
     }
 }
