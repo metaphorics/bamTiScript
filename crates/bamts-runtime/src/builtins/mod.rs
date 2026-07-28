@@ -8,22 +8,31 @@ use crate::{
 };
 
 mod array;
+mod collections;
+mod date;
 mod json;
 mod number;
 mod object;
+mod regexp;
 mod string;
+mod symbol;
 
 pub(crate) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     globals: &mut BTreeMap<String, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
+    symbol::install(heap, globals, builtins);
+    collections::install_iterator_prototype(heap, globals, builtins);
+    collections::install(heap, globals, builtins);
+    date::install(heap, globals, builtins);
     object::install(heap, globals, builtins);
     array::install(heap, globals, builtins);
     string::install(heap, globals, builtins);
     number::install(heap, globals, builtins);
     install_boolean(heap, globals, builtins);
     install_math(heap, globals, builtins);
+    regexp::install(heap, globals, builtins);
     install_globals(heap, globals, builtins);
     json::install(heap, globals, builtins);
     install_errors(heap, globals, builtins);
@@ -395,29 +404,93 @@ fn install_errors<H: Host>(
     globals: &mut BTreeMap<String, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
-    for name in [
+    let error_prototype = push(
+        heap,
+        HeapEntry::Object {
+            properties: PropertyMap::default(),
+            prototype: Some(builtins.object_prototype()),
+            extensible: true,
+            boxed_primitive: None,
+        },
+    );
+    let error_to_string = install_function(heap, builtins, "toString", 0, error_to_string::<H>);
+    define_data(heap, error_prototype, "toString", error_to_string);
+    install_error_type(
+        heap,
+        globals,
+        builtins,
         "Error",
+        1,
+        error_prototype,
+        error_prototype,
+    );
+    for name in [
         "EvalError",
         "RangeError",
         "ReferenceError",
         "SyntaxError",
         "TypeError",
         "URIError",
+        "AggregateError",
     ] {
         let prototype = push(
             heap,
             HeapEntry::Object {
                 properties: PropertyMap::default(),
-                prototype: Some(builtins.object_prototype()),
+                prototype: Some(error_prototype),
                 extensible: true,
                 boxed_primitive: None,
             },
         );
-        let constructor = install_function(heap, builtins, name, 1, error_constructor::<H>);
-        builtins.set_constructor_prototype(heap, constructor, prototype);
-        builtins.set_error_prototype(heap, constructor, prototype);
-        globals.insert(name.to_owned(), constructor);
+        let length = usize::from(name == "AggregateError") as u32 + 1;
+        install_error_type(
+            heap,
+            globals,
+            builtins,
+            name,
+            length,
+            prototype,
+            error_prototype,
+        );
     }
+}
+
+fn install_error_type<H: Host>(
+    heap: &mut Vec<HeapEntry>,
+    globals: &mut BTreeMap<String, Value>,
+    builtins: &mut BuiltinTable<H>,
+    name: &'static str,
+    length: u32,
+    prototype: Value,
+    _error_prototype: Value,
+) {
+    let name_value = push(heap, HeapEntry::String(name.to_owned()));
+    let empty = push(heap, HeapEntry::String(String::new()));
+    let HeapEntry::Object { properties, .. } = &mut heap[heap_index(prototype)] else {
+        unreachable!()
+    };
+    properties.insert(
+        PropertyKey::Named("name".to_owned()),
+        Property::Data {
+            value: name_value,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        },
+    );
+    properties.insert(
+        PropertyKey::Named("message".to_owned()),
+        Property::Data {
+            value: empty,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        },
+    );
+    let constructor = install_function(heap, builtins, name, length, error_constructor::<H>);
+    builtins.set_constructor_prototype(heap, constructor, prototype);
+    builtins.set_error_prototype(heap, constructor, prototype);
+    globals.insert(name.to_owned(), constructor);
 }
 
 fn error_constructor<H: Host>(
@@ -429,6 +502,7 @@ fn error_constructor<H: Host>(
     let id = machine
         .current_builtin_id()
         .ok_or_else(|| type_error("invalid error constructor"))?;
+    let name = machine.intrinsics.builtins.get(id).name;
     let prototype = machine.intrinsics.error_prototype(id);
     let object = machine
         .allocate(HeapEntry::Object {
@@ -438,11 +512,66 @@ fn error_constructor<H: Host>(
             boxed_primitive: None,
         })
         .map_err(EvalFailure::Runtime)?;
-    if let Some(message) = args.first() {
-        let text = allocate_string(machine, machine.to_string(*message)?)?;
+    let (message_index, options_index) = if name == "AggregateError" {
+        let errors = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let values = machine
+            .array_elements(errors)?
+            .ok_or_else(|| type_error("AggregateError errors argument is not iterable"))?;
+        let array = allocate_array(machine, values)?;
+        machine.set_data_property(object, "errors", array)?;
+        (1, 2)
+    } else {
+        (0, 1)
+    };
+    if let Some(message) = args
+        .get(message_index)
+        .filter(|value| **value != Value::UNDEFINED)
+    {
+        let message_text = machine.to_string(*message)?;
+        let text = allocate_string(machine, message_text)?;
         machine.set_data_property(object, "message", text)?;
     }
+    if let Some(options) = args
+        .get(options_index)
+        .copied()
+        .filter(|value| *value != Value::UNDEFINED)
+    {
+        let cause_key = PropertyKey::Named("cause".to_owned());
+        if machine.has_property(options, &cause_key)? {
+            let cause = machine.get_named_property(options, "cause")?;
+            machine.set_data_property(object, "cause", cause)?;
+        }
+    }
+    let message_value = machine.get_named_property(object, "message")?;
+    let message = machine.to_string(message_value)?;
+    let stack = if message.is_empty() {
+        format!("{name}\n    at <bamts>")
+    } else {
+        format!("{name}: {message}\n    at <bamts>")
+    };
+    let stack = allocate_string(machine, stack)?;
+    machine.set_data_property(object, "stack", stack)?;
     Ok(BuiltinOutcome::Value(object))
+}
+
+fn error_to_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let name_value = machine.get_named_property(this, "name")?;
+    let name = machine.to_string(name_value)?;
+    let message_value = machine.get_named_property(this, "message")?;
+    let message = machine.to_string(message_value)?;
+    let text = if name.is_empty() {
+        message
+    } else if message.is_empty() {
+        name
+    } else {
+        format!("{name}: {message}")
+    };
+    Ok(BuiltinOutcome::Value(allocate_string(machine, text)?))
 }
 
 impl<'a, H: Host> Machine<'a, H> {

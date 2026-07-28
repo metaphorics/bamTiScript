@@ -8,6 +8,9 @@ use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyMap, ThrowOrigin};
 #[path = "builtins/mod.rs"]
 mod builtins;
 
+#[path = "regexp.rs"]
+mod regexp;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct BuiltinId(usize);
 
@@ -44,6 +47,7 @@ pub(crate) struct BuiltinTable<H: Host> {
     number_prototype: Value,
     boolean_prototype: Value,
     error_prototypes: Vec<(BuiltinId, Value)>,
+    symbol_iterator: Option<Value>,
     marker: PhantomData<fn() -> H>,
 }
 
@@ -65,6 +69,7 @@ impl<H: Host> BuiltinTable<H> {
             number_prototype,
             boolean_prototype,
             error_prototypes: Vec::new(),
+            symbol_iterator: None,
             marker: PhantomData,
         }
     }
@@ -103,6 +108,14 @@ impl<H: Host> BuiltinTable<H> {
 
     pub(crate) fn boolean_prototype(&self) -> Value {
         self.boolean_prototype
+    }
+
+    pub(crate) fn set_symbol_iterator(&mut self, iterator: Value) {
+        self.symbol_iterator = Some(iterator);
+    }
+
+    pub(crate) fn symbol_iterator(&self) -> Value {
+        self.symbol_iterator.expect("Symbol builtins install first")
     }
 
     pub(crate) fn set_constructor_prototype(
@@ -526,5 +539,94 @@ mod tests {
         for ((label, expected), actual) in expected.into_iter().zip(actual) {
             assert_eq!(actual.as_bytes(), expected.as_bytes(), "{label}");
         }
+    }
+
+    fn construct_builtin(
+        machine: &mut Machine<'_, TestHost>,
+        name: &str,
+        arguments: &[Value],
+    ) -> Value {
+        let constructor = machine.intrinsics.global(name).expect("global exists");
+        let index = machine.runtime_slot(constructor).unwrap().unwrap();
+        let HeapEntry::NativeFunction { id, .. } = machine.heap[index] else {
+            panic!("constructor is native")
+        };
+        let BuiltinOutcome::Value(value) = machine
+            .call_builtin(id, Value::UNDEFINED, arguments, true)
+            .unwrap()
+        else {
+            panic!("constructor returns a value")
+        };
+        value
+    }
+
+    #[test]
+    fn collections_symbols_errors_regexp_and_date_match_node_24_observables() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let symbol = machine.intrinsics.global("Symbol").unwrap();
+        let symbol_for = machine.get_named_property(symbol, "for").unwrap();
+        let key_text = machine
+            .allocate(HeapEntry::String("shared".to_owned()))
+            .unwrap();
+        let first = machine.call_value(symbol_for, symbol, &[key_text]).unwrap();
+        let second = machine.call_value(symbol_for, symbol, &[key_text]).unwrap();
+        assert_eq!(first, second, "Symbol.for registry identity");
+
+        let map = construct_builtin(&mut machine, "Map", &[]);
+        let set = machine.get_named_property(map, "set").unwrap();
+        machine
+            .call_value(set, map, &[Value::int32(2), Value::int32(20)])
+            .unwrap();
+        machine
+            .call_value(set, map, &[Value::int32(1), Value::int32(10)])
+            .unwrap();
+        let keys = machine.get_named_property(map, "keys").unwrap();
+        let iterator = machine.call_value(keys, map, &[]).unwrap();
+        let next = machine.get_named_property(iterator, "next").unwrap();
+        let first_result = machine.call_value(next, iterator, &[]).unwrap();
+        let second_result = machine.call_value(next, iterator, &[]).unwrap();
+        assert_eq!(
+            machine.get_named_property(first_result, "value").unwrap(),
+            Value::int32(2)
+        );
+        assert_eq!(
+            machine.get_named_property(second_result, "value").unwrap(),
+            Value::int32(1)
+        );
+
+        let pattern = machine
+            .allocate(HeapEntry::String("^(a|b)\\.js$".to_owned()))
+            .unwrap();
+        let regexp = construct_builtin(&mut machine, "RegExp", &[pattern]);
+        let test = machine.get_named_property(regexp, "test").unwrap();
+        let input = machine
+            .allocate(HeapEntry::String("b.js".to_owned()))
+            .unwrap();
+        assert_eq!(
+            machine.call_value(test, regexp, &[input]).unwrap(),
+            Value::TRUE
+        );
+
+        let message = machine
+            .allocate(HeapEntry::String("boom".to_owned()))
+            .unwrap();
+        let error = construct_builtin(&mut machine, "TypeError", &[message]);
+        let error_message = machine.get_named_property(error, "message").unwrap();
+        assert_eq!(machine.to_string(error_message).unwrap(), "boom");
+        let stack = machine.get_named_property(error, "stack").unwrap();
+        assert!(
+            machine
+                .to_string(stack)
+                .unwrap()
+                .starts_with("TypeError: boom")
+        );
+
+        let date = construct_builtin(&mut machine, "Date", &[Value::int32(0)]);
+        let to_iso = machine.get_named_property(date, "toISOString").unwrap();
+        let iso = machine.call_value(to_iso, date, &[]).unwrap();
+        assert_eq!(machine.to_string(iso).unwrap(), "1970-01-01T00:00:00.000Z");
     }
 }

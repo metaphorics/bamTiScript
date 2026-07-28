@@ -50,10 +50,21 @@ pub(super) fn install<H: Host>(
         ("repeat", 1, repeat::<H>),
         ("concat", 1, concat::<H>),
         ("normalize", 0, normalize::<H>),
+        ("match", 1, string_match::<H>),
+        ("matchAll", 1, match_all::<H>),
+        ("search", 1, search::<H>),
     ] {
         let f = install_function(heap, builtins, name, length, handler);
         define_data(heap, prototype, name, f)
     }
+    let iterator = install_function(heap, builtins, "[Symbol.iterator]", 0, string_iterator::<H>);
+    let HeapEntry::Object { properties, .. } = &mut heap[super::heap_index(prototype)] else {
+        unreachable!()
+    };
+    properties.insert(
+        PropertyKey::Private(super::heap_index(builtins.symbol_iterator()) as u32),
+        super::builtin_property(iterator),
+    );
 }
 fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: Value) {
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[super::heap_index(constructor)]
@@ -354,19 +365,6 @@ fn ends_with<H: Host>(
         end >= n.len() && h[end - n.len()..end] == n,
     )))
 }
-fn reject_regexp<H: Host>(machine: &Machine<'_, H>, value: Value) -> Result<(), EvalFailure> {
-    let is_regexp = machine
-        .runtime_slot(value)
-        .map_err(EvalFailure::Runtime)?
-        .is_some_and(|index| matches!(machine.heap[index], HeapEntry::RegExp { .. }));
-    if is_regexp {
-        Err(type_error(
-            "regular expression string methods require RegExp support",
-        ))
-    } else {
-        Ok(())
-    }
-}
 
 fn split<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -374,8 +372,10 @@ fn split<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    if let Some(separator) = args.first().copied() {
-        reject_regexp(machine, separator)?;
+    if let Some(separator) = args.first().copied()
+        && super::regexp::regexp_parts(machine, separator).is_some()
+    {
+        return split_regexp(machine, this, args);
     }
     let s = text(machine, this)?;
     let limit = value_number(
@@ -435,8 +435,10 @@ fn replace_impl<H: Host>(
     args: &[Value],
     all: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    if let Some(search) = args.first().copied() {
-        reject_regexp(machine, search)?;
+    if let Some(search) = args.first().copied()
+        && super::regexp::regexp_parts(machine, search).is_some()
+    {
+        return replace_regexp(machine, this, args, all);
     }
     let s = text(machine, this)?;
     let needle = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
@@ -659,4 +661,287 @@ pub(super) fn decode_uri_component<H: Host>(
     }
     let text = String::from_utf8(out).map_err(|_| type_error("URI malformed"))?;
     Ok(BuiltinOutcome::Value(allocate_string(machine, text)?))
+}
+
+fn string_iterator<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let values = text(machine, this)?
+        .chars()
+        .map(|character| allocate_string(machine, character.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let source = allocate_array(machine, values)?;
+    Ok(BuiltinOutcome::Value(super::collections::iterator(
+        machine, source,
+    )?))
+}
+
+fn regexp_for_argument<H: Host>(
+    machine: &mut Machine<'_, H>,
+    value: Value,
+) -> Result<(crate::intrinsics::regexp::Regex, Option<Value>), EvalFailure> {
+    if let Some((pattern, flags)) = super::regexp::regexp_parts(machine, value) {
+        Ok((
+            super::regexp::compile(machine, &pattern, &flags)?,
+            Some(value),
+        ))
+    } else {
+        let pattern = machine.to_string(value)?;
+        Ok((super::regexp::compile(machine, &pattern, "")?, None))
+    }
+}
+
+fn string_match<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let input = text(machine, this)?;
+    let argument = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let (regex, object) = regexp_for_argument(machine, argument)?;
+    if !regex.flags().global {
+        let matched = match object {
+            Some(regexp) => super::regexp::execute(machine, regexp, &input)?,
+            None => regex.exec(&input, 0),
+        };
+        return match matched {
+            Some(matched) => Ok(BuiltinOutcome::Value(super::regexp::match_array(
+                machine, &input, matched,
+            )?)),
+            None => Ok(BuiltinOutcome::Value(Value::NULL)),
+        };
+    }
+    if let Some(regexp) = object {
+        machine.set_data_property(regexp, "lastIndex", Value::int32(0))?;
+    }
+    let matches = collect_matches(&regex, &input);
+    if matches.is_empty() {
+        return Ok(BuiltinOutcome::Value(Value::NULL));
+    }
+    let mut values = Vec::with_capacity(matches.len());
+    for matched in matches {
+        values.push(allocate_string(
+            machine,
+            super::regexp::slice_chars(&input, matched.range),
+        )?);
+    }
+    Ok(BuiltinOutcome::Value(allocate_array(machine, values)?))
+}
+
+fn match_all<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let input = text(machine, this)?;
+    let argument = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let (regex, object) = regexp_for_argument(machine, argument)?;
+    if object.is_some() && !regex.flags().global {
+        return Err(type_error(
+            "String.prototype.matchAll requires a global RegExp",
+        ));
+    }
+    let mut values = Vec::new();
+    for matched in collect_matches(&regex, &input) {
+        values.push(super::regexp::match_array(machine, &input, matched)?);
+    }
+    let source = allocate_array(machine, values)?;
+    Ok(BuiltinOutcome::Value(super::collections::iterator(
+        machine, source,
+    )?))
+}
+
+fn search<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let input = text(machine, this)?;
+    let argument = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let (regex, _) = regexp_for_argument(machine, argument)?;
+    Ok(BuiltinOutcome::Value(crate::number_value(
+        regex
+            .exec(&input, 0)
+            .map_or(-1.0, |matched| matched.range.start as f64),
+    )))
+}
+
+fn collect_matches(
+    regex: &crate::intrinsics::regexp::Regex,
+    input: &str,
+) -> Vec<crate::intrinsics::regexp::Match> {
+    let mut matches = Vec::new();
+    let mut start = 0;
+    let length = input.chars().count();
+    while start <= length {
+        let Some(matched) = regex.exec(input, start) else {
+            break;
+        };
+        let next = if matched.range.end == matched.range.start {
+            matched.range.end + 1
+        } else {
+            matched.range.end
+        };
+        matches.push(matched);
+        if !regex.flags().global || next > length {
+            break;
+        }
+        start = next;
+    }
+    matches
+}
+
+fn split_regexp<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let input = text(machine, this)?;
+    let separator = args[0];
+    let (pattern, flags) =
+        super::regexp::regexp_parts(machine, separator).expect("caller checked RegExp argument");
+    let regex = super::regexp::compile(machine, &pattern, &flags.replace('y', ""))?;
+    let limit = value_number(
+        machine.to_number(
+            args.get(1)
+                .copied()
+                .unwrap_or(crate::number_value(u32::MAX as f64)),
+        )?,
+    ) as u32 as usize;
+    let mut pieces = Vec::new();
+    let mut cursor = 0;
+    let length = input.chars().count();
+    while cursor <= length && pieces.len() < limit {
+        let Some(matched) = regex.exec(&input, cursor) else {
+            break;
+        };
+        pieces.push(super::regexp::slice_chars(
+            &input,
+            cursor..matched.range.start,
+        ));
+        for capture in matched.captures.iter().skip(1) {
+            if pieces.len() == limit {
+                break;
+            }
+            pieces.push(capture.clone().map_or(String::new(), |range| {
+                super::regexp::slice_chars(&input, range)
+            }));
+        }
+        cursor = if matched.range.end == matched.range.start {
+            matched.range.end + 1
+        } else {
+            matched.range.end
+        };
+    }
+    if pieces.len() < limit {
+        pieces.push(super::regexp::slice_chars(
+            &input,
+            cursor.min(length)..length,
+        ));
+    }
+    let mut values = Vec::new();
+    for piece in pieces.into_iter().take(limit) {
+        values.push(allocate_string(machine, piece)?);
+    }
+    Ok(BuiltinOutcome::Value(allocate_array(machine, values)?))
+}
+
+fn replace_regexp<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    replace_all_call: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let input = text(machine, this)?;
+    let regexp = args[0];
+    let (pattern, flags) =
+        super::regexp::regexp_parts(machine, regexp).expect("caller checked RegExp argument");
+    let regex = super::regexp::compile(machine, &pattern, &flags)?;
+    if replace_all_call && !regex.flags().global {
+        return Err(type_error(
+            "String.prototype.replaceAll requires a global RegExp",
+        ));
+    }
+    let replacer = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    let matches = collect_matches(&regex, &input);
+    let mut output = String::new();
+    let mut cursor = 0;
+    for matched in matches {
+        output.push_str(&super::regexp::slice_chars(
+            &input,
+            cursor..matched.range.start,
+        ));
+        output.push_str(&regexp_replacement(machine, replacer, &input, &matched)?);
+        cursor = matched.range.end;
+        if !regex.flags().global {
+            break;
+        }
+    }
+    output.push_str(&super::regexp::slice_chars(
+        &input,
+        cursor..input.chars().count(),
+    ));
+    Ok(BuiltinOutcome::Value(allocate_string(machine, output)?))
+}
+
+fn regexp_replacement<H: Host>(
+    machine: &mut Machine<'_, H>,
+    replacer: Value,
+    input: &str,
+    matched: &crate::intrinsics::regexp::Match,
+) -> Result<String, EvalFailure> {
+    let matched_text = super::regexp::slice_chars(input, matched.range.clone());
+    if machine.is_callable(replacer)? {
+        let mut arguments = Vec::with_capacity(matched.captures.len() + 2);
+        for capture in &matched.captures {
+            arguments.push(match capture {
+                Some(range) => {
+                    allocate_string(machine, super::regexp::slice_chars(input, range.clone()))?
+                }
+                None => Value::UNDEFINED,
+            });
+        }
+        arguments.push(crate::number_value(matched.range.start as f64));
+        arguments.push(allocate_string(machine, input.to_owned())?);
+        return machine
+            .call_value(replacer, Value::UNDEFINED, &arguments)
+            .and_then(|value| machine.to_string(value));
+    }
+    let replacement = machine.to_string(replacer)?;
+    let before = super::regexp::slice_chars(input, 0..matched.range.start);
+    let after = super::regexp::slice_chars(input, matched.range.end..input.chars().count());
+    let mut output = String::new();
+    let chars: Vec<char> = replacement.chars().collect();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] != '$' || index + 1 == chars.len() {
+            output.push(chars[index]);
+            index += 1;
+            continue;
+        }
+        match chars[index + 1] {
+            '$' => output.push('$'),
+            '&' => output.push_str(&matched_text),
+            '`' => output.push_str(&before),
+            '\'' => output.push_str(&after),
+            digit if digit.is_ascii_digit() && digit != '0' => {
+                let capture = digit.to_digit(10).expect("digit") as usize;
+                if let Some(Some(range)) = matched.captures.get(capture) {
+                    output.push_str(&super::regexp::slice_chars(input, range.clone()));
+                }
+            }
+            other => {
+                output.push('$');
+                output.push(other);
+            }
+        }
+        index += 2;
+    }
+    Ok(output)
 }

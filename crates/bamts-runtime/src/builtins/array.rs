@@ -59,6 +59,19 @@ pub(super) fn install<H: Host>(
         let function = install_function(heap, builtins, name, length, handler);
         define_data(heap, prototype, name, function);
     }
+    let keys = install_function(heap, builtins, "keys", 0, keys_iterator::<H>);
+    let values = install_function(heap, builtins, "values", 0, values_iterator::<H>);
+    let entries = install_function(heap, builtins, "entries", 0, entries_iterator::<H>);
+    define_data(heap, prototype, "keys", keys);
+    define_data(heap, prototype, "values", values);
+    define_data(heap, prototype, "entries", entries);
+    let HeapEntry::Array { properties, .. } = &mut heap[super::heap_index(prototype)] else {
+        unreachable!()
+    };
+    properties.insert(
+        PropertyKey::Private(super::heap_index(builtins.symbol_iterator()) as u32),
+        super::builtin_property(values),
+    );
 }
 
 fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: Value) {
@@ -810,4 +823,59 @@ fn at<H: Host>(
         }
     };
     Ok(BuiltinOutcome::Value(value))
+}
+
+fn keys_iterator<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let length = elements(machine, this)?.len();
+    let keys = (0..length)
+        .map(|index| crate::number_value(index as f64))
+        .collect();
+    let source = allocate_array(machine, keys)?;
+    Ok(BuiltinOutcome::Value(super::collections::iterator(
+        machine, source,
+    )?))
+}
+
+fn values_iterator<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    elements(machine, this)?;
+    Ok(BuiltinOutcome::Value(super::collections::iterator(
+        machine, this,
+    )?))
+}
+
+fn entries_iterator<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let values = elements(machine, this)?;
+    let mut entries = Vec::with_capacity(values.len());
+    for (index, value) in values.into_iter().enumerate() {
+        entries.push(allocate_array(
+            machine,
+            vec![
+                crate::number_value(index as f64),
+                if value == Value::HOLE {
+                    Value::UNDEFINED
+                } else {
+                    value
+                },
+            ],
+        )?);
+    }
+    let source = allocate_array(machine, entries)?;
+    Ok(BuiltinOutcome::Value(super::collections::iterator(
+        machine, source,
+    )?))
 }
