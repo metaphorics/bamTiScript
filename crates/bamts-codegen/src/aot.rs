@@ -115,6 +115,12 @@ pub fn compile_aot(
     let isa = isa_builder
         .finish(flags)
         .map_err(|error| AotError::TargetBuild(error.to_string()))?;
+    let pointer_bits = isa.frontend_config().pointer_bits();
+    if pointer_bits != 64 {
+        return Err(AotError::Lower(LowerError::UnsupportedPointerWidth {
+            bits: pointer_bits,
+        }));
+    }
     let target_endianness = isa
         .triple()
         .endianness()
@@ -513,5 +519,14 @@ mod tests {
         }));
         assert_eq!(emitted.required_helpers, [Helper::LoadConstant.symbol()]);
         assert_eq!(emitted.entry_function, 1);
+    }
+
+    #[test]
+    fn rejects_32_bit_target_without_emitting_an_object() {
+        let error = compile_aot(&test_module(), "x86").expect_err("32-bit AOT target is rejected");
+        assert!(matches!(
+            error,
+            AotError::Lower(LowerError::UnsupportedPointerWidth { bits: 32 })
+        ));
     }
 }
