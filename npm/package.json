@@ -1,0 +1,5 @@
+{
+  "name": "bamti-npm-packaging",
+  "private": true,
+  "type": "module"
+}

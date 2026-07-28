@@ -1,0 +1,16 @@
+{
+  "name": "@bamti/cli-linux-arm64",
+  "version": "0.1.0",
+  "description": "BamTS CLI binary for Linux arm64",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/metaphorics/bamTiScript.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "files": ["README.md", "bin/bamts"]
+}

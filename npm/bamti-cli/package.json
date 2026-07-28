@@ -1,0 +1,32 @@
+{
+  "name": "bamti-cli",
+  "version": "0.1.0",
+  "description": "BamTS compiler command-line interface",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/metaphorics/bamTiScript.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "type": "module",
+  "exports": "./index.js",
+  "types": "./index.d.ts",
+  "bin": {
+    "bamts": "./bin/bamts.js"
+  },
+  "files": [
+    "README.md",
+    "bin/bamts.js",
+    "index.d.ts",
+    "index.js"
+  ],
+  "optionalDependencies": {
+    "@bamti/cli-darwin-arm64": "0.1.0",
+    "@bamti/cli-darwin-x64": "0.1.0",
+    "@bamti/cli-linux-arm64": "0.1.0",
+    "@bamti/cli-linux-x64": "0.1.0",
+    "@bamti/cli-win32-x64": "0.1.0"
+  }
+}

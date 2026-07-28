@@ -1,0 +1,22 @@
+{
+  "name": "bamti",
+  "version": "0.1.0",
+  "description": "Programmatic interface for the BamTS compiler CLI",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/metaphorics/bamTiScript.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "type": "module",
+  "files": [
+    "README.md",
+    "index.d.ts",
+    "index.js"
+  ],
+  "dependencies": {
+    "bamti-cli": "0.1.0"
+  }
+}
