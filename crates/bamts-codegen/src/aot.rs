@@ -16,9 +16,9 @@ use crate::{
     lower_program,
 };
 
-const HELPER_COUNT: u32 = 30;
+const HELPER_COUNT: u32 = 31;
 const AOT_MAGIC: u64 = u64::from_le_bytes(*b"BMTSAOT1");
-const AOT_ABI_VERSION: u32 = 2;
+const AOT_ABI_VERSION: u32 = 3;
 const UNIT_DESCRIPTOR_BYTES: usize = 16;
 const PROGRAM_DESCRIPTOR_BYTES: usize = 56;
 
@@ -539,7 +539,7 @@ mod tests {
         let (descriptor, descriptor_index) = symbol_bytes(&file, PROGRAM_DESCRIPTOR_SYMBOL);
         assert_eq!(descriptor.len(), PROGRAM_DESCRIPTOR_BYTES);
         assert_eq!(&descriptor[0..8], b"BMTSAOT1");
-        assert_eq!(u32::from_le_bytes(descriptor[8..12].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(descriptor[8..12].try_into().unwrap()), 3);
         assert_eq!(
             u64::from_le_bytes(descriptor[24..32].try_into().unwrap()),
             canonical.len() as u64
@@ -581,7 +581,13 @@ mod tests {
         assert!(file.symbols().any(|symbol| {
             symbol.name() == Ok(emitted.entry_symbol.as_str()) && !symbol.is_undefined()
         }));
-        assert_eq!(emitted.required_helpers, [Helper::LoadConstant.symbol()]);
+        assert_eq!(
+            emitted.required_helpers,
+            [Helper::LoadConstant.symbol(), Helper::ConsumeFuel.symbol()]
+        );
+        assert!(file.symbols().any(|symbol| {
+            symbol.name() == Ok(Helper::ConsumeFuel.symbol()) && symbol.is_undefined()
+        }));
         assert_eq!((emitted.entry_module, emitted.entry_function), (1, 0));
         assert_eq!(emitted.entry_symbol, function_symbol(1, 0));
     }

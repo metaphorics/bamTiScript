@@ -644,6 +644,7 @@ pub struct Machine<'a, H: Host> {
     intrinsic_slots: usize,
     heap_bytes: usize,
     live_registers: usize,
+    native_depth: usize,
     fuel: u64,
     globals: BTreeMap<String, Value>,
     last_completion: Option<Value>,
@@ -791,6 +792,7 @@ impl<'a, H: Host> Machine<'a, H> {
             heap_bytes: 0,
             intrinsic_slots,
             live_registers,
+            native_depth: 0,
             last_completion: None,
             globals: BTreeMap::new(),
             registry: ModuleRegistry {
@@ -1227,7 +1229,7 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn run_loop(&mut self, stop_depth: usize) -> Result<Option<Execution>, RuntimeError> {
-        if self.frames.len() > self.limits.max_call_depth {
+        if self.frames.len().saturating_add(self.native_depth) > self.limits.max_call_depth {
             return Err(self.error_here(RuntimeErrorKind::CallDepthExceeded {
                 limit: self.limits.max_call_depth,
             }));
@@ -1244,16 +1246,9 @@ impl<'a, H: Host> Machine<'a, H> {
                 let frame = &self.frames[frame_index];
                 (frame.module, frame.function, frame.pc)
             };
-            if self.fuel == 0 {
-                return Err(self.error_at(
-                    RuntimeErrorKind::FuelExhausted {
-                        limit: self.limits.fuel,
-                    },
-                    function_index,
-                    pc,
-                ));
+            if let Err(kind) = self.consume_fuel(1) {
+                return Err(self.error_at(kind, function_index, pc));
             }
-            self.fuel -= 1;
             let instruction = self.module_code(module_id).functions()[function_index].code()[pc];
 
             match instruction {
@@ -1990,22 +1985,23 @@ impl<'a, H: Host> Machine<'a, H> {
     ) -> Result<(), RuntimeError> {
         let function_index = target.function.get() as usize;
         let metadata = &self.module_code(target.module).functions()[function_index];
-        if self.frames.len() >= self.limits.max_call_depth {
-            return Err(self.error_here_at(
-                RuntimeErrorKind::CallDepthExceeded {
-                    limit: self.limits.max_call_depth,
-                },
-                return_to.call_pc,
-            ));
+        let limit_error = |kind| {
+            if let Some(caller) = self.frames.last() {
+                self.error_at_in_module(kind, caller.module, caller.function, return_to.call_pc)
+            } else {
+                self.error_at_in_module(kind, target.module, function_index, 0)
+            }
+        };
+        if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
+            return Err(limit_error(RuntimeErrorKind::CallDepthExceeded {
+                limit: self.limits.max_call_depth,
+            }));
         }
         let next_registers = metadata.register_count() as usize;
         if self.live_registers.saturating_add(next_registers) > self.limits.max_total_registers {
-            return Err(self.error_here_at(
-                RuntimeErrorKind::RegisterLimitExceeded {
-                    limit: self.limits.max_total_registers,
-                },
-                return_to.call_pc,
-            ));
+            return Err(limit_error(RuntimeErrorKind::RegisterLimitExceeded {
+                limit: self.limits.max_total_registers,
+            }));
         }
         let frame = Frame::new(
             target,
@@ -2019,6 +2015,41 @@ impl<'a, H: Host> Machine<'a, H> {
         self.live_registers += next_registers;
         self.frames.push(frame);
         Ok(())
+    }
+
+    pub(crate) fn consume_fuel(&mut self, amount: u64) -> Result<(), RuntimeErrorKind> {
+        if self.fuel < amount {
+            self.fuel = 0;
+            return Err(RuntimeErrorKind::FuelExhausted {
+                limit: self.limits.fuel,
+            });
+        }
+        self.fuel -= amount;
+        Ok(())
+    }
+
+    pub(crate) fn reserve_native_activation(
+        &mut self,
+        register_count: usize,
+    ) -> Result<(), RuntimeErrorKind> {
+        if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
+            return Err(RuntimeErrorKind::CallDepthExceeded {
+                limit: self.limits.max_call_depth,
+            });
+        }
+        if self.live_registers.saturating_add(register_count) > self.limits.max_total_registers {
+            return Err(RuntimeErrorKind::RegisterLimitExceeded {
+                limit: self.limits.max_total_registers,
+            });
+        }
+        self.native_depth += 1;
+        self.live_registers += register_count;
+        Ok(())
+    }
+
+    pub(crate) fn release_native_activation(&mut self, register_count: usize) {
+        self.native_depth -= 1;
+        self.live_registers -= register_count;
     }
 
     fn execute_call(&mut self, request: CallRequest) -> Result<(), RuntimeError> {

@@ -37,10 +37,10 @@ use crate::{Completion, CompletionTag, ShadowFrame, Value};
 // -- The helper algebra ------------------------------------------------------
 
 /// The number of runtime helpers, `0..HELPER_COUNT`.
-pub const HELPER_COUNT: u32 = 30;
+pub const HELPER_COUNT: u32 = 31;
 
 /// A runtime helper, identified by its stable ABI index. The variant order is
-/// the canonical `external_index` order (0..29) and is byte-identical to
+/// the canonical `external_index` order (0..30) and is byte-identical to
 /// # Safety
 ///
 /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
@@ -292,6 +292,14 @@ pub enum NativeHelper {
     ///
     /// `bamts_export` — index 29.
     Export = 29,
+    /// # Safety
+    ///
+    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+    /// range is disjoint from its header, and a live, aligned, writable `out`.
+    /// Both remain valid and unaliased for the full call.
+    ///
+    /// `bamts_consume_fuel` — index 30.
+    ConsumeFuel = 30,
 }
 
 impl NativeHelper {
@@ -336,6 +344,7 @@ impl NativeHelper {
             NativeHelper::GetIterator => "bamts_get_iterator",
             NativeHelper::IteratorNext => "bamts_iterator_next",
             NativeHelper::Export => "bamts_export",
+            NativeHelper::ConsumeFuel => "bamts_consume_fuel",
         }
     }
 
@@ -380,6 +389,7 @@ impl NativeHelper {
             27 => Some(NativeHelper::GetIterator),
             28 => Some(NativeHelper::IteratorNext),
             29 => Some(NativeHelper::Export),
+            30 => Some(NativeHelper::ConsumeFuel),
             _ => None,
         }
     }
@@ -481,6 +491,8 @@ pub enum HelperCall {
     },
     /// Export local value `src` under string constant `name`.
     Export { name: u32, src: Value },
+    /// Consume `amount` units from the shared instruction budget.
+    ConsumeFuel { amount: u32 },
 }
 
 impl HelperCall {
@@ -518,6 +530,7 @@ impl HelperCall {
             HelperCall::GetIterator { .. } => NativeHelper::GetIterator,
             HelperCall::IteratorNext { .. } => NativeHelper::IteratorNext,
             HelperCall::Export { .. } => NativeHelper::Export,
+            HelperCall::ConsumeFuel { .. } => NativeHelper::ConsumeFuel,
         }
     }
 }
@@ -1184,6 +1197,22 @@ pub unsafe extern "C" fn bamts_resume_value(frame: *mut ShadowFrame, out: *mut C
 /// # Safety
 ///
 /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out`. Both
+/// remain valid and unaliased for the full call.
+///
+/// `bamts_consume_fuel(frame, amount, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_consume_fuel(
+    frame: *mut ShadowFrame,
+    amount: u32,
+    out: *mut Completion,
+) -> u32 {
+    dispatch_simple(frame, out, HelperCall::ConsumeFuel { amount })
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
 /// range is disjoint from its header, and a live, aligned, writable `out` when
 /// this helper has one. Both remain valid and unaliased for the full call.
 ///
@@ -1567,6 +1596,7 @@ const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u32, *mut Completion) -> u3
 const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u32, u32, *mut Completion) -> u32 =
     bamts_iterator_next; // 28
 const _: unsafe extern "C" fn(*mut ShadowFrame, u32, u64, *mut Completion) -> u32 = bamts_export; // 29
+const _: unsafe extern "C" fn(*mut ShadowFrame, u32, *mut Completion) -> u32 = bamts_consume_fuel; // 30
 
 // -- Native entry invocation seam --------------------------------------------
 
@@ -1625,7 +1655,7 @@ unsafe fn call_native_entry(
 /// The little-endian image magic, `b"BMTSAOT1"`.
 pub const AOT_MAGIC: u64 = u64::from_le_bytes(*b"BMTSAOT1");
 /// The supported AOT image ABI version.
-pub const AOT_ABI_VERSION: u32 = 2;
+pub const AOT_ABI_VERSION: u32 = 3;
 
 /// One compiled function in a linked AOT image.
 #[repr(C)]
@@ -2103,6 +2133,9 @@ mod tests {
     fn test_bamts_truthy(f: *mut ShadowFrame, v: u64) -> u32 {
         unsafe { super::bamts_truthy(f, v) }
     }
+    fn test_bamts_consume_fuel(f: *mut ShadowFrame, amount: u32, o: *mut Completion) -> u32 {
+        unsafe { super::bamts_consume_fuel(f, amount, o) }
+    }
     fn test_bamts_iterator_next(
         f: *mut ShadowFrame,
         i: u64,
@@ -2135,7 +2168,7 @@ mod tests {
     /// this helper has one. Both remain valid and unaliased for the full call.
     ///
     /// `bamts_codegen::Helper::{external_index, symbol}`.
-    const CODEGEN_HELPERS: [(u32, &str); 30] = [
+    const CODEGEN_HELPERS: [(u32, &str); 31] = [
         (0, "bamts_load_constant"),
         (1, "bamts_unary"),
         (2, "bamts_binary"),
@@ -2166,6 +2199,7 @@ mod tests {
         (27, "bamts_get_iterator"),
         (28, "bamts_iterator_next"),
         (29, "bamts_export"),
+        (30, "bamts_consume_fuel"),
     ];
 
     /// A recording dispatcher: captures the last call and returns a fixed
@@ -2333,6 +2367,10 @@ mod tests {
             .helper(),
             NativeHelper::Export
         );
+        assert_eq!(
+            HelperCall::ConsumeFuel { amount: 1 }.helper(),
+            NativeHelper::ConsumeFuel
+        );
     }
 
     #[test]
@@ -2360,6 +2398,19 @@ mod tests {
                 right: Value::int32(4),
             })
         );
+    }
+
+    #[test]
+    fn consume_fuel_wrapper_preserves_amount() {
+        let mut regs = [Value::UNINITIALIZED; 1];
+        let mut frame = frame_with(&mut regs);
+        let mut completion = Completion::new(Value::UNDEFINED);
+        let mut ops = Recorder::normal(Value::UNDEFINED);
+        let tag = with_native_ops(&mut ops, || {
+            test_bamts_consume_fuel(&mut frame, 7, &mut completion)
+        });
+        assert_eq!(tag, CompletionTag::Normal.as_u32());
+        assert_eq!(ops.last.get(), Some(HelperCall::ConsumeFuel { amount: 7 }));
     }
 
     #[test]

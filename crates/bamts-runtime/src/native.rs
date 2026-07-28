@@ -255,10 +255,6 @@ pub struct NativeEngine<'m, 'h, H: Host> {
     backend: Backend,
     /// Metadata for each live activation; register files are driver-stack locals.
     activations: RefCell<Vec<Activation>>,
-    /// Live register accounting mirroring the interpreter's ceiling.
-    live_registers: Cell<usize>,
-    /// Remaining instruction budget for the reference driver.
-    fuel: Cell<u64>,
     /// Buffered process stdout.
     stdout: RefCell<Vec<u8>>,
     /// The process exit code (`0` for normal termination).
@@ -284,15 +280,15 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     where
         'm: 'h,
     {
-        let fuel = limits.fuel;
+        let mut machine = Machine::new(program, host, limits);
+        machine.frames.clear();
+        machine.live_registers = 0;
         NativeEngine {
-            machine: RefCell::new(Machine::new(program, host, limits)),
+            machine: RefCell::new(machine),
             program,
             entries,
             backend,
             activations: RefCell::new(Vec::new()),
-            live_registers: Cell::new(0),
-            fuel: Cell::new(fuel),
             stdout: RefCell::new(Vec::new()),
             exit_code: Cell::new(0),
             pending_throw: Cell::new(None),
@@ -336,10 +332,6 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
 
     fn max_total_registers(&self) -> usize {
         self.machine.borrow().limits.max_total_registers
-    }
-
-    fn fuel_limit(&self) -> u64 {
-        self.machine.borrow().limits.fuel
     }
 
     fn error_at(
@@ -499,8 +491,11 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     ) -> Result<(FrameCompletion, Vec<Value>), RuntimeError> {
         let register_count = self.module(module).functions()[function].register_count() as usize;
         let mut registers = self.seed_registers(module, function, captures, &args);
-        self.live_registers
-            .set(self.live_registers.get() + register_count);
+        let reserved = self
+            .machine
+            .borrow_mut()
+            .reserve_native_activation(register_count);
+        reserved.map_err(|kind| self.error_at(module, kind, function, 0))?;
         self.activations.borrow_mut().push(Activation {
             this_value,
             new_target,
@@ -510,8 +505,9 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         });
         let completion = self.run_frame(module, function, &mut registers);
         self.activations.borrow_mut().pop();
-        self.live_registers
-            .set(self.live_registers.get() - register_count);
+        self.machine
+            .borrow_mut()
+            .release_native_activation(register_count);
         completion.map(|completion| (completion, registers))
     }
 
@@ -548,17 +544,13 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
 
         let mut pc = 0usize;
         loop {
-            if self.fuel.get() == 0 {
-                let limit = self.fuel_limit();
-                return Err(self.error_at(
-                    module,
-                    RuntimeErrorKind::FuelExhausted { limit },
-                    function,
-                    pc,
-                ));
-            }
-            self.fuel.set(self.fuel.get() - 1);
             let instruction = self.module(module).functions()[function].code()[pc];
+            if is_inline_instruction(instruction) {
+                let consumed = self.machine.borrow_mut().consume_fuel(1);
+                if let Err(kind) = consumed {
+                    return Err(self.error_at(module, kind, function, pc));
+                }
+            }
 
             // Control-flow opcodes are the driver's own responsibility (the CLIF
             // the AOT/JIT backend generates); every value/heap/host opcode is
@@ -997,20 +989,6 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         args: &[Value],
     ) -> InvokeOutcome {
         let index = target.function.get() as usize;
-        if self.activations.borrow().len() >= self.max_call_depth() {
-            let limit = self.max_call_depth();
-            self.pending_fatal_kind
-                .set(Some(RuntimeErrorKind::CallDepthExceeded { limit }));
-            return InvokeOutcome::Fatal;
-        }
-        let register_count =
-            self.module(target.module).functions()[index].register_count() as usize;
-        if self.live_registers.get().saturating_add(register_count) > self.max_total_registers() {
-            let limit = self.max_total_registers();
-            self.pending_fatal_kind
-                .set(Some(RuntimeErrorKind::RegisterLimitExceeded { limit }));
-            return InvokeOutcome::Fatal;
-        }
         match self.backend {
             Backend::Reference => {
                 match self.execute(
@@ -1058,8 +1036,14 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 return InvokeOutcome::Fatal;
             }
         };
-        self.live_registers
-            .set(self.live_registers.get() + register_count);
+        if let Err(kind) = self
+            .machine
+            .borrow_mut()
+            .reserve_native_activation(register_count)
+        {
+            self.pending_fatal_kind.set(Some(kind));
+            return InvokeOutcome::Fatal;
+        }
         self.activations.borrow_mut().push(Activation {
             this_value: this,
             new_target,
@@ -1087,8 +1071,9 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         );
         drop(registers);
         self.activations.borrow_mut().pop();
-        self.live_registers
-            .set(self.live_registers.get() - register_count);
+        self.machine
+            .borrow_mut()
+            .release_native_activation(register_count);
         match tag {
             Ok(CompletionTag::Normal) => InvokeOutcome::Value(out.value),
             Ok(CompletionTag::Throw) => {
@@ -1387,7 +1372,11 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 0,
             ))
         })?;
-        self.live_registers.set(register_count);
+        let reserved = self
+            .machine
+            .borrow_mut()
+            .reserve_native_activation(register_count);
+        reserved.map_err(|kind| NativeError::Runtime(self.error_at(module, kind, function, 0)))?;
         self.activations.borrow_mut().push(Activation {
             this_value: Value::UNDEFINED,
             new_target: Value::UNDEFINED,
@@ -1403,7 +1392,9 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             entries.invoke(module.get(), function_id.get(), &mut shadow, &mut out)
         });
         self.activations.borrow_mut().pop();
-        self.live_registers.set(0);
+        self.machine
+            .borrow_mut()
+            .release_native_activation(register_count);
         match tag {
             Ok(CompletionTag::Normal) => Ok(Execution {
                 outcome: ExecutionOutcome {
@@ -1459,6 +1450,16 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
 
     fn dispatch(&self, frame: &mut NativeFrame<'_>, call: HelperCall) -> HelperResult {
         let module = ModuleId::new(frame.module_id());
+        let amount = match call {
+            HelperCall::ResumeValue => None,
+            HelperCall::ConsumeFuel { amount } => Some(u64::from(amount)),
+            _ => Some(1),
+        };
+        if let Some(amount) = amount
+            && let Err(kind) = self.machine.borrow_mut().consume_fuel(amount)
+        {
+            return self.fatal(kind);
+        }
         match call {
             HelperCall::LoadConstant { const_id } => {
                 let result = self
@@ -1789,7 +1790,49 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
             HelperCall::Export { .. } => self.fail(EvalFailure::Throw(ThrowOrigin::TypeError {
                 operation: "export outside an engine-owned module registry",
             })),
+            HelperCall::ConsumeFuel { .. } => HelperResult::normal(Value::UNDEFINED),
         }
+    }
+}
+
+fn is_inline_instruction(instruction: Instruction) -> bool {
+    match instruction {
+        Instruction::Move { .. }
+        | Instruction::Jump { .. }
+        | Instruction::JumpIfTrue { .. }
+        | Instruction::JumpIfFalse { .. }
+        | Instruction::Return { .. }
+        | Instruction::Halt
+        | Instruction::Throw { .. }
+        | Instruction::Suspend { .. } => true,
+        Instruction::LoadConst { .. }
+        | Instruction::Unary { .. }
+        | Instruction::Binary { .. }
+        | Instruction::CreateObject { .. }
+        | Instruction::CreateArray { .. }
+        | Instruction::CreateClosure { .. }
+        | Instruction::GetProperty { .. }
+        | Instruction::SetProperty { .. }
+        | Instruction::DeleteProperty { .. }
+        | Instruction::DefineAccessor { .. }
+        | Instruction::Call { .. }
+        | Instruction::Construct { .. }
+        | Instruction::LoadGlobal { .. }
+        | Instruction::StoreGlobal { .. }
+        | Instruction::TypeOfGlobal { .. }
+        | Instruction::LoadThis { .. }
+        | Instruction::LoadArguments { .. }
+        | Instruction::LoadNewTarget { .. }
+        | Instruction::ArrayPush { .. }
+        | Instruction::ArrayExtend { .. }
+        | Instruction::ObjectSpread { .. }
+        | Instruction::SetPrototype { .. }
+        | Instruction::CreatePrivateName { .. }
+        | Instruction::CreateRegExp { .. }
+        | Instruction::GetIterator { .. }
+        | Instruction::IteratorNext { .. }
+        | Instruction::Import { .. }
+        | Instruction::Export { .. } => false,
     }
 }
 
@@ -2611,6 +2654,105 @@ mod tests {
         );
         let value = assert_parity(&module, || SilentHost);
         assert_eq!(value.as_int32(), Some(7));
+    }
+
+    #[test]
+    fn reference_and_interpreter_charge_each_mixed_instruction_once() {
+        let module = verified(
+            vec![Constant::Int32(1)],
+            vec![entry_function(
+                3,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::Move {
+                        dst: reg(1),
+                        src: reg(0),
+                    },
+                    Instruction::Binary {
+                        dst: reg(2),
+                        op: BinaryOp::Add,
+                        left: reg(0),
+                        right: reg(1),
+                    },
+                    Instruction::Jump { target: pc(4) },
+                    Instruction::Halt,
+                ],
+            )],
+        );
+        let program = one_module_program(&module);
+
+        for fuel in [0, 4, 5] {
+            let limits = Limits {
+                fuel,
+                ..Limits::default()
+            };
+            let mut interpreter_host = SilentHost;
+            let interpreter = Machine::new(&program, &mut interpreter_host, limits.clone()).run();
+            let mut reference_host = SilentHost;
+            let reference =
+                NativeEngine::new(&program, &NoEntries, &mut reference_host, limits).run();
+            assert_eq!(interpreter, reference, "fuel={fuel}");
+            if fuel == 5 {
+                assert!(reference.is_ok(), "N instructions must fit fuel N");
+            } else {
+                assert!(
+                    matches!(
+                        reference,
+                        Err(RuntimeError {
+                            kind: RuntimeErrorKind::FuelExhausted { limit },
+                            ..
+                        }) if limit == fuel
+                    ),
+                    "fuel={fuel} must exhaust before the next instruction"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_reservations_share_interpreter_depth_and_register_ceilings() {
+        let module = verified(Vec::new(), vec![entry_function(2, vec![Instruction::Halt])]);
+        let program = one_module_program(&module);
+        let mut host = SilentHost;
+        let mut machine = Machine::new(
+            &program,
+            &mut host,
+            Limits {
+                max_call_depth: 2,
+                max_total_registers: 3,
+                ..Limits::default()
+            },
+        );
+
+        assert_eq!(machine.frames.len(), 1);
+        assert_eq!(machine.live_registers, 2);
+        machine.reserve_native_activation(1).unwrap();
+        assert_eq!((machine.native_depth, machine.live_registers), (1, 3));
+        assert!(matches!(
+            machine.reserve_native_activation(0),
+            Err(RuntimeErrorKind::CallDepthExceeded { limit: 2 })
+        ));
+        assert_eq!(
+            (machine.native_depth, machine.live_registers),
+            (1, 3),
+            "failed depth reservation is atomic"
+        );
+        machine.release_native_activation(1);
+
+        machine.limits.max_call_depth = 3;
+        machine.limits.max_total_registers = 2;
+        assert!(matches!(
+            machine.reserve_native_activation(1),
+            Err(RuntimeErrorKind::RegisterLimitExceeded { limit: 2 })
+        ));
+        assert_eq!(
+            (machine.native_depth, machine.live_registers),
+            (0, 2),
+            "failed register reservation is atomic"
+        );
     }
 
     #[test]

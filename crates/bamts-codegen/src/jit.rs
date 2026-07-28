@@ -254,6 +254,7 @@ fn helper_address(helper: Helper) -> *const u8 {
         Helper::GetIterator => bamts_native::bamts_get_iterator as *const u8,
         Helper::IteratorNext => bamts_native::bamts_iterator_next as *const u8,
         Helper::Export => bamts_native::bamts_export as *const u8,
+        Helper::ConsumeFuel => bamts_native::bamts_consume_fuel as *const u8,
     }
 }
 
@@ -270,13 +271,16 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use bamts_bytecode::{
-        Constant, ConstantId, Function as BytecodeFunction, FunctionFlags, FunctionId, Instruction,
-        Module, ModuleId, Program, ProgramModule,
+        BinaryOp, Constant, ConstantId, ExceptionHandler, Function as BytecodeFunction,
+        FunctionFlags, FunctionId, Instruction, Module, ModuleId, Pc, Program, ProgramModule,
+        Register,
     };
     use bamts_native::{
         AbiError, Completion, CompletionTag, NativeEntryTable, NativeHelper, ShadowFrame, Value,
     };
-    use bamts_runtime::{Host, Limits, run_linked_program};
+    use bamts_runtime::{
+        Host, Limits, NativeError, RuntimeError, RuntimeErrorKind, run_linked_program,
+    };
 
     use crate::Helper;
 
@@ -285,6 +289,17 @@ mod tests {
     struct SilentHost;
 
     impl Host for SilentHost {}
+
+    #[derive(Default)]
+    struct RecordingHost {
+        stdout: Vec<u8>,
+    }
+
+    impl Host for RecordingHost {
+        fn write_stdout(&mut self, bytes: &[u8]) {
+            self.stdout.extend_from_slice(bytes);
+        }
+    }
 
     fn module(name: &str) -> ProgramModule<bamts_bytecode::Verified> {
         ProgramModule {
@@ -315,6 +330,146 @@ mod tests {
             .expect("test program verifies")
     }
 
+    fn one_function_program(
+        constants: Vec<Constant>,
+        register_count: u32,
+        code: Vec<Instruction>,
+        handlers: Vec<ExceptionHandler>,
+    ) -> Program<bamts_bytecode::Verified> {
+        let module = ProgramModule {
+            name: ConstantId::new(0),
+            code: Module::new(
+                constants,
+                vec![BytecodeFunction::new(
+                    None,
+                    0,
+                    0,
+                    register_count,
+                    FunctionFlags::default(),
+                    code,
+                    handlers,
+                )],
+                FunctionId::new(0),
+            )
+            .verify()
+            .expect("metering fixture verifies"),
+            edges: Vec::new(),
+            bindings: Vec::new(),
+            exports: Vec::new(),
+        };
+        Program::link(vec![module], ModuleId::new(0)).expect("metering fixture links")
+    }
+
+    fn callback_reentry_program() -> Program<bamts_bytecode::Verified> {
+        let constants = vec![
+            Constant::String("entry".to_owned()),
+            Constant::String("Array".to_owned()),
+            Constant::String("prototype".to_owned()),
+            Constant::String("map".to_owned()),
+            Constant::Int32(1),
+        ];
+        let entry = BytecodeFunction::new(
+            None,
+            0,
+            0,
+            11,
+            FunctionFlags::default(),
+            vec![
+                Instruction::LoadGlobal {
+                    dst: Register::new(0),
+                    name: ConstantId::new(1),
+                },
+                Instruction::LoadConst {
+                    dst: Register::new(1),
+                    constant: ConstantId::new(2),
+                },
+                Instruction::GetProperty {
+                    dst: Register::new(2),
+                    object: Register::new(0),
+                    key: Register::new(1),
+                },
+                Instruction::LoadConst {
+                    dst: Register::new(3),
+                    constant: ConstantId::new(3),
+                },
+                Instruction::GetProperty {
+                    dst: Register::new(4),
+                    object: Register::new(2),
+                    key: Register::new(3),
+                },
+                Instruction::CreateArray {
+                    dst: Register::new(5),
+                },
+                Instruction::LoadConst {
+                    dst: Register::new(6),
+                    constant: ConstantId::new(4),
+                },
+                Instruction::ArrayPush {
+                    array: Register::new(5),
+                    value: Register::new(6),
+                },
+                Instruction::CreateArray {
+                    dst: Register::new(7),
+                },
+                Instruction::CreateClosure {
+                    dst: Register::new(8),
+                    function: FunctionId::new(1),
+                    captures: Register::new(7),
+                },
+                Instruction::CreateArray {
+                    dst: Register::new(9),
+                },
+                Instruction::ArrayPush {
+                    array: Register::new(9),
+                    value: Register::new(8),
+                },
+                Instruction::Call {
+                    dst: Register::new(10),
+                    callee: Register::new(4),
+                    this_value: Register::new(5),
+                    arguments: Register::new(9),
+                },
+                Instruction::Halt,
+            ],
+            Vec::new(),
+        );
+        let callback = BytecodeFunction::new(
+            None,
+            0,
+            0,
+            1,
+            FunctionFlags::default(),
+            vec![Instruction::Halt],
+            Vec::new(),
+        );
+        let module = ProgramModule {
+            name: ConstantId::new(0),
+            code: Module::new(constants, vec![entry, callback], FunctionId::new(0))
+                .verify()
+                .expect("callback fixture verifies"),
+            edges: Vec::new(),
+            bindings: Vec::new(),
+            exports: Vec::new(),
+        };
+        Program::link(vec![module], ModuleId::new(0)).expect("callback fixture links")
+    }
+
+    fn assert_fuel_exhausted(
+        result: Result<bamts_runtime::ExecutionOutcome, NativeError>,
+        limit: u64,
+    ) {
+        assert!(
+            matches!(
+                result,
+                Err(NativeError::Runtime(RuntimeError {
+                    kind: RuntimeErrorKind::FuelExhausted { limit: found },
+                    ..
+                })) if found == limit
+            ),
+            "expected fuel exhaustion at limit {limit}, got {result:?}"
+        );
+    }
+
     #[test]
     fn codegen_and_native_helper_tables_are_identical() {
         for index in 0..bamts_native::HELPER_COUNT {
@@ -335,9 +490,12 @@ mod tests {
             let mut register = Value::UNINITIALIZED;
             let mut frame = ShadowFrame::new(core::ptr::null_mut(), 0, module_id, &mut register, 1);
             let mut out = Completion::new(Value::UNDEFINED);
+            // Direct entry invocation has no NativeOps dispatcher installed, so
+            // the mandatory pre-Halt fuel helper reports a fatal trap. Reaching
+            // it proves both local function-id tuples were compiled and bound.
             assert_eq!(
                 program.invoke(module_id, 0, &mut frame, &mut out),
-                Ok(CompletionTag::Normal)
+                Ok(CompletionTag::FatalTrap)
             );
         }
     }
@@ -353,6 +511,258 @@ mod tests {
             .expect("matching JIT program runs");
         assert_eq!(outcome.exit_code, 0);
         assert!(outcome.stdout.is_empty());
+    }
+
+    #[test]
+    fn jit_charges_each_mixed_instruction_once_at_exact_boundaries() {
+        let bytecode = one_function_program(
+            vec![Constant::String("entry".to_owned()), Constant::Int32(1)],
+            3,
+            vec![
+                Instruction::LoadConst {
+                    dst: Register::new(0),
+                    constant: ConstantId::new(1),
+                },
+                Instruction::Move {
+                    dst: Register::new(1),
+                    src: Register::new(0),
+                },
+                Instruction::Binary {
+                    dst: Register::new(2),
+                    op: BinaryOp::Add,
+                    left: Register::new(0),
+                    right: Register::new(1),
+                },
+                Instruction::Jump { target: Pc::new(4) },
+                Instruction::Halt,
+            ],
+            Vec::new(),
+        );
+        let compiled = compile_jit(&bytecode).expect("mixed program compiles");
+
+        for fuel in [0, 4] {
+            let mut host = SilentHost;
+            let result = run_linked_program(
+                &bytecode,
+                &compiled,
+                &mut host,
+                &Limits {
+                    fuel,
+                    ..Limits::default()
+                },
+            );
+            assert_fuel_exhausted(result, fuel);
+        }
+
+        let mut host = SilentHost;
+        let result = run_linked_program(
+            &bytecode,
+            &compiled,
+            &mut host,
+            &Limits {
+                fuel: 5,
+                ..Limits::default()
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "five instructions fit fuel five: {result:?}"
+        );
+    }
+
+    #[test]
+    fn jit_jump_to_self_exhausts_fuel() {
+        let bytecode = one_function_program(
+            vec![Constant::String("entry".to_owned())],
+            0,
+            vec![Instruction::Jump { target: Pc::new(0) }],
+            Vec::new(),
+        );
+        let compiled = compile_jit(&bytecode).expect("spin loop compiles");
+        let mut host = SilentHost;
+        let result = run_linked_program(
+            &bytecode,
+            &compiled,
+            &mut host,
+            &Limits {
+                fuel: 3,
+                ..Limits::default()
+            },
+        );
+        assert_fuel_exhausted(result, 3);
+    }
+
+    #[test]
+    fn jit_builtin_callback_reentry_shares_all_machine_budgets() {
+        let bytecode = callback_reentry_program();
+        let compiled = compile_jit(&bytecode).expect("callback program compiles");
+
+        let mut host = SilentHost;
+        let exact = run_linked_program(
+            &bytecode,
+            &compiled,
+            &mut host,
+            &Limits {
+                fuel: 15,
+                max_call_depth: 2,
+                max_total_registers: 12,
+                ..Limits::default()
+            },
+        );
+        assert!(
+            exact.is_ok(),
+            "entry plus callback fit exact shared limits: {exact:?}"
+        );
+
+        let mut host = SilentHost;
+        assert_fuel_exhausted(
+            run_linked_program(
+                &bytecode,
+                &compiled,
+                &mut host,
+                &Limits {
+                    fuel: 14,
+                    max_call_depth: 2,
+                    max_total_registers: 12,
+                    ..Limits::default()
+                },
+            ),
+            14,
+        );
+
+        let mut host = SilentHost;
+        let depth = run_linked_program(
+            &bytecode,
+            &compiled,
+            &mut host,
+            &Limits {
+                max_call_depth: 1,
+                max_total_registers: 12,
+                ..Limits::default()
+            },
+        );
+        assert!(matches!(
+            depth,
+            Err(NativeError::Runtime(RuntimeError {
+                kind: RuntimeErrorKind::CallDepthExceeded { limit: 1 },
+                ..
+            }))
+        ));
+
+        let mut host = SilentHost;
+        let registers = run_linked_program(
+            &bytecode,
+            &compiled,
+            &mut host,
+            &Limits {
+                max_call_depth: 2,
+                max_total_registers: 11,
+                ..Limits::default()
+            },
+        );
+        assert!(matches!(
+            registers,
+            Err(NativeError::Runtime(RuntimeError {
+                kind: RuntimeErrorKind::RegisterLimitExceeded { limit: 11 },
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn jit_fuel_exhaustion_bypasses_bytecode_handler() {
+        let bytecode = one_function_program(
+            vec![Constant::String("entry".to_owned()), Constant::Undefined],
+            1,
+            vec![
+                Instruction::LoadConst {
+                    dst: Register::new(0),
+                    constant: ConstantId::new(1),
+                },
+                Instruction::Throw {
+                    value: Register::new(0),
+                },
+                Instruction::Halt,
+            ],
+            vec![ExceptionHandler {
+                start: Pc::new(1),
+                end: Pc::new(2),
+                handler: Pc::new(2),
+                catch_register: Register::new(0),
+            }],
+        );
+        let compiled = compile_jit(&bytecode).expect("handler program compiles");
+        let mut host = SilentHost;
+        let result = run_linked_program(
+            &bytecode,
+            &compiled,
+            &mut host,
+            &Limits {
+                fuel: 1,
+                ..Limits::default()
+            },
+        );
+        assert_fuel_exhausted(result, 1);
+    }
+
+    #[test]
+    fn jit_zero_fuel_prevents_stdout_side_effects() {
+        let bytecode = one_function_program(
+            vec![
+                Constant::String("entry".to_owned()),
+                Constant::String("console".to_owned()),
+                Constant::String("log".to_owned()),
+                Constant::String("hello".to_owned()),
+            ],
+            6,
+            vec![
+                Instruction::LoadGlobal {
+                    dst: Register::new(0),
+                    name: ConstantId::new(1),
+                },
+                Instruction::LoadConst {
+                    dst: Register::new(1),
+                    constant: ConstantId::new(2),
+                },
+                Instruction::GetProperty {
+                    dst: Register::new(2),
+                    object: Register::new(0),
+                    key: Register::new(1),
+                },
+                Instruction::LoadConst {
+                    dst: Register::new(3),
+                    constant: ConstantId::new(3),
+                },
+                Instruction::CreateArray {
+                    dst: Register::new(4),
+                },
+                Instruction::ArrayPush {
+                    array: Register::new(4),
+                    value: Register::new(3),
+                },
+                Instruction::Call {
+                    dst: Register::new(5),
+                    callee: Register::new(2),
+                    this_value: Register::new(0),
+                    arguments: Register::new(4),
+                },
+                Instruction::Halt,
+            ],
+            Vec::new(),
+        );
+        let compiled = compile_jit(&bytecode).expect("stdout fixture compiles");
+        let mut host = RecordingHost::default();
+        let result = run_linked_program(
+            &bytecode,
+            &compiled,
+            &mut host,
+            &Limits {
+                fuel: 0,
+                ..Limits::default()
+            },
+        );
+        assert_fuel_exhausted(result, 0);
+        assert!(host.stdout.is_empty(), "fuel failure precedes console.log");
     }
 
     #[test]

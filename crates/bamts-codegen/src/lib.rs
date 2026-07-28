@@ -288,6 +288,7 @@ const _: () = {
 /// | 27  | `GetIterator`       | `src: i64, kind: i32`                        |
 /// | 28  | `IteratorNext`      | `iterator: i64, done_reg: i32, value_reg: i32` (two-write) |
 /// | 29  | `Export`            | `name: i32, src: i64`                        |
+/// | 30  | `ConsumeFuel`       | `amount: i32` (total except `FatalTrap`)     |
 ///
 /// Every helper except [`Helper::Truthy`] returns a
 /// `bamts_native::CompletionTag`. [`Helper::Truthy`] returns `0`/`1`.
@@ -385,6 +386,10 @@ pub enum Helper {
     /// `bamts_export(frame, name, src, out)`: export the local value `src` under
     /// the string constant `name`.
     Export,
+    /// `bamts_consume_fuel(frame, amount, out)`: reserve `amount` bytecode
+    /// instructions from the shared machine budget. Returns `FatalTrap` on
+    /// exhaustion and never routes through a bytecode exception handler.
+    ConsumeFuel,
 }
 
 impl Helper {
@@ -422,6 +427,7 @@ impl Helper {
             Helper::GetIterator => "bamts_get_iterator",
             Helper::IteratorNext => "bamts_iterator_next",
             Helper::Export => "bamts_export",
+            Helper::ConsumeFuel => "bamts_consume_fuel",
         }
     }
 
@@ -460,6 +466,7 @@ impl Helper {
             Helper::GetIterator => 27,
             Helper::IteratorNext => 28,
             Helper::Export => 29,
+            Helper::ConsumeFuel => 30,
         }
     }
 
@@ -498,6 +505,7 @@ impl Helper {
             27 => Some(Helper::GetIterator),
             28 => Some(Helper::IteratorNext),
             29 => Some(Helper::Export),
+            30 => Some(Helper::ConsumeFuel),
             _ => None,
         }
     }
@@ -524,7 +532,8 @@ impl Helper {
             Helper::Import
             | Helper::LoadGlobal
             | Helper::TypeOfGlobal
-            | Helper::CreatePrivateName => &[types::I64, types::I32, types::I64],
+            | Helper::CreatePrivateName
+            | Helper::ConsumeFuel => &[types::I64, types::I32, types::I64],
             // (frame, function_id, captures, out)
             Helper::CreateClosure => &[types::I64, types::I32, types::I64, types::I64],
             // (frame, object, key, out)
@@ -1095,6 +1104,9 @@ impl<'a> Lowering<'a> {
     fn emit_instruction(&mut self, pc: usize, instruction: Instruction) {
         let block = self.pc_blocks[pc].expect("reachable pc has a block");
         self.builder.switch_to_block(block);
+        if is_inline_instruction(instruction) {
+            self.emit_consume_fuel();
+        }
         match instruction {
             Instruction::LoadConst { dst, constant } => {
                 let const_id = self.iconst32(i64::from(constant.get()));
@@ -1636,6 +1648,19 @@ impl<'a> Lowering<'a> {
         self.helper_refs.insert(helper, func_ref);
         func_ref
     }
+
+    fn emit_consume_fuel(&mut self) {
+        let amount = self.iconst32(1);
+        let tag = self.call_helper(Helper::ConsumeFuel, &[self.frame, amount, self.out]);
+        let normal = self.builder.create_block();
+        let abnormal = self.builder.create_block();
+        self.builder.ins().brif(tag, abnormal, &[], normal, &[]);
+
+        self.builder.switch_to_block(abnormal);
+        self.builder.ins().return_(&[tag]);
+
+        self.builder.switch_to_block(normal);
+    }
 }
 
 /// The byte offset of a register slot within the handles array. [`validate_slots`]
@@ -1721,6 +1746,50 @@ fn routes_to_handler(instruction: Instruction) -> bool {
         | Instruction::JumpIfFalse { .. }
         | Instruction::Return { .. }
         | Instruction::Halt => false,
+    }
+}
+
+/// Whether the opcode is emitted directly by the compiler/reference driver and
+/// therefore requires an explicit pre-effect fuel charge. This exhaustive match
+/// keeps the one-charge ledger synchronized with the bytecode algebra.
+fn is_inline_instruction(instruction: Instruction) -> bool {
+    match instruction {
+        Instruction::Move { .. }
+        | Instruction::Jump { .. }
+        | Instruction::JumpIfTrue { .. }
+        | Instruction::JumpIfFalse { .. }
+        | Instruction::Return { .. }
+        | Instruction::Halt
+        | Instruction::Throw { .. }
+        | Instruction::Suspend { .. } => true,
+        Instruction::LoadConst { .. }
+        | Instruction::Unary { .. }
+        | Instruction::Binary { .. }
+        | Instruction::CreateObject { .. }
+        | Instruction::CreateArray { .. }
+        | Instruction::CreateClosure { .. }
+        | Instruction::GetProperty { .. }
+        | Instruction::SetProperty { .. }
+        | Instruction::DeleteProperty { .. }
+        | Instruction::DefineAccessor { .. }
+        | Instruction::Call { .. }
+        | Instruction::Construct { .. }
+        | Instruction::LoadGlobal { .. }
+        | Instruction::StoreGlobal { .. }
+        | Instruction::TypeOfGlobal { .. }
+        | Instruction::LoadThis { .. }
+        | Instruction::LoadArguments { .. }
+        | Instruction::LoadNewTarget { .. }
+        | Instruction::ArrayPush { .. }
+        | Instruction::ArrayExtend { .. }
+        | Instruction::ObjectSpread { .. }
+        | Instruction::SetPrototype { .. }
+        | Instruction::CreatePrivateName { .. }
+        | Instruction::CreateRegExp { .. }
+        | Instruction::GetIterator { .. }
+        | Instruction::IteratorNext { .. }
+        | Instruction::Import { .. }
+        | Instruction::Export { .. } => false,
     }
 }
 
@@ -1954,7 +2023,7 @@ mod tests {
         );
         assert!(clif.contains("return"), "must return:\n{clif}");
         let lowered = lower_code_module(ModuleId::new(0), &module, host_config()).expect("lowers");
-        assert!(lowered.functions[0].helpers.is_empty());
+        assert_eq!(lowered.functions[0].helpers, vec![Helper::ConsumeFuel]);
         assert_eq!(lowered.functions[0].entry_points, vec![0]);
     }
 
@@ -1993,6 +2062,7 @@ mod tests {
             Helper::GetIterator,
             Helper::IteratorNext,
             Helper::Export,
+            Helper::ConsumeFuel,
         ];
         let mut symbols = BTreeSet::new();
         for (expected_index, helper) in helpers.iter().copied().enumerate() {
@@ -2005,8 +2075,8 @@ mod tests {
             );
             assert!(symbols.insert(helper.symbol()), "unique symbol {helper:?}");
         }
-        assert_eq!(symbols.len(), 30);
-        assert_eq!(Helper::from_external_index(30), None);
+        assert_eq!(symbols.len(), 31);
+        assert_eq!(Helper::from_external_index(31), None);
     }
 
     #[test]
@@ -2017,7 +2087,7 @@ mod tests {
             Vec::new(),
         ));
         let (helpers, clif) = lower_one(&module);
-        assert_eq!(helpers, vec![Helper::LoadConstant]);
+        assert_eq!(helpers, vec![Helper::LoadConstant, Helper::ConsumeFuel]);
         assert_eq!(Helper::LoadConstant.symbol(), "bamts_load_constant");
         assert_eq!(Helper::LoadConstant.external_index(), 0);
         assert_eq!(Helper::from_external_index(0), Some(Helper::LoadConstant));
@@ -2095,8 +2165,44 @@ mod tests {
         ];
         let module = single(func(2, code, Vec::new()));
         let (helpers, _) = lower_one(&module);
-        // Move introduces no helper of its own.
-        assert_eq!(helpers, vec![Helper::LoadConstant]);
+        // Move introduces only its explicit instruction-budget helper.
+        assert_eq!(helpers, vec![Helper::LoadConstant, Helper::ConsumeFuel]);
+    }
+
+    #[test]
+    fn reachable_inline_pcs_each_emit_one_fuel_charge() {
+        let code = vec![
+            load_undef(reg(0)),
+            Instruction::Move {
+                dst: reg(1),
+                src: reg(0),
+            },
+            Instruction::Jump { target: Pc::new(4) },
+            Instruction::Binary {
+                dst: reg(0),
+                op: BinaryOp::Add,
+                left: reg(0),
+                right: reg(0),
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(2, code, Vec::new()));
+        let (helpers, clif) = lower_one(&module);
+        assert_eq!(helpers, vec![Helper::LoadConstant, Helper::ConsumeFuel]);
+
+        let declaration = clif
+            .lines()
+            .find(|line| line.contains("u1:30"))
+            .expect("consume-fuel import");
+        let function_ref = declaration
+            .split_whitespace()
+            .next()
+            .expect("helper function reference");
+        assert_eq!(
+            clif.matches(&format!("call {function_ref}")).count(),
+            3,
+            "Move, Jump, and Halt each charge once; LoadConst and unreachable Binary do not:\n{clif}"
+        );
     }
 
     #[test]
@@ -2144,16 +2250,20 @@ mod tests {
         let module = single(func(1, code, Vec::new()));
         let (helpers, clif) = lower_one(&module);
         assert!(helpers.contains(&Helper::Truthy));
-        // The conditional's `brif` is the last branch emitted (the LoadConst
-        // completion routing precedes it). Its operands render truthy (then)
-        // first, falsy (else) second. Blocks are numbered in ascending
-        // reachable-pc order, so for JumpIfFalse the truthy edge must target the
-        // earlier fallthrough (pc2) block and the falsy edge the later jump
-        // target (pc3) block: truthy block number < falsy block number. A swap
-        // to JumpIfTrue polarity would reverse this.
-        let brif = clif
+        let truthy_declaration = clif
             .lines()
-            .rfind(|line| line.contains("brif"))
+            .find(|line| line.contains("u1:12"))
+            .expect("truthy import");
+        let truthy_ref = truthy_declaration
+            .split_whitespace()
+            .next()
+            .expect("truthy function reference");
+        let mut lines = clif.lines();
+        lines
+            .find(|line| line.contains(&format!("call {truthy_ref}")))
+            .expect("truthy call");
+        let brif = lines
+            .find(|line| line.contains("brif"))
             .expect("conditional branch missing");
         let edges: Vec<u32> = brif
             .split(|c: char| !c.is_ascii_alphanumeric())
@@ -2743,8 +2853,8 @@ mod tests {
         }];
         let module = single(func(1, code, handlers));
         let (helpers, clif) = lower_one(&module);
-        // A locally-caught throw needs no helper and jumps to the handler.
-        assert_eq!(helpers, vec![Helper::LoadConstant]);
+        // A locally-caught throw needs only its fuel helper and jumps to the handler.
+        assert_eq!(helpers, vec![Helper::LoadConstant, Helper::ConsumeFuel]);
         assert!(clif.contains("jump"), "handler jump missing:\n{clif}");
         assert!(
             clif.contains("store"),
@@ -2757,7 +2867,7 @@ mod tests {
         let code = vec![load_undef(reg(0)), Instruction::Return { value: reg(0) }];
         let module = single(func(1, code, Vec::new()));
         let (helpers, clif) = lower_one(&module);
-        assert_eq!(helpers, vec![Helper::LoadConstant]);
+        assert_eq!(helpers, vec![Helper::LoadConstant, Helper::ConsumeFuel]);
         assert!(
             clif.contains("store"),
             "return value store missing:\n{clif}"
@@ -2838,7 +2948,11 @@ mod tests {
         ];
         let module = single(func(1, code, Vec::new()));
         let (helpers, _) = lower_one(&module);
-        assert!(helpers.is_empty(), "unreachable Binary lowered a helper");
+        assert_eq!(
+            helpers,
+            vec![Helper::ConsumeFuel],
+            "unreachable Binary must not lower its helper"
+        );
     }
 
     #[test]
