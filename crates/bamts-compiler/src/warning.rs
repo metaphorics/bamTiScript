@@ -1,113 +1,40 @@
 use crate::{
-    diagnostic::{Diagnostic, DiagnosticCode, Recovered},
-    source::{SourceId, SourceText},
+    diagnostic::{Diagnostic, Recovered},
+    lint::{LintLevel, LintProfile, LintTable, RULES},
+    rules,
+    source::{ScriptKind, SourceId, SourceText},
     syntax::SourceFile,
 };
 
 const MAX_RECOGNIZER_TOKENS: usize = 4_096;
 const MAX_PATTERN_TOKENS: usize = 128;
 
-/// One closed, non-fatal hard-warning rule.
-///
-/// The anchors and message are static so the catalog remains stable across
-/// compilations and diagnostics do not need to own copied rule metadata.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct HardWarningRule {
-    code: DiagnosticCode,
-    source_anchor: &'static str,
-    issue_anchor: &'static str,
-    message: &'static str,
-}
-
-impl HardWarningRule {
-    /// Returns this rule's stable warning code.
-    #[must_use]
-    pub const fn code(&self) -> DiagnosticCode {
-        self.code
-    }
-
-    /// Returns the immutable source-pattern anchor for this rule.
-    #[must_use]
-    pub const fn source_anchor(&self) -> &'static str {
-        self.source_anchor
-    }
-
-    /// Returns the immutable issue-class anchor for this rule.
-    #[must_use]
-    pub const fn issue_anchor(&self) -> &'static str {
-        self.issue_anchor
-    }
-
-    /// Returns the exact stable warning message.
-    #[must_use]
-    pub const fn message(&self) -> &'static str {
-        self.message
-    }
-}
-
-/// The complete hard-warning catalog. These rules are warnings only; none can
-/// change a recovered compiler product into an error.
-pub static HARD_WARNING_RULES: [HardWarningRule; 7] = [
-    HardWarningRule {
-        code: DiagnosticCode::new("BAMTS-W001"),
-        source_anchor: "source:interface-method-signature",
-        issue_anchor: "issue:method-parameter-bivariance",
-        message: "Method parameter bivariance can accept an incompatible callback.",
-    },
-    HardWarningRule {
-        code: DiagnosticCode::new("BAMTS-W002"),
-        source_anchor: "source:typed-array-variable-assignment",
-        issue_anchor: "issue:mutable-array-covariance",
-        message: "Mutable array covariance can write an incompatible element.",
-    },
-    HardWarningRule {
-        code: DiagnosticCode::new("BAMTS-W003"),
-        source_anchor: "source:non-fresh-object-assignment",
-        issue_anchor: "issue:excess-property-bypass",
-        message: "A non-fresh object value bypasses excess-property checking.",
-    },
-    HardWarningRule {
-        code: DiagnosticCode::new("BAMTS-W004"),
-        source_anchor: "source:delete-required-property",
-        issue_anchor: "issue:delete-required-property",
-        message: "Deleting a required property can violate its declared shape.",
-    },
-    HardWarningRule {
-        code: DiagnosticCode::new("BAMTS-W005"),
-        source_anchor: "source:direct-catch-property-access",
-        issue_anchor: "issue:unchecked-catch-property-access",
-        message: "Catch binding property access is unchecked.",
-    },
-    HardWarningRule {
-        code: DiagnosticCode::new("BAMTS-W006"),
-        source_anchor: "source:generic-any-return-cast",
-        issue_anchor: "issue:generic-any-downcast",
-        message: "Casting any to a generic type bypasses its constraint.",
-    },
-    HardWarningRule {
-        code: DiagnosticCode::new("BAMTS-W007"),
-        source_anchor: "source:dynamic-tuple-index",
-        issue_anchor: "issue:dynamic-tuple-out-of-bounds-indexing",
-        message: "Dynamic indexing can read beyond a tuple's bounds.",
-    },
-];
-
-/// Looks up a hard-warning rule by its stable code.
-#[must_use]
-pub fn hard_warning_rule(code: DiagnosticCode) -> Option<&'static HardWarningRule> {
-    HARD_WARNING_RULES.iter().find(|rule| rule.code == code)
-}
-
-/// Analyzes only the recovered source product and returns new, ordered warnings.
+/// Analyzes the recovered syntax product using the default lint profile.
 ///
 /// Existing recovery diagnostics are intentionally neither read nor mutated.
-/// Each recognizer accepts one deliberately narrow lexical shape; source text
-/// outside those shapes produces no warning from that recognizer until semantic
-/// checking replaces these bounded front-end recognizers.
 #[must_use]
 pub fn analyze_hard_warnings(source_file: &Recovered<SourceFile>) -> Vec<Diagnostic> {
+    analyze_warnings(source_file, &LintTable::new(LintProfile::Default))
+}
+
+/// Analyzes the recovered syntax product using a resolved lint table.
+#[must_use]
+pub fn analyze_warnings(
+    source_file: &Recovered<SourceFile>,
+    levels: &LintTable,
+) -> Vec<Diagnostic> {
     let source_file = source_file.product();
-    analyze_source_text(source_file.source_id(), source_file.source_text())
+    let mut diagnostics = if matches!(
+        source_file.script_kind(),
+        ScriptKind::TypeScript | ScriptKind::TypeScriptReact
+    ) {
+        analyze_source_text(source_file.source_id(), source_file.source_text())
+    } else {
+        Vec::new()
+    };
+    diagnostics.extend(rules::analyze(source_file, levels));
+    diagnostics.sort();
+    diagnostics
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -829,19 +756,32 @@ fn emit(
     let Ok(range) = source.range(start, end) else {
         return;
     };
-    let rule = &HARD_WARNING_RULES[rule_index];
-    diagnostics.push(Diagnostic::warning(
-        rule.code,
-        source_id,
-        range,
-        rule.message,
-    ));
+    let rule = &RULES[rule_index];
+    let message = match rule_index {
+        0 => "Method parameter bivariance can accept an incompatible callback.",
+        1 => "Mutable array covariance can write an incompatible element.",
+        2 => "A non-fresh object value bypasses excess-property checking.",
+        3 => "Deleting a required property can violate its declared shape.",
+        4 => "Catch binding property access is unchecked.",
+        5 => "Casting any to a generic type bypasses its constraint.",
+        6 => "Dynamic indexing can read beyond a tuple's bounds.",
+        _ => unreachable!("legacy warning index is closed"),
+    };
+    diagnostics.push(
+        Diagnostic::lint(LintLevel::Warn, rule.id(), source_id, range, message)
+            .expect("legacy hard warnings are enabled"),
+    );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{HARD_WARNING_RULES, analyze_source_text, hard_warning_rule};
-    use crate::source::{SourceId, SourceText};
+    use std::sync::Arc;
+
+    use super::{analyze_hard_warnings, analyze_source_text};
+    use crate::{
+        parser, scanner,
+        source::{ScriptKind, SourceId, SourceText},
+    };
 
     fn codes(source: &str) -> Vec<&'static str> {
         let source = SourceText::new(source);
@@ -849,35 +789,6 @@ mod tests {
             .iter()
             .map(|diagnostic| diagnostic.code().as_str())
             .collect()
-    }
-
-    #[test]
-    fn catalog_codes_are_unique_and_stably_formatted() {
-        let codes = HARD_WARNING_RULES
-            .iter()
-            .map(|rule| rule.code().as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            codes,
-            [
-                "BAMTS-W001",
-                "BAMTS-W002",
-                "BAMTS-W003",
-                "BAMTS-W004",
-                "BAMTS-W005",
-                "BAMTS-W006",
-                "BAMTS-W007",
-            ]
-        );
-        assert!(
-            HARD_WARNING_RULES
-                .iter()
-                .all(|rule| !rule.source_anchor().is_empty() && !rule.issue_anchor().is_empty())
-        );
-        assert_eq!(
-            hard_warning_rule(HARD_WARNING_RULES[3].code()).map(|rule| rule.message()),
-            Some("Deleting a required property can violate its declared shape.")
-        );
     }
 
     #[test]
@@ -951,5 +862,22 @@ mod tests {
         assert!(codes("// catch (error) { error.message; }").is_empty());
         assert!(codes("const note = \"catch (error) { error.message; }\";").is_empty());
         assert!(codes("const matcher = /catch \\(error\\) \\{ error\\.message; \\}/;").is_empty());
+    }
+
+    #[test]
+    fn javascript_skips_typescript_only_hard_warnings() {
+        let parsed = parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::JavaScript,
+            Arc::new(SourceText::new(
+                "try {} catch (error) { error.message; } value === NaN;",
+            )),
+        ));
+        let codes = analyze_hard_warnings(&parsed)
+            .iter()
+            .map(|diagnostic| diagnostic.code().as_str())
+            .collect::<Vec<_>>();
+        assert!(codes.contains(&"BAMTS-W079"));
+        assert!(!codes.contains(&"BAMTS-W005"));
     }
 }
