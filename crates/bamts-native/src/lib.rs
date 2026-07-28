@@ -14,9 +14,12 @@
 //! canonical execution plan (N5); the Lean files do not assign them a wire
 //! layout. `Bamti.NodeLoop.Completion` is a separate event-loop proof record.
 //!
-//! No garbage collector, JIT, slot table, or host FFI lives here yet; those
-//! are separate phases. This file is total, allocation-free, and requires no
-//! `unsafe`.
+//! The value/frame primitives in this file are total, allocation-free, and
+//! require no `unsafe`. The native runtime bridge — the exported `bamts_*`
+//! helper ABI, the panic- and nesting-safe [`native_bridge::NativeOps`]
+//! dispatch seam, and the feature-gated JIT/AOT linkage surfaces — lives in
+//! [`native_bridge`], which centralizes every `unsafe` operation the generated
+//! code requires.
 
 use core::num::{NonZeroU16, NonZeroU32};
 
@@ -463,6 +466,11 @@ const _: () = {
     assert!(offset_of!(ShadowFrame, handles) == 16);
     assert!(offset_of!(ShadowFrame, handle_len) == 24);
 };
+
+// -- Native runtime bridge ---------------------------------------------------
+
+pub mod native_bridge;
+pub use native_bridge::*;
 
 #[cfg(test)]
 mod tests {
