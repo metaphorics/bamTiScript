@@ -174,6 +174,9 @@ fn parse_args<H: Host>(
                         let Some(text) = config.args.get(index) else {
                             return Err(type_error("string parseArgs option is missing its value"));
                         };
+                        if text.starts_with('-') {
+                            return Err(type_error("ERR_PARSE_ARGS_INVALID_OPTION_VALUE"));
+                        }
                         (text.clone(), Some(false))
                     };
                     let value = alloc_string(machine, &text)?;
@@ -233,6 +236,9 @@ fn parse_args<H: Host>(
                                     "string parseArgs option is missing its value",
                                 ));
                             };
+                            if text.starts_with('-') {
+                                return Err(type_error("ERR_PARSE_ARGS_INVALID_OPTION_VALUE"));
+                            }
                             (text.clone(), false)
                         } else {
                             (rest, true)
@@ -588,6 +594,7 @@ fn alloc_array<H: Host>(
             properties: PropertyMap::default(),
             prototype: Some(machine.intrinsics.array_prototype),
             extensible: true,
+            length_writable: true,
         })
         .map_err(EvalFailure::Runtime)
 }
@@ -820,7 +827,7 @@ fn encode_base64(bytes: &[u8], url: bool) -> String {
     output
 }
 
-fn decode_base64(text: &str, url: bool) -> Result<Vec<u8>, EvalFailure> {
+fn decode_base64(text: &str, _url: bool) -> Result<Vec<u8>, EvalFailure> {
     let mut sextets = Vec::new();
     for byte in text.bytes() {
         if byte == b'=' {
@@ -830,10 +837,10 @@ fn decode_base64(text: &str, url: bool) -> Result<Vec<u8>, EvalFailure> {
             b'A'..=b'Z' => byte - b'A',
             b'a'..=b'z' => byte - b'a' + 26,
             b'0'..=b'9' => byte - b'0' + 52,
-            b'+' if !url => 62,
-            b'/' if !url => 63,
-            b'-' if url => 62,
-            b'_' if url => 63,
+            b'+' => 62,
+            b'/' => 63,
+            b'-' => 62,
+            b'_' => 63,
             b'\r' | b'\n' | b' ' | b'\t' => continue,
             _ => return Err(type_error("invalid base64 hash input")),
         };
@@ -1396,5 +1403,59 @@ mod tests {
         assert_eq!(interpreter.value, native.value);
         assert_eq!(interpreter.outcome, native.outcome);
         assert_eq!(interpreter.entry_registers, native.entry_registers);
+    }
+    #[test]
+    fn parse_args_rejects_detached_dash_values_and_allows_inline() {
+        let program = blank_program();
+        let mut host = EchoHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let name = descriptor(&mut machine, "string", None, false, None);
+        let file = descriptor(&mut machine, "string", Some("f"), false, None);
+
+        let detached_long = config(&mut machine, &["--name", "-bar"], &[("name", name)], &[]);
+        assert!(matches!(
+            call_parse_args(&mut machine, detached_long),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+
+        let detached_short = config(&mut machine, &["-f", "-bar"], &[("file", file)], &[]);
+        assert!(matches!(
+            call_parse_args(&mut machine, detached_short),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+
+        let inline_long = config(&mut machine, &["--name=-bar"], &[("name", name)], &[]);
+        let result = call_parse_args(&mut machine, inline_long).unwrap();
+        let values = machine_value(&machine, result, "values");
+        assert_eq!(text(&machine, machine_value(&machine, values, "name")), "-bar");
+
+        let inline_short = config(&mut machine, &["-f-bar"], &[("file", file)], &[]);
+        let result = call_parse_args(&mut machine, inline_short).unwrap();
+        let values = machine_value(&machine, result, "values");
+        assert_eq!(text(&machine, machine_value(&machine, values, "file")), "-bar");
+    }
+
+    #[test]
+    fn hash_base64_accepts_url_alphabet() {
+        let program = blank_program();
+        let mut host = EchoHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let algorithm = alloc_string(&mut machine, "echo").unwrap();
+        let BuiltinOutcome::Value(hash) =
+            create_hash(&mut machine, Value::UNDEFINED, &[algorithm], false).unwrap()
+        else {
+            unreachable!()
+        };
+        // 0xFB 0xFF standard base64 is "+/8=" and base64url is "-_8=".
+        let data = alloc_string(&mut machine, "-_8=").unwrap();
+        let base64 = alloc_string(&mut machine, "base64").unwrap();
+        hash_update(&mut machine, hash, &[data, base64], false).unwrap();
+        let output = alloc_string(&mut machine, "base64").unwrap();
+        let BuiltinOutcome::Value(digest) =
+            hash_digest(&mut machine, hash, &[output], false).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(text(&machine, digest), "+/8=");
     }
 }
