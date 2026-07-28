@@ -93,6 +93,14 @@ impl From<LowerError> for AotError {
     }
 }
 
+fn require_64_bit_pointer_width(bits: u8) -> Result<(), AotError> {
+    if bits != 64 {
+        Err(AotError::Lower(LowerError::UnsupportedPointerWidth { bits }))
+    } else {
+        Ok(())
+    }
+}
+
 /// Compiles a verified module into one relocatable object for `target`.
 ///
 /// The object contains every lowered function, the canonical bytecode encoding,
@@ -115,12 +123,7 @@ pub fn compile_aot(
     let isa = isa_builder
         .finish(flags)
         .map_err(|error| AotError::TargetBuild(error.to_string()))?;
-    let pointer_bits = isa.frontend_config().pointer_bits();
-    if pointer_bits != 64 {
-        return Err(AotError::Lower(LowerError::UnsupportedPointerWidth {
-            bits: pointer_bits,
-        }));
-    }
+    require_64_bit_pointer_width(isa.frontend_config().pointer_bits())?;
     let target_endianness = isa
         .triple()
         .endianness()
@@ -522,11 +525,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_32_bit_target_without_emitting_an_object() {
-        let error = compile_aot(&test_module(), "x86").expect_err("32-bit AOT target is rejected");
+    fn require_64_bit_pointer_width_rejects_32() {
         assert!(matches!(
-            error,
-            AotError::Lower(LowerError::UnsupportedPointerWidth { bits: 32 })
+            require_64_bit_pointer_width(32),
+            Err(AotError::Lower(LowerError::UnsupportedPointerWidth { bits: 32 }))
         ));
+    }
+
+    #[test]
+    fn require_64_bit_pointer_width_accepts_64() {
+        assert!(require_64_bit_pointer_width(64).is_ok());
+    }
+
+    #[test]
+    fn compile_aot_rejects_i686_without_panic() {
+        let error = compile_aot(&test_module(), "i686-unknown-linux-gnu")
+            .expect_err("i686 AOT target is rejected");
+        assert!(matches!(error, AotError::TargetLookup(_)));
     }
 }
