@@ -168,7 +168,7 @@ pub(crate) struct Intrinsics<H: Host> {
     pub(crate) string_prototype: Value,
     pub(crate) number_prototype: Value,
     pub(crate) boolean_prototype: Value,
-    builtins: BuiltinTable<H>,
+    pub(crate) builtins: BuiltinTable<H>,
     function_call: Value,
     object_to_string: Value,
 }

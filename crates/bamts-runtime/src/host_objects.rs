@@ -54,7 +54,7 @@ pub(crate) fn install<H: Host>(
         },
     );
     let versions = object(heap, object_prototype);
-    put_text(heap, versions, "node", "22.0.0");
+    put_text(heap, versions, "node", "24.18.0");
 
     let process = object(heap, object_prototype);
     put(heap, process, "stdout", stdout);
@@ -62,7 +62,7 @@ pub(crate) fn install<H: Host>(
     put(heap, process, "env", env);
     put(heap, process, "argv", argv);
     put_text(heap, process, "platform", std::env::consts::OS);
-    put_text(heap, process, "version", "v22.0.0");
+    put_text(heap, process, "version", "v24.18.0");
     put(heap, process, "versions", versions);
     for (name, length, handler) in [
         ("exit", 1, process_exit::<H> as _),
@@ -80,6 +80,8 @@ pub(crate) fn install<H: Host>(
         put(heap, global_this, name, *value);
     }
     put(heap, global_this, "globalThis", global_this);
+    put(heap, global_this, "global", global_this);
+    globals.insert("global".to_owned(), global_this);
     globals.insert("globalThis".to_owned(), global_this);
 }
 
@@ -344,7 +346,9 @@ impl<H: Host> Machine<'_, H> {
                     HeapEntry::RegExp { pattern, flags, .. } => Ok(format!("/{pattern}/{flags}")),
                     HeapEntry::Iterator { .. }
                     | HeapEntry::ProcessEnv { .. }
-                    | HeapEntry::ModuleNamespace { .. } => Ok("{}".to_owned()),
+                    | HeapEntry::ModuleNamespace { .. }
+                    | HeapEntry::ExternalModuleNamespace { .. }
+                    | HeapEntry::HashState { .. } => Ok("{}".to_owned()),
                 }
             }
         }

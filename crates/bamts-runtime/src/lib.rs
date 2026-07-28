@@ -31,6 +31,7 @@ use bamts_bytecode::{
 };
 use bamts_native::{Decoded, SlotId, Value};
 
+mod external_modules;
 mod host_objects;
 mod intrinsics;
 mod native;
@@ -440,6 +441,16 @@ enum HeapEntry {
     ModuleNamespace {
         module: ModuleId,
     },
+    ExternalModuleNamespace {
+        specifier: &'static str,
+    },
+    HashState {
+        algorithm: String,
+        data: Vec<u8>,
+        digested: bool,
+        update: Value,
+        digest: Value,
+    },
     PrivateName {
         description: String,
     },
@@ -473,10 +484,14 @@ impl HeapEntry {
                 text.len()
             }
             Self::RegExp { pattern, flags, .. } => pattern.len() + flags.len(),
+            Self::HashState {
+                algorithm, data, ..
+            } => algorithm.len() + data.len(),
             Self::Object { .. }
             | Self::Array { .. }
             | Self::Function { .. }
             | Self::ModuleNamespace { .. }
+            | Self::ExternalModuleNamespace { .. }
             | Self::NativeFunction { .. }
             | Self::ProcessEnv { .. }
             | Self::Iterator { .. } => 1,
@@ -636,6 +651,20 @@ pub struct Machine<'a, H: Host> {
 struct ModuleRegistry {
     modules: Vec<ModuleInstance>,
     cells: Vec<Cell>,
+    external: BTreeMap<&'static str, ExternalModuleInstance>,
+}
+
+#[derive(Clone, Debug)]
+struct ExternalModuleInstance {
+    namespace: Value,
+    exports: BTreeMap<&'static str, ExternalExport>,
+    internals: BTreeMap<&'static str, Value>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExternalExport {
+    value: Value,
+    cell: Option<CellId>,
 }
 
 #[derive(Clone, Debug)]
@@ -710,7 +739,12 @@ impl<'a, H: Host> Machine<'a, H> {
         );
         let live_registers = frame.registers.len();
         let mut heap = Vec::new();
-        let intrinsics = intrinsics::Intrinsics::<H>::initialize(&mut heap);
+        let mut intrinsics = intrinsics::Intrinsics::<H>::initialize(&mut heap);
+        let installed_external = external_modules::install(
+            &mut heap,
+            &mut intrinsics.builtins,
+            intrinsics.object_prototype,
+        );
         let argv_text = host.argv().to_vec();
         let argv_values: Vec<Value> = argv_text
             .into_iter()
@@ -754,7 +788,34 @@ impl<'a, H: Host> Machine<'a, H> {
             live_registers,
             last_completion: None,
             globals: BTreeMap::new(),
-            registry: ModuleRegistry::default(),
+            registry: ModuleRegistry {
+                external: installed_external
+                    .into_iter()
+                    .map(|module| {
+                        let mut exports: BTreeMap<_, _> = module
+                            .exports
+                            .into_iter()
+                            .map(|(name, value)| (name, ExternalExport { value, cell: None }))
+                            .collect();
+                        exports.insert(
+                            "default",
+                            ExternalExport {
+                                value: module.namespace,
+                                cell: None,
+                            },
+                        );
+                        (
+                            module.specifier,
+                            ExternalModuleInstance {
+                                namespace: module.namespace,
+                                exports,
+                                internals: module.internals,
+                            },
+                        )
+                    })
+                    .collect(),
+                ..ModuleRegistry::default()
+            },
             current_builtin_id: None,
             intrinsics,
         }
@@ -850,53 +911,46 @@ impl<'a, H: Host> Machine<'a, H> {
                     BindingKind::Hoisted | BindingKind::Lexical => continue,
                     BindingKind::Imported { edge, name } => {
                         let dependency = program.modules()[module_index].edges[edge.get() as usize];
-                        let EdgeTarget::Local(target) = dependency.target else {
-                            return Err(self.program_error(
-                                module_id,
-                                RuntimeErrorKind::ExternalModuleUnavailable {
-                                    module: module_id,
-                                    edge,
-                                },
-                            ));
-                        };
-                        match program.resolve_export(target, self.constant_text(module_id, name)) {
-                            Some(ResolvedExport::Local { module, binding }) => {
-                                self.registry.modules[module.get() as usize].binding_cells
-                                    [binding.get() as usize]
-                                    .expect("own cells are allocated before aliases link")
+                        match dependency.target {
+                            EdgeTarget::External => {
+                                let name = self.constant_text(module_id, name).to_owned();
+                                self.external_export_cell(module_id, edge, &name)?
                             }
-                            Some(ResolvedExport::External { module, edge, .. }) => {
-                                return Err(self.program_error(
-                                    module,
-                                    RuntimeErrorKind::ExternalModuleUnavailable { module, edge },
-                                ));
-                            }
-                            None => {
-                                return Err(self.program_error(
-                                    module_id,
-                                    RuntimeErrorKind::InvalidVerifiedProgram {
-                                        module: module_id,
-                                        instruction: Instruction::Import {
-                                            dst: bamts_bytecode::Register::new(0),
-                                            specifier: name,
+                            EdgeTarget::Local(target) => match program
+                                .resolve_export(target, self.constant_text(module_id, name))
+                            {
+                                Some(ResolvedExport::Local { module, binding }) => {
+                                    self.registry.modules[module.get() as usize].binding_cells
+                                        [binding.get() as usize]
+                                        .expect("own cells are allocated before aliases link")
+                                }
+                                Some(ResolvedExport::External { module, edge, name }) => {
+                                    let name = self.constant_text(module, name).to_owned();
+                                    self.external_export_cell(module, edge, &name)?
+                                }
+                                None => {
+                                    return Err(self.program_error(
+                                        module_id,
+                                        RuntimeErrorKind::InvalidVerifiedProgram {
+                                            module: module_id,
+                                            instruction: Instruction::Import {
+                                                dst: bamts_bytecode::Register::new(0),
+                                                specifier: name,
+                                            },
                                         },
-                                    },
-                                ));
-                            }
+                                    ));
+                                }
+                            },
                         }
                     }
                     BindingKind::Namespace { edge } => {
                         let dependency = program.modules()[module_index].edges[edge.get() as usize];
-                        let EdgeTarget::Local(target) = dependency.target else {
-                            return Err(self.program_error(
-                                module_id,
-                                RuntimeErrorKind::ExternalModuleUnavailable {
-                                    module: module_id,
-                                    edge,
-                                },
-                            ));
+                        let namespace = match dependency.target {
+                            EdgeTarget::Local(target) => {
+                                self.module_namespace(target, module_id)?
+                            }
+                            EdgeTarget::External => self.external_namespace(module_id, edge)?,
                         };
-                        let namespace = self.module_namespace(target, module_id)?;
                         self.allocate_cell(namespace, module_id)?
                     }
                 };
@@ -932,11 +986,88 @@ impl<'a, H: Host> Machine<'a, H> {
         if let Some(value) = self.registry.modules[target.get() as usize].namespace {
             return Ok(value);
         }
+        let exported_names: Vec<String> = self.program().modules()[target.get() as usize]
+            .exports
+            .iter()
+            .map(|export| self.constant_text(target, export.name).to_owned())
+            .collect();
+        for exported_name in exported_names {
+            if let Some(ResolvedExport::External { module, edge, name }) =
+                self.program().resolve_export(target, &exported_name)
+            {
+                let name = self.constant_text(module, name).to_owned();
+                self.external_export_cell(module, edge, &name)?;
+            }
+        }
         let value = self
             .allocate(HeapEntry::ModuleNamespace { module: target })
             .map_err(|kind| self.program_error(requester, kind))?;
         self.registry.modules[target.get() as usize].namespace = Some(value);
         Ok(value)
+    }
+
+    fn external_specifier(&self, module: ModuleId, edge: EdgeId) -> Option<&'static str> {
+        let dependency = self.program().modules()[module.get() as usize].edges[edge.get() as usize];
+        let specifier = self.constant_text(module, dependency.specifier);
+        self.registry
+            .external
+            .get_key_value(specifier)
+            .map(|(&name, _)| name)
+    }
+
+    fn external_namespace(
+        &mut self,
+        module: ModuleId,
+        edge: EdgeId,
+    ) -> Result<Value, RuntimeError> {
+        let Some(specifier) = self.external_specifier(module, edge) else {
+            return Err(self.program_error(
+                module,
+                RuntimeErrorKind::ExternalModuleUnavailable { module, edge },
+            ));
+        };
+        let export_names: Vec<&'static str> = self.registry.external[specifier]
+            .exports
+            .keys()
+            .copied()
+            .collect();
+        for name in export_names {
+            self.external_export_cell(module, edge, name)?;
+        }
+        Ok(self.registry.external[specifier].namespace)
+    }
+
+    fn external_export_cell(
+        &mut self,
+        module: ModuleId,
+        edge: EdgeId,
+        name: &str,
+    ) -> Result<CellId, RuntimeError> {
+        let Some(specifier) = self.external_specifier(module, edge) else {
+            return Err(self.program_error(
+                module,
+                RuntimeErrorKind::ExternalModuleUnavailable { module, edge },
+            ));
+        };
+        let Some(export) = self.registry.external[specifier].exports.get(name).copied() else {
+            return Err(self.program_error(
+                module,
+                RuntimeErrorKind::ExternalModuleUnavailable { module, edge },
+            ));
+        };
+        if let Some(cell) = export.cell {
+            return Ok(cell);
+        }
+        let cell = self.allocate_cell(export.value, module)?;
+        self.registry
+            .external
+            .get_mut(specifier)
+            .expect("external module remains registered")
+            .exports
+            .get_mut(name)
+            .expect("external export remains registered")
+            .cell = Some(cell);
+        Ok(cell)
     }
 
     fn evaluate_module(&mut self, module: ModuleId) -> Result<Option<Execution>, RuntimeError> {
@@ -1021,6 +1152,10 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             match edge.target {
                 EdgeTarget::Local(dependency) => dependencies.push(dependency),
+                EdgeTarget::External
+                    if self
+                        .external_specifier(module, EdgeId::new(edge_index as u32))
+                        .is_some() => {}
                 EdgeTarget::External => {
                     let error = self.program_error(
                         module,
@@ -2538,6 +2673,18 @@ impl<'a, H: Host> Machine<'a, H> {
                     Err(kind) => Some(Found::Failure(kind)),
                 }
             }
+            HeapEntry::ExternalModuleNamespace { specifier } => {
+                let PropertyKey::Named(name) = key else {
+                    return None;
+                };
+                let export = self.registry.external[specifier]
+                    .exports
+                    .get(name.as_str())?;
+                let cell = export
+                    .cell
+                    .expect("external namespace exports link before evaluation");
+                Some(Found::Value(self.registry.cells[cell.0].value))
+            }
             HeapEntry::NativeFunction { properties, .. } => property_lookup(properties, key),
             HeapEntry::RegExp {
                 pattern,
@@ -2565,6 +2712,16 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 None
             }
+            HeapEntry::HashState { update, digest, .. } => {
+                let PropertyKey::Named(name) = key else {
+                    return None;
+                };
+                match name.as_str() {
+                    "update" => Some(Found::Value(*update)),
+                    "digest" => Some(Found::Value(*digest)),
+                    _ => None,
+                }
+            }
             HeapEntry::ProcessEnv { .. }
             | HeapEntry::String(_)
             | HeapEntry::BigInt(_)
@@ -2590,8 +2747,18 @@ impl<'a, H: Host> Machine<'a, H> {
                     Ok(Some(value))
                 }
             }
-            Some(ResolvedExport::External { module, edge, .. }) => {
-                Err(RuntimeErrorKind::ExternalModuleUnavailable { module, edge })
+            Some(ResolvedExport::External { module, edge, name }) => {
+                let Some(specifier) = self.external_specifier(module, edge) else {
+                    return Err(RuntimeErrorKind::ExternalModuleUnavailable { module, edge });
+                };
+                let name = self.constant_text(module, name);
+                let Some(export) = self.registry.external[specifier].exports.get(name) else {
+                    return Err(RuntimeErrorKind::ExternalModuleUnavailable { module, edge });
+                };
+                let Some(cell) = export.cell else {
+                    return Err(RuntimeErrorKind::ExternalModuleUnavailable { module, edge });
+                };
+                Ok(Some(self.registry.cells[cell.0].value))
             }
             None => Ok(None),
         }
@@ -2834,9 +3001,14 @@ impl<'a, H: Host> Machine<'a, H> {
                     operation: "set internal process environment",
                 }));
             }
-            HeapEntry::ModuleNamespace { .. } => {
+            HeapEntry::ModuleNamespace { .. } | HeapEntry::ExternalModuleNamespace { .. } => {
                 return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                     operation: "assign to module namespace",
+                }));
+            }
+            HeapEntry::HashState { .. } => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "assign to hash state",
                 }));
             }
         };
@@ -3043,8 +3215,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 HeapEntry::String(_)
                 | HeapEntry::BigInt(_)
                 | HeapEntry::PrivateName { .. }
-                | HeapEntry::Iterator { .. } => Ok(true),
-                HeapEntry::ModuleNamespace { .. } => Ok(false),
+                | HeapEntry::Iterator { .. }
+                | HeapEntry::HashState { .. } => Ok(true),
+                HeapEntry::ModuleNamespace { .. } | HeapEntry::ExternalModuleNamespace { .. } => {
+                    Ok(false)
+                }
             },
             None => Ok(true),
         }
@@ -3356,9 +3531,16 @@ impl<'a, H: Host> Machine<'a, H> {
                     names.sort();
                     Ok(names.into_iter().map(PropertyKey::Named).collect())
                 }
+                HeapEntry::ExternalModuleNamespace { specifier } => Ok(self.registry.external
+                    [specifier]
+                    .exports
+                    .keys()
+                    .map(|name| PropertyKey::Named((*name).to_owned()))
+                    .collect()),
                 HeapEntry::ProcessEnv { .. }
                 | HeapEntry::BigInt(_)
                 | HeapEntry::PrivateName { .. }
+                | HeapEntry::HashState { .. }
                 | HeapEntry::Iterator { .. } => Ok(Vec::new()),
             },
             None => Ok(Vec::new()),
@@ -3699,6 +3881,8 @@ impl<'a, H: Host> Machine<'a, H> {
                         | HeapEntry::Array { .. }
                         | HeapEntry::Function { .. }
                         | HeapEntry::ModuleNamespace { .. }
+                        | HeapEntry::ExternalModuleNamespace { .. }
+                        | HeapEntry::HashState { .. }
                         | HeapEntry::NativeFunction { .. }
                         | HeapEntry::RegExp { .. }
                         | HeapEntry::ProcessEnv { .. }
@@ -3730,6 +3914,8 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::Array { .. }
                     | HeapEntry::Function { .. }
                     | HeapEntry::ModuleNamespace { .. }
+                    | HeapEntry::ExternalModuleNamespace { .. }
+                    | HeapEntry::HashState { .. }
                     | HeapEntry::NativeFunction { .. }
                     | HeapEntry::PrivateName { .. }
                     | HeapEntry::RegExp { .. }
@@ -3757,6 +3943,8 @@ impl<'a, H: Host> Machine<'a, H> {
                     HeapEntry::Object { .. }
                     | HeapEntry::Array { .. }
                     | HeapEntry::ModuleNamespace { .. }
+                    | HeapEntry::ExternalModuleNamespace { .. }
+                    | HeapEntry::HashState { .. }
                     | HeapEntry::RegExp { .. }
                     | HeapEntry::ProcessEnv { .. }
                     | HeapEntry::Iterator { .. } => "object",
@@ -3882,11 +4070,13 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::Array { .. }
                 | HeapEntry::Function { .. }
                 | HeapEntry::ModuleNamespace { .. }
+                | HeapEntry::ExternalModuleNamespace { .. }
                 | HeapEntry::NativeFunction { .. }
                 | HeapEntry::RegExp { .. }
                 | HeapEntry::Iterator { .. }
                 | HeapEntry::ProcessEnv { .. }
-                | HeapEntry::PrivateName { .. } => self.value_to_string(value, 0).map(Some),
+                | HeapEntry::PrivateName { .. }
+                | HeapEntry::HashState { .. } => self.value_to_string(value, 0).map(Some),
                 HeapEntry::BigInt(_) => Ok(None),
             },
             None => Ok(None),
@@ -3910,8 +4100,10 @@ impl<'a, H: Host> Machine<'a, H> {
                         HeapEntry::String(text) | HeapEntry::BigInt(text) => Ok(text.clone()),
                         HeapEntry::Object { .. }
                         | HeapEntry::ModuleNamespace { .. }
+                        | HeapEntry::ExternalModuleNamespace { .. }
                         | HeapEntry::ProcessEnv { .. }
-                        | HeapEntry::Iterator { .. } => Ok("[object Object]".to_owned()),
+                        | HeapEntry::Iterator { .. }
+                        | HeapEntry::HashState { .. } => Ok("[object Object]".to_owned()),
                         HeapEntry::RegExp { pattern, flags, .. } => {
                             Ok(format!("/{pattern}/{flags}"))
                         }
