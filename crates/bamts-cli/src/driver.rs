@@ -8,11 +8,16 @@ use std::process::{Command, ExitStatus};
 use std::sync::Arc;
 
 use bamts_compiler::lower::{LowerError, LowerOptions, lower};
-use bamts_compiler::pipeline::{FrontendMode, FrontendRequest, compile_frontend};
-use bamts_compiler::source::{ScriptKind, SourceId, SourceText};
+use bamts_compiler::pipeline::{FrontendMode, FrontendRequest, compile_frontend_with_lints};
+use bamts_compiler::{
+    diagnostic::DiagnosticReport,
+    lint::{LintOverride, LintProfile, LintTable},
+    project::parse_bamts_toml,
+    source::{ScriptKind, SourceId, SourceText},
+};
 use bamts_runtime::{Limits, run_linked_program};
 
-use crate::args::{CliArgs, ExecutionTarget, Mode};
+use crate::args::{ArgsError, CliArgs, ExecutionTarget, Mode};
 use crate::diagnostics::{self, DiagnosticSource};
 
 const NODE_STATICLIB: &[u8] = include_bytes!(env!("BAMTS_NODE_STATICLIB"));
@@ -39,6 +44,11 @@ pub enum DriverError {
     },
     Diagnostics {
         rendered: String,
+    },
+    Usage(ArgsError),
+    LintConfig {
+        path: PathBuf,
+        message: String,
     },
     Lower(LowerError),
     Jit(bamts_codegen::JitError),
@@ -98,6 +108,11 @@ impl DriverError {
             _ => None,
         }
     }
+
+    #[must_use]
+    pub const fn is_usage_error(&self) -> bool {
+        matches!(self, Self::Usage(_))
+    }
 }
 
 impl fmt::Display for DriverError {
@@ -112,6 +127,10 @@ impl fmt::Display for DriverError {
                 path.display()
             ),
             Self::Diagnostics { .. } => formatter.write_str("source contains error diagnostics"),
+            Self::Usage(error) => error.fmt(formatter),
+            Self::LintConfig { path, message } => {
+                write!(formatter, "could not load lint configuration `{}`: {message}", path.display())
+            }
             Self::Lower(error) => write!(formatter, "source cannot be lowered: {error}"),
             Self::Jit(error) => write!(formatter, "JIT compilation failed: {error}"),
             Self::Native(error) => write!(formatter, "program execution failed: {error}"),
@@ -204,9 +223,11 @@ impl Error for DriverError {
             Self::Jit(error) => Some(error),
             Self::Native(error) => Some(error),
             Self::Aot(error) => Some(error),
+            Self::Usage(error) => Some(error),
             Self::MissingEntrypoint
             | Self::UnsupportedSourceExtension { .. }
             | Self::Diagnostics { .. }
+            | Self::LintConfig { .. }
             | Self::MultipleCompileInputs
             | Self::UnsupportedCompileTarget(_)
             | Self::UnsupportedOutputOption(_)
@@ -224,15 +245,88 @@ pub fn execute(args: &CliArgs) -> Result<CommandOutcome, DriverError> {
         Mode::Check => check(args),
         Mode::Compile => compile(args),
         Mode::Run => run(args),
+        Mode::Explain => {
+            let rule = args
+                .explain_rule
+                .as_deref()
+                .ok_or(DriverError::Usage(ArgsError::MissingExplainRule))?;
+            let explanation = crate::args::explain_rule(rule).map_err(DriverError::Usage)?;
+            Ok(CommandOutcome {
+                stdout: explanation.into_bytes(),
+                ..CommandOutcome::default()
+            })
+        }
     }
+}
+
+fn levels(args: &CliArgs) -> Result<LintTable, DriverError> {
+    let profile = if args.pedantic {
+        LintProfile::Pedantic
+    } else if args.strict {
+        LintProfile::Strict
+    } else {
+        LintProfile::Default
+    };
+    let mut levels = LintTable::new(profile);
+    if let Some(path) = lint_config_path(args) {
+        let source = fs::read_to_string(&path).map_err(|source| DriverError::ReadSource {
+            path: path.clone(),
+            source,
+        })?;
+        let config = parse_bamts_toml(&source).map_err(|error| DriverError::LintConfig {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+        levels.apply_config(&config).map_err(forbidden_lint_override)?;
+    }
+    let overrides = args.lint_overrides.iter().map(|override_arg| {
+        let flag = match override_arg.level {
+            bamts_compiler::lint::LintLevel::Allow => "-A",
+            bamts_compiler::lint::LintLevel::Warn => "-W",
+            bamts_compiler::lint::LintLevel::Deny => "-D",
+            bamts_compiler::lint::LintLevel::Forbid => "-F",
+        };
+        LintOverride::new(
+            override_arg.selector.as_str(),
+            override_arg.level,
+            format!("{flag} {}", override_arg.selector),
+        )
+    });
+    levels.apply_cli(overrides).map_err(forbidden_lint_override)?;
+    Ok(levels)
+}
+
+fn forbidden_lint_override(error: bamts_compiler::lint::ForbidOverrideError) -> DriverError {
+    DriverError::Usage(ArgsError::ForbiddenLintOverride {
+        rule: error.rule().slug().to_string(),
+        forbidden_by: error.forbidden_by().to_string(),
+        lowered_by: error.lowered_by().to_string(),
+    })
+}
+
+fn lint_config_path(args: &CliArgs) -> Option<PathBuf> {
+    let start = args.entrypoint.as_deref().map_or_else(
+        || std::env::current_dir().ok(),
+        |entrypoint| {
+            let path = Path::new(entrypoint);
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            if parent.is_absolute() {
+                Some(parent.to_path_buf())
+            } else {
+                std::env::current_dir().ok().map(|directory| directory.join(parent))
+            }
+        },
+    )?;
+    start.ancestors().map(|directory| directory.join("bamts.toml")).find(|path| path.is_file())
 }
 
 fn check(args: &CliArgs) -> Result<CommandOutcome, DriverError> {
     let paths = input_paths(args);
+    let levels = levels(args)?;
     let mut units = Vec::with_capacity(paths.len());
     for (index, path) in paths.iter().enumerate() {
         let source_id = SourceId::new(u32::try_from(index).unwrap_or(u32::MAX));
-        units.push(frontend(path, source_id)?);
+        units.push(frontend(path, source_id, &levels)?);
     }
 
     let diagnostics = units
@@ -252,7 +346,12 @@ fn check(args: &CliArgs) -> Result<CommandOutcome, DriverError> {
             text: &unit.source,
         })
         .collect::<Vec<_>>();
-    let rendered = diagnostics::render(args.diagnostics_format, &diagnostics, &sources);
+    let rendered = diagnostics::render_report(
+        args.diagnostics_format,
+        &DiagnosticReport::new(&diagnostics),
+        &sources,
+        args.error_limit,
+    );
     if units.iter().any(|unit| unit.output.has_errors()) {
         return Err(DriverError::Diagnostics { rendered });
     }
@@ -277,7 +376,8 @@ fn compile(args: &CliArgs) -> Result<CommandOutcome, DriverError> {
     }
 
     let entrypoint = required_entrypoint(args)?;
-    let unit = frontend(entrypoint, SourceId::new(0))?;
+    let levels = levels(args)?;
+    let unit = frontend(entrypoint, SourceId::new(0), &levels)?;
     let warnings = require_clean_frontend(args, &unit)?;
     let bytecode = lower(
         unit.output.source_file(),
@@ -303,7 +403,8 @@ fn compile(args: &CliArgs) -> Result<CommandOutcome, DriverError> {
 
 fn run(args: &CliArgs) -> Result<CommandOutcome, DriverError> {
     let entrypoint = required_entrypoint(args)?;
-    let unit = frontend(entrypoint, SourceId::new(0))?;
+    let levels = levels(args)?;
+    let unit = frontend(entrypoint, SourceId::new(0), &levels)?;
     let warnings = require_clean_frontend(args, &unit)?;
     let bytecode = lower(
         unit.output.source_file(),
@@ -345,19 +446,22 @@ struct FrontendUnit {
     output: bamts_compiler::pipeline::FrontendOutput,
 }
 
-fn frontend(path: &Path, source_id: SourceId) -> Result<FrontendUnit, DriverError> {
+fn frontend(path: &Path, source_id: SourceId, levels: &LintTable) -> Result<FrontendUnit, DriverError> {
     let source = fs::read_to_string(path).map_err(|source| DriverError::ReadSource {
         path: path.to_owned(),
         source,
     })?;
     let script_kind = script_kind(path)?;
     let source = Arc::new(SourceText::new(source));
-    let output = compile_frontend(FrontendRequest {
-        source_id,
-        script_kind,
-        source: Arc::clone(&source),
-        mode: FrontendMode::Check,
-    });
+    let output = compile_frontend_with_lints(
+        FrontendRequest {
+            source_id,
+            script_kind,
+            source: Arc::clone(&source),
+            mode: FrontendMode::Check,
+        },
+        levels,
+    );
     Ok(FrontendUnit {
         path: path.to_owned(),
         source_id,
@@ -369,14 +473,15 @@ fn frontend(path: &Path, source_id: SourceId) -> Result<FrontendUnit, DriverErro
 
 fn require_clean_frontend(args: &CliArgs, unit: &FrontendUnit) -> Result<String, DriverError> {
     let source_name = unit.path.to_string_lossy();
-    let rendered = diagnostics::render(
+    let rendered = diagnostics::render_report(
         args.diagnostics_format,
-        unit.output.diagnostics(),
+        &DiagnosticReport::new(unit.output.diagnostics()),
         &[DiagnosticSource {
             id: unit.source_id,
             name: &source_name,
             text: &unit.source,
         }],
+        args.error_limit,
     );
     if unit.output.has_errors() {
         Err(DriverError::Diagnostics { rendered })
@@ -653,7 +758,13 @@ fn publish_linked_executable(temporary: &Path, destination: &Path) -> Result<(),
 
 #[cfg(test)]
 mod tests {
-    use super::{DriverError, content_hash, probe_toolchain};
+    use bamts_compiler::{
+        lint::{LintLevel, SourceDialect, rule_by_name},
+    };
+
+    use crate::args::{ArgsError, parse_args};
+
+    use super::{DriverError, content_hash, levels, probe_toolchain};
 
     #[test]
     fn content_hash_is_stable_and_sensitive() {
@@ -678,5 +789,52 @@ mod tests {
             error.to_string(),
             "native linking for Cargo target `aarch64-unknown-linux-gnu` is unsupported from host `x86_64-unknown-linux-gnu`"
         );
+    }
+
+    #[test]
+    fn cli_rule_override_beats_a_later_group_override() {
+        let args = parse_args([
+            "check",
+            "-A",
+            "explicit-any",
+            "-D",
+            "escape-hatches",
+            "main.ts",
+        ])
+        .expect("arguments parse");
+        let table = levels(&args).expect("overrides resolve");
+        let explicit_any = rule_by_name("explicit-any").expect("registered rule").id();
+        let implicit_any = rule_by_name("implicit-any").expect("registered rule").id();
+        assert_eq!(table.level(explicit_any), LintLevel::Allow);
+        assert_eq!(table.level(implicit_any), LintLevel::Deny);
+    }
+
+    #[test]
+    fn lowering_forbid_is_a_typed_usage_error() {
+        let args = parse_args([
+            "check",
+            "-F",
+            "explicit-any",
+            "-A",
+            "explicit-any",
+            "main.ts",
+        ])
+        .expect("arguments parse");
+        assert!(matches!(
+            levels(&args),
+            Err(DriverError::Usage(ArgsError::ForbiddenLintOverride { .. }))
+        ));
+    }
+
+    #[test]
+    fn strict_cli_profile_keeps_javascript_rules_nonfatal() {
+        let args = parse_args(["check", "--strict", "vendored.js"]).expect("arguments parse");
+        let table = levels(&args).expect("profile resolves");
+        let footgun = rule_by_name("invalid-number-formatting-options")
+            .expect("registered footgun")
+            .id();
+        let typescript_only = rule_by_name("explicit-any").expect("registered rule").id();
+        assert_eq!(table.level_for_source(footgun, SourceDialect::JavaScript), LintLevel::Warn);
+        assert_eq!(table.level_for_source(typescript_only, SourceDialect::JavaScript), LintLevel::Allow);
     }
 }
