@@ -1,5 +1,7 @@
 use std::{fmt, fmt::Write as _, str::FromStr, sync::Arc};
 
+use crate::source::ScriptKind;
+
 /// A lint's ordered severity. A `forbid` level is an immutable lock.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum LintLevel {
@@ -142,6 +144,81 @@ impl RuleId {
     }
 }
 
+/// One source in an executable lint example. `resolves_to` names another source
+/// in the same example program and is used only when module semantics require it.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RuleExampleSource {
+    script_kind: ScriptKind,
+    text: &'static str,
+    resolves_to: Option<usize>,
+}
+
+impl RuleExampleSource {
+    #[must_use]
+    pub const fn new(script_kind: ScriptKind, text: &'static str) -> Self {
+        Self { script_kind, text, resolves_to: None }
+    }
+
+    #[must_use]
+    pub const fn resolving_to(mut self, source: usize) -> Self {
+        self.resolves_to = Some(source);
+        self
+    }
+
+    #[must_use]
+    pub const fn script_kind(self) -> ScriptKind { self.script_kind }
+
+    #[must_use]
+    pub const fn text(self) -> &'static str { self.text }
+
+    #[must_use]
+    pub const fn resolves_to(self) -> Option<usize> { self.resolves_to }
+}
+
+/// Compiler-option state consumed by configuration-phase lint rules.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct CompilerLintOptions {
+    pub preserve_const_enums: bool,
+    pub emit_decorator_metadata: bool,
+    pub use_define_for_class_fields: bool,
+}
+
+impl CompilerLintOptions {
+    pub const STANDARD: Self = Self {
+        preserve_const_enums: false,
+        emit_decorator_metadata: false,
+        use_define_for_class_fields: true,
+    };
+}
+
+/// The typed execution phase for one catalog example.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum RuleExampleCase {
+    Source(RuleExampleSource),
+    Program(&'static [RuleExampleSource]),
+    CompilerOptions(CompilerLintOptions),
+}
+
+/// A positive and negative executable contract carried by one rule definition.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RuleExamples {
+    trigger: RuleExampleCase,
+    clean: RuleExampleCase,
+}
+
+impl RuleExamples {
+    #[must_use]
+    pub const fn new(trigger: RuleExampleCase, clean: RuleExampleCase) -> Self {
+        Self { trigger, clean }
+    }
+
+    #[must_use]
+    pub const fn trigger(self) -> RuleExampleCase { self.trigger }
+
+    #[must_use]
+    pub const fn clean(self) -> RuleExampleCase { self.clean }
+}
+
 /// The complete metadata required to register a lint rule.
 ///
 /// Fields and construction are private: a rule identity can only come from [`RULES`],
@@ -154,6 +231,7 @@ pub struct RuleDefinition {
     rationale: &'static str,
     sound_alternative: &'static str,
     silence_flag: &'static str,
+    examples: RuleExamples,
 }
 
 impl RuleDefinition {
@@ -165,6 +243,7 @@ impl RuleDefinition {
         rationale: &'static str,
         sound_alternative: &'static str,
         silence_flag: &'static str,
+        examples: RuleExamples,
     ) -> Self {
         Self {
             id: RuleId { code, slug },
@@ -173,6 +252,7 @@ impl RuleDefinition {
             rationale,
             sound_alternative,
             silence_flag,
+            examples,
         }
     }
 
@@ -215,10 +295,33 @@ impl RuleDefinition {
     pub const fn silence_flag(&self) -> &'static str {
         self.silence_flag
     }
+
+    #[must_use]
+    pub const fn examples(&self) -> RuleExamples {
+        self.examples
+    }
+}
+
+macro_rules! source_example {
+    ($kind:ident, $text:literal) => {
+        RuleExampleCase::Source(RuleExampleSource::new(ScriptKind::$kind, $text))
+    };
+}
+
+macro_rules! examples {
+    ($trigger:literal, $clean:literal) => {
+        RuleExamples::new(
+            source_example!(TypeScript, $trigger),
+            source_example!(TypeScript, $clean),
+        )
+    };
+    ($kind:ident, $trigger:literal, $clean:literal) => {
+        RuleExamples::new(source_example!($kind, $trigger), source_example!($kind, $clean))
+    };
 }
 
 macro_rules! rule {
-    ($code:literal, $slug:literal, $group:ident, $level:ident, $rationale:literal, $alternative:literal) => {
+    ($code:literal, $slug:literal, $group:ident, $level:ident, $rationale:literal, $alternative:literal, $examples:expr) => {
         RuleDefinition::new(
             $code,
             $slug,
@@ -227,6 +330,7 @@ macro_rules! rule {
             $rationale,
             $alternative,
             concat!("-A ", $slug),
+            $examples,
         )
     };
 }
@@ -239,7 +343,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "Method parameters are bivariant, so a narrower handler can receive an incompatible value.",
-        "Use a function-property callback with a contravariant parameter."
+        "Use a function-property callback with a contravariant parameter.",
+        examples!("interface H { handle(x: Dog): void }", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W002",
@@ -247,7 +352,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "Mutable arrays are covariant, so a widened alias can write the wrong element type.",
-        "Expose readonly arrays across type boundaries."
+        "Expose readonly arrays across type boundaries.",
+        examples!("const dogs: Dog[] = []; const animals: Animal[] = dogs;", "const dogs: Animal[] = []; const animals: Animal[] = dogs;")
     ),
     rule!(
         "BAMTS-W003",
@@ -255,7 +361,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "A non-fresh object can bypass excess-property checks and hide misspelled fields.",
-        "Validate the object at its construction boundary."
+        "Validate the object at its construction boundary.",
+        examples!("const candidate = { keep: 1, extra: true }; const target: { keep: number } = candidate;", "const target: { keep: number } = { keep: 1, extra: true };")
     ),
     rule!(
         "BAMTS-W004",
@@ -263,7 +370,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "Deleting a required property breaks the declared object shape.",
-        "Model removability with an optional property or a separate value."
+        "Model removability with an optional property or a separate value.",
+        examples!("const item: { required: number } = { required: 1 }; delete item.required;", "const item: { optional?: number } = {}; delete item.optional;")
     ),
     rule!(
         "BAMTS-W005",
@@ -271,7 +379,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "A catch binding is untrusted until it is narrowed before member access.",
-        "Narrow the caught value with a runtime guard."
+        "Narrow the caught value with a runtime guard.",
+        examples!("try {} catch (error) { error.message; }", "try {} catch (error) { if (error instanceof Error) error.message; }")
     ),
     rule!(
         "BAMTS-W006",
@@ -279,7 +388,8 @@ pub static RULES: [RuleDefinition; 86] = [
         EscapeHatches,
         Warn,
         "Casting any through a generic return loses the proof required by every caller.",
-        "Validate the input and return a concrete checked type."
+        "Validate the input and return a concrete checked type.",
+        examples!("function f<T>(x:any):T{return x as T}", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W007",
@@ -287,7 +397,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "A dynamic tuple index can read beyond the tuple's known bounds.",
-        "Use a literal index or prove the index is in range."
+        "Use a literal index or prove the index is in range.",
+        examples!("const pair: [string, number] = [\"a\", 1]; pair[index];", "const pair: [string, number] = [\"a\", 1]; pair[1];")
     ),
     rule!(
         "BAMTS-W008",
@@ -295,7 +406,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "An index-signature read can be absent even when its value type excludes undefined.",
-        "Handle undefined after the lookup."
+        "Handle undefined after the lookup.",
+        examples!("interface D {[key: string]: number} declare const d:D; declare const k:string; const n=d[k];", "const colors: Record<'red', number>={red:1}; const n=colors['red'];")
     ),
     rule!(
         "BAMTS-W009",
@@ -303,7 +415,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "An optional property without undefined distinguishes absence from an explicit undefined value.",
-        "Omit the property or include undefined in its declared type."
+        "Omit the property or include undefined in its declared type.",
+        examples!("const o: {x?: number} = {x: undefined};", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W010",
@@ -311,7 +424,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "Extracting a receiver-dependent method loses the this binding it requires.",
-        "Bind the method or call it through its receiver."
+        "Bind the method or call it through its receiver.",
+        examples!("const f = obj.method; f();", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W011",
@@ -319,7 +433,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "Different getter and setter types hide an unsafe property boundary.",
-        "Use one compatible property type or an explicit conversion method."
+        "Use one compatible property type or an explicit conversion method.",
+        examples!("class C { get x(): number { return 1 } set x(v: string | number) {} }", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W012",
@@ -327,7 +442,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "A writable alias can mutate data promised as readonly elsewhere.",
-        "Keep the mutable value private and expose a readonly view."
+        "Keep the mutable value private and expose a readonly view.",
+        examples!("const r: {readonly x:number}=m; m.x=2;", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W013",
@@ -335,7 +451,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "A callback that accepts fewer parameters can silently discard required protocol data.",
-        "Declare the callback parameters you intentionally receive."
+        "Declare the callback parameters you intentionally receive.",
+        examples!("const f: (x:number,y:string)=>void = () => {};", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W014",
@@ -343,7 +460,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "A value returned from a void callback is silently discarded.",
-        "Use a block body when the return value is intentionally ignored."
+        "Use a block body when the return value is intentionally ignored.",
+        examples!("const f: () => void = () => 42;", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W015",
@@ -351,7 +469,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "Object.keys does not prove that runtime keys are limited to keyof T.",
-        "Validate keys at runtime or work from a closed key list."
+        "Validate keys at runtime or work from a closed key list.",
+        examples!("const ks = Object.keys(x) as (keyof typeof x)[];", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W016",
@@ -359,7 +478,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "Dot access through an index signature hides that a property may be absent.",
-        "Use bracket access and handle the missing value."
+        "Use bracket access and handle the missing value.",
+        examples!("interface D {[key:string]: number} declare const d:D; d.username;", "interface D {[key:string]: number} declare const d:D; d['username'];")
     ),
     rule!(
         "BAMTS-W017",
@@ -367,7 +487,8 @@ pub static RULES: [RuleDefinition; 86] = [
         EscapeHatches,
         Warn,
         "Explicit any disables type checking at the annotated boundary.",
-        "Use unknown and narrow it before use."
+        "Use unknown and narrow it before use.",
+        examples!("let value: any;", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W018",
@@ -375,7 +496,8 @@ pub static RULES: [RuleDefinition; 86] = [
         EscapeHatches,
         Warn,
         "An inferred any lets an untyped value flow without an explicit boundary.",
-        "Add an explicit checked type or unknown annotation."
+        "Add an explicit checked type or unknown annotation.",
+        examples!("function f(x) { return x; }", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W019",
@@ -383,7 +505,8 @@ pub static RULES: [RuleDefinition; 86] = [
         EscapeHatches,
         Warn,
         "A type assertion claims a narrower type without runtime proof.",
-        "Narrow with a guard or validate with a decoder."
+        "Narrow with a guard or validate with a decoder.",
+        examples!("const n = value as number;", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W020",
@@ -391,7 +514,8 @@ pub static RULES: [RuleDefinition; 86] = [
         EscapeHatches,
         Warn,
         "A double assertion bypasses assignability through any or unknown.",
-        "Convert or validate the value at the boundary."
+        "Convert or validate the value at the boundary.",
+        examples!("const n = value as unknown as number;", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W021",
@@ -399,7 +523,8 @@ pub static RULES: [RuleDefinition; 86] = [
         EscapeHatches,
         Warn,
         "A non-null assertion erases a possible null or undefined value.",
-        "Narrow the value before accessing it."
+        "Narrow the value before accessing it.",
+        examples!("node!.textContent;", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W022",
@@ -407,7 +532,8 @@ pub static RULES: [RuleDefinition; 86] = [
         EscapeHatches,
         Warn,
         "A definite-assignment assertion skips proof that a field is initialized.",
-        "Initialize the field or assign it in every constructor path."
+        "Initialize the field or assign it in every constructor path.",
+        examples!("class C { value!: string }", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W023",
@@ -415,7 +541,8 @@ pub static RULES: [RuleDefinition; 86] = [
         EscapeHatches,
         Warn,
         "A TypeScript diagnostic directive hides a compiler check instead of resolving it.",
-        "Fix the diagnostic or make the boundary explicit."
+        "Fix the diagnostic or make the boundary explicit.",
+        examples!("// @ts-ignore", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W024",
@@ -423,7 +550,8 @@ pub static RULES: [RuleDefinition; 86] = [
         NonErasable,
         Warn,
         "A value-bearing namespace requires runtime code instead of erasing as type syntax.",
-        "Use ES modules or an ambient namespace."
+        "Use ES modules or an ambient namespace.",
+        examples!("namespace N { export const x = 1 }", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W025",
@@ -431,7 +559,8 @@ pub static RULES: [RuleDefinition; 86] = [
         NonErasable,
         Warn,
         "A parameter property synthesizes a field assignment during compilation.",
-        "Declare the field and assign the constructor parameter explicitly."
+        "Declare the field and assign the constructor parameter explicitly.",
+        examples!("class C { constructor(public x: number) {} }", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W026",
@@ -439,7 +568,8 @@ pub static RULES: [RuleDefinition; 86] = [
         LegacySyntax,
         Warn,
         "Legacy decorators have semantics that differ from standard ECMAScript decorators.",
-        "Use standard decorators or an explicit wrapper."
+        "Use standard decorators or an explicit wrapper.",
+        examples!("@sealed class C {}", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W027",
@@ -447,7 +577,8 @@ pub static RULES: [RuleDefinition; 86] = [
         LegacySyntax,
         Warn,
         "Angle-bracket assertions are ambiguous with JSX syntax.",
-        "Use the `as T` assertion spelling."
+        "Use the `as T` assertion spelling.",
+        examples!("const n = <number>value;", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W028",
@@ -455,7 +586,8 @@ pub static RULES: [RuleDefinition; 86] = [
         LegacySyntax,
         Warn,
         "Declaration output that depends on cross-file inference is fragile and non-local.",
-        "Write an explicit exported type annotation."
+        "Write an explicit exported type annotation.",
+        RuleExamples::new(RuleExampleCase::Program(&[RuleExampleSource::new(ScriptKind::TypeScript, "import { make } from './dep.js'; export const value = make();").resolving_to(1), RuleExampleSource::new(ScriptKind::TypeScript, "export const make = (): number => 1;")]), source_example!(TypeScript, "export const value: number = 1;"))
     ),
     rule!(
         "BAMTS-W029",
@@ -463,7 +595,8 @@ pub static RULES: [RuleDefinition; 86] = [
         LegacySyntax,
         Warn,
         "JSX requires a configured runtime transform and cannot simply be erased.",
-        "Configure a JSX runtime or use ordinary function calls."
+        "Configure a JSX runtime or use ordinary function calls.",
+        examples!(TypeScriptReact, "const el = <Widget value={1} />;", "const safe = 1;")
     ),
     rule!(
         "BAMTS-W030",
@@ -471,7 +604,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Modules,
         Warn,
         "TypeScript import-equals and export-equals require target-specific module rewriting.",
-        "Use standard ESM import and export syntax."
+        "Use standard ESM import and export syntax.",
+        examples!("import fs = require(\"fs\");", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W031",
@@ -479,7 +613,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Modules,
         Warn,
         "A type-only import emitted as a value import creates a runtime dependency.",
-        "Use `import type` for type-only symbols."
+        "Use `import type` for type-only symbols.",
+        RuleExamples::new(RuleExampleCase::Program(&[RuleExampleSource::new(ScriptKind::TypeScript, "import { User } from './types.js'; const user: User = { name: 'Ada' };").resolving_to(1), RuleExampleSource::new(ScriptKind::TypeScript, "export interface User { name: string }")]), RuleExampleCase::Program(&[RuleExampleSource::new(ScriptKind::TypeScript, "import type { User } from './types.js'; const user: User = { name: 'Ada' };").resolving_to(1), RuleExampleSource::new(ScriptKind::TypeScript, "export interface User { name: string }")]))
     ),
     rule!(
         "BAMTS-W032",
@@ -487,7 +622,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Modules,
         Warn,
         "A type-only re-export emitted as a value re-export creates a runtime dependency.",
-        "Use `export type` for type-only symbols."
+        "Use `export type` for type-only symbols.",
+        RuleExamples::new(RuleExampleCase::Program(&[RuleExampleSource::new(ScriptKind::TypeScript, "export { User } from './types.js';").resolving_to(1), RuleExampleSource::new(ScriptKind::TypeScript, "export interface User { name: string }")]), RuleExampleCase::Program(&[RuleExampleSource::new(ScriptKind::TypeScript, "export type { User } from './types.js';").resolving_to(1), RuleExampleSource::new(ScriptKind::TypeScript, "export interface User { name: string }")]))
     ),
     rule!(
         "BAMTS-W033",
@@ -495,7 +631,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Modules,
         Allow,
         "CommonJS globals inside an ESM module depend on host-specific interop.",
-        "Use ESM exports or isolate the CommonJS bridge."
+        "Use ESM exports or isolate the CommonJS bridge.",
+        examples!("export const x = require('x');", "const x = require('x'); x;")
     ),
     rule!(
         "BAMTS-W034",
@@ -503,7 +640,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Modules,
         Allow,
         "A file without imports or exports silently becomes a global script.",
-        "Add an explicit export or force module detection."
+        "Add an explicit export or force module detection.",
+        examples!("const shared = 1;", "export {}; const shared = 1;")
     ),
     rule!(
         "BAMTS-W035",
@@ -511,7 +649,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Modules,
         Warn,
         "An unresolved side-effect import can conceal a missing runtime dependency.",
-        "Resolve the module or declare the host-provided virtual module."
+        "Resolve the module or declare the host-provided virtual module.",
+        RuleExamples::new(RuleExampleCase::Program(&[RuleExampleSource::new(ScriptKind::TypeScript, "import './missing.js';")]), RuleExampleCase::Program(&[RuleExampleSource::new(ScriptKind::TypeScript, "import './polyfill.js';").resolving_to(1), RuleExampleSource::new(ScriptKind::JavaScript, "globalThis.ready = true;")]))
     ),
     rule!(
         "BAMTS-W036",
@@ -519,7 +658,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Modules,
         Warn,
         "Relative ESM imports need a runtime file extension in Node-style resolution.",
-        "Write the explicit runtime extension."
+        "Write the explicit runtime extension.",
+        examples!("import {x} from \"./util\";", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W037",
@@ -527,7 +667,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Modules,
         Warn,
         "A default import from CommonJS can rely on synthetic interop semantics.",
-        "Use a namespace import or a real ESM default export."
+        "Use a namespace import or a real ESM default export.",
+        RuleExamples::new(RuleExampleCase::Program(&[RuleExampleSource::new(ScriptKind::TypeScript, "import legacy from './legacy.js'; legacy();").resolving_to(1), RuleExampleSource::new(ScriptKind::JavaScript, "module.exports = function legacy() {};")]), RuleExampleCase::Program(&[RuleExampleSource::new(ScriptKind::TypeScript, "import modern from './modern.js'; modern();").resolving_to(1), RuleExampleSource::new(ScriptKind::JavaScript, "export default function modern() {}")]))
     ),
     rule!(
         "BAMTS-W038",
@@ -535,7 +676,8 @@ pub static RULES: [RuleDefinition; 86] = [
         ClassSemantics,
         Allow,
         "A constructor dispatching to an overridable method can observe uninitialized derived state.",
-        "Defer the hook until construction is complete."
+        "Defer the hook until construction is complete.",
+        examples!("class B { constructor(){ this.init() } }", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W039",
@@ -543,7 +685,8 @@ pub static RULES: [RuleDefinition; 86] = [
         ClassSemantics,
         Allow,
         "An uninitialized field has different runtime presence under competing emit modes.",
-        "Initialize it or use `declare` when no own field is intended."
+        "Initialize it or use `declare` when no own field is intended.",
+        examples!("class C { value: string; }", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W040",
@@ -551,7 +694,8 @@ pub static RULES: [RuleDefinition; 86] = [
         ClassSemantics,
         Allow,
         "A defined field can shadow an inherited accessor instead of invoking it.",
-        "Use an accessor, `declare`, or a distinct field name."
+        "Use an accessor, `declare`, or a distinct field name.",
+        examples!("class B { get data():number{return 1} } class D extends B { data = 1; }", "class B { get data():number{return 1} } class D extends B { declare data:number; }")
     ),
     rule!(
         "BAMTS-W041",
@@ -559,7 +703,8 @@ pub static RULES: [RuleDefinition; 86] = [
         ClassSemantics,
         Allow,
         "An unmarked override can silently drift when its base member changes.",
-        "Mark the member with `override`."
+        "Mark the member with `override`.",
+        examples!("class B { run(){} } class D extends B { run(){} }", "class B { run(){} } class D extends B { override run(){} }")
     ),
     rule!(
         "BAMTS-W042",
@@ -567,7 +712,8 @@ pub static RULES: [RuleDefinition; 86] = [
         ClassSemantics,
         Allow,
         "A TypeScript private modifier erases and does not provide runtime privacy.",
-        "Use an ECMAScript `#private` field for runtime privacy."
+        "Use an ECMAScript `#private` field for runtime privacy.",
+        examples!("class C { private secret = 1 }", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W043",
@@ -575,7 +721,8 @@ pub static RULES: [RuleDefinition; 86] = [
         EnumSemantics,
         Warn,
         "A non-const enum creates a runtime object with non-erasable behavior.",
-        "Use a union or a const object when a runtime object is intentional."
+        "Use a union or a const object when a runtime object is intentional.",
+        examples!("enum Color { Red, Blue }", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W044",
@@ -583,7 +730,8 @@ pub static RULES: [RuleDefinition; 86] = [
         EnumSemantics,
         Warn,
         "A const enum relies on compile-time inlining across compilation boundaries.",
-        "Use a union or a const object."
+        "Use a union or a const object.",
+        examples!("const enum Code { Ok = 200 }", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W045",
@@ -591,7 +739,8 @@ pub static RULES: [RuleDefinition; 86] = [
         EnumSemantics,
         Warn,
         "Numeric enums accept arbitrary numbers, weakening the enum boundary.",
-        "Use a string enum or validate the numeric value."
+        "Use a string enum or validate the numeric value.",
+        examples!("enum E { A } let e:E=E.A; let n:number=e;", "enum E { A } const e=E.A;")
     ),
     rule!(
         "BAMTS-W046",
@@ -599,7 +748,8 @@ pub static RULES: [RuleDefinition; 86] = [
         EnumSemantics,
         Warn,
         "A heterogeneous enum mixes unrelated representations and complicates consumers.",
-        "Use one representation or a discriminated union."
+        "Use one representation or a discriminated union.",
+        examples!("enum Answer { No = 0, Yes = \"YES\" }", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W047",
@@ -607,7 +757,8 @@ pub static RULES: [RuleDefinition; 86] = [
         EnumSemantics,
         Warn,
         "A computed enum member depends on runtime evaluation rather than a stable constant.",
-        "Use a constant initializer or a separate runtime value."
+        "Use a constant initializer or a separate runtime value.",
+        examples!("enum E { X = getValue() }", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W048",
@@ -615,7 +766,8 @@ pub static RULES: [RuleDefinition; 86] = [
         EnumSemantics,
         Warn,
         "Numeric enum reverse lookup depends on generated runtime mappings.",
-        "Store the display name explicitly."
+        "Store the display name explicitly.",
+        examples!("enum E { A } const name=E[E.A];", "enum E { A } const value=E.A;")
     ),
     rule!(
         "BAMTS-W049",
@@ -623,7 +775,8 @@ pub static RULES: [RuleDefinition; 86] = [
         DeclarationMerging,
         Warn,
         "Same-scope interfaces merge implicitly, making a type's shape non-local.",
-        "Declare one complete interface or use a closed type alias."
+        "Declare one complete interface or use a closed type alias.",
+        examples!("interface Box {x:number} interface Box {y:number}", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W050",
@@ -631,7 +784,8 @@ pub static RULES: [RuleDefinition; 86] = [
         DeclarationMerging,
         Warn,
         "A namespace merged with a value creates an implicit hybrid declaration.",
-        "Use an explicit object or separate module export."
+        "Use an explicit object or separate module export.",
+        examples!("function f(){} namespace f { export const x=1 }", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W051",
@@ -639,7 +793,8 @@ pub static RULES: [RuleDefinition; 86] = [
         DeclarationMerging,
         Warn,
         "A global augmentation mutates ambient types for unrelated code.",
-        "Expose a local wrapper or explicit global installation boundary."
+        "Expose a local wrapper or explicit global installation boundary.",
+        examples!("declare global { interface Window { x: number } }", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W052",
@@ -647,7 +802,8 @@ pub static RULES: [RuleDefinition; 86] = [
         DeclarationMerging,
         Warn,
         "A module augmentation changes another module's contract outside that module.",
-        "Wrap or extend the module through an explicit local API."
+        "Wrap or extend the module through an explicit local API.",
+        examples!("declare module \"lib\" { interface X { y: number } }", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W053",
@@ -655,7 +811,8 @@ pub static RULES: [RuleDefinition; 86] = [
         DeclarationMerging,
         Warn,
         "An ambient value declaration cannot prove that the runtime provides the value.",
-        "Pass the value explicitly or install it through a checked host API."
+        "Pass the value explicitly or install it through a checked host API.",
+        examples!("declare const injected: string;", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W054",
@@ -663,7 +820,8 @@ pub static RULES: [RuleDefinition; 86] = [
         JavaScriptCompatibility,
         Allow,
         "JavaScript source enters a typed program with weaker static guarantees.",
-        "Convert the source to TypeScript or isolate it behind typed declarations."
+        "Convert the source to TypeScript or isolate it behind typed declarations.",
+        RuleExamples::new(source_example!(JavaScript, "const legacy = 1;"), source_example!(TypeScript, "const safe: number = 1;"))
     ),
     rule!(
         "BAMTS-W055",
@@ -671,7 +829,8 @@ pub static RULES: [RuleDefinition; 86] = [
         JavaScriptCompatibility,
         Allow,
         "JSDoc types make JavaScript comments carry part of the type system.",
-        "Move the file to TypeScript with native type syntax."
+        "Move the file to TypeScript with native type syntax.",
+        examples!(JavaScript, "/** @type {number} */ let n = 1;", "const safe = 1;")
     ),
     rule!(
         "BAMTS-W056",
@@ -679,7 +838,8 @@ pub static RULES: [RuleDefinition; 86] = [
         JavaScriptCompatibility,
         Allow,
         "Prototype assignment spreads class behavior across mutable runtime objects.",
-        "Use class syntax or an explicit factory object."
+        "Use class syntax or an explicit factory object.",
+        examples!(JavaScript, "Ctor.prototype.run = function() {};", "const safe = 1;")
     ),
     rule!(
         "BAMTS-W057",
@@ -687,7 +847,8 @@ pub static RULES: [RuleDefinition; 86] = [
         JavaScriptCompatibility,
         Allow,
         "A per-file ts-check directive makes type-checking policy non-uniform.",
-        "Use project-wide checkJs or convert the file to TypeScript."
+        "Use project-wide checkJs or convert the file to TypeScript.",
+        examples!(JavaScript, "// @ts-check", "const safe = 1;")
     ),
     rule!(
         "BAMTS-W058",
@@ -695,7 +856,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Opinionated,
         Allow,
         "An interface can merge later, leaving an API shape open unintentionally.",
-        "Use a type alias for a closed shape."
+        "Use a type alias for a closed shape.",
+        examples!("interface Point { x: number }", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W059",
@@ -703,7 +865,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Opinionated,
         Allow,
         "A mutable array type advertises mutation where a read-only view may suffice.",
-        "Accept `readonly T[]` unless mutation is required."
+        "Accept `readonly T[]` unless mutation is required.",
+        examples!("function f(xs: string[]) {}", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W060",
@@ -711,7 +874,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Opinionated,
         Allow,
         "A method signature keeps bivariant parameter checking.",
-        "Use a function-property signature for callback members."
+        "Use a function-property signature for callback members.",
+        examples!("interface H { run(x: Animal): void }", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W061",
@@ -719,7 +883,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Opinionated,
         Allow,
         "A wildcard barrel export obscures the package's public dependency surface.",
-        "Re-export the intended names explicitly."
+        "Re-export the intended names explicitly.",
+        examples!("export * from \"./internal.js\";", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W062",
@@ -727,7 +892,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Opinionated,
         Allow,
         "A default export lets importers rename one public binding arbitrarily.",
-        "Use a named export."
+        "Use a named export.",
+        examples!("export default function run() {}", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W063",
@@ -735,7 +901,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Opinionated,
         Allow,
         "A discriminated-union switch omits a reachable variant.",
-        "Handle every variant and assert never in the default branch."
+        "Handle every variant and assert never in the default branch.",
+        examples!("type S = { kind: \"a\" } | { kind: \"b\" }; function f(s: S) { switch (s.kind) { case \"a\": break; } }", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W064",
@@ -743,7 +910,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Opinionated,
         Allow,
         "A long positional parameter list makes calls easy to misorder.",
-        "Use a parameter object or smaller cohesive functions."
+        "Use a parameter object or smaller cohesive functions.",
+        examples!("function f(a:number,b:number,c:number,d:number,e:number) {}", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W065",
@@ -751,7 +919,8 @@ pub static RULES: [RuleDefinition; 86] = [
         ControlFlow,
         Warn,
         "A function can complete without returning the value its signature implies.",
-        "Return on every reachable path or include undefined in the return type."
+        "Return on every reachable path or include undefined in the return type.",
+        examples!("function f(x:boolean){ if(x)return 1 }", "function f(x:boolean){ if(x)return 0; try { return 1; } catch { return 2; } }")
     ),
     rule!(
         "BAMTS-W066",
@@ -759,7 +928,8 @@ pub static RULES: [RuleDefinition; 86] = [
         ControlFlow,
         Warn,
         "A non-empty switch case falls through without an explicit transfer.",
-        "Add break, return, throw, or an explicit fallthrough marker."
+        "Add break, return, throw, or an explicit fallthrough marker.",
+        examples!("switch(x){case 1: work(); case 2: stop();}", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W067",
@@ -767,7 +937,8 @@ pub static RULES: [RuleDefinition; 86] = [
         ControlFlow,
         Warn,
         "A statement is unreachable under the program's control flow.",
-        "Remove it or restructure the surrounding control flow."
+        "Remove it or restructure the surrounding control flow.",
+        examples!("function f(){ return; work(); }", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W068",
@@ -775,7 +946,8 @@ pub static RULES: [RuleDefinition; 86] = [
         ControlFlow,
         Warn,
         "A label is declared but never targeted, obscuring control flow.",
-        "Remove the label or add its intended labeled transfer."
+        "Remove the label or add its intended labeled transfer.",
+        examples!("unused: for (;;) { break; }", "outer: for (;;) { break outer; }")
     ),
     rule!(
         "BAMTS-W069",
@@ -783,7 +955,8 @@ pub static RULES: [RuleDefinition; 86] = [
         ControlFlow,
         Warn,
         "A local binding is never read after declaration.",
-        "Remove it or use it deliberately."
+        "Remove it or use it deliberately.",
+        examples!("function f(){ const x=1; }", "function f(){ const x=1; return x; }")
     ),
     rule!(
         "BAMTS-W070",
@@ -791,7 +964,8 @@ pub static RULES: [RuleDefinition; 86] = [
         ControlFlow,
         Warn,
         "A declared parameter is never read by its function.",
-        "Remove it or name an intentionally unused protocol parameter clearly."
+        "Remove it or name an intentionally unused protocol parameter clearly.",
+        examples!("function f(unused: number) {}", "function f(used: number) { return used; }")
     ),
     rule!(
         "BAMTS-W071",
@@ -799,7 +973,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "Known number-formatting arguments lie outside the ECMAScript-supported range.",
-        "Validate or clamp the argument before calling the method."
+        "Validate or clamp the argument before calling the method.",
+        examples!("(42).toString(1);", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W072",
@@ -807,7 +982,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "Integer-like object keys are ordered before other keys, not purely by insertion.",
-        "Avoid insertion-order dependence or sort the keys explicitly."
+        "Avoid insertion-order dependence or sort the keys explicitly.",
+        examples!("Object.keys({b: 1, \"2\": 2});", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W073",
@@ -815,7 +991,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "JSON.stringify can throw for BigInt or return undefined for a top-level value.",
-        "Validate serializability and handle the undefined result."
+        "Validate serializability and handle the undefined result.",
+        examples!("JSON.stringify(10n);", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W074",
@@ -823,7 +1000,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "JSON.parse returns untrusted data that is consumed as a trusted type.",
-        "Parse to unknown and validate with a decoder."
+        "Parse to unknown and validate with a decoder.",
+        examples!("const u: User = JSON.parse(text);", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W075",
@@ -831,7 +1009,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "Comparator-free sort coerces elements to strings rather than numeric order.",
-        "Pass an explicit numeric or domain comparator."
+        "Pass an explicit numeric or domain comparator.",
+        examples!("[10, 2, 5].sort();", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W076",
@@ -839,7 +1018,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "Loose equality can depend on implicit abstract coercion.",
-        "Use strict equality or an explicit conversion."
+        "Use strict equality or an explicit conversion.",
+        examples!("\"0\" == false;", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W077",
@@ -847,7 +1027,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "Implicit object-to-primitive conversion can call surprising coercion hooks.",
-        "Call String, Number, or an explicit conversion method."
+        "Call String, Number, or an explicit conversion method.",
+        examples!("\"key_\" + Object.create(null);", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W078",
@@ -855,7 +1036,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "Interpolating a symbol directly into a template literal throws.",
-        "Wrap it with String or use its description."
+        "Wrap it with String or use its description.",
+        examples!("`ID: ${Symbol(\"x\")}`", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W079",
@@ -863,7 +1045,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "NaN is never strictly equal to itself, so a direct comparison is ineffective.",
-        "Use Number.isNaN."
+        "Use Number.isNaN.",
+        examples!("if (value === NaN) {}", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W080",
@@ -871,7 +1054,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Unsoundness,
         Warn,
         "A toStringTag override is not a trustworthy runtime brand.",
-        "Use a string tag and validate the actual value shape."
+        "Use a string tag and validate the actual value shape.",
+        examples!("({ [Symbol.toStringTag]: 123 });", "const safe: number = 1;")
     ),
     rule!(
         "BAMTS-W081",
@@ -879,7 +1063,8 @@ pub static RULES: [RuleDefinition; 86] = [
         ClassSemantics,
         Allow,
         "An uninitialized derived field defines an own property that shadows an inherited accessor.",
-        "Use `declare`, initialize deliberately, or rename the field."
+        "Use `declare`, initialize deliberately, or rename the field.",
+        examples!("class B { get data():number{return 1} } class D extends B { data:number; }", "class B { get data():number{return 1} } class D extends B { declare data:number; }")
     ),
     rule!(
         "BAMTS-W082",
@@ -887,7 +1072,8 @@ pub static RULES: [RuleDefinition; 86] = [
         NonErasable,
         Warn,
         "Preserving const enums retains runtime enum objects while inlining their uses.",
-        "Disable preserveConstEnums or replace the enum."
+        "Disable preserveConstEnums or replace the enum.",
+        RuleExamples::new(RuleExampleCase::CompilerOptions(CompilerLintOptions { preserve_const_enums: true, ..CompilerLintOptions::STANDARD }), RuleExampleCase::CompilerOptions(CompilerLintOptions::STANDARD))
     ),
     rule!(
         "BAMTS-W083",
@@ -895,7 +1081,8 @@ pub static RULES: [RuleDefinition; 86] = [
         LegacySyntax,
         Warn,
         "Emitted decorator metadata couples runtime reflection to compiler type information.",
-        "Disable metadata emit and provide explicit metadata."
+        "Disable metadata emit and provide explicit metadata.",
+        RuleExamples::new(RuleExampleCase::CompilerOptions(CompilerLintOptions { emit_decorator_metadata: true, ..CompilerLintOptions::STANDARD }), RuleExampleCase::CompilerOptions(CompilerLintOptions::STANDARD))
     ),
     rule!(
         "BAMTS-W084",
@@ -903,7 +1090,8 @@ pub static RULES: [RuleDefinition; 86] = [
         ClassSemantics,
         Allow,
         "Legacy class-field set semantics invoke inherited setters instead of defining fields.",
-        "Enable standard define semantics."
+        "Enable standard define semantics.",
+        RuleExamples::new(RuleExampleCase::CompilerOptions(CompilerLintOptions { use_define_for_class_fields: false, ..CompilerLintOptions::STANDARD }), RuleExampleCase::CompilerOptions(CompilerLintOptions::STANDARD))
     ),
     rule!(
         "BAMTS-W085",
@@ -911,7 +1099,8 @@ pub static RULES: [RuleDefinition; 86] = [
         JavaScriptCompatibility,
         Deny,
         "TypeScript-only syntax in a JavaScript file violates that file's source dialect.",
-        "Rename the file to TypeScript or remove the type syntax."
+        "Rename the file to TypeScript or remove the type syntax.",
+        examples!(JavaScript, "interface Point { x: number }", "const safe = 1;")
     ),
     rule!(
         "BAMTS-W086",
@@ -919,7 +1108,8 @@ pub static RULES: [RuleDefinition; 86] = [
         Modules,
         Warn,
         "An ESM named import from CommonJS may not exist in its statically detected exports.",
-        "Use the CommonJS default export or a declared named export."
+        "Use the CommonJS default export or a declared named export.",
+        RuleExamples::new(RuleExampleCase::Program(&[RuleExampleSource::new(ScriptKind::TypeScript, "import { helper } from './legacy.js'; helper();").resolving_to(1), RuleExampleSource::new(ScriptKind::JavaScript, "exports.other = () => 1;")]), RuleExampleCase::Program(&[RuleExampleSource::new(ScriptKind::TypeScript, "import { helper } from './legacy.js'; helper();").resolving_to(1), RuleExampleSource::new(ScriptKind::JavaScript, "function helper() {} module.exports = { helper };")]))
     ),
 ];
 
@@ -934,7 +1124,7 @@ pub fn rule_reference() -> String {
     for rule in RULES {
         writeln!(
             reference,
-            "\n## `{}`: `{}`\n\n- Group: `{}`\n- Default level: `{}`\n- Rationale: {}\n- Sound alternative: {}\n- Silence: `{}`",
+            "\n## `{}`: `{}`\n\n- Group: `{}`\n- Default level: `{}`\n- Rationale: {}\n- Sound alternative: {}\n- Silence: `{}`\n- Trigger: {}\n- Clean: {}",
             rule.code(),
             rule.slug(),
             rule.group().slug(),
@@ -942,11 +1132,39 @@ pub fn rule_reference() -> String {
             rule.rationale(),
             rule.sound_alternative(),
             rule.silence_flag(),
+            render_example(rule.examples().trigger()),
+            render_example(rule.examples().clean()),
         )
         .expect("writing to a String cannot fail");
     }
 
     reference
+}
+
+fn render_example(example: RuleExampleCase) -> String {
+    match example {
+        RuleExampleCase::Source(source) => render_example_source(source),
+        RuleExampleCase::Program(sources) => sources
+            .iter()
+            .map(|source| render_example_source(*source))
+            .collect::<Vec<_>>()
+            .join("<br>"),
+        RuleExampleCase::CompilerOptions(options) => format!(
+            "<code>preserveConstEnums={}, emitDecoratorMetadata={}, useDefineForClassFields={}</code>",
+            options.preserve_const_enums,
+            options.emit_decorator_metadata,
+            options.use_define_for_class_fields,
+        ),
+    }
+}
+
+fn render_example_source(source: RuleExampleSource) -> String {
+    let escaped = source
+        .text()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    format!("<code>{:?}: {escaped}</code>", source.script_kind())
 }
 
 
@@ -1373,11 +1591,17 @@ impl LintTable {
                 | "BAMTS-W080"
         );
         let control_flow = RULES[rule_index(rule)].group() == RuleGroup::ControlFlow;
-        if spec_footgun || control_flow {
-            LintLevel::Warn
-        } else {
-            LintLevel::Allow
+        let javascript_compatibility =
+            RULES[rule_index(rule)].group() == RuleGroup::JavaScriptCompatibility;
+        if spec_footgun || control_flow || javascript_compatibility {
+            let effective = self.level(rule);
+            return if effective == LintLevel::Allow {
+                LintLevel::Allow
+            } else {
+                LintLevel::Warn
+            };
         }
+        LintLevel::Allow
     }
 
     /// Applies the project baseline: groups first, then the more-specific rule lane.
@@ -1759,7 +1983,7 @@ mod tests {
     }
 
     #[test]
-    fn javascript_dialect_is_warning_only_for_footguns_and_control_flow() {
+    fn javascript_dialect_preserves_allow_and_clamps_enabled_rules_to_warning() {
         let table = LintTable::new(LintProfile::Pedantic);
         assert_eq!(
             table.level_for_source(
@@ -1774,6 +1998,17 @@ mod tests {
         );
         assert_eq!(
             table.level_for_source(rule("explicit-any"), SourceDialect::JavaScript),
+            LintLevel::Allow
+        );
+        assert_eq!(
+            table.level_for_source(rule("javascript-syntax-rejection"), SourceDialect::JavaScript),
+            LintLevel::Warn
+        );
+        assert_eq!(
+            LintTable::new(LintProfile::Default).level_for_source(
+                rule("javascript-input"),
+                SourceDialect::JavaScript,
+            ),
             LintLevel::Allow
         );
     }

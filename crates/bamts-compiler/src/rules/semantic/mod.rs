@@ -8,7 +8,9 @@ use crate::{
     diagnostic::{Diagnostic, Recovered},
     lint::{rule_by_code, LintTable, SourceDialect},
     source::{SourceId, TextRange, Utf16Pos},
-    syntax::SourceFile,
+    syntax::{
+        ExportDeclaration, ImportBinding, ModuleExportName, SourceFile, Statement, TokenKind,
+    },
 };
 
 mod coercions;
@@ -627,6 +629,151 @@ pub(crate) fn collect_program_facts(
             model.replace_facts(facts);
         }
     }
+
+    for recovered in sources {
+        let source = recovered.product();
+        let mut additions = Vec::new();
+        for statement in source.statements() {
+            let Statement::Import(import) = statement.data() else {
+                continue;
+            };
+            let edge = edges.iter().find(|edge| {
+                edge.from == source.source_id() && edge.specifier == statement.id()
+            });
+            if import.clause.is_none() {
+                if edge.is_none() {
+                    additions.push(HazardFact {
+                        hazard: SemanticHazard::UncheckedSideEffectImport,
+                        range: statement.range(),
+                        note: None,
+                    });
+                }
+                continue;
+            }
+            let Some(edge) = edge else {
+                continue;
+            };
+            let Some(target) = source_map.get(&edge.to) else {
+                continue;
+            };
+            let commonjs = commonjs_exports(target);
+            if !commonjs.is_commonjs {
+                continue;
+            }
+            let clause = import.clause.as_ref().expect("checked above");
+            if clause.default.is_some() && !has_esm_default_export(target) {
+                additions.push(HazardFact {
+                    hazard: SemanticHazard::InteropDependentDefaultImport,
+                    range: statement.range(),
+                    note: None,
+                });
+            }
+            if let Some(ImportBinding::Named(specifiers)) = &clause.binding {
+                for specifier in specifiers {
+                    let Some(name) = module_export_name(source, &specifier.data().imported) else {
+                        continue;
+                    };
+                    if !commonjs.named.iter().any(|exported| exported == &name) {
+                        additions.push(HazardFact {
+                            hazard: SemanticHazard::CjsEsmNamedExportMismatch,
+                            range: specifier.range(),
+                            note: Some(format!("CommonJS target does not statically export `{name}`").into_boxed_str()),
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(model) = models.get_mut(&source.source_id()) {
+            let mut facts = model.facts().clone();
+            for fact in additions {
+                facts.push(fact);
+            }
+            model.replace_facts(facts);
+        }
+    }
+}
+
+struct CommonJsExports<'a> {
+    is_commonjs: bool,
+    named: Vec<&'a str>,
+}
+
+fn commonjs_exports(source: &SourceFile) -> CommonJsExports<'_> {
+    let tokens = source.tokens().iter().filter_map(|token| {
+        if matches!(token.kind(), TokenKind::Whitespace | TokenKind::LineComment | TokenKind::BlockComment) {
+            return None;
+        }
+        Some((token.kind(), source.token_text(token)?))
+    }).collect::<Vec<_>>();
+    let mut is_commonjs = false;
+    let mut named = Vec::new();
+    for window in tokens.windows(3) {
+        if window[0].1 == "module" && window[1].0 == TokenKind::Dot && window[2].1 == "exports" {
+            is_commonjs = true;
+        }
+        if window[0].1 == "exports" && window[1].0 == TokenKind::Dot && window[2].0 == TokenKind::Identifier {
+            is_commonjs = true;
+            named.push(window[2].1);
+        }
+    }
+    for index in 0..tokens.len().saturating_sub(4) {
+        if tokens[index].1 != "module"
+            || tokens[index + 1].0 != TokenKind::Dot
+            || tokens[index + 2].1 != "exports"
+            || tokens[index + 3].0 != TokenKind::Eq
+            || tokens[index + 4].0 != TokenKind::LBrace
+        {
+            continue;
+        }
+        is_commonjs = true;
+        let mut depth = 1_usize;
+        let mut cursor = index + 5;
+        while cursor < tokens.len() && depth > 0 {
+            match tokens[cursor].0 {
+                TokenKind::LBrace => depth += 1,
+                TokenKind::RBrace => depth -= 1,
+                TokenKind::Identifier | TokenKind::StringLiteral
+                    if depth == 1
+                        && matches!(
+                            tokens.get(cursor.wrapping_sub(1)).map(|token| token.0),
+                            Some(TokenKind::LBrace | TokenKind::Comma)
+                        )
+                        && matches!(
+                            tokens.get(cursor + 1).map(|token| token.0),
+                            Some(
+                                TokenKind::Colon
+                                    | TokenKind::Comma
+                                    | TokenKind::RBrace
+                                    | TokenKind::LParen
+                            )
+                        ) =>
+                {
+                    named.push(tokens[cursor].1.trim_matches(['"', '\'']));
+                }
+                _ => {}
+            }
+            cursor += 1;
+        }
+    }
+    CommonJsExports { is_commonjs, named }
+}
+
+fn has_esm_default_export(source: &SourceFile) -> bool {
+    source.statements().iter().any(|statement| {
+        matches!(statement.data(), Statement::Export(ExportDeclaration::Default(_)))
+    })
+}
+
+fn module_export_name<'a>(source: &'a SourceFile, name: &ModuleExportName) -> Option<&'a str> {
+    let range = match name {
+        ModuleExportName::Identifier(node) => node.range(),
+        ModuleExportName::String(node) => node.range(),
+        ModuleExportName::Missing(_) => return None,
+    };
+    let text = source.source_text();
+    let start = text.utf16_to_byte(range.start()).ok()?;
+    let end = text.utf16_to_byte(range.end()).ok()?;
+    text.as_str().get(start..end).map(|value| value.trim_matches(['"', '\'']))
 }
 
 #[cfg(test)]
