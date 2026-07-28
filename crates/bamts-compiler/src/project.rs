@@ -1,3 +1,5 @@
+use crate::lint::{LintConfig, LintLevel, LintSetting};
+
 use std::{
     fmt,
     path::{Component, Path, PathBuf},
@@ -627,6 +629,145 @@ const fn hex_value(byte: u8) -> Option<u16> {
     }
 }
 
+/// A syntax or value error in the lint-owned portion of `bamts.toml`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BamtsTomlError {
+    line: usize,
+    message: Arc<str>,
+}
+
+impl BamtsTomlError {
+    #[must_use]
+    pub const fn line(&self) -> usize {
+        self.line
+    }
+
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for BamtsTomlError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "bamts.toml:{}: {}", self.line, self.message)
+    }
+}
+
+impl std::error::Error for BamtsTomlError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LintTomlSection {
+    Other,
+    Groups,
+    Rules,
+}
+
+/// Parses only `[lints.groups]` and `[lints.rules]` from an already-loaded
+/// `bamts.toml`. Other native BamTS sections remain owned by their subsystems.
+pub fn parse_bamts_toml(source: &str) -> Result<LintConfig, BamtsTomlError> {
+    let mut section = LintTomlSection::Other;
+    let mut groups = Vec::new();
+    let mut rules = Vec::new();
+    for (line_index, raw_line) in source.lines().enumerate() {
+        let line_number = line_index + 1;
+        let line = strip_toml_comment(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            let Some(name) = line
+                .strip_prefix('[')
+                .and_then(|line| line.strip_suffix(']'))
+            else {
+                return Err(bamts_toml_error(line_number, "malformed table header"));
+            };
+            section = match name.trim() {
+                "lints.groups" => LintTomlSection::Groups,
+                "lints.rules" => LintTomlSection::Rules,
+                _ => LintTomlSection::Other,
+            };
+            continue;
+        }
+        if section == LintTomlSection::Other {
+            continue;
+        }
+        let Some((raw_name, raw_level)) = line.split_once('=') else {
+            return Err(bamts_toml_error(
+                line_number,
+                "lint setting must be `name = \"level\"`",
+            ));
+        };
+        let name = parse_toml_atom(raw_name.trim()).ok_or_else(|| {
+            bamts_toml_error(
+                line_number,
+                "lint name must be a non-empty bare or quoted key",
+            )
+        })?;
+        let level_name = parse_toml_atom(raw_level.trim())
+            .ok_or_else(|| bamts_toml_error(line_number, "lint level must be a quoted string"))?;
+        if !raw_level.trim().starts_with('"') {
+            return Err(bamts_toml_error(
+                line_number,
+                "lint level must be a quoted string",
+            ));
+        }
+        let level = level_name.parse::<LintLevel>().map_err(|_| {
+            bamts_toml_error(
+                line_number,
+                "lint level must be one of allow, warn, deny, or forbid",
+            )
+        })?;
+        let setting = LintSetting::new(name, level, format!("bamts.toml:{line_number}"));
+        match section {
+            LintTomlSection::Groups => groups.push(setting),
+            LintTomlSection::Rules => rules.push(setting),
+            LintTomlSection::Other => unreachable!("other sections were skipped"),
+        }
+    }
+    Ok(LintConfig::new(groups, rules))
+}
+
+fn strip_toml_comment(line: &str) -> &str {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            '#' if !quoted => return &line[..index],
+            _ => {}
+        }
+    }
+    line
+}
+
+fn parse_toml_atom(value: &str) -> Option<&str> {
+    if let Some(quoted) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    {
+        (!quoted.is_empty() && !quoted.contains(['"', '\\'])).then_some(quoted)
+    } else {
+        (!value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+        .then_some(value)
+    }
+}
+
+fn bamts_toml_error(line: usize, message: &'static str) -> BamtsTomlError {
+    BamtsTomlError {
+        line,
+        message: Arc::from(message),
+    }
+}
+
 /// A strict tsconfig schema or confinement failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConfigError {
@@ -691,6 +832,68 @@ impl PathMapping {
     #[must_use]
     pub fn targets(&self) -> &[PathBuf] {
         &self.targets
+    }
+}
+/// The deliberately narrow tsconfig view consumed by lint configuration.
+///
+/// No TypeScript strictness switch changes BamTS lint levels; those live only in
+/// `bamts.toml` and the BamTS profile/CLI surface.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LintTsConfig {
+    target: Option<Arc<str>>,
+    module: Option<Arc<str>>,
+    module_resolution: Option<Arc<str>>,
+    paths: Arc<[PathMapping]>,
+}
+
+impl LintTsConfig {
+    /// Parses only `paths`, `target`, `module`, and `moduleResolution`.
+    pub fn parse(
+        root: &ProjectRoot,
+        config_path: impl AsRef<Path>,
+        source: &str,
+    ) -> Result<Self, ConfigError> {
+        let path = root.confine(config_path)?;
+        let directory = path
+            .parent()
+            .ok_or_else(|| PathError::PathHasNoParent { path: path.clone() })?;
+        let raw = parse_jsonc(source)?
+            .as_object()
+            .ok_or(ConfigError::RootMustBeObject)?
+            .clone();
+        let compiler = match raw.get("compilerOptions") {
+            None => None,
+            Some(value) => Some(value.as_object().ok_or_else(|| ConfigError::InvalidField {
+                field: Arc::from("compilerOptions"),
+                expected: "an object",
+            })?),
+        };
+        Ok(Self {
+            target: optional_nested_string(compiler, "target")?,
+            module: optional_nested_string(compiler, "module")?,
+            module_resolution: optional_nested_string(compiler, "moduleResolution")?,
+            paths: parse_path_mappings(root, directory, compiler)?,
+        })
+    }
+
+    #[must_use]
+    pub fn target(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
+
+    #[must_use]
+    pub fn module(&self) -> Option<&str> {
+        self.module.as_deref()
+    }
+
+    #[must_use]
+    pub fn module_resolution(&self) -> Option<&str> {
+        self.module_resolution.as_deref()
+    }
+
+    #[must_use]
+    pub fn paths(&self) -> &[PathMapping] {
+        &self.paths
     }
 }
 
@@ -1827,14 +2030,58 @@ fn resolve_package_target(
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigError, JsonValue, JsoncErrorKind, ModuleResolutionError, PackageError, PackageJson,
-        PackageMode, PackageTarget, ProjectConfig, ProjectRoot, ResolutionConditions,
-        ResolutionFlavor, parse_jsonc, plan_relative_module,
+        ConfigError, JsonValue, JsoncErrorKind, LintTsConfig, ModuleResolutionError, PackageError,
+        PackageJson, PackageMode, PackageTarget, ProjectConfig, ProjectRoot, ResolutionConditions,
+        ResolutionFlavor, parse_bamts_toml, parse_jsonc, plan_relative_module,
     };
     use std::path::{Path, PathBuf};
 
     fn root() -> ProjectRoot {
         ProjectRoot::new("/workspace/corpus").expect("absolute test root")
+    }
+
+    #[test]
+    fn bamts_toml_reads_only_lint_groups_and_rules() {
+        let config = parse_bamts_toml(
+            r#"
+                title = "ignored"
+                [lints.groups]
+                escape-hatches = "deny"
+                [unrelated]
+                setting = "ignored"
+                [lints.rules]
+                BAMTS-W017 = "forbid" # exact rule
+            "#,
+        )
+        .expect("valid bamts.toml lint tables");
+        assert_eq!(config.groups().len(), 1);
+        assert_eq!(config.groups()[0].name(), "escape-hatches");
+        assert_eq!(config.rules().len(), 1);
+        assert_eq!(config.rules()[0].name(), "BAMTS-W017");
+        assert_eq!(config.rules()[0].source(), "bamts.toml:8");
+    }
+
+    #[test]
+    fn lint_tsconfig_ignores_typescript_strictness_options() {
+        let config = LintTsConfig::parse(
+            &root(),
+            "/workspace/corpus/tsconfig.json",
+            r#"{
+                "compilerOptions": {
+                    "target": "ES2022",
+                    "module": "NodeNext",
+                    "moduleResolution": "NodeNext",
+                    "paths": {"@app/*": ["src/*"]},
+                    "strict": true,
+                    "useDefineForClassFields": false
+                }
+            }"#,
+        )
+        .expect("supported tsconfig view");
+        assert_eq!(config.target(), Some("ES2022"));
+        assert_eq!(config.module(), Some("NodeNext"));
+        assert_eq!(config.module_resolution(), Some("NodeNext"));
+        assert_eq!(config.paths()[0].pattern(), "@app/*");
     }
 
     #[test]
