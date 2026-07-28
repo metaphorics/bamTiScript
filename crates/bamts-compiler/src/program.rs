@@ -29,12 +29,37 @@ pub enum ModuleEdgeKind {
     DynamicRuntime,
 }
 
+/// The canonical identity of a resolved module dependency.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ModuleTarget {
+    Local(SourceId),
+    External(Arc<str>),
+}
+
+impl ModuleTarget {
+    #[must_use]
+    pub const fn local_source_id(&self) -> Option<SourceId> {
+        match self {
+            Self::Local(source_id) => Some(*source_id),
+            Self::External(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn external_specifier(&self) -> Option<&str> {
+        match self {
+            Self::Local(_) => None,
+            Self::External(specifier) => Some(specifier),
+        }
+    }
+}
+
 /// One source-anchored, resolved dependency.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModuleEdge {
     kind: ModuleEdgeKind,
     specifier: Arc<str>,
-    target: SourceId,
+    target: ModuleTarget,
     range: TextRange,
 }
 
@@ -50,8 +75,8 @@ impl ModuleEdge {
     }
 
     #[must_use]
-    pub const fn target(&self) -> SourceId {
-        self.target
+    pub const fn target(&self) -> &ModuleTarget {
+        &self.target
     }
 
     #[must_use]
@@ -143,7 +168,7 @@ impl ResolvedProgram {
     }
 
     /// Returns the eager runtime closure in the program's canonical order.
-    /// Type-only and dynamic edges do not cause eager runtime initialization.
+    /// Type-only, dynamic, and external edges do not cause eager runtime initialization.
     #[must_use]
     pub fn runtime_modules(&self) -> Vec<&ResolvedModule> {
         let mut reachable = HashSet::new();
@@ -154,14 +179,15 @@ impl ResolvedProgram {
             }
             let module = self
                 .module(source_id)
-                .expect("every edge target belongs to the resolved program");
-            pending.extend(
-                module
-                    .dependencies()
-                    .iter()
-                    .filter(|edge| edge.kind == ModuleEdgeKind::StaticRuntime)
-                    .map(ModuleEdge::target),
-            );
+                .expect("every local edge target belongs to the resolved program");
+            pending.extend(module.dependencies().iter().filter_map(|edge| {
+                match (edge.kind, edge.target()) {
+                    (ModuleEdgeKind::StaticRuntime, ModuleTarget::Local(source_id)) => {
+                        Some(*source_id)
+                    }
+                    _ => None,
+                }
+            }));
         }
         self.modules
             .iter()
@@ -406,7 +432,11 @@ impl ProgramLoader {
         &self,
         importer: &Path,
         edge: &UnresolvedEdge,
-    ) -> Result<PathBuf, ProgramLoadError> {
+    ) -> Result<ResolvedEdgeTarget, ProgramLoadError> {
+        if edge.specifier.starts_with("node:") {
+            return Ok(ResolvedEdgeTarget::External(Arc::clone(&edge.specifier)));
+        }
+
         let flavor = match edge.kind {
             ModuleEdgeKind::TypeOnly => ResolutionFlavor::Types,
             ModuleEdgeKind::StaticRuntime | ModuleEdgeKind::DynamicRuntime => {
@@ -426,22 +456,31 @@ impl ProgramLoader {
                 source,
             })?;
             self.canonical_selection(plan.candidates())?
+                .map(ResolvedEdgeTarget::Local)
         } else if edge.specifier.starts_with('#') {
             self.resolve_package_import(importer, edge, flavor)?
         } else {
             match self.resolve_mapped(&edge.specifier, flavor)? {
-                Some(mapped) => Some(mapped),
-                None => self.resolve_package(importer, edge, flavor)?,
+                Some(mapped) => Some(ResolvedEdgeTarget::Local(mapped)),
+                None => self
+                    .resolve_package(importer, edge, flavor)?
+                    .map(ResolvedEdgeTarget::Local),
             }
         };
-        selected.ok_or_else(|| {
-            ProgramLoadError::UnresolvedModule(diagnostic(
-                importer,
-                &edge.specifier,
-                edge.kind,
-                edge.range,
-            ))
-        })
+        if let Some(target) = selected {
+            return Ok(target);
+        }
+        if edge.kind == ModuleEdgeKind::TypeOnly
+            && split_package_specifier(&edge.specifier).is_some()
+        {
+            return Ok(ResolvedEdgeTarget::External(Arc::clone(&edge.specifier)));
+        }
+        Err(ProgramLoadError::UnresolvedModule(diagnostic(
+            importer,
+            &edge.specifier,
+            edge.kind,
+            edge.range,
+        )))
     }
 
     fn resolve_mapped(
@@ -516,7 +555,7 @@ impl ProgramLoader {
         importer: &Path,
         edge: &UnresolvedEdge,
         flavor: ResolutionFlavor,
-    ) -> Result<Option<PathBuf>, ProgramLoadError> {
+    ) -> Result<Option<ResolvedEdgeTarget>, ProgramLoadError> {
         let mut directory = importer.parent();
         while let Some(current) = directory {
             if !current.starts_with(self.root.path()) {
@@ -547,7 +586,9 @@ impl ProgramLoader {
                         source,
                     })?;
                 return match target {
-                    PackageTarget::Path(path) => self.select_absolute(&path, flavor),
+                    PackageTarget::Path(path) => Ok(self
+                        .select_absolute(&path, flavor)?
+                        .map(ResolvedEdgeTarget::Local)),
                     PackageTarget::External(specifier) => {
                         let external = UnresolvedEdge {
                             kind: edge.kind,
@@ -555,8 +596,11 @@ impl ProgramLoader {
                             range: edge.range,
                         };
                         match self.resolve_mapped(&external.specifier, flavor)? {
-                            Some(mapped) => Ok(Some(mapped)),
-                            None => self.resolve_package(importer, &external, flavor),
+                            Some(mapped) => Ok(Some(ResolvedEdgeTarget::Local(mapped))),
+                            None => match self.resolve_package(importer, &external, flavor)? {
+                                Some(package) => Ok(Some(ResolvedEdgeTarget::Local(package))),
+                                None => Ok(Some(ResolvedEdgeTarget::External(external.specifier))),
+                            },
                         }
                     }
                 };
@@ -568,6 +612,12 @@ impl ProgramLoader {
         }
         Ok(None)
     }
+}
+
+#[derive(Clone, Debug)]
+enum ResolvedEdgeTarget {
+    Local(PathBuf),
+    External(Arc<str>),
 }
 
 struct LoadState<'a> {
@@ -597,8 +647,12 @@ impl LoadState<'_> {
         let unresolved = collect_edges(parsed.product());
         let mut dependencies = Vec::with_capacity(unresolved.len());
         for edge in unresolved {
-            let target_path = self.loader.resolve_edge(&path, &edge)?;
-            let target = self.visit(target_path)?;
+            let target = match self.loader.resolve_edge(&path, &edge)? {
+                ResolvedEdgeTarget::Local(target_path) => {
+                    ModuleTarget::Local(self.visit(target_path)?)
+                }
+                ResolvedEdgeTarget::External(specifier) => ModuleTarget::External(specifier),
+            };
             dependencies.push(ModuleEdge {
                 kind: edge.kind,
                 specifier: edge.specifier,
@@ -1316,7 +1370,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use super::{ModuleEdgeKind, ProgramLoadError, ProgramLoader};
+    use super::{ModuleEdgeKind, ModuleTarget, ProgramLoadError, ProgramLoader};
     use crate::project::{ProjectConfig, ProjectRoot};
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -1423,7 +1477,10 @@ mod tests {
         let b = &program.modules()[0];
 
         assert_eq!(names(&program), ["b.ts", "a.ts"]);
-        assert_eq!(b.dependencies()[0].target(), program.entrypoint_id());
+        assert_eq!(
+            b.dependencies()[0].target(),
+            &ModuleTarget::Local(program.entrypoint_id())
+        );
     }
 
     #[test]
@@ -1536,5 +1593,117 @@ mod tests {
             diagnostic.importer().file_name(),
             Some(Path::new("main.ts").as_os_str())
         );
+    }
+
+    #[test]
+    fn retains_node_builtin_as_external_static_runtime_edge() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "main.ts",
+            "import { parseArgs } from 'node:util'; void parseArgs;",
+        );
+
+        let program = fixture.loader().load("main.ts").unwrap();
+        let edge = &program.entrypoint().dependencies()[0];
+
+        assert_eq!(names(&program), ["main.ts"]);
+        assert_eq!(edge.kind(), ModuleEdgeKind::StaticRuntime);
+        assert_eq!(edge.target().external_specifier(), Some("node:util"));
+        assert_eq!(program.runtime_modules().len(), 1);
+    }
+
+    #[test]
+    fn preserves_unresolved_type_package_as_external_identity() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "import type { JsonValue } from 'type-fest';");
+
+        let program = fixture.loader().load("main.ts").unwrap();
+        let edge = &program.entrypoint().dependencies()[0];
+
+        assert_eq!(edge.kind(), ModuleEdgeKind::TypeOnly);
+        assert_eq!(edge.target().external_specifier(), Some("type-fest"));
+        assert_eq!(program.runtime_modules().len(), 1);
+    }
+
+    #[test]
+    fn unresolved_ordinary_runtime_package_is_rejected() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "import 'waybread';");
+
+        let ProgramLoadError::UnresolvedModule(diagnostic) =
+            fixture.loader().load("main.ts").unwrap_err()
+        else {
+            panic!("expected unresolved-module diagnostic");
+        };
+
+        assert_eq!(diagnostic.kind(), ModuleEdgeKind::StaticRuntime);
+        assert_eq!(diagnostic.specifier(), "waybread");
+    }
+
+    #[test]
+    fn retains_dynamic_engine_module_as_external_edge() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "package.json",
+            r##"{"name":"root","imports":{"#engine":"engine:clock"}}"##,
+        );
+        fixture.write(
+            "main.ts",
+            "async function load() { return import('#engine'); }",
+        );
+
+        let program = fixture.loader().load("main.ts").unwrap();
+        let edge = &program.entrypoint().dependencies()[0];
+
+        assert_eq!(edge.kind(), ModuleEdgeKind::DynamicRuntime);
+        assert_eq!(edge.specifier(), "#engine");
+        assert_eq!(edge.target().external_specifier(), Some("engine:clock"));
+        assert_eq!(program.runtime_modules().len(), 1);
+    }
+
+    #[test]
+    fn local_type_package_takes_precedence_over_external_fallback() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "import type { Shape } from 'waybread';");
+        fixture.write(
+            "node_modules/waybread/package.json",
+            r#"{"name":"waybread","types":"./index.d.ts"}"#,
+        );
+        fixture.write(
+            "node_modules/waybread/index.d.ts",
+            "export interface Shape { x: number }",
+        );
+
+        let program = fixture.loader().load("main.ts").unwrap();
+        let edge = &program.entrypoint().dependencies()[0];
+
+        assert_eq!(names(&program), ["index.d.ts", "main.ts"]);
+        assert!(matches!(edge.target(), ModuleTarget::Local(_)));
+    }
+
+    #[test]
+    fn loads_every_declared_corpus_program_graph() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let manifest = fs::read_to_string(repository.join("corpus/manifest.toml")).unwrap();
+        let entrypoints: Vec<_> = manifest
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("entrypoint = \"")
+                    .and_then(|value| value.strip_suffix('"'))
+            })
+            .collect();
+        assert_eq!(entrypoints.len(), 20);
+
+        let root = ProjectRoot::new(repository).unwrap();
+        let config = ProjectConfig::parse(&root, root.path().join("tsconfig.json"), "{}").unwrap();
+        let loader = ProgramLoader::new(&root, config.options()).unwrap();
+        for entrypoint in entrypoints {
+            loader
+                .load(entrypoint)
+                .unwrap_or_else(|error| panic!("{entrypoint}: {error}"));
+        }
     }
 }
