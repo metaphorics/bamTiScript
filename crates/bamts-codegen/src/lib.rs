@@ -1934,7 +1934,7 @@ mod tests {
         assert_eq!(signature.params[1].value_type, types::I64);
         assert_eq!(signature.returns.len(), 1);
         assert_eq!(signature.returns[0].value_type, types::I32);
-        assert_eq!(function.symbol, "bamts_fn_0");
+        assert_eq!(function.symbol, "bamts_m0_fn_0");
         assert_eq!(function.id.get(), 0);
         assert_eq!(lowered.entry.get(), 0);
     }
