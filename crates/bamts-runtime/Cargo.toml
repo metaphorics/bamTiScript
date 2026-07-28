@@ -4,6 +4,17 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[features]
+default = []
+# Marker feature: the runtime's native engine and `run_linked_program` are
+# unconditional and accept a caller-supplied `NativeEntryTable`, so no AOT-image
+# linkage lives here. `main` and `bamts_native::linked_program()` belong to the
+# concrete host crate (bamts-node), avoiding a runtime -> node dependency cycle.
+aot-main = []
+
 [dependencies]
 bamts-bytecode = { path = "../bamts-bytecode" }
 bamts-native = { path = "../bamts-native", features = ["gc"] }

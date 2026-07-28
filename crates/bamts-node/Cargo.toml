@@ -4,9 +4,27 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
-[dependencies]
-bamts-runtime = { path = "../bamts-runtime" }
-bamts-native = { path = "../bamts-native", features = ["node-host"] }
+[lib]
+crate-type = ["rlib", "staticlib"]
 
-[lints]
-workspace = true
+[features]
+default = ["node-host"]
+node-host = ["bamts-native/node-host"]
+aot-main = [
+    "node-host",
+    "dep:bamts-bytecode",
+    "bamts-native/aot-image",
+]
+
+[dependencies]
+bamts-bytecode = { path = "../bamts-bytecode", optional = true }
+bamts-native = { path = "../bamts-native" }
+bamts-runtime = { path = "../bamts-runtime" }
+
+[lints.rust]
+# `unsafe_code` is downgraded from the workspace `forbid` to `deny` so that a
+# single `#[allow(unsafe_code)]` may cover the one required item: the
+# edition-2024 `#[unsafe(no_mangle)]` export marker on the AOT staticlib `main`.
+# The crate has no unsafe operations; every unsafe operation lives in
+# bamts-native. Crate-wide `deny` still rejects any accidental unsafe elsewhere.
+unsafe_code = "deny"

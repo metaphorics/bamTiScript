@@ -4,11 +4,25 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[dependencies]
+# JIT linkage only. Off by default and activated exclusively by `jit-entry`, so
+# the default, `gc`, `node-host`, and `aot-image` builds carry no Cranelift
+# dependency. Pinned to match bamts-codegen's Cranelift pin (`=0.134.2`) so the
+# `host-jit` closure resolves a single version of each crate.
+cranelift-jit = { version = "=0.134.2", optional = true }
+cranelift-module = { version = "=0.134.2", optional = true }
+
 [features]
 default = []
 gc = []
 node-host = []
-jit-entry = []
+# The lifetime-bound `JitEntry` over a finalized `cranelift-jit` function. Pulls
+# the Cranelift dependencies so a consumer that only enables `jit-entry` (e.g.
+# bamts-codegen under `host-jit`) links the JIT surface without a second toggle.
+jit-entry = ["dep:cranelift-jit", "dep:cranelift-module"]
+# The `linked_program()` reader of the external `bamts_program_descriptor`
+# symbol. No dependencies: the AOT path never links Cranelift.
+aot-image = []
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

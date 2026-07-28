@@ -72,11 +72,16 @@ dependencies = [
 [[package]]
 name = "bamts-native"
 version = "0.0.0"
+dependencies = [
+ "cranelift-jit",
+ "cranelift-module",
+]
 
 [[package]]
 name = "bamts-node"
 version = "0.0.0"
 dependencies = [
+ "bamts-bytecode",
  "bamts-native",
  "bamts-runtime",
 ]
