@@ -1,10 +1,9 @@
 //! Shared, backend-neutral Cranelift lowering for verified BamTS bytecode.
 //!
-//! This crate turns a [`bamts_bytecode::Module<Verified>`] into Cranelift IR
-//! through one lowering function, [`lower_module`]. It produces a stable
-//! [`LoweredModule`] record (one [`ir::Function`] per bytecode function plus
-//! its ABI signature, resume-dispatch tokens, and required runtime helpers)
-//! that later feature-gated backends consume:
+//! This crate turns a canonical [`bamts_bytecode::Program<Verified>`] into
+//! Cranelift IR through [`lower_program`]. It retains one [`LoweredModule`] per
+//! program module, with module-local pools and module-qualified native symbols,
+//! for both feature-gated backends:
 //!
 //! * a `host-jit` backend that finalizes each `ir::Function` into executable
 //!   memory, and
@@ -176,8 +175,8 @@ use std::error::Error;
 use std::fmt;
 
 use bamts_bytecode::{
-    AccessorKind, BinaryOp, ExceptionHandler, FunctionId, Instruction, IteratorKind, Module, Pc,
-    Register, UnaryOp, Verified,
+    AccessorKind, BinaryOp, ExceptionHandler, FunctionId, Instruction, IteratorKind, Module,
+    ModuleId, Pc, Program, Register, UnaryOp, Verified,
 };
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
@@ -193,6 +192,8 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
 /// Byte offset of `ShadowFrame.bytecode_pc` (a `u32`).
 const SHADOW_FRAME_PC_OFFSET: i32 = 8;
+/// Byte offset of `ShadowFrame.module_id` (a `u32`).
+const SHADOW_FRAME_MODULE_OFFSET: i32 = 12;
 /// Byte offset of `ShadowFrame.handles` (a `*mut Value`).
 const SHADOW_FRAME_HANDLES_OFFSET: i32 = 16;
 /// Byte offset of `Completion.value` within the out-parameter.
@@ -231,6 +232,9 @@ pub const HELPER_NAMESPACE: u32 = 1;
 const _: () = {
     use core::mem::offset_of;
     assert!(offset_of!(bamts_native::ShadowFrame, bytecode_pc) == SHADOW_FRAME_PC_OFFSET as usize);
+    assert!(
+        offset_of!(bamts_native::ShadowFrame, module_id) == SHADOW_FRAME_MODULE_OFFSET as usize
+    );
     assert!(offset_of!(bamts_native::ShadowFrame, handles) == SHADOW_FRAME_HANDLES_OFFSET as usize);
     assert!(core::mem::size_of::<bamts_native::Completion>() == VALUE_BYTES as usize);
     assert!(bamts_native::Value::UNDEFINED.to_bits() == UNDEFINED_BITS as u64);
@@ -707,6 +711,32 @@ impl fmt::Display for LowerError {
 
 impl Error for LowerError {}
 
+/// A deterministic lowering failure anchored to its canonical program module.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgramLowerError {
+    /// The module whose bytecode could not be lowered.
+    pub module: ModuleId,
+    /// The module-local lowering failure.
+    pub kind: LowerError,
+}
+
+impl fmt::Display for ProgramLowerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "module {} could not be lowered: {}",
+            self.module.get(),
+            self.kind
+        )
+    }
+}
+
+impl Error for ProgramLowerError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.kind)
+    }
+}
+
 // -- Lowered records ---------------------------------------------------------
 
 /// One lowered function: its Cranelift IR plus the metadata a backend needs to
@@ -744,10 +774,12 @@ impl fmt::Debug for LoweredFunction {
     }
 }
 
-/// The complete lowering of a verified module.
+/// The complete lowering of one verified module within a program.
 #[derive(Clone)]
 pub struct LoweredModule {
-    /// One lowered function per bytecode function, in index order.
+    /// The canonical program-local module id.
+    pub id: ModuleId,
+    /// One lowered function per bytecode function, in module-local index order.
     pub functions: Vec<LoweredFunction>,
     /// The module entry function.
     pub entry: FunctionId,
@@ -758,6 +790,7 @@ pub struct LoweredModule {
 impl fmt::Debug for LoweredModule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LoweredModule")
+            .field("id", &self.id)
             .field("functions", &self.functions)
             .field("entry", &self.entry)
             .field("call_conv", &self.call_conv)
@@ -765,28 +798,60 @@ impl fmt::Debug for LoweredModule {
     }
 }
 
-/// The linker symbol for the lowered function at `index`.
+/// The shared lowering of one canonical verified program.
+#[derive(Clone, Debug)]
+pub struct LoweredProgram {
+    /// One lowering per program module, in canonical module-id order.
+    pub modules: Vec<LoweredModule>,
+    /// The program entry module.
+    pub entry_module: ModuleId,
+    /// The entry function local to `entry_module`.
+    pub entry_function: FunctionId,
+}
+
+/// The collision-free linker symbol for a module-qualified lowered function.
 #[must_use]
-pub fn function_symbol(index: u32) -> String {
-    format!("bamts_fn_{index}")
+pub fn function_symbol(module_id: u32, function_id: u32) -> String {
+    format!("bamts_m{module_id}_fn_{function_id}")
 }
 
 // -- Lowering entry point ----------------------------------------------------
 
-/// Lowers every function of a verified module to Cranelift IR.
+/// Lowers every function of every module in a verified canonical program.
 ///
-/// `config` is supplied by the backend from its ISA (`isa.frontend_config()`);
-/// it fixes the calling convention and pointer type. The target must be 64-bit.
-/// Each produced function is validated (signature and register-slot bounds) and
-/// then run through Cranelift's IR verifier before return, so a successful
-/// result is structurally valid IR.
-///
-/// # Errors
-///
-/// Returns [`LowerError`] for a non-64-bit target, an unaddressable function
-/// count, an unaddressable register file, a signature mismatch, or an internal
-/// IR-verification failure.
-pub fn lower_module(
+/// Modules remain separate: function and constant ids are never flattened or
+/// renumbered. Each error carries the module id whose lowering failed.
+pub fn lower_program(
+    program: &Program<Verified>,
+    config: TargetFrontendConfig,
+) -> Result<LoweredProgram, ProgramLowerError> {
+    let mut modules = Vec::with_capacity(program.modules().len());
+    for (index, module) in program.modules().iter().enumerate() {
+        let module_id = ModuleId::new(index as u32);
+        modules.push(
+            lower_code_module(module_id, module.code(), config).map_err(|kind| {
+                ProgramLowerError {
+                    module: module_id,
+                    kind,
+                }
+            })?,
+        );
+    }
+    let entry_module = program.entry();
+    let entry_function = program
+        .module(entry_module)
+        .expect("verified program entry module exists")
+        .code()
+        .entry();
+    Ok(LoweredProgram {
+        modules,
+        entry_module,
+        entry_function,
+    })
+}
+
+fn lower_code_module(
+    module_id: ModuleId,
     module: &Module<Verified>,
     config: TargetFrontendConfig,
 ) -> Result<LoweredModule, LowerError> {
@@ -812,6 +877,7 @@ pub fn lower_module(
         // Bounds checked above.
         let id = FunctionId::new(index as u32);
         let lowered = lower_function(
+            module_id,
             id,
             function,
             &entry_signature,
@@ -823,6 +889,7 @@ pub fn lower_module(
     }
 
     Ok(LoweredModule {
+        id: module_id,
         functions,
         entry: module.entry(),
         call_conv,
@@ -858,6 +925,7 @@ fn validate_slots(id: FunctionId, function: &bamts_bytecode::Function) -> Result
 }
 
 fn lower_function(
+    module_id: ModuleId,
     id: FunctionId,
     function: &bamts_bytecode::Function,
     entry_signature: &Signature,
@@ -896,7 +964,7 @@ fn lower_function(
 
     Ok(LoweredFunction {
         id,
-        symbol: function_symbol(id.get()),
+        symbol: function_symbol(module_id.get(), id.get()),
         signature: entry_signature.clone(),
         clif,
         entry_points,
@@ -1827,7 +1895,7 @@ mod tests {
             Vec::new(),
         );
         let module = single(function);
-        let lowered = lower_module(&module, host_config()).expect("lowers");
+        let lowered = lower_code_module(ModuleId::new(0), &module, host_config()).expect("lowers");
         assert_eq!(lowered.functions[0].capture_count, 2);
     }
 
@@ -1841,13 +1909,13 @@ mod tests {
     }
 
     fn clif_of(module: &Module<Verified>) -> String {
-        let lowered = lower_module(module, host_config()).expect("lowers");
+        let lowered = lower_code_module(ModuleId::new(0), module, host_config()).expect("lowers");
         lowered.functions[0].clif.display().to_string()
     }
 
     /// Lower a module and return the single function's helpers and CLIF text.
     fn lower_one(module: &Module<Verified>) -> (Vec<Helper>, String) {
-        let lowered = lower_module(module, host_config()).expect("lowers");
+        let lowered = lower_code_module(ModuleId::new(0), module, host_config()).expect("lowers");
         let function = &lowered.functions[0];
         (
             function.helpers.clone(),
@@ -1858,7 +1926,7 @@ mod tests {
     #[test]
     fn entry_signature_is_the_native_abi() {
         let module = single(func(1, vec![Instruction::Halt], Vec::new()));
-        let lowered = lower_module(&module, host_config()).expect("lowers");
+        let lowered = lower_code_module(ModuleId::new(0), &module, host_config()).expect("lowers");
         let function = &lowered.functions[0];
         let signature = &function.signature;
         assert_eq!(signature.params.len(), 2);
@@ -1885,7 +1953,7 @@ mod tests {
             "undefined store missing:\n{clif}"
         );
         assert!(clif.contains("return"), "must return:\n{clif}");
-        let lowered = lower_module(&module, host_config()).expect("lowers");
+        let lowered = lower_code_module(ModuleId::new(0), &module, host_config()).expect("lowers");
         assert!(lowered.functions[0].helpers.is_empty());
         assert_eq!(lowered.functions[0].entry_points, vec![0]);
     }
@@ -2387,7 +2455,7 @@ mod tests {
             vec![func(1, code, handlers)],
         );
         // Must lower without panicking on a missing handler block.
-        let lowered = lower_module(&module, host_config()).expect("lowers");
+        let lowered = lower_code_module(ModuleId::new(0), &module, host_config()).expect("lowers");
         assert!(lowered.functions[0].helpers.contains(&Helper::TypeOfGlobal));
     }
 
@@ -2601,7 +2669,7 @@ mod tests {
             Instruction::Halt,
         ];
         let module = single(func(1, code, Vec::new()));
-        let lowered = lower_module(&module, host_config()).expect("lowers");
+        let lowered = lower_code_module(ModuleId::new(0), &module, host_config()).expect("lowers");
         let function = &lowered.functions[0];
         // Fresh token 0 plus the suspend at pc 1 -> token 2.
         assert_eq!(function.entry_points, vec![0, 2]);
@@ -2780,10 +2848,10 @@ mod tests {
             func(0, vec![Instruction::Halt], Vec::new()),
         ];
         let module = verified(Vec::new(), functions);
-        let lowered = lower_module(&module, host_config()).expect("lowers");
+        let lowered = lower_code_module(ModuleId::new(0), &module, host_config()).expect("lowers");
         assert_eq!(lowered.functions.len(), 2);
-        assert_eq!(lowered.functions[0].symbol, "bamts_fn_0");
-        assert_eq!(lowered.functions[1].symbol, "bamts_fn_1");
+        assert_eq!(lowered.functions[0].symbol, "bamts_m0_fn_0");
+        assert_eq!(lowered.functions[1].symbol, "bamts_m0_fn_1");
         let name0 = lowered.functions[0].clif.display().to_string();
         assert!(name0.contains("u0:0"), "function 0 name wrong:\n{name0}");
         let name1 = lowered.functions[1].clif.display().to_string();
@@ -2833,7 +2901,8 @@ mod tests {
             page_size_align_log2: 12,
         };
         let module = single(func(0, vec![Instruction::Halt], Vec::new()));
-        let error = lower_module(&module, config).expect_err("32-bit rejected");
+        let error =
+            lower_code_module(ModuleId::new(0), &module, config).expect_err("32-bit rejected");
         assert!(matches!(
             error,
             LowerError::UnsupportedPointerWidth { bits: 32 }
@@ -2882,7 +2951,39 @@ mod tests {
         )
         .verify()
         .expect("verifies");
-        let lowered = lower_module(&module, host_config()).expect("lowers");
-        assert_eq!(lowered.functions[0].symbol, "bamts_fn_0");
+        let lowered = lower_code_module(ModuleId::new(0), &module, host_config()).expect("lowers");
+        assert_eq!(lowered.functions[0].symbol, "bamts_m0_fn_0");
+    }
+    #[test]
+    fn program_lowering_retains_module_local_ids_and_entry_tuple() {
+        let make_module = |name: &str| bamts_bytecode::ProgramModule {
+            name: ConstantId::new(0),
+            code: Module::new(
+                vec![Constant::String(name.to_owned())],
+                vec![func(0, vec![Instruction::Halt], Vec::new())],
+                FunctionId::new(0),
+            )
+            .verify()
+            .expect("module verifies"),
+            edges: Vec::new(),
+            bindings: Vec::new(),
+            exports: Vec::new(),
+        };
+        let program = Program::link(
+            vec![make_module("dependency"), make_module("entry")],
+            ModuleId::new(1),
+        )
+        .expect("program verifies");
+
+        let lowered = lower_program(&program, host_config()).expect("program lowers");
+        assert_eq!(lowered.modules.len(), 2);
+        assert_eq!(lowered.modules[0].id, ModuleId::new(0));
+        assert_eq!(lowered.modules[1].id, ModuleId::new(1));
+        assert_eq!(lowered.modules[0].functions[0].id, FunctionId::new(0));
+        assert_eq!(lowered.modules[1].functions[0].id, FunctionId::new(0));
+        assert_eq!(lowered.modules[0].functions[0].symbol, "bamts_m0_fn_0");
+        assert_eq!(lowered.modules[1].functions[0].symbol, "bamts_m1_fn_0");
+        assert_eq!(lowered.entry_module, ModuleId::new(1));
+        assert_eq!(lowered.entry_function, FunctionId::new(0));
     }
 }
