@@ -57,8 +57,9 @@
 //!   [`Instruction::LoadThis`], [`Instruction::LoadArguments`], and
 //!   [`Instruction::LoadNewTarget`] name the ambient bindings a function body
 //!   observes.
-//! * **Modules.** [`Instruction::Import`] and [`Instruction::Export`] name a
-//!   module linkage entry by string constant.
+//! * **Modules.** [`Instruction::Import`] is dynamic and names a dependency by
+//!   string constant; static bindings and exports live in [`Program`] linkage
+//!   metadata so they identify live cells rather than activation registers.
 //! * **Regular expressions.** [`Instruction::CreateRegExp`] materializes a
 //!   `RegExp` from string-constant pattern and flags.
 //!

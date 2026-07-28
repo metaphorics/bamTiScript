@@ -4,14 +4,14 @@ use std::fmt;
 use std::marker::PhantomData;
 
 use crate::{
-    Constant, ConstantId, DecodeError, DecodeLimits, Instruction, Module, Register, Unverified,
-    Verified, VerifyError, decode,
+    Constant, ConstantId, DecodeError, DecodeLimits, Instruction, Module, Unverified, Verified,
+    VerifyError, decode,
 };
 
 /// `BMTPC\0\0\1`: the canonical whole-program container, distinct from module magic.
 pub const PROGRAM_MAGIC: [u8; 8] = [66, 77, 84, 80, 67, 0, 0, 1];
 /// The sole supported program-envelope version.
-pub const PROGRAM_VERSION: u8 = 1;
+pub const PROGRAM_VERSION: u8 = 2;
 
 index_type!(
     /// Index of a module within a program.
@@ -50,11 +50,10 @@ pub enum BindingKind {
     Namespace { edge: EdgeId },
 }
 
-/// One named module binding. `register` belongs to the module entry function.
+/// One named module binding. A binding identifies a live cell, never an activation register.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Binding {
     pub name: ConstantId,
-    pub register: Register,
     pub kind: BindingKind,
 }
 
@@ -228,7 +227,6 @@ impl Program<Verified> {
             write_u32(module.bindings.len() as u32, &mut output);
             for binding in &module.bindings {
                 write_u32(binding.name.get(), &mut output);
-                write_u32(binding.register.get(), &mut output);
                 match binding.kind {
                     BindingKind::Hoisted => output.push(0),
                     BindingKind::Lexical => output.push(1),
@@ -275,10 +273,33 @@ impl Program<Verified> {
                 .find(|export| string(&current.code, export.name) == Some(export_name))?;
             match export.source {
                 ExportSource::Local(binding) => {
-                    return Some(ResolvedExport::Local {
-                        module: module_id,
-                        binding,
-                    });
+                    match current.bindings.get(binding.get() as usize)?.kind {
+                        BindingKind::Imported { edge, name } => {
+                            let edge_id = edge;
+                            let edge = current.edges.get(edge.get() as usize)?;
+                            match edge.target {
+                                EdgeTarget::Local(target) => {
+                                    module_id = target;
+                                    export_name = string(&current.code, name)?;
+                                }
+                                EdgeTarget::External => {
+                                    return Some(ResolvedExport::External {
+                                        module: module_id,
+                                        edge: edge_id,
+                                        name,
+                                    });
+                                }
+                            }
+                        }
+                        BindingKind::Hoisted
+                        | BindingKind::Lexical
+                        | BindingKind::Namespace { .. } => {
+                            return Some(ResolvedExport::Local {
+                                module: module_id,
+                                binding,
+                            });
+                        }
+                    }
                 }
                 ExportSource::Indirect { edge, name } => {
                     let edge_id = edge;
@@ -510,10 +531,6 @@ pub enum ProgramVerifyErrorKind {
         binding: BindingId,
         constant: ConstantId,
     },
-    BindingRegisterOutOfBounds {
-        binding: BindingId,
-        register: Register,
-    },
     BindingEdgeOutOfBounds {
         binding: BindingId,
         edge: EdgeId,
@@ -530,7 +547,11 @@ pub enum ProgramVerifyErrorKind {
         first: BindingId,
         second: BindingId,
     },
-    ImportedBindingWrite {
+    StaticBindingRequiresEagerEdge {
+        binding: BindingId,
+        edge: EdgeId,
+    },
+    MissingImportedExport {
         binding: BindingId,
     },
     ExportNameOutOfBounds {
@@ -561,7 +582,7 @@ pub enum ProgramVerifyErrorKind {
         export: u32,
         constant: ConstantId,
     },
-    StaticImportMissingEdge {
+    DynamicImportMissingEdge {
         specifier: ConstantId,
     },
     SnapshotExportInstruction {
@@ -761,7 +782,6 @@ impl<'a> ProgramDecoder<'a> {
         let mut bindings = Vec::with_capacity(binding_count);
         for _ in 0..binding_count {
             let name = ConstantId::new(self.u32()?);
-            let register = Register::new(self.u32()?);
             let tag_at = self.offset;
             let kind = match self.byte()? {
                 0 => BindingKind::Hoisted,
@@ -779,11 +799,7 @@ impl<'a> ProgramDecoder<'a> {
                     );
                 }
             };
-            bindings.push(Binding {
-                name,
-                register,
-                kind,
-            });
+            bindings.push(Binding { name, kind });
         }
 
         let export_count = self.count("exports", self.limits.max_exports_per_module)?;
@@ -983,7 +999,8 @@ fn verify_program_metadata(
         }
         verify_module_metadata(modules, module_id, module)?;
     }
-    verify_indirect_exports(modules)
+    verify_export_resolutions(modules)?;
+    verify_imported_bindings(modules)
 }
 
 fn verify_module_metadata(
@@ -1060,11 +1077,6 @@ fn verify_module_metadata(
         }
     }
 
-    let entry_function = &module.code.functions()[module.code.entry().get() as usize];
-    let mut entry_writes = vec![false; entry_function.register_count() as usize];
-    for instruction in entry_function.code().iter().copied() {
-        instruction.visit_writes(|register| entry_writes[register.get() as usize] = true);
-    }
     let mut binding_names = HashMap::with_capacity(module.bindings.len());
     for (index, binding) in module.bindings.iter().enumerate() {
         let binding_id = BindingId::new(index as u32);
@@ -1081,15 +1093,6 @@ fn verify_module_metadata(
                 constant: binding.name,
             },
         )?;
-        if binding.register.get() >= entry_function.register_count() {
-            return Err(module_error(
-                module_id,
-                ProgramVerifyErrorKind::BindingRegisterOutOfBounds {
-                    binding: binding_id,
-                    register: binding.register,
-                },
-            ));
-        }
         if let Some(first) = binding_names.insert(binding_name, binding_id) {
             return Err(module_error(
                 module_id,
@@ -1101,7 +1104,7 @@ fn verify_module_metadata(
         }
         match binding.kind {
             BindingKind::Imported { edge, name } => {
-                require_edge(module_id, module, binding_id, edge)?;
+                let dependency = require_edge(module_id, module, binding_id, edge)?;
                 required_string(
                     module_id,
                     module,
@@ -1115,22 +1118,24 @@ fn verify_module_metadata(
                         constant: name,
                     },
                 )?;
-                if entry_writes[binding.register.get() as usize] {
+                if !dependency.eager {
                     return Err(module_error(
                         module_id,
-                        ProgramVerifyErrorKind::ImportedBindingWrite {
+                        ProgramVerifyErrorKind::StaticBindingRequiresEagerEdge {
                             binding: binding_id,
+                            edge,
                         },
                     ));
                 }
             }
             BindingKind::Namespace { edge } => {
-                require_edge(module_id, module, binding_id, edge)?;
-                if entry_writes[binding.register.get() as usize] {
+                let dependency = require_edge(module_id, module, binding_id, edge)?;
+                if !dependency.eager {
                     return Err(module_error(
                         module_id,
-                        ProgramVerifyErrorKind::ImportedBindingWrite {
+                        ProgramVerifyErrorKind::StaticBindingRequiresEagerEdge {
                             binding: binding_id,
+                            edge,
                         },
                     ));
                 }
@@ -1211,11 +1216,11 @@ fn verify_module_metadata(
                         string(&module.code, specifier).expect("module verifier checked string");
                     if !specifiers
                         .get(import_name)
-                        .is_some_and(|edge| module.edges[edge.get() as usize].eager)
+                        .is_some_and(|edge| !module.edges[edge.get() as usize].eager)
                     {
                         return Err(module_error(
                             module_id,
-                            ProgramVerifyErrorKind::StaticImportMissingEdge { specifier },
+                            ProgramVerifyErrorKind::DynamicImportMissingEdge { specifier },
                         ));
                     }
                 }
@@ -1254,17 +1259,47 @@ fn require_edge(
     module: &ProgramModule<Verified>,
     binding: BindingId,
     edge: EdgeId,
-) -> Result<(), ProgramVerifyError> {
-    if edge.get() as usize >= module.edges.len() {
-        return Err(module_error(
+) -> Result<&Edge, ProgramVerifyError> {
+    module.edges.get(edge.get() as usize).ok_or_else(|| {
+        module_error(
             module_id,
             ProgramVerifyErrorKind::BindingEdgeOutOfBounds { binding, edge },
-        ));
+        )
+    })
+}
+
+fn verify_imported_bindings(modules: &[ProgramModule<Verified>]) -> Result<(), ProgramVerifyError> {
+    for (module_index, module) in modules.iter().enumerate() {
+        let module_id = ModuleId::new(module_index as u32);
+        for (binding_index, binding) in module.bindings.iter().enumerate() {
+            let BindingKind::Imported { edge, name } = binding.kind else {
+                continue;
+            };
+            let EdgeTarget::Local(target) = module.edges[edge.get() as usize].target else {
+                continue;
+            };
+            let imported_name =
+                string(&module.code, name).expect("metadata verifier checked imported name");
+            let target = &modules[target.get() as usize];
+            if !target.exports.iter().any(|export| {
+                string(&target.code, export.name).expect("metadata verifier checked export name")
+                    == imported_name
+            }) {
+                return Err(module_error(
+                    module_id,
+                    ProgramVerifyErrorKind::MissingImportedExport {
+                        binding: BindingId::new(binding_index as u32),
+                    },
+                ));
+            }
+        }
     }
     Ok(())
 }
 
-fn verify_indirect_exports(modules: &[ProgramModule<Verified>]) -> Result<(), ProgramVerifyError> {
+fn verify_export_resolutions(
+    modules: &[ProgramModule<Verified>],
+) -> Result<(), ProgramVerifyError> {
     let export_indices: Vec<HashMap<&str, usize>> = modules
         .iter()
         .map(|module| {
@@ -1310,31 +1345,65 @@ fn verify_indirect_exports(modules: &[ProgramModule<Verified>]) -> Result<(), Pr
                 states[current.0][current.1] = 1;
                 stack.push(current);
                 let current_module = &modules[current.0];
-                let ExportSource::Indirect { edge, name } =
-                    current_module.exports[current.1].source
-                else {
+                let next = match current_module.exports[current.1].source {
+                    ExportSource::Local(binding) => {
+                        match current_module.bindings[binding.get() as usize].kind {
+                            BindingKind::Imported { edge, name } => {
+                                let edge = &current_module.edges[edge.get() as usize];
+                                match edge.target {
+                                    EdgeTarget::External => None,
+                                    EdgeTarget::Local(target) => {
+                                        let name = string(&current_module.code, name)
+                                            .expect("metadata verifier checked imported name");
+                                        let target_index = target.get() as usize;
+                                        let target_export = export_indices[target_index]
+                                            .get(name)
+                                            .copied()
+                                            .ok_or_else(|| {
+                                                module_error(
+                                                    ModuleId::new(current.0 as u32),
+                                                    ProgramVerifyErrorKind::MissingImportedExport {
+                                                        binding,
+                                                    },
+                                                )
+                                            })?;
+                                        Some((target_index, target_export))
+                                    }
+                                }
+                            }
+                            BindingKind::Hoisted
+                            | BindingKind::Lexical
+                            | BindingKind::Namespace { .. } => None,
+                        }
+                    }
+                    ExportSource::Indirect { edge, name } => {
+                        let edge = &current_module.edges[edge.get() as usize];
+                        match edge.target {
+                            EdgeTarget::External => None,
+                            EdgeTarget::Local(target) => {
+                                let name = string(&current_module.code, name)
+                                    .expect("metadata verifier checked indirect name");
+                                let target_index = target.get() as usize;
+                                let target_export = export_indices[target_index]
+                                    .get(name)
+                                    .copied()
+                                    .ok_or_else(|| {
+                                        module_error(
+                                            ModuleId::new(current.0 as u32),
+                                            ProgramVerifyErrorKind::MissingIndirectExport {
+                                                export: current.1 as u32,
+                                            },
+                                        )
+                                    })?;
+                                Some((target_index, target_export))
+                            }
+                        }
+                    }
+                };
+                let Some(next) = next else {
                     break;
                 };
-                let EdgeTarget::Local(target) = current_module.edges[edge.get() as usize].target
-                else {
-                    break;
-                };
-                let target_index = target.get() as usize;
-                let name =
-                    string(&current_module.code, name).expect("metadata verifier checked string");
-                let target_export =
-                    export_indices[target_index]
-                        .get(name)
-                        .copied()
-                        .ok_or_else(|| {
-                            module_error(
-                                ModuleId::new(current.0 as u32),
-                                ProgramVerifyErrorKind::MissingIndirectExport {
-                                    export: current.1 as u32,
-                                },
-                            )
-                        })?;
-                current = (target_index, target_export);
+                current = next;
             }
             for &(resolved_module, resolved_export) in &stack {
                 states[resolved_module][resolved_export] = 2;
@@ -1403,7 +1472,7 @@ fn write_u32(value: u32, output: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Function, FunctionFlags, FunctionId};
+    use crate::{Function, FunctionFlags, FunctionId, Register};
 
     fn verified_module(name: &str, extra: &[&str]) -> Module<Verified> {
         let mut constants = vec![Constant::String(name.to_owned())];
@@ -1436,7 +1505,6 @@ mod tests {
             edges: Vec::new(),
             bindings: vec![Binding {
                 name: ConstantId::new(1),
-                register: Register::new(0),
                 kind: BindingKind::Hoisted,
             }],
             exports: vec![Export {
@@ -1662,7 +1730,7 @@ mod tests {
         let mut binding_tag = raw_module_prefix(&code);
         write_u32(0, &mut binding_tag);
         write_u32(1, &mut binding_tag);
-        binding_tag.extend_from_slice(&[1, 0, 9]);
+        binding_tag.extend_from_slice(&[1, 9]);
         assert!(matches!(
             decode_program(&binding_tag, &ProgramDecodeLimits::default()),
             Err(ProgramDecodeError {
@@ -1864,15 +1932,6 @@ mod tests {
                 .kind,
             ProgramVerifyErrorKind::ExportEdgeOutOfBounds { .. }
         ));
-
-        let mut module = program_module("main");
-        module.bindings[0].register = Register::new(1);
-        assert!(matches!(
-            Program::link(vec![module], ModuleId::new(0))
-                .unwrap_err()
-                .kind,
-            ProgramVerifyErrorKind::BindingRegisterOutOfBounds { .. }
-        ));
     }
 
     #[test]
@@ -1940,7 +1999,6 @@ mod tests {
             let mut module = empty(ConstantId::new(0));
             module.bindings.push(Binding {
                 name,
-                register: Register::new(0),
                 kind: BindingKind::Lexical,
             });
             let kind = Program::link(vec![module], ModuleId::new(0))
@@ -1983,7 +2041,6 @@ mod tests {
         });
         module.bindings.push(Binding {
             name: ConstantId::new(0),
-            register: Register::new(0),
             kind: BindingKind::Imported {
                 edge: EdgeId::new(0),
                 name: ConstantId::new(1),
@@ -2112,13 +2169,12 @@ mod tests {
     }
 
     #[test]
-    fn executable_program_rejects_snapshot_exports_and_unmapped_static_imports() {
-        let constants = vec![
-            Constant::String("main".to_owned()),
-            Constant::String("./dep".to_owned()),
-        ];
-        let module = Module::new(
-            constants.clone(),
+    fn dynamic_imports_require_non_eager_edges() {
+        let code = Module::new(
+            vec![
+                Constant::String("main".to_owned()),
+                Constant::String("./dep".to_owned()),
+            ],
             vec![Function::new(
                 None,
                 0,
@@ -2138,22 +2194,31 @@ mod tests {
         )
         .verify()
         .unwrap();
-        let program_module = ProgramModule {
+        let dynamic_module = |eager| ProgramModule {
             name: ConstantId::new(0),
-            code: module,
-            edges: Vec::new(),
+            code: code.clone(),
+            edges: vec![Edge {
+                specifier: ConstantId::new(1),
+                target: EdgeTarget::External,
+                eager,
+            }],
             bindings: Vec::new(),
             exports: Vec::new(),
         };
+
+        Program::link(vec![dynamic_module(false)], ModuleId::new(0)).unwrap();
         assert!(matches!(
-            Program::link(vec![program_module], ModuleId::new(0))
+            Program::link(vec![dynamic_module(true)], ModuleId::new(0))
                 .unwrap_err()
                 .kind,
-            ProgramVerifyErrorKind::StaticImportMissingEdge { .. }
+            ProgramVerifyErrorKind::DynamicImportMissingEdge { .. }
         ));
+    }
 
+    #[test]
+    fn executable_program_rejects_snapshot_exports() {
         let module = Module::new(
-            constants,
+            vec![Constant::String("main".to_owned())],
             vec![Function::new(
                 None,
                 0,
@@ -2177,28 +2242,30 @@ mod tests {
         )
         .verify()
         .unwrap();
-        let program_module = ProgramModule {
-            name: ConstantId::new(0),
-            code: module,
-            edges: Vec::new(),
-            bindings: Vec::new(),
-            exports: Vec::new(),
-        };
         assert!(matches!(
-            Program::link(vec![program_module], ModuleId::new(0))
-                .unwrap_err()
-                .kind,
+            Program::link(
+                vec![ProgramModule {
+                    name: ConstantId::new(0),
+                    code: module,
+                    edges: Vec::new(),
+                    bindings: Vec::new(),
+                    exports: Vec::new(),
+                }],
+                ModuleId::new(0),
+            )
+            .unwrap_err()
+            .kind,
             ProgramVerifyErrorKind::SnapshotExportInstruction { .. }
         ));
     }
 
     #[test]
-    fn imported_binding_writes_are_rejected_when_entry_register_is_known() {
-        let module = Module::new(
+    fn post_import_mutation_keeps_external_binding_as_live_identity() {
+        let code = Module::new(
             vec![
                 Constant::String("main".to_owned()),
                 Constant::String("x".to_owned()),
-                Constant::String("./dep".to_owned()),
+                Constant::String("builtin:live".to_owned()),
             ],
             vec![Function::new(
                 None,
@@ -2219,29 +2286,166 @@ mod tests {
         )
         .verify()
         .unwrap();
-        let program_module = ProgramModule {
-            name: ConstantId::new(0),
-            code: module,
-            edges: vec![Edge {
+        let program = Program::link(
+            vec![ProgramModule {
+                name: ConstantId::new(0),
+                code,
+                edges: vec![Edge {
+                    specifier: ConstantId::new(2),
+                    target: EdgeTarget::External,
+                    eager: true,
+                }],
+                bindings: vec![Binding {
+                    name: ConstantId::new(1),
+                    kind: BindingKind::Imported {
+                        edge: EdgeId::new(0),
+                        name: ConstantId::new(1),
+                    },
+                }],
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .unwrap();
+        assert!(matches!(
+            program.modules()[0].bindings()[0].kind,
+            BindingKind::Imported { .. }
+        ));
+    }
+
+    #[test]
+    fn external_imported_reexports_remain_available_to_providers() {
+        let mut module = program_module("main");
+        module.edges.push(Edge {
+            specifier: ConstantId::new(2),
+            target: EdgeTarget::External,
+            eager: true,
+        });
+        module.bindings[0].kind = BindingKind::Imported {
+            edge: EdgeId::new(0),
+            name: ConstantId::new(1),
+        };
+        let program = Program::link(vec![module], ModuleId::new(0)).unwrap();
+        assert_eq!(
+            program.resolve_export(ModuleId::new(0), "x"),
+            Some(ResolvedExport::External {
+                module: ModuleId::new(0),
+                edge: EdgeId::new(0),
+                name: ConstantId::new(1),
+            })
+        );
+    }
+
+    #[test]
+    fn lazy_static_bindings_are_rejected() {
+        for kind in [
+            BindingKind::Imported {
+                edge: EdgeId::new(0),
+                name: ConstantId::new(1),
+            },
+            BindingKind::Namespace {
+                edge: EdgeId::new(0),
+            },
+        ] {
+            let mut module = program_module("main");
+            module.edges.push(Edge {
                 specifier: ConstantId::new(2),
                 target: EdgeTarget::External,
                 eager: false,
-            }],
-            bindings: vec![Binding {
-                name: ConstantId::new(1),
-                register: Register::new(0),
-                kind: BindingKind::Imported {
-                    edge: EdgeId::new(0),
-                    name: ConstantId::new(1),
-                },
-            }],
-            exports: Vec::new(),
+            });
+            module.bindings[0].kind = kind;
+            assert!(matches!(
+                Program::link(vec![module], ModuleId::new(0))
+                    .unwrap_err()
+                    .kind,
+                ProgramVerifyErrorKind::StaticBindingRequiresEagerEdge { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn imported_export_cycles_are_rejected() {
+        let mut left = program_module("left");
+        left.edges.push(Edge {
+            specifier: ConstantId::new(2),
+            target: EdgeTarget::Local(ModuleId::new(1)),
+            eager: true,
+        });
+        left.bindings[0].kind = BindingKind::Imported {
+            edge: EdgeId::new(0),
+            name: ConstantId::new(1),
         };
+
+        let mut right = program_module("right");
+        right.edges.push(Edge {
+            specifier: ConstantId::new(2),
+            target: EdgeTarget::Local(ModuleId::new(0)),
+            eager: true,
+        });
+        right.bindings[0].kind = BindingKind::Imported {
+            edge: EdgeId::new(0),
+            name: ConstantId::new(1),
+        };
+
         assert!(matches!(
-            Program::link(vec![program_module], ModuleId::new(0))
+            Program::link(vec![left, right], ModuleId::new(0))
                 .unwrap_err()
                 .kind,
-            ProgramVerifyErrorKind::ImportedBindingWrite { .. }
+            ProgramVerifyErrorKind::IndirectExportCycle { .. }
+        ));
+    }
+
+    #[test]
+    fn local_imports_require_exports_and_follow_indirect_exports() {
+        let mut importer = program_module("importer");
+        importer.edges.push(Edge {
+            specifier: ConstantId::new(2),
+            target: EdgeTarget::Local(ModuleId::new(1)),
+            eager: true,
+        });
+        importer.bindings[0].kind = BindingKind::Imported {
+            edge: EdgeId::new(0),
+            name: ConstantId::new(1),
+        };
+
+        let mut relay = program_module("relay");
+        relay.edges.push(Edge {
+            specifier: ConstantId::new(2),
+            target: EdgeTarget::Local(ModuleId::new(2)),
+            eager: true,
+        });
+        relay.exports[0].source = ExportSource::Indirect {
+            edge: EdgeId::new(0),
+            name: ConstantId::new(1),
+        };
+        let program = Program::link(
+            vec![importer, relay, program_module("leaf")],
+            ModuleId::new(0),
+        )
+        .unwrap();
+        let leaf = Some(ResolvedExport::Local {
+            module: ModuleId::new(2),
+            binding: BindingId::new(0),
+        });
+        assert_eq!(program.resolve_export(ModuleId::new(0), "x"), leaf);
+        assert_eq!(program.resolve_export(ModuleId::new(1), "x"), leaf);
+
+        let mut importer = program_module("importer");
+        importer.edges.push(Edge {
+            specifier: ConstantId::new(2),
+            target: EdgeTarget::Local(ModuleId::new(1)),
+            eager: true,
+        });
+        importer.bindings[0].kind = BindingKind::Imported {
+            edge: EdgeId::new(0),
+            name: ConstantId::new(3),
+        };
+        importer.exports.clear();
+        assert!(matches!(
+            Program::link(vec![importer, program_module("target")], ModuleId::new(0),)
+                .unwrap_err()
+                .kind,
+            ProgramVerifyErrorKind::MissingImportedExport { .. }
         ));
     }
 }
