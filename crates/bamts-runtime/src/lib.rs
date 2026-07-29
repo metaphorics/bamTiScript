@@ -4465,9 +4465,6 @@ impl<'a, H: Host> Machine<'a, H> {
         src: Value,
         key: &PropertyKey,
     ) -> Result<bool, EvalFailure> {
-        if matches!(key, PropertyKey::Private(_)) {
-            return Ok(false);
-        }
         let Some(index) = self.runtime_slot(src).map_err(EvalFailure::Runtime)? else {
             return Ok(false);
         };
@@ -5200,7 +5197,8 @@ fn ordered_property_keys(properties: &PropertyMap) -> Vec<PropertyKey> {
                 Some(index) => indices.push((index, key.clone())),
                 None => strings.push(key.clone()),
             },
-            PropertyKey::Symbol(_) | PropertyKey::Private(_) => symbols.push(key.clone()),
+            PropertyKey::Symbol(_) => symbols.push(key.clone()),
+            PropertyKey::Private(_) => {}
         }
     }
     indices.sort_unstable_by_key(|(index, _)| *index);

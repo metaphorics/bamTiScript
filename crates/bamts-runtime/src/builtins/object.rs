@@ -1168,6 +1168,32 @@ mod tests {
     }
 
     #[test]
+    fn define_properties_ignores_language_private_descriptors() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = object(&mut machine);
+        let descriptors = object(&mut machine);
+        let private = machine
+            .allocate(HeapEntry::PrivateName {
+                description: EcmaString::from_utf8("private"),
+            })
+            .unwrap();
+        let key = machine.to_property_key(private).unwrap();
+        let descriptor = data_descriptor(&mut machine, Value::int32(7));
+        machine
+            .set_data_property_key(descriptors, key.clone(), descriptor)
+            .unwrap();
+
+        call_define_properties(&mut machine, target, descriptors).unwrap();
+
+        assert_eq!(
+            machine.get_property_key(target, &key).unwrap(),
+            Value::UNDEFINED
+        );
+    }
+
+    #[test]
     fn existing_namespaces_expose_standard_to_string_tags() {
         let module = module();
         let mut host = TestHost;

@@ -409,6 +409,42 @@ mod tests {
 
     #[cfg(feature = "node-host")]
     #[test]
+    fn object_reflection_cannot_transfer_private_fields() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            class Secret {
+                #value = {
+                    value: 7,
+                    enumerable: true,
+                    configurable: true,
+                    writable: true,
+                };
+
+                probe(target: object) {
+                    try {
+                        return target.#value;
+                    } catch {
+                        return "missing";
+                    }
+                }
+            }
+
+            const source = new Secret();
+            const target = {};
+            const before = source.probe(target);
+            Object.defineProperties(target, source);
+            const after = source.probe(target);
+            process.stdout.write(String(before === after) + "\n");
+        "#;
+        let (directory, entrypoint) = script_fixture("private-field-reflection", source)?;
+        let output = run_program(&entrypoint)?;
+
+        assert_eq!(output.stdout, b"true\n");
+        assert_eq!(output.exit_code, 0);
+        remove_fixture(&directory)
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
     fn runs_node_vm_scripts() -> Result<(), Box<dyn Error>> {
         let cases = [
             (
