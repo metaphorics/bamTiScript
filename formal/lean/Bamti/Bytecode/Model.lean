@@ -190,7 +190,7 @@ def decodeHandlers : List EncodedHandler → Except DecodeError (List Handler)
       | _, .error error => .error error
 
 def magicBytes : List Nat := [66, 77, 84, 66, 67, 0, 0, 1]
-def formatVersion : Nat := 1
+def formatVersion : Nat := 2
 
 def encode (program : Program) : Wire :=
   { magic := magicBytes
