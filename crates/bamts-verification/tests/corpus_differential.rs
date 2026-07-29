@@ -1,7 +1,7 @@
-use std::path::Path;
+use std::{fs, path::Path, process};
 
 use bamts_verification::corpus::{
-    BamtsRunner, CorpusFailure, CorpusStage, ExecutionMode, NodeOracle, OracleOutcome,
+    BamtsRunner, CaseSpec, CorpusFailure, CorpusStage, ExecutionMode, NodeOracle, OracleOutcome,
     PINNED_CASE_IDS, TASK_106_SYNC_CASE_IDS, load_corpus,
 };
 
@@ -34,6 +34,59 @@ fn all_pinned_cases_match_node_in_jit_and_aot() {
     assert!(
         failures.is_empty(),
         "corpus differential failures:\n{}",
+        failures.join("\n\n")
+    );
+}
+
+#[test]
+fn declaration_owned_self_captures_match_node_in_jit_and_aot() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("task-106-self-captures-{}", process::id());
+    let entrypoint = format!("target/{id}.js");
+    let path = root.join(&entrypoint);
+    fs::write(
+        &path,
+        "function run() {
+  const arrow = () => arrow;
+  function recursive() { return recursive; }
+  class Self { method() { return Self; } }
+  const { destructured = () => destructured } = {};
+  const shadowed = () => shadowed;
+  { const shadowed = 0; }
+  console.log(arrow() === arrow);
+  console.log(recursive() === recursive);
+  console.log(new Self().method() === Self);
+  console.log(destructured() === destructured);
+  console.log(shadowed() === shadowed);
+}
+run();
+",
+    )
+    .expect("write self-capture fixture");
+    let spec = CaseSpec {
+        id,
+        repository: "local".to_owned(),
+        commit: "0".repeat(40),
+        license: "UNLICENSED".to_owned(),
+        source_dir: "target".to_owned(),
+        entrypoint,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+    };
+    let oracle = NodeOracle::discover(&root).expect("the pinned Node oracle must be available");
+    let bamts = BamtsRunner::new(&root);
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_file(path).expect("remove self-capture fixture");
+    assert!(
+        failures.is_empty(),
+        "declaration-owned self-capture differential failures:\n{}",
         failures.join("\n\n")
     );
 }
