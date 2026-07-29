@@ -450,7 +450,7 @@ enum AotCompletion<'a> {
     Failure(AotMainFailure),
 }
 
-/// Emits each buffered host stream once; host stderr is flushed before return.
+/// Emits buffered host stdout only on success and always flushes host stderr.
 #[cfg(any(feature = "aot-main", test))]
 fn write_aot_completion(
     host: &NodeHost,
@@ -458,9 +458,9 @@ fn write_aot_completion(
     stdout: &mut impl std::io::Write,
     stderr: &mut impl std::io::Write,
 ) -> std::io::Result<i32> {
-    stdout.write_all(host.stdout())?;
     let (exit_code, failure) = match completion {
         AotCompletion::Success(outcome) => {
+            stdout.write_all(host.stdout())?;
             stdout.write_all(&outcome.stdout)?;
             (
                 if host.exit_code() == 0 {
@@ -675,7 +675,7 @@ mod tests {
         .expect("completion writes");
 
         assert_eq!(exit_code, 1);
-        assert_eq!(stdout, b"before failure");
+        assert!(stdout.is_empty());
         assert_eq!(stderr, b"host diagnostic\nbamts: aot runtime\n");
     }
 
