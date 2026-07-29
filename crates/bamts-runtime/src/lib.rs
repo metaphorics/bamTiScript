@@ -433,47 +433,45 @@ impl Property {
 #[derive(Clone, Debug, Default)]
 struct PropertyMap(Vec<(PropertyKey, Property)>);
 
-impl PropertyMap {
-    fn get(&self, key: &PropertyKey) -> Option<&Property> {
-        self.0
-            .iter()
-            .find_map(|(candidate, property)| (candidate == key).then_some(property))
-    }
-
-    fn get_mut(&mut self, key: &PropertyKey) -> Option<&mut Property> {
-        self.0
-            .iter_mut()
-            .find_map(|(candidate, property)| (candidate == key).then_some(property))
-    }
-
-    fn contains_key(&self, key: &PropertyKey) -> bool {
-        self.get(key).is_some()
-    }
-
-    fn get_ascii(&self, ascii: &str) -> Option<&Property> {
-        debug_assert!(ascii.is_ascii());
-        self.0
-            .iter()
-            .find_map(|(key, property)| key.eq_ascii(ascii).then_some(property))
-    }
-
-    fn insert(&mut self, key: PropertyKey, property: Property) -> Option<Property> {
-        if let Some(existing) = self.get_mut(&key) {
-            return Some(std::mem::replace(existing, property));
-        }
-        self.0.push((key, property));
-        None
-    }
-
-    fn remove(&mut self, key: &PropertyKey) -> Option<Property> {
-        let index = self.0.iter().position(|(candidate, _)| candidate == key)?;
-        Some(self.0.remove(index).1)
-    }
-
-    fn iter(&self) -> impl Iterator<Item = (&PropertyKey, &Property)> {
-        self.0.iter().map(|(key, property)| (key, property))
-    }
+impl PropertyMap { fn get(&self, key: &PropertyKey) -> Option<&Property> {
+    self.0
+        .iter()
+        .find_map(|(candidate, property)| (candidate == key).then_some(property))
 }
+
+fn get_mut(&mut self, key: &PropertyKey) -> Option<&mut Property> {
+    self.0
+        .iter_mut()
+        .find_map(|(candidate, property)| (candidate == key).then_some(property))
+}
+
+fn contains_key(&self, key: &PropertyKey) -> bool {
+    self.get(key).is_some()
+}
+
+fn get_ascii(&self, ascii: &str) -> Option<&Property> {
+    debug_assert!(ascii.is_ascii());
+    self.0
+        .iter()
+        .find_map(|(key, property)| key.eq_ascii(ascii).then_some(property))
+}
+
+fn insert(&mut self, key: PropertyKey, property: Property) -> Option<Property> {
+    if let Some(existing) = self.get_mut(&key) {
+        return Some(std::mem::replace(existing, property));
+    }
+    self.0.push((key, property));
+    None
+}
+
+fn remove(&mut self, key: &PropertyKey) -> Option<Property> {
+    let index = self.0.iter().position(|(candidate, _)| candidate == key)?;
+    Some(self.0.remove(index).1)
+}
+
+fn iter(&self) -> impl Iterator<Item = (&PropertyKey, &Property)> {
+    self.0.iter().map(|(key, property)| (key, property))
+} fn charge_bytes(&self) -> usize { self.0.iter().fold(0, |bytes, (key, _)| bytes.saturating_add(key.charge_bytes())) } }
 
 impl<'a> IntoIterator for &'a PropertyMap {
     type Item = (&'a PropertyKey, &'a Property);
@@ -677,52 +675,7 @@ pub(crate) struct BoundCallable {
 }
 
 impl HeapEntry {
-    fn initial_bytes(&self) -> usize {
-        match self {
-            Self::String(text)
-            | Self::Symbol { description: text }
-            | Self::PrivateName { description: text } => text.len_units().saturating_mul(2),
-            Self::BigInt(text) => text.len(),
-            Self::RegExp { pattern, flags, .. } => pattern
-                .len_units()
-                .saturating_add(flags.len_units())
-                .saturating_mul(2),
-            Self::HashState {
-                algorithm, data, ..
-            } => algorithm.len() + data.len(),
-            Self::Collection { entries, .. } => entries
-                .len()
-                .saturating_mul(CollectionEntry::BYTES)
-                .saturating_add(1),
-            Self::NativeFunction { callable, .. } => match callable {
-                NativeCallable::Builtin(_) => 1,
-                NativeCallable::Bound(bound) => bound.arguments.len().saturating_add(1),
-            },
-            Self::Generator { state, .. } => match state {
-                GeneratorState::SuspendedStart(start) => start
-                    .captures
-                    .len()
-                    .saturating_add(start.args.len())
-                    .saturating_add(1),
-                GeneratorState::Suspended(activation) => activation
-                    .registers
-                    .len()
-                    .saturating_add(activation.args.len())
-                    .saturating_add(1),
-                GeneratorState::Executing | GeneratorState::Completed => 1,
-            },
-            Self::Object { .. }
-            | Self::Array { .. }
-            | Self::Function { .. }
-            | Self::Script { .. }
-            | Self::ModuleNamespace { .. }
-            | Self::ExternalModuleNamespace { .. }
-            | Self::ProcessEnv { .. }
-            | Self::Date { .. }
-            | Self::BuiltinIterator { .. }
-            | Self::Iterator { .. } => 1,
-        }
-    }
+    fn initial_bytes(&self) -> usize { match self { Self::String(text) | Self::Symbol { description: text } | Self::PrivateName { description: text } => text.len_units().saturating_mul(2), Self::BigInt(text) => text.len(), Self::RegExp { pattern, flags, .. } => pattern.len_units().saturating_add(flags.len_units()).saturating_mul(2), Self::HashState { algorithm, data, .. } => algorithm.len() + data.len(), Self::Collection { entries, .. } => entries.len().saturating_mul(CollectionEntry::BYTES).saturating_add(1), Self::NativeFunction { callable, .. } => match callable { NativeCallable::Builtin(_) => 1, NativeCallable::Bound(bound) => bound.arguments.len().saturating_add(1), }, Self::Generator { state, .. } => match state { GeneratorState::SuspendedStart(start) => start.captures.len().saturating_add(start.args.len()).saturating_add(1), GeneratorState::Suspended(activation) => activation.registers.len().saturating_add(activation.args.len()).saturating_add(1), GeneratorState::Executing | GeneratorState::Completed => 1, }, Self::Object { properties, .. } => properties.charge_bytes().saturating_add(1), Self::Array { .. } | Self::Function { .. } | Self::Script { .. } | Self::ModuleNamespace { .. } | Self::ExternalModuleNamespace { .. } | Self::ProcessEnv { .. } | Self::Date { .. } | Self::BuiltinIterator { .. } | Self::Iterator { .. } => 1, } }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2292,11 +2245,9 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(())
     }
 
-    fn charge_heap(&mut self, bytes: usize) -> Result<(), RuntimeErrorKind> {
-        self.ensure_allocation_capacity(0, bytes)?;
-        self.heap_bytes += bytes;
-        Ok(())
-    }
+    fn ensure_object_property_capacity(&self, property_bytes: usize) -> Result<(), RuntimeErrorKind> { let bytes = property_bytes.checked_add(1).ok_or(RuntimeErrorKind::HeapByteLimitExceeded { limit: self.limits.max_heap_bytes })?; self.ensure_allocation_capacity(1, bytes) } fn charge_heap(&mut self, bytes: usize) -> Result<(), RuntimeErrorKind> { self.ensure_allocation_capacity(0, bytes)?;
+    self.heap_bytes += bytes;
+    Ok(()) }
 
     fn runtime_slot(&self, value: Value) -> Result<Option<usize>, RuntimeErrorKind> {
         let Some(decoded) = value.decode() else {
