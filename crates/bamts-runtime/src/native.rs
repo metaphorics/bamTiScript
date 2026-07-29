@@ -260,6 +260,11 @@ enum InvokeOutcome {
     Fatal,
 }
 
+enum ImportFailure {
+    Threw(RuntimeError),
+    Fatal,
+}
+
 /// The native semantic engine over a verified program.
 ///
 /// `'m` bounds the module and entry table; `'h` bounds the host borrow. The
@@ -423,7 +428,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     ) -> Result<Option<Execution>, RuntimeError> {
         let dependencies = match self.machine.borrow_mut().begin_module_evaluation(module)? {
             crate::ModuleEvaluation::Cycle => return Ok(None),
-            crate::ModuleEvaluation::Evaluated(result) => return result.map(Some),
+            crate::ModuleEvaluation::Evaluated(result) => return result.map(|()| None),
             crate::ModuleEvaluation::Ready(dependencies) => dependencies,
         };
         for dependency in dependencies {
@@ -1144,6 +1149,101 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         }
     }
 
+    fn evaluate_import(&self, module: ModuleId) -> Result<(), ImportFailure> {
+        let begun = self.machine.borrow_mut().begin_module_evaluation(module);
+        let dependencies = match begun {
+            Err(error) => {
+                self.pending_error.set(Some(error));
+                return Err(ImportFailure::Fatal);
+            }
+            Ok(crate::ModuleEvaluation::Cycle) => return Ok(()),
+            Ok(crate::ModuleEvaluation::Evaluated(Ok(()))) => return Ok(()),
+            Ok(crate::ModuleEvaluation::Evaluated(Err(error))) => {
+                if matches!(error.kind, RuntimeErrorKind::UncaughtThrow { .. }) {
+                    return Err(ImportFailure::Threw(error));
+                }
+                self.pending_error.set(Some(error));
+                return Err(ImportFailure::Fatal);
+            }
+            Ok(crate::ModuleEvaluation::Ready(dependencies)) => dependencies,
+        };
+        for dependency in dependencies {
+            if let Err(failure) = self.evaluate_import(dependency) {
+                let mut machine = self.machine.borrow_mut();
+                match &failure {
+                    ImportFailure::Threw(error) => {
+                        machine.settle_module_evaluation(module, Err(error.clone()));
+                    }
+                    ImportFailure::Fatal => machine.abort_module_evaluation(module),
+                }
+                return Err(failure);
+            }
+        }
+
+        let function = self.module(module).entry();
+        let outcome = self.invoke_runtime(
+            crate::RuntimeFunction { module, function },
+            &[],
+            Value::UNDEFINED,
+            Value::UNDEFINED,
+            &[],
+        );
+        match outcome {
+            InvokeOutcome::Value(_) => {
+                self.machine
+                    .borrow_mut()
+                    .settle_module_evaluation(module, Ok(()));
+                Ok(())
+            }
+            InvokeOutcome::Threw(value, origin) => {
+                let error = self.error_at(
+                    module,
+                    RuntimeErrorKind::UncaughtThrow { value, origin },
+                    function.get() as usize,
+                    0,
+                );
+                self.machine
+                    .borrow_mut()
+                    .settle_module_evaluation(module, Err(error.clone()));
+                Err(ImportFailure::Threw(error))
+            }
+            InvokeOutcome::Fatal => {
+                self.machine.borrow_mut().abort_module_evaluation(module);
+                Err(ImportFailure::Fatal)
+            }
+        }
+    }
+
+    fn import_namespace(&self, requester: ModuleId, specifier: u32) -> HelperResult {
+        let target = self
+            .machine
+            .borrow()
+            .resolve_import(requester, ConstantId::new(specifier));
+        let target = match target {
+            Ok(target) => target,
+            Err(kind) => return self.fatal(kind),
+        };
+        if let crate::ImportTarget::Local(module) = target
+            && let Err(failure) = self.evaluate_import(module)
+        {
+            return match failure {
+                ImportFailure::Threw(error) => self.fail(crate::import_failure(&error)),
+                ImportFailure::Fatal => HelperResult {
+                    tag: CompletionTag::FatalTrap,
+                    value: Value::UNDEFINED,
+                },
+            };
+        }
+        let namespace = self
+            .machine
+            .borrow_mut()
+            .imported_namespace(requester, target);
+        match namespace {
+            Ok(value) => HelperResult::normal(value),
+            Err(kind) => self.fatal(kind),
+        }
+    }
+
     // -- HelperResult constructors -------------------------------------------
 
     fn fatal(&self, kind: RuntimeErrorKind) -> HelperResult {
@@ -1359,7 +1459,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         let dependencies = match self.machine.borrow_mut().begin_module_evaluation(module)? {
             crate::ModuleEvaluation::Cycle => return Ok(None),
             crate::ModuleEvaluation::Evaluated(result) => {
-                return result.map(Some).map_err(Into::into);
+                return result.map(|()| None).map_err(Into::into);
             }
             crate::ModuleEvaluation::Ready(dependencies) => dependencies,
         };
@@ -1709,9 +1809,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 };
                 self.construct(callee, &arguments)
             }
-            HelperCall::Import { .. } => self.fail(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "import outside an engine-owned module registry",
-            })),
+            HelperCall::Import { specifier } => self.import_namespace(module, specifier),
             HelperCall::Truthy { value } => {
                 HelperResult::normal(Value::boolean(self.machine.borrow().truthy(value)))
             }
@@ -1938,7 +2036,10 @@ mod tests {
         EdgeTarget, ExceptionHandler, Export, ExportSource, Function, FunctionFlags, FunctionId,
         Instruction, Module, ModuleId, Pc, Program, ProgramModule, Register, Verified,
     };
-    use bamts_native::{AbiError, Completion, CompletionTag, NativeEntryTable, ShadowFrame, Value};
+    use bamts_native::{
+        AbiError, Completion, CompletionTag, HelperCall, NativeEntryTable, NativeFrame, NativeOps,
+        ShadowFrame, Value,
+    };
 
     use crate::{Host, Limits, Machine, RuntimeError, RuntimeErrorKind, ThrowOrigin};
 
@@ -2011,6 +2112,53 @@ mod tests {
 
     fn linked(modules: Vec<ProgramModule<Verified>>, entry: u32) -> Program<Verified> {
         Program::link(modules, ModuleId::new(entry)).expect("module fixture links")
+    }
+
+    fn dynamic_cycle_program() -> Program<Verified> {
+        let root = program_module(
+            "root",
+            vec![Constant::String(EcmaString::from_utf8("./target"))],
+            vec![entry_function(
+                3,
+                vec![
+                    Instruction::Import {
+                        dst: reg(0),
+                        specifier: cid(1),
+                    },
+                    Instruction::Import {
+                        dst: reg(1),
+                        specifier: cid(1),
+                    },
+                    Instruction::Binary {
+                        dst: reg(2),
+                        op: BinaryOp::StrictEqual,
+                        left: reg(0),
+                        right: reg(1),
+                    },
+                    Instruction::Return { value: reg(2) },
+                ],
+            )],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::Local(ModuleId::new(1)),
+                kind: EdgeKind::Dynamic,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let target = program_module(
+            "target",
+            vec![Constant::String(EcmaString::from_utf8("./root"))],
+            vec![entry_function(1, vec![Instruction::Halt])],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        linked(vec![root, target], 0)
     }
 
     fn assert_program_parity(
@@ -3173,6 +3321,112 @@ mod tests {
         let mut host = SilentHost;
         run_linked_program(&program, &entries, &mut host, &Limits::default()).unwrap();
         assert_eq!(entries.invoked.borrow().as_slice(), &[(0, 0), (1, 0)]);
+    }
+
+    #[test]
+    fn dynamic_import_cycle_matches_the_reference_backend() {
+        let execution = assert_program_parity(&dynamic_cycle_program()).unwrap();
+        assert_eq!(execution.value, Value::TRUE);
+        assert_eq!(execution.entry_registers[0], execution.entry_registers[1]);
+    }
+
+    #[test]
+    fn dynamic_import_throw_is_caught_at_the_requester_in_both_backends() {
+        let root = program_module(
+            "root",
+            vec![Constant::String(EcmaString::from_utf8("./target"))],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                2,
+                FunctionFlags::default(),
+                vec![
+                    Instruction::Import {
+                        dst: reg(0),
+                        specifier: cid(1),
+                    },
+                    Instruction::Halt,
+                    Instruction::Return { value: reg(1) },
+                ],
+                vec![ExceptionHandler {
+                    start: pc(0),
+                    end: pc(1),
+                    handler: pc(2),
+                    catch_register: reg(1),
+                }],
+            )],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::Local(ModuleId::new(1)),
+                kind: EdgeKind::Dynamic,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let target = program_module(
+            "target",
+            vec![Constant::Int32(9)],
+            vec![entry_function(
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::Throw { value: reg(0) },
+                ],
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(
+            assert_program_parity(&linked(vec![root, target], 0))
+                .unwrap()
+                .value,
+            Value::int32(9)
+        );
+    }
+
+    #[test]
+    fn linked_dynamic_import_invokes_the_target_once() {
+        let program = dynamic_cycle_program();
+        let entries = RecordingEntries {
+            program_bytes: program.encode(),
+            ..RecordingEntries::default()
+        };
+        let mut host = SilentHost;
+        let engine = NativeEngine::build(
+            &program,
+            &entries,
+            &mut host,
+            Limits::default(),
+            Backend::Linked,
+        );
+        engine.machine.borrow_mut().instantiate_modules().unwrap();
+        assert!(matches!(
+            engine
+                .machine
+                .borrow_mut()
+                .begin_module_evaluation(ModuleId::new(0))
+                .unwrap(),
+            crate::ModuleEvaluation::Ready(_)
+        ));
+
+        let mut registers = [Value::UNINITIALIZED; 3];
+        let handles = registers.as_mut_ptr();
+        let mut shadow =
+            ShadowFrame::new(std::ptr::null_mut(), 0, 0, handles, registers.len() as u16);
+        let mut frame = NativeFrame::new(&mut shadow, &mut registers).unwrap();
+        let first = engine.dispatch(&mut frame, HelperCall::Import { specifier: 1 });
+        let second = engine.dispatch(&mut frame, HelperCall::Import { specifier: 1 });
+
+        assert_eq!(first.tag, CompletionTag::Normal);
+        assert_eq!(second.tag, CompletionTag::Normal);
+        assert_eq!(first.value, second.value);
+        assert_eq!(entries.invoked.borrow().as_slice(), &[(1, 0)]);
     }
 
     #[test]

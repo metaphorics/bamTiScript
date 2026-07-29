@@ -249,8 +249,9 @@ pub enum RuntimeErrorKind {
         module: ModuleId,
         edge: EdgeId,
     },
-    DynamicImportUnsupported {
+    DynamicImportEdgeMissing {
         module: ModuleId,
+        specifier: ConstantId,
     },
     InvalidVerifiedProgram {
         module: ModuleId,
@@ -322,10 +323,11 @@ impl fmt::Display for RuntimeError {
                 module.get(),
                 edge.get()
             ),
-            RuntimeErrorKind::DynamicImportUnsupported { module } => write!(
+            RuntimeErrorKind::DynamicImportEdgeMissing { module, specifier } => write!(
                 formatter,
-                "dynamic import is unsupported in module {}",
-                module.get()
+                "verified module {} has no dynamic edge for constant {}",
+                module.get(),
+                specifier.get()
             ),
             RuntimeErrorKind::InvalidVerifiedProgram {
                 module,
@@ -719,6 +721,13 @@ enum EvalFailure {
     Runtime(RuntimeErrorKind),
 }
 
+pub(crate) fn import_failure(error: &RuntimeError) -> EvalFailure {
+    match &error.kind {
+        RuntimeErrorKind::UncaughtThrow { value, .. } => EvalFailure::ThrowValue(*value),
+        kind => EvalFailure::Runtime(kind.clone()),
+    }
+}
+
 /// The outcome of resolving a property read.
 #[derive(Clone, Debug)]
 enum GetOutcome {
@@ -829,14 +838,20 @@ struct ModuleInstance {
 enum ModuleState {
     Unevaluated,
     Evaluating,
-    Evaluated(Result<Execution, RuntimeError>),
+    Evaluated(Result<(), RuntimeError>),
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum ModuleEvaluation {
     Cycle,
-    Evaluated(Result<Execution, RuntimeError>),
+    Evaluated(Result<(), RuntimeError>),
     Ready(Vec<ModuleId>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ImportTarget {
+    Local(ModuleId),
+    External(EdgeId),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1378,10 +1393,102 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(cell)
     }
 
+    pub(crate) fn resolve_import(
+        &self,
+        module: ModuleId,
+        specifier: ConstantId,
+    ) -> Result<ImportTarget, RuntimeErrorKind> {
+        let name = self.constant_text(module, specifier);
+        self.program_module(module)
+            .edges
+            .iter()
+            .enumerate()
+            .find(|(_, edge)| {
+                edge.kind.has_dynamic() && self.constant_text(module, edge.specifier) == name
+            })
+            .map(|(index, edge)| match edge.target {
+                EdgeTarget::Local(target) => ImportTarget::Local(target),
+                EdgeTarget::External => ImportTarget::External(EdgeId::new(index as u32)),
+            })
+            .ok_or(RuntimeErrorKind::DynamicImportEdgeMissing { module, specifier })
+    }
+
+    pub(crate) fn imported_namespace(
+        &mut self,
+        requester: ModuleId,
+        target: ImportTarget,
+    ) -> Result<Value, RuntimeErrorKind> {
+        match target {
+            ImportTarget::Local(target) => self.module_namespace(target, requester),
+            ImportTarget::External(edge) => self.external_namespace(requester, edge),
+        }
+        .map_err(|error| error.kind)
+    }
+
+    fn run_import_entry(&mut self, module: ModuleId) -> Result<(), RuntimeError> {
+        let function = self.module_code(module).entry();
+        let stop_depth = self.frames.len();
+        self.push_frame(
+            RuntimeFunction { module, function },
+            &[],
+            Value::UNDEFINED,
+            Value::UNDEFINED,
+            &[],
+            None,
+        )?;
+        let result = self.run_loop(stop_depth).and_then(|execution| {
+            execution.map(|_| ()).ok_or_else(|| {
+                self.program_error(
+                    module,
+                    RuntimeErrorKind::InvalidVerifiedProgram {
+                        module,
+                        instruction: Instruction::Halt,
+                    },
+                )
+            })
+        });
+        if result.is_err() {
+            self.unwind_frames_to(stop_depth);
+        }
+        result
+    }
+
+    fn evaluate_import(&mut self, module: ModuleId) -> Result<(), RuntimeError> {
+        let dependencies = match self.begin_module_evaluation(module)? {
+            ModuleEvaluation::Cycle => return Ok(()),
+            ModuleEvaluation::Evaluated(result) => return result,
+            ModuleEvaluation::Ready(dependencies) => dependencies,
+        };
+        for dependency in dependencies {
+            if let Err(error) = self.evaluate_import(dependency) {
+                self.settle_module_evaluation(module, Err(error.clone()));
+                return Err(error);
+            }
+        }
+        let result = self.run_import_entry(module);
+        self.settle_module_evaluation(module, result.clone());
+        result
+    }
+
+    fn import_namespace(
+        &mut self,
+        requester: ModuleId,
+        specifier: ConstantId,
+    ) -> Result<Value, EvalFailure> {
+        let target = self
+            .resolve_import(requester, specifier)
+            .map_err(EvalFailure::Runtime)?;
+        if let ImportTarget::Local(module) = target {
+            self.evaluate_import(module)
+                .map_err(|error| import_failure(&error))?;
+        }
+        self.imported_namespace(requester, target)
+            .map_err(EvalFailure::Runtime)
+    }
     fn evaluate_module(&mut self, module: ModuleId) -> Result<Option<Execution>, RuntimeError> {
         let dependencies = match self.begin_module_evaluation(module)? {
             ModuleEvaluation::Cycle => return Ok(None),
-            ModuleEvaluation::Evaluated(result) => return result.map(Some),
+            ModuleEvaluation::Evaluated(result) => return result.map(|()| None),
             ModuleEvaluation::Ready(dependencies) => dependencies,
         };
         for dependency in dependencies {
@@ -1473,8 +1580,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             edge: EdgeId::new(edge_index as u32),
                         },
                     );
-                    self.registry.modules[module.get() as usize].state =
-                        ModuleState::Evaluated(Err(error.clone()));
+                    self.settle_module_evaluation(module, Err(error.clone()));
                     return Err(error);
                 }
             }
@@ -1491,8 +1597,26 @@ impl<'a, H: Host> Machine<'a, H> {
             self.frames.clear();
             self.live_registers = 0;
         }
-        self.registry.modules[module.get() as usize].state = ModuleState::Evaluated(result.clone());
+        let stored = result.as_ref().map(|_| ()).map_err(Clone::clone);
+        self.settle_module_evaluation(module, stored);
         result
+    }
+
+    pub(crate) fn settle_module_evaluation(
+        &mut self,
+        module: ModuleId,
+        result: Result<(), RuntimeError>,
+    ) {
+        match result {
+            Ok(()) => {
+                self.registry.modules[module.get() as usize].state = ModuleState::Evaluated(Ok(()));
+            }
+            Err(error) if matches!(error.kind, RuntimeErrorKind::UncaughtThrow { .. }) => {
+                self.registry.modules[module.get() as usize].state =
+                    ModuleState::Evaluated(Err(error));
+            }
+            Err(_) => self.abort_module_evaluation(module),
+        }
     }
 
     pub(crate) fn abort_module_evaluation(&mut self, module: ModuleId) {
@@ -1944,11 +2068,14 @@ impl<'a, H: Host> Machine<'a, H> {
                 Instruction::Suspend { .. } => {
                     self.throw_type("suspend outside an engine-owned event loop", pc)?;
                 }
-                Instruction::Import { .. } => {
-                    return Err(self.error_here_at(
-                        RuntimeErrorKind::DynamicImportUnsupported { module: module_id },
-                        pc,
-                    ));
+                Instruction::Import { dst, specifier } => {
+                    match self.import_namespace(module_id, specifier) {
+                        Ok(namespace) => {
+                            self.write_register(frame_index, dst.get(), namespace);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
                 }
                 Instruction::Export { .. } => {
                     return Err(self.error_here_at(
@@ -2302,16 +2429,16 @@ impl<'a, H: Host> Machine<'a, H> {
         this_value: Value,
         new_target: Value,
         arguments: &[Value],
-        return_to: ReturnTo,
+        return_to: Option<ReturnTo>,
     ) -> Result<(), RuntimeError> {
         let function_index = target.function.get() as usize;
         let metadata = &self.module_code(target.module).functions()[function_index];
-        let limit_error = |kind| {
-            if let Some(caller) = self.frames.last() {
+        let limit_error = |kind| match (self.frames.last(), return_to) {
+            (Some(caller), Some(return_to)) => {
                 self.error_at_in_module(kind, caller.module, caller.function, return_to.call_pc)
-            } else {
-                self.error_at_in_module(kind, target.module, function_index, 0)
             }
+            (_, None) => self.error_at_in_module(kind, target.module, function_index, 0),
+            (None, Some(_)) => unreachable!("a returning frame has a caller"),
         };
         if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
             return Err(limit_error(RuntimeErrorKind::CallDepthExceeded {
@@ -2325,13 +2452,7 @@ impl<'a, H: Host> Machine<'a, H> {
             }));
         }
         let frame = Frame::new(
-            target,
-            metadata,
-            captures,
-            this_value,
-            new_target,
-            arguments,
-            Some(return_to),
+            target, metadata, captures, this_value, new_target, arguments, return_to,
         );
         self.live_registers += next_registers;
         self.frames.push(frame);
@@ -2390,11 +2511,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 this_value,
                 new_target,
                 arguments,
-                ReturnTo {
+                Some(ReturnTo {
                     destination: destination.map(|register| register as usize),
                     call_pc,
                     constructed,
-                },
+                }),
             ),
             Ok(CalleeKind::Builtin { id, bound_this }) => {
                 let this_value = bound_this.unwrap_or(this_value);
@@ -2750,18 +2871,18 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             CalleeKind::Runtime { target, captures } => {
                 let stop_depth = self.frames.len();
-                let call_pc = self.frames.last().map_or(0, |frame| frame.pc);
+                let return_to = self.frames.last().map(|frame| ReturnTo {
+                    destination: None,
+                    call_pc: frame.pc,
+                    constructed: None,
+                });
                 self.push_frame(
                     target,
                     &captures,
                     this_value,
                     Value::UNDEFINED,
                     arguments,
-                    ReturnTo {
-                        destination: None,
-                        call_pc,
-                        constructed: None,
-                    },
+                    return_to,
                 )
                 .map_err(|error| EvalFailure::Runtime(error.kind))?;
                 match self.run_loop(stop_depth) {
@@ -2770,18 +2891,28 @@ impl<'a, H: Host> Machine<'a, H> {
                             value: Value::UNDEFINED,
                         },
                     )),
-                    Ok(Some(_)) => unreachable!("a nested call cannot complete the entry frame"),
-                    Err(error) => match error.kind {
-                        RuntimeErrorKind::UncaughtThrow { value, .. } => {
-                            Err(EvalFailure::ThrowValue(value))
+                    Ok(Some(execution)) => Ok(execution.value),
+                    Err(error) => {
+                        self.unwind_frames_to(stop_depth);
+                        match error.kind {
+                            RuntimeErrorKind::UncaughtThrow { value, .. } => {
+                                Err(EvalFailure::ThrowValue(value))
+                            }
+                            kind => Err(EvalFailure::Runtime(kind)),
                         }
-                        kind => Err(EvalFailure::Runtime(kind)),
-                    },
+                    }
                 }
             }
             CalleeKind::NotCallable => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                 operation: "call",
             })),
+        }
+    }
+
+    fn unwind_frames_to(&mut self, depth: usize) {
+        while self.frames.len() > depth {
+            let frame = self.frames.pop().expect("frame depth was checked");
+            self.live_registers -= frame.registers.len();
         }
     }
 
@@ -5642,6 +5773,81 @@ mod tests {
     }
 
     #[test]
+    fn runtime_callback_without_interpreter_caller_propagates_throw() {
+        let program = verified(
+            Vec::new(),
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(1, 1, vec![Instruction::Throw { value: reg(0) }], Vec::new()),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callee = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(1),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        let thrown = Value::int32(7);
+
+        assert!(matches!(
+            machine.call_value(callee, Value::UNDEFINED, &[thrown]),
+            Err(EvalFailure::ThrowValue(value)) if value == thrown
+        ));
+    }
+
+    #[test]
+    fn runtime_callback_failure_releases_root_frame() {
+        let program = verified(
+            Vec::new(),
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    1,
+                    1,
+                    vec![Instruction::Return { value: reg(0) }],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callee = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(1),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        machine.fuel = 0;
+
+        assert!(matches!(
+            machine.call_value(callee, Value::UNDEFINED, &[Value::int32(7)]),
+            Err(EvalFailure::Runtime(RuntimeErrorKind::FuelExhausted { .. }))
+        ));
+        assert!(machine.frames.is_empty());
+        assert_eq!(machine.live_registers, 0);
+
+        machine.fuel = 1;
+        assert!(matches!(
+            machine.call_value(callee, Value::UNDEFINED, &[Value::int32(7)]),
+            Ok(value) if value == Value::int32(7)
+        ));
+    }
+
+    #[test]
     fn object_values_have_stable_distinct_heap_identity() {
         let module = verified(
             vec![],
@@ -8466,7 +8672,410 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_import_is_a_typed_runtime_error() {
+    fn dynamic_import_preserves_cycles_identity_and_single_evaluation() {
+        let root = program_module(
+            "root",
+            vec![
+                Constant::String(EcmaString::from_utf8("./dependency")),
+                Constant::String(EcmaString::from_utf8("count")),
+                Constant::Int32(0),
+                Constant::String(EcmaString::from_utf8("value")),
+            ],
+            vec![function(
+                0,
+                7,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(3),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(2),
+                        value: reg(0),
+                    },
+                    Instruction::Import {
+                        dst: reg(1),
+                        specifier: cid(1),
+                    },
+                    Instruction::Import {
+                        dst: reg(2),
+                        specifier: cid(1),
+                    },
+                    Instruction::Binary {
+                        dst: reg(3),
+                        op: BinaryOp::StrictEqual,
+                        left: reg(1),
+                        right: reg(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(4),
+                        constant: cid(4),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(5),
+                        object: reg(2),
+                        key: reg(4),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(6),
+                        name: cid(2),
+                    },
+                    Instruction::Return { value: reg(5) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::Local(ModuleId::new(1)),
+                kind: EdgeKind::Dynamic,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let dependency = program_module(
+            "dependency",
+            vec![
+                Constant::String(EcmaString::from_utf8("./root")),
+                Constant::String(EcmaString::from_utf8("count")),
+                Constant::Int32(1),
+                Constant::Int32(7),
+                Constant::String(EcmaString::from_utf8("value")),
+            ],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(3),
+                    },
+                    Instruction::Binary {
+                        dst: reg(2),
+                        op: BinaryOp::Add,
+                        left: reg(0),
+                        right: reg(1),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(2),
+                        value: reg(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(4),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(5),
+                        value: reg(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            vec![Binding {
+                name: cid(5),
+                kind: BindingKind::Hoisted,
+            }],
+            vec![Export {
+                name: cid(5),
+                source: ExportSource::Local(BindingId::new(0)),
+            }],
+        );
+
+        let execution = run_ok(&linked(vec![root, dependency], 0));
+        assert_eq!(execution.value, Value::int32(7));
+        assert_eq!(execution.entry_registers[1], execution.entry_registers[2]);
+        assert_eq!(execution.entry_registers[3], Value::TRUE);
+        assert_eq!(execution.entry_registers[6], Value::int32(1));
+    }
+
+    #[test]
+    fn dynamic_import_counts_live_registers_and_retries_engine_failures() {
+        let target = program_module(
+            "target",
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let root = program_module(
+            "root",
+            vec![Constant::String(EcmaString::from_utf8("./target"))],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::Import {
+                        dst: reg(0),
+                        specifier: cid(1),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::Local(ModuleId::new(1)),
+                kind: EdgeKind::Dynamic,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let program = linked(vec![root, target], 0);
+        let mut host = TestHost;
+        let mut machine = Machine::new(
+            &program,
+            &mut host,
+            Limits {
+                max_total_registers: 1,
+                ..Limits::default()
+            },
+        );
+        machine.frames.clear();
+        machine.live_registers = 0;
+        machine.instantiate_modules().unwrap();
+
+        let error = machine.evaluate_import(ModuleId::new(0)).unwrap_err();
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::RegisterLimitExceeded { limit: 1 }
+        ));
+        assert_eq!(machine.frames.len(), 0);
+        assert_eq!(machine.live_registers, 0);
+
+        machine.limits.max_total_registers = 2;
+        machine.evaluate_import(ModuleId::new(0)).unwrap();
+    }
+
+    #[test]
+    fn dynamic_import_rethrows_one_stored_failure_at_each_import_site() {
+        let root = program_module(
+            "root",
+            vec![
+                Constant::String(EcmaString::from_utf8("./target")),
+                Constant::String(EcmaString::from_utf8("count")),
+                Constant::Int32(0),
+            ],
+            vec![function(
+                0,
+                4,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(3),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(2),
+                        value: reg(0),
+                    },
+                    Instruction::Import {
+                        dst: reg(0),
+                        specifier: cid(1),
+                    },
+                    Instruction::Halt,
+                    Instruction::Import {
+                        dst: reg(0),
+                        specifier: cid(1),
+                    },
+                    Instruction::Halt,
+                    Instruction::LoadGlobal {
+                        dst: reg(3),
+                        name: cid(2),
+                    },
+                    Instruction::Return { value: reg(2) },
+                ],
+                vec![
+                    ExceptionHandler {
+                        start: pc(2),
+                        end: pc(3),
+                        handler: pc(4),
+                        catch_register: reg(1),
+                    },
+                    ExceptionHandler {
+                        start: pc(4),
+                        end: pc(5),
+                        handler: pc(6),
+                        catch_register: reg(2),
+                    },
+                ],
+            )],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::Local(ModuleId::new(1)),
+                kind: EdgeKind::Dynamic,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let target = program_module(
+            "target",
+            vec![
+                Constant::String(EcmaString::from_utf8("count")),
+                Constant::Int32(1),
+                Constant::Int32(9),
+            ],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(1),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(2),
+                    },
+                    Instruction::Binary {
+                        dst: reg(2),
+                        op: BinaryOp::Add,
+                        left: reg(0),
+                        right: reg(1),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(1),
+                        value: reg(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(3),
+                    },
+                    Instruction::Throw { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let execution = run_ok(&linked(vec![root, target], 0));
+        assert_eq!(execution.value, Value::int32(9));
+        assert_eq!(execution.entry_registers[1], Value::int32(9));
+        assert_eq!(execution.entry_registers[2], Value::int32(9));
+        assert_eq!(execution.entry_registers[3], Value::int32(1));
+    }
+
+    #[test]
+    fn dynamic_import_returns_the_registered_external_namespace() {
+        let module = program_module(
+            "root",
+            vec![Constant::String(EcmaString::from_utf8("external"))],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::Import {
+                        dst: reg(0),
+                        specifier: cid(1),
+                    },
+                    Instruction::Import {
+                        dst: reg(1),
+                        specifier: cid(1),
+                    },
+                    Instruction::Binary {
+                        dst: reg(2),
+                        op: BinaryOp::StrictEqual,
+                        left: reg(0),
+                        right: reg(1),
+                    },
+                    Instruction::Return { value: reg(2) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::External,
+                kind: EdgeKind::Dynamic,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let program = linked(vec![module], 0);
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let namespace = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        machine.registry.external.insert(
+            EcmaString::from_utf8("external"),
+            ExternalModuleInstance {
+                namespace,
+                exports: BTreeMap::new(),
+                internals: BTreeMap::new(),
+            },
+        );
+
+        let execution = machine.run().unwrap();
+        assert_eq!(execution.value, Value::TRUE);
+        assert_eq!(execution.entry_registers[0], namespace);
+        assert_eq!(execution.entry_registers[1], namespace);
+    }
+
+    #[test]
+    fn dynamic_import_resolution_is_requester_scoped() {
+        let requester = |name, target| {
+            program_module(
+                name,
+                vec![Constant::String(EcmaString::from_utf8("./target"))],
+                vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+                vec![Edge {
+                    specifier: cid(1),
+                    target: EdgeTarget::Local(ModuleId::new(target)),
+                    kind: EdgeKind::Dynamic,
+                }],
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        let target = |name| {
+            program_module(
+                name,
+                Vec::new(),
+                vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        let program = linked(
+            vec![
+                requester("first", 2),
+                requester("second", 3),
+                target("first-target"),
+                target("second-target"),
+            ],
+            0,
+        );
+        let mut host = TestHost;
+        let machine = Machine::new(&program, &mut host, Limits::default());
+
+        assert_eq!(
+            machine.resolve_import(ModuleId::new(0), cid(1)),
+            Ok(ImportTarget::Local(ModuleId::new(2)))
+        );
+        assert_eq!(
+            machine.resolve_import(ModuleId::new(1), cid(1)),
+            Ok(ImportTarget::Local(ModuleId::new(3)))
+        );
+    }
+
+    #[test]
+    fn dynamic_import_of_a_missing_external_is_a_runtime_error() {
         let module = program_module(
             "root",
             vec![Constant::String(EcmaString::from_utf8("dynamic"))],
@@ -8497,7 +9106,8 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error.kind,
-            RuntimeErrorKind::DynamicImportUnsupported { module } if module == ModuleId::new(0)
+            RuntimeErrorKind::ExternalModuleUnavailable { module, edge }
+                if module == ModuleId::new(0) && edge == EdgeId::new(0)
         ));
     }
 
