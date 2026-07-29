@@ -628,9 +628,7 @@ fn from_entries<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let iterable = args.first().copied().unwrap_or(Value::UNDEFINED);
-    let entries = machine
-        .array_elements(iterable)?
-        .ok_or_else(|| type_error("Object.fromEntries requires an iterable"))?;
+    let entries = machine.iterable_values(iterable)?;
     let object = machine
         .allocate(HeapEntry::Object {
             properties: PropertyMap::default(),
@@ -639,12 +637,13 @@ fn from_entries<H: Host>(
             boxed_primitive: None,
         })
         .map_err(EvalFailure::Runtime)?;
-    for entry in entries.into_iter().filter(|value| *value != Value::HOLE) {
-        let pair = machine
-            .array_elements(entry)?
-            .ok_or_else(|| type_error("Iterator value is not an entry object"))?;
-        let key = machine.to_property_key(pair.first().copied().unwrap_or(Value::UNDEFINED))?;
-        let value = pair.get(1).copied().unwrap_or(Value::UNDEFINED);
+    for entry in entries {
+        if !machine.is_object(entry) {
+            return Err(type_error("Iterator value is not an entry object"));
+        }
+        let key_value = machine.get_named_property(entry, "0")?;
+        let key = machine.to_property_key(key_value)?;
+        let value = machine.get_named_property(entry, "1")?;
         machine.set_data_property_key(object, key, value)?;
     }
     Ok(BuiltinOutcome::Value(object))
@@ -2481,5 +2480,192 @@ mod tests {
         let values = machine.array_elements(result).unwrap().unwrap();
         assert_eq!(values.len(), machine.limits.max_argument_count as usize - 1);
         assert_eq!(values[0], receiver);
+    }
+
+    // ---- from_entries iterable tests ---------------------------------------
+
+    fn custom_iterator_next<H: Host>(
+        machine: &mut Machine<'_, H>,
+        this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let values = machine.get_named_property(this, "_values")?;
+        let index_val = machine.get_named_property(this, "_index")?;
+        let elements = machine.array_elements(values)?.unwrap_or_default();
+        let index = match index_val.decode() {
+            Some(Decoded::Int32(i)) => i as usize,
+            Some(Decoded::Number(n)) => n as usize,
+            _ => 0,
+        };
+        let result = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .map_err(EvalFailure::Runtime)?;
+        if index >= elements.len() {
+            machine.set_data_property(result, "done", Value::TRUE)?;
+            machine.set_data_property(result, "value", Value::UNDEFINED)?;
+        } else {
+            machine.set_data_property(result, "done", Value::FALSE)?;
+            machine.set_data_property(result, "value", elements[index])?;
+            machine.set_data_property(this, "_index", Value::int32((index + 1) as u32))?;
+        }
+        Ok(BuiltinOutcome::Value(result))
+    }
+
+    fn custom_iterator_create<H: Host>(
+        machine: &mut Machine<'_, H>,
+        this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let iter = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .map_err(EvalFailure::Runtime)?;
+        let values = machine.get_named_property(this, "_values")?;
+        let next = machine.get_named_property(this, "_next")?;
+        machine.set_data_property(iter, "_values", values)?;
+        machine.set_data_property(iter, "_index", Value::int32(0))?;
+        machine.set_data_property(iter, "next", next)?;
+        Ok(BuiltinOutcome::Value(iter))
+    }
+
+    fn custom_iterable(machine: &mut Machine<'_, TestHost>, values: Vec<Value>) -> Value {
+        let next_id = machine
+            .intrinsics
+            .builtins
+            .register(crate::intrinsics::BuiltinDef {
+                name: "from_entries next",
+                length: 0,
+                handler: custom_iterator_next::<TestHost>,
+            });
+        let next_fn =
+            crate::intrinsics::native_function(&mut machine.heap, next_id, "from entries next", 0);
+        let create_id = machine
+            .intrinsics
+            .builtins
+            .register(crate::intrinsics::BuiltinDef {
+                name: "from entries iterator",
+                length: 0,
+                handler: custom_iterator_create::<TestHost>,
+            });
+        let create_fn = crate::intrinsics::native_function(
+            &mut machine.heap,
+            create_id,
+            "from entries iterator",
+            0,
+        );
+        let iterable = object(machine);
+        let values_array = allocate_array(machine, values).unwrap();
+        machine
+            .set_data_property(iterable, "_values", values_array)
+            .unwrap();
+        machine
+            .set_data_property(iterable, "_next", next_fn)
+            .unwrap();
+        let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
+        let iterator_key = machine.to_property_key(iterator_symbol).unwrap();
+        machine
+            .set_data_property_key(iterable, iterator_key, create_fn)
+            .unwrap();
+        iterable
+    }
+
+    fn entry_pair(machine: &mut Machine<'_, TestHost>, key: &str, value: Value) -> Value {
+        let entry = object(machine);
+        let key_str = allocate_string(machine, EcmaString::from_utf8(key)).unwrap();
+        machine.set_data_property(entry, "0", key_str).unwrap();
+        machine.set_data_property(entry, "1", value).unwrap();
+        entry
+    }
+
+    #[test]
+    fn from_entries_consumes_generic_iterable() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let e1 = entry_pair(&mut machine, "a", Value::int32(1));
+        let e2 = entry_pair(&mut machine, "b", Value::int32(2));
+        let source = custom_iterable(&mut machine, vec![e1, e2]);
+
+        let result = call_object(&mut machine, "fromEntries", &[source]).unwrap();
+        assert_eq!(
+            machine.get_named_property(result, "a").unwrap(),
+            Value::int32(1)
+        );
+        assert_eq!(
+            machine.get_named_property(result, "b").unwrap(),
+            Value::int32(2)
+        );
+    }
+
+    #[test]
+    fn from_entries_accepts_object_shaped_entries() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        // Entries are plain objects with "0"/"1" properties, not arrays.
+        let e1 = entry_pair(&mut machine, "x", Value::int32(10));
+        let e2 = entry_pair(&mut machine, "y", Value::int32(20));
+        let source = custom_iterable(&mut machine, vec![e1, e2]);
+
+        let result = call_object(&mut machine, "fromEntries", &[source]).unwrap();
+        assert_eq!(
+            machine.get_named_property(result, "x").unwrap(),
+            Value::int32(10)
+        );
+        assert_eq!(
+            machine.get_named_property(result, "y").unwrap(),
+            Value::int32(20)
+        );
+    }
+
+    #[test]
+    fn from_entries_rejects_primitive_entries() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        // Iterator yields a primitive number, not an object-shaped entry.
+        let source = custom_iterable(&mut machine, vec![Value::int32(42)]);
+        let result = call_object(&mut machine, "fromEntries", &[source]);
+        assert!(
+            result.is_err(),
+            "Object.fromEntries with primitive entry must fail"
+        );
+    }
+
+    #[test]
+    fn from_entries_consumes_array_through_protocol() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let a_key = allocate_string(&mut machine, EcmaString::from_utf8("a")).unwrap();
+        let e1 = allocate_array(&mut machine, vec![a_key, Value::int32(1)]).unwrap();
+        let b_key = allocate_string(&mut machine, EcmaString::from_utf8("b")).unwrap();
+        let e2 = allocate_array(&mut machine, vec![b_key, Value::int32(2)]).unwrap();
+        let source = allocate_array(&mut machine, vec![e1, e2]).unwrap();
+
+        let result = call_object(&mut machine, "fromEntries", &[source]).unwrap();
+        assert_eq!(
+            machine.get_named_property(result, "a").unwrap(),
+            Value::int32(1)
+        );
+        assert_eq!(
+            machine.get_named_property(result, "b").unwrap(),
+            Value::int32(2)
+        );
     }
 }

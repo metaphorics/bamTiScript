@@ -508,6 +508,59 @@ impl CollectionEntry {
     const BYTES: usize = std::mem::size_of::<Self>();
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum IteratorNextPrepared {
+    Ready { done: bool, value: Value },
+    Call { callee: Value, this_value: Value },
+}
+
+#[derive(Clone, Debug)]
+enum IteratorState {
+    Keys { index: usize, keys: Vec<EcmaString> },
+    Protocol { iterator: Value, next: Value },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GeneratorStart {
+    pub(crate) target: RuntimeFunction,
+    pub(crate) captures: Vec<Value>,
+    pub(crate) this_value: Value,
+    pub(crate) new_target: Value,
+    pub(crate) args: Vec<Value>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GeneratorActivation {
+    pub(crate) target: RuntimeFunction,
+    pub(crate) registers: Vec<Value>,
+    pub(crate) this_value: Value,
+    pub(crate) new_target: Value,
+    pub(crate) args: Vec<Value>,
+    pub(crate) arguments_object: Option<Value>,
+    pub(crate) resume_token: u32,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum GeneratorState {
+    SuspendedStart(GeneratorStart),
+    Executing,
+    Suspended(GeneratorActivation),
+    Completed,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum GeneratorResume {
+    Yield {
+        value: Value,
+        activation: GeneratorActivation,
+    },
+    Return(Value),
+    Throw {
+        value: Value,
+        origin: ThrowOrigin,
+    },
+}
+
 #[derive(Clone, Debug)]
 enum HeapEntry {
     String(EcmaString),
@@ -591,9 +644,13 @@ enum HeapEntry {
         extensible: bool,
     },
     Iterator {
-        source: Value,
-        index: usize,
-        keys: Option<Vec<EcmaString>>,
+        state: IteratorState,
+    },
+    Generator {
+        state: GeneratorState,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+        extensible: bool,
     },
     ProcessEnv {
         prototype: Option<Value>,
@@ -641,6 +698,19 @@ impl HeapEntry {
                 NativeCallable::Builtin(_) => 1,
                 NativeCallable::Bound(bound) => bound.arguments.len().saturating_add(1),
             },
+            Self::Generator { state, .. } => match state {
+                GeneratorState::SuspendedStart(start) => start
+                    .captures
+                    .len()
+                    .saturating_add(start.args.len())
+                    .saturating_add(1),
+                GeneratorState::Suspended(activation) => activation
+                    .registers
+                    .len()
+                    .saturating_add(activation.args.len())
+                    .saturating_add(1),
+                GeneratorState::Executing | GeneratorState::Completed => 1,
+            },
             Self::Object { .. }
             | Self::Array { .. }
             | Self::Function { .. }
@@ -681,9 +751,9 @@ pub(crate) struct BoundCall {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct RuntimeFunction {
-    module: ModuleId,
-    function: FunctionId,
+pub(crate) struct RuntimeFunction {
+    pub(crate) module: ModuleId,
+    pub(crate) function: FunctionId,
 }
 
 #[derive(Clone, Debug)]
@@ -741,6 +811,10 @@ enum EvalFailure {
     Throw(ThrowOrigin),
     ThrowValue(Value),
     Runtime(RuntimeErrorKind),
+    ThrowValueOrigin {
+        value: Value,
+        origin: ThrowOrigin,
+    },
 }
 
 pub(crate) fn import_failure(error: &RuntimeError) -> EvalFailure {
@@ -812,6 +886,12 @@ pub struct Machine<'a, H: Host> {
     fuel: u64,
     globals: BTreeMap<EcmaString, Value>,
     last_completion: Option<Value>,
+    /// Frame depths owned by native-to-runtime callback evaluations. A throw
+    /// crossing this boundary returns to the native caller so the enclosing
+    /// bytecode instruction resolves it at its own program counter.
+    callback_boundaries: Vec<usize>,
+    generator_boundaries: Vec<usize>,
+    pending_generator_resume: Option<GeneratorResume>,
     intrinsics: intrinsics::Intrinsics<H>,
     current_builtin_id: Option<intrinsics::BuiltinId>,
     registry: ModuleRegistry,
@@ -977,6 +1057,9 @@ impl<'a, H: Host> Machine<'a, H> {
             live_registers,
             native_depth: 0,
             last_completion: None,
+            callback_boundaries: Vec::new(),
+            generator_boundaries: Vec::new(),
+            pending_generator_resume: None,
             globals: BTreeMap::new(),
             registry: ModuleRegistry {
                 external: installed_external
@@ -2087,6 +2170,31 @@ impl<'a, H: Host> Machine<'a, H> {
                     let value = self.read_register(frame_index, value.get());
                     self.throw(value, ThrowOrigin::Bytecode, pc)?;
                 }
+                Instruction::Suspend { src, .. }
+                    if self
+                        .generator_boundaries
+                        .last()
+                        .is_some_and(|boundary| *boundary == frame_index) =>
+                {
+                    let value = self.read_register(frame_index, src.get());
+                    let frame = self.frames.pop().expect("generator activation is executing");
+                    self.pending_generator_resume = Some(GeneratorResume::Yield {
+                        value,
+                        activation: GeneratorActivation {
+                            target: RuntimeFunction {
+                                module: frame.module,
+                                function: FunctionId::new(frame.function as u32),
+                            },
+                            registers: frame.registers,
+                            this_value: frame.this_value,
+                            new_target: frame.new_target,
+                            args: frame.args,
+                            arguments_object: frame.arguments_object,
+                            resume_token: pc as u32 + 1,
+                        },
+                    });
+                    return Ok(None);
+                }
                 Instruction::Suspend { .. } => {
                     self.throw_type("suspend outside an engine-owned event loop", pc)?;
                 }
@@ -2271,6 +2379,22 @@ impl<'a, H: Host> Machine<'a, H> {
             self.registry.cells[cell.0].value = value;
         } else {
             let name = self.constant_text(module, name).to_owned();
+            if let Some(global_this) = self.intrinsics.global("globalThis") {
+                let key = PropertyKey::Named(name.clone());
+                if matches!(
+                    self.own_descriptor(global_this, &key)?,
+                    Some(
+                        Property::Data {
+                            writable: false,
+                            ..
+                        } | Property::Accessor { setter: None, .. }
+                    )
+                ) {
+                    return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "assign to non-writable global property",
+                    }));
+                }
+            }
             self.globals.insert(name, value);
         }
         Ok(())
@@ -2578,6 +2702,37 @@ impl<'a, H: Host> Machine<'a, H> {
         self.live_registers -= register_count;
     }
 
+    pub(crate) fn reserve_suspended_generator_registers(
+        &mut self,
+        register_count: usize,
+    ) -> Result<(), RuntimeErrorKind> {
+        if self.live_registers.saturating_add(register_count) > self.limits.max_total_registers {
+            return Err(RuntimeErrorKind::RegisterLimitExceeded {
+                limit: self.limits.max_total_registers,
+            });
+        }
+        self.live_registers += register_count;
+        Ok(())
+    }
+
+    pub(crate) fn release_suspended_generator_registers(&mut self, register_count: usize) {
+        self.live_registers -= register_count;
+    }
+
+    pub(crate) fn enter_native_generator(&mut self) -> Result<(), RuntimeErrorKind> {
+        if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
+            return Err(RuntimeErrorKind::CallDepthExceeded {
+                limit: self.limits.max_call_depth,
+            });
+        }
+        self.native_depth += 1;
+        Ok(())
+    }
+
+    pub(crate) fn leave_native_generator(&mut self) {
+        self.native_depth -= 1;
+    }
+
     fn execute_call(&mut self, request: CallRequest<'_>) -> Result<(), RuntimeError> {
         let CallRequest {
             callee,
@@ -2594,6 +2749,24 @@ impl<'a, H: Host> Machine<'a, H> {
         loop {
             match self.callee_kind(callee) {
                 Ok(CalleeKind::Runtime { target, captures }) => {
+                    let flags = self.module_code(target.module).functions()
+                        [target.function.get() as usize]
+                        .flags();
+                    if flags.is_generator && !flags.is_async {
+                        let generator = self
+                            .create_generator(GeneratorStart {
+                                target,
+                                captures,
+                                this_value,
+                                new_target,
+                                args: arguments.as_ref().to_vec(),
+                            })
+                            .map_err(|kind| self.error_here_at(kind, call_pc))?;
+                        if let Some(register) = destination {
+                            self.write_register(self.frames.len() - 1, register, generator);
+                        }
+                        return Ok(());
+                    }
                     return self.push_frame(
                         target,
                         &captures,
@@ -2624,6 +2797,18 @@ impl<'a, H: Host> Machine<'a, H> {
                             this_value = next_this;
                             arguments = Cow::Owned(next_arguments);
                         }
+                        Ok(intrinsics::BuiltinOutcome::GeneratorNext {
+                            generator,
+                            resume_value,
+                        }) => match self.resume_generator(generator, resume_value) {
+                            Ok(value) => {
+                                if let Some(register) = destination {
+                                    self.write_register(self.frames.len() - 1, register, value);
+                                }
+                                return Ok(());
+                            }
+                            Err(failure) => return self.resolve_failure(failure, call_pc),
+                        },
                         Ok(intrinsics::BuiltinOutcome::ConstructCall { .. }) => {
                             return self.throw_type("call", call_pc);
                         }
@@ -2680,9 +2865,10 @@ impl<'a, H: Host> Machine<'a, H> {
                     self.write_register(self.frames.len() - 1, destination, value);
                     Ok(())
                 }
-                Ok(intrinsics::BuiltinOutcome::Call { .. }) => {
-                    self.throw_type("construct", call_pc)
-                }
+                Ok(
+                    intrinsics::BuiltinOutcome::Call { .. }
+                    | intrinsics::BuiltinOutcome::GeneratorNext { .. },
+                ) => self.throw_type("construct", call_pc),
                 Ok(intrinsics::BuiltinOutcome::ConstructCall {
                     callee: continuation,
                     this_value,
@@ -2980,6 +3166,10 @@ impl<'a, H: Host> Machine<'a, H> {
                             this_value = next_this;
                             arguments = Cow::Owned(next_arguments);
                         }
+                        intrinsics::BuiltinOutcome::GeneratorNext {
+                            generator,
+                            resume_value,
+                        } => return self.resume_generator(generator, resume_value),
                         intrinsics::BuiltinOutcome::ConstructCall { .. } => {
                             return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                                 operation: "call",
@@ -2988,6 +3178,20 @@ impl<'a, H: Host> Machine<'a, H> {
                     }
                 }
                 CalleeKind::Runtime { target, captures } => {
+                    let flags = self.module_code(target.module).functions()
+                        [target.function.get() as usize]
+                        .flags();
+                    if flags.is_generator && !flags.is_async {
+                        return self
+                            .create_generator(GeneratorStart {
+                                target,
+                                captures,
+                                this_value,
+                                new_target: Value::UNDEFINED,
+                                args: arguments.as_ref().to_vec(),
+                            })
+                            .map_err(EvalFailure::Runtime);
+                    }
                     let stop_depth = self.frames.len();
                     let return_to = self.frames.last().map(|frame| ReturnTo {
                         destination: None,
@@ -3003,7 +3207,12 @@ impl<'a, H: Host> Machine<'a, H> {
                         return_to,
                     )
                     .map_err(|error| EvalFailure::Runtime(error.kind))?;
-                    return match self.run_loop(stop_depth) {
+                    self.callback_boundaries.push(stop_depth);
+                    let result = self.run_loop(stop_depth);
+                    self.callback_boundaries
+                        .pop()
+                        .expect("nested runtime callback owns its unwind boundary");
+                    return match result {
                         Ok(None) => self.last_completion.take().ok_or(EvalFailure::Runtime(
                             RuntimeErrorKind::InvalidValue {
                                 value: Value::UNDEFINED,
@@ -3081,6 +3290,7 @@ impl<'a, H: Host> Machine<'a, H> {
         match failure {
             EvalFailure::Throw(origin) => self.throw(Value::UNDEFINED, origin, pc),
             EvalFailure::ThrowValue(value) => self.throw(value, ThrowOrigin::Bytecode, pc),
+            EvalFailure::ThrowValueOrigin { value, origin } => self.throw(value, origin, pc),
             EvalFailure::Runtime(kind) => Err(self.error_here_at(kind, pc)),
         }
     }
@@ -3107,6 +3317,18 @@ impl<'a, H: Host> Machine<'a, H> {
             .function;
         let mut search_pc = faulting_pc;
         loop {
+            if self
+                .callback_boundaries
+                .last()
+                .is_some_and(|boundary| self.frames.len() == *boundary)
+            {
+                return Err(self.error_at_in_module(
+                    RuntimeErrorKind::UncaughtThrow { value, origin },
+                    site_module,
+                    site_function,
+                    faulting_pc,
+                ));
+            }
             let frame_index = self.frames.len() - 1;
             let function_index = self.frames[frame_index].function;
             let module = self.frames[frame_index].module;
@@ -3356,6 +3578,7 @@ impl<'a, H: Host> Machine<'a, H> {
         }
         match &self.heap[index] {
             HeapEntry::Object { properties, .. }
+            | HeapEntry::Generator { properties, .. }
             | HeapEntry::Script { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
             | HeapEntry::Date { properties, .. }
@@ -3439,7 +3662,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     Found::Value(Value::boolean(flags.as_units().contains(&u16::from(unit))))
                 };
                 match name {
-                    "source" => Some(Found::Text(pattern.clone())),
+                    "source" => Some(Found::Text(crate::intrinsics::builtins::canonical_source(
+                        pattern,
+                    ))),
                     "flags" => Some(Found::Text(flags.clone())),
                     "global" => Some(flag(b'g')),
                     "ignoreCase" => Some(flag(b'i')),
@@ -3476,6 +3701,7 @@ impl<'a, H: Host> Machine<'a, H> {
         }
         match &self.heap[index] {
             HeapEntry::Object { properties, .. }
+            | HeapEntry::Generator { properties, .. }
             | HeapEntry::Script { properties, .. }
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
@@ -3561,7 +3787,9 @@ impl<'a, H: Host> Machine<'a, H> {
                         ))
                     };
                     if name.eq_ascii("source") {
-                        return Some(Found::Text(pattern.clone()));
+                        return Some(Found::Text(crate::intrinsics::builtins::canonical_source(
+                            pattern,
+                        )));
                     }
                     if name.eq_ascii("flags") {
                         return Some(Found::Text(flags.clone()));
@@ -3651,6 +3879,7 @@ impl<'a, H: Host> Machine<'a, H> {
     fn own_data_property(&self, index: usize, name: &str) -> Option<Value> {
         let properties = match &self.heap[index] {
             HeapEntry::Object { properties, .. }
+            | HeapEntry::Generator { properties, .. }
             | HeapEntry::Script { properties, .. }
             | HeapEntry::Array { properties, .. }
             | HeapEntry::Function { properties, .. }
@@ -3670,6 +3899,7 @@ impl<'a, H: Host> Machine<'a, H> {
     fn prototype_index(&self, index: usize) -> Result<Option<usize>, EvalFailure> {
         let prototype = match &self.heap[index] {
             HeapEntry::Object { prototype, .. }
+            | HeapEntry::Generator { prototype, .. }
             | HeapEntry::Script { prototype, .. }
             | HeapEntry::Array { prototype, .. }
             | HeapEntry::Function { prototype, .. }
@@ -3685,6 +3915,31 @@ impl<'a, H: Host> Machine<'a, H> {
             Some(value) => self.runtime_slot(value).map_err(EvalFailure::Runtime),
             None => Ok(None),
         }
+    }
+
+    pub(crate) fn inherits_from_prototype(
+        &self,
+        value: Value,
+        prototype: Value,
+    ) -> Result<bool, EvalFailure> {
+        let Some(mut current) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
+            return Ok(false);
+        };
+        let Some(target) = self.runtime_slot(prototype).map_err(EvalFailure::Runtime)? else {
+            return Ok(false);
+        };
+        let mut traversed = 0;
+        while let Some(next) = self.prototype_index(current)? {
+            if next == target {
+                return Ok(true);
+            }
+            current = next;
+            traversed += 1;
+            if traversed > self.heap.len() {
+                return Ok(false);
+            }
+        }
+        Ok(false)
     }
 
     // ---- property set ------------------------------------------------------
@@ -3742,6 +3997,7 @@ impl<'a, H: Host> Machine<'a, H> {
         loop {
             let accessor = match &self.heap[node] {
                 HeapEntry::Object { properties, .. }
+                | HeapEntry::Generator { properties, .. }
                 | HeapEntry::Script { properties, .. }
                 | HeapEntry::Array { properties, .. }
                 | HeapEntry::Function { properties, .. }
@@ -3848,6 +4104,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 extensible,
                 ..
             }
+            | HeapEntry::Generator {
+                properties,
+                extensible,
+                ..
+            }
             | HeapEntry::Script {
                 properties,
                 extensible,
@@ -3921,6 +4182,7 @@ impl<'a, H: Host> Machine<'a, H> {
 
         let growth = match &self.heap[index] {
             HeapEntry::Object { properties, .. }
+            | HeapEntry::Generator { properties, .. }
             | HeapEntry::Script { properties, .. }
             | HeapEntry::Function { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
@@ -3978,6 +4240,7 @@ impl<'a, H: Host> Machine<'a, H> {
         self.charge_heap(growth).map_err(EvalFailure::Runtime)?;
         match &mut self.heap[index] {
             HeapEntry::Object { properties, .. }
+            | HeapEntry::Generator { properties, .. }
             | HeapEntry::Script { properties, .. }
             | HeapEntry::Function { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
@@ -4062,6 +4325,11 @@ impl<'a, H: Host> Machine<'a, H> {
                     .map_err(EvalFailure::Runtime)?;
                 let (properties, extensible) = match &mut self.heap[index] {
                     HeapEntry::Object {
+                        properties,
+                        extensible,
+                        ..
+                    }
+                    | HeapEntry::Generator {
                         properties,
                         extensible,
                         ..
@@ -4155,6 +4423,7 @@ impl<'a, H: Host> Machine<'a, H> {
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => match &mut self.heap[index] {
                 HeapEntry::Object { properties, .. }
+                | HeapEntry::Generator { properties, .. }
                 | HeapEntry::Script { properties, .. }
                 | HeapEntry::Function { properties, .. }
                 | HeapEntry::NativeFunction { properties, .. }
@@ -4260,7 +4529,7 @@ impl<'a, H: Host> Machine<'a, H> {
 
     // ---- aggregates & prototypes ------------------------------------------
 
-    fn array_push(&mut self, array: Value, value: Value) -> Result<(), EvalFailure> {
+    pub(crate) fn array_push(&mut self, array: Value, value: Value) -> Result<(), EvalFailure> {
         match self.runtime_slot(array).map_err(EvalFailure::Runtime)? {
             Some(index) => {
                 if !matches!(self.heap[index], HeapEntry::Array { .. }) {
@@ -4295,83 +4564,13 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn array_extend(&mut self, array: Value, iterable: Value) -> Result<(), EvalFailure> {
-        let values = self.iterate_values(iterable)?;
-        match self.runtime_slot(array).map_err(EvalFailure::Runtime)? {
-            Some(index) => {
-                if !matches!(self.heap[index], HeapEntry::Array { .. }) {
-                    return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                        operation: "spread into non-array",
-                    }));
-                }
-                self.charge_heap(8usize.saturating_mul(values.len()))
-                    .map_err(EvalFailure::Runtime)?;
-                if let HeapEntry::Array {
-                    elements,
-                    properties,
-                    length_writable,
-                    ..
-                } = &mut self.heap[index]
-                {
-                    let offset = elements.len();
-                    array_set_length(
-                        elements,
-                        properties,
-                        *length_writable,
-                        number_value((offset + values.len()) as f64),
-                        "spread beyond non-writable array length",
-                    )?;
-                    elements[offset..].copy_from_slice(&values);
-                }
-                Ok(())
+        let iterator = self.create_iterator(iterable, IteratorKind::Sync)?;
+        loop {
+            let (done, value) = self.iterator_next(iterator)?;
+            if done {
+                return Ok(());
             }
-            None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "spread into non-array",
-            })),
-        }
-    }
-
-    /// Collects every value produced by iterating `value` (arrays and strings
-    /// are the local iterables; anything else is not iterable).
-    fn iterate_values(&mut self, value: Value) -> Result<Vec<Value>, EvalFailure> {
-        match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
-            Some(index) => match &self.heap[index] {
-                HeapEntry::Array { elements, .. } => Ok(elements
-                    .iter()
-                    .map(|element| {
-                        if *element == Value::HOLE {
-                            Value::UNDEFINED
-                        } else {
-                            *element
-                        }
-                    })
-                    .collect()),
-                HeapEntry::String(text) => {
-                    let pieces: Vec<EcmaString> = text
-                        .code_points()
-                        .map(|(_, code_point)| {
-                            let mut builder = EcmaStringBuilder::new();
-                            builder
-                                .push_code_point(code_point)
-                                .expect("EcmaString code point is valid");
-                            builder.finish()
-                        })
-                        .collect();
-                    let mut values = Vec::with_capacity(pieces.len());
-                    for piece in pieces {
-                        values.push(
-                            self.allocate(HeapEntry::String(piece))
-                                .map_err(EvalFailure::Runtime)?,
-                        );
-                    }
-                    Ok(values)
-                }
-                _ => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                    operation: "value is not iterable",
-                })),
-            },
-            None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "value is not iterable",
-            })),
+            self.array_push(array, value)?;
         }
     }
 
@@ -4380,7 +4579,10 @@ impl<'a, H: Host> Machine<'a, H> {
             Some(index)
                 if matches!(
                     self.heap[index],
-                    HeapEntry::Object { .. } | HeapEntry::Script { .. } | HeapEntry::Array { .. }
+                    HeapEntry::Object { .. }
+                        | HeapEntry::Generator { .. }
+                        | HeapEntry::Script { .. }
+                        | HeapEntry::Array { .. }
                 ) =>
             {
                 index
@@ -4420,6 +4622,9 @@ impl<'a, H: Host> Machine<'a, H> {
                 HeapEntry::Object {
                     prototype: slot, ..
                 }
+                | HeapEntry::Generator {
+                    prototype: slot, ..
+                }
                 | HeapEntry::Script {
                     prototype: slot, ..
                 }
@@ -4454,46 +4659,295 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    // ---- iterators ---------------------------------------------------------
+    pub(crate) fn create_generator(
+        &mut self,
+        start: GeneratorStart,
+    ) -> Result<Value, RuntimeErrorKind> {
+        self.allocate(HeapEntry::Generator {
+            state: GeneratorState::SuspendedStart(start),
+            properties: PropertyMap::default(),
+            prototype: Some(self.intrinsics.builtins.generator_prototype()),
+            extensible: true,
+        })
+    }
 
-    fn create_iterator(&mut self, src: Value, kind: IteratorKind) -> Result<Value, EvalFailure> {
-        match kind {
-            IteratorKind::Keys => {
-                let keys = self.enumerable_keys(src)?;
-                self.allocate(HeapEntry::Iterator {
-                    source: src,
-                    index: 0,
-                    keys: Some(keys),
-                })
-                .map_err(EvalFailure::Runtime)
+    fn resume_generator(
+        &mut self,
+        generator: Value,
+        resume_value: Value,
+    ) -> Result<Value, EvalFailure> {
+        let state = self.take_generator_state(generator)?;
+        if matches!(&state, GeneratorState::Completed) {
+            return self.iterator_result(Value::UNDEFINED, true);
+        }
+
+        let stop_depth = self.frames.len();
+        let return_to = self.frames.last().map(|frame| ReturnTo {
+            destination: None,
+            call_pc: frame.pc,
+            constructed: None,
+        });
+        let prepared = match state {
+            GeneratorState::SuspendedStart(start) => self
+                .push_frame(
+                    start.target,
+                    &start.captures,
+                    start.this_value,
+                    start.new_target,
+                    &start.args,
+                    return_to,
+                )
+                .map_err(|error| EvalFailure::Runtime(error.kind)),
+            GeneratorState::Suspended(activation) => {
+                self.push_resumed_generator_frame(activation, resume_value, return_to)
             }
-            IteratorKind::Sync | IteratorKind::Async => {
-                match self.runtime_slot(src).map_err(EvalFailure::Runtime)? {
-                    Some(index)
-                        if matches!(
-                            self.heap[index],
-                            HeapEntry::Array { .. } | HeapEntry::String(_)
-                        ) =>
-                    {
-                        self.allocate(HeapEntry::Iterator {
-                            source: src,
-                            index: 0,
-                            keys: None,
-                        })
-                        .map_err(EvalFailure::Runtime)
+            GeneratorState::Executing | GeneratorState::Completed => unreachable!(),
+        };
+        if let Err(failure) = prepared {
+            self.settle_generator_completed(generator)?;
+            return Err(failure);
+        }
+
+        let resumed = self.run_generator_activation(stop_depth);
+        match resumed {
+            Ok(GeneratorResume::Yield { value, activation }) => {
+                self.settle_generator_yield(generator, value, activation)
+            }
+            Ok(GeneratorResume::Return(value)) => {
+                self.settle_generator_completed(generator)?;
+                self.iterator_result(value, true)
+            }
+            Ok(GeneratorResume::Throw { value, origin }) => {
+                self.settle_generator_completed(generator)?;
+                Err(EvalFailure::ThrowValueOrigin { value, origin })
+            }
+            Err(failure) => {
+                self.settle_generator_completed(generator)?;
+                Err(failure)
+            }
+        }
+    }
+
+    fn push_resumed_generator_frame(
+        &mut self,
+        activation: GeneratorActivation,
+        resume_value: Value,
+        return_to: Option<ReturnTo>,
+    ) -> Result<(), EvalFailure> {
+        if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
+            self.release_suspended_generator_registers(activation.registers.len());
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::CallDepthExceeded {
+                limit: self.limits.max_call_depth,
+            }));
+        }
+        let suspend_pc = activation
+            .resume_token
+            .checked_sub(1)
+            .expect("suspended generator token is nonzero") as usize;
+        let instruction = self.module_code(activation.target.module).functions()
+            [activation.target.function.get() as usize]
+            .code()[suspend_pc];
+        let Instruction::Suspend { dst, resume, .. } = instruction else {
+            unreachable!("generator resume token names a suspend instruction");
+        };
+        let mut frame = Frame {
+            module: activation.target.module,
+            function: activation.target.function.get() as usize,
+            pc: resume.get() as usize,
+            registers: activation.registers,
+            return_to,
+            this_value: activation.this_value,
+            new_target: activation.new_target,
+            args: activation.args,
+            arguments_object: activation.arguments_object,
+        };
+        frame.registers[dst.get() as usize] = resume_value;
+        self.frames.push(frame);
+        Ok(())
+    }
+
+    fn run_generator_activation(
+        &mut self,
+        stop_depth: usize,
+    ) -> Result<GeneratorResume, EvalFailure> {
+        self.last_completion = None;
+        self.pending_generator_resume = None;
+        self.callback_boundaries.push(stop_depth);
+        self.generator_boundaries.push(stop_depth);
+        let result = self.run_loop(stop_depth);
+        self.generator_boundaries
+            .pop()
+            .expect("generator execution owns its suspend boundary");
+        self.callback_boundaries
+            .pop()
+            .expect("generator execution owns its unwind boundary");
+
+        match result {
+            Ok(Some(execution)) => Ok(GeneratorResume::Return(execution.value)),
+            Ok(None) => {
+                if let Some(resume) = self.pending_generator_resume.take() {
+                    return Ok(resume);
+                }
+                let value = self.last_completion.take().unwrap_or(Value::UNDEFINED);
+                Ok(GeneratorResume::Return(value))
+            }
+            Err(error) => {
+                self.unwind_frames_to(stop_depth);
+                match error.kind {
+                    RuntimeErrorKind::UncaughtThrow { value, origin } => {
+                        Ok(GeneratorResume::Throw { value, origin })
                     }
-                    _ => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                        operation: "value is not iterable",
-                    })),
+                    kind => Err(EvalFailure::Runtime(kind)),
                 }
             }
         }
+    }
+
+    pub(crate) fn take_generator_state(
+        &mut self,
+        generator: Value,
+    ) -> Result<GeneratorState, EvalFailure> {
+        let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)? else {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Generator.prototype.next called on incompatible receiver",
+            }));
+        };
+        let HeapEntry::Generator { state, .. } = &mut self.heap[index] else {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Generator.prototype.next called on incompatible receiver",
+            }));
+        };
+        match std::mem::replace(state, GeneratorState::Executing) {
+            GeneratorState::Executing => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "generator is already running",
+            })),
+            GeneratorState::Completed => {
+                *state = GeneratorState::Completed;
+                Ok(GeneratorState::Completed)
+            }
+            state => Ok(state),
+        }
+    }
+
+    pub(crate) fn settle_generator_yield(
+        &mut self,
+        generator: Value,
+        value: Value,
+        activation: GeneratorActivation,
+    ) -> Result<Value, EvalFailure> {
+        let register_count = activation.registers.len();
+        let result = match self.iterator_result(value, false) {
+            Ok(result) => result,
+            Err(failure) => {
+                self.release_suspended_generator_registers(register_count);
+                self.replace_executing_generator(generator, GeneratorState::Completed)?;
+                return Err(failure);
+            }
+        };
+        if let Err(failure) =
+            self.replace_executing_generator(generator, GeneratorState::Suspended(activation))
+        {
+            self.release_suspended_generator_registers(register_count);
+            return Err(failure);
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn settle_generator_completed(
+        &mut self,
+        generator: Value,
+    ) -> Result<(), EvalFailure> {
+        self.replace_executing_generator(generator, GeneratorState::Completed)
+    }
+
+    fn replace_executing_generator(
+        &mut self,
+        generator: Value,
+        next: GeneratorState,
+    ) -> Result<(), EvalFailure> {
+        let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)? else {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: generator,
+            }));
+        };
+        let HeapEntry::Generator { state, .. } = &mut self.heap[index] else {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: generator,
+            }));
+        };
+        if !matches!(state, GeneratorState::Executing) {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: generator,
+            }));
+        }
+        *state = next;
+        Ok(())
+    }
+
+    pub(crate) fn iterator_result(
+        &mut self,
+        value: Value,
+        done: bool,
+    ) -> Result<Value, EvalFailure> {
+        let result = self
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(self.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .map_err(EvalFailure::Runtime)?;
+        self.set_data_property(result, "value", value)?;
+        self.set_data_property(result, "done", Value::boolean(done))?;
+        Ok(result)
+    }
+
+    // ---- iterators ---------------------------------------------------------
+
+    fn create_iterator(&mut self, src: Value, kind: IteratorKind) -> Result<Value, EvalFailure> {
+        if kind == IteratorKind::Keys {
+            let keys = self.enumerable_keys(src)?;
+            return self
+                .allocate(HeapEntry::Iterator {
+                    state: IteratorState::Keys { index: 0, keys },
+                })
+                .map_err(EvalFailure::Runtime);
+        }
+
+        let iterator_symbol = self.intrinsics.builtins.symbol_iterator();
+        let iterator_key = self.to_property_key(iterator_symbol)?;
+        let method = self.get_property_key(src, &iterator_key)?;
+        if !self.is_callable(method)? {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "value is not iterable",
+            }));
+        }
+        let iterator = self.call_value(method, src, &[])?;
+        if !self.is_object(iterator) {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "iterator method returned a non-object",
+            }));
+        }
+        let next = self.get_named_property(iterator, "next")?;
+        self.create_protocol_iterator(iterator, next)
+    }
+
+    pub(crate) fn create_protocol_iterator(
+        &mut self,
+        iterator: Value,
+        next: Value,
+    ) -> Result<Value, EvalFailure> {
+        self.allocate(HeapEntry::Iterator {
+            state: IteratorState::Protocol { iterator, next },
+        })
+        .map_err(EvalFailure::Runtime)
     }
 
     fn own_property_keys(&self, src: Value) -> Result<Vec<PropertyKey>, EvalFailure> {
         match self.runtime_slot(src).map_err(EvalFailure::Runtime)? {
             Some(index) => match &self.heap[index] {
                 HeapEntry::Object { properties, .. }
+                | HeapEntry::Generator { properties, .. }
                 | HeapEntry::Script { properties, .. }
                 | HeapEntry::Function { properties, .. }
                 | HeapEntry::NativeFunction { properties, .. }
@@ -4602,6 +5056,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 matches!(key, PropertyKey::Named(_))
             }
             HeapEntry::Object { properties, .. }
+            | HeapEntry::Generator { properties, .. }
             | HeapEntry::Script { properties, .. }
             | HeapEntry::Function { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
@@ -4629,91 +5084,94 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn iterator_next(&mut self, iterator: Value) -> Result<(bool, Value), EvalFailure> {
+        let (callee, this_value) = match self.prepare_iterator_next(iterator)? {
+            IteratorNextPrepared::Ready { done, value } => return Ok((done, value)),
+            IteratorNextPrepared::Call {
+                callee,
+                this_value,
+            } => (callee, this_value),
+        };
+
+        let result = self.call_value(callee, this_value, &[])?;
+        if !self.is_object(result) {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "iterator next returned a non-object",
+            }));
+        }
+        let done = self.get_named_property(result, "done")?;
+        if self.truthy(done) {
+            return Ok((true, Value::UNDEFINED));
+        }
+        let value = self.get_named_property(result, "value")?;
+        Ok((false, value))
+    }
+
+    pub(crate) fn prepare_iterator_next(
+        &mut self,
+        iterator: Value,
+    ) -> Result<IteratorNextPrepared, EvalFailure> {
         let iterator_index = self
             .runtime_slot(iterator)
             .map_err(EvalFailure::Runtime)?
             .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
                 operation: "iterator next on non-iterator",
             }))?;
-        let (source, current, keys_len, key_at) = match &self.heap[iterator_index] {
+        match &self.heap[iterator_index] {
             HeapEntry::Iterator {
-                source,
-                index,
-                keys,
-                ..
-            } => (
-                *source,
-                *index,
-                keys.as_ref().map(Vec::len),
-                keys.as_ref().and_then(|keys| keys.get(*index).cloned()),
-            ),
-            _ => {
-                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                    operation: "iterator next on non-iterator",
-                }));
-            }
-        };
-
-        if let Some(length) = keys_len {
-            if current >= length {
-                return Ok((true, Value::UNDEFINED));
-            }
-            let text = key_at.expect("current < length has a key");
-            let value = self
-                .allocate(HeapEntry::String(text))
-                .map_err(EvalFailure::Runtime)?;
-            self.advance_iterator(iterator_index);
-            return Ok((false, value));
-        }
-
-        enum Step {
-            Element(Option<Value>),
-            Text(Option<EcmaString>),
-        }
-        let step = match self.runtime_slot(source).map_err(EvalFailure::Runtime)? {
-            Some(source_index) => match &self.heap[source_index] {
-                HeapEntry::Array { elements, .. } => {
-                    Step::Element(elements.get(current).map(|element| {
-                        if *element == Value::HOLE {
-                            Value::UNDEFINED
-                        } else {
-                            *element
-                        }
-                    }))
-                }
-                HeapEntry::String(text) => {
-                    let Some((offset, _)) = text.code_points().nth(current) else {
-                        return Ok((true, Value::UNDEFINED));
-                    };
-                    let next_offset = text
-                        .code_points()
-                        .nth(current + 1)
-                        .map_or(text.len_units(), |(next, _)| next);
-                    Step::Text(Some(text.slice_units(offset..next_offset)))
-                }
-                _ => return Ok((true, Value::UNDEFINED)),
-            },
-            None => return Ok((true, Value::UNDEFINED)),
-        };
-        match step {
-            Step::Element(Some(value)) => {
-                self.advance_iterator(iterator_index);
-                Ok((false, value))
-            }
-            Step::Element(None) => Ok((true, Value::UNDEFINED)),
-            Step::Text(Some(text)) => {
+                state: IteratorState::Keys { index, keys },
+            } => {
+                let Some(text) = keys.get(*index).cloned() else {
+                    return Ok(IteratorNextPrepared::Ready {
+                        done: true,
+                        value: Value::UNDEFINED,
+                    });
+                };
                 let value = self
                     .allocate(HeapEntry::String(text))
                     .map_err(EvalFailure::Runtime)?;
                 self.advance_iterator(iterator_index);
-                Ok((false, value))
+                Ok(IteratorNextPrepared::Ready { done: false, value })
             }
-            Step::Text(None) => Ok((true, Value::UNDEFINED)),
+            HeapEntry::Iterator {
+                state: IteratorState::Protocol { iterator, next },
+            } => Ok(IteratorNextPrepared::Call {
+                callee: *next,
+                this_value: *iterator,
+            }),
+            _ => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "iterator next on non-iterator",
+            })),
+        }
+    }
+
+    pub(crate) fn iterable_values(&mut self, source: Value) -> Result<Vec<Value>, EvalFailure> {
+        let iterator = self.create_iterator(source, IteratorKind::Sync)?;
+        let mut values = Vec::new();
+        loop {
+            let (done, value) = self.iterator_next(iterator)?;
+            if done {
+                return Ok(values);
+            }
+            let bytes = values
+                .len()
+                .checked_add(1)
+                .and_then(|length| length.checked_mul(std::mem::size_of::<Value>()))
+                .ok_or(EvalFailure::Runtime(
+                    RuntimeErrorKind::HeapByteLimitExceeded {
+                        limit: self.limits.max_heap_bytes,
+                    },
+                ))?;
+            self.ensure_allocation_capacity(1, bytes)
+                .map_err(EvalFailure::Runtime)?;
+            values.push(value);
         }
     }
 
     fn advance_iterator(&mut self, iterator_index: usize) {
-        if let HeapEntry::Iterator { index, .. } = &mut self.heap[iterator_index] {
+        if let HeapEntry::Iterator {
+            state: IteratorState::Keys { index, .. },
+        } = &mut self.heap[iterator_index]
+        {
             *index += 1;
         }
     }
@@ -4911,6 +5369,58 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(value)
     }
 
+    fn coercion_is_primitive(&self, value: Value) -> Result<bool, EvalFailure> {
+        let Some(index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
+            return Ok(true);
+        };
+        Ok(matches!(
+            self.heap[index],
+            HeapEntry::String(_)
+                | HeapEntry::BigInt(_)
+                | HeapEntry::Symbol { .. }
+                | HeapEntry::PrivateName { .. }
+        ))
+    }
+
+    pub(crate) fn to_primitive_observable(
+        &mut self,
+        value: Value,
+        prefer_string: bool,
+    ) -> Result<Value, EvalFailure> {
+        if self.coercion_is_primitive(value)? {
+            return Ok(value);
+        }
+        let methods = if prefer_string {
+            ["toString", "valueOf"]
+        } else {
+            ["valueOf", "toString"]
+        };
+        for name in methods {
+            let method = self.get_named_property(value, name)?;
+            if !self.is_callable(method)? {
+                continue;
+            }
+            let primitive = self.call_value(method, value, &[])?;
+            if self.coercion_is_primitive(primitive)? {
+                return Ok(primitive);
+            }
+        }
+        Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+            operation: "cannot convert object to primitive",
+        }))
+    }
+
+    pub(crate) fn to_string_observable(&mut self, value: Value) -> Result<EcmaString, EvalFailure> {
+        let primitive = self.to_primitive_observable(value, true)?;
+        self.to_string(primitive)
+    }
+
+
+    pub(crate) fn to_number_observable(&mut self, value: Value) -> Result<Value, EvalFailure> {
+        let primitive = self.to_primitive_observable(value, false)?;
+        self.to_number(primitive)
+    }
+
     fn to_number(&self, value: Value) -> Result<Value, EvalFailure> {
         match value.decode() {
             Some(Decoded::Number(_)) | Some(Decoded::Int32(_)) => self.to_primitive(value),
@@ -4937,6 +5447,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             }))
                         }
                         HeapEntry::Object { .. }
+                        | HeapEntry::Generator { .. }
                         | HeapEntry::Script { .. }
                         | HeapEntry::Array { .. }
                         | HeapEntry::Function { .. }
@@ -4974,6 +5485,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     HeapEntry::String(text) => !text.is_empty(),
                     HeapEntry::BigInt(text) => text != "0",
                     HeapEntry::Object { .. }
+                    | HeapEntry::Generator { .. }
                     | HeapEntry::Script { .. }
                     | HeapEntry::Array { .. }
                     | HeapEntry::Function { .. }
@@ -5010,6 +5522,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     HeapEntry::Symbol { .. } => "symbol",
                     HeapEntry::PrivateName { .. } => "object",
                     HeapEntry::Object { .. }
+                    | HeapEntry::Generator { .. }
                     | HeapEntry::Script { .. }
                     | HeapEntry::Array { .. }
                     | HeapEntry::ModuleNamespace { .. }
@@ -5142,6 +5655,7 @@ impl<'a, H: Host> Machine<'a, H> {
             Some(index) => match &self.heap[index] {
                 HeapEntry::String(text) => Ok(Some(text.clone())),
                 HeapEntry::Object { .. }
+                | HeapEntry::Generator { .. }
                 | HeapEntry::Script { .. }
                 | HeapEntry::Array { .. }
                 | HeapEntry::Function { .. }
@@ -5163,7 +5677,7 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    fn value_to_string(&self, value: Value, depth: u8) -> Result<EcmaString, EvalFailure> {
+    fn value_to_string(&self, value: Value, depth: usize) -> Result<EcmaString, EvalFailure> {
         if depth >= 32 {
             return Ok(EcmaString::default());
         }
@@ -5185,6 +5699,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         HeapEntry::String(text) => Ok(text.clone()),
                         HeapEntry::BigInt(text) => Ok(EcmaString::from_utf8(text)),
                         HeapEntry::Object { .. }
+                        | HeapEntry::Generator { .. }
                         | HeapEntry::Script { .. }
                         | HeapEntry::Date { .. }
                         | HeapEntry::BuiltinIterator { .. }
@@ -5729,6 +6244,26 @@ mod tests {
         )
     }
 
+    fn generator_function(
+        parameters: u32,
+        registers: u32,
+        code: Vec<Instruction>,
+        handlers: Vec<ExceptionHandler>,
+    ) -> Function {
+        Function::new(
+            None,
+            0,
+            parameters,
+            registers,
+            FunctionFlags {
+                is_async: false,
+                is_generator: true,
+            },
+            code,
+            handlers,
+        )
+    }
+
     /// A function with `captures` leading capture registers.
     fn closure_function(
         captures: u32,
@@ -5846,6 +6381,509 @@ mod tests {
         Machine::new(program, &mut host, Limits::default())
             .run()
             .unwrap()
+    }
+
+    fn generator_callable<H: Host>(
+        machine: &mut Machine<'_, H>,
+        function: u32,
+    ) -> Value {
+        machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(function),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap()
+    }
+
+    fn generator_next<H: Host>(
+        machine: &mut Machine<'_, H>,
+        generator: Value,
+        resume_value: Value,
+    ) -> Result<(Value, bool), EvalFailure> {
+        let next = machine.get_named_property(generator, "next")?;
+        let result = machine.call_value(next, generator, &[resume_value])?;
+        let done = machine.get_named_property(result, "done")?;
+        let value = machine.get_named_property(result, "value")?;
+        Ok((value, machine.truthy(done)))
+    }
+
+    #[test]
+    fn sync_generator_is_lazy_resumes_registers_and_stays_completed() {
+        let program = verified(
+            vec![Constant::Int32(10)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                generator_function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(1),
+                            src: reg(0),
+                            resume: pc(2),
+                        },
+                        Instruction::Binary {
+                            dst: reg(2),
+                            op: BinaryOp::Add,
+                            left: reg(0),
+                            right: reg(1),
+                        },
+                        Instruction::Return { value: reg(2) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine
+            .call_value(callable, Value::UNDEFINED, &[])
+            .unwrap();
+        assert_eq!(machine.live_registers, 0, "calling must not start the body");
+        machine
+            .set_data_property(generator, "visible", Value::int32(1))
+            .unwrap();
+        assert_eq!(
+            machine.get_named_property(generator, "visible").unwrap(),
+            Value::int32(1),
+        );
+        assert_eq!(
+            machine.own_property_keys(generator).unwrap(),
+            vec![PropertyKey::Named(EcmaString::from_utf8("visible"))],
+        );
+        assert!(
+            machine
+                .inherits_from_prototype(
+                    generator,
+                    machine.intrinsics.builtins.generator_prototype(),
+                )
+                .unwrap()
+        );
+
+        assert_eq!(
+            generator_next(&mut machine, generator, Value::int32(99)).unwrap(),
+            (Value::int32(10), false),
+        );
+        assert_eq!(machine.live_registers, 3);
+        assert_eq!(
+            generator_next(&mut machine, generator, Value::int32(5)).unwrap(),
+            (Value::int32(15), true),
+        );
+        assert_eq!(machine.live_registers, 0);
+        assert_eq!(
+            generator_next(&mut machine, generator, Value::int32(8)).unwrap(),
+            (Value::UNDEFINED, true),
+        );
+    }
+
+    #[test]
+    fn sync_generator_reentrant_next_is_a_type_error() {
+        let program = verified(
+            Vec::new(),
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                generator_function(0, 1, vec![Instruction::Halt], Vec::new()),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine
+            .call_value(callable, Value::UNDEFINED, &[])
+            .unwrap();
+        let _ = machine.take_generator_state(generator).unwrap();
+
+        assert!(matches!(
+            generator_next(&mut machine, generator, Value::UNDEFINED),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+    }
+
+    #[test]
+    fn sync_generator_uncaught_throw_preserves_origin_and_completes() {
+        let program = verified(
+            vec![Constant::Int32(7)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                generator_function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Throw { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine
+            .call_value(callable, Value::UNDEFINED, &[])
+            .unwrap();
+
+        assert!(matches!(
+            generator_next(&mut machine, generator, Value::UNDEFINED),
+            Err(EvalFailure::ThrowValueOrigin {
+                value,
+                origin: ThrowOrigin::Bytecode,
+            }) if value == Value::int32(7)
+        ));
+        assert_eq!(
+            generator_next(&mut machine, generator, Value::UNDEFINED).unwrap(),
+            (Value::UNDEFINED, true),
+        );
+        assert_eq!(machine.live_registers, 0);
+    }
+
+    #[test]
+    fn outer_compiled_handler_catches_generator_throw_value() {
+        let program = verified(
+            vec![
+                Constant::Int32(7),
+                Constant::Undefined,
+                Constant::String(EcmaString::from_utf8("next")),
+            ],
+            vec![
+                function(
+                    0,
+                    8,
+                    vec![
+                        Instruction::CreateArray { dst: reg(0) },
+                        Instruction::CreateClosure {
+                            dst: reg(1),
+                            function: FunctionId::new(1),
+                            captures: reg(0),
+                        },
+                        Instruction::CreateArray { dst: reg(2) },
+                        Instruction::LoadConst {
+                            dst: reg(3),
+                            constant: cid(1),
+                        },
+                        Instruction::Call {
+                            dst: reg(4),
+                            callee: reg(1),
+                            this_value: reg(3),
+                            arguments: reg(2),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(5),
+                            constant: cid(2),
+                        },
+                        Instruction::GetProperty {
+                            dst: reg(6),
+                            object: reg(4),
+                            key: reg(5),
+                        },
+                        Instruction::Call {
+                            dst: reg(7),
+                            callee: reg(6),
+                            this_value: reg(4),
+                            arguments: reg(2),
+                        },
+                        Instruction::Return { value: reg(3) },
+                        Instruction::Return { value: reg(7) },
+                    ],
+                    vec![ExceptionHandler {
+                        start: pc(7),
+                        end: pc(8),
+                        handler: pc(9),
+                        catch_register: reg(7),
+                    }],
+                ),
+                generator_function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Throw { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+
+        assert_eq!(run_ok(&program).value, Value::int32(7));
+    }
+
+    #[test]
+    fn sync_generator_catches_body_throw_before_suspending() {
+        let program = verified(
+            vec![Constant::Int32(7)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                generator_function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Throw { value: reg(0) },
+                        Instruction::Suspend {
+                            dst: reg(2),
+                            src: reg(1),
+                            resume: pc(3),
+                        },
+                        Instruction::Return { value: reg(2) },
+                    ],
+                    vec![ExceptionHandler {
+                        start: pc(1),
+                        end: pc(2),
+                        handler: pc(2),
+                        catch_register: reg(1),
+                    }],
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine
+            .call_value(callable, Value::UNDEFINED, &[])
+            .unwrap();
+
+        assert_eq!(
+            generator_next(&mut machine, generator, Value::UNDEFINED).unwrap(),
+            (Value::int32(7), false),
+        );
+        assert_eq!(
+            generator_next(&mut machine, generator, Value::int32(9)).unwrap(),
+            (Value::int32(9), true),
+        );
+    }
+
+    #[test]
+    fn suspended_generator_registers_remain_charged() {
+        let program = verified(
+            vec![Constant::Int32(1)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                generator_function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(1),
+                            src: reg(0),
+                            resume: pc(2),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(
+            &program,
+            &mut host,
+            Limits {
+                max_total_registers: 3,
+                ..Limits::default()
+            },
+        );
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let first = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        let second = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        assert_eq!(
+            generator_next(&mut machine, first, Value::UNDEFINED).unwrap(),
+            (Value::int32(1), false),
+        );
+        assert!(matches!(
+            generator_next(&mut machine, second, Value::UNDEFINED),
+            Err(EvalFailure::Runtime(
+                RuntimeErrorKind::RegisterLimitExceeded { .. }
+            ))
+        ));
+        assert_eq!(machine.live_registers, 3);
+        assert_eq!(
+            generator_next(&mut machine, first, Value::int32(4)).unwrap(),
+            (Value::int32(4), true),
+        );
+        assert_eq!(machine.live_registers, 0);
+    }
+
+    #[test]
+    fn resumed_generator_call_depth_failure_releases_registers() {
+        let program = verified(
+            vec![Constant::Int32(1)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                generator_function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(1),
+                            src: reg(0),
+                            resume: pc(2),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(
+            &program,
+            &mut host,
+            Limits {
+                max_total_registers: 2,
+                ..Limits::default()
+            },
+        );
+        machine.frames.clear();
+        machine.live_registers = 0;
+
+        let callable = generator_callable(&mut machine, 1);
+        let first = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        // Start and suspend the first generator, charging its two registers.
+        assert_eq!(
+            generator_next(&mut machine, first, Value::UNDEFINED).unwrap(),
+            (Value::int32(1), false),
+        );
+        assert_eq!(machine.live_registers, 2);
+
+        // Fill the compiled call depth to the exact limit so the next resume
+        // fails in push_resumed_generator_frame before it can take ownership.
+        machine.frames.push(Frame {
+            module: ModuleId::new(0),
+            function: 0,
+            pc: 0,
+            registers: Vec::new(),
+            return_to: None,
+            this_value: Value::UNDEFINED,
+            new_target: Value::UNDEFINED,
+            args: Vec::new(),
+            arguments_object: None,
+        });
+        machine.limits.max_call_depth = machine.frames.len();
+
+        assert!(matches!(
+            generator_next(&mut machine, first, Value::int32(7)),
+            Err(EvalFailure::Runtime(RuntimeErrorKind::CallDepthExceeded { .. }))
+        ));
+        assert_eq!(machine.live_registers, 0);
+
+        // The generator is now sticky Completed.
+        assert_eq!(
+            generator_next(&mut machine, first, Value::UNDEFINED).unwrap(),
+            (Value::UNDEFINED, true),
+        );
+
+        // Remove the artificial depth and make room for another activation.
+        machine.frames.pop();
+        machine.limits.max_call_depth = Limits::default().max_call_depth;
+
+        // A second generator can suspend again only if the first's charge was released.
+        let second = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        assert_eq!(
+            generator_next(&mut machine, second, Value::UNDEFINED).unwrap(),
+            (Value::int32(1), false),
+        );
+        assert_eq!(machine.live_registers, 2);
+        assert_eq!(
+            generator_next(&mut machine, second, Value::int32(9)).unwrap(),
+            (Value::int32(9), true),
+        );
+        assert_eq!(machine.live_registers, 0);
+    }
+    #[test]
+    fn array_extend_consumes_generator_through_sync_iterator_protocol() {
+        let program = verified(
+            vec![Constant::Int32(1), Constant::Int32(2)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                generator_function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(2),
+                            src: reg(0),
+                            resume: pc(2),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(1),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(2),
+                            src: reg(1),
+                            resume: pc(4),
+                        },
+                        Instruction::Return { value: reg(2) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine
+            .call_value(callable, Value::UNDEFINED, &[])
+            .unwrap();
+        let array = machine
+            .allocate(HeapEntry::Array {
+                elements: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.array_prototype),
+                extensible: true,
+                length_writable: true,
+            })
+            .unwrap();
+
+        machine.array_extend(array, generator).unwrap();
+        assert_eq!(
+            machine.array_elements(array).unwrap(),
+            Some(vec![Value::int32(1), Value::int32(2)]),
+        );
+        assert_eq!(machine.live_registers, 0);
     }
 
     #[test]
@@ -6256,6 +7294,316 @@ mod tests {
             vec![entry],
         );
         assert_eq!(run_ok(&module).value, Value::int32(3));
+    }
+
+    #[test]
+    fn array_extend_uses_sync_protocol_for_set_and_rejects_plain_object() {
+        let module = verified(
+            Vec::new(),
+            vec![function(0, 0, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let set_constructor = machine.intrinsics.global("Set").unwrap();
+        let set_prototype = machine
+            .get_named_property(set_constructor, "prototype")
+            .unwrap();
+        let set = machine
+            .allocate(HeapEntry::Collection {
+                entries: vec![CollectionEntry {
+                    order: 0,
+                    key: Value::int32(7),
+                    value: Value::int32(7),
+                }],
+                next_order: 1,
+                properties: PropertyMap::default(),
+                prototype: Some(set_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        let target = machine
+            .allocate(HeapEntry::Array {
+                elements: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.array_prototype),
+                extensible: true,
+                length_writable: true,
+            })
+            .unwrap();
+
+        machine.array_extend(target, set).unwrap();
+        assert_eq!(
+            machine.array_elements(target).unwrap(),
+            Some(vec![Value::int32(7)])
+        );
+
+        let plain_object = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        assert!(matches!(
+            machine.array_extend(target, plain_object),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "value is not iterable"
+            }))
+        ));
+    }
+
+    #[test]
+    fn sync_iterator_uses_symbol_method_and_caches_next() {
+        fn iterator_identity<H: Host>(
+            _machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            Ok(intrinsics::BuiltinOutcome::Value(this))
+        }
+
+        fn next_getter<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            let reads = machine.get_named_property(this, "nextReads")?;
+            let reads = if reads == Value::int32(0) { 1 } else { 2 };
+            machine.set_data_property(this, "nextReads", Value::int32(reads))?;
+            Ok(intrinsics::BuiltinOutcome::Value(
+                machine.get_named_property(this, "nextFunction")?,
+            ))
+        }
+
+        fn next_result<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            Ok(intrinsics::BuiltinOutcome::Value(
+                machine.get_named_property(this, "result")?,
+            ))
+        }
+
+        fn done_getter<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            machine.set_data_property(this, "order", Value::int32(1))?;
+            Ok(intrinsics::BuiltinOutcome::Value(Value::FALSE))
+        }
+
+        fn value_getter<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            if machine.get_named_property(this, "order")? != Value::int32(1) {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "iterator value read before done",
+                }));
+            }
+            Ok(intrinsics::BuiltinOutcome::Value(Value::int32(42)))
+        }
+
+        let module = verified(
+            Vec::new(),
+            vec![function(0, 0, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let mut install = |name, handler| {
+            let id = machine
+                .intrinsics
+                .builtins
+                .register(intrinsics::BuiltinDef {
+                    name,
+                    length: 0,
+                    handler,
+                });
+            intrinsics::native_function(&mut machine.heap, id, name, 0)
+        };
+        let iterator_identity = install(
+            "[Symbol.iterator]",
+            iterator_identity::<TestHost> as intrinsics::BuiltinHandler<TestHost>,
+        );
+        let next_getter = install("get next", next_getter::<TestHost>);
+        let next_result = install("next", next_result::<TestHost>);
+        let done_getter = install("get done", done_getter::<TestHost>);
+        let value_getter = install("get value", value_getter::<TestHost>);
+        let object_prototype = machine.intrinsics.object_prototype;
+        let result = machine
+            .allocate(HeapEntry::Object {
+                properties: {
+                    let mut properties = PropertyMap::default();
+                    for (key, property) in [
+                        (
+                            PropertyKey::Named(EcmaString::from_utf8("order")),
+                            Property::Data {
+                                value: Value::int32(0),
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        ),
+                        (
+                            PropertyKey::Named(EcmaString::from_utf8("done")),
+                            Property::Accessor {
+                                getter: Some(done_getter),
+                                setter: None,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        ),
+                        (
+                            PropertyKey::Named(EcmaString::from_utf8("value")),
+                            Property::Accessor {
+                                getter: Some(value_getter),
+                                setter: None,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        ),
+                    ] {
+                        properties.insert(key, property);
+                    }
+                    properties
+                },
+                prototype: Some(object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
+        let iterator_key = machine.to_property_key(iterator_symbol).unwrap();
+        let source = machine
+            .allocate(HeapEntry::Object {
+                properties: {
+                    let mut properties = PropertyMap::default();
+                    for (key, property) in [
+                        (
+                            iterator_key,
+                            Property::Data {
+                                value: iterator_identity,
+                                writable: true,
+                                enumerable: false,
+                                configurable: true,
+                            },
+                        ),
+                        (
+                            PropertyKey::Named(EcmaString::from_utf8("next")),
+                            Property::Accessor {
+                                getter: Some(next_getter),
+                                setter: None,
+                                enumerable: false,
+                                configurable: true,
+                            },
+                        ),
+                        (
+                            PropertyKey::Named(EcmaString::from_utf8("nextReads")),
+                            Property::Data {
+                                value: Value::int32(0),
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        ),
+                        (
+                            PropertyKey::Named(EcmaString::from_utf8("nextFunction")),
+                            Property::Data {
+                                value: next_result,
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        ),
+                        (
+                            PropertyKey::Named(EcmaString::from_utf8("result")),
+                            Property::Data {
+                                value: result,
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        ),
+                    ] {
+                        properties.insert(key, property);
+                    }
+                    properties
+                },
+                prototype: Some(object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+
+        let iterator = machine.create_iterator(source, IteratorKind::Sync).unwrap();
+        assert_eq!(
+            machine.iterator_next(iterator).unwrap(),
+            (false, Value::int32(42))
+        );
+        assert_eq!(
+            machine.iterator_next(iterator).unwrap(),
+            (false, Value::int32(42))
+        );
+        assert_eq!(
+            machine.get_named_property(source, "nextReads").unwrap(),
+            Value::int32(1)
+        );
+
+        let mut completed_properties = PropertyMap::default();
+        completed_properties.insert(
+            PropertyKey::Named(EcmaString::from_utf8("done")),
+            Property::Data {
+                value: Value::TRUE,
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            },
+        );
+        completed_properties.insert(
+            PropertyKey::Named(EcmaString::from_utf8("value")),
+            Property::Accessor {
+                getter: Some(value_getter),
+                setter: None,
+                enumerable: true,
+                configurable: true,
+            },
+        );
+        let completed = machine
+            .allocate(HeapEntry::Object {
+                properties: completed_properties,
+                prototype: Some(object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        machine
+            .set_data_property(source, "result", completed)
+            .unwrap();
+        assert_eq!(
+            machine.iterator_next(iterator).unwrap(),
+            (true, Value::UNDEFINED)
+        );
+
+        machine
+            .delete_property(source, &PropertyKey::Named(EcmaString::from_utf8("next")))
+            .unwrap();
+        machine
+            .set_data_property(source, "next", Value::int32(1))
+            .unwrap();
+        let invalid_next = machine.create_iterator(source, IteratorKind::Sync).unwrap();
+        assert!(matches!(
+            machine.iterator_next(invalid_next),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
     }
 
     #[test]
@@ -7289,6 +8637,188 @@ mod tests {
             )],
         );
         assert_eq!(run_ok(&module).value, Value::int32(9));
+    }
+
+    #[test]
+    fn native_callback_throw_is_caught_at_outer_call_site() {
+        let entry = function(
+            0,
+            9,
+            vec![
+                Instruction::CreateArray { dst: reg(0) },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(0),
+                },
+                Instruction::ArrayPush {
+                    array: reg(0),
+                    value: reg(1),
+                },
+                Instruction::CreateArray { dst: reg(2) },
+                Instruction::CreateClosure {
+                    dst: reg(3),
+                    function: FunctionId::new(1),
+                    captures: reg(2),
+                },
+                Instruction::LoadConst {
+                    dst: reg(4),
+                    constant: cid(1),
+                },
+                Instruction::GetProperty {
+                    dst: reg(5),
+                    object: reg(0),
+                    key: reg(4),
+                },
+                Instruction::CreateArray { dst: reg(6) },
+                Instruction::ArrayPush {
+                    array: reg(6),
+                    value: reg(3),
+                },
+                Instruction::Call {
+                    dst: reg(7),
+                    callee: reg(5),
+                    this_value: reg(0),
+                    arguments: reg(6),
+                },
+                Instruction::Halt,
+                Instruction::Return { value: reg(8) },
+            ],
+            vec![ExceptionHandler {
+                start: pc(9),
+                end: pc(10),
+                handler: pc(11),
+                catch_register: reg(8),
+            }],
+        );
+        let callback = closure_function(
+            0,
+            0,
+            1,
+            vec![
+                Instruction::LoadConst {
+                    dst: reg(0),
+                    constant: cid(0),
+                },
+                Instruction::Throw { value: reg(0) },
+            ],
+        );
+        let module = verified(
+            vec![
+                Constant::Int32(7),
+                Constant::String(EcmaString::from_utf8("map")),
+            ],
+            vec![entry, callback],
+        );
+
+        assert_eq!(run_ok(&module).value, Value::int32(7));
+    }
+
+    #[test]
+    fn native_callback_throw_uncaught_at_outer_call_site() {
+        let entry = function(
+            0,
+            9,
+            vec![
+                Instruction::CreateArray { dst: reg(0) },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(0),
+                },
+                Instruction::ArrayPush {
+                    array: reg(0),
+                    value: reg(1),
+                },
+                Instruction::CreateArray { dst: reg(2) },
+                Instruction::CreateClosure {
+                    dst: reg(3),
+                    function: FunctionId::new(1),
+                    captures: reg(2),
+                },
+                Instruction::LoadConst {
+                    dst: reg(4),
+                    constant: cid(1),
+                },
+                Instruction::GetProperty {
+                    dst: reg(5),
+                    object: reg(0),
+                    key: reg(4),
+                },
+                Instruction::CreateArray { dst: reg(6) },
+                Instruction::ArrayPush {
+                    array: reg(6),
+                    value: reg(3),
+                },
+                Instruction::Call {
+                    dst: reg(7),
+                    callee: reg(5),
+                    this_value: reg(0),
+                    arguments: reg(6),
+                },
+                Instruction::Halt,
+            ],
+            Vec::new(),
+        );
+        let callback = closure_function(
+            0,
+            0,
+            1,
+            vec![
+                Instruction::LoadConst {
+                    dst: reg(0),
+                    constant: cid(0),
+                },
+                Instruction::Throw { value: reg(0) },
+            ],
+        );
+        let simple = closure_function(
+            0,
+            0,
+            1,
+            vec![
+                Instruction::LoadConst {
+                    dst: reg(0),
+                    constant: cid(2),
+                },
+                Instruction::Return { value: reg(0) },
+            ],
+        );
+        let module = verified(
+            vec![
+                Constant::Int32(7),
+                Constant::String(EcmaString::from_utf8("map")),
+                Constant::Int32(42),
+            ],
+            vec![entry, callback, simple],
+        );
+
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let error = machine.run_loop(0).unwrap_err();
+        assert_eq!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                value: Value::int32(7),
+                origin: ThrowOrigin::Bytecode,
+            }
+        );
+        assert!(machine.callback_boundaries.is_empty());
+        assert!(machine.frames.is_empty());
+        assert_eq!(machine.live_registers, 0);
+
+        let callee = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(2),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        assert_eq!(
+            machine.call_value(callee, Value::UNDEFINED, &[]).unwrap(),
+            Value::int32(42)
+        );
     }
 
     #[test]

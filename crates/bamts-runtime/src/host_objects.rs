@@ -79,7 +79,13 @@ pub(crate) fn install<H: Host>(
 
     let global_this = object(heap, object_prototype);
     for (name, value) in globals.iter() {
-        put_ecma(heap, global_this, name.clone(), *value);
+        if name.eq_ascii("Infinity") {
+            crate::intrinsics::builtins::define_frozen_data(heap, global_this, "Infinity", *value);
+        } else if name.eq_ascii("NaN") {
+            crate::intrinsics::builtins::define_frozen_data(heap, global_this, "NaN", *value);
+        } else {
+            put_ecma(heap, global_this, name.clone(), *value);
+        }
     }
     put(heap, global_this, "globalThis", global_this);
     put(heap, global_this, "global", global_this);
@@ -332,7 +338,8 @@ impl<H: Host> Machine<'_, H> {
                     | HeapEntry::Script { properties, .. }
                     | HeapEntry::Date { properties, .. }
                     | HeapEntry::BuiltinIterator { properties, .. }
-                    | HeapEntry::Collection { properties, .. } => {
+                    | HeapEntry::Collection { properties, .. }
+                    | HeapEntry::Generator { properties, .. } => {
                         if depth >= 2 {
                             return Ok("[Object]".to_owned());
                         }

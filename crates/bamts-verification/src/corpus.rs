@@ -72,6 +72,21 @@ pub const PINNED_CASE_IDS: [&str; 20] = [
     "yocto-queue",
 ];
 
+/// Synchronous corpus cases unblocked by Task 106 alone, in manifest order.
+pub const TASK_106_SYNC_CASE_IDS: [&str; 11] = [
+    "defu",
+    "destr",
+    "dot-prop",
+    "escape-string-regexp",
+    "mitt",
+    "p-queue",
+    "pathe",
+    "rou3",
+    "tslib",
+    "ufo",
+    "valita",
+];
+
 /// The only environment variables the oracle exposes to a case.  Everything
 /// inherited from the parent process is cleared before these are set.
 pub const NORMALIZED_ENV: [&str; 4] = ["TZ=UTC", "LANG=C", "LC_ALL=C", "NO_COLOR=1"];
@@ -835,7 +850,7 @@ impl BamtsRunner {
         let compile =
             driver::execute(&args).map_err(|error| cli_error(spec, ExecutionMode::Aot, error))?;
         let limits = aot_execution_limits(spec, self.max_output_bytes);
-        let mut outcome = run_process(
+        let outcome = run_process(
             "BamTS AOT executable",
             &executable,
             &self.root,

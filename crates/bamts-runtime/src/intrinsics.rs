@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
-use bamts_bytecode::EcmaString;
+use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
 
 use crate::{EvalFailure, HeapEntry, Host, Machine, NativeCallable, PropertyMap, ThrowOrigin};
@@ -28,6 +28,10 @@ pub(crate) enum BuiltinOutcome {
         this_value: Value,
         arguments: Vec<Value>,
         prototype: Value,
+    },
+    GeneratorNext {
+        generator: Value,
+        resume_value: Value,
     },
 }
 
@@ -60,6 +64,7 @@ pub(crate) struct BuiltinTable<H: Host> {
     object_to_string: Option<Value>,
     regexp_prototype: Option<Value>,
     iterator_prototype: Option<Value>,
+    generator_prototype: Option<Value>,
     marker: PhantomData<fn() -> H>,
 }
 
@@ -87,6 +92,7 @@ impl<H: Host> BuiltinTable<H> {
             object_to_string: None,
             regexp_prototype: None,
             iterator_prototype: None,
+            generator_prototype: None,
             marker: PhantomData,
         }
     }
@@ -177,6 +183,15 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn iterator_prototype(&self) -> Value {
         self.iterator_prototype
             .expect("iterator builtins install their prototype")
+    }
+
+    pub(crate) fn set_generator_prototype(&mut self, prototype: Value) {
+        self.generator_prototype = Some(prototype);
+    }
+
+    pub(crate) fn generator_prototype(&self) -> Value {
+        self.generator_prototype
+            .expect("generator builtins install their prototype")
     }
 
     pub(crate) fn set_constructor_prototype(
@@ -469,6 +484,22 @@ impl<'a, H: Host> Machine<'a, H> {
     pub(crate) fn to_string(&self, value: Value) -> Result<EcmaString, EvalFailure> {
         self.value_to_string(value, 0)
     }
+
+    pub(crate) fn string_constructor_text(&self, value: Value) -> Result<EcmaString, EvalFailure> {
+            let Some(index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
+                return self.to_string(value);
+            };
+            let HeapEntry::Symbol { description } = &self.heap[index] else {
+                return self.to_string(value);
+            };
+            let mut text = EcmaStringBuilder::with_capacity(description.len_units().saturating_add(8));
+            text.push_utf8("Symbol(");
+            for &unit in description.as_units() {
+                text.push_unit(unit);
+            }
+            text.push_unit(u16::from(b')'));
+            Ok(text.finish())
+        }
 
     pub(crate) fn to_boolean(&self, value: Value) -> bool {
         self.truthy(value)

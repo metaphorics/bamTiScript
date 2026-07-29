@@ -19,6 +19,7 @@ pub(super) fn install<H: Host>(
     let async_iterator = symbol(heap, "Symbol.asyncIterator");
     let has_instance = symbol(heap, "Symbol.hasInstance");
     let to_string_tag = symbol(heap, "Symbol.toStringTag");
+    let dispose = symbol(heap, "Symbol.dispose");
     builtins.set_symbol_iterator(iterator);
     builtins.set_symbol_to_string_tag(to_string_tag);
     builtins.set_symbol_prototype(prototype);
@@ -32,6 +33,7 @@ pub(super) fn install<H: Host>(
         ("asyncIterator", async_iterator),
         ("hasInstance", has_instance),
         ("toStringTag", to_string_tag),
+        ("dispose", dispose),
     ] {
         define_readonly_property(heap, constructor, name, value);
     }
@@ -199,4 +201,118 @@ fn value_of<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     symbol_description(machine, this)?;
     Ok(BuiltinOutcome::Value(this))
+}
+
+#[cfg(test)]
+mod tests {
+    use bamts_bytecode::{
+        Constant, ConstantId, Function, FunctionFlags, FunctionId, Instruction, Module, ModuleId,
+        Program, ProgramModule, Verified,
+    };
+
+    use super::*;
+    use crate::Limits;
+
+    #[derive(Default)]
+    struct TestHost;
+
+    impl Host for TestHost {}
+
+    fn module() -> Program<Verified> {
+        let code = Module::new(
+            vec![Constant::String(EcmaString::from_utf8("<test>"))],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                1,
+                FunctionFlags::default(),
+                vec![Instruction::Halt],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("valid test module");
+        Program::link(
+            vec![ProgramModule {
+                name: ConstantId::new(0),
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect("valid test program")
+    }
+
+    #[test]
+    fn symbol_dispose_is_installed_on_constructor() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let symbol = machine
+            .intrinsics
+            .global("Symbol")
+            .expect("Symbol is installed");
+        let dispose = machine
+            .get_named_property(symbol, "dispose")
+            .expect("Symbol.dispose is installed");
+        let description = symbol_description(&machine, dispose).expect("dispose is a symbol");
+        assert!(
+            description.eq_ascii("Symbol.dispose"),
+            "Symbol.dispose description must be 'Symbol.dispose'"
+        );
+    }
+
+    #[test]
+    fn symbol_dispose_descriptor_is_readonly_non_enumerable_non_configurable() {
+        let module = module();
+        let mut host = TestHost;
+        let machine = Machine::new(&module, &mut host, Limits::default());
+        let symbol = machine
+            .intrinsics
+            .global("Symbol")
+            .expect("Symbol is installed");
+        let key = PropertyKey::Named(EcmaString::from_utf8("dispose"));
+        let descriptor = machine
+            .own_descriptor(symbol, &key)
+            .expect("descriptor lookup succeeds")
+            .expect("Symbol.dispose is defined");
+        match descriptor {
+            Property::Data {
+                writable,
+                enumerable,
+                configurable,
+                ..
+            } => {
+                assert!(!writable, "Symbol.dispose must be non-writable");
+                assert!(!enumerable, "Symbol.dispose must be non-enumerable");
+                assert!(!configurable, "Symbol.dispose must be non-configurable");
+            }
+            Property::Accessor { .. } => panic!("Symbol.dispose must be a data property"),
+        }
+    }
+
+    #[test]
+    fn symbol_dispose_identity_is_stable_across_reads() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let symbol = machine
+            .intrinsics
+            .global("Symbol")
+            .expect("Symbol is installed");
+        let first = machine
+            .get_named_property(symbol, "dispose")
+            .expect("Symbol.dispose is readable");
+        let second = machine
+            .get_named_property(symbol, "dispose")
+            .expect("Symbol.dispose is readable on second read");
+        assert_eq!(
+            first, second,
+            "Symbol.dispose identity must be stable across reads"
+        );
+    }
 }

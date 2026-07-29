@@ -64,9 +64,10 @@ use bamts_native::{
 
 use crate::intrinsics::BuiltinOutcome;
 use crate::{
-    CalleeKind, EvalFailure, Execution, ExecutionOutcome, GetOutcome, HeapEntry, Host, Limits,
-    Machine, PropertyMap, RuntimeError, RuntimeErrorKind, SetOutcome, ThrowOrigin,
-    accessor_from_selector, binary_from_selector, iterator_kind_from_selector, unary_from_selector,
+    CalleeKind, EvalFailure, Execution, ExecutionOutcome, GeneratorActivation, GeneratorResume,
+    GeneratorStart, GeneratorState, GetOutcome, HeapEntry, Host, IteratorNextPrepared, Limits,
+    Machine, PropertyMap, RuntimeError, RuntimeErrorKind, SetOutcome, ThrowOrigin, accessor_from_selector,
+    binary_from_selector, iterator_kind_from_selector, unary_from_selector,
 };
 
 // -- ABI selector encoders (inverse of the shared `*_from_selector` decoders) --
@@ -250,6 +251,14 @@ enum Flow {
 enum FrameCompletion {
     Normal(Value),
     Unwind(Value, ThrowOrigin, usize),
+    Suspend(Value, u32),
+}
+
+#[derive(Clone, Copy)]
+enum FrameDrive {
+    Ordinary,
+    GeneratorStart,
+    GeneratorResume { token: u32, sent: Value },
 }
 
 /// The result of invoking a callee (runtime function, host entity, or foreign
@@ -488,6 +497,12 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     function,
                     pc,
                 )),
+                FrameCompletion::Suspend(value, _) => Err(self.error_at(
+                    module,
+                    RuntimeErrorKind::InvalidValue { value },
+                    function,
+                    0,
+                )),
             })
         };
         self.machine
@@ -552,7 +567,13 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             arguments_object: None,
             pending_resume: None,
         });
-        let completion = self.run_frame(module, function, code, &mut registers);
+        let completion = self.run_frame(
+            module,
+            function,
+            code,
+            &mut registers,
+            FrameDrive::Ordinary,
+        );
         self.activations.borrow_mut().pop();
         self.machine
             .borrow_mut()
@@ -568,6 +589,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         function: usize,
         code: &Module<Verified>,
         registers: &mut Vec<Value>,
+        drive: FrameDrive,
     ) -> Result<FrameCompletion, RuntimeError> {
         let length = u16::try_from(registers.len()).map_err(|_| {
             let limit = self.max_total_registers();
@@ -596,7 +618,31 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             module,
             function: FunctionId::new(function as u32),
         };
-        let mut pc = 0usize;
+        let mut pc = match drive {
+            FrameDrive::Ordinary | FrameDrive::GeneratorStart => 0,
+            FrameDrive::GeneratorResume { token, sent } => {
+                let suspend_pc = token.checked_sub(1).map(|pc| pc as usize).ok_or_else(|| {
+                    self.error_at(
+                        module,
+                        RuntimeErrorKind::InvalidValue { value: Value::UNDEFINED },
+                        function,
+                        0,
+                    )
+                })?;
+                let Instruction::Suspend { dst, resume, .. } =
+                    code.functions()[function].code()[suspend_pc]
+                else {
+                    return Err(self.error_at(
+                        module,
+                        RuntimeErrorKind::InvalidValue { value: Value::UNDEFINED },
+                        function,
+                        suspend_pc,
+                    ));
+                };
+                frame.set_register(dst.get(), sent);
+                resume.get() as usize
+            }
+        };
         loop {
             let instruction = code.functions()[function].code()[pc];
             if is_inline_instruction(instruction) {
@@ -652,6 +698,19 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                             return Ok(FrameCompletion::Unwind(value, origin, pc));
                         }
                     }
+                }
+                Instruction::Suspend { src, .. }
+                    if matches!(drive, FrameDrive::GeneratorStart | FrameDrive::GeneratorResume { .. }) =>
+                {
+                    let token = u32::try_from(pc + 1).map_err(|_| {
+                        self.error_at(
+                            module,
+                            RuntimeErrorKind::InvalidValue { value: Value::UNDEFINED },
+                            function,
+                            pc,
+                        )
+                    })?;
+                    return Ok(FrameCompletion::Suspend(frame.register(src.get()), token));
                 }
                 Instruction::Suspend { .. } => {
                     match self.raise(
@@ -905,6 +964,13 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
 
     /// Interprets a [`HelperResult`] against the frame: stores a normal result
     /// into `dst`, searches handlers for a throw, or turns a trap into an error.
+    fn take_matching_throw(&self, value: Value) -> (Value, ThrowOrigin) {
+        match self.pending_throw.take() {
+            Some(pending) if pending.value == value => (pending.value, pending.origin),
+            Some(_) | None => (value, ThrowOrigin::Bytecode),
+        }
+    }
+
     fn apply(
         &self,
         frame: &mut NativeFrame<'_>,
@@ -917,16 +983,14 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         let function = target.function.get() as usize;
         match result.tag {
             CompletionTag::Normal => {
+                self.pending_throw.take();
                 if let Some(register) = dst {
                     frame.set_register(register, result.value);
                 }
                 Ok(Flow::Next)
             }
             CompletionTag::Throw => {
-                let (value, origin) = match self.pending_throw.take() {
-                    Some(pending) => (pending.value, pending.origin),
-                    None => (result.value, ThrowOrigin::Bytecode),
-                };
+                let (value, origin) = self.take_matching_throw(result.value);
                 Ok(self.raise(frame, code, function, pc, value, origin))
             }
             CompletionTag::Suspend => {
@@ -998,10 +1062,11 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     return self.invoke_runtime(target, &captures, this, new_target, args.as_ref());
                 }
                 Ok(CalleeKind::Builtin { id }) => {
-                    let result =
+                    let result = {
                         self.machine
                             .borrow_mut()
-                            .call_builtin(id, this, args.as_ref(), false);
+                            .call_builtin(id, this, args.as_ref(), false)
+                    };
                     match result {
                         Ok(BuiltinOutcome::Value(value)) => {
                             return InvokeOutcome::Value(value);
@@ -1022,11 +1087,20 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                                 ThrowOrigin::TypeError { operation: "call" },
                             );
                         }
+                        Ok(BuiltinOutcome::GeneratorNext {
+                            generator,
+                            resume_value,
+                        }) => {
+                            return self.resume_generator(generator, resume_value);
+                        }
                         Err(EvalFailure::Throw(origin)) => {
                             return InvokeOutcome::Threw(Value::UNDEFINED, origin);
                         }
                         Err(EvalFailure::ThrowValue(value)) => {
                             return InvokeOutcome::Threw(value, ThrowOrigin::Bytecode);
+                        }
+                        Err(EvalFailure::ThrowValueOrigin { value, origin }) => {
+                            return InvokeOutcome::Threw(value, origin);
                         }
                         Err(EvalFailure::Runtime(kind)) => {
                             self.pending_fatal_kind.set(Some(kind));
@@ -1078,6 +1152,24 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         args: &[Value],
     ) -> InvokeOutcome {
         let index = target.function.get() as usize;
+        let handle = self.code_ref(target.module);
+        let flags = handle.code(target.module).functions()[index].flags();
+        if flags.is_generator && !flags.is_async {
+            let created = self.machine.borrow_mut().create_generator(GeneratorStart {
+                target,
+                captures: captures.to_vec(),
+                this_value: this,
+                new_target,
+                args: args.to_vec(),
+            });
+            return match created {
+                Ok(generator) => InvokeOutcome::Value(generator),
+                Err(kind) => {
+                    self.pending_fatal_kind.set(Some(kind));
+                    InvokeOutcome::Fatal
+                }
+            };
+        }
         if self.backend == Backend::Reference || self.is_dynamic_module(target.module) {
             return match self.execute(
                 target.module,
@@ -1091,6 +1183,11 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 Ok((FrameCompletion::Unwind(value, origin, _), _)) => {
                     InvokeOutcome::Threw(value, origin)
                 }
+                Ok((FrameCompletion::Suspend(value, _), _)) => {
+                    self.pending_fatal_kind
+                        .set(Some(RuntimeErrorKind::InvalidValue { value }));
+                    InvokeOutcome::Fatal
+                }
                 Err(error) => {
                     self.pending_error.set(Some(error));
                     InvokeOutcome::Fatal
@@ -1098,6 +1195,482 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             };
         }
         self.invoke_linked(target, captures, this, new_target, args)
+    }
+
+    fn resume_generator(
+        &self,
+        generator: Value,
+        resume_value: Value,
+    ) -> InvokeOutcome {
+        let state = self.machine.borrow_mut().take_generator_state(generator);
+        let resumed = match state {
+            Ok(GeneratorState::Completed) => {
+                return self.generator_result(Value::UNDEFINED, true);
+            }
+            Ok(GeneratorState::SuspendedStart(start)) => {
+                if self.backend == Backend::Reference || self.is_dynamic_module(start.target.module) {
+                    self.start_reference_generator(start)
+                } else {
+                    self.start_linked_generator(start)
+                }
+            }
+            Ok(GeneratorState::Suspended(activation)) => {
+                if self.backend == Backend::Reference
+                    || self.is_dynamic_module(activation.target.module)
+                {
+                    self.resume_reference_generator(activation, resume_value)
+                } else {
+                    self.resume_linked_generator(activation, resume_value)
+                }
+            }
+            Ok(GeneratorState::Executing) => unreachable!("executing state is rejected by take_generator_state"),
+            Err(failure) => return self.failure_outcome(failure),
+        };
+
+        match resumed {
+            Some(GeneratorResume::Yield { value, activation }) => {
+                let result = self
+                    .machine
+                    .borrow_mut()
+                    .settle_generator_yield(generator, value, activation);
+                self.eval_outcome(result)
+            }
+            Some(GeneratorResume::Return(value)) => {
+                let settled = self
+                    .machine
+                    .borrow_mut()
+                    .settle_generator_completed(generator);
+                if let Err(failure) = settled {
+                    return self.failure_outcome(failure);
+                }
+                self.generator_result(value, true)
+            }
+            Some(GeneratorResume::Throw { value, origin, .. }) => {
+                let settled = self
+                    .machine
+                    .borrow_mut()
+                    .settle_generator_completed(generator);
+                if let Err(failure) = settled {
+                    return self.failure_outcome(failure);
+                }
+                InvokeOutcome::Threw(value, origin)
+            }
+            None => {
+                if let Err(failure) = self
+                    .machine
+                    .borrow_mut()
+                    .settle_generator_completed(generator)
+                {
+                    return self.failure_outcome(failure);
+                }
+                InvokeOutcome::Fatal
+            }
+        }
+    }
+
+    fn generator_result(&self, value: Value, done: bool) -> InvokeOutcome {
+        let result = self.machine.borrow_mut().iterator_result(value, done);
+        self.eval_outcome(result)
+    }
+
+    fn eval_outcome(&self, result: Result<Value, EvalFailure>) -> InvokeOutcome {
+        match result {
+            Ok(value) => InvokeOutcome::Value(value),
+            Err(failure) => self.failure_outcome(failure),
+        }
+    }
+
+    fn failure_outcome(&self, failure: EvalFailure) -> InvokeOutcome {
+        match failure {
+            EvalFailure::Throw(origin) => InvokeOutcome::Threw(Value::UNDEFINED, origin),
+            EvalFailure::ThrowValue(value) => InvokeOutcome::Threw(value, ThrowOrigin::Bytecode),
+            EvalFailure::ThrowValueOrigin { value, origin } => InvokeOutcome::Threw(value, origin),
+            EvalFailure::Runtime(kind) => {
+                self.pending_fatal_kind.set(Some(kind));
+                InvokeOutcome::Fatal
+            }
+        }
+    }
+
+    fn get_outcome(&self, outcome: Result<GetOutcome, EvalFailure>, receiver: Value) -> InvokeOutcome {
+        match outcome {
+            Ok(GetOutcome::Value(value)) => InvokeOutcome::Value(value),
+            Ok(GetOutcome::Text(text)) => match self.machine.borrow_mut().allocate(HeapEntry::String(text)) {
+                Ok(value) => InvokeOutcome::Value(value),
+                Err(kind) => {
+                    self.pending_fatal_kind.set(Some(kind));
+                    InvokeOutcome::Fatal
+                }
+            },
+            Ok(GetOutcome::Getter(getter)) => {
+                self.invoke_callee(getter, receiver, &[], Value::UNDEFINED)
+            }
+            Err(failure) => self.failure_outcome(failure),
+        }
+    }
+
+    fn get_ascii(&self, object: Value, name: &str) -> InvokeOutcome {
+        let outcome = self.machine.borrow_mut().resolve_get_ascii(object, name);
+        self.get_outcome(outcome, object)
+    }
+
+    fn get_iterator_active(
+        &self,
+        source: Value,
+        kind: bamts_bytecode::IteratorKind,
+    ) -> InvokeOutcome {
+        if kind == bamts_bytecode::IteratorKind::Keys {
+            let created = self.machine.borrow_mut().create_iterator(source, kind);
+            return self.eval_outcome(created);
+        }
+        let method = {
+            let mut machine = self.machine.borrow_mut();
+            let symbol = machine.intrinsics.builtins.symbol_iterator();
+            let key = match machine.to_property_key(symbol) {
+                Ok(key) => key,
+                Err(failure) => return self.failure_outcome(failure),
+            };
+            machine.resolve_get(source, &key)
+        };
+        let method = match self.get_outcome(method, source) {
+            InvokeOutcome::Value(method) => method,
+            other => return other,
+        };
+        match self.machine.borrow().is_callable(method) {
+            Ok(true) => {}
+            Ok(false) => {
+                return InvokeOutcome::Threw(
+                    Value::UNDEFINED,
+                    ThrowOrigin::TypeError { operation: "value is not iterable" },
+                );
+            }
+            Err(failure) => return self.failure_outcome(failure),
+        }
+        let iterator = match self.invoke_callee(method, source, &[], Value::UNDEFINED) {
+            InvokeOutcome::Value(iterator) => iterator,
+            other => return other,
+        };
+        if !self.machine.borrow().is_object(iterator) {
+            return InvokeOutcome::Threw(
+                Value::UNDEFINED,
+                ThrowOrigin::TypeError {
+                    operation: "iterator method returned a non-object",
+                },
+            );
+        }
+        let next = match self.get_ascii(iterator, "next") {
+            InvokeOutcome::Value(next) => next,
+            other => return other,
+        };
+        let created = self
+            .machine
+            .borrow_mut()
+            .create_protocol_iterator(iterator, next);
+        self.eval_outcome(created)
+    }
+
+    fn iterator_next_active(&self, iterator: Value) -> Result<(bool, Value), InvokeOutcome> {
+        let prepared = self.machine.borrow_mut().prepare_iterator_next(iterator);
+        let result = match prepared {
+            Ok(IteratorNextPrepared::Ready { done, value }) => return Ok((done, value)),
+            Ok(IteratorNextPrepared::Call { callee, this_value }) => {
+                match self.invoke_callee(callee, this_value, &[], Value::UNDEFINED) {
+                    InvokeOutcome::Value(result) => result,
+                    other => return Err(other),
+                }
+            }
+            Err(failure) => return Err(self.failure_outcome(failure)),
+        };
+        if !self.machine.borrow().is_object(result) {
+            return Err(InvokeOutcome::Threw(
+                Value::UNDEFINED,
+                ThrowOrigin::TypeError {
+                    operation: "iterator next returned a non-object",
+                },
+            ));
+        }
+        let done = match self.get_ascii(result, "done") {
+            InvokeOutcome::Value(done) => done,
+            other => return Err(other),
+        };
+        if self.machine.borrow().truthy(done) {
+            return Ok((true, Value::UNDEFINED));
+        }
+        let value = match self.get_ascii(result, "value") {
+            InvokeOutcome::Value(value) => value,
+            other => return Err(other),
+        };
+        Ok((false, value))
+    }
+
+    fn array_extend_active(&self, array: Value, iterable: Value) -> InvokeOutcome {
+        let iterator = match self.get_iterator_active(iterable, bamts_bytecode::IteratorKind::Sync) {
+            InvokeOutcome::Value(iterator) => iterator,
+            other => return other,
+        };
+        loop {
+            let (done, value) = match self.iterator_next_active(iterator) {
+                Ok(step) => step,
+                Err(outcome) => return outcome,
+            };
+            if done {
+                return InvokeOutcome::Value(Value::UNDEFINED);
+            }
+            if let Err(failure) = self.machine.borrow_mut().array_push(array, value) {
+                return self.failure_outcome(failure);
+            }
+        }
+    }
+
+    fn start_reference_generator(&self, start: GeneratorStart) -> Option<GeneratorResume> {
+        let target = start.target;
+        let index = target.function.get() as usize;
+        let handle = self.code_ref(target.module);
+        let code = handle.code(target.module);
+        let register_count = code.functions()[index].register_count() as usize;
+        let mut registers = self.seed_registers(code, index, &start.captures, &start.args);
+        if let Err(kind) = self
+            .machine
+            .borrow_mut()
+            .reserve_suspended_generator_registers(register_count)
+        {
+            self.pending_fatal_kind.set(Some(kind));
+            return None;
+        }
+        if let Err(kind) = self.machine.borrow_mut().enter_native_generator() {
+            self.machine
+                .borrow_mut()
+                .release_suspended_generator_registers(register_count);
+            self.pending_fatal_kind.set(Some(kind));
+            return None;
+        }
+        self.activations.borrow_mut().push(Activation {
+            this_value: start.this_value,
+            new_target: start.new_target,
+            args: start.args.clone(),
+            arguments_object: None,
+            pending_resume: None,
+        });
+        let completion = self.run_frame(
+            target.module,
+            index,
+            code,
+            &mut registers,
+            FrameDrive::GeneratorStart,
+        );
+        let activation = self.activations.borrow_mut().pop().expect("generator activation exists");
+        self.machine.borrow_mut().leave_native_generator();
+        self.finish_reference_generator(target, registers, activation, completion)
+    }
+
+    fn resume_reference_generator(
+        &self,
+        mut suspended: GeneratorActivation,
+        sent: Value,
+    ) -> Option<GeneratorResume> {
+        let target = suspended.target;
+        let index = target.function.get() as usize;
+        let handle = self.code_ref(target.module);
+        let code = handle.code(target.module);
+        let register_count = suspended.registers.len();
+        if let Err(kind) = self.machine.borrow_mut().enter_native_generator() {
+            self.machine
+                .borrow_mut()
+                .release_suspended_generator_registers(register_count);
+            self.pending_fatal_kind.set(Some(kind));
+            return None;
+        }
+        self.activations.borrow_mut().push(Activation {
+            this_value: suspended.this_value,
+            new_target: suspended.new_target,
+            args: suspended.args.clone(),
+            arguments_object: suspended.arguments_object,
+            pending_resume: None,
+        });
+        let completion = self.run_frame(
+            target.module,
+            index,
+            code,
+            &mut suspended.registers,
+            FrameDrive::GeneratorResume {
+                token: suspended.resume_token,
+                sent,
+            },
+        );
+        let activation = self.activations.borrow_mut().pop().expect("generator activation exists");
+        self.machine.borrow_mut().leave_native_generator();
+        self.finish_reference_generator(target, suspended.registers, activation, completion)
+    }
+
+    fn finish_reference_generator(
+        &self,
+        target: crate::RuntimeFunction,
+        registers: Vec<Value>,
+        activation: Activation,
+        completion: Result<FrameCompletion, RuntimeError>,
+    ) -> Option<GeneratorResume> {
+        let register_count = registers.len();
+        match completion {
+            Ok(FrameCompletion::Suspend(value, resume_token)) => Some(GeneratorResume::Yield {
+                value,
+                activation: GeneratorActivation {
+                    target,
+                    registers,
+                    this_value: activation.this_value,
+                    new_target: activation.new_target,
+                    args: activation.args,
+                    arguments_object: activation.arguments_object,
+                    resume_token,
+                },
+            }),
+            Ok(FrameCompletion::Normal(value)) => {
+                self.machine
+                    .borrow_mut()
+                    .release_suspended_generator_registers(register_count);
+                Some(GeneratorResume::Return(value))
+            }
+            Ok(FrameCompletion::Unwind(value, origin, _)) => {
+                self.machine
+                    .borrow_mut()
+                    .release_suspended_generator_registers(register_count);
+                Some(GeneratorResume::Throw { value, origin })
+            }
+            Err(error) => {
+                self.machine
+                    .borrow_mut()
+                    .release_suspended_generator_registers(register_count);
+                self.pending_error.set(Some(error));
+                None
+            }
+        }
+    }
+
+    fn start_linked_generator(&self, start: GeneratorStart) -> Option<GeneratorResume> {
+        let index = start.target.function.get() as usize;
+        let handle = self.code_ref(start.target.module);
+        let code = handle.code(start.target.module);
+        let registers = self.seed_registers(code, index, &start.captures, &start.args);
+        if let Err(kind) = self
+            .machine
+            .borrow_mut()
+            .reserve_suspended_generator_registers(registers.len())
+        {
+            self.pending_fatal_kind.set(Some(kind));
+            return None;
+        }
+        self.drive_linked_generator(
+            GeneratorActivation {
+                target: start.target,
+                registers,
+                this_value: start.this_value,
+                new_target: start.new_target,
+                args: start.args,
+                arguments_object: None,
+                resume_token: 0,
+            },
+            None,
+        )
+    }
+
+    fn resume_linked_generator(
+        &self,
+        activation: GeneratorActivation,
+        sent: Value,
+    ) -> Option<GeneratorResume> {
+        self.drive_linked_generator(activation, Some(sent))
+    }
+
+    fn drive_linked_generator(
+        &self,
+        mut suspended: GeneratorActivation,
+        pending_resume: Option<Value>,
+    ) -> Option<GeneratorResume> {
+        let register_count = suspended.registers.len();
+        if let Err(kind) = self.machine.borrow_mut().enter_native_generator() {
+            self.machine
+                .borrow_mut()
+                .release_suspended_generator_registers(register_count);
+            self.pending_fatal_kind.set(Some(kind));
+            return None;
+        }
+        let length = match u16::try_from(register_count) {
+            Ok(length) => length,
+            Err(_) => {
+                self.machine.borrow_mut().leave_native_generator();
+                self.machine
+                    .borrow_mut()
+                    .release_suspended_generator_registers(register_count);
+                self.pending_fatal_kind.set(Some(RuntimeErrorKind::RegisterLimitExceeded {
+                    limit: self.max_total_registers(),
+                }));
+                return None;
+            }
+        };
+        self.activations.borrow_mut().push(Activation {
+            this_value: suspended.this_value,
+            new_target: suspended.new_target,
+            args: suspended.args.clone(),
+            arguments_object: suspended.arguments_object,
+            pending_resume,
+        });
+        let handles = suspended.registers.as_mut_ptr();
+        let (invoked, next_token, out) = {
+            let mut shadow = ShadowFrame::new(
+                std::ptr::null_mut(),
+                suspended.resume_token,
+                suspended.target.module.get(),
+                handles,
+                length,
+            );
+            let mut out = Completion::new(Value::UNDEFINED);
+            let invoked = self.entries.invoke(
+                suspended.target.module.get(),
+                suspended.target.function.get(),
+                &mut shadow,
+                &mut out,
+            );
+            (invoked, shadow.bytecode_pc, out)
+        };
+        let activation = self.activations.borrow_mut().pop().expect("generator activation exists");
+        self.machine.borrow_mut().leave_native_generator();
+        suspended.arguments_object = activation.arguments_object;
+
+        match invoked {
+            Ok(CompletionTag::Suspend) if next_token != 0 => {
+                suspended.resume_token = next_token;
+                Some(GeneratorResume::Yield {
+                    value: out.value,
+                    activation: suspended,
+                })
+            }
+            Ok(CompletionTag::Normal) => {
+                self.pending_throw.take();
+                self.machine
+                    .borrow_mut()
+                    .release_suspended_generator_registers(register_count);
+                Some(GeneratorResume::Return(out.value))
+            }
+            Ok(CompletionTag::Throw) => {
+                self.machine
+                    .borrow_mut()
+                    .release_suspended_generator_registers(register_count);
+                let (value, origin) = self.take_matching_throw(out.value);
+                Some(GeneratorResume::Throw { value, origin })
+            }
+            Ok(CompletionTag::Suspend | CompletionTag::FatalTrap) => {
+                self.machine
+                    .borrow_mut()
+                    .release_suspended_generator_registers(register_count);
+                None
+            }
+            Err(error) => {
+                self.machine
+                    .borrow_mut()
+                    .release_suspended_generator_registers(register_count);
+                self.pending_abi_error.set(Some(error));
+                None
+            }
+        }
     }
 
     /// Invokes a compiled entry through the borrowed [`NativeEntryTable`],
@@ -1141,36 +1714,36 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             pending_resume: None,
         });
         let handles = registers.as_mut_ptr();
-        let mut shadow = ShadowFrame::new(
-            std::ptr::null_mut(),
-            0,
-            target.module.get(),
-            handles,
-            length,
-        );
-        let mut out = Completion::new(Value::UNDEFINED);
-        let entries = self.entries;
-        // No borrow guard is held across `invoke`: the compiled entry re-enters
-        // `dispatch` on this same engine, which takes fresh short-lived borrows.
-        let tag = entries.invoke(
-            target.module.get(),
-            target.function.get(),
-            &mut shadow,
-            &mut out,
-        );
+        let (tag, out) = {
+            let mut shadow = ShadowFrame::new(
+                std::ptr::null_mut(),
+                0,
+                target.module.get(),
+                handles,
+                length,
+            );
+            let mut out = Completion::new(Value::UNDEFINED);
+            let tag = self.entries.invoke(
+                target.module.get(),
+                target.function.get(),
+                &mut shadow,
+                &mut out,
+            );
+            (tag, out)
+        };
         drop(registers);
         self.activations.borrow_mut().pop();
         self.machine
             .borrow_mut()
             .release_native_activation(register_count);
         match tag {
-            Ok(CompletionTag::Normal) => InvokeOutcome::Value(out.value),
+            Ok(CompletionTag::Normal) => {
+                self.pending_throw.take();
+                InvokeOutcome::Value(out.value)
+            }
             Ok(CompletionTag::Throw) => {
-                let origin = self
-                    .pending_throw
-                    .take()
-                    .map_or(ThrowOrigin::Bytecode, |pending| pending.origin);
-                InvokeOutcome::Threw(out.value, origin)
+                let (value, origin) = self.take_matching_throw(out.value);
+                InvokeOutcome::Threw(value, origin)
             }
             Ok(CompletionTag::Suspend | CompletionTag::FatalTrap) => InvokeOutcome::Fatal,
             Err(error) => {
@@ -1301,6 +1874,10 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 }));
                 HelperResult::throw(value)
             }
+            EvalFailure::ThrowValueOrigin { value, origin } => {
+                self.pending_throw.set(Some(PendingThrow { value, origin }));
+                HelperResult::throw(value)
+            }
             EvalFailure::Runtime(kind) => self.fatal(kind),
         }
     }
@@ -1410,7 +1987,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 );
                 match result {
                     Ok(BuiltinOutcome::Value(value)) => HelperResult::normal(value),
-                    Ok(BuiltinOutcome::Call { .. }) => {
+                    Ok(BuiltinOutcome::Call { .. } | BuiltinOutcome::GeneratorNext { .. }) => {
                         self.pending_throw.set(Some(PendingThrow {
                             value: Value::UNDEFINED,
                             origin: ThrowOrigin::TypeError {
@@ -1605,39 +2182,43 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             pending_resume: None,
         });
         let handles = registers.as_mut_ptr();
-        let mut shadow = ShadowFrame::new(std::ptr::null_mut(), 0, module.get(), handles, length);
-        let mut out = Completion::new(Value::UNDEFINED);
         let entries = self.entries;
-        let tag = with_native_ops(self, || {
-            entries.invoke(module.get(), function_id.get(), &mut shadow, &mut out)
-        });
+        let (tag, out, fault_pc) = {
+            let mut shadow =
+                ShadowFrame::new(std::ptr::null_mut(), 0, module.get(), handles, length);
+            let mut out = Completion::new(Value::UNDEFINED);
+            let tag = with_native_ops(self, || {
+                entries.invoke(module.get(), function_id.get(), &mut shadow, &mut out)
+            });
+            (tag, out, shadow.bytecode_pc as usize)
+        };
         self.activations.borrow_mut().pop();
         self.machine
             .borrow_mut()
             .release_native_activation(register_count);
         match tag {
-            Ok(CompletionTag::Normal) => Ok(Execution {
-                outcome: ExecutionOutcome {
-                    stdout: self.stdout.borrow().clone(),
-                    exit_code: self.exit_code.get(),
-                },
-                value: out.value,
-                link: out.value,
-                entry_registers: registers,
-            }),
+            Ok(CompletionTag::Normal) => {
+                self.pending_throw.take();
+                Ok(Execution {
+                    outcome: ExecutionOutcome {
+                        stdout: self.stdout.borrow().clone(),
+                        exit_code: self.exit_code.get(),
+                    },
+                    value: out.value,
+                    link: out.value,
+                    entry_registers: registers,
+                })
+            }
             Ok(CompletionTag::Throw) => {
-                let origin = self
-                    .pending_throw
-                    .take()
-                    .map_or(ThrowOrigin::Bytecode, |pending| pending.origin);
+                let (value, origin) = self.take_matching_throw(out.value);
                 Err(NativeError::Runtime(self.error_at(
                     module,
                     RuntimeErrorKind::UncaughtThrow {
-                        value: out.value,
+                        value,
                         origin,
                     },
                     function,
-                    shadow.bytecode_pc as usize,
+                    fault_pc,
                 )))
             }
             Ok(CompletionTag::Suspend | CompletionTag::FatalTrap) => {
@@ -1650,7 +2231,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         module,
                         kind,
                         function,
-                        shadow.bytecode_pc as usize,
+                        fault_pc,
                     )))
                 } else {
                     Err(NativeError::FatalTrap { value: out.value })
@@ -1941,11 +2522,8 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 }
             }
             HelperCall::ArrayExtend { array, iterable } => {
-                let result = self.machine.borrow_mut().array_extend(array, iterable);
-                match result {
-                    Ok(()) => HelperResult::normal(Value::UNDEFINED),
-                    Err(failure) => self.fail(failure),
-                }
+                let outcome = self.array_extend_active(array, iterable);
+                self.outcome_result(outcome)
             }
             HelperCall::ObjectSpread { target, source } => {
                 let result = self.machine.borrow_mut().object_spread(target, source);
@@ -1978,10 +2556,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 })
             }
             HelperCall::GetIterator { src, kind } => match iterator_kind_from_selector(kind) {
-                Some(kind) => {
-                    let result = self.machine.borrow_mut().create_iterator(src, kind);
-                    self.eval_result(result)
-                }
+                Some(kind) => self.outcome_result(self.get_iterator_active(src, kind)),
                 None => self.fatal(RuntimeErrorKind::InvalidValue {
                     value: Value::UNDEFINED,
                 }),
@@ -1990,23 +2565,20 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 iterator,
                 done_reg,
                 value_reg,
-            } => {
-                let stepped = self.machine.borrow_mut().iterator_next(iterator);
-                match stepped {
-                    Ok((done, value)) => {
-                        let wrote_done = frame.try_set_register(done_reg, Value::boolean(done));
-                        let wrote_value = frame.try_set_register(value_reg, value);
-                        if wrote_done && wrote_value {
-                            HelperResult::normal(Value::UNDEFINED)
-                        } else {
-                            self.fatal(RuntimeErrorKind::InvalidValue {
-                                value: Value::UNDEFINED,
-                            })
-                        }
+            } => match self.iterator_next_active(iterator) {
+                Ok((done, value)) => {
+                    let wrote_done = frame.try_set_register(done_reg, Value::boolean(done));
+                    let wrote_value = frame.try_set_register(value_reg, value);
+                    if wrote_done && wrote_value {
+                        HelperResult::normal(Value::UNDEFINED)
+                    } else {
+                        self.fatal(RuntimeErrorKind::InvalidValue {
+                            value: Value::UNDEFINED,
+                        })
                     }
-                    Err(failure) => self.fail(failure),
                 }
-            }
+                Err(outcome) => self.outcome_result(outcome),
+            },
             HelperCall::Export { .. } => self.fail(EvalFailure::Throw(ThrowOrigin::TypeError {
                 operation: "export outside an engine-owned module registry",
             })),
@@ -2087,18 +2659,18 @@ mod tests {
     use bamts_bytecode::{
         BinaryOp, Binding, BindingId, BindingKind, Constant, ConstantId, Edge, EdgeId, EdgeKind,
         EdgeTarget, ExceptionHandler, Export, ExportSource, Function, FunctionFlags, FunctionId,
-        Instruction, Module, ModuleId, Pc, Program, ProgramModule, Register, Verified,
+        Instruction, IteratorKind, Module, ModuleId, Pc, Program, ProgramModule, Register, Verified,
     };
     use bamts_native::{
-        AbiError, Completion, CompletionTag, HelperCall, NativeEntryTable, NativeFrame, NativeOps,
+        AbiError, Completion, CompletionTag, HelperCall, HelperResult, NativeEntryTable, NativeFrame, NativeOps,
         ShadowFrame, Value,
     };
 
-    use crate::{Host, Limits, Machine, RuntimeError, RuntimeErrorKind, ThrowOrigin};
+    use crate::{GeneratorState, HeapEntry, Host, Limits, Machine, PropertyMap, RuntimeError, RuntimeErrorKind, ThrowOrigin};
 
     use super::EcmaString;
     use super::{
-        Backend, InvokeOutcome, NativeEngine, NativeError, PendingThrow, run_linked_program,
+        Activation, Backend, InvokeOutcome, NativeEngine, NativeError, PendingThrow, run_linked_program,
     };
 
     fn reg(raw: u32) -> Register {
@@ -3613,6 +4185,40 @@ mod tests {
     }
 
     #[test]
+    fn builtin_iterators_match_between_engines() {
+        let module = verified(
+            vec![Constant::Int32(8)],
+            vec![entry_function(
+                5,
+                vec![
+                    Instruction::CreateArray { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::ArrayPush {
+                        array: reg(0),
+                        value: reg(1),
+                    },
+                    Instruction::GetIterator {
+                        dst: reg(2),
+                        src: reg(0),
+                        kind: IteratorKind::Sync,
+                    },
+                    Instruction::IteratorNext {
+                        done: reg(3),
+                        value: reg(4),
+                        iterator: reg(2),
+                    },
+                    Instruction::Return { value: reg(4) },
+                ],
+            )],
+        );
+
+        assert_eq!(assert_parity(&module, || SilentHost), Value::int32(8));
+    }
+
+    #[test]
     fn bound_calls_match_between_engines() {
         let module = verified(
             vec![
@@ -4045,6 +4651,31 @@ mod tests {
     }
 
     #[test]
+    fn stale_pending_throw_cannot_replace_a_new_bytecode_throw() {
+        let program = trivial_program();
+        let mut host = SilentHost;
+        let engine = NativeEngine::build(
+            &program,
+            &NoEntries,
+            &mut host,
+            Limits::default(),
+            Backend::Linked,
+        );
+        engine.pending_throw.set(Some(PendingThrow {
+            value: Value::int32(1),
+            origin: ThrowOrigin::ReferenceError {
+                operation: "stale",
+            },
+        }));
+
+        assert_eq!(
+            engine.take_matching_throw(Value::int32(2)),
+            (Value::int32(2), ThrowOrigin::Bytecode)
+        );
+        assert!(engine.pending_throw.get().is_none());
+    }
+
+    #[test]
     fn linked_entry_sources_pending_runtime_fatal_kind() {
         let program = trivial_program();
         let mut host = SilentHost;
@@ -4178,5 +4809,447 @@ mod tests {
         );
         assert!(matches!(outcome, InvokeOutcome::Value(value) if value == Value::int32(42)));
         assert!(entries.invoked.borrow().is_empty());
+    }
+    fn generator_program(code: Vec<Instruction>, constants: Vec<Constant>) -> Program<Verified> {
+        let generator = Function::new(
+            None,
+            0,
+            0,
+            3,
+            FunctionFlags {
+                is_async: false,
+                is_generator: true,
+            },
+            code,
+            Vec::new(),
+        );
+        one_module_program(&verified(
+            constants,
+            vec![entry_function(1, vec![Instruction::Halt]), generator],
+        ))
+    }
+
+    fn yielding_generator_program() -> Program<Verified> {
+        generator_program(
+            vec![
+                Instruction::LoadConst {
+                    dst: reg(0),
+                    constant: cid(0),
+                },
+                Instruction::Suspend {
+                    dst: reg(1),
+                    src: reg(0),
+                    resume: pc(2),
+                },
+                Instruction::LoadConst {
+                    dst: reg(0),
+                    constant: cid(1),
+                },
+                Instruction::Suspend {
+                    dst: reg(1),
+                    src: reg(0),
+                    resume: pc(4),
+                },
+                Instruction::Return { value: reg(1) },
+            ],
+            vec![Constant::Int32(4), Constant::Int32(5)],
+        )
+    }
+
+    fn invoke_test_generator<H: Host>(engine: &NativeEngine<'_, '_, H>) -> Value {
+        match engine.invoke_runtime(
+            crate::RuntimeFunction {
+                module: ModuleId::new(0),
+                function: FunctionId::new(1),
+            },
+            &[],
+            Value::UNDEFINED,
+            Value::UNDEFINED,
+            &[],
+        ) {
+            InvokeOutcome::Value(generator) => generator,
+            _ => panic!("generator call must return its lazy generator object"),
+        }
+    }
+
+    fn assert_iterator_result<H: Host>(
+        engine: &NativeEngine<'_, '_, H>,
+        outcome: InvokeOutcome,
+        expected_value: Value,
+        expected_done: bool,
+    ) {
+        let result = match outcome {
+            InvokeOutcome::Value(result) => result,
+            _ => panic!("generator next must return an iterator result"),
+        };
+        let mut machine = engine.machine.borrow_mut();
+        let value = machine
+            .get_named_property(result, "value")
+            .expect("iterator result has value");
+        let done = machine
+            .get_named_property(result, "done")
+            .expect("iterator result has done");
+        assert_eq!(value, expected_value);
+        assert_eq!(done, Value::boolean(expected_done));
+    }
+
+    #[test]
+    fn reference_generator_is_lazy_yields_resumes_and_completes_stickily() {
+        let program = yielding_generator_program();
+        let mut host = SilentHost;
+        let entries = NoEntries;
+        let engine = NativeEngine::new(&program, &entries, &mut host, Limits::default());
+        let generator = invoke_test_generator(&engine);
+
+        {
+            let machine = engine.machine.borrow();
+            let index = machine.runtime_slot(generator).unwrap().unwrap();
+            assert!(matches!(
+                &machine.heap[index],
+                HeapEntry::Generator {
+                    state: GeneratorState::SuspendedStart(_),
+                    ..
+                }
+            ));
+        }
+
+        assert_iterator_result(
+            &engine,
+            engine.resume_generator(generator, Value::int32(999)),
+            Value::int32(4),
+            false,
+        );
+        {
+            let machine = engine.machine.borrow();
+            let index = machine.runtime_slot(generator).unwrap().unwrap();
+            let HeapEntry::Generator {
+                state: GeneratorState::Suspended(activation),
+                ..
+            } = &machine.heap[index]
+            else {
+                panic!("generator must retain its suspended activation");
+            };
+            assert_eq!(activation.resume_token, 2);
+            assert_eq!(activation.registers[0], Value::int32(4));
+        }
+
+        assert_iterator_result(
+            &engine,
+            engine.resume_generator(generator, Value::int32(99)),
+            Value::int32(5),
+            false,
+        );
+        assert_iterator_result(
+            &engine,
+            engine.resume_generator(generator, Value::int32(7)),
+            Value::int32(7),
+            true,
+        );
+        assert_iterator_result(
+            &engine,
+            engine.resume_generator(generator, Value::int32(8)),
+            Value::UNDEFINED,
+            true,
+        );
+        let machine = engine.machine.borrow();
+        assert_eq!(machine.live_registers, 0);
+        assert_eq!(machine.native_depth, 0);
+    }
+
+    #[test]
+    fn reference_generator_throw_completes_and_preserves_value_and_origin() {
+        let program = generator_program(
+            vec![
+                Instruction::LoadConst {
+                    dst: reg(0),
+                    constant: cid(0),
+                },
+                Instruction::Throw { value: reg(0) },
+            ],
+            vec![Constant::Int32(42)],
+        );
+        let mut host = SilentHost;
+        let entries = NoEntries;
+        let engine = NativeEngine::new(&program, &entries, &mut host, Limits::default());
+        let generator = invoke_test_generator(&engine);
+        assert!(matches!(
+            engine.resume_generator(generator, Value::UNDEFINED),
+            InvokeOutcome::Threw(value, ThrowOrigin::Bytecode) if value == Value::int32(42)
+        ));
+        assert_iterator_result(
+            &engine,
+            engine.resume_generator(generator, Value::UNDEFINED),
+            Value::UNDEFINED,
+            true,
+        );
+        let machine = engine.machine.borrow();
+        assert_eq!(machine.live_registers, 0);
+        assert_eq!(machine.native_depth, 0);
+    }
+
+    #[test]
+    fn suspended_reference_generator_registers_enforce_the_global_ceiling() {
+        let program = yielding_generator_program();
+        let mut host = SilentHost;
+        let entries = NoEntries;
+        let mut limits = Limits::default();
+        limits.max_total_registers = 3;
+        let engine = NativeEngine::new(&program, &entries, &mut host, limits);
+        let first = invoke_test_generator(&engine);
+        let second = invoke_test_generator(&engine);
+        assert_iterator_result(
+            &engine,
+            engine.resume_generator(first, Value::UNDEFINED),
+            Value::int32(4),
+            false,
+        );
+        assert!(matches!(
+            engine.resume_generator(second, Value::UNDEFINED),
+            InvokeOutcome::Fatal
+        ));
+        assert!(matches!(
+            engine.pending_fatal_kind.take(),
+            Some(RuntimeErrorKind::RegisterLimitExceeded { limit: 3 })
+        ));
+    }
+
+    #[derive(Clone, Copy)]
+    struct GeneratorEntryStep {
+        token: u32,
+        next_token: u32,
+        tag: CompletionTag,
+        value: Value,
+    }
+
+    struct GeneratorEntries {
+        steps: Vec<GeneratorEntryStep>,
+        call: Cell<usize>,
+        handles: Cell<Option<*mut Value>>,
+    }
+
+    impl GeneratorEntries {
+        fn yielding() -> Self {
+            Self {
+                steps: vec![
+                    GeneratorEntryStep {
+                        token: 0,
+                        next_token: 2,
+                        tag: CompletionTag::Suspend,
+                        value: Value::int32(4),
+                    },
+                    GeneratorEntryStep {
+                        token: 2,
+                        next_token: 4,
+                        tag: CompletionTag::Suspend,
+                        value: Value::int32(5),
+                    },
+                    GeneratorEntryStep {
+                        token: 4,
+                        next_token: 4,
+                        tag: CompletionTag::Normal,
+                        value: Value::int32(7),
+                    },
+                ],
+                call: Cell::new(0),
+                handles: Cell::new(None),
+            }
+        }
+
+        fn terminal(tag: CompletionTag, value: Value) -> Self {
+            Self {
+                steps: vec![GeneratorEntryStep {
+                    token: 0,
+                    next_token: 1,
+                    tag,
+                    value,
+                }],
+                call: Cell::new(0),
+                handles: Cell::new(None),
+            }
+        }
+    }
+
+    impl NativeEntryTable for GeneratorEntries {
+        fn program_bytes(&self) -> &[u8] {
+            &[]
+        }
+
+        fn invoke(
+            &self,
+            module_id: u32,
+            function_id: u32,
+            frame: &mut ShadowFrame,
+            out: &mut Completion,
+        ) -> Result<CompletionTag, AbiError> {
+            assert_eq!(module_id, 0);
+            assert_eq!(function_id, 1);
+            let call = self.call.get();
+            let step = self.steps[call];
+            self.call.set(call + 1);
+            assert_eq!(frame.bytecode_pc, step.token);
+            match self.handles.get() {
+                Some(handles) => assert_eq!(
+                    handles, frame.handles,
+                    "linked resumes must reuse the saved register allocation"
+                ),
+                None => self.handles.set(Some(frame.handles)),
+            }
+            frame.bytecode_pc = step.next_token;
+            *out = Completion::new(step.value);
+            Ok(step.tag)
+        }
+    }
+
+    #[test]
+    fn linked_generator_reuses_saved_registers_and_dispatches_resume_tokens() {
+        let program = yielding_generator_program();
+        let entries = GeneratorEntries::yielding();
+        let mut host = SilentHost;
+        let engine = NativeEngine::build(
+            &program,
+            &entries,
+            &mut host,
+            Limits::default(),
+            Backend::Linked,
+        );
+        let generator = invoke_test_generator(&engine);
+        assert_eq!(entries.call.get(), 0, "generator call is lazy");
+        assert_iterator_result(
+            &engine,
+            engine.resume_generator(generator, Value::int32(999)),
+            Value::int32(4),
+            false,
+        );
+        assert_iterator_result(
+            &engine,
+            engine.resume_generator(generator, Value::int32(99)),
+            Value::int32(5),
+            false,
+        );
+        assert_iterator_result(
+            &engine,
+            engine.resume_generator(generator, Value::int32(7)),
+            Value::int32(7),
+            true,
+        );
+        assert_iterator_result(
+            &engine,
+            engine.resume_generator(generator, Value::UNDEFINED),
+            Value::UNDEFINED,
+            true,
+        );
+        assert_eq!(entries.call.get(), 3);
+        let machine = engine.machine.borrow();
+        assert_eq!(machine.live_registers, 0);
+        assert_eq!(machine.native_depth, 0);
+    }
+
+    #[test]
+    fn linked_resume_value_dispatch_consumes_the_sent_value_once() {
+        let program = yielding_generator_program();
+        let entries = NoEntries;
+        let mut host = SilentHost;
+        let engine = NativeEngine::build(
+            &program,
+            &entries,
+            &mut host,
+            Limits::default(),
+            Backend::Linked,
+        );
+        engine.activations.borrow_mut().push(Activation {
+            this_value: Value::UNDEFINED,
+            new_target: Value::UNDEFINED,
+            args: Vec::new(),
+            arguments_object: None,
+            pending_resume: Some(Value::int32(77)),
+        });
+        let mut registers = vec![Value::UNINITIALIZED];
+        let mut shadow =
+            ShadowFrame::new(std::ptr::null_mut(), 2, 0, registers.as_mut_ptr(), 1);
+        let mut frame = NativeFrame::new(&mut shadow, &mut registers).unwrap();
+        let resumed = engine.dispatch(&mut frame, HelperCall::ResumeValue);
+        assert_eq!(resumed, HelperResult::normal(Value::int32(77)));
+        assert_eq!(
+            engine.dispatch(&mut frame, HelperCall::ResumeValue).tag,
+            CompletionTag::FatalTrap
+        );
+        engine.activations.borrow_mut().pop();
+    }
+
+    #[test]
+    fn linked_generator_throw_and_fatal_release_once_and_complete_stickily() {
+        for (tag, expected_throw) in [
+            (CompletionTag::Throw, true),
+            (CompletionTag::FatalTrap, false),
+        ] {
+            let program = generator_program(vec![Instruction::Halt], Vec::new());
+            let entries = GeneratorEntries::terminal(tag, Value::int32(42));
+            let mut host = SilentHost;
+            let engine = NativeEngine::build(
+                &program,
+                &entries,
+                &mut host,
+                Limits::default(),
+                Backend::Linked,
+            );
+            let generator = invoke_test_generator(&engine);
+            let outcome = engine.resume_generator(generator, Value::UNDEFINED);
+            if expected_throw {
+                assert!(matches!(
+                    outcome,
+                    InvokeOutcome::Threw(value, ThrowOrigin::Bytecode)
+                        if value == Value::int32(42)
+                ));
+            } else {
+                assert!(matches!(outcome, InvokeOutcome::Fatal));
+            }
+            assert_iterator_result(
+                &engine,
+                engine.resume_generator(generator, Value::UNDEFINED),
+                Value::UNDEFINED,
+                true,
+            );
+            let machine = engine.machine.borrow();
+            assert_eq!(machine.live_registers, 0);
+            assert_eq!(machine.native_depth, 0);
+        }
+    }
+
+    #[test]
+    fn linked_array_extend_drives_generator_through_linked_entries() {
+        let program = yielding_generator_program();
+        let entries = GeneratorEntries::yielding();
+        let mut host = SilentHost;
+        let engine = NativeEngine::build(
+            &program,
+            &entries,
+            &mut host,
+            Limits::default(),
+            Backend::Linked,
+        );
+        let generator = invoke_test_generator(&engine);
+        let array = {
+            let prototype = engine.machine.borrow().intrinsics.array_prototype;
+            engine
+                .machine
+                .borrow_mut()
+                .allocate(HeapEntry::Array {
+                    elements: Vec::new(),
+                    properties: PropertyMap::default(),
+                    prototype: Some(prototype),
+                    extensible: true,
+                    length_writable: true,
+                })
+                .unwrap()
+        };
+        assert!(matches!(
+            engine.array_extend_active(array, generator),
+            InvokeOutcome::Value(value) if value == Value::UNDEFINED
+        ));
+        assert_eq!(
+            engine.machine.borrow().arguments_from_array(array).unwrap(),
+            vec![Value::int32(4), Value::int32(5)]
+        );
+        assert_eq!(entries.call.get(), 3);
     }
 }

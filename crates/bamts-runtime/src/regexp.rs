@@ -833,7 +833,7 @@ fn class_node(item: ClassItem) -> Node {
 fn decimal_digit(unit: u16) -> Option<usize> {
     (unit <= 0x7f)
         .then_some(unit as u8)
-        .and_then(|byte| byte.is_ascii_digit().then_some((byte - b'0') as usize))
+        .and_then(|byte| byte.is_ascii_digit().then(|| (byte - b'0') as usize))
 }
 
 fn hex_digit(unit: u16) -> Option<u32> {
@@ -897,6 +897,23 @@ mod tests {
         );
         assert!(regex(r"[abc]at", "").exec(&text("cat"), 0).is_some());
         assert!(regex(r"^(a|b)\.js$", "").exec(&text("b.js"), 0).is_some());
+    }
+
+    #[test]
+    fn destr_json_signature_matches_number_and_preserves_unmatched_captures() {
+        let input = text("123");
+        let matched = regex(
+            r#"^\s*["[{]|^\s*-?\d{1,16}(\.\d{1,17})?([Ee][+-]?\d+)?\s*$"#,
+            "",
+        )
+        .exec(&input, 0)
+        .unwrap();
+
+        assert_eq!(matched.range, 0..input.as_units().len());
+        assert_eq!(
+            matched.captures,
+            vec![Some(0..input.as_units().len()), None, None]
+        );
     }
 
     #[test]

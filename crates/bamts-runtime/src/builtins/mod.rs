@@ -15,8 +15,10 @@ mod json;
 mod number;
 mod object;
 mod regexp;
+pub(crate) use regexp::canonical_source;
 mod string;
 mod symbol;
+mod uint8array;
 
 pub(crate) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -25,6 +27,7 @@ pub(crate) fn install<H: Host>(
 ) {
     symbol::install(heap, globals, builtins);
     collections::install_iterator_prototype(heap, builtins);
+    collections::install_generator_prototype(heap, builtins);
     collections::install(heap, globals, builtins);
     date::install(heap, globals, builtins);
     object::install(heap, globals, builtins);
@@ -34,6 +37,7 @@ pub(crate) fn install<H: Host>(
     install_boolean(heap, globals, builtins);
     install_math(heap, globals, builtins);
     regexp::install(heap, globals, builtins);
+    uint8array::install(heap, globals, builtins);
     install_globals(heap, globals, builtins);
     json::install(heap, globals, builtins);
     let json = *globals
@@ -90,7 +94,36 @@ pub(super) fn define_to_string_tag(
     };
     properties.insert(
         PropertyKey::Symbol(heap_index(symbol) as u32),
-        builtin_property(value),
+        Property::Data {
+            value,
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        },
+    );
+}
+
+/// Installs a named data property that is non-writable, non-enumerable, and
+/// non-configurable onto an ordinary object, array, or native function.
+pub(crate) fn define_frozen_data(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) {
+    let index = heap_index(object);
+    let properties = match &mut heap[index] {
+        HeapEntry::Object { properties, .. }
+        | HeapEntry::Array { properties, .. }
+        | HeapEntry::Function { properties, .. }
+        | HeapEntry::Script { properties, .. }
+        | HeapEntry::RegExp { properties, .. }
+        | HeapEntry::NativeFunction { properties, .. } => properties,
+        _ => panic!("frozen property target must be an ordinary object"),
+    };
+    properties.insert(
+        PropertyKey::Named(EcmaString::from_utf8(name)),
+        Property::Data {
+            value,
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        },
     );
 }
 
@@ -437,11 +470,28 @@ fn install_globals<H: Host>(
         ("isFinite", 1, number::global_is_finite::<H>),
         ("encodeURIComponent", 1, string::encode_uri_component::<H>),
         ("decodeURIComponent", 1, string::decode_uri_component::<H>),
+        ("unescape", 1, string::unescape::<H>),
         ("structuredClone", 1, object::structured_clone::<H>),
     ] {
         let value = install_function(heap, builtins, name, length, handler);
         globals.insert(EcmaString::from_utf8(name), value);
     }
+    globals.insert(
+        EcmaString::from_utf8("Infinity"),
+        crate::number_value(f64::INFINITY),
+    );
+    globals.insert(EcmaString::from_utf8("NaN"), crate::number_value(f64::NAN));
+    let atomics = push(
+        heap,
+        HeapEntry::Object {
+            properties: PropertyMap::default(),
+            prototype: Some(builtins.object_prototype()),
+            extensible: true,
+            boxed_primitive: None,
+        },
+    );
+    define_to_string_tag(heap, atomics, builtins.symbol_to_string_tag(), "Atomics");
+    globals.insert(EcmaString::from_utf8("Atomics"), atomics);
 }
 
 fn install_errors<H: Host>(
@@ -540,7 +590,7 @@ fn install_error_type<H: Host>(
 
 fn error_constructor<H: Host>(
     machine: &mut Machine<'_, H>,
-    _this: Value,
+    this: Value,
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
@@ -549,31 +599,34 @@ fn error_constructor<H: Host>(
         .ok_or_else(|| type_error("invalid error constructor"))?;
     let name = machine.intrinsics.builtins.get(id).name;
     let prototype = machine.intrinsics.error_prototype(id);
-    let object = machine
-        .allocate(HeapEntry::Object {
-            properties: PropertyMap::default(),
-            prototype: Some(prototype),
-            extensible: true,
-            boxed_primitive: None,
-        })
-        .map_err(EvalFailure::Runtime)?;
+    let object = if machine.inherits_from_prototype(this, prototype)? {
+        this
+    } else {
+        machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .map_err(EvalFailure::Runtime)?
+    };
     let (message_index, options_index) = if name == "AggregateError" {
         let errors = args.first().copied().unwrap_or(Value::UNDEFINED);
-        let values = machine
-            .array_elements(errors)?
-            .ok_or_else(|| type_error("AggregateError errors argument is not iterable"))?;
+        let values = machine.iterable_values(errors)?;
         let array = allocate_array(machine, values)?;
         machine.set_data_property(object, "errors", array)?;
         (1, 2)
     } else {
         (0, 1)
     };
-    if let Some(message) = args
+    let message = args
         .get(message_index)
         .filter(|value| **value != Value::UNDEFINED)
-    {
-        let message_text = machine.to_string(*message)?;
-        let text = allocate_string(machine, message_text)?;
+        .map(|value| machine.to_string(*value))
+        .transpose()?;
+    if let Some(message) = &message {
+        let text = allocate_string(machine, message.clone())?;
         machine.set_data_property(object, "message", text)?;
     }
     if let Some(options) = args
@@ -587,11 +640,11 @@ fn error_constructor<H: Host>(
             machine.set_data_property(object, "cause", cause)?;
         }
     }
-    let message_value = machine.get_named_property(object, "message")?;
-    let message = machine.to_string(message_value)?;
     let mut stack = bamts_bytecode::EcmaStringBuilder::new();
     stack.push_utf8(name);
-    if !message.is_empty() {
+    if let Some(message) = &message
+        && !message.is_empty()
+    {
         stack.push_utf8(": ");
         for &unit in message.as_units() {
             stack.push_unit(unit);
@@ -1013,5 +1066,363 @@ impl<'a, H: Host> Machine<'a, H> {
         }
         properties.insert(key, descriptor);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bamts_bytecode::{
+        Constant, ConstantId, Function, FunctionFlags, FunctionId, Instruction, Module, ModuleId,
+        Program, ProgramModule, Verified,
+    };
+
+    use super::*;
+    use crate::Limits;
+
+    #[derive(Default)]
+    struct TestHost;
+
+    impl Host for TestHost {}
+
+    fn module() -> Program<Verified> {
+        let code = Module::new(
+            vec![Constant::String(EcmaString::from_utf8("<test>"))],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                1,
+                FunctionFlags::default(),
+                vec![Instruction::Halt],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("valid test module");
+        Program::link(
+            vec![ProgramModule {
+                name: ConstantId::new(0),
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect("valid test program")
+    }
+
+    fn inherited_message_getter<H: Host>(
+        _machine: &mut Machine<'_, H>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Err(type_error(
+            "inherited message getter ran before derived fields",
+        ))
+    }
+
+    #[test]
+    fn valita_style_message_getter_does_not_run_before_private_issue_field() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let getter = install_function(
+            &mut machine.heap,
+            &mut machine.intrinsics.builtins,
+            "inherited message getter",
+            0,
+            inherited_message_getter::<TestHost>,
+        );
+        let mut properties = PropertyMap::default();
+        properties.insert(
+            PropertyKey::Named(EcmaString::from_utf8("message")),
+            Property::Accessor {
+                getter: Some(getter),
+                setter: None,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+        let error = machine.intrinsics.global("Error").expect("Error exists");
+        let error_prototype = machine
+            .get_named_property(error, "prototype")
+            .expect("Error.prototype exists");
+        let prototype = machine
+            .allocate(HeapEntry::Object {
+                properties,
+                prototype: Some(error_prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .expect("prototype allocation succeeds");
+        let receiver = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .expect("derived receiver allocation succeeds");
+        let initialized = machine
+            .call_value(error, receiver, &[])
+            .expect("Error does not read the inherited message getter");
+        assert_eq!(initialized, receiver);
+        let stack = machine
+            .get_named_property(receiver, "stack")
+            .expect("Error creates stack on the existing receiver");
+        assert!(
+            machine
+                .to_string(stack)
+                .expect("stack is string")
+                .eq_ascii("Error\n    at <bamts>")
+        );
+
+        let unrelated = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .expect("unrelated receiver allocation succeeds");
+        assert_ne!(
+            machine
+                .call_value(error, unrelated, &[])
+                .expect("Error allocates for an unrelated receiver"),
+            unrelated
+        );
+
+        let receiver_with_message = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .expect("second derived receiver allocation succeeds");
+        let message = machine
+            .allocate(HeapEntry::String(EcmaString::from_utf8("issue")))
+            .expect("message allocation succeeds");
+        assert_eq!(
+            machine
+                .call_value(error, receiver_with_message, &[message])
+                .expect("Error initializes the second derived receiver"),
+            receiver_with_message
+        );
+        let stack = machine
+            .get_named_property(receiver_with_message, "stack")
+            .expect("Error creates the second stack");
+        assert!(
+            machine
+                .to_string(stack)
+                .expect("stack is string")
+                .eq_ascii("Error: issue\n    at <bamts>")
+        );
+    }
+
+    #[test]
+    fn global_infinity_descriptor_is_frozen_with_exact_value() {
+        let module = module();
+        let mut host = TestHost;
+        let machine = Machine::new(&module, &mut host, Limits::default());
+        let global_this = machine
+            .intrinsics
+            .global("globalThis")
+            .expect("globalThis is installed");
+        let key = PropertyKey::Named(EcmaString::from_utf8("Infinity"));
+        let descriptor = machine
+            .own_descriptor(global_this, &key)
+            .expect("descriptor lookup succeeds")
+            .expect("Infinity is defined on globalThis");
+        match descriptor {
+            Property::Data {
+                value,
+                writable,
+                enumerable,
+                configurable,
+            } => {
+                assert!(!writable, "Infinity must be non-writable");
+                assert!(!enumerable, "Infinity must be non-enumerable");
+                assert!(!configurable, "Infinity must be non-configurable");
+                assert!(
+                    value_number(value).is_infinite() && value_number(value).is_sign_positive(),
+                    "Infinity value must be +Infinity"
+                );
+            }
+            Property::Accessor { .. } => panic!("Infinity must be a data property"),
+        }
+    }
+
+    #[test]
+    fn global_nan_descriptor_is_frozen_with_exact_value() {
+        let module = module();
+        let mut host = TestHost;
+        let machine = Machine::new(&module, &mut host, Limits::default());
+        let global_this = machine
+            .intrinsics
+            .global("globalThis")
+            .expect("globalThis is installed");
+        let key = PropertyKey::Named(EcmaString::from_utf8("NaN"));
+        let descriptor = machine
+            .own_descriptor(global_this, &key)
+            .expect("descriptor lookup succeeds")
+            .expect("NaN is defined on globalThis");
+        match descriptor {
+            Property::Data {
+                value,
+                writable,
+                enumerable,
+                configurable,
+            } => {
+                assert!(!writable, "NaN must be non-writable");
+                assert!(!enumerable, "NaN must be non-enumerable");
+                assert!(!configurable, "NaN must be non-configurable");
+                assert!(value_number(value).is_nan(), "NaN value must be NaN");
+            }
+            Property::Accessor { .. } => panic!("NaN must be a data property"),
+        }
+    }
+
+    #[test]
+    fn global_infinity_and_nan_are_stable_across_reads() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let global_this = machine
+            .intrinsics
+            .global("globalThis")
+            .expect("globalThis is installed");
+        let first_infinity = machine
+            .get_named_property(global_this, "Infinity")
+            .expect("Infinity is readable");
+        let second_infinity = machine
+            .get_named_property(global_this, "Infinity")
+            .expect("Infinity is readable on second read");
+        assert_eq!(
+            first_infinity, second_infinity,
+            "Infinity must be stable across reads"
+        );
+        let first_nan = machine
+            .get_named_property(global_this, "NaN")
+            .expect("NaN is readable");
+        let second_nan = machine
+            .get_named_property(global_this, "NaN")
+            .expect("NaN is readable on second read");
+        assert_eq!(first_nan, second_nan, "NaN must be stable across reads");
+    }
+
+    #[test]
+    fn atomics_is_an_object_with_correct_to_string_tag() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let atomics = machine
+            .intrinsics
+            .global("Atomics")
+            .expect("Atomics is installed");
+        let object_to_string = machine.intrinsics.object_to_string();
+        let result = machine
+            .call_value(object_to_string, atomics, &[])
+            .expect("Object.prototype.toString.call(Atomics) succeeds");
+        assert!(
+            machine
+                .string_value(result)
+                .is_some_and(|text| text.eq_ascii("[object Atomics]")),
+            "Atomics must report [object Atomics]"
+        );
+    }
+
+    #[test]
+    fn atomics_to_string_tag_descriptor_matches_namespace_tag() {
+        let module = module();
+        let mut host = TestHost;
+        let machine = Machine::new(&module, &mut host, Limits::default());
+        let atomics = machine
+            .intrinsics
+            .global("Atomics")
+            .expect("Atomics is installed");
+        let tag_key = PropertyKey::Symbol(heap_index(
+            machine.intrinsics.builtins.symbol_to_string_tag(),
+        ) as u32);
+        let descriptor = machine
+            .own_descriptor(atomics, &tag_key)
+            .expect("descriptor lookup succeeds")
+            .expect("Atomics has Symbol.toStringTag");
+        match descriptor {
+            Property::Data {
+                value,
+                writable,
+                enumerable,
+                configurable,
+            } => {
+                assert!(!writable, "Atomics toStringTag must be non-writable");
+                assert!(!enumerable, "Atomics toStringTag must be non-enumerable");
+                assert!(configurable, "Atomics toStringTag must be configurable");
+                assert!(
+                    machine
+                        .string_value(value)
+                        .is_some_and(|text| text.eq_ascii("Atomics")),
+                    "Atomics toStringTag value must be 'Atomics'"
+                );
+            }
+            Property::Accessor { .. } => panic!("Atomics toStringTag must be a data property"),
+        }
+    }
+
+    #[test]
+    fn atomics_global_binding_is_writable_and_configurable() {
+        let module = module();
+        let mut host = TestHost;
+        let machine = Machine::new(&module, &mut host, Limits::default());
+        let global_this = machine
+            .intrinsics
+            .global("globalThis")
+            .expect("globalThis is installed");
+        let key = PropertyKey::Named(EcmaString::from_utf8("Atomics"));
+        let descriptor = machine
+            .own_descriptor(global_this, &key)
+            .expect("descriptor lookup succeeds")
+            .expect("Atomics is defined on globalThis");
+        match descriptor {
+            Property::Data {
+                writable,
+                enumerable,
+                configurable,
+                ..
+            } => {
+                assert!(writable, "Atomics global binding must be writable");
+                assert!(
+                    enumerable,
+                    "Atomics global binding follows normal put_ecma semantics"
+                );
+                assert!(configurable, "Atomics global binding must be configurable");
+            }
+            Property::Accessor { .. } => panic!("Atomics global binding must be a data property"),
+        }
+    }
+
+    #[test]
+    fn atomics_claims_no_methods() {
+        let module = module();
+        let mut host = TestHost;
+        let machine = Machine::new(&module, &mut host, Limits::default());
+        let atomics = machine
+            .intrinsics
+            .global("Atomics")
+            .expect("Atomics is installed");
+        let keys = machine
+            .own_property_keys(atomics)
+            .expect("Atomics is an object");
+        let method_keys: Vec<_> = keys
+            .into_iter()
+            .filter(|key| !matches!(key, PropertyKey::Symbol(_)))
+            .collect();
+        assert!(
+            method_keys.is_empty(),
+            "Atomics must not claim any named methods"
+        );
     }
 }

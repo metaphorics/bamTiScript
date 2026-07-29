@@ -578,7 +578,9 @@ mod tests {
             .expect("construction succeeds")
         {
             BuiltinOutcome::Value(script) => script,
-            BuiltinOutcome::Call { .. } | BuiltinOutcome::ConstructCall { .. } => {
+            BuiltinOutcome::Call { .. }
+            | BuiltinOutcome::ConstructCall { .. }
+            | BuiltinOutcome::GeneratorNext { .. } => {
                 panic!("Script construction must not execute")
             }
         };
@@ -841,7 +843,9 @@ mod tests {
             .unwrap()
         {
             BuiltinOutcome::Value(script) => script,
-            BuiltinOutcome::Call { .. } | BuiltinOutcome::ConstructCall { .. } => unreachable!(),
+            BuiltinOutcome::Call { .. }
+            | BuiltinOutcome::ConstructCall { .. }
+            | BuiltinOutcome::GeneratorNext { .. } => unreachable!(),
         };
         let run = machine
             .get_named_property(script, "runInThisContext")

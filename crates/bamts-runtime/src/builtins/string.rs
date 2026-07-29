@@ -86,7 +86,7 @@ fn constructor<H: Host>(
     let text = if args.is_empty() {
         EcmaString::default()
     } else {
-        machine.to_string(args[0])?
+        machine.string_constructor_text(args[0])?
     };
     let value = allocate_string(machine, text)?;
     if constructing {
@@ -810,6 +810,46 @@ fn percent_octet(units: &[u16], offset: usize) -> Option<u8> {
     Some((high << 4) | low)
 }
 
+pub(super) fn unescape<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _: Value,
+    args: &[Value],
+    _: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let source = machine.to_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let units = source.as_units();
+    let mut output = EcmaStringBuilder::with_capacity(units.len());
+    let mut offset = 0;
+    while offset < units.len() {
+        if units[offset] != u16::from(b'%') {
+            output.push_unit(units[offset]);
+            offset += 1;
+            continue;
+        }
+        if units.get(offset + 1) == Some(&u16::from(b'u')) {
+            let digits = (0..4).try_fold(0_u16, |value, index| {
+                Some((value << 4) | u16::from(hex_value(*units.get(offset + index + 2)?)?))
+            });
+            if let Some(unit) = digits {
+                output.push_unit(unit);
+                offset += 6;
+                continue;
+            }
+        }
+        if let Some(octet) = percent_octet(units, offset) {
+            output.push_unit(u16::from(octet));
+            offset += 3;
+            continue;
+        }
+        output.push_unit(units[offset]);
+        offset += 1;
+    }
+    Ok(BuiltinOutcome::Value(allocate_string(
+        machine,
+        output.finish(),
+    )?))
+}
+
 fn utf8_sequence_len(first: u8) -> Option<usize> {
     match first {
         0x00..=0x7f => Some(1),
@@ -1192,4 +1232,196 @@ fn regexp_replacement<H: Host>(
         offset += 2;
     }
     Ok(output.finish())
+}
+
+#[cfg(test)]
+mod unescape_tests {
+    use bamts_bytecode::{
+        Constant, ConstantId, Function, FunctionFlags, FunctionId, Instruction, Module, ModuleId,
+        Program, ProgramModule, Verified,
+    };
+
+    use super::*;
+    use crate::intrinsics::{BuiltinDef, native_function};
+    use crate::{Limits, PropertyMap, ThrowOrigin};
+
+    #[derive(Default)]
+    struct TestHost;
+    impl Host for TestHost {}
+
+    fn module() -> Program<Verified> {
+        let code = Module::new(
+            vec![Constant::String(EcmaString::from_utf8("<test>"))],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                1,
+                FunctionFlags::default(),
+                vec![Instruction::Halt],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("valid test module");
+        Program::link(
+            vec![ProgramModule {
+                name: ConstantId::new(0),
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect("valid test program")
+    }
+
+    fn escape_string(
+        machine: &mut Machine<'_, TestHost>,
+        _: Value,
+        _: &[Value],
+        _: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Ok(BuiltinOutcome::Value(
+            machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("%u0041")))
+                .map_err(EvalFailure::Runtime)?,
+        ))
+    }
+
+    fn throw_on_coercion(
+        _: &mut Machine<'_, TestHost>,
+        _: Value,
+        _: &[Value],
+        _: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+            operation: "unescape coercion hook",
+        }))
+    }
+
+    fn native(
+        machine: &mut Machine<'_, TestHost>,
+        name: &'static str,
+        handler: BuiltinHandler<TestHost>,
+    ) -> Value {
+        let id = machine.intrinsics.builtins.register(BuiltinDef {
+            name,
+            length: 0,
+            handler,
+        });
+        native_function(&mut machine.heap, id, name, 0)
+    }
+
+    fn object(machine: &mut Machine<'_, TestHost>) -> Value {
+        machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .expect("object allocation succeeds")
+    }
+
+    #[test]
+    fn string_constructor_renders_symbols_without_relaxing_implicit_coercion() {
+        let program = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let symbol_constructor = machine
+            .intrinsics
+            .global("Symbol")
+            .expect("Symbol is installed");
+        let description = machine
+            .allocate(HeapEntry::String(EcmaString::from_utf8("event")))
+            .expect("description allocation succeeds");
+        let symbol = machine
+            .call_value(symbol_constructor, Value::UNDEFINED, &[description])
+            .expect("Symbol creates a symbol");
+
+        assert!(matches!(
+            machine.to_string(symbol),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "convert symbol to string"
+            }))
+        ));
+
+        let string_constructor = machine
+            .intrinsics
+            .global("String")
+            .expect("String is installed");
+        let rendered = machine
+            .call_value(string_constructor, Value::UNDEFINED, &[symbol])
+            .expect("String(Symbol) succeeds");
+        assert!(machine
+            .string_value(rendered)
+            .is_some_and(|text| text.eq_ascii("Symbol(event)")));
+    }
+
+    #[test]
+    fn unescape_observes_string_coercion_and_preserves_malformed_utf16() {
+        let program = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let unescape = machine
+            .intrinsics
+            .global("unescape")
+            .expect("unescape installs");
+        let coercible = object(&mut machine);
+        let to_string = native(&mut machine, "toString", escape_string);
+        machine
+            .set_data_property(coercible, "toString", to_string)
+            .unwrap();
+        let coerced = machine
+            .call_value(unescape, Value::UNDEFINED, &[coercible])
+            .unwrap();
+        assert!(
+            machine
+                .string_value(coerced)
+                .is_some_and(|text| text.eq_ascii("A"))
+        );
+
+        let malformed = machine
+            .allocate(HeapEntry::String(EcmaString::from_utf8(
+                "%uD800%u0041%uZZZZ%4G%u12",
+            )))
+            .unwrap();
+        let decoded = machine
+            .call_value(unescape, Value::UNDEFINED, &[malformed])
+            .unwrap();
+        assert_eq!(
+            machine.string_value(decoded).unwrap().as_units(),
+            &[
+                0xd800,
+                0x0041,
+                b'%' as u16,
+                b'u' as u16,
+                b'Z' as u16,
+                b'Z' as u16,
+                b'Z' as u16,
+                b'Z' as u16,
+                b'%' as u16,
+                b'4' as u16,
+                b'G' as u16,
+                b'%' as u16,
+                b'u' as u16,
+                b'1' as u16,
+                b'2' as u16,
+            ]
+        );
+
+        let throwing = object(&mut machine);
+        let throwing_to_string = native(&mut machine, "throwing toString", throw_on_coercion);
+        machine
+            .set_data_property(throwing, "toString", throwing_to_string)
+            .unwrap();
+        assert!(
+            machine
+                .call_value(unescape, Value::UNDEFINED, &[throwing])
+                .is_err()
+        );
+    }
 }
