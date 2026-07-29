@@ -22,6 +22,7 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -77,6 +78,8 @@ pub struct Limits {
     pub max_module_cells: usize,
     /// Ceiling on host-compiled scripts retained by one machine.
     pub max_dynamic_modules: usize,
+    /// Ceiling on queued microtasks.
+    pub max_microtasks: usize,
 }
 
 impl Default for Limits {
@@ -90,6 +93,7 @@ impl Default for Limits {
             max_heap_bytes: 64 << 20,
             max_module_cells: 1 << 20,
             max_dynamic_modules: 1 << 10,
+            max_microtasks: 1 << 20,
         }
     }
 }
@@ -239,6 +243,10 @@ pub enum RuntimeErrorKind {
     DynamicModuleLimitExceeded {
         limit: usize,
     },
+    MicrotaskQueueLimitExceeded {
+        limit: usize,
+    },
+    MicrotaskDrainReentry,
     InvalidDynamicScript {
         reason: &'static str,
     },
@@ -308,6 +316,12 @@ impl fmt::Display for RuntimeError {
             }
             RuntimeErrorKind::DynamicModuleLimitExceeded { limit } => {
                 write!(formatter, "dynamic module limit {limit} exceeded")
+            }
+            RuntimeErrorKind::MicrotaskQueueLimitExceeded { limit } => {
+                write!(formatter, "microtask queue limit {limit} exceeded")
+            }
+            RuntimeErrorKind::MicrotaskDrainReentry => {
+                write!(formatter, "microtask drain is already active")
             }
             RuntimeErrorKind::InvalidDynamicScript { reason } => {
                 write!(formatter, "invalid dynamic script: {reason}")
@@ -567,6 +581,79 @@ pub(crate) enum GeneratorResume {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) enum PromiseState {
+    Pending {
+        fulfill_reactions: Vec<PromiseReaction>,
+        reject_reactions: Vec<PromiseReaction>,
+    },
+    Fulfilled {
+        value: Value,
+    },
+    Rejected {
+        reason: Value,
+        origin: ThrowOrigin,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PromiseCompletion {
+    Fulfilled,
+    Rejected,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PromiseReaction {
+    Fulfilled {
+        handler: Value,
+        derived: Value,
+    },
+    Rejected {
+        handler: Value,
+        derived: Value,
+    },
+    Finally {
+        handler: Value,
+        derived: Value,
+        completion: PromiseCompletion,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum MicrotaskJob {
+    Reaction {
+        reaction: PromiseReaction,
+        value: Value,
+        origin: ThrowOrigin,
+    },
+    Thenable {
+        promise: Value,
+        thenable: Value,
+        then: Value,
+    },
+    Callback {
+        callback: Value,
+    },
+}
+
+/// An exception reported by a `queueMicrotask` callback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MicrotaskException {
+    /// The value thrown by the callback.
+    pub value: Value,
+    /// The operation that produced the throw.
+    pub origin: ThrowOrigin,
+}
+
+/// The result of one explicit microtask checkpoint.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MicrotaskDrain {
+    /// The number of jobs removed from the queue and run.
+    pub executed: usize,
+    /// Callback exceptions, in FIFO execution order.
+    pub uncaught: Vec<MicrotaskException>,
+}
+
+#[derive(Clone, Debug)]
 enum HeapEntry {
     String(EcmaString),
     BigInt(String),
@@ -661,6 +748,33 @@ enum HeapEntry {
         prototype: Option<Value>,
         extensible: bool,
     },
+    Promise {
+        state: PromiseState,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+        extensible: bool,
+    },
+    PromiseResolver {
+        promise: Value,
+        used: bool,
+    },
+    PromiseFinally {
+        derived: Value,
+        value: Value,
+        origin: ThrowOrigin,
+        completion: PromiseCompletion,
+    },
+    PromiseAll {
+        promise: Value,
+        values: Vec<Value>,
+        remaining: usize,
+        settled: bool,
+    },
+    PromiseAllElement {
+        aggregate: Value,
+        index: usize,
+        called: bool,
+    },
     NativeFunction {
         callable: NativeCallable,
         properties: PropertyMap,
@@ -725,7 +839,12 @@ impl HeapEntry {
             | Self::ProcessEnv { .. }
             | Self::Date { .. }
             | Self::BuiltinIterator { .. }
-            | Self::Iterator { .. } => 1,
+            | Self::Iterator { .. }
+            | Self::Promise { .. }
+            | Self::PromiseResolver { .. }
+            | Self::PromiseFinally { .. }
+            | Self::PromiseAll { .. }
+            | Self::PromiseAllElement { .. } => 1,
         }
     }
 }
@@ -812,7 +931,7 @@ impl Frame {
 }
 
 #[derive(Clone, Debug)]
-enum EvalFailure {
+pub(crate) enum EvalFailure {
     Throw(ThrowOrigin),
     ThrowValue(Value),
     Runtime(RuntimeErrorKind),
@@ -894,6 +1013,8 @@ pub struct Machine<'a, H: Host> {
     callback_boundaries: Vec<usize>,
     generator_boundaries: Vec<usize>,
     pending_generator_resume: Option<GeneratorResume>,
+    microtasks: VecDeque<MicrotaskJob>,
+    microtask_drain_active: bool,
     intrinsics: intrinsics::Intrinsics<H>,
     current_builtin_id: Option<intrinsics::BuiltinId>,
     registry: ModuleRegistry,
@@ -1062,6 +1183,8 @@ impl<'a, H: Host> Machine<'a, H> {
             callback_boundaries: Vec::new(),
             generator_boundaries: Vec::new(),
             pending_generator_resume: None,
+            microtasks: VecDeque::new(),
+            microtask_drain_active: false,
             globals: BTreeMap::new(),
             registry: ModuleRegistry {
                 external: installed_external
@@ -1099,15 +1222,24 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     pub fn run(mut self) -> Result<Execution, RuntimeError> {
+        self.evaluate()
+    }
+
+    /// Evaluates the program without draining queued microtasks.
+    ///
+    /// The machine remains available for an explicit [`Self::drain_microtasks`]
+    /// checkpoint.
+    pub fn evaluate(&mut self) -> Result<Execution, RuntimeError> {
         if let Some(program) = self.program {
+            let entry = program.entry();
             self.frames.clear();
             self.live_registers = 0;
             self.instantiate_modules()?;
-            return self.evaluate_module(program.entry())?.ok_or_else(|| {
+            return self.evaluate_module(entry)?.ok_or_else(|| {
                 self.program_error(
-                    program.entry(),
+                    entry,
                     RuntimeErrorKind::InvalidVerifiedProgram {
-                        module: program.entry(),
+                        module: entry,
                         instruction: Instruction::Halt,
                     },
                 )
@@ -1116,6 +1248,1092 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(self
             .run_loop(0)?
             .expect("the entry frame completes before the run loop stops"))
+    }
+
+    /// Runs queued microtasks in FIFO order until the queue is empty.
+    ///
+    /// Jobs queued by another job run in the same checkpoint. Promise callback
+    /// throws settle their derived promises. Throws from `queueMicrotask`
+    /// callbacks are returned in [`MicrotaskDrain::uncaught`].
+    pub fn drain_microtasks(&mut self) -> Result<MicrotaskDrain, RuntimeError> {
+        if self.microtask_drain_active {
+            return Err(self.microtask_error(RuntimeErrorKind::MicrotaskDrainReentry));
+        }
+        self.microtask_drain_active = true;
+        let result = (|| {
+            let mut report = MicrotaskDrain::default();
+            while self.microtasks.front().is_some() {
+                self.consume_fuel(1)
+                    .map_err(|kind| self.microtask_error(kind))?;
+                let job = self
+                    .microtasks
+                    .pop_front()
+                    .expect("the queued microtask remains present after fuel charging");
+                report.executed = report.executed.saturating_add(1);
+                self.execute_microtask_job(job, &mut report)
+                    .map_err(|kind| self.microtask_error(kind))?;
+            }
+            Ok(report)
+        })();
+        self.microtask_drain_active = false;
+        result
+    }
+
+    fn microtask_error(&self, kind: RuntimeErrorKind) -> RuntimeError {
+        let function = self.module.entry();
+        let instruction = self.module.functions()[function.get() as usize]
+            .code()
+            .first()
+            .copied()
+            .unwrap_or(Instruction::Halt);
+        RuntimeError {
+            kind,
+            function,
+            pc: Pc::new(0),
+            source: RuntimeSource {
+                function_name: None,
+                instruction,
+            },
+        }
+    }
+
+    fn execute_microtask_job(
+        &mut self,
+        job: MicrotaskJob,
+        report: &mut MicrotaskDrain,
+    ) -> Result<(), RuntimeErrorKind> {
+        match job {
+            MicrotaskJob::Reaction {
+                reaction,
+                value,
+                origin,
+            } => self.execute_promise_reaction(reaction, value, origin),
+            MicrotaskJob::Thenable {
+                promise,
+                thenable,
+                then,
+            } => self.execute_thenable_job(promise, thenable, then),
+            MicrotaskJob::Callback { callback } => {
+                self.execute_callback_microtask(callback, report)
+            }
+        }
+    }
+
+    fn execute_callback_microtask(
+        &mut self,
+        callback: Value,
+        report: &mut MicrotaskDrain,
+    ) -> Result<(), RuntimeErrorKind> {
+        match self.call_value(callback, Value::UNDEFINED, &[]) {
+            Ok(_) => Ok(()),
+            Err(EvalFailure::Runtime(kind)) => Err(kind),
+            Err(failure) => {
+                let (value, origin) =
+                    self.promise_rejection_value(failure)
+                        .map_err(|failure| match failure {
+                            EvalFailure::Runtime(kind) => kind,
+                            _ => RuntimeErrorKind::InvalidValue { value: callback },
+                        })?;
+                report.uncaught.try_reserve(1).map_err(|_| {
+                    RuntimeErrorKind::HeapByteLimitExceeded {
+                        limit: self.limits.max_heap_bytes,
+                    }
+                })?;
+                report.uncaught.push(MicrotaskException { value, origin });
+                Ok(())
+            }
+        }
+    }
+
+    fn execute_thenable_job(
+        &mut self,
+        promise: Value,
+        thenable: Value,
+        then: Value,
+    ) -> Result<(), RuntimeErrorKind> {
+        let record = self
+            .create_promise_resolver(promise)
+            .map_err(|failure| match failure {
+                EvalFailure::Runtime(kind) => kind,
+                _ => RuntimeErrorKind::InvalidValue { value: promise },
+            })?;
+        let (resolve_target, reject_target) = self.intrinsics.builtins.promise_resolver_targets();
+        let resolve = self
+            .create_promise_resolver_function(resolve_target, record)
+            .map_err(|failure| match failure {
+                EvalFailure::Runtime(kind) => kind,
+                _ => RuntimeErrorKind::InvalidValue { value: record },
+            })?;
+        let reject = self
+            .create_promise_resolver_function(reject_target, record)
+            .map_err(|failure| match failure {
+                EvalFailure::Runtime(kind) => kind,
+                _ => RuntimeErrorKind::InvalidValue { value: record },
+            })?;
+        match self.call_value(then, thenable, &[resolve, reject]) {
+            Ok(_) => Ok(()),
+            Err(EvalFailure::Runtime(kind)) => Err(kind),
+            Err(failure) => self
+                .reject_promise_resolver_failure(record, failure)
+                .map_err(|failure| match failure {
+                    EvalFailure::Runtime(kind) => kind,
+                    _ => RuntimeErrorKind::InvalidValue { value: record },
+                }),
+        }
+    }
+
+    fn execute_promise_reaction(
+        &mut self,
+        reaction: PromiseReaction,
+        value: Value,
+        origin: ThrowOrigin,
+    ) -> Result<(), RuntimeErrorKind> {
+        match reaction {
+            PromiseReaction::Fulfilled { handler, derived } => self.execute_promise_handler(
+                handler,
+                derived,
+                value,
+                origin,
+                PromiseCompletion::Fulfilled,
+            ),
+            PromiseReaction::Rejected { handler, derived } => self.execute_promise_handler(
+                handler,
+                derived,
+                value,
+                origin,
+                PromiseCompletion::Rejected,
+            ),
+            PromiseReaction::Finally {
+                handler,
+                derived,
+                completion,
+            } => self.execute_promise_finally(handler, derived, value, origin, completion),
+        }
+    }
+
+    fn execute_promise_handler(
+        &mut self,
+        handler: Value,
+        derived: Value,
+        value: Value,
+        origin: ThrowOrigin,
+        completion: PromiseCompletion,
+    ) -> Result<(), RuntimeErrorKind> {
+        if !self.is_callable(handler).map_err(|failure| match failure {
+            EvalFailure::Runtime(kind) => kind,
+            _ => RuntimeErrorKind::InvalidValue { value: handler },
+        })? {
+            return match completion {
+                PromiseCompletion::Fulfilled => self.resolve_promise(derived, value),
+                PromiseCompletion::Rejected => self.reject_promise(derived, value, origin),
+            };
+        }
+        match self.call_value(handler, Value::UNDEFINED, &[value]) {
+            Ok(result) => self.resolve_promise(derived, result),
+            Err(EvalFailure::Runtime(kind)) => Err(kind),
+            Err(failure) => self
+                .reject_promise_failure(derived, failure)
+                .map_err(|failure| match failure {
+                    EvalFailure::Runtime(kind) => kind,
+                    _ => RuntimeErrorKind::InvalidValue { value: derived },
+                }),
+        }
+    }
+
+    fn execute_promise_finally(
+        &mut self,
+        handler: Value,
+        derived: Value,
+        value: Value,
+        origin: ThrowOrigin,
+        completion: PromiseCompletion,
+    ) -> Result<(), RuntimeErrorKind> {
+        if !self.is_callable(handler).map_err(|failure| match failure {
+            EvalFailure::Runtime(kind) => kind,
+            _ => RuntimeErrorKind::InvalidValue { value: handler },
+        })? {
+            return match completion {
+                PromiseCompletion::Fulfilled => self.resolve_promise(derived, value),
+                PromiseCompletion::Rejected => self.reject_promise(derived, value, origin),
+            };
+        }
+        let cleanup = self.create_promise().map_err(|failure| match failure {
+            EvalFailure::Runtime(kind) => kind,
+            _ => RuntimeErrorKind::InvalidValue { value: derived },
+        })?;
+        let record = self
+            .create_promise_finally(derived, value, origin, completion)
+            .map_err(|failure| match failure {
+                EvalFailure::Runtime(kind) => kind,
+                _ => RuntimeErrorKind::InvalidValue { value: derived },
+            })?;
+        let (on_fulfilled, on_rejected) = self.intrinsics.builtins.promise_finally_targets();
+        let on_fulfilled = self
+            .create_promise_resolver_function(on_fulfilled, record)
+            .map_err(|failure| match failure {
+                EvalFailure::Runtime(kind) => kind,
+                _ => RuntimeErrorKind::InvalidValue { value: record },
+            })?;
+        let on_rejected = self
+            .create_promise_resolver_function(on_rejected, record)
+            .map_err(|failure| match failure {
+                EvalFailure::Runtime(kind) => kind,
+                _ => RuntimeErrorKind::InvalidValue { value: record },
+            })?;
+        self.promise_then(cleanup, on_fulfilled, on_rejected)
+            .map_err(|failure| match failure {
+                EvalFailure::Runtime(kind) => kind,
+                _ => RuntimeErrorKind::InvalidValue { value: cleanup },
+            })?;
+        match self.call_value(handler, Value::UNDEFINED, &[]) {
+            Ok(result) => self.resolve_promise(cleanup, result),
+            Err(EvalFailure::Runtime(kind)) => Err(kind),
+            Err(failure) => self
+                .reject_promise_failure(cleanup, failure)
+                .map_err(|failure| match failure {
+                    EvalFailure::Runtime(kind) => kind,
+                    _ => RuntimeErrorKind::InvalidValue { value: cleanup },
+                }),
+        }
+    }
+
+    pub(crate) fn enqueue_microtask_callback(
+        &mut self,
+        callback: Value,
+    ) -> Result<(), EvalFailure> {
+        self.ensure_microtask_capacity(1)
+            .map_err(EvalFailure::Runtime)?;
+        self.microtasks
+            .push_back(MicrotaskJob::Callback { callback });
+        Ok(())
+    }
+
+    fn ensure_microtask_capacity(&mut self, additional: usize) -> Result<(), RuntimeErrorKind> {
+        if self
+            .microtasks
+            .len()
+            .checked_add(additional)
+            .is_none_or(|length| length > self.limits.max_microtasks)
+        {
+            return Err(RuntimeErrorKind::MicrotaskQueueLimitExceeded {
+                limit: self.limits.max_microtasks,
+            });
+        }
+        self.microtasks.try_reserve(additional).map_err(|_| {
+            RuntimeErrorKind::HeapByteLimitExceeded {
+                limit: self.limits.max_heap_bytes,
+            }
+        })
+    }
+
+    pub(crate) fn create_promise(&mut self) -> Result<Value, EvalFailure> {
+        self.allocate(HeapEntry::Promise {
+            state: PromiseState::Pending {
+                fulfill_reactions: Vec::new(),
+                reject_reactions: Vec::new(),
+            },
+            properties: PropertyMap::default(),
+            prototype: Some(self.intrinsics.builtins.promise_prototype()),
+            extensible: true,
+        })
+        .map_err(EvalFailure::Runtime)
+    }
+
+    pub(crate) fn create_promise_resolver(&mut self, promise: Value) -> Result<Value, EvalFailure> {
+        self.allocate(HeapEntry::PromiseResolver {
+            promise,
+            used: false,
+        })
+        .map_err(EvalFailure::Runtime)
+    }
+
+    pub(crate) fn create_promise_resolver_function(
+        &mut self,
+        target: Value,
+        record: Value,
+    ) -> Result<Value, EvalFailure> {
+        self.allocate(HeapEntry::NativeFunction {
+            callable: NativeCallable::Bound(Box::new(BoundCallable {
+                target,
+                this_value: Value::UNDEFINED,
+                arguments: vec![record],
+            })),
+            properties: PropertyMap::default(),
+            extensible: true,
+        })
+        .map_err(EvalFailure::Runtime)
+    }
+
+    pub(crate) fn resolve_promise_resolver(
+        &mut self,
+        record: Value,
+        value: Value,
+    ) -> Result<(), EvalFailure> {
+        if let Some(promise) = self.use_promise_resolver(record)? {
+            self.resolve_promise(promise, value)
+                .map_err(EvalFailure::Runtime)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reject_promise_resolver(
+        &mut self,
+        record: Value,
+        reason: Value,
+    ) -> Result<(), EvalFailure> {
+        if let Some(promise) = self.use_promise_resolver(record)? {
+            self.reject_promise(promise, reason, ThrowOrigin::Bytecode)
+                .map_err(EvalFailure::Runtime)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reject_promise_resolver_failure(
+        &mut self,
+        record: Value,
+        failure: EvalFailure,
+    ) -> Result<(), EvalFailure> {
+        if let Some(promise) = self.use_promise_resolver(record)? {
+            self.reject_promise_failure(promise, failure)?;
+        }
+        Ok(())
+    }
+
+    fn use_promise_resolver(&mut self, record: Value) -> Result<Option<Value>, EvalFailure> {
+        let index = self
+            .runtime_slot(record)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise resolver",
+            }))?;
+        let HeapEntry::PromiseResolver { promise, used } = &mut self.heap[index] else {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise resolver",
+            }));
+        };
+        if *used {
+            return Ok(None);
+        }
+        *used = true;
+        Ok(Some(*promise))
+    }
+
+    fn charge_promise_reactions(&mut self, count: usize) -> Result<(), EvalFailure> {
+        let bytes = std::mem::size_of::<PromiseReaction>()
+            .checked_mul(count)
+            .ok_or(EvalFailure::Runtime(
+                RuntimeErrorKind::HeapByteLimitExceeded {
+                    limit: self.limits.max_heap_bytes,
+                },
+            ))?;
+        self.charge_heap(bytes).map_err(EvalFailure::Runtime)
+    }
+
+    pub(crate) fn promise_then(
+        &mut self,
+        promise: Value,
+        on_fulfilled: Value,
+        on_rejected: Value,
+    ) -> Result<Value, EvalFailure> {
+        let index = self
+            .runtime_slot(promise)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.prototype.then",
+            }))?;
+        let settled = match &self.heap[index] {
+            HeapEntry::Promise {
+                state: PromiseState::Pending { .. },
+                ..
+            } => None,
+            HeapEntry::Promise {
+                state: PromiseState::Fulfilled { value },
+                ..
+            } => Some((true, *value, ThrowOrigin::Bytecode)),
+            HeapEntry::Promise {
+                state: PromiseState::Rejected { reason, origin },
+                ..
+            } => Some((false, *reason, *origin)),
+            _ => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "Promise.prototype.then",
+                }));
+            }
+        };
+        let derived = self.create_promise()?;
+        if let Some((fulfilled, value, origin)) = settled {
+            self.ensure_microtask_capacity(1)
+                .map_err(EvalFailure::Runtime)?;
+            let reaction = if fulfilled {
+                PromiseReaction::Fulfilled {
+                    handler: on_fulfilled,
+                    derived,
+                }
+            } else {
+                PromiseReaction::Rejected {
+                    handler: on_rejected,
+                    derived,
+                }
+            };
+            self.microtasks.push_back(MicrotaskJob::Reaction {
+                reaction,
+                value,
+                origin,
+            });
+            return Ok(derived);
+        }
+        self.charge_promise_reactions(2)?;
+        let HeapEntry::Promise {
+            state:
+                PromiseState::Pending {
+                    fulfill_reactions,
+                    reject_reactions,
+                },
+            ..
+        } = &mut self.heap[index]
+        else {
+            unreachable!("pending Promise state was checked before derived allocation");
+        };
+        fulfill_reactions.push(PromiseReaction::Fulfilled {
+            handler: on_fulfilled,
+            derived,
+        });
+        reject_reactions.push(PromiseReaction::Rejected {
+            handler: on_rejected,
+            derived,
+        });
+        Ok(derived)
+    }
+
+    pub(crate) fn promise_finally(
+        &mut self,
+        promise: Value,
+        handler: Value,
+    ) -> Result<Value, EvalFailure> {
+        let index = self
+            .runtime_slot(promise)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.prototype.finally",
+            }))?;
+        let settled = match &self.heap[index] {
+            HeapEntry::Promise {
+                state: PromiseState::Pending { .. },
+                ..
+            } => None,
+            HeapEntry::Promise {
+                state: PromiseState::Fulfilled { value },
+                ..
+            } => Some((true, *value, ThrowOrigin::Bytecode)),
+            HeapEntry::Promise {
+                state: PromiseState::Rejected { reason, origin },
+                ..
+            } => Some((false, *reason, *origin)),
+            _ => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "Promise.prototype.finally",
+                }));
+            }
+        };
+        let derived = self.create_promise()?;
+        let reaction = |completion| PromiseReaction::Finally {
+            handler,
+            derived,
+            completion,
+        };
+        if let Some((fulfilled, value, origin)) = settled {
+            self.ensure_microtask_capacity(1)
+                .map_err(EvalFailure::Runtime)?;
+            self.microtasks.push_back(MicrotaskJob::Reaction {
+                reaction: reaction(if fulfilled {
+                    PromiseCompletion::Fulfilled
+                } else {
+                    PromiseCompletion::Rejected
+                }),
+                value,
+                origin,
+            });
+            return Ok(derived);
+        }
+        self.charge_promise_reactions(2)?;
+        let HeapEntry::Promise {
+            state:
+                PromiseState::Pending {
+                    fulfill_reactions,
+                    reject_reactions,
+                },
+            ..
+        } = &mut self.heap[index]
+        else {
+            unreachable!("pending Promise state was checked before derived allocation");
+        };
+        fulfill_reactions.push(reaction(PromiseCompletion::Fulfilled));
+        reject_reactions.push(reaction(PromiseCompletion::Rejected));
+        Ok(derived)
+    }
+
+    pub(crate) fn create_promise_finally(
+        &mut self,
+        derived: Value,
+        value: Value,
+        origin: ThrowOrigin,
+        completion: PromiseCompletion,
+    ) -> Result<Value, EvalFailure> {
+        self.allocate(HeapEntry::PromiseFinally {
+            derived,
+            value,
+            origin,
+            completion,
+        })
+        .map_err(EvalFailure::Runtime)
+    }
+
+    pub(crate) fn fulfill_promise_finally(&mut self, record: Value) -> Result<(), EvalFailure> {
+        let (derived, value, origin, completion) = self.promise_finally_record(record)?;
+        match completion {
+            PromiseCompletion::Fulfilled => self
+                .resolve_promise(derived, value)
+                .map_err(EvalFailure::Runtime),
+            PromiseCompletion::Rejected => self
+                .reject_promise(derived, value, origin)
+                .map_err(EvalFailure::Runtime),
+        }
+    }
+
+    pub(crate) fn reject_promise_finally(
+        &mut self,
+        record: Value,
+        reason: Value,
+    ) -> Result<(), EvalFailure> {
+        let (derived, _, _, _) = self.promise_finally_record(record)?;
+        self.reject_promise(derived, reason, ThrowOrigin::Bytecode)
+            .map_err(EvalFailure::Runtime)
+    }
+
+    fn promise_finally_record(
+        &mut self,
+        record: Value,
+    ) -> Result<(Value, Value, ThrowOrigin, PromiseCompletion), EvalFailure> {
+        let index = self
+            .runtime_slot(record)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise finally target",
+            }))?;
+        let HeapEntry::PromiseFinally {
+            derived,
+            value,
+            origin,
+            completion,
+        } = &self.heap[index]
+        else {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise finally target",
+            }));
+        };
+        Ok((*derived, *value, *origin, *completion))
+    }
+
+    pub(crate) fn promise_resolve(&mut self, value: Value) -> Result<Value, EvalFailure> {
+        if matches!(self.runtime_slot(value).map_err(EvalFailure::Runtime)?, Some(index) if matches!(self.heap[index], HeapEntry::Promise { .. }))
+        {
+            return Ok(value);
+        }
+        let promise = self.create_promise()?;
+        self.resolve_promise(promise, value)
+            .map_err(EvalFailure::Runtime)?;
+        Ok(promise)
+    }
+
+    pub(crate) fn promise_reject(&mut self, reason: Value) -> Result<Value, EvalFailure> {
+        let promise = self.create_promise()?;
+        self.reject_promise(promise, reason, ThrowOrigin::Bytecode)
+            .map_err(EvalFailure::Runtime)?;
+        Ok(promise)
+    }
+
+    pub(crate) fn promise_all(&mut self, iterable: Value) -> Result<Value, EvalFailure> {
+        let promise = self.create_promise()?;
+        let aggregate = self
+            .allocate(HeapEntry::PromiseAll {
+                promise,
+                values: Vec::new(),
+                remaining: 1,
+                settled: false,
+            })
+            .map_err(EvalFailure::Runtime)?;
+        let iterator = match self.create_iterator(iterable, IteratorKind::Sync) {
+            Ok(iterator) => iterator,
+            Err(failure) => {
+                self.mark_promise_all_settled(aggregate)?;
+                self.reject_promise_failure(promise, failure)?;
+                return Ok(promise);
+            }
+        };
+        loop {
+            let value = match self.iterator_next(iterator) {
+                Ok((true, _)) => break,
+                Ok((false, value)) => value,
+                Err(failure) => {
+                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                }
+            };
+            let index = match self.add_promise_all_element(aggregate) {
+                Ok(index) => index,
+                Err(failure) => {
+                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                }
+            };
+            let element = match self
+                .allocate(HeapEntry::PromiseAllElement {
+                    aggregate,
+                    index,
+                    called: false,
+                })
+                .map_err(EvalFailure::Runtime)
+            {
+                Ok(element) => element,
+                Err(failure) => {
+                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                }
+            };
+            let (fulfill_target, reject_target) = self.intrinsics.builtins.promise_all_targets();
+            let on_fulfilled = match self.create_promise_resolver_function(fulfill_target, element)
+            {
+                Ok(callback) => callback,
+                Err(failure) => {
+                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                }
+            };
+            let on_rejected = match self.create_promise_resolver_function(reject_target, element) {
+                Ok(callback) => callback,
+                Err(failure) => {
+                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                }
+            };
+            let resolved = match self.promise_resolve(value) {
+                Ok(resolved) => resolved,
+                Err(failure) => {
+                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                }
+            };
+            if let Err(failure) = self.promise_then(resolved, on_fulfilled, on_rejected) {
+                return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+            }
+        }
+        if let Some(values) = self.finish_promise_all(aggregate)? {
+            let array = self.create_array(values)?;
+            self.fulfill_promise(promise, array)
+                .map_err(EvalFailure::Runtime)?;
+        }
+        Ok(promise)
+    }
+
+    fn reject_promise_all_abrupt(
+        &mut self,
+        aggregate: Value,
+        promise: Value,
+        iterator: Value,
+        failure: EvalFailure,
+    ) -> Result<Value, EvalFailure> {
+        self.mark_promise_all_settled(aggregate)?;
+        if let Err(EvalFailure::Runtime(kind)) = self.close_iterator(iterator) {
+            return Err(EvalFailure::Runtime(kind));
+        }
+        self.reject_promise_failure(promise, failure)?;
+        Ok(promise)
+    }
+
+    fn close_iterator(&mut self, iterator: Value) -> Result<(), EvalFailure> {
+        let Some(index) = self.runtime_slot(iterator).map_err(EvalFailure::Runtime)? else {
+            return Ok(());
+        };
+        let HeapEntry::Iterator {
+            state: IteratorState::Protocol { iterator, .. },
+        } = &self.heap[index]
+        else {
+            return Ok(());
+        };
+        let iterator = *iterator;
+        let close = self.get_named_property(iterator, "return")?;
+        if self.is_callable(close)? {
+            let _ = self.call_value(close, iterator, &[])?;
+        }
+        Ok(())
+    }
+
+    fn mark_promise_all_settled(&mut self, aggregate: Value) -> Result<bool, EvalFailure> {
+        let index = self
+            .runtime_slot(aggregate)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.all target",
+            }))?;
+        let HeapEntry::PromiseAll { settled, .. } = &mut self.heap[index] else {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.all target",
+            }));
+        };
+        let changed = !*settled;
+        *settled = true;
+        Ok(changed)
+    }
+
+    fn add_promise_all_element(&mut self, aggregate: Value) -> Result<usize, EvalFailure> {
+        let index = self
+            .runtime_slot(aggregate)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.all target",
+            }))?;
+        let next_remaining = match &self.heap[index] {
+            HeapEntry::PromiseAll {
+                remaining,
+                settled: false,
+                ..
+            } => remaining.checked_add(1).ok_or(EvalFailure::Runtime(
+                RuntimeErrorKind::HeapByteLimitExceeded {
+                    limit: self.limits.max_heap_bytes,
+                },
+            ))?,
+            HeapEntry::PromiseAll { .. } => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "Promise.all target",
+                }));
+            }
+            _ => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "Promise.all target",
+                }));
+            }
+        };
+        self.charge_heap(std::mem::size_of::<Value>())
+            .map_err(EvalFailure::Runtime)?;
+        let HeapEntry::PromiseAll {
+            values, remaining, ..
+        } = &mut self.heap[index]
+        else {
+            unreachable!("Promise.all aggregate was checked before its heap charge");
+        };
+        values.try_reserve(1).map_err(|_| {
+            EvalFailure::Runtime(RuntimeErrorKind::HeapByteLimitExceeded {
+                limit: self.limits.max_heap_bytes,
+            })
+        })?;
+        let index = values.len();
+        values.push(Value::UNDEFINED);
+        *remaining = next_remaining;
+        Ok(index)
+    }
+
+    fn finish_promise_all(&mut self, aggregate: Value) -> Result<Option<Vec<Value>>, EvalFailure> {
+        let index = self
+            .runtime_slot(aggregate)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.all target",
+            }))?;
+        let HeapEntry::PromiseAll {
+            values,
+            remaining,
+            settled,
+            ..
+        } = &mut self.heap[index]
+        else {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.all target",
+            }));
+        };
+        if *settled {
+            return Ok(None);
+        }
+        *remaining -= 1;
+        if *remaining != 0 {
+            return Ok(None);
+        }
+        *settled = true;
+        Ok(Some(std::mem::take(values)))
+    }
+
+    pub(crate) fn resolve_promise_all_element(
+        &mut self,
+        element: Value,
+        value: Value,
+    ) -> Result<(), EvalFailure> {
+        let index = self
+            .runtime_slot(element)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.all target",
+            }))?;
+        let (aggregate, output_index) = {
+            let HeapEntry::PromiseAllElement {
+                aggregate,
+                index: output_index,
+                called,
+            } = &mut self.heap[index]
+            else {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "Promise.all target",
+                }));
+            };
+            if *called {
+                return Ok(());
+            }
+            *called = true;
+            (*aggregate, *output_index)
+        };
+        let aggregate_index = self
+            .runtime_slot(aggregate)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.all target",
+            }))?;
+        let (promise, values) = {
+            let HeapEntry::PromiseAll {
+                promise,
+                values,
+                remaining,
+                settled,
+            } = &mut self.heap[aggregate_index]
+            else {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "Promise.all target",
+                }));
+            };
+            if *settled {
+                return Ok(());
+            }
+            values[output_index] = value;
+            *remaining -= 1;
+            let values = (*remaining == 0).then(|| {
+                *settled = true;
+                std::mem::take(values)
+            });
+            (*promise, values)
+        };
+        if let Some(values) = values {
+            let array = self.create_array(values)?;
+            self.fulfill_promise(promise, array)
+                .map_err(EvalFailure::Runtime)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reject_promise_all_element(
+        &mut self,
+        element: Value,
+        reason: Value,
+    ) -> Result<(), EvalFailure> {
+        let index = self
+            .runtime_slot(element)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.all target",
+            }))?;
+        let aggregate = {
+            let HeapEntry::PromiseAllElement {
+                aggregate, called, ..
+            } = &mut self.heap[index]
+            else {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "Promise.all target",
+                }));
+            };
+            if *called {
+                return Ok(());
+            }
+            *called = true;
+            *aggregate
+        };
+        let aggregate_index = self
+            .runtime_slot(aggregate)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.all target",
+            }))?;
+        let HeapEntry::PromiseAll { promise, .. } = &self.heap[aggregate_index] else {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.all target",
+            }));
+        };
+        let promise = *promise;
+        if !self.mark_promise_all_settled(aggregate)? {
+            return Ok(());
+        }
+        self.reject_promise(promise, reason, ThrowOrigin::Bytecode)
+            .map_err(EvalFailure::Runtime)
+    }
+
+    fn create_array(&mut self, elements: Vec<Value>) -> Result<Value, EvalFailure> {
+        self.allocate(HeapEntry::Array {
+            elements,
+            properties: PropertyMap::default(),
+            prototype: Some(self.intrinsics.array_prototype),
+            extensible: true,
+            length_writable: true,
+        })
+        .map_err(EvalFailure::Runtime)
+    }
+
+    fn resolve_promise(&mut self, promise: Value, value: Value) -> Result<(), RuntimeErrorKind> {
+        if promise == value {
+            return self
+                .reject_promise_failure(
+                    promise,
+                    EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "Promise cannot resolve itself",
+                    }),
+                )
+                .map_err(|failure| match failure {
+                    EvalFailure::Runtime(kind) => kind,
+                    _ => RuntimeErrorKind::InvalidValue { value: promise },
+                });
+        }
+        if !self.is_object(value) {
+            return self.fulfill_promise(promise, value);
+        }
+        let then = match self.get_named_property(value, "then") {
+            Ok(then) => then,
+            Err(EvalFailure::Runtime(kind)) => return Err(kind),
+            Err(failure) => {
+                return self.reject_promise_failure(promise, failure).map_err(
+                    |failure| match failure {
+                        EvalFailure::Runtime(kind) => kind,
+                        _ => RuntimeErrorKind::InvalidValue { value: promise },
+                    },
+                );
+            }
+        };
+        if !self.is_callable(then).map_err(|failure| match failure {
+            EvalFailure::Runtime(kind) => kind,
+            _ => RuntimeErrorKind::InvalidValue { value: then },
+        })? {
+            return self.fulfill_promise(promise, value);
+        }
+        self.ensure_microtask_capacity(1)?;
+        self.microtasks.push_back(MicrotaskJob::Thenable {
+            promise,
+            thenable: value,
+            then,
+        });
+        Ok(())
+    }
+
+    fn reject_promise(
+        &mut self,
+        promise: Value,
+        reason: Value,
+        origin: ThrowOrigin,
+    ) -> Result<(), RuntimeErrorKind> {
+        self.settle_promise(promise, PromiseState::Rejected { reason, origin })
+    }
+
+    fn fulfill_promise(&mut self, promise: Value, value: Value) -> Result<(), RuntimeErrorKind> {
+        self.settle_promise(promise, PromiseState::Fulfilled { value })
+    }
+
+    fn settle_promise(
+        &mut self,
+        promise: Value,
+        terminal: PromiseState,
+    ) -> Result<(), RuntimeErrorKind> {
+        let index = self
+            .runtime_slot(promise)?
+            .ok_or(RuntimeErrorKind::InvalidValue { value: promise })?;
+        let reaction_count = match &self.heap[index] {
+            HeapEntry::Promise {
+                state:
+                    PromiseState::Pending {
+                        fulfill_reactions,
+                        reject_reactions,
+                    },
+                ..
+            } => match &terminal {
+                PromiseState::Fulfilled { .. } => fulfill_reactions.len(),
+                PromiseState::Rejected { .. } => reject_reactions.len(),
+                PromiseState::Pending { .. } => unreachable!("Promise settlement is terminal"),
+            },
+            HeapEntry::Promise { .. } => return Ok(()),
+            _ => return Err(RuntimeErrorKind::InvalidValue { value: promise }),
+        };
+        self.ensure_microtask_capacity(reaction_count)?;
+        let reactions = match &mut self.heap[index] {
+            HeapEntry::Promise { state, .. } => {
+                let reactions = match state {
+                    PromiseState::Pending {
+                        fulfill_reactions,
+                        reject_reactions,
+                    } => match &terminal {
+                        PromiseState::Fulfilled { .. } => std::mem::take(fulfill_reactions),
+                        PromiseState::Rejected { .. } => std::mem::take(reject_reactions),
+                        PromiseState::Pending { .. } => {
+                            unreachable!("Promise settlement is terminal")
+                        }
+                    },
+                    _ => return Ok(()),
+                };
+                *state = terminal.clone();
+                reactions
+            }
+            _ => return Err(RuntimeErrorKind::InvalidValue { value: promise }),
+        };
+        let (value, origin) = match terminal {
+            PromiseState::Fulfilled { value } => (value, ThrowOrigin::Bytecode),
+            PromiseState::Rejected { reason, origin } => (reason, origin),
+            PromiseState::Pending { .. } => unreachable!("Promise settlement is terminal"),
+        };
+        for reaction in reactions {
+            self.microtasks.push_back(MicrotaskJob::Reaction {
+                reaction,
+                value,
+                origin,
+            });
+        }
+        Ok(())
+    }
+
+    fn reject_promise_failure(
+        &mut self,
+        promise: Value,
+        failure: EvalFailure,
+    ) -> Result<(), EvalFailure> {
+        let (reason, origin) = self.promise_rejection_value(failure)?;
+        self.reject_promise(promise, reason, origin)
+            .map_err(EvalFailure::Runtime)
+    }
+
+    fn promise_rejection_value(
+        &mut self,
+        failure: EvalFailure,
+    ) -> Result<(Value, ThrowOrigin), EvalFailure> {
+        match failure {
+            EvalFailure::ThrowValue(value) => Ok((value, ThrowOrigin::Bytecode)),
+            EvalFailure::ThrowValueOrigin { value, origin } => Ok((value, origin)),
+            EvalFailure::Throw(ThrowOrigin::Bytecode) => {
+                Ok((Value::UNDEFINED, ThrowOrigin::Bytecode))
+            }
+            EvalFailure::Throw(origin) => {
+                let (name, message) = match origin {
+                    ThrowOrigin::TypeError { operation } => ("TypeError", operation),
+                    ThrowOrigin::RangeError { operation } => ("RangeError", operation),
+                    ThrowOrigin::ReferenceError { operation } => ("ReferenceError", operation),
+                    ThrowOrigin::UriError { operation } => ("URIError", operation),
+                    ThrowOrigin::Bytecode => unreachable!("handled above"),
+                };
+                let id = self
+                    .intrinsics
+                    .builtins
+                    .id_named(name)
+                    .expect("error constructor is installed");
+                match self.throw_error(id, message.to_owned()) {
+                    EvalFailure::ThrowValue(value) => Ok((value, origin)),
+                    EvalFailure::Runtime(kind) => Err(EvalFailure::Runtime(kind)),
+                    _ => unreachable!("error materialization returns a thrown value"),
+                }
+            }
+            EvalFailure::Runtime(kind) => Err(EvalFailure::Runtime(kind)),
+        }
     }
 
     fn program(&self) -> &Program<Verified> {
@@ -3632,7 +4850,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::NativeFunction { properties, .. }
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
-            | HeapEntry::Collection { properties, .. } => property_lookup_ascii(properties, name),
+            | HeapEntry::Collection { properties, .. }
+            | HeapEntry::Promise { properties, .. } => property_lookup_ascii(properties, name),
             HeapEntry::Array {
                 elements,
                 properties,
@@ -3735,7 +4954,11 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::BigInt(_)
             | HeapEntry::Symbol { .. }
             | HeapEntry::PrivateName { .. }
-            | HeapEntry::Iterator { .. } => None,
+            | HeapEntry::Iterator { .. }
+            | HeapEntry::PromiseResolver { .. }
+            | HeapEntry::PromiseFinally { .. }
+            | HeapEntry::PromiseAll { .. }
+            | HeapEntry::PromiseAllElement { .. } => None,
         }
     }
 
@@ -3754,7 +4977,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Script { properties, .. }
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
-            | HeapEntry::Collection { properties, .. } => property_lookup(properties, key),
+            | HeapEntry::Collection { properties, .. }
+            | HeapEntry::Promise { properties, .. } => property_lookup(properties, key),
             HeapEntry::Array {
                 elements,
                 properties,
@@ -3884,7 +5108,11 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::BigInt(_)
             | HeapEntry::Symbol { .. }
             | HeapEntry::PrivateName { .. }
-            | HeapEntry::Iterator { .. } => None,
+            | HeapEntry::Iterator { .. }
+            | HeapEntry::PromiseResolver { .. }
+            | HeapEntry::PromiseFinally { .. }
+            | HeapEntry::PromiseAll { .. }
+            | HeapEntry::PromiseAllElement { .. } => None,
         }
     }
 
@@ -3936,7 +5164,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::RegExp { properties, .. }
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
-            | HeapEntry::Collection { properties, .. } => properties,
+            | HeapEntry::Collection { properties, .. }
+            | HeapEntry::Promise { properties, .. } => properties,
             _ => return None,
         };
         match properties.get_ascii(name) {
@@ -3956,6 +5185,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Date { prototype, .. }
             | HeapEntry::BuiltinIterator { prototype, .. }
             | HeapEntry::Collection { prototype, .. }
+            | HeapEntry::Promise { prototype, .. }
             | HeapEntry::ProcessEnv { prototype, .. } => *prototype,
             HeapEntry::NativeFunction { .. } => Some(self.intrinsics.function_prototype),
             _ => None,
@@ -4054,7 +5284,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::RegExp { properties, .. }
                 | HeapEntry::Date { properties, .. }
                 | HeapEntry::BuiltinIterator { properties, .. }
-                | HeapEntry::Collection { properties, .. } => match properties.get(key) {
+                | HeapEntry::Collection { properties, .. }
+                | HeapEntry::Promise { properties, .. } => match properties.get(key) {
                     Some(Property::Accessor { setter, .. }) => Some(Some(*setter)),
                     Some(Property::Data { .. }) => Some(None),
                     None => None,
@@ -4192,6 +5423,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 properties,
                 extensible,
                 ..
+            }
+            | HeapEntry::Promise {
+                properties,
+                extensible,
+                ..
             } => (Some(properties), *extensible, false),
             HeapEntry::Array {
                 elements,
@@ -4238,7 +5474,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::RegExp { properties, .. }
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
-            | HeapEntry::Collection { properties, .. } => {
+            | HeapEntry::Collection { properties, .. }
+            | HeapEntry::Promise { properties, .. } => {
                 usize::from(!properties.contains_key(&key)) * key.charge_bytes()
             }
             HeapEntry::Array {
@@ -4265,7 +5502,11 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             HeapEntry::Symbol { .. }
             | HeapEntry::PrivateName { .. }
-            | HeapEntry::Iterator { .. } => {
+            | HeapEntry::Iterator { .. }
+            | HeapEntry::PromiseResolver { .. }
+            | HeapEntry::PromiseFinally { .. }
+            | HeapEntry::PromiseAll { .. }
+            | HeapEntry::PromiseAllElement { .. } => {
                 return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                     operation: "set property on non-object",
                 }));
@@ -4296,7 +5537,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::RegExp { properties, .. }
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
-            | HeapEntry::Collection { properties, .. } => {
+            | HeapEntry::Collection { properties, .. }
+            | HeapEntry::Promise { properties, .. } => {
                 properties.insert(
                     key,
                     Property::Data {
@@ -4422,6 +5664,11 @@ impl<'a, H: Host> Machine<'a, H> {
                         properties,
                         extensible,
                         ..
+                    }
+                    | HeapEntry::Promise {
+                        properties,
+                        extensible,
+                        ..
                     } => (properties, *extensible),
                     _ => {
                         return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
@@ -4479,7 +5726,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::RegExp { properties, .. }
                 | HeapEntry::Date { properties, .. }
                 | HeapEntry::BuiltinIterator { properties, .. }
-                | HeapEntry::Collection { properties, .. } => {
+                | HeapEntry::Collection { properties, .. }
+                | HeapEntry::Promise { properties, .. } => {
                     if properties
                         .get(key)
                         .is_some_and(|property| !property.configurable())
@@ -4529,6 +5777,10 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::Symbol { .. }
                 | HeapEntry::PrivateName { .. }
                 | HeapEntry::Iterator { .. }
+                | HeapEntry::PromiseResolver { .. }
+                | HeapEntry::PromiseFinally { .. }
+                | HeapEntry::PromiseAll { .. }
+                | HeapEntry::PromiseAllElement { .. }
                 | HeapEntry::HashState { .. } => Ok(true),
                 HeapEntry::ModuleNamespace { .. } | HeapEntry::ExternalModuleNamespace { .. } => {
                     Ok(false)
@@ -4632,6 +5884,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         | HeapEntry::Generator { .. }
                         | HeapEntry::Script { .. }
                         | HeapEntry::Array { .. }
+                        | HeapEntry::Promise { .. }
                 ) =>
             {
                 index
@@ -4693,6 +5946,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     prototype: slot, ..
                 }
                 | HeapEntry::Collection {
+                    prototype: slot, ..
+                }
+                | HeapEntry::Promise {
                     prototype: slot, ..
                 } => {
                     *slot = prototype;
@@ -5003,7 +6259,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::RegExp { properties, .. }
                 | HeapEntry::Date { properties, .. }
                 | HeapEntry::BuiltinIterator { properties, .. }
-                | HeapEntry::Collection { properties, .. } => Ok(ordered_property_keys(properties)),
+                | HeapEntry::Collection { properties, .. }
+                | HeapEntry::Promise { properties, .. } => Ok(ordered_property_keys(properties)),
                 HeapEntry::Array {
                     elements,
                     properties,
@@ -5067,7 +6324,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::Symbol { .. }
                 | HeapEntry::PrivateName { .. }
                 | HeapEntry::HashState { .. }
-                | HeapEntry::Iterator { .. } => Ok(Vec::new()),
+                | HeapEntry::Iterator { .. }
+                | HeapEntry::PromiseResolver { .. }
+                | HeapEntry::PromiseFinally { .. }
+                | HeapEntry::PromiseAll { .. }
+                | HeapEntry::PromiseAllElement { .. } => Ok(Vec::new()),
             },
             None => Ok(Vec::new()),
         }
@@ -5112,7 +6373,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::RegExp { properties, .. }
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
-            | HeapEntry::Collection { properties, .. } => {
+            | HeapEntry::Collection { properties, .. }
+            | HeapEntry::Promise { properties, .. } => {
                 properties.get(key).is_some_and(Property::enumerable)
             }
             _ => false,
@@ -5514,6 +6776,11 @@ impl<'a, H: Host> Machine<'a, H> {
                         | HeapEntry::Date { .. }
                         | HeapEntry::BuiltinIterator { .. }
                         | HeapEntry::Collection { .. }
+                        | HeapEntry::Promise { .. }
+                        | HeapEntry::PromiseResolver { .. }
+                        | HeapEntry::PromiseFinally { .. }
+                        | HeapEntry::PromiseAll { .. }
+                        | HeapEntry::PromiseAllElement { .. }
                         | HeapEntry::ProcessEnv { .. }
                         | HeapEntry::Iterator { .. } => Ok(Value::number(f64::NAN)),
                     },
@@ -5554,6 +6821,11 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::Date { .. }
                     | HeapEntry::BuiltinIterator { .. }
                     | HeapEntry::Collection { .. }
+                    | HeapEntry::Promise { .. }
+                    | HeapEntry::PromiseResolver { .. }
+                    | HeapEntry::PromiseFinally { .. }
+                    | HeapEntry::PromiseAll { .. }
+                    | HeapEntry::PromiseAllElement { .. }
                     | HeapEntry::ProcessEnv { .. }
                     | HeapEntry::Iterator { .. } => true,
                 },
@@ -5587,6 +6859,11 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::Date { .. }
                     | HeapEntry::BuiltinIterator { .. }
                     | HeapEntry::Collection { .. }
+                    | HeapEntry::Promise { .. }
+                    | HeapEntry::PromiseResolver { .. }
+                    | HeapEntry::PromiseFinally { .. }
+                    | HeapEntry::PromiseAll { .. }
+                    | HeapEntry::PromiseAllElement { .. }
                     | HeapEntry::ProcessEnv { .. }
                     | HeapEntry::Iterator { .. } => "object",
                 },
@@ -5732,6 +7009,11 @@ impl<'a, H: Host> Machine<'a, H> {
                         | HeapEntry::Date { .. }
                         | HeapEntry::BuiltinIterator { .. }
                         | HeapEntry::Collection { .. }
+                        | HeapEntry::Promise { .. }
+                        | HeapEntry::PromiseResolver { .. }
+                        | HeapEntry::PromiseFinally { .. }
+                        | HeapEntry::PromiseAll { .. }
+                        | HeapEntry::PromiseAllElement { .. }
                         | HeapEntry::ModuleNamespace { .. }
                         | HeapEntry::ExternalModuleNamespace { .. }
                         | HeapEntry::ProcessEnv { .. }
@@ -5835,7 +7117,12 @@ impl<'a, H: Host> Machine<'a, H> {
         match self.runtime_slot(value) {
             Ok(Some(index)) => !matches!(
                 self.heap[index],
-                HeapEntry::String(_) | HeapEntry::BigInt(_)
+                HeapEntry::String(_)
+                    | HeapEntry::BigInt(_)
+                    | HeapEntry::PromiseResolver { .. }
+                    | HeapEntry::PromiseFinally { .. }
+                    | HeapEntry::PromiseAll { .. }
+                    | HeapEntry::PromiseAllElement { .. }
             ),
             Ok(None) => matches!(value.decode(), Some(Decoded::HeapRef(_))),
             Err(_) => false,
@@ -6239,6 +7526,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::intrinsics::BuiltinOutcome;
     use bamts_bytecode::{
         Binding, Edge, EdgeKind, ExceptionHandler, Export, ExportSource, FunctionFlags, NumberBits,
         ProgramModule, Register,
@@ -11466,5 +12754,619 @@ mod tests {
                 - Machine::<TestHost>::script_heap_cost(&small),
             large_verification - small_verification
         );
+    }
+    #[test]
+    fn promise_resolver_settles_once_and_reactions_wait_for_drain() {
+        let program = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("resolve")),
+                Constant::String(EcmaString::from_utf8("reject")),
+                Constant::String(EcmaString::from_utf8("observed")),
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    2,
+                    2,
+                    vec![
+                        Instruction::StoreGlobal {
+                            name: cid(0),
+                            value: reg(0),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(1),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    1,
+                    1,
+                    vec![
+                        Instruction::StoreGlobal {
+                            name: cid(2),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let executor = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(1),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        let observer = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(2),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let constructor_index = machine.runtime_slot(constructor).unwrap().unwrap();
+        let HeapEntry::NativeFunction {
+            callable: NativeCallable::Builtin(constructor_id),
+            ..
+        } = machine.heap[constructor_index]
+        else {
+            panic!("Promise must be a native constructor");
+        };
+        let BuiltinOutcome::Value(promise) = machine
+            .call_builtin(constructor_id, Value::UNDEFINED, &[executor], true)
+            .unwrap()
+        else {
+            panic!("Promise construction returns a Promise");
+        };
+        let then = machine.get_named_property(promise, "then").unwrap();
+        machine
+            .call_value(then, promise, &[observer])
+            .expect("then returns a derived Promise");
+        let resolve = machine
+            .globals
+            .get(&EcmaString::from_utf8("resolve"))
+            .copied()
+            .unwrap();
+        let reject = machine
+            .globals
+            .get(&EcmaString::from_utf8("reject"))
+            .copied()
+            .unwrap();
+        assert_eq!(
+            machine
+                .call_value(resolve, Value::UNDEFINED, &[Value::int32(1)])
+                .unwrap(),
+            Value::UNDEFINED
+        );
+        assert_eq!(
+            machine
+                .call_value(reject, Value::UNDEFINED, &[Value::int32(2)])
+                .unwrap(),
+            Value::UNDEFINED
+        );
+        assert!(
+            !machine
+                .globals
+                .contains_key(&EcmaString::from_utf8("observed"))
+        );
+
+        let drain = machine.drain_microtasks().unwrap();
+        assert_eq!(drain.executed, 1);
+        assert!(drain.uncaught.is_empty());
+        assert_eq!(
+            machine
+                .globals
+                .get(&EcmaString::from_utf8("observed"))
+                .copied(),
+            Some(Value::int32(1))
+        );
+    }
+
+    #[test]
+    fn promise_resolution_adopts_thenables_with_a_fresh_resolver() {
+        let program = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("resolve")),
+                Constant::String(EcmaString::from_utf8("reject")),
+                Constant::String(EcmaString::from_utf8("observed")),
+                Constant::Int32(7),
+                Constant::Int32(8),
+                Constant::Int32(9),
+                Constant::Undefined,
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    2,
+                    2,
+                    vec![
+                        Instruction::StoreGlobal {
+                            name: cid(0),
+                            value: reg(0),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(1),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    1,
+                    1,
+                    vec![
+                        Instruction::StoreGlobal {
+                            name: cid(2),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    2,
+                    6,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(2),
+                            constant: cid(3),
+                        },
+                        Instruction::CreateArray { dst: reg(3) },
+                        Instruction::ArrayPush {
+                            array: reg(3),
+                            value: reg(2),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(4),
+                            constant: cid(6),
+                        },
+                        Instruction::Call {
+                            dst: reg(5),
+                            callee: reg(0),
+                            this_value: reg(4),
+                            arguments: reg(3),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(2),
+                            constant: cid(4),
+                        },
+                        Instruction::CreateArray { dst: reg(3) },
+                        Instruction::ArrayPush {
+                            array: reg(3),
+                            value: reg(2),
+                        },
+                        Instruction::Call {
+                            dst: reg(5),
+                            callee: reg(1),
+                            this_value: reg(4),
+                            arguments: reg(3),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(2),
+                            constant: cid(5),
+                        },
+                        Instruction::Throw { value: reg(2) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let runtime_function = |machine: &mut Machine<'_, TestHost>, function| {
+            machine
+                .allocate(HeapEntry::Function {
+                    module: ModuleId::new(0),
+                    function: FunctionId::new(function),
+                    captures: Vec::new(),
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.function_prototype),
+                    extensible: true,
+                })
+                .unwrap()
+        };
+        let executor = runtime_function(&mut machine, 1);
+        let observer = runtime_function(&mut machine, 2);
+        let then_callback = runtime_function(&mut machine, 3);
+        let thenable = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        machine
+            .set_data_property(thenable, "then", then_callback)
+            .unwrap();
+
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let constructor_index = machine.runtime_slot(constructor).unwrap().unwrap();
+        let HeapEntry::NativeFunction {
+            callable: NativeCallable::Builtin(constructor_id),
+            ..
+        } = machine.heap[constructor_index]
+        else {
+            panic!("Promise must be a native constructor");
+        };
+        let BuiltinOutcome::Value(promise) = machine
+            .call_builtin(constructor_id, Value::UNDEFINED, &[executor], true)
+            .unwrap()
+        else {
+            panic!("Promise construction returns a Promise");
+        };
+        let resolve = machine
+            .globals
+            .get(&EcmaString::from_utf8("resolve"))
+            .copied()
+            .unwrap();
+        let reject = machine
+            .globals
+            .get(&EcmaString::from_utf8("reject"))
+            .copied()
+            .unwrap();
+        machine
+            .call_value(resolve, Value::UNDEFINED, &[thenable])
+            .unwrap();
+        let then = machine.get_named_property(promise, "then").unwrap();
+        machine.call_value(then, promise, &[observer]).unwrap();
+        machine
+            .call_value(reject, Value::UNDEFINED, &[Value::int32(9)])
+            .unwrap();
+        assert!(
+            !machine
+                .globals
+                .contains_key(&EcmaString::from_utf8("observed"))
+        );
+
+        let drain = machine.drain_microtasks().unwrap();
+        assert_eq!(drain.executed, 2);
+        assert!(drain.uncaught.is_empty());
+        assert_eq!(
+            machine
+                .globals
+                .get(&EcmaString::from_utf8("observed"))
+                .copied(),
+            Some(Value::int32(7))
+        );
+    }
+
+    #[test]
+    fn queue_microtask_drains_fifo_including_jobs_added_during_drain() {
+        let program = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("order")),
+                Constant::String(EcmaString::from_utf8("queueMicrotask")),
+                Constant::String(EcmaString::from_utf8("third")),
+                Constant::Int32(1),
+                Constant::Int32(2),
+                Constant::Int32(3),
+                Constant::Undefined,
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    0,
+                    7,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(3),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(0),
+                            value: reg(1),
+                        },
+                        Instruction::LoadGlobal {
+                            dst: reg(2),
+                            name: cid(1),
+                        },
+                        Instruction::LoadGlobal {
+                            dst: reg(3),
+                            name: cid(2),
+                        },
+                        Instruction::CreateArray { dst: reg(4) },
+                        Instruction::ArrayPush {
+                            array: reg(4),
+                            value: reg(3),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(5),
+                            constant: cid(6),
+                        },
+                        Instruction::Call {
+                            dst: reg(6),
+                            callee: reg(2),
+                            this_value: reg(5),
+                            arguments: reg(4),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(4),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(0),
+                            value: reg(1),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(5),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(0),
+                            value: reg(1),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let runtime_function = |machine: &mut Machine<'_, TestHost>, function| {
+            machine
+                .allocate(HeapEntry::Function {
+                    module: ModuleId::new(0),
+                    function: FunctionId::new(function),
+                    captures: Vec::new(),
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.function_prototype),
+                    extensible: true,
+                })
+                .unwrap()
+        };
+        let first = runtime_function(&mut machine, 1);
+        let second = runtime_function(&mut machine, 2);
+        let third = runtime_function(&mut machine, 3);
+        let order = machine
+            .allocate(HeapEntry::Array {
+                elements: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.array_prototype),
+                extensible: true,
+                length_writable: true,
+            })
+            .unwrap();
+        machine
+            .globals
+            .insert(EcmaString::from_utf8("order"), order);
+        machine
+            .globals
+            .insert(EcmaString::from_utf8("third"), third);
+        let queue = machine.intrinsics.global("queueMicrotask").unwrap();
+        machine
+            .call_value(queue, Value::UNDEFINED, &[first])
+            .unwrap();
+        machine
+            .call_value(queue, Value::UNDEFINED, &[second])
+            .unwrap();
+
+        let drain = machine.drain_microtasks().unwrap();
+        assert_eq!(drain.executed, 3);
+        assert!(drain.uncaught.is_empty());
+        let index = machine.runtime_slot(order).unwrap().unwrap();
+        let HeapEntry::Array { elements, .. } = &machine.heap[index] else {
+            panic!("order remains an array");
+        };
+        assert_eq!(
+            elements,
+            &[Value::int32(1), Value::int32(2), Value::int32(3)]
+        );
+    }
+
+    #[test]
+    fn queue_microtask_reports_callback_throws_and_continues() {
+        let program = verified(
+            vec![
+                Constant::Int32(7),
+                Constant::Int32(1),
+                Constant::String(EcmaString::from_utf8("observed")),
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Throw { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(1),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(2),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let runtime_function = |machine: &mut Machine<'_, TestHost>, function| {
+            machine
+                .allocate(HeapEntry::Function {
+                    module: ModuleId::new(0),
+                    function: FunctionId::new(function),
+                    captures: Vec::new(),
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.function_prototype),
+                    extensible: true,
+                })
+                .unwrap()
+        };
+        let throwing = runtime_function(&mut machine, 1);
+        let observer = runtime_function(&mut machine, 2);
+        let queue = machine.intrinsics.global("queueMicrotask").unwrap();
+        machine
+            .call_value(queue, Value::UNDEFINED, &[throwing])
+            .unwrap();
+        machine
+            .call_value(queue, Value::UNDEFINED, &[observer])
+            .unwrap();
+
+        let drain = machine.drain_microtasks().unwrap();
+        assert_eq!(drain.executed, 2);
+        assert_eq!(
+            drain.uncaught,
+            vec![MicrotaskException {
+                value: Value::int32(7),
+                origin: ThrowOrigin::Bytecode,
+            }]
+        );
+        assert_eq!(
+            machine
+                .globals
+                .get(&EcmaString::from_utf8("observed"))
+                .copied(),
+            Some(Value::int32(1))
+        );
+    }
+
+    #[test]
+    fn microtask_boundaries_preserve_the_queued_head() {
+        let program = verified(
+            vec![Constant::Undefined],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(
+            &program,
+            &mut host,
+            Limits {
+                max_microtasks: 1,
+                ..Limits::default()
+            },
+        );
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callback = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(1),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        let queue = machine.intrinsics.global("queueMicrotask").unwrap();
+        assert!(matches!(
+            machine.call_value(queue, Value::UNDEFINED, &[Value::int32(1)]),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+        machine
+            .call_value(queue, Value::UNDEFINED, &[callback])
+            .unwrap();
+        assert!(matches!(
+            machine.call_value(queue, Value::UNDEFINED, &[callback]),
+            Err(EvalFailure::Runtime(
+                RuntimeErrorKind::MicrotaskQueueLimitExceeded { limit: 1 }
+            ))
+        ));
+
+        let fuel = machine.fuel;
+        machine.microtask_drain_active = true;
+        let reentry = machine.drain_microtasks().unwrap_err();
+        assert!(matches!(
+            reentry.kind,
+            RuntimeErrorKind::MicrotaskDrainReentry
+        ));
+        assert_eq!(machine.fuel, fuel);
+        assert_eq!(machine.microtasks.len(), 1);
+        machine.microtask_drain_active = false;
+
+        machine.fuel = 0;
+        let exhausted = machine.drain_microtasks().unwrap_err();
+        assert!(matches!(
+            exhausted.kind,
+            RuntimeErrorKind::FuelExhausted { .. }
+        ));
+        assert!(!machine.microtask_drain_active);
+        assert_eq!(machine.microtasks.len(), 1);
+
+        machine.fuel = 100;
+        let drain = machine.drain_microtasks().unwrap();
+        assert_eq!(drain.executed, 1);
+        assert!(machine.microtasks.is_empty());
     }
 }

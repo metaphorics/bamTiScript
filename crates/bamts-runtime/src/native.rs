@@ -2908,6 +2908,96 @@ mod tests {
         }
     }
 
+    #[test]
+    fn microtask_checkpoint_matches_interpreter_and_native_engine() {
+        let program = linked(
+            vec![program_module(
+                "root",
+                vec![
+                    Constant::String(EcmaString::from_utf8("queueMicrotask")),
+                    Constant::String(EcmaString::from_utf8("observed")),
+                    Constant::Int32(7),
+                    Constant::Undefined,
+                ],
+                vec![
+                    entry_function(
+                        6,
+                        vec![
+                            Instruction::CreateArray { dst: reg(0) },
+                            Instruction::CreateClosure {
+                                dst: reg(1),
+                                function: FunctionId::new(1),
+                                captures: reg(0),
+                            },
+                            Instruction::LoadGlobal {
+                                dst: reg(2),
+                                name: cid(1),
+                            },
+                            Instruction::CreateArray { dst: reg(3) },
+                            Instruction::ArrayPush {
+                                array: reg(3),
+                                value: reg(1),
+                            },
+                            Instruction::LoadConst {
+                                dst: reg(4),
+                                constant: cid(4),
+                            },
+                            Instruction::Call {
+                                dst: reg(5),
+                                callee: reg(2),
+                                this_value: reg(4),
+                                arguments: reg(3),
+                            },
+                            Instruction::Return { value: reg(4) },
+                        ],
+                    ),
+                    module_function(
+                        0,
+                        1,
+                        vec![
+                            Instruction::LoadConst {
+                                dst: reg(0),
+                                constant: cid(3),
+                            },
+                            Instruction::StoreGlobal {
+                                name: cid(2),
+                                value: reg(0),
+                            },
+                            Instruction::Return { value: reg(0) },
+                        ],
+                    ),
+                ],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )],
+            0,
+        );
+        let observed = EcmaString::from_utf8("observed");
+
+        let mut interpreter_host = SilentHost;
+        let mut interpreter = Machine::new(&program, &mut interpreter_host, Limits::default());
+        interpreter.evaluate().unwrap();
+        assert!(!interpreter.globals.contains_key(&observed));
+        let interpreter_drain = interpreter.drain_microtasks().unwrap();
+        let interpreter_value = interpreter.globals.get(&observed).copied();
+
+        let mut native_host = SilentHost;
+        let engine = NativeEngine::new(&program, &NoEntries, &mut native_host, Limits::default());
+        engine.machine.borrow_mut().instantiate_modules().unwrap();
+        engine
+            .evaluate_reference_module(program.entry())
+            .unwrap()
+            .expect("native entry completes");
+        assert!(!engine.machine.borrow().globals.contains_key(&observed));
+        let native_drain = engine.machine.borrow_mut().drain_microtasks().unwrap();
+        let native_value = engine.machine.borrow().globals.get(&observed).copied();
+
+        assert_eq!(interpreter_drain, native_drain);
+        assert_eq!(interpreter_value, Some(Value::int32(7)));
+        assert_eq!(native_value, interpreter_value);
+    }
+
     #[derive(Default)]
     struct RecordingEntries {
         program_bytes: Vec<u8>,

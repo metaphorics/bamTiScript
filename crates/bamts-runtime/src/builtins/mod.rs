@@ -14,6 +14,7 @@ mod date;
 mod json;
 mod number;
 mod object;
+mod promise;
 mod regexp;
 pub(crate) use regexp::canonical_source;
 mod string;
@@ -26,6 +27,7 @@ pub(crate) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     symbol::install(heap, globals, builtins);
+    promise::install(heap, globals, builtins);
     collections::install_iterator_prototype(heap, builtins);
     collections::install_generator_prototype(heap, builtins);
     collections::install(heap, globals, builtins);

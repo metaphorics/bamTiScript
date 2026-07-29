@@ -331,6 +331,28 @@ mod tests {
         Ok((directory, entrypoint))
     }
 
+    #[cfg(feature = "node-host")]
+    fn run_microtask_checkpoint(
+        name: &str,
+        source: &str,
+    ) -> Result<(Vec<u8>, bamts_runtime::MicrotaskDrain), Box<dyn Error>> {
+        let (directory, entrypoint) = script_fixture(name, source)?;
+        let executable = compile_source_file(&entrypoint)?;
+        let mut host = bamts_node::NodeHost::new();
+        host.set_script_compiler(Box::new(super::ScriptCompiler));
+        let mut machine = bamts_runtime::Machine::new(
+            executable.wire(),
+            &mut host,
+            bamts_runtime::Limits::default(),
+        );
+        machine.evaluate()?;
+        let drain = machine.drain_microtasks()?;
+        drop(machine);
+        let stdout = host.stdout().to_vec();
+        remove_fixture(&directory)?;
+        Ok((stdout, drain))
+    }
+
     #[test]
     fn compiles_complete_program_with_module_local_function_ids() -> Result<(), Box<dyn Error>> {
         let (directory, entrypoint) = fixture("compile")?;
@@ -482,6 +504,227 @@ mod tests {
             remove_fixture(&directory)?;
         }
         Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn promise_static_methods_chain_at_an_explicit_microtask_checkpoint()
+    -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            const seen: number[] = [];
+            const first = Promise.resolve(1).then(value => { seen.push(value); });
+            const second = Promise.reject(2).catch(reason => { seen.push(reason); });
+            const third = Promise.all([Promise.resolve(3), 4]).then(values => {
+                seen.push(values[0] + values[1]);
+            });
+            const fourth = Promise.resolve(5).finally(() => {}).then(value => {
+                seen.push(value);
+            });
+            Promise.all([first, second, third, fourth]).then(() => {
+                process.stdout.write(seen.join(",") + "\n");
+            });
+        "#;
+        let (stdout, drain) = run_microtask_checkpoint("promise-checkpoint", source)?;
+        assert!(drain.executed > 0);
+        assert!(drain.uncaught.is_empty());
+        assert_eq!(stdout, b"1,2,7,5\n");
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn promise_finally_waits_and_all_keeps_input_order() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            const seen: string[] = [];
+            let releaseCleanup;
+            const cleanup = new Promise(resolve => { releaseCleanup = resolve; });
+            const waited = Promise.resolve(10)
+                .finally(() => cleanup)
+                .then(value => { seen.push("value:" + value); });
+            queueMicrotask(() => { seen.push("checkpoint"); });
+            queueMicrotask(() => { releaseCleanup(); });
+
+            const replaced = Promise.reject(20)
+                .finally(() => Promise.reject(30))
+                .catch(reason => { seen.push("reason:" + reason); });
+            const empty = Promise.all([]).then(values => {
+                seen.push("empty:" + values.length);
+            });
+
+            let resolveFirst;
+            let resolveSecond;
+            const first = new Promise(resolve => { resolveFirst = resolve; });
+            const second = new Promise(resolve => { resolveSecond = resolve; });
+            const ordered = Promise.all([first, second]).then(values => {
+                seen.push("order:" + values.join(":"));
+            });
+            resolveSecond(2);
+            resolveFirst(1);
+
+            Promise.all([waited, replaced, empty, ordered]).then(() => {
+                process.stdout.write(seen.join(",") + "\n");
+            });
+        "#;
+        let (stdout, drain) = run_microtask_checkpoint("promise-edges", source)?;
+        assert!(drain.executed > 0);
+        assert!(drain.uncaught.is_empty());
+        assert_eq!(stdout, b"checkpoint,empty:0,order:1:2,value:10,reason:30\n");
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn promise_all_closes_an_abrupt_iterator_and_keeps_the_original_throw()
+    -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            let closed = false;
+            const iterable = {
+                [Symbol.iterator]() {
+                    return {
+                        next() { throw 7; },
+                        return() {
+                            closed = true;
+                            throw 8;
+                        },
+                    };
+                },
+            };
+            Promise.all(iterable).catch(reason => {
+                process.stdout.write(reason + "|" + closed + "\n");
+            });
+
+            const lookupFailure = {
+                [Symbol.iterator]() {
+                    return {
+                        next() { throw 7; },
+                        get return() { throw 8; },
+                    };
+                },
+            };
+            Promise.all(lookupFailure).catch(reason => {
+                process.stdout.write("lookup:" + reason + "\n");
+            });
+        "#;
+        let (stdout, drain) = run_microtask_checkpoint("promise-iterator-close", source)?;
+        assert!(drain.executed > 0);
+        assert!(drain.uncaught.is_empty());
+        assert_eq!(stdout, b"7|true\nlookup:7\n");
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn promise_thenable_getter_is_sync_and_body_is_queued() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            let gets = 0;
+            let calls = 0;
+            const thenable = {
+                get then() {
+                    gets += 1;
+                    return resolve => {
+                        calls += 1;
+                        resolve(7);
+                    };
+                },
+            };
+            const promise = Promise.resolve(thenable);
+            process.stdout.write(gets + "|" + calls + "|");
+            promise.then(value => {
+                process.stdout.write(gets + "|" + calls + "|" + value + "\n");
+            });
+        "#;
+        let (stdout, drain) = run_microtask_checkpoint("promise-thenable-getter", source)?;
+        assert!(drain.executed > 0);
+        assert!(drain.uncaught.is_empty());
+        assert_eq!(stdout, b"1|0|1|1|7\n");
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn promise_reactions_keep_registration_order_across_settlement() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            const seen: string[] = [];
+            let resolve;
+            const promise = new Promise(settle => { resolve = settle; });
+            promise.then(() => { seen.push("A"); });
+            promise.then(() => { seen.push("B"); });
+            resolve();
+            promise.then(() => { seen.push("C"); });
+            queueMicrotask(() => {
+                process.stdout.write(seen.join("") + "\n");
+            });
+        "#;
+        let (stdout, drain) = run_microtask_checkpoint("promise-reaction-order", source)?;
+        assert_eq!(drain.executed, 4);
+        assert!(drain.uncaught.is_empty());
+        assert_eq!(stdout, b"ABC\n");
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn promise_self_resolution_rejects() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            let resolve;
+            const promise = new Promise(settle => { resolve = settle; });
+            resolve(promise);
+            promise.catch(() => {
+                process.stdout.write("self-rejected\n");
+            });
+        "#;
+        let (stdout, drain) = run_microtask_checkpoint("promise-self-resolution", source)?;
+        assert!(drain.executed > 0);
+        assert!(drain.uncaught.is_empty());
+        assert_eq!(stdout, b"self-rejected\n");
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn promise_surface_has_node_tags_brands_and_lengths() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            const checks = [Object.prototype.toString.call(Promise.resolve())];
+            try {
+                Promise.prototype.then.call({}, () => {});
+                checks.push("bad-brand");
+            } catch (error) {
+                checks.push("brand-error");
+            }
+            try {
+                queueMicrotask(1);
+                checks.push("bad-callback");
+            } catch (error) {
+                checks.push("callback-error");
+            }
+            try {
+                const detached = Promise.resolve;
+                detached(1);
+                checks.push("bad-static");
+            } catch (error) {
+                checks.push("static-error");
+            }
+            checks.push(
+                Promise.length,
+                Promise.resolve.length,
+                Promise.reject.length,
+                Promise.all.length,
+                Promise.prototype.then.length,
+                Promise.prototype.catch.length,
+                Promise.prototype.finally.length,
+                queueMicrotask.length,
+            );
+            process.stdout.write(checks.join("|") + "\n");
+        "#;
+        let (directory, entrypoint) = script_fixture("promise-surface", source)?;
+        let output = run_program(&entrypoint)?;
+
+        assert_eq!(
+            output.stdout,
+            b"[object Promise]|brand-error|callback-error|static-error|1|1|1|1|2|1|1|1\n"
+        );
+        assert_eq!(output.exit_code, 0);
+        remove_fixture(&directory)
     }
 
     #[cfg(feature = "aot")]

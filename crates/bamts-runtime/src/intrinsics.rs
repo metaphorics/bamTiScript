@@ -65,6 +65,10 @@ pub(crate) struct BuiltinTable<H: Host> {
     regexp_prototype: Option<Value>,
     iterator_prototype: Option<Value>,
     generator_prototype: Option<Value>,
+    promise_resolver_targets: Option<(Value, Value)>,
+    promise_finally_targets: Option<(Value, Value)>,
+    promise_all_targets: Option<(Value, Value)>,
+    promise_prototype: Option<Value>,
     marker: PhantomData<fn() -> H>,
 }
 
@@ -93,6 +97,10 @@ impl<H: Host> BuiltinTable<H> {
             regexp_prototype: None,
             iterator_prototype: None,
             generator_prototype: None,
+            promise_resolver_targets: None,
+            promise_finally_targets: None,
+            promise_all_targets: None,
+            promise_prototype: None,
             marker: PhantomData,
         }
     }
@@ -192,6 +200,42 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn generator_prototype(&self) -> Value {
         self.generator_prototype
             .expect("generator builtins install their prototype")
+    }
+
+    pub(crate) fn set_promise_prototype(&mut self, prototype: Value) {
+        self.promise_prototype = Some(prototype);
+    }
+
+    pub(crate) fn promise_prototype(&self) -> Value {
+        self.promise_prototype
+            .expect("Promise builtins install their prototype")
+    }
+
+    pub(crate) fn set_promise_resolver_targets(&mut self, resolve: Value, reject: Value) {
+        self.promise_resolver_targets = Some((resolve, reject));
+    }
+
+    pub(crate) fn promise_resolver_targets(&self) -> (Value, Value) {
+        self.promise_resolver_targets
+            .expect("Promise builtins install resolver targets")
+    }
+
+    pub(crate) fn set_promise_finally_targets(&mut self, fulfill: Value, reject: Value) {
+        self.promise_finally_targets = Some((fulfill, reject));
+    }
+
+    pub(crate) fn promise_finally_targets(&self) -> (Value, Value) {
+        self.promise_finally_targets
+            .expect("Promise builtins install finally targets")
+    }
+
+    pub(crate) fn set_promise_all_targets(&mut self, fulfill: Value, reject: Value) {
+        self.promise_all_targets = Some((fulfill, reject));
+    }
+
+    pub(crate) fn promise_all_targets(&self) -> (Value, Value) {
+        self.promise_all_targets
+            .expect("Promise builtins install all targets")
     }
 
     pub(crate) fn set_constructor_prototype(
