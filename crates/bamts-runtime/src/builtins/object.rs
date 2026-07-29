@@ -180,8 +180,10 @@ fn assign<H: Host>(
         if matches!(source.decode(), Some(Decoded::Undefined | Decoded::Null)) {
             continue;
         }
-        for name in machine.enumerable_keys(source)? {
-            let key = PropertyKey::Named(name);
+        for key in machine.own_property_keys(source)? {
+            if !machine.own_property_is_enumerable(source, &key)? {
+                continue;
+            }
             let value = machine.get_property_key(source, &key)?;
             machine.set_data_property_key(target, key, value)?;
         }
@@ -1013,6 +1015,133 @@ mod tests {
                 .string_value(display)
                 .is_some_and(|text| text.eq_ascii("Symbol(key)"))
         );
+    }
+
+    #[test]
+    fn assign_copies_enumerable_symbol_properties() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = object(&mut machine);
+        let source = object(&mut machine);
+        let symbol = symbol(&mut machine, "key");
+        let key = symbol_key(&machine, symbol);
+        machine
+            .set_data_property_key(source, key.clone(), Value::int32(42))
+            .unwrap();
+
+        call_object(&mut machine, "assign", &[target, source]).unwrap();
+
+        assert_eq!(
+            machine.get_property_key(target, &key).unwrap(),
+            Value::int32(42)
+        );
+    }
+
+    #[test]
+    fn assign_rechecks_descriptors_after_getters() {
+        fn delete_next<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            machine.delete_property(this, &PropertyKey::Named(EcmaString::from_utf8("next")))?;
+            Ok(BuiltinOutcome::Value(Value::int32(1)))
+        }
+
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let getter_id = machine
+            .intrinsics
+            .builtins
+            .register(crate::intrinsics::BuiltinDef {
+                name: "delete next",
+                length: 0,
+                handler: delete_next::<TestHost>,
+            });
+        let getter =
+            crate::intrinsics::native_function(&mut machine.heap, getter_id, "delete next", 0);
+        let source = object(&mut machine);
+        let target = object(&mut machine);
+        let first = PropertyKey::Named(EcmaString::from_utf8("first"));
+        let next = PropertyKey::Named(EcmaString::from_utf8("next"));
+        machine
+            .define_descriptor(
+                source,
+                first.clone(),
+                Property::Accessor {
+                    getter: Some(getter),
+                    setter: None,
+                    enumerable: true,
+                    configurable: true,
+                },
+            )
+            .unwrap();
+        machine
+            .set_data_property_key(source, next.clone(), Value::int32(2))
+            .unwrap();
+
+        call_object(&mut machine, "assign", &[target, source]).unwrap();
+
+        assert_eq!(
+            machine.get_property_key(target, &first).unwrap(),
+            Value::int32(1)
+        );
+        assert!(!machine.has_own_property_key(target, &next).unwrap());
+    }
+
+    #[test]
+    fn assign_orders_descriptor_backed_array_indices_numerically() {
+        fn delete_later_index<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            machine.delete_property(this, &PropertyKey::Named(EcmaString::from_utf8("10")))?;
+            Ok(BuiltinOutcome::Value(Value::int32(1)))
+        }
+
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let getter_id = machine
+            .intrinsics
+            .builtins
+            .register(crate::intrinsics::BuiltinDef {
+                name: "delete later index",
+                length: 0,
+                handler: delete_later_index::<TestHost>,
+            });
+        let getter = crate::intrinsics::native_function(
+            &mut machine.heap,
+            getter_id,
+            "delete later index",
+            0,
+        );
+        let mut elements = vec![Value::HOLE; 11];
+        elements[10] = Value::int32(2);
+        let source = allocate_array(&mut machine, elements).unwrap();
+        machine
+            .define_descriptor(
+                source,
+                PropertyKey::Named(EcmaString::from_utf8("2")),
+                Property::Accessor {
+                    getter: Some(getter),
+                    setter: None,
+                    enumerable: true,
+                    configurable: true,
+                },
+            )
+            .unwrap();
+        let target = object(&mut machine);
+        let later = PropertyKey::Named(EcmaString::from_utf8("10"));
+
+        call_object(&mut machine, "assign", &[target, source]).unwrap();
+
+        assert!(!machine.has_own_property_key(target, &later).unwrap());
     }
 
     #[test]

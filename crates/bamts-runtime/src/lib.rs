@@ -4281,79 +4281,12 @@ impl<'a, H: Host> Machine<'a, H> {
                 }));
             }
         };
-        // Own enumerable data properties of the source are copied. `null` and
-        // `undefined` sources are a no-op, matching `{ ...null }`.
-        let mut pairs: Vec<(PropertyKey, Value)> = Vec::new();
-        let mut char_pairs: Vec<(EcmaString, EcmaString)> = Vec::new();
-        if let Some(index) = self.runtime_slot(source).map_err(EvalFailure::Runtime)? {
-            match &self.heap[index] {
-                HeapEntry::Object { properties, .. }
-                | HeapEntry::Script { properties, .. }
-                | HeapEntry::Date { properties, .. }
-                | HeapEntry::BuiltinIterator { properties, .. }
-                | HeapEntry::Collection { properties, .. } => {
-                    for (key, property) in properties {
-                        if let (
-                            PropertyKey::Named(_),
-                            Property::Data {
-                                value,
-                                enumerable: true,
-                                ..
-                            },
-                        ) = (key, property)
-                        {
-                            pairs.push((key.clone(), *value));
-                        }
-                    }
-                }
-                HeapEntry::Array {
-                    elements,
-                    properties,
-                    ..
-                } => {
-                    for (offset, element) in elements.iter().enumerate() {
-                        if *element != Value::HOLE {
-                            pairs.push((
-                                PropertyKey::Named(EcmaString::from_utf8(&offset.to_string())),
-                                *element,
-                            ));
-                        }
-                    }
-                    for (key, property) in properties {
-                        if let (
-                            PropertyKey::Named(name),
-                            Property::Data {
-                                value,
-                                enumerable: true,
-                                ..
-                            },
-                        ) = (key, property)
-                            && array_index(name).is_none()
-                        {
-                            pairs.push((key.clone(), *value));
-                        }
-                    }
-                }
-                HeapEntry::String(text) => {
-                    for offset in 0..text.len_units() {
-                        char_pairs.push((
-                            EcmaString::from_utf8(&offset.to_string()),
-                            EcmaString::from_units(&[text
-                                .unit_at(offset)
-                                .expect("offset is in bounds")]),
-                        ));
-                    }
-                }
-                _ => {}
+        let keys = self.own_property_keys(source)?;
+        for key in keys {
+            if !self.own_property_is_enumerable(source, &key)? {
+                continue;
             }
-        }
-        for (name, text) in char_pairs {
-            let value = self
-                .allocate(HeapEntry::String(text))
-                .map_err(EvalFailure::Runtime)?;
-            pairs.push((PropertyKey::Named(name), value));
-        }
-        for (key, value) in pairs {
+            let value = self.get_property_key(source, &key)?;
             self.set_own_data(target_index, key, value)?;
         }
         Ok(())
@@ -4463,20 +4396,38 @@ impl<'a, H: Host> Machine<'a, H> {
                     properties,
                     ..
                 } => {
-                    let mut keys: Vec<PropertyKey> = (0..elements.len())
-                        .filter(|offset| elements[*offset] != Value::HOLE)
-                        .map(|offset| {
-                            PropertyKey::Named(EcmaString::from_utf8(&offset.to_string()))
+                    let mut indices: Vec<(usize, PropertyKey)> = elements
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, element)| **element != Value::HOLE)
+                        .map(|(offset, _)| {
+                            (
+                                offset,
+                                PropertyKey::Named(EcmaString::from_utf8(&offset.to_string())),
+                            )
                         })
                         .collect();
-                    keys.extend(ordered_property_keys(properties).into_iter().filter(|key| {
-                        key.as_string().and_then(array_index).is_none_or(|offset| {
-                            elements
-                                .get(offset as usize)
-                                .is_none_or(|element| *element == Value::HOLE)
-                        })
-                    }));
-                    Ok(keys)
+                    let mut suffix = Vec::new();
+                    for key in ordered_property_keys(properties) {
+                        let Some(offset) = key.as_string().and_then(array_index) else {
+                            suffix.push(key);
+                            continue;
+                        };
+                        let offset = offset as usize;
+                        if elements
+                            .get(offset)
+                            .is_some_and(|element| *element != Value::HOLE)
+                        {
+                            continue;
+                        }
+                        indices.push((offset, key));
+                    }
+                    indices.sort_unstable_by_key(|(offset, _)| *offset);
+                    Ok(indices
+                        .into_iter()
+                        .map(|(_, key)| key)
+                        .chain(suffix)
+                        .collect())
                 }
                 HeapEntry::String(text) => Ok((0..text.len_units())
                     .map(|index| PropertyKey::Named(EcmaString::from_utf8(&index.to_string())))
@@ -4509,51 +4460,65 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    fn enumerable_keys(&self, src: Value) -> Result<Vec<EcmaString>, EvalFailure> {
-        let keys = self.own_property_keys(src)?;
+    fn own_property_is_enumerable(
+        &self,
+        src: Value,
+        key: &PropertyKey,
+    ) -> Result<bool, EvalFailure> {
+        if matches!(key, PropertyKey::Private(_)) {
+            return Ok(false);
+        }
         let Some(index) = self.runtime_slot(src).map_err(EvalFailure::Runtime)? else {
-            return Ok(Vec::new());
+            return Ok(false);
         };
-        Ok(keys
-            .into_iter()
-            .filter_map(|key| {
-                let PropertyKey::Named(name) = &key else {
-                    return None;
-                };
-                let enumerable = match &self.heap[index] {
-                    HeapEntry::Array {
-                        elements,
-                        properties,
-                        ..
-                    } => properties.get(&key).map_or_else(
-                        || {
-                            array_index(name).is_some_and(|offset| {
-                                elements
-                                    .get(offset as usize)
-                                    .is_some_and(|element| *element != Value::HOLE)
-                            })
-                        },
-                        Property::enumerable,
-                    ),
-                    HeapEntry::String(text) => {
-                        array_index(name).is_some_and(|offset| (offset as usize) < text.len_units())
-                    }
-                    HeapEntry::ModuleNamespace { .. } => true,
-                    HeapEntry::Object { properties, .. }
-                    | HeapEntry::Script { properties, .. }
-                    | HeapEntry::Function { properties, .. }
-                    | HeapEntry::NativeFunction { properties, .. }
-                    | HeapEntry::RegExp { properties, .. }
-                    | HeapEntry::Date { properties, .. }
-                    | HeapEntry::BuiltinIterator { properties, .. }
-                    | HeapEntry::Collection { properties, .. } => {
-                        properties.get(&key).is_some_and(Property::enumerable)
-                    }
-                    _ => false,
-                };
-                enumerable.then_some(name.clone())
-            })
-            .collect())
+        Ok(match &self.heap[index] {
+            HeapEntry::Array {
+                elements,
+                properties,
+                ..
+            } => properties.get(key).map_or_else(
+                || {
+                    key.as_string().is_some_and(|name| {
+                        array_index(name).is_some_and(|offset| {
+                            elements
+                                .get(offset as usize)
+                                .is_some_and(|element| *element != Value::HOLE)
+                        })
+                    })
+                },
+                Property::enumerable,
+            ),
+            HeapEntry::String(text) => key.as_string().is_some_and(|name| {
+                array_index(name).is_some_and(|offset| (offset as usize) < text.len_units())
+            }),
+            HeapEntry::ModuleNamespace { .. } | HeapEntry::ExternalModuleNamespace { .. } => {
+                matches!(key, PropertyKey::Named(_))
+            }
+            HeapEntry::Object { properties, .. }
+            | HeapEntry::Script { properties, .. }
+            | HeapEntry::Function { properties, .. }
+            | HeapEntry::NativeFunction { properties, .. }
+            | HeapEntry::RegExp { properties, .. }
+            | HeapEntry::Date { properties, .. }
+            | HeapEntry::BuiltinIterator { properties, .. }
+            | HeapEntry::Collection { properties, .. } => {
+                properties.get(key).is_some_and(Property::enumerable)
+            }
+            _ => false,
+        })
+    }
+
+    fn enumerable_keys(&self, src: Value) -> Result<Vec<EcmaString>, EvalFailure> {
+        let mut names = Vec::new();
+        for key in self.own_property_keys(src)? {
+            if !self.own_property_is_enumerable(src, &key)? {
+                continue;
+            }
+            if let PropertyKey::Named(name) = key {
+                names.push(name);
+            }
+        }
+        Ok(names)
     }
 
     fn iterator_next(&mut self, iterator: Value) -> Result<(bool, Value), EvalFailure> {
@@ -6226,6 +6191,120 @@ mod tests {
             )],
         );
         assert_eq!(run_ok(&module).value, Value::int32(9));
+    }
+
+    #[test]
+    fn object_spread_copies_enumerable_symbol_properties() {
+        let module = verified(
+            Vec::new(),
+            vec![function(0, 0, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let prototype = machine.intrinsics.object_prototype;
+        let object = |machine: &mut Machine<'_, TestHost>| {
+            machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap()
+        };
+        let source = object(&mut machine);
+        let target = object(&mut machine);
+        let symbol = machine
+            .allocate(HeapEntry::Symbol {
+                description: EcmaString::from_utf8("key"),
+            })
+            .unwrap();
+        let key = machine.to_property_key(symbol).unwrap();
+        machine
+            .set_data_property_key(source, key.clone(), Value::int32(42))
+            .unwrap();
+
+        machine.object_spread(target, source).unwrap();
+
+        assert_eq!(
+            machine.get_property_key(target, &key).unwrap(),
+            Value::int32(42)
+        );
+    }
+
+    #[test]
+    fn object_spread_rechecks_descriptors_after_getters() {
+        fn delete_next<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            machine.delete_property(this, &PropertyKey::Named(EcmaString::from_utf8("next")))?;
+            Ok(intrinsics::BuiltinOutcome::Value(Value::int32(1)))
+        }
+
+        let module = verified(
+            Vec::new(),
+            vec![function(0, 0, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let getter_id = machine
+            .intrinsics
+            .builtins
+            .register(intrinsics::BuiltinDef {
+                name: "delete next",
+                length: 0,
+                handler: delete_next::<TestHost>,
+            });
+        let getter = intrinsics::native_function(&mut machine.heap, getter_id, "delete next", 0);
+        let first = PropertyKey::Named(EcmaString::from_utf8("first"));
+        let next = PropertyKey::Named(EcmaString::from_utf8("next"));
+        let mut source_properties = PropertyMap::default();
+        source_properties.insert(
+            first.clone(),
+            Property::Accessor {
+                getter: Some(getter),
+                setter: None,
+                enumerable: true,
+                configurable: true,
+            },
+        );
+        source_properties.insert(
+            next.clone(),
+            Property::Data {
+                value: Value::int32(2),
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            },
+        );
+        let prototype = machine.intrinsics.object_prototype;
+        let source = machine
+            .allocate(HeapEntry::Object {
+                properties: source_properties,
+                prototype: Some(prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        let target = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+
+        machine.object_spread(target, source).unwrap();
+
+        assert_eq!(
+            machine.get_property_key(target, &first).unwrap(),
+            Value::int32(1)
+        );
+        assert!(!machine.has_own_property_key(target, &next).unwrap());
     }
 
     #[test]
