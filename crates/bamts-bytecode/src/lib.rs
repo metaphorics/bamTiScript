@@ -2530,7 +2530,7 @@ impl<'a> Decoder<'a> {
             return Err(self.error(self.offset, DecodeErrorKind::UnexpectedEof));
         };
         let Some(bytes) = source.get(self.offset..end) else {
-            return Err(self.error(source.len(), DecodeErrorKind::UnexpectedEof));
+            return Err(self.error(self.offset, DecodeErrorKind::UnexpectedEof));
         };
         self.offset = end;
         Ok(bytes)
@@ -3462,6 +3462,20 @@ mod tests {
             Err(DecodeError {
                 offset: 8,
                 kind: DecodeErrorKind::UnsupportedVersion { version: 1 },
+            })
+        );
+    }
+
+    #[test]
+    fn truncated_string_reports_payload_start() {
+        let mut bytes = prefix();
+        bytes.extend_from_slice(&[1, 2, 2, b'a', 0]);
+
+        assert_eq!(
+            decode(&bytes, &DecodeLimits::default()),
+            Err(DecodeError {
+                offset: 12,
+                kind: DecodeErrorKind::UnexpectedEof,
             })
         );
     }
