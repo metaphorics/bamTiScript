@@ -2,7 +2,7 @@ use std::{fs, path::Path, process};
 
 use bamts_verification::corpus::{
     BamtsRunner, CaseSpec, CorpusFailure, CorpusStage, ExecutionMode, NodeOracle, OracleOutcome,
-    PINNED_CASE_IDS, TASK_106_SYNC_CASE_IDS, load_corpus,
+    PINNED_CASE_IDS, TASK_106_SYNC_CASE_IDS, TASK_107_NODE_CASE_IDS, load_corpus,
 };
 
 #[test]
@@ -208,6 +208,39 @@ fn task_106_sync_cases_match_node_in_jit_and_aot() {
     assert!(
         failures.is_empty(),
         "Task 106 differential failures:\n{}",
+        failures.join("\n\n")
+    );
+}
+
+#[test]
+fn task_107_node_cases_match_node_in_jit_and_aot() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let corpus = load_corpus(&root).expect("the pinned corpus must parse and validate");
+    let ids = corpus
+        .cases
+        .iter()
+        .filter(|case| TASK_107_NODE_CASE_IDS.contains(&case.id.as_str()))
+        .map(|case| case.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids, TASK_107_NODE_CASE_IDS,
+        "the Task 107 gate must cover exactly citty, is-plain-obj, and ohash in manifest order"
+    );
+
+    let oracle = NodeOracle::discover(&root).expect("the pinned Node oracle must be available");
+    let bamts = BamtsRunner::new(&root);
+    let mut failures = Vec::new();
+    for id in TASK_107_NODE_CASE_IDS {
+        let case = corpus.case(id).expect("Task 107 case must exist");
+        let expected = oracle.run_case(case);
+        for mode in ExecutionMode::ALL {
+            let actual = bamts.run_case(case, mode);
+            compare_case(&case.id, mode, &expected, &actual, &mut failures);
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "Task 107 differential failures:\n{}",
         failures.join("\n\n")
     );
 }

@@ -10,9 +10,7 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use bamts_bytecode::{Program, Verified};
 use bamts_compiler::diagnostic::{Diagnostic, DiagnosticSeverity};
 use bamts_compiler::lower::LowerOptions;
 use bamts_compiler::pipeline::{FrontendMode, compile_program_frontend};
@@ -23,6 +21,8 @@ pub use bamts_bytecode as bytecode;
 pub use bamts_compiler as compiler;
 #[cfg(feature = "node-host")]
 pub use bamts_node as node;
+#[cfg(feature = "node-host")]
+pub use bamts_node::ScriptCompiler;
 pub use bamts_runtime as runtime;
 
 /// Native-code backends, available only when either native-code feature is enabled.
@@ -123,55 +123,6 @@ impl From<bamts_runtime::RuntimeError> for Error {
 
 /// Result type returned by facade convenience entry points.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-/// The facade's classic-script compiler capability.
-#[derive(Default)]
-pub struct ScriptCompiler;
-
-impl bamts_runtime::CompileProvider for ScriptCompiler {
-    fn compile_script(
-        &mut self,
-        source: bamts_runtime::ScriptSource<'_>,
-    ) -> std::result::Result<Arc<Program<Verified>>, bamts_runtime::ScriptCompileError> {
-        bamts_compiler::compile_classic_script(
-            source.source,
-            &String::from_utf16_lossy(source.name),
-        )
-        .map(Arc::new)
-        .map_err(map_script_compile_error)
-    }
-}
-
-fn map_script_compile_error(
-    error: bamts_compiler::ScriptCompileError,
-) -> bamts_runtime::ScriptCompileError {
-    match error {
-        bamts_compiler::ScriptCompileError::IllFormedSource { unit_offset } => {
-            bamts_runtime::ScriptCompileError::IllFormedSource { unit_offset }
-        }
-        bamts_compiler::ScriptCompileError::Syntax {
-            message,
-            line,
-            column,
-        } => bamts_runtime::ScriptCompileError::Syntax {
-            message,
-            line,
-            column,
-        },
-        bamts_compiler::ScriptCompileError::Unsupported {
-            message,
-            line,
-            column,
-        } => bamts_runtime::ScriptCompileError::Unsupported {
-            message,
-            line,
-            column,
-        },
-        bamts_compiler::ScriptCompileError::Capacity { message } => {
-            bamts_runtime::ScriptCompileError::Capacity { message }
-        }
-    }
-}
 
 /// Compiles an entrypoint and its complete local module graph into one executable program.
 ///

@@ -57,6 +57,10 @@ if (
     throw "bound construction mismatch";
 }
 "#;
+const VM_PROGRAM: &str = r#"import { runInNewContext } from 'node:vm';
+console.log(runInNewContext('1 + 1'));
+console.log(typeof runInNewContext('({})'));
+"#;
 static NEXT_DIRECTORY: AtomicU32 = AtomicU32::new(0);
 
 #[test]
@@ -218,6 +222,36 @@ fn aot_supports_apply_and_bound_callables() {
         .expect("callable AOT executable starts");
     assert_success(&output, "compiled callable program");
     assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn aot_runs_node_vm_in_new_context() {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", VM_PROGRAM);
+    let executable = project
+        .path
+        .join(format!("node-vm{}", std::env::consts::EXE_SUFFIX));
+
+    let compile = Command::new(bamts_binary())
+        .args(["compile", "--target", "aot", "--output"])
+        .arg(&executable)
+        .arg("main.ts")
+        .current_dir(&project.path)
+        .env("BAMTS_CACHE_DIR", project.path.join("cache"))
+        .output()
+        .expect("bamts node:vm AOT compile starts");
+    assert_success(&compile, "bamts compile node:vm AOT");
+
+    let output = Command::new(&executable)
+        .output()
+        .expect("node:vm AOT executable starts");
+    assert_success(&output, "compiled node:vm program");
+    assert!(
+        !stderr(&output).contains("bamts: aot runtime"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(output.stdout, b"2\nobject\n");
 }
 
 #[test]

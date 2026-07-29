@@ -5,7 +5,64 @@
 use std::collections::BTreeMap;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "script-compiler")]
+use std::sync::Arc;
+
+#[cfg(feature = "script-compiler")]
+use bamts_bytecode::{Program, Verified};
 use bamts_runtime::Host;
+
+/// Classic-script compiler capability for Node hosts.
+#[cfg(feature = "script-compiler")]
+#[derive(Default)]
+pub struct ScriptCompiler;
+
+#[cfg(feature = "script-compiler")]
+impl bamts_runtime::CompileProvider for ScriptCompiler {
+    fn compile_script(
+        &mut self,
+        source: bamts_runtime::ScriptSource<'_>,
+    ) -> std::result::Result<Arc<Program<Verified>>, bamts_runtime::ScriptCompileError> {
+        bamts_compiler::compile_classic_script(
+            source.source,
+            &String::from_utf16_lossy(source.name),
+        )
+        .map(Arc::new)
+        .map_err(map_script_compile_error)
+    }
+}
+
+#[cfg(feature = "script-compiler")]
+fn map_script_compile_error(
+    error: bamts_compiler::ScriptCompileError,
+) -> bamts_runtime::ScriptCompileError {
+    match error {
+        bamts_compiler::ScriptCompileError::IllFormedSource { unit_offset } => {
+            bamts_runtime::ScriptCompileError::IllFormedSource { unit_offset }
+        }
+        bamts_compiler::ScriptCompileError::Syntax {
+            message,
+            line,
+            column,
+        } => bamts_runtime::ScriptCompileError::Syntax {
+            message,
+            line,
+            column,
+        },
+        bamts_compiler::ScriptCompileError::Unsupported {
+            message,
+            line,
+            column,
+        } => bamts_runtime::ScriptCompileError::Unsupported {
+            message,
+            line,
+            column,
+        },
+        bamts_compiler::ScriptCompileError::Capacity { message } => {
+            bamts_runtime::ScriptCompileError::Capacity { message }
+        }
+    }
+}
 
 /// Concrete Node-compatible capability state.
 ///
@@ -390,6 +447,8 @@ fn run_aot_main() -> i32 {
     use bamts_runtime::{Limits, run_linked_program};
 
     let mut host = NodeHost::new();
+    #[cfg(feature = "script-compiler")]
+    host.set_script_compiler(Box::new(ScriptCompiler));
     let linked = match linked_program() {
         Ok(linked) => linked,
         Err(_) => return finish_aot_process(&host, AotCompletion::Failure(AotMainFailure::Link)),

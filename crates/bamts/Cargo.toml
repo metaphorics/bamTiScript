@@ -8,7 +8,7 @@ publish.workspace = true
 default = []
 aot = ["dep:bamts-codegen", "bamts-codegen/aot"]
 host-jit = ["dep:bamts-codegen", "bamts-codegen/host-jit"]
-node-host = ["dep:bamts-node", "bamts-node/node-host"]
+node-host = ["dep:bamts-node", "bamts-node/node-host", "bamts-node/script-compiler"]
 
 [dependencies]
 bamts-bytecode = { path = "../bamts-bytecode" }

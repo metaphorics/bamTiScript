@@ -172,10 +172,15 @@ fn parse_args<H: Host>(
             });
             let (value, token_value, inline_value) = match kind {
                 OptionType::Boolean => {
-                    if inline.is_some() {
-                        return Err(type_error("boolean parseArgs option has a value"));
+                    if let Some(text) = inline {
+                        if config.strict {
+                            return Err(type_error("boolean parseArgs option has a value"));
+                        }
+                        let text = text.to_owned();
+                        (alloc_string(machine, &text)?, Some(text), Some(true))
+                    } else {
+                        (Value::boolean(!negative), None, None)
                     }
-                    (Value::boolean(!negative), None, None)
                 }
                 OptionType::String => {
                     let (text, inline_value) = if let Some(text) = inline {
@@ -363,7 +368,10 @@ fn parse_config<H: Host>(
                     return Err(type_error("duplicate parseArgs short option"));
                 }
             }
-            let default = descriptor.get("default").copied();
+            let default = descriptor
+                .get("default")
+                .copied()
+                .filter(|value| *value != Value::UNDEFINED);
             if let Some(default) = default {
                 validate_default(machine, default, kind, multiple)?;
             }
@@ -1216,6 +1224,82 @@ mod tests {
         let missing = config(&mut machine, &["--name"], &[("name", string)], &[]);
         assert!(matches!(
             call_parse_args(&mut machine, missing),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+    }
+
+    #[test]
+    fn parse_args_ignores_undefined_defaults_and_handles_boolean_inline_values() {
+        let program = blank_program();
+        let mut host = EchoHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+
+        let absent_default = descriptor(&mut machine, "string", None, false, None);
+        let undefined_default =
+            descriptor(&mut machine, "string", None, false, Some(Value::UNDEFINED));
+        let defaults = config(
+            &mut machine,
+            &[],
+            &[("absent", absent_default), ("undefined", undefined_default)],
+            &[],
+        );
+        let result = call_parse_args(&mut machine, defaults).unwrap();
+        let values = machine_value(&machine, result, "values");
+        let values_index = machine.runtime_slot(values).unwrap().unwrap();
+        assert!(
+            machine
+                .own_get(
+                    values_index,
+                    &PropertyKey::Named(EcmaString::from_utf8("absent")),
+                )
+                .is_none()
+        );
+        assert!(
+            machine
+                .own_get(
+                    values_index,
+                    &PropertyKey::Named(EcmaString::from_utf8("undefined")),
+                )
+                .is_none()
+        );
+
+        let invalid_default = alloc_string(&mut machine, "invalid").unwrap();
+        let boolean_with_invalid_default =
+            descriptor(&mut machine, "boolean", None, false, Some(invalid_default));
+        let invalid = config(
+            &mut machine,
+            &[],
+            &[("boolean", boolean_with_invalid_default)],
+            &[],
+        );
+        assert!(matches!(
+            call_parse_args(&mut machine, invalid),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+
+        let boolean = descriptor(&mut machine, "boolean", None, false, None);
+        let loose = config(
+            &mut machine,
+            &["--boolean=false"],
+            &[("boolean", boolean)],
+            &[("strict", false)],
+        );
+        let result = call_parse_args(&mut machine, loose).unwrap();
+        let values = machine_value(&machine, result, "values");
+        assert_eq!(
+            text(&machine, machine_value(&machine, values, "boolean")),
+            "false"
+        );
+
+        let boolean = descriptor(&mut machine, "boolean", None, false, None);
+        let strict = config(
+            &mut machine,
+            &["--boolean=false"],
+            &[("boolean", boolean)],
+            &[],
+        );
+        assert!(matches!(
+            call_parse_args(&mut machine, strict),
             Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
         ));
     }

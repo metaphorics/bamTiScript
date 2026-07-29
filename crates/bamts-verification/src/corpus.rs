@@ -87,6 +87,9 @@ pub const TASK_106_SYNC_CASE_IDS: [&str; 11] = [
     "valita",
 ];
 
+/// Pinned Node builtin cases completed by Task 107, in manifest order.
+pub const TASK_107_NODE_CASE_IDS: [&str; 3] = ["citty", "is-plain-obj", "ohash"];
+
 /// The only environment variables the oracle exposes to a case.  Everything
 /// inherited from the parent process is cleared before these are set.
 pub const NORMALIZED_ENV: [&str; 4] = ["TZ=UTC", "LANG=C", "LC_ALL=C", "NO_COLOR=1"];

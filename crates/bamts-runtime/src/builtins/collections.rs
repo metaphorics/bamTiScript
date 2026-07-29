@@ -48,6 +48,8 @@ fn install_map<H: Host>(
     define_getter(heap, prototype, "size", size);
     let entries = named_property(heap, prototype, "entries");
     define_symbol(heap, prototype, builtins.symbol_iterator(), entries);
+    let map_tag = super::super::push(heap, HeapEntry::String(EcmaString::from_utf8("Map")));
+    define_to_string_tag(heap, prototype, builtins.symbol_to_string_tag(), map_tag);
     globals.insert(EcmaString::from_utf8("Map"), constructor);
 }
 
@@ -76,6 +78,8 @@ fn install_set<H: Host>(
     define_getter(heap, prototype, "size", size);
     let values = named_property(heap, prototype, "values");
     define_symbol(heap, prototype, builtins.symbol_iterator(), values);
+    let set_tag = super::super::push(heap, HeapEntry::String(EcmaString::from_utf8("Set")));
+    define_to_string_tag(heap, prototype, builtins.symbol_to_string_tag(), set_tag);
     globals.insert(EcmaString::from_utf8("Set"), constructor);
 }
 
@@ -809,6 +813,20 @@ fn define_symbol(heap: &mut [HeapEntry], object: Value, symbol: Value, value: Va
         builtin_property(value),
     );
 }
+fn define_to_string_tag(heap: &mut [HeapEntry], object: Value, symbol: Value, value: Value) {
+    let HeapEntry::Object { properties, .. } = &mut heap[heap_index(object)] else {
+        unreachable!()
+    };
+    properties.insert(
+        PropertyKey::Symbol(heap_index(symbol) as u32),
+        Property::Data {
+            value,
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        },
+    );
+}
 fn named_property(heap: &[HeapEntry], object: Value, name: &str) -> Value {
     let HeapEntry::Object { properties, .. } = &heap[heap_index(object)] else {
         unreachable!()
@@ -1141,7 +1159,9 @@ mod tests {
         let gen_proto = machine.intrinsics.builtins.generator_prototype();
         let iter_proto = machine.intrinsics.builtins.iterator_prototype();
         assert!(
-            machine.inherits_from_prototype(gen_proto, iter_proto).unwrap(),
+            machine
+                .inherits_from_prototype(gen_proto, iter_proto)
+                .unwrap(),
             "%GeneratorPrototype% must inherit from %IteratorPrototype%"
         );
     }
@@ -1201,7 +1221,10 @@ mod tests {
         let non_generator = object(&mut machine);
         let result = machine.take_generator_state(non_generator);
         assert!(
-            matches!(result, Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))),
+            matches!(
+                result,
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ),
             "next on a non-generator must produce a TypeError"
         );
     }
@@ -1261,5 +1284,61 @@ mod tests {
         let done = machine.get_named_property(result, "done").unwrap();
         assert_eq!(result_value, value);
         assert_eq!(done, Value::TRUE);
+    }
+    #[test]
+    fn map_and_set_to_string_tags() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let object_to_string = machine.intrinsics.object_to_string();
+
+        let map = construct_builtin(&mut machine, "Map", &[]);
+        let map_tag = machine
+            .call_value(object_to_string, map, &[])
+            .expect("Object.prototype.toString.call(new Map()) succeeds");
+        assert!(
+            machine
+                .string_value(map_tag)
+                .is_some_and(|text| text.eq_ascii("[object Map]")),
+            "Map instances expose the Map toStringTag"
+        );
+
+        let set = construct_builtin(&mut machine, "Set", &[]);
+        let set_tag = machine
+            .call_value(object_to_string, set, &[])
+            .expect("Object.prototype.toString.call(new Set()) succeeds");
+        assert!(
+            machine
+                .string_value(set_tag)
+                .is_some_and(|text| text.eq_ascii("[object Set]")),
+            "Set instances expose the Set toStringTag"
+        );
+
+        let tag_symbol = machine.intrinsics.builtins.symbol_to_string_tag();
+        let tag_key =
+            PropertyKey::Symbol(machine.runtime_slot(tag_symbol).unwrap().unwrap() as u32);
+        for name in ["Map", "Set"] {
+            let constructor = machine.intrinsics.global(name).unwrap();
+            let prototype = machine
+                .get_named_property(constructor, "prototype")
+                .unwrap();
+            let prototype_index = machine.runtime_slot(prototype).unwrap().unwrap();
+            let HeapEntry::Object { properties, .. } = &machine.heap[prototype_index] else {
+                panic!("{name}.prototype must be an object");
+            };
+            let Some(Property::Data {
+                writable,
+                enumerable,
+                configurable,
+                ..
+            }) = properties.get(&tag_key)
+            else {
+                panic!("{name}.prototype must own Symbol.toStringTag");
+            };
+            assert_eq!(
+                (*writable, *enumerable, *configurable),
+                (false, false, true)
+            );
+        }
     }
 }

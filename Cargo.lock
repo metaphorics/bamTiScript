@@ -95,6 +95,7 @@ name = "bamts-node"
 version = "0.0.0"
 dependencies = [
  "bamts-bytecode",
+ "bamts-compiler",
  "bamts-native",
  "bamts-runtime",
 ]

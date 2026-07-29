@@ -39,6 +39,13 @@ pub(crate) fn install<H: Host>(
         2,
         run_in_this_context::<H>,
     );
+    let run_in_new_context = register(
+        heap,
+        builtins,
+        "runInNewContext",
+        3,
+        run_in_new_context::<H>,
+    );
     let run_prototype = intrinsics::push(
         heap,
         HeapEntry::Object {
@@ -54,6 +61,22 @@ pub(crate) fn install<H: Host>(
         run_prototype,
         "constructor",
         run_in_this_context,
+    );
+    let run_in_new_context_prototype = intrinsics::push(
+        heap,
+        HeapEntry::Object {
+            properties: PropertyMap::default(),
+            prototype: Some(object_prototype),
+            boxed_primitive: None,
+            extensible: true,
+        },
+    );
+    builtins.set_function_prototype(heap, run_in_new_context, run_in_new_context_prototype);
+    crate::intrinsics::builtins::define_data(
+        heap,
+        run_in_new_context_prototype,
+        "constructor",
+        run_in_new_context,
     );
     let script_run_in_this_context = register(
         heap,
@@ -77,6 +100,7 @@ pub(crate) fn install<H: Host>(
         namespace,
         exports: vec![
             (EcmaString::from_utf8("Script"), script),
+            (EcmaString::from_utf8("runInNewContext"), run_in_new_context),
             (
                 EcmaString::from_utf8("runInThisContext"),
                 run_in_this_context,
@@ -133,7 +157,9 @@ fn script_constructor<H: Host>(
         ));
     }
 
-    let (code, name) = source_arguments(machine, args)?;
+    let code = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    let (code, name) = source_arguments(machine, code, options)?;
     let entry = compile_entry(machine, code, name, ScriptAllocation::Object)?;
     let script = machine
         .allocate(HeapEntry::Script {
@@ -172,7 +198,50 @@ fn run_in_this_context<H: Host>(
     } else {
         None
     };
-    let (code, name) = source_arguments(machine, args)?;
+    let code = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    let (code, name) = source_arguments(machine, code, options)?;
+    let allocation = if constructing {
+        ScriptAllocation::ConstructedCall
+    } else {
+        ScriptAllocation::Call
+    };
+    let entry = compile_entry(machine, code, name, allocation)?;
+    call_entry(machine, entry, prototype)
+}
+
+fn run_in_new_context<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let prototype = if constructing {
+        let function = machine.registry.external[&EcmaString::from_utf8("node:vm")].exports
+            [&EcmaString::from_utf8("runInNewContext")]
+            .value;
+        Some(
+            machine
+                .constructed_prototype(function)
+                .map_err(EvalFailure::Runtime)?,
+        )
+    } else {
+        None
+    };
+    let context = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    if context != Value::UNDEFINED {
+        if !machine.is_object(context) || machine.is_callable(context)? {
+            return Err(type_error(
+                "The \"contextObject\" argument must be an object",
+            ));
+        }
+        return Err(type_error(
+            "runInNewContext context objects are unsupported",
+        ));
+    }
+    let code = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let options = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+    let (code, name) = source_arguments(machine, code, options)?;
     let allocation = if constructing {
         ScriptAllocation::ConstructedCall
     } else {
@@ -216,16 +285,13 @@ fn script_run_in_this_context<H: Host>(
 
 fn source_arguments<H: Host>(
     machine: &mut Machine<'_, H>,
-    args: &[Value],
+    code: Value,
+    options: Value,
 ) -> Result<(EcmaString, EcmaString), EvalFailure> {
-    let code = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-    let Some(options) = args
-        .get(1)
-        .copied()
-        .filter(|value| *value != Value::UNDEFINED)
-    else {
+    let code = machine.to_string(code)?;
+    if options == Value::UNDEFINED {
         return Ok((code, EcmaString::from_utf8("evalmachine.<anonymous>")));
-    };
+    }
     if let Some(name) = machine.string_value(options) {
         return Ok((code, name));
     }
@@ -469,21 +535,39 @@ mod tests {
         let program = program_returning(0);
         let mut host = compiler_host();
         let mut machine = Machine::new(&program, &mut host, Limits::default());
-        let vm = machine
-            .registry
-            .external
-            .get(&EcmaString::from_utf8("node:vm"))
-            .expect("node:vm is installed");
-        let names: Vec<_> = vm.exports.keys().cloned().collect();
-        assert_eq!(
-            names,
-            vec![
-                EcmaString::from_utf8("Script"),
-                EcmaString::from_utf8("default"),
-                EcmaString::from_utf8("runInThisContext"),
-            ]
-        );
-        let (script, run) = vm_exports(&machine);
+        let (script, run, run_new) = {
+            let vm = machine
+                .registry
+                .external
+                .get(&EcmaString::from_utf8("node:vm"))
+                .expect("node:vm is installed");
+            let names: Vec<_> = vm.exports.keys().cloned().collect();
+            assert_eq!(
+                names,
+                vec![
+                    EcmaString::from_utf8("Script"),
+                    EcmaString::from_utf8("default"),
+                    EcmaString::from_utf8("runInNewContext"),
+                    EcmaString::from_utf8("runInThisContext"),
+                ]
+            );
+            let script = vm
+                .exports
+                .get(&EcmaString::from_utf8("Script"))
+                .expect("Script is exported")
+                .value;
+            let run = vm
+                .exports
+                .get(&EcmaString::from_utf8("runInThisContext"))
+                .expect("runInThisContext is exported")
+                .value;
+            let run_new = vm
+                .exports
+                .get(&EcmaString::from_utf8("runInNewContext"))
+                .expect("runInNewContext is exported")
+                .value;
+            (script, run, run_new)
+        };
         let prototype = script_prototype(&machine);
         assert_eq!(
             machine
@@ -558,6 +642,77 @@ mod tests {
                 .builtins
                 .get(builtin_id(&machine, run))
                 .length,
+            2
+        );
+        assert_eq!(
+            machine
+                .intrinsics
+                .builtins
+                .get(builtin_id(&machine, run_new))
+                .length,
+            3
+        );
+    }
+
+    #[test]
+    fn run_in_new_context_executes_compiled_source() {
+        let program = program_returning(0);
+        let mut host = compiler_host();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.instantiate_modules().unwrap();
+        let run = machine.registry.external[&EcmaString::from_utf8("node:vm")].exports
+            [&EcmaString::from_utf8("runInNewContext")]
+            .value;
+        let source = machine
+            .allocate(HeapEntry::String(EcmaString::from_utf8("({})")))
+            .unwrap();
+
+        assert_eq!(
+            machine
+                .call_value(run, Value::UNDEFINED, &[source])
+                .unwrap(),
+            Value::int32(42)
+        );
+        assert!(matches!(
+            machine.call_value(run, Value::UNDEFINED, &[source, Value::NULL]),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+        let context = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        assert!(matches!(
+            machine.call_value(run, Value::UNDEFINED, &[source, context]),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+        assert_eq!(
+            machine
+                .host
+                .compiler
+                .as_ref()
+                .expect("compiler remains installed")
+                .sources
+                .len(),
+            1
+        );
+        assert!(matches!(
+            machine
+                .call_builtin(builtin_id(&machine, run), Value::UNDEFINED, &[source], true)
+                .unwrap(),
+            BuiltinOutcome::ConstructCall { .. }
+        ));
+        assert_eq!(
+            machine
+                .host
+                .compiler
+                .as_ref()
+                .expect("compiler remains installed")
+                .sources
+                .len(),
             2
         );
     }

@@ -54,6 +54,7 @@ pub(super) fn install<H: Host>(
         ("match", 1, string_match::<H>),
         ("matchAll", 1, match_all::<H>),
         ("search", 1, search::<H>),
+        ("localeCompare", 1, locale_compare::<H>),
     ] {
         let f = install_function(heap, builtins, name, length, handler);
         define_data(heap, prototype, name, f)
@@ -100,6 +101,24 @@ fn text<H: Host>(machine: &Machine<'_, H>, this: Value) -> Result<EcmaString, Ev
         return Err(type_error("String method called on null or undefined"));
     }
     machine.to_string(machine.unbox_primitive_or_self(this)?)
+}
+fn locale_compare<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if matches!(this.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+        return Err(type_error("String method called on null or undefined"));
+    }
+    let this = machine.to_string_observable(this)?;
+    let other = machine.to_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let result: i32 = match this.as_units().cmp(other.as_units()) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    };
+    Ok(BuiltinOutcome::Value(Value::int32(result as u32)))
 }
 fn append(out: &mut EcmaStringBuilder, text: &EcmaString) {
     for &unit in text.as_units() {
@@ -1327,6 +1346,68 @@ mod unescape_tests {
     }
 
     #[test]
+    fn locale_compare_uses_observable_utf16_lexical_signs() {
+        let program = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let locale_compare = machine
+            .get_named_property(
+                machine.intrinsics.builtins.string_prototype(),
+                "localeCompare",
+            )
+            .expect("localeCompare is installed");
+        let lower_a = machine
+            .allocate(HeapEntry::String(EcmaString::from_utf8("alpha")))
+            .unwrap();
+        let lower_b = machine
+            .allocate(HeapEntry::String(EcmaString::from_utf8("beta")))
+            .unwrap();
+        let lower_a_again = machine
+            .allocate(HeapEntry::String(EcmaString::from_utf8("alpha")))
+            .unwrap();
+        let upper_a = machine
+            .allocate(HeapEntry::String(EcmaString::from_utf8("Alpha")))
+            .unwrap();
+
+        assert_eq!(
+            machine
+                .call_value(locale_compare, lower_a, &[lower_b])
+                .unwrap(),
+            Value::int32((-1_i32) as u32)
+        );
+        assert_eq!(
+            machine
+                .call_value(locale_compare, lower_b, &[lower_a])
+                .unwrap(),
+            Value::int32(1)
+        );
+        assert_eq!(
+            machine
+                .call_value(locale_compare, lower_a, &[lower_a_again])
+                .unwrap(),
+            Value::int32(0)
+        );
+        assert_eq!(
+            machine
+                .call_value(locale_compare, lower_a, &[upper_a])
+                .unwrap(),
+            Value::int32(1)
+        );
+
+        let coercible = object(&mut machine);
+        let to_string = native(&mut machine, "localeCompare toString", escape_string);
+        machine
+            .set_data_property(coercible, "toString", to_string)
+            .unwrap();
+        assert_eq!(
+            machine
+                .call_value(locale_compare, coercible, &[lower_a])
+                .unwrap(),
+            Value::int32((-1_i32) as u32)
+        );
+    }
+
+    #[test]
     fn string_constructor_renders_symbols_without_relaxing_implicit_coercion() {
         let program = module();
         let mut host = TestHost;
@@ -1356,9 +1437,55 @@ mod unescape_tests {
         let rendered = machine
             .call_value(string_constructor, Value::UNDEFINED, &[symbol])
             .expect("String(Symbol) succeeds");
-        assert!(machine
-            .string_value(rendered)
-            .is_some_and(|text| text.eq_ascii("Symbol(event)")));
+        assert!(
+            machine
+                .string_value(rendered)
+                .is_some_and(|text| text.eq_ascii("Symbol(event)"))
+        );
+    }
+
+    #[test]
+    fn string_constructor_uses_error_to_string_for_constructed_errors() {
+        let program = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let message = machine
+            .allocate(HeapEntry::String(EcmaString::from_utf8("message")))
+            .expect("message allocation succeeds");
+        let error_constructor = machine
+            .intrinsics
+            .global("Error")
+            .expect("Error is installed");
+        let error_index = machine
+            .runtime_slot(error_constructor)
+            .expect("Error is a runtime value")
+            .expect("Error is heap allocated");
+        let HeapEntry::NativeFunction {
+            callable: crate::NativeCallable::Builtin(id),
+            ..
+        } = machine.heap[error_index]
+        else {
+            panic!("Error constructor is native");
+        };
+        let crate::intrinsics::BuiltinOutcome::Value(error) = machine
+            .call_builtin(id, Value::UNDEFINED, &[message], true)
+            .expect("new Error succeeds")
+        else {
+            panic!("new Error returns a value");
+        };
+
+        let string_constructor = machine
+            .intrinsics
+            .global("String")
+            .expect("String is installed");
+        let rendered = machine
+            .call_value(string_constructor, Value::UNDEFINED, &[error])
+            .expect("String(new Error) succeeds");
+        assert!(
+            machine
+                .string_value(rendered)
+                .is_some_and(|text| text.eq_ascii("Error: message"))
+        );
     }
 
     #[test]

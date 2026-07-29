@@ -5322,16 +5322,18 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn add(&mut self, left: Value, right: Value) -> Result<Value, EvalFailure> {
-        let left_string = self.add_string_primitive(left)?;
-        let right_string = self.add_string_primitive(right)?;
+        let left = self.to_primitive_default(left)?;
+        let right = self.to_primitive_default(right)?;
+        let left_string = self.string_text(left).cloned();
+        let right_string = self.string_text(right).cloned();
         if left_string.is_some() || right_string.is_some() {
             let left = match left_string {
                 Some(text) => text,
-                None => self.value_to_string(left, 0)?,
+                None => self.to_string(left)?,
             };
             let right = match right_string {
                 Some(text) => text,
-                None => self.value_to_string(right, 0)?,
+                None => self.to_string(right)?,
             };
             let mut builder = EcmaStringBuilder::with_capacity(
                 left.len_units().saturating_add(right.len_units()),
@@ -5426,6 +5428,14 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::Symbol { .. }
                 | HeapEntry::PrivateName { .. }
         ))
+    }
+
+    fn to_primitive_default(&mut self, value: Value) -> Result<Value, EvalFailure> {
+        let prefer_string = self
+            .runtime_slot(value)
+            .map_err(EvalFailure::Runtime)?
+            .is_some_and(|index| matches!(self.heap[index], HeapEntry::Date { .. }));
+        self.to_primitive_observable(value, prefer_string)
     }
 
     pub(crate) fn to_primitive_observable(
@@ -5692,33 +5702,6 @@ impl<'a, H: Host> Machine<'a, H> {
             None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                 operation: "instanceof",
             })),
-        }
-    }
-
-    fn add_string_primitive(&self, value: Value) -> Result<Option<EcmaString>, EvalFailure> {
-        match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
-            Some(index) => match &self.heap[index] {
-                HeapEntry::String(text) => Ok(Some(text.clone())),
-                HeapEntry::Object { .. }
-                | HeapEntry::Generator { .. }
-                | HeapEntry::Script { .. }
-                | HeapEntry::Array { .. }
-                | HeapEntry::Function { .. }
-                | HeapEntry::ModuleNamespace { .. }
-                | HeapEntry::ExternalModuleNamespace { .. }
-                | HeapEntry::NativeFunction { .. }
-                | HeapEntry::RegExp { .. }
-                | HeapEntry::Date { .. }
-                | HeapEntry::BuiltinIterator { .. }
-                | HeapEntry::Collection { .. }
-                | HeapEntry::Iterator { .. }
-                | HeapEntry::ProcessEnv { .. }
-                | HeapEntry::Symbol { .. }
-                | HeapEntry::PrivateName { .. }
-                | HeapEntry::HashState { .. } => self.value_to_string(value, 0).map(Some),
-                HeapEntry::BigInt(_) => Ok(None),
-            },
-            None => Ok(None),
         }
     }
 
@@ -7029,6 +7012,139 @@ mod tests {
         let execution = run_ok(&module);
         assert_eq!(execution.entry_registers[2], Value::FALSE);
         assert_eq!(execution.value, Value::TRUE);
+    }
+
+    #[test]
+    fn addition_coerces_objects_left_to_right_and_interpolates_errors() {
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("L")),
+                Constant::String(EcmaString::from_utf8("additionOrder")),
+                Constant::String(EcmaString::from_utf8("message")),
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(1),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let left = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .unwrap();
+        let right = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .unwrap();
+        let left_value_of = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(1),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        let right_value_of = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(2),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        machine
+            .set_data_property(left, "valueOf", left_value_of)
+            .unwrap();
+        machine
+            .set_data_property(right, "valueOf", right_value_of)
+            .unwrap();
+        let coerced = machine.add(left, right).unwrap();
+        assert!(
+            machine
+                .string_value(coerced)
+                .is_some_and(|text| text.eq_ascii("LL"))
+        );
+
+        let error_constructor = machine.intrinsics.global("Error").unwrap();
+        let message = machine
+            .allocate(HeapEntry::String(EcmaString::from_utf8("message")))
+            .unwrap();
+        let error = machine
+            .call_value(error_constructor, Value::UNDEFINED, &[message])
+            .unwrap();
+        let empty = machine
+            .allocate(HeapEntry::String(EcmaString::default()))
+            .unwrap();
+        let interpolated = machine.add(empty, error).unwrap();
+        assert!(
+            machine
+                .string_value(interpolated)
+                .is_some_and(|text| text.eq_ascii("Error: message"))
+        );
+
+        let date_constructor = machine.intrinsics.global("Date").unwrap();
+        let date_prototype = machine
+            .get_named_property(date_constructor, "prototype")
+            .unwrap();
+        let date = machine
+            .allocate(HeapEntry::Date {
+                time: 0.0,
+                properties: PropertyMap::default(),
+                prototype: Some(date_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        machine
+            .set_data_property(date, "toString", left_value_of)
+            .unwrap();
+        let date_text = machine.add(date, empty).unwrap();
+        assert!(
+            machine
+                .string_value(date_text)
+                .is_some_and(|text| text.eq_ascii("L"))
+        );
     }
 
     #[test]

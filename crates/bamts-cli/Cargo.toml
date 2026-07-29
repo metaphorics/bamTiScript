@@ -16,7 +16,7 @@ bamts-codegen = { path = "../bamts-codegen", features = ["aot", "host-jit"] }
 bamts-node = { path = "../bamts-node" }
 
 [build-dependencies]
-bamts-node = { path = "../bamts-node", features = ["aot-main"] }
+bamts-node = { path = "../bamts-node", features = ["aot-main", "script-compiler"] }
 
 [lints]
 workspace = true

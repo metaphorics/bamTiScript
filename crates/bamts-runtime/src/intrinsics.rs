@@ -444,6 +444,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     HeapEntry::RegExp { .. } => "RegExp",
                     HeapEntry::BigInt(_) => "BigInt",
                     HeapEntry::PrivateName { .. } => "Symbol",
+                    HeapEntry::Date { .. } => "Date",
                     HeapEntry::Object { .. } if self.is_error_object(index)? => "Error",
                     _ => "Object",
                 })
@@ -485,21 +486,42 @@ impl<'a, H: Host> Machine<'a, H> {
         self.value_to_string(value, 0)
     }
 
-    pub(crate) fn string_constructor_text(&self, value: Value) -> Result<EcmaString, EvalFailure> {
-            let Some(index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
-                return self.to_string(value);
-            };
-            let HeapEntry::Symbol { description } = &self.heap[index] else {
-                return self.to_string(value);
-            };
-            let mut text = EcmaStringBuilder::with_capacity(description.len_units().saturating_add(8));
-            text.push_utf8("Symbol(");
-            for &unit in description.as_units() {
-                text.push_unit(unit);
+    pub(crate) fn string_constructor_text(
+        &mut self,
+        value: Value,
+    ) -> Result<EcmaString, EvalFailure> {
+        if let Some(index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
+            if let HeapEntry::Symbol { description } = &self.heap[index] {
+                let mut text =
+                    EcmaStringBuilder::with_capacity(description.len_units().saturating_add(8));
+                text.push_utf8("Symbol(");
+                for &unit in description.as_units() {
+                    text.push_unit(unit);
+                }
+                text.push_unit(u16::from(b')'));
+                return Ok(text.finish());
             }
-            text.push_unit(u16::from(b')'));
-            Ok(text.finish())
         }
+
+        if !self.is_object(value) {
+            return self.to_string(value);
+        }
+
+        for name in ["toString", "valueOf"] {
+            let method = self.get_named_property(value, name)?;
+            if !self.is_callable(method)? {
+                continue;
+            }
+            let primitive = self.call_value(method, value, &[])?;
+            if !self.is_object(primitive) {
+                return self.to_string(primitive);
+            }
+        }
+
+        Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+            operation: "cannot convert object to primitive without invoking user code",
+        }))
+    }
 
     pub(crate) fn to_boolean(&self, value: Value) -> bool {
         self.truthy(value)
@@ -763,6 +785,13 @@ mod tests {
         assert!(stack.starts_with("TypeError: boom"));
 
         let date = construct_builtin(&mut machine, "Date", &[Value::int32(0)]);
+        let object_to_string = machine.intrinsics.object_to_string();
+        let date_tag = machine.call_value(object_to_string, date, &[]).unwrap();
+        assert!(
+            machine
+                .string_value(date_tag)
+                .is_some_and(|text| text.eq_ascii("[object Date]"))
+        );
         let to_iso = machine.get_named_property(date, "toISOString").unwrap();
         let iso = machine.call_value(to_iso, date, &[]).unwrap();
         assert!(
