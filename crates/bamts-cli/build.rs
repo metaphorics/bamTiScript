@@ -63,13 +63,19 @@ fn select_node_rlib(
     if candidates.is_empty() {
         return None;
     }
-    let compatible = candidates
+    let mut compatible = candidates
         .iter()
         .filter(|candidate| {
             metadata_supports_aot_main(rustc, target, dependencies, candidate, wrapper, out_dir)
         })
         .cloned()
         .collect::<Vec<_>>();
+    compatible.sort_by(|left, right| {
+        let modified = |path: &PathBuf| fs::metadata(path).and_then(|value| value.modified()).ok();
+        modified(right)
+            .cmp(&modified(left))
+            .then_with(|| left.cmp(right))
+    });
     Some(compatible.first().cloned().unwrap_or_else(|| {
         panic!(
             "no bamts-node rlib in `{}` has the metadata required for the aot-main entrypoint; candidates: {}",
