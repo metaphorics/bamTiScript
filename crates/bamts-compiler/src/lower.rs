@@ -2058,6 +2058,10 @@ impl<'a> FunctionContext<'a> {
             let catch_register = self.alloc_register(range)?;
             let handler_pc = self.next_pc();
             if let Some(handler_clause) = &try_statement.handler {
+                if let Some(completion) = self.completion {
+                    let undefined = self.undefined(builder, range)?;
+                    self.move_to(range, completion, undefined)?;
+                }
                 self.push_scope();
                 let clause = handler_clause.data();
                 if let Some(binding) = &clause.binding {
