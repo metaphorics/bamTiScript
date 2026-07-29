@@ -25,8 +25,9 @@
 //! ```
 //!
 //! * `frame` points at the register frame; `frame.handles` (offset 16) is the
-//!   `*mut Value` register array and `frame.bytecode_pc` (offset 8) carries the
-//!   resume token (see [`Suspend`](#suspend-and-the-resume-helper)).
+//!   `*mut Value` register array. `frame.bytecode_pc` (offset 8) records the
+//!   active instruction and carries the resume token after
+//!   [`Suspend`](#suspend-and-the-resume-helper).
 //! * `out` receives the completion value; the returned `u32` is a
 //!   `bamts_native::CompletionTag` discriminant (`Normal`/`Throw`/`Suspend`/
 //!   `FatalTrap`).
@@ -1104,6 +1105,13 @@ impl<'a> Lowering<'a> {
     fn emit_instruction(&mut self, pc: usize, instruction: Instruction) {
         let block = self.pc_blocks[pc].expect("reachable pc has a block");
         self.builder.switch_to_block(block);
+        let current_pc = self.iconst32(i64::from(pc as u32));
+        self.builder.ins().store(
+            MemFlagsData::trusted(),
+            current_pc,
+            self.frame,
+            SHADOW_FRAME_PC_OFFSET,
+        );
         if is_inline_instruction(instruction) {
             self.emit_consume_fuel();
         }
@@ -1529,6 +1537,13 @@ impl<'a> Lowering<'a> {
     fn emit_resume_prologue(&mut self, pc: usize, dst: Register, resume: Pc) {
         let block = self.resume_blocks[&pc];
         self.builder.switch_to_block(block);
+        let current_pc = self.iconst32(i64::from(pc as u32));
+        self.builder.ins().store(
+            MemFlagsData::trusted(),
+            current_pc,
+            self.frame,
+            SHADOW_FRAME_PC_OFFSET,
+        );
         let tag = self.call_helper(Helper::ResumeValue, &[self.frame, self.out]);
 
         let normal = self.builder.create_block();

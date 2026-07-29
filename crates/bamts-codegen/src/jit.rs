@@ -276,7 +276,8 @@ mod tests {
         Register,
     };
     use bamts_native::{
-        AbiError, Completion, CompletionTag, NativeEntryTable, NativeHelper, ShadowFrame, Value,
+        AbiError, Completion, CompletionTag, HelperCall, HelperResult, NativeEntryTable,
+        NativeFrame, NativeHelper, NativeOps, ShadowFrame, Value, with_native_ops,
     };
     use bamts_runtime::{
         Host, Limits, NativeError, RuntimeError, RuntimeErrorKind, run_linked_program,
@@ -289,6 +290,22 @@ mod tests {
     struct SilentHost;
 
     impl Host for SilentHost {}
+
+    struct FatalResume;
+
+    impl NativeOps for FatalResume {
+        fn truthy(&self, _frame: &mut NativeFrame<'_>, _value: Value) -> bool {
+            unreachable!("resume fixture never tests truthiness")
+        }
+
+        fn dispatch(&self, _frame: &mut NativeFrame<'_>, call: HelperCall) -> HelperResult {
+            assert_eq!(call, HelperCall::ResumeValue);
+            HelperResult {
+                tag: CompletionTag::FatalTrap,
+                value: Value::int32(99),
+            }
+        }
+    }
 
     #[derive(Default)]
     struct RecordingHost {
@@ -457,17 +474,12 @@ mod tests {
     fn assert_fuel_exhausted(
         result: Result<bamts_runtime::ExecutionOutcome, NativeError>,
         limit: u64,
-    ) {
-        assert!(
-            matches!(
-                result,
-                Err(NativeError::Runtime(RuntimeError {
-                    kind: RuntimeErrorKind::FuelExhausted { limit: found },
-                    ..
-                })) if found == limit
-            ),
-            "expected fuel exhaustion at limit {limit}, got {result:?}"
-        );
+    ) -> RuntimeError {
+        let Err(NativeError::Runtime(error)) = result else {
+            panic!("expected fuel exhaustion at limit {limit}, got {result:?}");
+        };
+        assert_eq!(error.kind, RuntimeErrorKind::FuelExhausted { limit });
+        error
     }
 
     #[test]
@@ -543,7 +555,7 @@ mod tests {
         );
         let compiled = compile_jit(&bytecode).expect("mixed program compiles");
 
-        for fuel in [0, 4] {
+        for (fuel, pc) in [(0, 0), (4, 4)] {
             let mut host = SilentHost;
             let result = run_linked_program(
                 &bytecode,
@@ -554,7 +566,7 @@ mod tests {
                     ..Limits::default()
                 },
             );
-            assert_fuel_exhausted(result, fuel);
+            assert_eq!(assert_fuel_exhausted(result, fuel).pc, Pc::new(pc));
         }
 
         let mut host = SilentHost;
@@ -571,6 +583,43 @@ mod tests {
             result.is_ok(),
             "five instructions fit fuel five: {result:?}"
         );
+    }
+
+    #[test]
+    fn resumed_helper_failure_reports_suspend_pc() {
+        let bytecode = one_function_program(
+            vec![
+                Constant::String(EcmaString::from_utf8("entry")),
+                Constant::Null,
+            ],
+            1,
+            vec![
+                Instruction::LoadConst {
+                    dst: Register::new(0),
+                    constant: ConstantId::new(1),
+                },
+                Instruction::Suspend {
+                    dst: Register::new(0),
+                    src: Register::new(0),
+                    resume: Pc::new(2),
+                },
+                Instruction::Halt,
+            ],
+            Vec::new(),
+        );
+        let program = compile_jit(&bytecode).expect("suspend program compiles");
+        let mut register = Value::UNINITIALIZED;
+        let mut frame = ShadowFrame::new(core::ptr::null_mut(), 2, 0, &mut register, 1);
+        let mut completion = Completion::new(Value::UNDEFINED);
+        let mut ops = FatalResume;
+
+        let tag = with_native_ops(&mut ops, || {
+            program.invoke(0, 0, &mut frame, &mut completion)
+        })
+        .expect("compiled entry is registered");
+
+        assert_eq!(tag, CompletionTag::FatalTrap);
+        assert_eq!(frame.bytecode_pc, 1);
     }
 
     #[test]
