@@ -7,9 +7,7 @@ use super::{
     allocate_string, define_data, install_function, range_error, type_error, value_number,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
-use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
-
-const DATE_VALUE: &str = "\0Date.value";
+use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyKey, PropertyMap};
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -59,22 +57,12 @@ fn constructor<H: Host>(
     }
     let constructor = machine.intrinsics.global("Date").expect("Date installed");
     let prototype = machine.get_named_property(constructor, "prototype")?;
-    let mut properties = PropertyMap::default();
-    properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8(DATE_VALUE)),
-        Property::Data {
-            value: crate::number_value(milliseconds),
-            writable: true,
-            enumerable: false,
-            configurable: false,
-        },
-    );
     let object = machine
-        .allocate(HeapEntry::Object {
-            properties,
+        .allocate(HeapEntry::Date {
+            time: milliseconds,
+            properties: PropertyMap::default(),
             prototype: Some(prototype),
             extensible: true,
-            boxed_primitive: None,
         })
         .map_err(EvalFailure::Runtime)?;
     Ok(BuiltinOutcome::Value(object))
@@ -97,7 +85,9 @@ fn get_time<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    Ok(BuiltinOutcome::Value(date_value(machine, this)?))
+    Ok(BuiltinOutcome::Value(crate::number_value(date_time(
+        machine, this,
+    )?)))
 }
 
 fn to_iso_string<H: Host>(
@@ -106,7 +96,7 @@ fn to_iso_string<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let milliseconds = value_number(date_value(machine, this)?);
+    let milliseconds = date_time(machine, this)?;
     let text = iso_string(milliseconds).ok_or_else(|| range_error("Invalid time value"))?;
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
@@ -114,13 +104,14 @@ fn to_iso_string<H: Host>(
     )?))
 }
 
-fn date_value<H: Host>(machine: &mut Machine<'_, H>, this: Value) -> Result<Value, EvalFailure> {
-    let value = machine.get_named_property(this, DATE_VALUE)?;
-    if value == Value::UNDEFINED {
-        Err(type_error("Date method called on incompatible receiver"))
-    } else {
-        Ok(value)
-    }
+fn date_time<H: Host>(machine: &Machine<'_, H>, this: Value) -> Result<f64, EvalFailure> {
+    let Some(index) = machine.runtime_slot(this).map_err(EvalFailure::Runtime)? else {
+        return Err(type_error("Date method called on incompatible receiver"));
+    };
+    let HeapEntry::Date { time, .. } = &machine.heap[index] else {
+        return Err(type_error("Date method called on incompatible receiver"));
+    };
+    Ok(*time)
 }
 
 fn iso_string(milliseconds: f64) -> Option<String> {

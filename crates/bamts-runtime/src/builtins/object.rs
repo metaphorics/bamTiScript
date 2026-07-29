@@ -818,6 +818,20 @@ fn clone_value<H: Host>(
             }
             Ok(clone)
         }
+        HeapEntry::Date {
+            time, prototype, ..
+        } => {
+            let clone = machine
+                .allocate(HeapEntry::Date {
+                    time,
+                    properties: PropertyMap::default(),
+                    prototype,
+                    extensible: true,
+                })
+                .map_err(EvalFailure::Runtime)?;
+            seen.insert(index, clone);
+            Ok(clone)
+        }
         _ => Err(type_error("value could not be cloned")),
     }
 }

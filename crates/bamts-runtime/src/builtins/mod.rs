@@ -699,6 +699,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 properties,
                 extensible,
                 ..
+            }
+            | HeapEntry::Date {
+                properties,
+                extensible,
+                ..
             } => (properties, extensible),
             HeapEntry::ProcessEnv { extensible, .. } => {
                 *extensible = false;
@@ -749,6 +754,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 ..
             }
             | HeapEntry::RegExp {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::Date {
                 properties,
                 extensible,
                 ..
@@ -826,7 +836,8 @@ impl<'a, H: Host> Machine<'a, H> {
             HeapEntry::Object { properties, .. }
             | HeapEntry::Function { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
-            | HeapEntry::RegExp { properties, .. } => properties,
+            | HeapEntry::RegExp { properties, .. }
+            | HeapEntry::Date { properties, .. } => properties,
             _ => return Ok(None),
         };
         Ok(properties.get(key).cloned())
@@ -891,6 +902,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 ..
             }
             | HeapEntry::RegExp {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::Date {
                 properties,
                 extensible,
                 ..

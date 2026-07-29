@@ -328,7 +328,7 @@ impl<H: Host> Machine<'_, H> {
                         }
                         Ok(format!("[ {} ]", parts.join(", ")))
                     }
-                    HeapEntry::Object { properties, .. } => {
+                    HeapEntry::Object { properties, .. } | HeapEntry::Date { properties, .. } => {
                         if depth >= 2 {
                             return Ok("[Object]".to_owned());
                         }

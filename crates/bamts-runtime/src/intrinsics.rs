@@ -740,4 +740,61 @@ mod tests {
                 .is_none_or(|name| name.as_units().first() != Some(&0))
         }));
     }
+
+    #[test]
+    fn date_state_is_typed_and_unforgeable() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let date = construct_builtin(&mut machine, "Date", &[Value::int32(0)]);
+        assert!(machine.own_property_keys(date).unwrap().is_empty());
+        let get_time = machine.get_named_property(date, "getTime").unwrap();
+
+        machine
+            .set_data_property(date, "\0Date.value", Value::int32(99))
+            .unwrap();
+        assert_eq!(
+            machine.call_value(get_time, date, &[]).unwrap(),
+            Value::int32(0)
+        );
+
+        let derived = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(date),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .unwrap();
+        assert!(machine.call_value(get_time, derived, &[]).is_err());
+
+        let structured_clone = machine.intrinsics.global("structuredClone").unwrap();
+        let clone = machine
+            .call_value(structured_clone, Value::UNDEFINED, &[date])
+            .unwrap();
+        assert_eq!(
+            machine.call_value(get_time, clone, &[]).unwrap(),
+            Value::int32(0)
+        );
+        assert!(machine.own_property_keys(clone).unwrap().is_empty());
+
+        let pair = machine
+            .allocate(HeapEntry::Array {
+                elements: vec![date, date],
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.array_prototype),
+                extensible: true,
+                length_writable: true,
+            })
+            .unwrap();
+        let pair_clone = machine
+            .call_value(structured_clone, Value::UNDEFINED, &[pair])
+            .unwrap();
+        let pair_index = machine.runtime_slot(pair_clone).unwrap().unwrap();
+        let HeapEntry::Array { elements, .. } = &machine.heap[pair_index] else {
+            panic!("cloned pair remains an array")
+        };
+        assert_eq!(elements[0], elements[1]);
+    }
 }
