@@ -103,7 +103,7 @@ use std::marker::PhantomData;
 /// `BMTBC\0\0\1`, matching `Bamti.Bytecode.magicBytes`.
 pub const MAGIC: [u8; 8] = [66, 77, 84, 66, 67, 0, 0, 1];
 /// The sole supported wire version.
-pub const FORMAT_VERSION: u8 = 2;
+pub const FORMAT_VERSION: u8 = 3;
 
 /// Structural verify-time ceiling on a function's register count. Generous
 /// enough for real code yet bounds definite-initialization bitset allocation.
@@ -459,7 +459,7 @@ impl AccessorKind {
     }
 }
 
-/// The production instruction algebra. Opcodes 0..=35 are stable wire tags.
+/// The production instruction algebra. Opcodes 0..=36 are stable wire tags.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Instruction {
     /// Load a constant into `dst` (refines the formal `Load`).
@@ -483,6 +483,9 @@ pub enum Instruction {
     CreateObject { dst: Register },
     /// Create a fresh empty array in `dst`.
     CreateArray { dst: Register },
+    /// Create a compiler-private one-element array cell seeded with the
+    /// runtime-only uninitialized sentinel.
+    CreateCell { dst: Register },
     /// Materialize a closure over `function`, binding the captured cells held in
     /// the array register `captures`, into `dst`. The captured cells initialize
     /// the callee's leading `capture_count` registers.
@@ -687,6 +690,7 @@ impl Instruction {
             Self::LoadConst { .. }
             | Self::CreateObject { .. }
             | Self::CreateArray { .. }
+            | Self::CreateCell { .. }
             | Self::LoadGlobal { .. }
             | Self::TypeOfGlobal { .. }
             | Self::LoadThis { .. }
@@ -710,6 +714,7 @@ impl Instruction {
             | Self::Binary { dst, .. }
             | Self::CreateObject { dst }
             | Self::CreateArray { dst }
+            | Self::CreateCell { dst }
             | Self::CreateClosure { dst, .. }
             | Self::GetProperty { dst, .. }
             | Self::DeleteProperty { dst, .. }
@@ -764,6 +769,7 @@ impl Instruction {
             | Self::Binary { .. }
             | Self::CreateObject { .. }
             | Self::CreateArray { .. }
+            | Self::CreateCell { .. }
             | Self::CreateClosure { .. }
             | Self::GetProperty { .. }
             | Self::SetProperty { .. }
@@ -1664,7 +1670,9 @@ fn verify_instruction(
             check_register(left)?;
             check_register(right)?;
         }
-        Instruction::CreateObject { dst } | Instruction::CreateArray { dst } => {
+        Instruction::CreateObject { dst }
+        | Instruction::CreateArray { dst }
+        | Instruction::CreateCell { dst } => {
             check_register(dst)?;
         }
         Instruction::CreateClosure {
@@ -2424,6 +2432,9 @@ impl<'a> Decoder<'a> {
                 src: Register::new(self.leb128()?),
             }),
             35 => Ok(Instruction::Halt),
+            36 => Ok(Instruction::CreateCell {
+                dst: Register::new(self.leb128()?),
+            }),
             opcode => Err(self.error(opcode_at, DecodeErrorKind::InvalidOpcode { opcode })),
         }
     }
@@ -2827,6 +2838,10 @@ fn encode_instruction(instruction: Instruction, output: &mut Vec<u8>) {
             write_u32(src.get(), output);
         }
         Instruction::Halt => output.push(35),
+        Instruction::CreateCell { dst } => {
+            output.push(36);
+            write_u32(dst.get(), output);
+        }
     }
 }
 
@@ -3061,7 +3076,7 @@ mod tests {
 
     /// Every opcode variant survives an encode -> decode round-trip at the
     /// instruction level, independent of CFG/reference validity. This pins the
-    /// wire tag and field order for all 36 opcodes.
+    /// wire tag and field order for all 37 opcodes.
     #[test]
     fn every_opcode_round_trips_on_the_wire() {
         let instructions = [
@@ -3214,8 +3229,11 @@ mod tests {
                 src: Register::new(74),
             },
             Instruction::Halt,
+            Instruction::CreateCell {
+                dst: Register::new(75),
+            },
         ];
-        assert_eq!(instructions.len(), 36, "one case per opcode");
+        assert_eq!(instructions.len(), 37, "one case per opcode");
         let limits = DecodeLimits::default();
         for (opcode, instruction) in instructions.into_iter().enumerate() {
             let mut bytes = Vec::new();

@@ -229,6 +229,7 @@ fn helper_address(helper: Helper) -> *const u8 {
         Helper::Binary => bamts_native::bamts_binary as *const u8,
         Helper::CreateObject => bamts_native::bamts_create_object as *const u8,
         Helper::CreateArray => bamts_native::bamts_create_array as *const u8,
+        Helper::CreateCell => bamts_native::bamts_create_cell as *const u8,
         Helper::CreateClosure => bamts_native::bamts_create_closure as *const u8,
         Helper::GetProperty => bamts_native::bamts_get_property as *const u8,
         Helper::SetProperty => bamts_native::bamts_set_property as *const u8,

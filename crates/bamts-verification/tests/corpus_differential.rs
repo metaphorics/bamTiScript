@@ -92,6 +92,94 @@ run();
 }
 
 #[test]
+fn local_lexical_tdz_matches_node_in_jit_and_aot() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("task-106-local-tdz-{}", process::id());
+    let entrypoint = format!("target/{id}.js");
+    let path = root.join(&entrypoint);
+    fs::write(
+        &path,
+        "function outcome(operation) {
+  try { return String(operation()); }
+  catch (error) { return error.name; }
+}
+function earlyRead() {
+  const read = () => later;
+  const observed = outcome(read);
+  let later = 1;
+  return observed;
+}
+function lateRead() {
+  const read = () => later;
+  let later = 1;
+  return read();
+}
+function hoisted() {
+  return declaredLater();
+  function declaredLater() { return 2; }
+}
+function blockRead() {
+  let value = 1;
+  {
+    const read = () => value;
+    const observed = outcome(read);
+    let value = 2;
+    return observed;
+  }
+}
+function localClassName() {
+  class LocalClass { static value = LocalClass; }
+  return LocalClass.value === LocalClass;
+}
+const C = class {};
+const heritage = outcome(() => { class C extends C {}; return C; });
+const expressionHeritage = outcome(() => class C extends C {});
+class StaticClass { static value = StaticClass; }
+const staticClassName = String(StaticClass.value === StaticClass);
+const typeResult = outcome(() => { return typeof value; let value; });
+process.stdout.write([
+  earlyRead(),
+  lateRead(),
+  hoisted(),
+  heritage,
+  expressionHeritage,
+  staticClassName,
+  String(localClassName()),
+  blockRead(),
+  typeResult,
+].join('\\n') + '\\n');
+",
+    )
+    .expect("write local TDZ fixture");
+    let spec = CaseSpec {
+        id,
+        repository: "local".to_owned(),
+        commit: "0".repeat(40),
+        license: "UNLICENSED".to_owned(),
+        source_dir: "target".to_owned(),
+        entrypoint,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+    };
+    let oracle = NodeOracle::discover(&root).expect("the pinned Node oracle must be available");
+    let bamts = BamtsRunner::new(&root);
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_file(path).expect("remove local TDZ fixture");
+    assert!(
+        failures.is_empty(),
+        "local lexical TDZ differential failures:\n{}",
+        failures.join("\n\n")
+    );
+}
+
+#[test]
 fn task_106_sync_cases_match_node_in_jit_and_aot() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let corpus = load_corpus(&root).expect("the pinned corpus must parse and validate");

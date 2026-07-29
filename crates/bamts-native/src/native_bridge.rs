@@ -1,4 +1,4 @@
-//! The native runtime bridge: the typed helper-call algebra, the exact 30
+//! The native runtime bridge: the typed helper-call algebra, the exact 32
 //! `bamts_*` C-ABI helper exports, the panic- and nesting-safe thread-local
 //! [`NativeOps`] dispatch seam, and the feature-gated JIT and AOT linkage
 //! surfaces.
@@ -37,16 +37,10 @@ use crate::{Completion, CompletionTag, ShadowFrame, Value};
 // -- The helper algebra ------------------------------------------------------
 
 /// The number of runtime helpers, `0..HELPER_COUNT`.
-pub const HELPER_COUNT: u32 = 31;
+pub const HELPER_COUNT: u32 = 32;
 
 /// A runtime helper, identified by its stable ABI index. The variant order is
-/// the canonical `external_index` order (0..30) and is byte-identical to
-/// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
+/// the canonical `external_index` order (0..31) and is byte-identical to
 /// `bamts_codegen::Helper`; [`NativeHelper::symbol`] returns the exact linker
 /// symbol generated code resolves against.
 #[repr(u32)]
@@ -300,6 +294,14 @@ pub enum NativeHelper {
     ///
     /// `bamts_consume_fuel` — index 30.
     ConsumeFuel = 30,
+    /// `bamts_create_cell` — index 31.
+    ///
+    /// # Safety
+    ///
+    /// The caller must provide a live, uniquely owned `frame` whose nonempty
+    /// handle range is disjoint from its header, and a live, aligned, writable
+    /// `out`. Both remain valid and unaliased for the full call.
+    CreateCell = 31,
 }
 
 impl NativeHelper {
@@ -345,6 +347,7 @@ impl NativeHelper {
             NativeHelper::IteratorNext => "bamts_iterator_next",
             NativeHelper::Export => "bamts_export",
             NativeHelper::ConsumeFuel => "bamts_consume_fuel",
+            NativeHelper::CreateCell => "bamts_create_cell",
         }
     }
 
@@ -390,6 +393,7 @@ impl NativeHelper {
             28 => Some(NativeHelper::IteratorNext),
             29 => Some(NativeHelper::Export),
             30 => Some(NativeHelper::ConsumeFuel),
+            31 => Some(NativeHelper::CreateCell),
             _ => None,
         }
     }
@@ -419,6 +423,8 @@ pub enum HelperCall {
     CreateObject,
     /// A fresh empty array.
     CreateArray,
+    /// A compiler-private array cell seeded with the uninitialized sentinel.
+    CreateCell,
     /// A closure over `function_id` binding the `captures` array value.
     CreateClosure { function_id: u32, captures: Value },
     /// `object[key]`.
@@ -505,6 +511,7 @@ impl HelperCall {
             HelperCall::Binary { .. } => NativeHelper::Binary,
             HelperCall::CreateObject => NativeHelper::CreateObject,
             HelperCall::CreateArray => NativeHelper::CreateArray,
+            HelperCall::CreateCell => NativeHelper::CreateCell,
             HelperCall::CreateClosure { .. } => NativeHelper::CreateClosure,
             HelperCall::GetProperty { .. } => NativeHelper::GetProperty,
             HelperCall::SetProperty { .. } => NativeHelper::SetProperty,
@@ -987,6 +994,18 @@ pub unsafe extern "C" fn bamts_create_object(frame: *mut ShadowFrame, out: *mut 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bamts_create_array(frame: *mut ShadowFrame, out: *mut Completion) -> u32 {
     dispatch_simple(frame, out, HelperCall::CreateArray)
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out`.
+/// Both remain valid and unaliased for the full call.
+///
+/// `bamts_create_cell(frame, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_create_cell(frame: *mut ShadowFrame, out: *mut Completion) -> u32 {
+    dispatch_simple(frame, out, HelperCall::CreateCell)
 }
 
 /// # Safety
@@ -2168,7 +2187,7 @@ mod tests {
     /// this helper has one. Both remain valid and unaliased for the full call.
     ///
     /// `bamts_codegen::Helper::{external_index, symbol}`.
-    const CODEGEN_HELPERS: [(u32, &str); 31] = [
+    const CODEGEN_HELPERS: [(u32, &str); 32] = [
         (0, "bamts_load_constant"),
         (1, "bamts_unary"),
         (2, "bamts_binary"),
@@ -2200,6 +2219,7 @@ mod tests {
         (28, "bamts_iterator_next"),
         (29, "bamts_export"),
         (30, "bamts_consume_fuel"),
+        (31, "bamts_create_cell"),
     ];
 
     /// A recording dispatcher: captures the last call and returns a fixed
@@ -2371,6 +2391,7 @@ mod tests {
             HelperCall::ConsumeFuel { amount: 1 }.helper(),
             NativeHelper::ConsumeFuel
         );
+        assert_eq!(HelperCall::CreateCell.helper(), NativeHelper::CreateCell);
     }
 
     #[test]

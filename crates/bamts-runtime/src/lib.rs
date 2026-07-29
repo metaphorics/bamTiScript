@@ -433,45 +433,52 @@ impl Property {
 #[derive(Clone, Debug, Default)]
 struct PropertyMap(Vec<(PropertyKey, Property)>);
 
-impl PropertyMap { fn get(&self, key: &PropertyKey) -> Option<&Property> {
-    self.0
-        .iter()
-        .find_map(|(candidate, property)| (candidate == key).then_some(property))
-}
-
-fn get_mut(&mut self, key: &PropertyKey) -> Option<&mut Property> {
-    self.0
-        .iter_mut()
-        .find_map(|(candidate, property)| (candidate == key).then_some(property))
-}
-
-fn contains_key(&self, key: &PropertyKey) -> bool {
-    self.get(key).is_some()
-}
-
-fn get_ascii(&self, ascii: &str) -> Option<&Property> {
-    debug_assert!(ascii.is_ascii());
-    self.0
-        .iter()
-        .find_map(|(key, property)| key.eq_ascii(ascii).then_some(property))
-}
-
-fn insert(&mut self, key: PropertyKey, property: Property) -> Option<Property> {
-    if let Some(existing) = self.get_mut(&key) {
-        return Some(std::mem::replace(existing, property));
+impl PropertyMap {
+    fn get(&self, key: &PropertyKey) -> Option<&Property> {
+        self.0
+            .iter()
+            .find_map(|(candidate, property)| (candidate == key).then_some(property))
     }
-    self.0.push((key, property));
-    None
-}
 
-fn remove(&mut self, key: &PropertyKey) -> Option<Property> {
-    let index = self.0.iter().position(|(candidate, _)| candidate == key)?;
-    Some(self.0.remove(index).1)
-}
+    fn get_mut(&mut self, key: &PropertyKey) -> Option<&mut Property> {
+        self.0
+            .iter_mut()
+            .find_map(|(candidate, property)| (candidate == key).then_some(property))
+    }
 
-fn iter(&self) -> impl Iterator<Item = (&PropertyKey, &Property)> {
-    self.0.iter().map(|(key, property)| (key, property))
-} fn charge_bytes(&self) -> usize { self.0.iter().fold(0, |bytes, (key, _)| bytes.saturating_add(key.charge_bytes())) } }
+    fn contains_key(&self, key: &PropertyKey) -> bool {
+        self.get(key).is_some()
+    }
+
+    fn get_ascii(&self, ascii: &str) -> Option<&Property> {
+        debug_assert!(ascii.is_ascii());
+        self.0
+            .iter()
+            .find_map(|(key, property)| key.eq_ascii(ascii).then_some(property))
+    }
+
+    fn insert(&mut self, key: PropertyKey, property: Property) -> Option<Property> {
+        if let Some(existing) = self.get_mut(&key) {
+            return Some(std::mem::replace(existing, property));
+        }
+        self.0.push((key, property));
+        None
+    }
+
+    fn remove(&mut self, key: &PropertyKey) -> Option<Property> {
+        let index = self.0.iter().position(|(candidate, _)| candidate == key)?;
+        Some(self.0.remove(index).1)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&PropertyKey, &Property)> {
+        self.0.iter().map(|(key, property)| (key, property))
+    }
+    fn charge_bytes(&self) -> usize {
+        self.0.iter().fold(0, |bytes, (key, _)| {
+            bytes.saturating_add(key.charge_bytes())
+        })
+    }
+}
 
 impl<'a> IntoIterator for &'a PropertyMap {
     type Item = (&'a PropertyKey, &'a Property);
@@ -675,7 +682,52 @@ pub(crate) struct BoundCallable {
 }
 
 impl HeapEntry {
-    fn initial_bytes(&self) -> usize { match self { Self::String(text) | Self::Symbol { description: text } | Self::PrivateName { description: text } => text.len_units().saturating_mul(2), Self::BigInt(text) => text.len(), Self::RegExp { pattern, flags, .. } => pattern.len_units().saturating_add(flags.len_units()).saturating_mul(2), Self::HashState { algorithm, data, .. } => algorithm.len() + data.len(), Self::Collection { entries, .. } => entries.len().saturating_mul(CollectionEntry::BYTES).saturating_add(1), Self::NativeFunction { callable, .. } => match callable { NativeCallable::Builtin(_) => 1, NativeCallable::Bound(bound) => bound.arguments.len().saturating_add(1), }, Self::Generator { state, .. } => match state { GeneratorState::SuspendedStart(start) => start.captures.len().saturating_add(start.args.len()).saturating_add(1), GeneratorState::Suspended(activation) => activation.registers.len().saturating_add(activation.args.len()).saturating_add(1), GeneratorState::Executing | GeneratorState::Completed => 1, }, Self::Object { properties, .. } => properties.charge_bytes().saturating_add(1), Self::Array { .. } | Self::Function { .. } | Self::Script { .. } | Self::ModuleNamespace { .. } | Self::ExternalModuleNamespace { .. } | Self::ProcessEnv { .. } | Self::Date { .. } | Self::BuiltinIterator { .. } | Self::Iterator { .. } => 1, } }
+    fn initial_bytes(&self) -> usize {
+        match self {
+            Self::String(text)
+            | Self::Symbol { description: text }
+            | Self::PrivateName { description: text } => text.len_units().saturating_mul(2),
+            Self::BigInt(text) => text.len(),
+            Self::RegExp { pattern, flags, .. } => pattern
+                .len_units()
+                .saturating_add(flags.len_units())
+                .saturating_mul(2),
+            Self::HashState {
+                algorithm, data, ..
+            } => algorithm.len() + data.len(),
+            Self::Collection { entries, .. } => entries
+                .len()
+                .saturating_mul(CollectionEntry::BYTES)
+                .saturating_add(1),
+            Self::NativeFunction { callable, .. } => match callable {
+                NativeCallable::Builtin(_) => 1,
+                NativeCallable::Bound(bound) => bound.arguments.len().saturating_add(1),
+            },
+            Self::Generator { state, .. } => match state {
+                GeneratorState::SuspendedStart(start) => start
+                    .captures
+                    .len()
+                    .saturating_add(start.args.len())
+                    .saturating_add(1),
+                GeneratorState::Suspended(activation) => activation
+                    .registers
+                    .len()
+                    .saturating_add(activation.args.len())
+                    .saturating_add(1),
+                GeneratorState::Executing | GeneratorState::Completed => 1,
+            },
+            Self::Object { properties, .. } => properties.charge_bytes().saturating_add(1),
+            Self::Array { .. }
+            | Self::Function { .. }
+            | Self::Script { .. }
+            | Self::ModuleNamespace { .. }
+            | Self::ExternalModuleNamespace { .. }
+            | Self::ProcessEnv { .. }
+            | Self::Date { .. }
+            | Self::BuiltinIterator { .. }
+            | Self::Iterator { .. } => 1,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -764,10 +816,7 @@ enum EvalFailure {
     Throw(ThrowOrigin),
     ThrowValue(Value),
     Runtime(RuntimeErrorKind),
-    ThrowValueOrigin {
-        value: Value,
-        origin: ThrowOrigin,
-    },
+    ThrowValueOrigin { value: Value, origin: ThrowOrigin },
 }
 
 pub(crate) fn import_failure(error: &RuntimeError) -> EvalFailure {
@@ -1797,6 +1846,19 @@ impl<'a, H: Host> Machine<'a, H> {
                     self.write_register(frame_index, dst.get(), value);
                     self.frames[frame_index].pc = pc + 1;
                 }
+                Instruction::CreateCell { dst } => {
+                    let value = self
+                        .allocate(HeapEntry::Array {
+                            elements: vec![Value::UNINITIALIZED],
+                            properties: PropertyMap::default(),
+                            prototype: Some(self.intrinsics.array_prototype),
+                            extensible: true,
+                            length_writable: true,
+                        })
+                        .map_err(|kind| self.error_at(kind, function_index, pc))?;
+                    self.write_register(frame_index, dst.get(), value);
+                    self.frames[frame_index].pc = pc + 1;
+                }
                 Instruction::CreateClosure {
                     dst,
                     function,
@@ -2130,7 +2192,10 @@ impl<'a, H: Host> Machine<'a, H> {
                         .is_some_and(|boundary| *boundary == frame_index) =>
                 {
                     let value = self.read_register(frame_index, src.get());
-                    let frame = self.frames.pop().expect("generator activation is executing");
+                    let frame = self
+                        .frames
+                        .pop()
+                        .expect("generator activation is executing");
                     self.pending_generator_resume = Some(GeneratorResume::Yield {
                         value,
                         activation: GeneratorActivation {
@@ -2245,9 +2310,23 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(())
     }
 
-    fn ensure_object_property_capacity(&self, property_bytes: usize) -> Result<(), RuntimeErrorKind> { let bytes = property_bytes.checked_add(1).ok_or(RuntimeErrorKind::HeapByteLimitExceeded { limit: self.limits.max_heap_bytes })?; self.ensure_allocation_capacity(1, bytes) } fn charge_heap(&mut self, bytes: usize) -> Result<(), RuntimeErrorKind> { self.ensure_allocation_capacity(0, bytes)?;
-    self.heap_bytes += bytes;
-    Ok(()) }
+    fn ensure_object_property_capacity(
+        &self,
+        property_bytes: usize,
+    ) -> Result<(), RuntimeErrorKind> {
+        let bytes =
+            property_bytes
+                .checked_add(1)
+                .ok_or(RuntimeErrorKind::HeapByteLimitExceeded {
+                    limit: self.limits.max_heap_bytes,
+                })?;
+        self.ensure_allocation_capacity(1, bytes)
+    }
+    fn charge_heap(&mut self, bytes: usize) -> Result<(), RuntimeErrorKind> {
+        self.ensure_allocation_capacity(0, bytes)?;
+        self.heap_bytes += bytes;
+        Ok(())
+    }
 
     fn runtime_slot(&self, value: Value) -> Result<Option<usize>, RuntimeErrorKind> {
         let Some(decoded) = value.decode() else {
@@ -3392,7 +3471,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     };
                 }
                 if let Some(found) = self.primitive_get(index, key) {
-                    return Self::found_outcome(found);
+                    return self.found_outcome(found);
                 }
                 match self.heap[index] {
                     HeapEntry::String(_) => self
@@ -3423,7 +3502,7 @@ impl<'a, H: Host> Machine<'a, H> {
         };
         for _ in 0..=self.heap.len() {
             if let Some(found) = self.own_get(node, key) {
-                return Self::found_outcome(found);
+                return self.found_outcome(found);
             }
             match self.prototype_index(node)? {
                 Some(next) => node = next,
@@ -3486,7 +3565,7 @@ impl<'a, H: Host> Machine<'a, H> {
         };
         for _ in 0..=self.heap.len() {
             if let Some(found) = self.own_get_ascii(node, name) {
-                return Self::found_outcome(found);
+                return self.found_outcome(found);
             }
             match self.prototype_index(node)? {
                 Some(next) => node = next,
@@ -3496,8 +3575,27 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(GetOutcome::Value(Value::UNDEFINED))
     }
 
-    fn found_outcome(found: Found) -> Result<GetOutcome, EvalFailure> {
+    fn found_outcome(&mut self, found: Found) -> Result<GetOutcome, EvalFailure> {
         match found {
+            Found::Value(Value::UNINITIALIZED) => {
+                let id = self
+                    .intrinsics
+                    .builtins
+                    .id_named("ReferenceError")
+                    .expect("ReferenceError intrinsic is installed");
+                match self.throw_error(
+                    id,
+                    "Cannot access lexical binding before initialization".into(),
+                ) {
+                    EvalFailure::ThrowValue(value) => Err(EvalFailure::ThrowValueOrigin {
+                        value,
+                        origin: ThrowOrigin::ReferenceError {
+                            operation: "lexical binding is uninitialized",
+                        },
+                    }),
+                    failure => Err(failure),
+                }
+            }
             Found::Value(value) => Ok(GetOutcome::Value(value)),
             Found::Text(text) => Ok(GetOutcome::Text(text)),
             Found::Getter(getter) => Ok(GetOutcome::Getter(getter)),
@@ -5037,10 +5135,7 @@ impl<'a, H: Host> Machine<'a, H> {
     fn iterator_next(&mut self, iterator: Value) -> Result<(bool, Value), EvalFailure> {
         let (callee, this_value) = match self.prepare_iterator_next(iterator)? {
             IteratorNextPrepared::Ready { done, value } => return Ok((done, value)),
-            IteratorNextPrepared::Call {
-                callee,
-                this_value,
-            } => (callee, this_value),
+            IteratorNextPrepared::Call { callee, this_value } => (callee, this_value),
         };
 
         let result = self.call_value(callee, this_value, &[])?;
@@ -5365,7 +5460,6 @@ impl<'a, H: Host> Machine<'a, H> {
         let primitive = self.to_primitive_observable(value, true)?;
         self.to_string(primitive)
     }
-
 
     pub(crate) fn to_number_observable(&mut self, value: Value) -> Result<Value, EvalFailure> {
         let primitive = self.to_primitive_observable(value, false)?;
@@ -6334,10 +6428,7 @@ mod tests {
             .unwrap()
     }
 
-    fn generator_callable<H: Host>(
-        machine: &mut Machine<'_, H>,
-        function: u32,
-    ) -> Value {
+    fn generator_callable<H: Host>(machine: &mut Machine<'_, H>, function: u32) -> Value {
         machine
             .allocate(HeapEntry::Function {
                 module: ModuleId::new(0),
@@ -6398,9 +6489,7 @@ mod tests {
         machine.frames.clear();
         machine.live_registers = 0;
         let callable = generator_callable(&mut machine, 1);
-        let generator = machine
-            .call_value(callable, Value::UNDEFINED, &[])
-            .unwrap();
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
         assert_eq!(machine.live_registers, 0, "calling must not start the body");
         machine
             .set_data_property(generator, "visible", Value::int32(1))
@@ -6452,9 +6541,7 @@ mod tests {
         machine.frames.clear();
         machine.live_registers = 0;
         let callable = generator_callable(&mut machine, 1);
-        let generator = machine
-            .call_value(callable, Value::UNDEFINED, &[])
-            .unwrap();
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
         let _ = machine.take_generator_state(generator).unwrap();
 
         assert!(matches!(
@@ -6488,9 +6575,7 @@ mod tests {
         machine.frames.clear();
         machine.live_registers = 0;
         let callable = generator_callable(&mut machine, 1);
-        let generator = machine
-            .call_value(callable, Value::UNDEFINED, &[])
-            .unwrap();
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
 
         assert!(matches!(
             generator_next(&mut machine, generator, Value::UNDEFINED),
@@ -6615,9 +6700,7 @@ mod tests {
         machine.frames.clear();
         machine.live_registers = 0;
         let callable = generator_callable(&mut machine, 1);
-        let generator = machine
-            .call_value(callable, Value::UNDEFINED, &[])
-            .unwrap();
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
 
         assert_eq!(
             generator_next(&mut machine, generator, Value::UNDEFINED).unwrap(),
@@ -6750,7 +6833,9 @@ mod tests {
 
         assert!(matches!(
             generator_next(&mut machine, first, Value::int32(7)),
-            Err(EvalFailure::Runtime(RuntimeErrorKind::CallDepthExceeded { .. }))
+            Err(EvalFailure::Runtime(
+                RuntimeErrorKind::CallDepthExceeded { .. }
+            ))
         ));
         assert_eq!(machine.live_registers, 0);
 
@@ -6816,9 +6901,7 @@ mod tests {
         machine.frames.clear();
         machine.live_registers = 0;
         let callable = generator_callable(&mut machine, 1);
-        let generator = machine
-            .call_value(callable, Value::UNDEFINED, &[])
-            .unwrap();
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
         let array = machine
             .allocate(HeapEntry::Array {
                 elements: Vec::new(),
@@ -8113,6 +8196,81 @@ mod tests {
             vec![entry],
         );
         assert_eq!(run_ok(&module).value, Value::int32(5));
+    }
+
+    #[test]
+    fn create_cell_throws_reference_error_before_initialization() {
+        let module = verified(
+            vec![Constant::Int32(0)],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::CreateCell { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(2),
+                        object: reg(0),
+                        key: reg(1),
+                    },
+                    Instruction::Return { value: reg(2) },
+                ],
+                vec![],
+            )],
+        );
+        let mut host = TestHost;
+        let error = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .expect_err("uninitialized cell read throws");
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::ReferenceError { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn create_cell_can_be_initialized_to_undefined() {
+        let module = verified(
+            vec![Constant::Int32(0), Constant::Undefined],
+            vec![function(
+                0,
+                4,
+                vec![
+                    Instruction::CreateCell { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(1),
+                    },
+                    Instruction::SetProperty {
+                        object: reg(0),
+                        key: reg(1),
+                        value: reg(2),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(3),
+                        object: reg(0),
+                        key: reg(1),
+                    },
+                    Instruction::Return { value: reg(3) },
+                ],
+                vec![],
+            )],
+        );
+        let mut host = TestHost;
+        let execution = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .expect("explicit undefined initializes the cell");
+        assert_eq!(execution.value, Value::UNDEFINED);
     }
 
     #[test]

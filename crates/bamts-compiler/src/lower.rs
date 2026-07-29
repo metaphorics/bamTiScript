@@ -63,15 +63,14 @@ use crate::syntax::{
     BooleanLiteralNode, CallArgument, CallExpression, ClassDeclaration, ClassMember,
     ConditionalExpression, DoWhileStatement, ExportDeclaration, ExportDefaultValue,
     ExportNamedDeclaration, ExportSpecifierMode, Expr, Expression, ForBinding, ForInStatement,
-    ForInitializer, ForOfMode, ForOfStatement, ForStatement, FunctionBody, FunctionDeclaration,
-    FunctionLike, IdentifierNode, IfStatement, ImportBinding, ImportDeclaration,
-    ImportSpecifierMode, Literal, LogicalExpression, LogicalOperator, MemberExpression,
-    MemberProperty, MetaProperty, ModuleExportName, NewExpression, NodeKind, NumericLiteralNode,
-    ObjectLiteral, ObjectMember, ParameterNode, Pattern, PrivateIdentifierNode, PropertyModifier,
-    PropertyName, RegexLiteralNode, SourceFile, Statement, Stmt, StringLiteralNode,
-    SwitchStatement, TemplateElementNode, TemplateLiteral, TokenKind, UnaryOperator,
-    UpdateExpression, UpdateOperator, VariableDeclaration, VariableKind, WhileStatement,
-    YieldExpression,
+    ForInitializer, ForOfMode, ForOfStatement, ForStatement, FunctionBody, FunctionLike,
+    IdentifierNode, IfStatement, ImportBinding, ImportDeclaration, ImportSpecifierMode, Literal,
+    LogicalExpression, LogicalOperator, MemberExpression, MemberProperty, MetaProperty,
+    ModuleExportName, NewExpression, NodeKind, NumericLiteralNode, ObjectLiteral, ObjectMember,
+    ParameterNode, Pattern, PrivateIdentifierNode, PropertyModifier, PropertyName,
+    RegexLiteralNode, SourceFile, Statement, Stmt, StringLiteralNode, SwitchStatement,
+    TemplateElementNode, TemplateLiteral, TokenKind, UnaryOperator, UpdateExpression,
+    UpdateOperator, VariableDeclaration, VariableKind, WhileStatement, YieldExpression,
 };
 
 /// A degenerate range at the start of the document, used as the diagnostic
@@ -491,18 +490,38 @@ enum BindingIdentity {
 #[derive(Default)]
 struct CapturePlan {
     captured: HashSet<BindingIdentity>,
+    runtime_cells: HashSet<BindingIdentity>,
 }
 
 impl CapturePlan {
-    fn captures(
+    fn captures(&self, name: &str, site: BindingSite, declaration_scope: DeclarationScope) -> bool {
+        self.captured
+            .contains(&binding_identity(name, site, declaration_scope))
+    }
+
+    fn requires_cell(
         &self,
         name: &str,
         site: BindingSite,
         declaration_scope: DeclarationScope,
     ) -> bool {
-        self.captured
-            .contains(&binding_identity(name, site, declaration_scope))
+        let identity = binding_identity(name, site, declaration_scope);
+        self.captured.contains(&identity) || self.runtime_cells.contains(&identity)
     }
+}
+
+#[derive(Clone)]
+struct ImmediateDeclaration<'a> {
+    name: String,
+    site: BindingSite,
+    range: TextRange,
+    kind: ImmediateDeclarationKind<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum ImmediateDeclarationKind<'a> {
+    Lexical,
+    Function(&'a FunctionLike),
 }
 
 fn binding_identity(
@@ -613,7 +632,6 @@ struct FunctionContext<'a> {
     parent_constructor_capture: Option<Register>,
     arguments_source: ArgumentsSource,
 }
-
 
 impl<'a> FunctionContext<'a> {
     fn new_top_level(file: &'a SourceFile, goal: LoweringGoal) -> Self {
@@ -805,7 +823,6 @@ impl<'a> FunctionContext<'a> {
             .find_map(|scope| scope.get(name).copied())
     }
 
-
     fn declare(&mut self, name: String, binding: Binding, declaration_scope: DeclarationScope) {
         let scope = match declaration_scope {
             DeclarationScope::Function => self
@@ -879,13 +896,16 @@ impl<'a> FunctionContext<'a> {
     /// or body can materialize that closure. Module globals stay environment-backed.
     fn predeclare_captured_binding(
         &mut self,
-        builder: &mut ModuleBuilder,
         name: &str,
         range: TextRange,
         site: BindingSite,
         declaration_scope: DeclarationScope,
     ) -> Result<(), LowerError> {
-        if self.top_level || !self.capture_plan.captures(name, site, declaration_scope) {
+        if self.top_level
+            || !self
+                .capture_plan
+                .requires_cell(name, site, declaration_scope)
+        {
             return Ok(());
         }
         let identity = binding_identity(name, site, declaration_scope);
@@ -901,16 +921,8 @@ impl<'a> FunctionContext<'a> {
             self.predeclared_cells.insert(identity, cell);
             return Ok(());
         }
-        let undefined = self.undefined(builder, range)?;
         let cell = self.alloc_register(range)?;
-        self.emit(range, Instruction::CreateArray { dst: cell })?;
-        self.emit(
-            range,
-            Instruction::ArrayPush {
-                array: cell,
-                value: undefined,
-            },
-        )?;
+        self.emit(range, Instruction::CreateCell { dst: cell })?;
         self.declare(name.to_owned(), Binding::Cell(cell), declaration_scope);
         self.predeclared_cells.insert(identity, cell);
         Ok(())
@@ -919,7 +931,6 @@ impl<'a> FunctionContext<'a> {
     /// Predeclares just the planned captured leaves of a lexical pattern.
     fn predeclare_captured_pattern(
         &mut self,
-        builder: &mut ModuleBuilder,
         pattern: &Pattern,
         declaration_scope: DeclarationScope,
     ) -> Result<(), LowerError> {
@@ -927,7 +938,6 @@ impl<'a> FunctionContext<'a> {
             BindingPattern::Identifier(identifier) => {
                 let name = self.identifier_text(identifier)?;
                 self.predeclare_captured_binding(
-                    builder,
                     &name,
                     identifier.range(),
                     binding_site(identifier.range()),
@@ -936,28 +946,49 @@ impl<'a> FunctionContext<'a> {
             }
             BindingPattern::Object(object) => {
                 for property in &object.properties {
-                    self.predeclare_captured_pattern(builder, &property.binding, declaration_scope)?;
+                    self.predeclare_captured_pattern(&property.binding, declaration_scope)?;
                 }
                 Ok(())
             }
             BindingPattern::Array(array) => {
                 for element in &array.elements {
                     if let ArrayBindingElement::Binding(pattern) = element {
-                        self.predeclare_captured_pattern(builder, pattern, declaration_scope)?;
+                        self.predeclare_captured_pattern(pattern, declaration_scope)?;
                     }
                 }
                 Ok(())
             }
-            BindingPattern::Assignment(assignment) => self.predeclare_captured_pattern(
-                builder,
-                &assignment.left,
-                declaration_scope,
-            ),
+            BindingPattern::Assignment(assignment) => {
+                self.predeclare_captured_pattern(&assignment.left, declaration_scope)
+            }
             BindingPattern::Rest(rest) => {
-                self.predeclare_captured_pattern(builder, &rest.argument, declaration_scope)
+                self.predeclare_captured_pattern(&rest.argument, declaration_scope)
             }
             BindingPattern::Missing(_) => Ok(()),
         }
+    }
+
+    /// Creates the class expression's own TDZ cell, keyed by its declaration
+    /// site so a caller that already predeclared it shares the same binding.
+    fn predeclare_class_expression_binding(
+        &mut self,
+        name: &str,
+        range: TextRange,
+        site: BindingSite,
+    ) -> Result<Register, LowerError> {
+        let identity = binding_identity(name, site, DeclarationScope::Lexical);
+        if let Some(cell) = self.predeclared_cells.get(&identity).copied() {
+            return Ok(cell);
+        }
+        let cell = self.alloc_register(range)?;
+        self.emit(range, Instruction::CreateCell { dst: cell })?;
+        self.declare(
+            name.to_owned(),
+            Binding::Cell(cell),
+            DeclarationScope::Lexical,
+        );
+        self.predeclared_cells.insert(identity, cell);
+        Ok(cell)
     }
 
     fn cell_value(
@@ -1059,14 +1090,7 @@ impl<'a> FunctionContext<'a> {
                 Binding::Cell(cell) => self.store_cell(builder, cell, value, range),
             };
         }
-        self.declare_initialized(
-            builder,
-            name,
-            value,
-            range,
-            site,
-            declaration_scope,
-        )
+        self.declare_initialized(builder, name, value, range, site, declaration_scope)
     }
 
     /// Pre-allocates and zero-initializes storage for every `var`-scoped binding.
@@ -1094,11 +1118,10 @@ impl<'a> FunctionContext<'a> {
                 continue;
             }
             let id = builder.intern(Constant::Undefined, range)?;
-            if self.capture_plan.captures(
-                &name,
-                binding_site(range),
-                DeclarationScope::Function,
-            ) {
+            if self
+                .capture_plan
+                .captures(&name, binding_site(range), DeclarationScope::Function)
+            {
                 let value = self.alloc_register(range)?;
                 self.emit(
                     range,
@@ -1169,7 +1192,10 @@ impl<'a> FunctionContext<'a> {
         if let Some(binding) = self.resolve(name) {
             return match binding {
                 Binding::Local(home) => self.move_to(range, home, value),
-                Binding::Cell(cell) => self.store_cell(builder, cell, value, range),
+                Binding::Cell(cell) => {
+                    let _ = self.cell_value(builder, cell, range)?;
+                    self.store_cell(builder, cell, value, range)
+                }
             };
         }
         let id = builder.intern(Constant::String(EcmaString::from_utf8(name)), range)?;
@@ -1237,8 +1263,47 @@ impl<'a> FunctionContext<'a> {
         builder: &mut ModuleBuilder,
         statements: &[Stmt],
     ) -> Result<(), LowerError> {
+        self.instantiate_declarations(builder, statements, false)?;
         for statement in statements {
             self.lower_statement(builder, statement)?;
+        }
+        Ok(())
+    }
+
+    fn instantiate_declarations(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        statements: &[Stmt],
+        switch_scope: bool,
+    ) -> Result<(), LowerError> {
+        let declarations = collect_immediate_declarations(self.file, statements);
+        for declaration in &declarations {
+            if matches!(&declaration.kind, ImmediateDeclarationKind::Lexical)
+                && (switch_scope
+                    || self.capture_plan.requires_cell(
+                        &declaration.name,
+                        declaration.site,
+                        DeclarationScope::Lexical,
+                    ))
+            {
+                self.predeclare_captured_binding(
+                    &declaration.name,
+                    declaration.range,
+                    declaration.site,
+                    DeclarationScope::Lexical,
+                )?;
+            }
+        }
+        for declaration in declarations {
+            if let ImmediateDeclarationKind::Function(function) = declaration.kind {
+                self.instantiate_function_declaration(
+                    builder,
+                    declaration.range,
+                    &declaration.name,
+                    declaration.site,
+                    function,
+                )?;
+            }
         }
         Ok(())
     }
@@ -1269,9 +1334,7 @@ impl<'a> FunctionContext<'a> {
             Statement::Variable(declaration) => {
                 self.lower_variable_declaration(builder, declaration)
             }
-            Statement::Function(declaration) => {
-                self.lower_function_declaration(builder, range, declaration)
-            }
+            Statement::Function(_) => Ok(()),
             Statement::Class(class) => self.lower_class_declaration(builder, range, class, None),
             Statement::Enum(_) => {
                 Err(self.unsupported(range, UnsupportedConstruct::EnumDeclaration))
@@ -1372,6 +1435,7 @@ impl<'a> FunctionContext<'a> {
         builder: &mut ModuleBuilder,
         block: &Block,
     ) -> Result<(), LowerError> {
+        self.instantiate_declarations(builder, &block.statements, false)?;
         for statement in &block.statements {
             self.lower_statement(builder, statement)?;
         }
@@ -1543,11 +1607,7 @@ impl<'a> FunctionContext<'a> {
         });
         self.lower_nested(builder, &for_statement.body)?;
         let update_pc = self.next_pc();
-        self.rebind_iteration_cells(
-            builder,
-            &per_iteration_names,
-            head_range(for_statement),
-        )?;
+        self.rebind_iteration_cells(builder, &per_iteration_names, head_range(for_statement))?;
         if let Some(update) = &for_statement.update {
             self.lower_expression(builder, update)?;
         }
@@ -1691,10 +1751,7 @@ impl<'a> FunctionContext<'a> {
                     VariableKind::Var => DeclarationScope::Function,
                     VariableKind::Let | VariableKind::Const => DeclarationScope::Iteration,
                     VariableKind::Using | VariableKind::AwaitUsing => {
-                        return Err(self.unsupported(
-                            range,
-                            UnsupportedConstruct::UsingDeclaration,
-                        ));
+                        return Err(self.unsupported(range, UnsupportedConstruct::UsingDeclaration));
                     }
                 };
                 let declarator = declaration
@@ -1825,6 +1882,12 @@ impl<'a> FunctionContext<'a> {
     ) -> Result<(), LowerError> {
         let discriminant = self.lower_expression(builder, &switch.discriminant)?;
         self.push_scope();
+        let switch_statements = switch
+            .cases
+            .iter()
+            .flat_map(|case| case.data().consequent.iter().cloned())
+            .collect::<Vec<_>>();
+        self.instantiate_declarations(builder, &switch_statements, true)?;
         self.loops.push(LoopFrame {
             breaks: Vec::new(),
             continues: Vec::new(),
@@ -1889,7 +1952,6 @@ impl<'a> FunctionContext<'a> {
         Ok(())
     }
 
-
     fn lower_try(
         &mut self,
         builder: &mut ModuleBuilder,
@@ -1930,12 +1992,8 @@ impl<'a> FunctionContext<'a> {
         self.push_scope();
         let clause = handler_clause.data();
         if let Some(binding) = &clause.binding {
-            let bind_result = self.bind_pattern(
-                builder,
-                binding,
-                catch_register,
-                DeclarationScope::Lexical,
-            );
+            let bind_result =
+                self.bind_pattern(builder, binding, catch_register, DeclarationScope::Lexical);
             if let Err(error) = bind_result {
                 self.pop_scope();
                 return Err(error);
@@ -2176,7 +2234,7 @@ impl<'a> FunctionContext<'a> {
         for declarator in &declaration.declarations {
             let range = declarator.range();
             let data = declarator.data();
-            self.predeclare_captured_pattern(builder, &data.binding, declaration_scope)?;
+            self.predeclare_captured_pattern(&data.binding, declaration_scope)?;
             let value = match &data.initializer {
                 Some(initializer) => self.lower_expression(builder, initializer)?,
                 None => {
@@ -2201,55 +2259,40 @@ impl<'a> FunctionContext<'a> {
         for declarator in &declaration.declarations {
             let range = declarator.range();
             let data = declarator.data();
-            self.predeclare_captured_pattern(
-                builder,
-                &data.binding,
-                DeclarationScope::Iteration,
-            )?;
+            self.predeclare_captured_pattern(&data.binding, DeclarationScope::Iteration)?;
             let value = match &data.initializer {
                 Some(initializer) => self.lower_expression(builder, initializer)?,
                 None => self.undefined(builder, range)?,
             };
-            self.bind_pattern(
-                builder,
-                &data.binding,
-                value,
-                DeclarationScope::Iteration,
-            )?;
+            self.bind_pattern(builder, &data.binding, value, DeclarationScope::Iteration)?;
         }
         Ok(())
     }
 
-    fn lower_function_declaration(
+    fn instantiate_function_declaration(
         &mut self,
         builder: &mut ModuleBuilder,
         range: TextRange,
-        declaration: &FunctionDeclaration,
+        name: &str,
+        site: BindingSite,
+        function: &FunctionLike,
     ) -> Result<(), LowerError> {
-        let function = &declaration.function;
         if function.body.is_none() {
-            // A bodiless overload or ambient signature is type-only.
             return Ok(());
         }
-        let name = match &function.name {
-            Some(identifier) => self.identifier_text(identifier)?,
-            None => return Ok(()),
-        };
-        self.predeclare_captured_binding(
+        self.predeclare_captured_binding(name, range, site, DeclarationScope::Function)?;
+        let closure = self.build_constructible_function_value(
             builder,
-            &name,
             range,
-            function.name.as_ref().map_or(binding_site(range), |name| binding_site(name.range())),
-            DeclarationScope::Function,
+            Some(name.to_owned()),
+            function,
         )?;
-        let closure =
-            self.build_constructible_function_value(builder, range, Some(name.clone()), function)?;
         self.store_binding(
             builder,
-            &name,
+            name,
             closure,
             range,
-            function.name.as_ref().map_or(binding_site(range), |name| binding_site(name.range())),
+            site,
             DeclarationScope::Function,
         )
     }
@@ -2285,7 +2328,24 @@ impl<'a> FunctionContext<'a> {
             Expression::Function(function) => {
                 self.build_constructible_function_value(builder, range, None, &function.function)
             }
-            Expression::Class(class) => self.lower_class_value(builder, range, &class.class, None),
+            Expression::Class(class) => {
+                let name = class
+                    .class
+                    .name
+                    .as_ref()
+                    .map(|identifier| {
+                        self.identifier_text(identifier)
+                            .map(|name| (name, binding_site(identifier.range())))
+                    })
+                    .transpose()?;
+                self.lower_class_value(
+                    builder,
+                    range,
+                    &class.class,
+                    None,
+                    name.as_ref().map(|(name, site)| (name.as_str(), *site)),
+                )
+            }
             Expression::Arrow(arrow) => self.lower_arrow(builder, range, arrow),
             Expression::Call(call) => self.lower_call(builder, range, call),
             Expression::Member(member) => {
@@ -3896,30 +3956,18 @@ impl<'a> FunctionContext<'a> {
                     if function.body.is_none() {
                         return Ok(());
                     }
-                    let name = match &function.name {
-                        Some(identifier) => Some(self.identifier_text(identifier)?),
-                        None => None,
-                    };
-                    let closure = self.build_constructible_function_value(
-                        builder,
-                        range,
-                        name.clone(),
-                        function,
-                    )?;
-                    if let Some(name) = &name {
-                        self.store_binding(
-                            builder,
-                            name,
-                            closure,
-                            range,
-                            binding_site(range),
-                            DeclarationScope::Function,
-                        )?;
+                    if let Some(identifier) = &function.name {
+                        let name = self.identifier_text(identifier)?;
+                        let closure = self.read_name(builder, &name, range)?;
+                        self.export_value(builder, range, "default", closure)
+                    } else {
+                        let closure = self
+                            .build_constructible_function_value(builder, range, None, function)?;
+                        self.export_value(builder, range, "default", closure)
                     }
-                    self.export_value(builder, range, "default", closure)
                 }
                 ExportDefaultValue::Class(class) => {
-                    let value = self.lower_class_value(builder, range, class, None)?;
+                    let value = self.lower_class_value(builder, range, class, None, None)?;
                     if let Some(identifier) = &class.name {
                         let name = self.identifier_text(identifier)?;
                         self.store_binding(
@@ -3989,12 +4037,7 @@ impl<'a> FunctionContext<'a> {
                 for property in &object.properties {
                     if let BindingPattern::Rest(rest) = property.binding.data() {
                         let rest_value = self.rest_object(builder, range, value, &taken)?;
-                        self.bind_pattern(
-                            builder,
-                            &rest.argument,
-                            rest_value,
-                            declaration_scope,
-                        )?;
+                        self.bind_pattern(builder, &rest.argument, rest_value, declaration_scope)?;
                         continue;
                     }
                     let key = self.property_key(builder, &property.name)?;
@@ -4012,12 +4055,7 @@ impl<'a> FunctionContext<'a> {
                         Some(default) => self.apply_default(builder, range, element, default)?,
                         None => element,
                     };
-                    self.bind_pattern(
-                        builder,
-                        &property.binding,
-                        element,
-                        declaration_scope,
-                    )?;
+                    self.bind_pattern(builder, &property.binding, element, declaration_scope)?;
                 }
                 Ok(())
             }
@@ -4572,8 +4610,7 @@ impl<'a> FunctionContext<'a> {
                         parameter.data().binding.data(),
                         BindingPattern::Identifier(identifier)
                             if identifier_name(self.file, identifier).as_deref() == Some(&name)
-                    )
-                {
+                    ) {
                     slots[index]
                 } else if let Some(seed) = undefined_seed {
                     seed
@@ -4763,14 +4800,7 @@ impl<'a> FunctionContext<'a> {
                 None => None,
             },
         };
-        let value = self.lower_class_value(builder, range, class, name.as_deref())?;
-        if let Some(name) = &name {
-            let site = class
-                .name
-                .as_ref()
-                .map_or(binding_site(range), |identifier| binding_site(identifier.range()));
-            self.store_binding(builder, name, value, range, site, DeclarationScope::Lexical)?;
-        }
+        self.lower_class_value(builder, range, class, name.as_deref(), None)?;
         Ok(())
     }
 
@@ -4781,7 +4811,8 @@ impl<'a> FunctionContext<'a> {
         builder: &mut ModuleBuilder,
         range: TextRange,
         class: &ClassDeclaration,
-        name: Option<&str>,
+        declaration_name: Option<&str>,
+        expression_name: Option<(&str, BindingSite)>,
     ) -> Result<Register, LowerError> {
         if let Some(decorator) = class.decorators.first() {
             return Err(self.unsupported(
@@ -4789,35 +4820,52 @@ impl<'a> FunctionContext<'a> {
                 UnsupportedConstruct::DecoratedDeclaration,
             ));
         }
-        // Evaluate the superclass before creating the declaration cell so
-        // direct class TDZ behavior stays unchanged; members observe that cell.
+        let expression_cell = if let Some((name, site)) = expression_name {
+            self.push_scope();
+            Some(self.predeclare_class_expression_binding(name, range, site)?)
+        } else {
+            None
+        };
+        // Class declarations retain their predeclared outer cell. A named class
+        // expression instead shadows it with its own uninitialized cell here.
         let parent = match &class.extends {
             Some(heritage) => Some(self.lower_expression(builder, &heritage.expression)?),
             None => None,
         };
-        if let Some(name) = name {
+        let declaration_target = if let Some(name) = declaration_name {
             let site = class
                 .name
                 .as_ref()
-                .map_or(binding_site(range), |identifier| binding_site(identifier.range()));
-            self.predeclare_captured_binding(
-                builder,
-                name,
-                range,
-                site,
-                DeclarationScope::Lexical,
-            )?;
+                .map_or(binding_site(range), |identifier| {
+                    binding_site(identifier.range())
+                });
+            self.predeclare_captured_binding(name, range, site, DeclarationScope::Lexical)?;
+            let identity = binding_identity(name, site, DeclarationScope::Lexical);
+            if self.top_level {
+                None
+            } else if let Some(cell) = self.predeclared_cells.get(&identity).copied() {
+                Some(Binding::Cell(cell))
+            } else {
+                let home = self.alloc_register(range)?;
+                self.declare(
+                    name.to_owned(),
+                    Binding::Local(home),
+                    DeclarationScope::Lexical,
+                );
+                Some(Binding::Local(home))
+            }
+        } else {
+            None
+        };
+        if expression_cell.is_none() {
+            self.push_scope();
         }
-        self.push_scope();
         self.create_private_names(builder, range, class)?;
-        // Constructor function.
         let constructor = self.find_constructor(class);
         let ctor = self.build_constructor(builder, range, class, constructor, parent)?;
-        // Prototype object.
         let prototype = self.alloc_register(range)?;
         self.emit(range, Instruction::CreateObject { dst: prototype })?;
         if let Some(parent) = parent {
-            // C.prototype.__proto__ = P.prototype; C.__proto__ = P.
             let parent_prototype = self.get_named(builder, range, parent, "prototype")?;
             self.emit(
                 range,
@@ -4834,7 +4882,6 @@ impl<'a> FunctionContext<'a> {
                 },
             )?;
         }
-        // ctor.prototype = prototype.
         let prototype_key = self.string_reg(builder, EcmaString::from_utf8("prototype"), range)?;
         self.emit(
             range,
@@ -4844,7 +4891,27 @@ impl<'a> FunctionContext<'a> {
                 value: prototype,
             },
         )?;
-        // Members.
+        if let Some(cell) = expression_cell {
+            self.store_cell(builder, cell, ctor, range)?;
+        }
+        if let Some(name) = declaration_name {
+            match declaration_target {
+                Some(Binding::Local(home)) => self.move_to(range, home, ctor)?,
+                Some(Binding::Cell(cell)) => self.store_cell(builder, cell, ctor, range)?,
+                None => {
+                    debug_assert!(self.top_level);
+                    let id =
+                        builder.intern(Constant::String(EcmaString::from_utf8(name)), range)?;
+                    self.emit(
+                        range,
+                        Instruction::StoreGlobal {
+                            name: id,
+                            value: ctor,
+                        },
+                    )?;
+                }
+            }
+        }
         for member in &class.members {
             self.lower_class_member(builder, ctor, prototype, member)?;
         }
@@ -5340,6 +5407,8 @@ struct FreeVarScanner<'a> {
     function_roots: Vec<usize>,
     free: BTreeSet<String>,
     captured: HashSet<BindingIdentity>,
+    runtime_cells: HashSet<BindingIdentity>,
+    initialized: HashSet<BindingIdentity>,
     uses_this: bool,
     uses_arguments: bool,
     uses_new_target: bool,
@@ -5351,23 +5420,22 @@ impl CapturePlan {
     fn for_statements(file: &SourceFile, statements: &[Stmt]) -> Self {
         let mut scanner = FreeVarScanner::new(file);
         scanner.preseed_vars(statements);
+        scanner.predeclare_immediate(statements, false);
         for statement in statements {
             scanner.scan_statement(statement);
         }
         Self {
             captured: scanner.captured,
+            runtime_cells: scanner.runtime_cells,
         }
     }
 
-    fn for_function(
-        file: &SourceFile,
-        parameters: &[ParameterNode],
-        body: ArrowBody<'_>,
-    ) -> Self {
+    fn for_function(file: &SourceFile, parameters: &[ParameterNode], body: ArrowBody<'_>) -> Self {
         let mut scanner = FreeVarScanner::new(file);
         scanner.scan_function(parameters, body, false);
         Self {
             captured: scanner.captured,
+            runtime_cells: scanner.runtime_cells,
         }
     }
 
@@ -5381,6 +5449,7 @@ impl CapturePlan {
         scanner.preseed_parameters(parameters);
         if let Some(block) = body {
             scanner.preseed_vars(&block.statements);
+            scanner.predeclare_immediate(&block.statements, false);
         }
         scanner.scan_parameter_initializers(parameters);
         if let Some(block) = body {
@@ -5396,6 +5465,7 @@ impl CapturePlan {
         }
         Self {
             captured: scanner.captured,
+            runtime_cells: scanner.runtime_cells,
         }
     }
 }
@@ -5408,6 +5478,8 @@ impl<'a> FreeVarScanner<'a> {
             function_roots: vec![0],
             free: BTreeSet::new(),
             captured: HashSet::new(),
+            runtime_cells: HashSet::new(),
+            initialized: HashSet::new(),
             uses_this: false,
             uses_arguments: false,
             uses_new_target: false,
@@ -5427,6 +5499,7 @@ impl<'a> FreeVarScanner<'a> {
         | ArrowBody::Arrow(FunctionBody::Block(block)) = body
         {
             self.preseed_vars(&block.data().statements);
+            self.predeclare_immediate(&block.data().statements, false);
         }
         self.scan_parameter_initializers(parameters);
         match body {
@@ -5501,6 +5574,9 @@ impl<'a> FreeVarScanner<'a> {
             return;
         }
         if let Some(binding) = self.resolve_binding(name).cloned() {
+            if binding.owner_depth == 0 && !self.initialized.contains(&binding.identity) {
+                self.runtime_cells.insert(binding.identity.clone());
+            }
             if self.function_depth > binding.owner_depth && binding.owner_depth == 0 {
                 self.captured.insert(binding.identity);
             }
@@ -5509,12 +5585,45 @@ impl<'a> FreeVarScanner<'a> {
         }
     }
 
+    fn predeclare_immediate(&mut self, statements: &[Stmt], switch_scope: bool) {
+        for declaration in collect_immediate_declarations(self.file, statements) {
+            match declaration.kind {
+                ImmediateDeclarationKind::Function(_) => {
+                    let identity = BindingIdentity::Function(declaration.name.clone());
+                    self.bind_function(declaration.name);
+                    self.initialized.insert(identity);
+                }
+                ImmediateDeclarationKind::Lexical => {
+                    let identity = BindingIdentity::Lexical(declaration.site);
+                    self.bind_lexical(declaration.name, declaration.range);
+                    if switch_scope {
+                        self.runtime_cells.insert(identity);
+                    }
+                }
+            }
+        }
+    }
+
+    fn initialize_pattern(&mut self, pattern: &Pattern, declaration_scope: DeclarationScope) {
+        let mut names = Vec::new();
+        collect_pattern_names(self.file, pattern, &mut names);
+        for name in names {
+            if let Some(binding) = self.resolve_binding(&name)
+                && (matches!(declaration_scope, DeclarationScope::Function)
+                    || binding.owner_depth == self.function_depth)
+            {
+                self.initialized.insert(binding.identity.clone());
+            }
+        }
+    }
+
     fn preseed_parameters(&mut self, parameters: &[ParameterNode]) {
         for parameter in parameters {
             let mut names = Vec::new();
             collect_pattern_names(self.file, &parameter.data().binding, &mut names);
             for name in names {
-                self.bind_function(name);
+                self.bind_function(name.clone());
+                self.initialized.insert(BindingIdentity::Function(name));
             }
         }
     }
@@ -5523,7 +5632,8 @@ impl<'a> FreeVarScanner<'a> {
         let mut names = Vec::new();
         collect_var_names(self.file, statements, &mut names);
         for name in names {
-            self.bind_function(name);
+            self.bind_function(name.clone());
+            self.initialized.insert(BindingIdentity::Function(name));
         }
     }
 
@@ -5606,28 +5716,23 @@ impl<'a> FreeVarScanner<'a> {
                     _ => DeclarationScope::Lexical,
                 };
                 for declarator in &declaration.declarations {
-                    self.bind_pattern(&declarator.data().binding, scope);
                     if let Some(initializer) = &declarator.data().initializer {
                         self.scan_expression(initializer);
                     }
                     self.scan_pattern_effects(&declarator.data().binding);
+                    self.initialize_pattern(&declarator.data().binding, scope);
                 }
             }
             Statement::Function(declaration) => {
-                if declaration.function.body.is_some()
-                    && let Some(name) = &declaration.function.name
-                    && let Some(text) = identifier_name(self.file, name)
-                {
-                    self.bind_function(text);
-                }
                 self.scan_function_like(&declaration.function);
             }
             Statement::Class(class) => {
                 self.scan_class_heritage(class);
                 if let Some(name) = &class.name
                     && let Some(text) = identifier_name(self.file, name)
+                    && let Some(binding) = self.resolve_binding(&text)
                 {
-                    self.bind_lexical(text, name.range());
+                    self.initialized.insert(binding.identity.clone());
                 }
                 self.scan_class(class);
             }
@@ -5647,6 +5752,7 @@ impl<'a> FreeVarScanner<'a> {
             }
             Statement::Block(block) => {
                 self.push();
+                self.predeclare_immediate(&block.data().statements, false);
                 for statement in &block.data().statements {
                     self.scan_statement(statement);
                 }
@@ -5675,6 +5781,7 @@ impl<'a> FreeVarScanner<'a> {
                                     self.scan_expression(init);
                                 }
                                 self.scan_pattern_effects(&declarator.data().binding);
+                                self.initialize_pattern(&declarator.data().binding, scope);
                             }
                         }
                         ForInitializer::Expression(expression) => self.scan_expression(expression),
@@ -5706,6 +5813,12 @@ impl<'a> FreeVarScanner<'a> {
             Statement::Switch(statement) => {
                 self.scan_expression(&statement.discriminant);
                 self.push();
+                let statements = statement
+                    .cases
+                    .iter()
+                    .flat_map(|case| case.data().consequent.iter().cloned())
+                    .collect::<Vec<_>>();
+                self.predeclare_immediate(&statements, true);
                 for case in &statement.cases {
                     if let Some(test) = &case.data().test {
                         self.scan_expression(test);
@@ -5718,6 +5831,7 @@ impl<'a> FreeVarScanner<'a> {
             }
             Statement::Try(statement) => {
                 self.push();
+                self.predeclare_immediate(&statement.block.data().statements, false);
                 for statement in &statement.block.data().statements {
                     self.scan_statement(statement);
                 }
@@ -5726,7 +5840,9 @@ impl<'a> FreeVarScanner<'a> {
                     self.push();
                     if let Some(binding) = &handler.data().binding {
                         self.bind_pattern(binding, DeclarationScope::Lexical);
+                        self.initialize_pattern(binding, DeclarationScope::Lexical);
                     }
+                    self.predeclare_immediate(&handler.data().body.data().statements, false);
                     for statement in &handler.data().body.data().statements {
                         self.scan_statement(statement);
                     }
@@ -5734,6 +5850,7 @@ impl<'a> FreeVarScanner<'a> {
                 }
                 if let Some(finalizer) = &statement.finalizer {
                     self.push();
+                    self.predeclare_immediate(&finalizer.data().statements, false);
                     for statement in &finalizer.data().statements {
                         self.scan_statement(statement);
                     }
@@ -5794,6 +5911,7 @@ impl<'a> FreeVarScanner<'a> {
         self.preseed_parameters(&function.parameters);
         if let Some(FunctionBody::Block(block)) = &function.body {
             self.preseed_vars(&block.data().statements);
+            self.predeclare_immediate(&block.data().statements, false);
         }
         self.scan_parameter_initializers(&function.parameters);
         if let Some(body) = &function.body {
@@ -5820,6 +5938,7 @@ impl<'a> FreeVarScanner<'a> {
         self.preseed_parameters(&arrow.parameters);
         if let FunctionBody::Block(block) = &arrow.body {
             self.preseed_vars(&block.data().statements);
+            self.predeclare_immediate(&block.data().statements, false);
         }
         self.scan_parameter_initializers(&arrow.parameters);
         match &arrow.body {
@@ -5873,6 +5992,7 @@ impl<'a> FreeVarScanner<'a> {
         self.preseed_parameters(parameters);
         if let Some(constructor) = constructor {
             self.preseed_vars(&constructor.body.data().statements);
+            self.predeclare_immediate(&constructor.body.data().statements, false);
         }
         self.scan_parameter_initializers(parameters);
         if let Some(constructor) = constructor {
@@ -5920,6 +6040,7 @@ impl<'a> FreeVarScanner<'a> {
                 }
                 ClassMember::StaticBlock(block) => {
                     self.push();
+                    self.predeclare_immediate(&block.data().statements, false);
                     for statement in &block.data().statements {
                         self.scan_statement(statement);
                     }
@@ -6122,6 +6243,129 @@ fn head_range(for_statement: &ForStatement) -> TextRange {
         .test
         .as_ref()
         .map_or_else(zero_range, |test| test.range())
+}
+
+fn collect_immediate_declarations<'a>(
+    file: &SourceFile,
+    statements: &'a [Stmt],
+) -> Vec<ImmediateDeclaration<'a>> {
+    let mut declarations = Vec::new();
+    for statement in statements {
+        collect_immediate_declaration(file, statement, &mut declarations);
+    }
+    declarations
+}
+
+fn collect_immediate_declaration<'a>(
+    file: &SourceFile,
+    statement: &'a Stmt,
+    declarations: &mut Vec<ImmediateDeclaration<'a>>,
+) {
+    match statement.data() {
+        Statement::Variable(declaration)
+            if matches!(declaration.kind, VariableKind::Let | VariableKind::Const) =>
+        {
+            for declarator in &declaration.declarations {
+                collect_pattern_declarations(file, &declarator.data().binding, declarations);
+            }
+        }
+        Statement::Function(declaration) => {
+            let function = &declaration.function;
+            if function.body.is_some()
+                && let Some(identifier) = &function.name
+                && let Some(name) = identifier_name(file, identifier)
+            {
+                declarations.push(ImmediateDeclaration {
+                    name,
+                    site: binding_site(identifier.range()),
+                    range: statement.range(),
+                    kind: ImmediateDeclarationKind::Function(function),
+                });
+            }
+        }
+        Statement::Class(class) => {
+            if let Some(identifier) = &class.name
+                && let Some(name) = identifier_name(file, identifier)
+            {
+                declarations.push(ImmediateDeclaration {
+                    name,
+                    site: binding_site(identifier.range()),
+                    range: identifier.range(),
+                    kind: ImmediateDeclarationKind::Lexical,
+                });
+            }
+        }
+        Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
+            declaration,
+        ))) => collect_immediate_declaration(file, declaration, declarations),
+        Statement::Export(ExportDeclaration::Default(default)) => match &default.value {
+            ExportDefaultValue::Function(function) => {
+                if function.body.is_some()
+                    && let Some(identifier) = &function.name
+                    && let Some(name) = identifier_name(file, identifier)
+                {
+                    declarations.push(ImmediateDeclaration {
+                        name,
+                        site: binding_site(identifier.range()),
+                        range: statement.range(),
+                        kind: ImmediateDeclarationKind::Function(function),
+                    });
+                }
+            }
+            ExportDefaultValue::Class(class) => {
+                if let Some(identifier) = &class.name
+                    && let Some(name) = identifier_name(file, identifier)
+                {
+                    declarations.push(ImmediateDeclaration {
+                        name,
+                        site: binding_site(identifier.range()),
+                        range: identifier.range(),
+                        kind: ImmediateDeclarationKind::Lexical,
+                    });
+                }
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+fn collect_pattern_declarations<'a>(
+    file: &SourceFile,
+    pattern: &'a Pattern,
+    declarations: &mut Vec<ImmediateDeclaration<'a>>,
+) {
+    match pattern.data() {
+        BindingPattern::Identifier(identifier) => {
+            if let Some(name) = identifier_name(file, identifier) {
+                declarations.push(ImmediateDeclaration {
+                    name,
+                    site: binding_site(identifier.range()),
+                    range: identifier.range(),
+                    kind: ImmediateDeclarationKind::Lexical,
+                });
+            }
+        }
+        BindingPattern::Object(object) => {
+            for property in &object.properties {
+                collect_pattern_declarations(file, &property.binding, declarations);
+            }
+        }
+        BindingPattern::Array(array) => {
+            for element in &array.elements {
+                if let ArrayBindingElement::Binding(binding) = element {
+                    collect_pattern_declarations(file, binding, declarations);
+                }
+            }
+        }
+        BindingPattern::Assignment(assignment) => {
+            collect_pattern_declarations(file, &assignment.left, declarations);
+        }
+        BindingPattern::Rest(rest) => {
+            collect_pattern_declarations(file, &rest.argument, declarations);
+        }
+        BindingPattern::Missing(_) => {}
+    }
 }
 
 /// The runtime names a statement declares (for `export` linkage).
@@ -6782,7 +7026,11 @@ mod tests {
             }
             code.iter()
                 .any(|candidate| {
-                    matches!(candidate, Instruction::CreateArray { dst } if dst == value)
+                    matches!(
+                        candidate,
+                        Instruction::CreateArray { dst } | Instruction::CreateCell { dst }
+                            if dst == value
+                    )
                 })
                 .then_some(*value)
         })
@@ -6799,7 +7047,11 @@ mod tests {
     fn cell_allocations(code: &[Instruction], cell: Register) -> usize {
         code.iter()
             .filter(|instruction| {
-                matches!(instruction, Instruction::CreateArray { dst } if *dst == cell)
+                matches!(
+                    instruction,
+                    Instruction::CreateArray { dst } | Instruction::CreateCell { dst }
+                        if *dst == cell
+                )
             })
             .count()
     }
@@ -6812,7 +7064,7 @@ mod tests {
                     return false;
                 };
                 matches!(
-                    code.get((*entry).checked_sub(1).unwrap_or(0)),
+                    code.get((*entry).saturating_sub(1)),
                     Some(Instruction::Jump { target }) if target.get() as usize == *entry + 2
                 ) && matches!(
                     code.get(*entry + 1),
@@ -6829,8 +7081,6 @@ mod tests {
             })
             .count()
     }
-
-
 
     #[test]
     fn outer_write_is_observed_by_a_captured_read() {
@@ -6896,7 +7146,7 @@ mod tests {
         let allocation = code
             .iter()
             .position(
-                |instruction| matches!(instruction, Instruction::CreateArray { dst } if *dst == cell),
+                |instruction| matches!(instruction, Instruction::CreateArray { dst } | Instruction::CreateCell { dst } if *dst == cell),
             )
             .expect("cell allocation is present");
         let conditional = code
@@ -6924,7 +7174,7 @@ mod tests {
         let allocation = code
             .iter()
             .position(
-                |instruction| matches!(instruction, Instruction::CreateArray { dst } if *dst == cell),
+                |instruction| matches!(instruction, Instruction::CreateArray { dst } | Instruction::CreateCell { dst } if *dst == cell),
             )
             .expect("parameter cell is allocated");
         let assignment = code
@@ -6960,7 +7210,7 @@ mod tests {
             let allocation = code
                 .iter()
                 .position(
-                    |instruction| matches!(instruction, Instruction::CreateArray { dst } if *dst == cell),
+                    |instruction| matches!(instruction, Instruction::CreateArray { dst } | Instruction::CreateCell { dst } if *dst == cell),
                 )
                 .expect("parameter cell is allocated");
             let closure = code
@@ -6992,7 +7242,7 @@ mod tests {
             let allocation = code
                 .iter()
                 .position(
-                    |instruction| matches!(instruction, Instruction::CreateArray { dst } if *dst == cell),
+                    |instruction| matches!(instruction, Instruction::CreateArray { dst } | Instruction::CreateCell { dst } if *dst == cell),
                 )
                 .expect("captured cell is allocated");
             let closure = code
@@ -7011,27 +7261,140 @@ mod tests {
     }
 
     #[test]
-    fn uncaptured_and_later_lexical_bindings_do_not_get_cells() {
-        for source in [
-            "function outer() { const value = 1; return value; }",
+    fn safe_uncaptured_lexical_stays_in_a_register() {
+        let module = lower_js("function outer() { const value = 1; return value; }");
+        assert!(module.functions().iter().all(|function| {
+            !function
+                .code()
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::CreateCell { .. }))
+        }));
+    }
+
+    #[test]
+    fn captured_later_lexical_is_predeclared_once() {
+        let module = lower_js(
             "function outer() { const read = () => later; const later = 1; return read; }",
-        ] {
-            let module = lower_js(source);
-            assert!(
-                module
-                    .functions()
+        );
+        let owner = module
+            .functions()
+            .iter()
+            .find(|function| {
+                function
+                    .code()
                     .iter()
-                    .all(|function| created_cell_used_as_capture(function.code()).is_none()),
-                "{source}"
-            );
-        }
+                    .any(|instruction| matches!(instruction, Instruction::CreateCell { .. }))
+            })
+            .expect("owner predeclares the later lexical cell");
+        assert_eq!(
+            owner
+                .code()
+                .iter()
+                .filter(|instruction| matches!(instruction, Instruction::CreateCell { .. }))
+                .count(),
+            1
+        );
+        let cell = created_cell_used_as_capture(owner.code()).expect("closure captures the cell");
+        assert_eq!(cell_allocations(owner.code(), cell), 1);
+    }
+
+    #[test]
+    fn early_closure_read_uses_one_predeclared_cell_then_initializes_it() {
+        let module = lower_js(
+            "function outer() { const read = () => later; read(); let later = 1; return read(); }",
+        );
+        let code = module
+            .functions()
+            .iter()
+            .map(|function| function.code())
+            .find(|code| created_cell_used_as_capture(code).is_some())
+            .expect("outer owns the captured later binding");
+        let cell = created_cell_used_as_capture(code).expect("later binding is a cell");
+        let create = code
+            .iter()
+            .position(|instruction| matches!(instruction, Instruction::CreateCell { dst } if *dst == cell))
+            .expect("cell is seeded at scope entry");
+        let closure = code
+            .iter()
+            .position(|instruction| matches!(instruction, Instruction::CreateClosure { .. }))
+            .expect("reader closure is instantiated");
+        let initialize = code
+            .iter()
+            .position(|instruction| matches!(instruction, Instruction::SetProperty { object, .. } if *object == cell))
+            .expect("declaration initializes the cell");
+        assert!(create < closure && closure < initialize);
+        assert_eq!(cell_allocations(code, cell), 1);
+    }
+
+    #[test]
+    fn function_declaration_is_instantiated_once_before_executable_statements() {
+        let module = lower_js(
+            "function outer() { return declaredLater(); function declaredLater() { return 2; } }",
+        );
+        let code = module
+            .functions()
+            .iter()
+            .map(|function| function.code())
+            .find(|code| {
+                code.iter()
+                    .any(|instruction| matches!(instruction, Instruction::Call { .. }))
+            })
+            .expect("outer function calls its declaration");
+        let closure = code
+            .iter()
+            .position(|instruction| matches!(instruction, Instruction::CreateClosure { .. }))
+            .expect("function declaration is instantiated");
+        let call = code
+            .iter()
+            .position(|instruction| matches!(instruction, Instruction::Call { .. }))
+            .expect("call is emitted");
+        assert!(closure < call);
+        assert_eq!(
+            code.iter()
+                .filter(|instruction| matches!(instruction, Instruction::CreateClosure { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn class_heritage_reads_its_own_uninitialized_cell() {
+        let module = lower_js("function outer() { class C extends C {} return C; }");
+        let code = module
+            .functions()
+            .iter()
+            .map(|function| function.code())
+            .find(|code| {
+                code.iter()
+                    .any(|instruction| matches!(instruction, Instruction::CreateCell { .. }))
+            })
+            .expect("class owner predeclares its binding");
+        let cell = code
+            .iter()
+            .find_map(|instruction| match instruction {
+                Instruction::CreateCell { dst } => Some(*dst),
+                _ => None,
+            })
+            .expect("class cell exists");
+        let create = code
+            .iter()
+            .position(|instruction| matches!(instruction, Instruction::CreateCell { dst } if *dst == cell))
+            .expect("class cell allocation");
+        let heritage_read = code
+            .iter()
+            .position(|instruction| matches!(instruction, Instruction::GetProperty { object, .. } if *object == cell))
+            .expect("heritage reads through the class cell");
+        let initialize = code
+            .iter()
+            .rposition(|instruction| matches!(instruction, Instruction::SetProperty { object, .. } if *object == cell))
+            .expect("class declaration initializes the same cell");
+        assert!(create < heritage_read && heritage_read < initialize);
     }
 
     #[test]
     fn same_name_shadow_does_not_overbox_uncaptured_binding() {
-        let module = lower_js(
-            "function outer() { let value = 1; { let value = 2; } return () => value; }",
-        );
+        let module =
+            lower_js("function outer() { let value = 1; { let value = 2; } return () => value; }");
         let code = module
             .functions()
             .iter()
@@ -7040,7 +7403,10 @@ mod tests {
             .expect("outer binding is captured");
         assert_eq!(
             code.iter()
-                .filter(|instruction| matches!(instruction, Instruction::CreateArray { .. }))
+                .filter(|instruction| matches!(
+                    instruction,
+                    Instruction::CreateArray { .. } | Instruction::CreateCell { .. }
+                ))
                 .count(),
             2,
             "only the captured binding cell and closure capture array allocate"
@@ -7062,8 +7428,7 @@ mod tests {
 
     #[test]
     fn transitive_capture_passes_an_existing_cell_without_wrapping_it() {
-        let module =
-            lower_js("function outer() { let value = 1; return () => () => value; }");
+        let module = lower_js("function outer() { let value = 1; return () => () => value; }");
         let middle = module
             .functions()
             .iter()
@@ -7190,12 +7555,9 @@ mod tests {
     #[test]
     fn uncaptured_ordinary_and_loop_locals_emit_no_cell_scaffolds() {
         let ordinary = lower_js("function outer(value) { let copy = value; return copy; }");
-        let classic = lower_js(
-            "function outer(limit) { for (let index = 0; index < limit; index++) {} }",
-        );
-        let iterator = lower_js(
-            "function outer(values) { for (let value of values) {} }",
-        );
+        let classic =
+            lower_js("function outer(limit) { for (let index = 0; index < limit; index++) {} }");
+        let iterator = lower_js("function outer(values) { for (let value of values) {} }");
 
         for (label, module) in [
             ("ordinary", &ordinary),
@@ -7236,7 +7598,7 @@ mod tests {
                     let code = function.code();
                     let cell = created_cell_used_as_capture(code)?;
                     let allocation = code.iter().position(
-                        |instruction| matches!(instruction, Instruction::CreateArray { dst } if *dst == cell),
+                        |instruction| matches!(instruction, Instruction::CreateArray { dst } | Instruction::CreateCell { dst } if *dst == cell),
                     )?;
                     let step = code
                         .iter()
@@ -7608,9 +7970,9 @@ mod tests {
                 })
                 .unwrap_or_else(|| panic!("no LoadConst defines property key {register:?}"));
             match &constants[constant.get() as usize] {
-                Constant::String(value) => value
-                    .to_utf8_strict()
-                    .is_ok_and(|value| value == "method"),
+                Constant::String(value) => {
+                    value.to_utf8_strict().is_ok_and(|value| value == "method")
+                }
                 _ => false,
             }
         };
@@ -7624,7 +7986,9 @@ mod tests {
                 .iter()
                 .enumerate()
                 .find_map(|(index, instruction)| match instruction {
-                    Instruction::GetProperty { dst, object, key } if key_is_method(code, constants, *key) => {
+                    Instruction::GetProperty { dst, object, key }
+                        if key_is_method(code, constants, *key) =>
+                    {
                         Some((index, *dst, *object))
                     }
                     _ => None,
@@ -7644,13 +8008,18 @@ mod tests {
                     _ => None,
                 })
                 .expect("optional member call invokes the loaded method");
-            assert_eq!(this_value, object, "the call keeps the member object as this");
+            assert_eq!(
+                this_value, object,
+                "the call keeps the member object as this"
+            );
 
             let result_move_index = code[call_index + 1..]
                 .iter()
                 .enumerate()
                 .find_map(|(offset, instruction)| match instruction {
-                    Instruction::Move { src, .. } if *src == call_dst => Some(call_index + 1 + offset),
+                    Instruction::Move { src, .. } if *src == call_dst => {
+                        Some(call_index + 1 + offset)
+                    }
                     _ => None,
                 })
                 .expect("the call result is moved into a shared result register");
@@ -7661,13 +8030,17 @@ mod tests {
                 .enumerate()
                 .rev()
                 .find_map(|(index, instruction)| match instruction {
-                    Instruction::JumpIfTrue { condition, target } if code[..index].iter().any(|prior| {
-                        matches!(
-                            prior,
-                            Instruction::Binary { dst, op: BinaryOp::Equal, left, .. }
-                                if *dst == *condition && *left == object
-                        )
-                    }) => Some((index, *target)),
+                    Instruction::JumpIfTrue { condition, target }
+                        if code[..index].iter().any(|prior| {
+                            matches!(
+                                prior,
+                                Instruction::Binary { dst, op: BinaryOp::Equal, left, .. }
+                                    if *dst == *condition && *left == object
+                            )
+                        }) =>
+                    {
+                        Some((index, *target))
+                    }
                     _ => None,
                 })
                 .expect("optional object test branches before the member read");
@@ -7691,13 +8064,17 @@ mod tests {
                     .find_map(|(offset, instruction)| {
                         let index = member_index + 1 + offset;
                         match instruction {
-                            Instruction::JumpIfTrue { condition, target } if code[member_index + 1..index].iter().any(|prior| {
-                                matches!(
-                                    prior,
-                                    Instruction::Binary { dst, op: BinaryOp::Equal, left, .. }
-                                        if *dst == *condition && *left == callee
-                                )
-                            }) => Some(*target),
+                            Instruction::JumpIfTrue { condition, target }
+                                if code[member_index + 1..index].iter().any(|prior| {
+                                    matches!(
+                                        prior,
+                                        Instruction::Binary { dst, op: BinaryOp::Equal, left, .. }
+                                            if *dst == *condition && *left == callee
+                                    )
+                                }) =>
+                            {
+                                Some(*target)
+                            }
                             _ => None,
                         }
                     })

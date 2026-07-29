@@ -16,7 +16,7 @@ use crate::{
     lower_program,
 };
 
-const HELPER_COUNT: u32 = 31;
+const HELPER_COUNT: u32 = 32;
 const AOT_MAGIC: u64 = u64::from_le_bytes(*b"BMTSAOT1");
 const AOT_ABI_VERSION: u32 = 3;
 const UNIT_DESCRIPTOR_BYTES: usize = 16;

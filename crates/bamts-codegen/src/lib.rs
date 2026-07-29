@@ -94,6 +94,7 @@
 //! | `Binary`            | [`Helper::Binary`] with the operator selector              |
 //! | `CreateObject`      | [`Helper::CreateObject`] → `dst`                            |
 //! | `CreateArray`       | [`Helper::CreateArray`] → `dst`                             |
+//! | `CreateCell`        | [`Helper::CreateCell`] → `dst`                             |
 //! | `CreateClosure`     | [`Helper::CreateClosure`] (`function`, `captures` array)→dst|
 //! | `GetProperty`       | [`Helper::GetProperty`] (`object`, register `key`) → `dst`  |
 //! | `SetProperty`       | [`Helper::SetProperty`] (`object`, register `key`, `value`) |
@@ -290,6 +291,7 @@ const _: () = {
 /// | 28  | `IteratorNext`      | `iterator: i64, done_reg: i32, value_reg: i32` (two-write) |
 /// | 29  | `Export`            | `name: i32, src: i64`                        |
 /// | 30  | `ConsumeFuel`       | `amount: i32` (total except `FatalTrap`)     |
+/// | 31 | `CreateCell`        | —                                            |
 ///
 /// Every helper except [`Helper::Truthy`] returns a
 /// `bamts_native::CompletionTag`. [`Helper::Truthy`] returns `0`/`1`.
@@ -308,6 +310,8 @@ pub enum Helper {
     CreateObject,
     /// `bamts_create_array(frame, out)`: fresh empty array into `out.value`.
     CreateArray,
+    /// `bamts_create_cell(frame, out)`: fresh compiler-private TDZ cell.
+    CreateCell,
     /// `bamts_create_closure(frame, function_id, captures, out)`: materialize a
     /// closure over the named function, binding the captured cells held in the
     /// `captures` array value, into `out.value`. The runtime reads the callee's
@@ -429,6 +433,7 @@ impl Helper {
             Helper::IteratorNext => "bamts_iterator_next",
             Helper::Export => "bamts_export",
             Helper::ConsumeFuel => "bamts_consume_fuel",
+            Helper::CreateCell => "bamts_create_cell",
         }
     }
 
@@ -468,6 +473,7 @@ impl Helper {
             Helper::IteratorNext => 28,
             Helper::Export => 29,
             Helper::ConsumeFuel => 30,
+            Helper::CreateCell => 31,
         }
     }
 
@@ -507,6 +513,7 @@ impl Helper {
             28 => Some(Helper::IteratorNext),
             29 => Some(Helper::Export),
             30 => Some(Helper::ConsumeFuel),
+            31 => Some(Helper::CreateCell),
             _ => None,
         }
     }
@@ -525,6 +532,7 @@ impl Helper {
             // (frame, out)
             Helper::CreateObject
             | Helper::CreateArray
+            | Helper::CreateCell
             | Helper::ResumeValue
             | Helper::LoadThis
             | Helper::LoadArguments
@@ -1161,6 +1169,10 @@ impl<'a> Lowering<'a> {
                 let tag = self.call_helper(Helper::CreateArray, &[self.frame, self.out]);
                 self.route_completion(pc, tag, Some(dst));
             }
+            Instruction::CreateCell { dst } => {
+                let tag = self.call_helper(Helper::CreateCell, &[self.frame, self.out]);
+                self.route_completion(pc, tag, Some(dst));
+            }
             Instruction::CreateClosure {
                 dst,
                 function,
@@ -1730,6 +1742,7 @@ fn routes_to_handler(instruction: Instruction) -> bool {
         | Instruction::Binary { .. }
         | Instruction::CreateObject { .. }
         | Instruction::CreateArray { .. }
+        | Instruction::CreateCell { .. }
         | Instruction::CreateClosure { .. }
         | Instruction::GetProperty { .. }
         | Instruction::SetProperty { .. }
@@ -1782,6 +1795,7 @@ fn is_inline_instruction(instruction: Instruction) -> bool {
         | Instruction::Binary { .. }
         | Instruction::CreateObject { .. }
         | Instruction::CreateArray { .. }
+        | Instruction::CreateCell { .. }
         | Instruction::CreateClosure { .. }
         | Instruction::GetProperty { .. }
         | Instruction::SetProperty { .. }
@@ -1872,6 +1886,7 @@ impl NormalSuccessors for Instruction {
             | Instruction::Binary { .. }
             | Instruction::CreateObject { .. }
             | Instruction::CreateArray { .. }
+            | Instruction::CreateCell { .. }
             | Instruction::CreateClosure { .. }
             | Instruction::GetProperty { .. }
             | Instruction::SetProperty { .. }
@@ -2045,7 +2060,7 @@ mod tests {
     #[test]
     fn helper_index_table_is_a_stable_bijection() {
         // Every helper round-trips through its external index, and the table
-        // covers a dense 0..=29 range with unique symbols.
+        // covers a dense 0..=31 range with unique symbols.
         let helpers = [
             Helper::LoadConstant,
             Helper::Unary,
@@ -2078,6 +2093,7 @@ mod tests {
             Helper::IteratorNext,
             Helper::Export,
             Helper::ConsumeFuel,
+            Helper::CreateCell,
         ];
         let mut symbols = BTreeSet::new();
         for (expected_index, helper) in helpers.iter().copied().enumerate() {
@@ -2090,8 +2106,8 @@ mod tests {
             );
             assert!(symbols.insert(helper.symbol()), "unique symbol {helper:?}");
         }
-        assert_eq!(symbols.len(), 31);
-        assert_eq!(Helper::from_external_index(31), None);
+        assert_eq!(symbols.len(), 32);
+        assert_eq!(Helper::from_external_index(32), None);
     }
 
     #[test]
