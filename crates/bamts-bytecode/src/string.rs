@@ -24,6 +24,18 @@ impl EcmaString {
         Self(Arc::from(units))
     }
 
+    /// Decodes little-endian UTF-16 code units from a checked wire slice.
+    #[must_use]
+    pub(crate) fn from_le_bytes(bytes: &[u8]) -> Self {
+        debug_assert!(bytes.len().is_multiple_of(2));
+        Self(
+            bytes
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect::<Arc<[u16]>>(),
+        )
+    }
+
     /// Returns the exact UTF-16 code units.
     #[must_use]
     pub fn as_units(&self) -> &[u16] {
@@ -123,7 +135,11 @@ impl EcmaString {
         let mut offset = 0;
         while let Some(&unit) = self.0.get(offset) {
             if is_high_surrogate(unit) {
-                if self.0.get(offset + 1).is_some_and(|&next| is_low_surrogate(next)) {
+                if self
+                    .0
+                    .get(offset + 1)
+                    .is_some_and(|&next| is_low_surrogate(next))
+                {
                     offset += 2;
                 } else {
                     return Some(offset);
@@ -251,15 +267,25 @@ impl EcmaStringBuilder {
     }
 }
 
-const fn is_high_surrogate(unit: u16) -> bool { unit >= 0xD800 && unit <= 0xDBFF }
+const fn is_high_surrogate(unit: u16) -> bool {
+    unit >= 0xD800 && unit <= 0xDBFF
+}
 
-const fn is_low_surrogate(unit: u16) -> bool { unit >= 0xDC00 && unit <= 0xDFFF }
+const fn is_low_surrogate(unit: u16) -> bool {
+    unit >= 0xDC00 && unit <= 0xDFFF
+}
 
 #[cfg(test)]
 mod tests {
     use super::{EcmaString, EcmaStringBuilder};
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+
+    #[test]
+    fn little_endian_wire_units_are_exact() {
+        let string = EcmaString::from_le_bytes(&[0x61, 0, 0, 0xD8, 0, 0xDC]);
+        assert_eq!(string.as_units(), &[0x0061, 0xD800, 0xDC00]);
+    }
 
     #[test]
     fn lexical_order_is_by_code_units() {
@@ -338,7 +364,10 @@ mod tests {
     fn builder_rejects_out_of_range_code_points() {
         let mut builder = EcmaStringBuilder::new();
 
-        assert_eq!(builder.push_code_point(0x11_0000).unwrap_err().value, 0x11_0000);
+        assert_eq!(
+            builder.push_code_point(0x11_0000).unwrap_err().value,
+            0x11_0000
+        );
         assert!(builder.finish().is_empty());
     }
 

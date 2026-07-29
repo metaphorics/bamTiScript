@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
+use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
 use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyMap, ThrowOrigin};
@@ -150,7 +151,7 @@ impl<H: Host> BuiltinTable<H> {
             panic!("builtin constructor is a native function");
         };
         properties.insert(
-            crate::PropertyKey::Named("prototype".to_owned()),
+            crate::PropertyKey::Named(EcmaString::from_utf8("prototype")),
             crate::Property::Data {
                 value: prototype,
                 writable: false,
@@ -182,7 +183,7 @@ impl<H: Host> BuiltinTable<H> {
 }
 
 pub(crate) struct Intrinsics<H: Host> {
-    globals: BTreeMap<String, Value>,
+    pub(crate) globals: BTreeMap<EcmaString, Value>,
     pub(crate) object_prototype: Value,
     pub(crate) function_prototype: Value,
     pub(crate) array_prototype: Value,
@@ -231,12 +232,22 @@ impl<H: Host> Intrinsics<H> {
         builtins::install(heap, &mut globals, &mut builtins);
         crate::host_objects::install(heap, &mut globals, &mut builtins);
 
-        let function_call = globals
-            .remove("\0Function.prototype.call")
+        let function_call_key = globals
+            .keys()
+            .find(|key| key.eq_ascii("\0Function.prototype.call"))
+            .cloned()
             .expect("core builtins install Function.prototype.call");
-        let object_to_string = globals
-            .remove("\0Object.prototype.toString")
+        let function_call = globals
+            .remove(&function_call_key)
+            .expect("key remains present");
+        let object_to_string_key = globals
+            .keys()
+            .find(|key| key.eq_ascii("\0Object.prototype.toString"))
+            .cloned()
             .expect("core builtins install Object.prototype.toString");
+        let object_to_string = globals
+            .remove(&object_to_string_key)
+            .expect("key remains present");
 
         Self {
             globals,
@@ -253,7 +264,15 @@ impl<H: Host> Intrinsics<H> {
     }
 
     pub(crate) fn global(&self, name: &str) -> Option<Value> {
-        self.globals.get(name).copied()
+        debug_assert!(name.is_ascii());
+        self.globals
+            .iter()
+            .find_map(|(candidate, value)| candidate.eq_ascii(name).then_some(*value))
+    }
+
+    pub(crate) fn regexp_prototype(&self) -> Value {
+        self.global("\0RegExp.prototype")
+            .expect("RegExp builtins install their prototype")
     }
 
     pub(crate) fn error_prototype(&self, id: BuiltinId) -> Value {
@@ -291,10 +310,10 @@ pub(crate) fn native_function(
     name: &'static str,
     length: u32,
 ) -> Value {
-    let name_value = push(heap, HeapEntry::String(name.to_owned()));
+    let name_value = push(heap, HeapEntry::String(EcmaString::from_utf8(name)));
     let mut properties = PropertyMap::default();
     properties.insert(
-        crate::PropertyKey::Named("length".to_owned()),
+        crate::PropertyKey::Named(EcmaString::from_utf8("length")),
         crate::Property::Data {
             value: crate::number_value(f64::from(length)),
             writable: false,
@@ -303,7 +322,7 @@ pub(crate) fn native_function(
         },
     );
     properties.insert(
-        crate::PropertyKey::Named("name".to_owned()),
+        crate::PropertyKey::Named(EcmaString::from_utf8("name")),
         crate::Property::Data {
             value: name_value,
             writable: false,
@@ -408,7 +427,7 @@ impl<'a, H: Host> Machine<'a, H> {
         crate::format_number(number)
     }
 
-    pub(crate) fn to_string(&self, value: Value) -> Result<String, EvalFailure> {
+    pub(crate) fn to_string(&self, value: Value) -> Result<EcmaString, EvalFailure> {
         self.value_to_string(value, 0)
     }
 
@@ -453,7 +472,7 @@ mod tests {
 
     fn module() -> Program<Verified> {
         let code = Module::new(
-            vec![Constant::String("<test>".to_owned())],
+            vec![Constant::String(EcmaString::from_utf8("<test>"))],
             vec![Function::new(
                 None,
                 0,
@@ -528,7 +547,7 @@ mod tests {
         let json_text = machine.call_value(stringify, json, &[object]).unwrap();
 
         let test_key = machine
-            .allocate(HeapEntry::String("test".to_owned()))
+            .allocate(HeapEntry::String(EcmaString::from_utf8("test")))
             .unwrap();
         let has_own = call_static(&mut machine, "Object", "hasOwn", &[object, test_key]);
 
@@ -546,7 +565,7 @@ mod tests {
                 unreachable!()
             };
             properties.insert(
-                PropertyKey::Named(key.to_owned()),
+                PropertyKey::Named(EcmaString::from_utf8(key)),
                 Property::Data {
                     value: Value::int32(value),
                     writable: true,
@@ -574,7 +593,7 @@ mod tests {
             machine.to_string(is_array).unwrap(),
         ];
         for ((label, expected), actual) in expected.into_iter().zip(actual) {
-            assert_eq!(actual.as_bytes(), expected.as_bytes(), "{label}");
+            assert!(actual.eq_ascii(expected), "{label}: {actual:?}");
         }
     }
 
@@ -606,7 +625,7 @@ mod tests {
         let symbol = machine.intrinsics.global("Symbol").unwrap();
         let symbol_for = machine.get_named_property(symbol, "for").unwrap();
         let key_text = machine
-            .allocate(HeapEntry::String("shared".to_owned()))
+            .allocate(HeapEntry::String(EcmaString::from_utf8("shared")))
             .unwrap();
         let first = machine.call_value(symbol_for, symbol, &[key_text]).unwrap();
         let second = machine.call_value(symbol_for, symbol, &[key_text]).unwrap();
@@ -635,12 +654,12 @@ mod tests {
         );
 
         let pattern = machine
-            .allocate(HeapEntry::String("^(a|b)\\.js$".to_owned()))
+            .allocate(HeapEntry::String(EcmaString::from_utf8("^(a|b)\\.js$")))
             .unwrap();
         let regexp = construct_builtin(&mut machine, "RegExp", &[pattern]);
         let test = machine.get_named_property(regexp, "test").unwrap();
         let input = machine
-            .allocate(HeapEntry::String("b.js".to_owned()))
+            .allocate(HeapEntry::String(EcmaString::from_utf8("b.js")))
             .unwrap();
         assert_eq!(
             machine.call_value(test, regexp, &[input]).unwrap(),
@@ -648,22 +667,27 @@ mod tests {
         );
 
         let message = machine
-            .allocate(HeapEntry::String("boom".to_owned()))
+            .allocate(HeapEntry::String(EcmaString::from_utf8("boom")))
             .unwrap();
         let error = construct_builtin(&mut machine, "TypeError", &[message]);
         let error_message = machine.get_named_property(error, "message").unwrap();
-        assert_eq!(machine.to_string(error_message).unwrap(), "boom");
+        assert!(machine.to_string(error_message).unwrap().eq_ascii("boom"));
         let stack = machine.get_named_property(error, "stack").unwrap();
-        assert!(
-            machine
-                .to_string(stack)
-                .unwrap()
-                .starts_with("TypeError: boom")
-        );
+        let stack = machine
+            .to_string(stack)
+            .unwrap()
+            .to_utf8_strict()
+            .expect("error stack is well-formed UTF-16");
+        assert!(stack.starts_with("TypeError: boom"));
 
         let date = construct_builtin(&mut machine, "Date", &[Value::int32(0)]);
         let to_iso = machine.get_named_property(date, "toISOString").unwrap();
         let iso = machine.call_value(to_iso, date, &[]).unwrap();
-        assert_eq!(machine.to_string(iso).unwrap(), "1970-01-01T00:00:00.000Z");
+        assert!(
+            machine
+                .to_string(iso)
+                .unwrap()
+                .eq_ascii("1970-01-01T00:00:00.000Z")
+        );
     }
 }

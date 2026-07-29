@@ -1888,8 +1888,8 @@ impl NormalSuccessors for Instruction {
 mod tests {
     use super::*;
     use bamts_bytecode::{
-        Constant, ConstantId, Function as BytecodeFunction, FunctionFlags, Instruction, Pc,
-        Register,
+        Constant, ConstantId, EcmaString, Function as BytecodeFunction, FunctionFlags, Instruction,
+        Pc, Register,
     };
     use cranelift_codegen::isa;
 
@@ -2490,7 +2490,7 @@ mod tests {
             Instruction::Halt,
         ];
         let module = verified(
-            vec![Constant::String("g".to_string())],
+            vec![Constant::String(EcmaString::from_utf8("g"))],
             vec![func(2, code, Vec::new())],
         );
         let (helpers, clif) = lower_one(&module);
@@ -2561,7 +2561,7 @@ mod tests {
             catch_register: reg(0),
         }];
         let module = verified(
-            vec![Constant::String("g".to_string())],
+            vec![Constant::String(EcmaString::from_utf8("g"))],
             vec![func(1, code, handlers)],
         );
         // Must lower without panicking on a missing handler block.
@@ -2627,8 +2627,8 @@ mod tests {
         ];
         let module = verified(
             vec![
-                Constant::String("p".to_string()),
-                Constant::String("g".to_string()),
+                Constant::String(EcmaString::from_utf8("p")),
+                Constant::String(EcmaString::from_utf8("g")),
             ],
             vec![func(4, code, Vec::new())],
         );
@@ -2753,7 +2753,7 @@ mod tests {
             Instruction::Halt,
         ];
         let module = verified(
-            vec![Constant::String("x".to_string())],
+            vec![Constant::String(EcmaString::from_utf8("x"))],
             vec![func(1, code, Vec::new())],
         );
         let (helpers, clif) = lower_one(&module);
@@ -2905,7 +2905,7 @@ mod tests {
             Instruction::Halt,
         ];
         let module = verified(
-            vec![Constant::String("mod".to_string())],
+            vec![Constant::String(EcmaString::from_utf8("mod"))],
             vec![func(3, code, Vec::new())],
         );
         let (helpers, _) = lower_one(&module);
@@ -3059,7 +3059,7 @@ mod tests {
             Vec::new(),
         )];
         let module = Module::new(
-            vec![Constant::String("main".to_string())],
+            vec![Constant::String(EcmaString::from_utf8("main"))],
             functions,
             FunctionId::new(0),
         )
@@ -3073,7 +3073,7 @@ mod tests {
         let make_module = |name: &str| bamts_bytecode::ProgramModule {
             name: ConstantId::new(0),
             code: Module::new(
-                vec![Constant::String(name.to_owned())],
+                vec![Constant::String(EcmaString::from_utf8(name))],
                 vec![func(0, vec![Instruction::Halt], Vec::new())],
                 FunctionId::new(0),
             )

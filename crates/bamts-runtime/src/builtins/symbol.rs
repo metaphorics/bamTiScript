@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
 use super::{
@@ -10,7 +11,7 @@ use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey};
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
-    globals: &mut BTreeMap<String, Value>,
+    globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
@@ -46,7 +47,7 @@ pub(super) fn install<H: Host>(
         unreachable!()
     };
     properties.insert(
-        PropertyKey::Named("description".to_owned()),
+        PropertyKey::Named(EcmaString::from_utf8("description")),
         Property::Accessor {
             getter: Some(description),
             setter: None,
@@ -59,28 +60,31 @@ pub(super) fn install<H: Host>(
         builtin_property(symbol_tag),
     );
 
-    globals.insert("Symbol".to_owned(), constructor);
-    globals.insert("\0Symbol.registry".to_owned(), registry);
+    globals.insert(EcmaString::from_utf8("Symbol"), constructor);
+    globals.insert(EcmaString::from_utf8("\0Symbol.registry"), registry);
 }
 
 fn symbol(heap: &mut Vec<HeapEntry>, description: &str) -> Value {
     super::super::push(
         heap,
         HeapEntry::Symbol {
-            description: description.to_owned(),
+            description: EcmaString::from_utf8(description),
         },
     )
 }
 
 fn allocate_literal_string(heap: &mut Vec<HeapEntry>, text: &str) -> Value {
-    super::super::push(heap, HeapEntry::String(text.to_owned()))
+    super::super::push(heap, HeapEntry::String(EcmaString::from_utf8(text)))
 }
 
 fn define_native_property(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) {
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[heap_index(object)] else {
         unreachable!()
     };
-    properties.insert(PropertyKey::Named(name.to_owned()), builtin_property(value));
+    properties.insert(
+        PropertyKey::Named(EcmaString::from_utf8(name)),
+        builtin_property(value),
+    );
 }
 
 fn define_readonly_property(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) {
@@ -88,7 +92,7 @@ fn define_readonly_property(heap: &mut [HeapEntry], object: Value, name: &str, v
         unreachable!()
     };
     properties.insert(
-        PropertyKey::Named(name.to_owned()),
+        PropertyKey::Named(EcmaString::from_utf8(name)),
         Property::Data {
             value,
             writable: false,
@@ -131,7 +135,7 @@ fn symbol_for<H: Host>(
         .intrinsics
         .global("\0Symbol.registry")
         .expect("symbol registry installed");
-    let existing = machine.get_named_property(registry, &key)?;
+    let existing = machine.get_property_key(registry, &PropertyKey::Named(key.clone()))?;
     if existing != Value::UNDEFINED {
         return Ok(BuiltinOutcome::Value(existing));
     }
@@ -140,14 +144,14 @@ fn symbol_for<H: Host>(
             description: key.clone(),
         })
         .map_err(EvalFailure::Runtime)?;
-    machine.set_data_property(registry, &key, symbol)?;
+    machine.set_data_property_key(registry, PropertyKey::Named(key), symbol)?;
     Ok(BuiltinOutcome::Value(symbol))
 }
 
 fn symbol_description<H: Host>(
     machine: &Machine<'_, H>,
     value: Value,
-) -> Result<String, EvalFailure> {
+) -> Result<EcmaString, EvalFailure> {
     let Some(Decoded::HeapRef(id)) = value.decode() else {
         return Err(type_error("Symbol method called on incompatible receiver"));
     };
@@ -164,9 +168,10 @@ fn description<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
+    let description = symbol_description(machine, this)?;
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
-        symbol_description(machine, this)?,
+        description,
     )?))
 }
 
@@ -176,8 +181,18 @@ fn to_string<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let text = format!("Symbol({})", symbol_description(machine, this)?);
-    Ok(BuiltinOutcome::Value(allocate_string(machine, text)?))
+    let description = symbol_description(machine, this)?;
+    let mut builder =
+        bamts_bytecode::EcmaStringBuilder::with_capacity(description.len_units().saturating_add(8));
+    builder.push_utf8("Symbol(");
+    for &unit in description.as_units() {
+        builder.push_unit(unit);
+    }
+    builder.push_unit(u16::from(b')'));
+    Ok(BuiltinOutcome::Value(allocate_string(
+        machine,
+        builder.finish(),
+    )?))
 }
 
 fn value_of<H: Host>(

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use bamts_bytecode::EcmaString;
 use bamts_native::Value;
 
 use super::{
@@ -12,7 +13,7 @@ const DATE_VALUE: &str = "\0Date.value";
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
-    globals: &mut BTreeMap<String, Value>,
+    globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
@@ -24,7 +25,7 @@ pub(super) fn install<H: Host>(
         unreachable!()
     };
     properties.insert(
-        PropertyKey::Named("now".to_owned()),
+        PropertyKey::Named(EcmaString::from_utf8("now")),
         super::builtin_property(now),
     );
     for (name, handler) in [
@@ -35,7 +36,7 @@ pub(super) fn install<H: Host>(
         let function = install_function(heap, builtins, name, 0, handler);
         define_data(heap, prototype, name, function);
     }
-    globals.insert("Date".to_owned(), constructor);
+    globals.insert(EcmaString::from_utf8("Date"), constructor);
 }
 
 fn constructor<H: Host>(
@@ -50,16 +51,17 @@ fn constructor<H: Host>(
         machine.host.now_ms() as f64
     };
     if !constructing {
+        let text = iso_string(milliseconds).unwrap_or_else(|| "Invalid Date".to_owned());
         return Ok(BuiltinOutcome::Value(allocate_string(
             machine,
-            iso_string(milliseconds).unwrap_or_else(|| "Invalid Date".to_owned()),
+            EcmaString::from_utf8(&text),
         )?));
     }
     let constructor = machine.intrinsics.global("Date").expect("Date installed");
     let prototype = machine.get_named_property(constructor, "prototype")?;
     let mut properties = PropertyMap::default();
     properties.insert(
-        PropertyKey::Named(DATE_VALUE.to_owned()),
+        PropertyKey::Named(EcmaString::from_utf8(DATE_VALUE)),
         Property::Data {
             value: crate::number_value(milliseconds),
             writable: true,
@@ -106,7 +108,10 @@ fn to_iso_string<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let milliseconds = value_number(date_value(machine, this)?);
     let text = iso_string(milliseconds).ok_or_else(|| range_error("Invalid time value"))?;
-    Ok(BuiltinOutcome::Value(allocate_string(machine, text)?))
+    Ok(BuiltinOutcome::Value(allocate_string(
+        machine,
+        EcmaString::from_utf8(&text),
+    )?))
 }
 
 fn date_value<H: Host>(machine: &mut Machine<'_, H>, this: Value) -> Result<Value, EvalFailure> {

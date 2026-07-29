@@ -44,10 +44,10 @@ use std::error::Error;
 use std::fmt;
 
 use bamts_bytecode::{
-    AccessorKind, BigIntLiteral, BinaryOp, Constant, ConstantId, ExceptionHandler, Function,
-    FunctionFlags, FunctionId, Instruction, IteratorKind, MAX_CONSTANTS, MAX_FUNCTIONS,
-    MAX_INSTRUCTIONS, MAX_REGISTERS, Module, NumberBits, Pc, Register, UnaryOp, Verified,
-    VerifyError,
+    AccessorKind, BigIntLiteral, BinaryOp, Constant, ConstantId, EcmaString, EcmaStringBuilder,
+    ExceptionHandler, Function, FunctionFlags, FunctionId, Instruction, IteratorKind,
+    MAX_CONSTANTS, MAX_FUNCTIONS, MAX_INSTRUCTIONS, MAX_REGISTERS, Module, NumberBits, Pc,
+    Register, UnaryOp, Verified, VerifyError,
 };
 
 pub use crate::program::{
@@ -96,7 +96,7 @@ pub struct LowerOptions {
 const MAX_BODY_INSTRUCTIONS: usize = MAX_INSTRUCTIONS as usize - 2;
 /// Persisted string constants must fit the deterministic decode ceiling so an
 /// assembled module round-trips through [`bamts_bytecode::decode`].
-const MAX_STRING_BYTES: usize = 1 << 20;
+const MAX_STRING_UNITS: usize = 1 << 20;
 
 /// A typed lowering failure anchored to one source location.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -121,6 +121,8 @@ pub enum LowerErrorKind {
     InvalidBigIntLiteral,
     /// A regular-expression literal lexeme was malformed.
     InvalidRegexLiteral,
+    /// A module linkage name contained an unpaired UTF-16 surrogate.
+    IllFormedMetadataString,
     /// A runtime construct the current instruction set cannot express.
     Unsupported(UnsupportedConstruct),
     /// A structural production capacity ran out.
@@ -176,7 +178,7 @@ pub enum CapacityLimit {
     Constants,
     Functions,
     Instructions,
-    StringBytes,
+    StringUnits,
     Captures,
 }
 
@@ -207,6 +209,9 @@ impl fmt::Display for LowerErrorKind {
             Self::InvalidNumericLiteral => f.write_str("numeric literal has no cooked value"),
             Self::InvalidBigIntLiteral => f.write_str("bigint literal has no canonical value"),
             Self::InvalidRegexLiteral => f.write_str("regular-expression literal is malformed"),
+            Self::IllFormedMetadataString => {
+                f.write_str("module metadata string is not well-formed UTF-16")
+            }
             Self::Unsupported(construct) => {
                 write!(f, "unsupported runtime semantics: {construct}")
             }
@@ -247,7 +252,7 @@ impl fmt::Display for CapacityLimit {
             Self::Constants => "too many pooled constants",
             Self::Functions => "too many functions",
             Self::Instructions => "too many instructions in one function",
-            Self::StringBytes => "string constant exceeds the deterministic pool byte ceiling",
+            Self::StringUnits => "string constant exceeds the deterministic pool code-unit ceiling",
             Self::Captures => "too many captured variables in one closure",
         };
         f.write_str(text)
@@ -313,7 +318,7 @@ fn assemble_with_linkage_strings(
         functions: Vec::new(),
     };
     for value in linkage_strings {
-        builder.intern(Constant::String(value.clone()), file.range())?;
+        builder.intern(Constant::String(EcmaString::from_utf8(value)), file.range())?;
     }
     let entry = builder.reserve_function(file.range())?;
 
@@ -370,9 +375,9 @@ impl ModuleBuilder {
     /// Interns one constant, deduplicated, in deterministic first-use order.
     fn intern(&mut self, constant: Constant, range: TextRange) -> Result<ConstantId, LowerError> {
         if let Constant::String(value) = &constant
-            && value.len() > MAX_STRING_BYTES
+            && value.len_units() > MAX_STRING_UNITS
         {
-            return Err(self.error(range, LowerErrorKind::Capacity(CapacityLimit::StringBytes)));
+            return Err(self.error(range, LowerErrorKind::Capacity(CapacityLimit::StringUnits)));
         }
         if let Some(position) = self
             .constants
@@ -594,7 +599,7 @@ impl<'a> FunctionContext<'a> {
     fn string_reg(
         &mut self,
         builder: &mut ModuleBuilder,
-        value: String,
+        value: EcmaString,
         range: TextRange,
     ) -> Result<Register, LowerError> {
         self.load_constant(builder, Constant::String(value), range)
@@ -709,7 +714,7 @@ impl<'a> FunctionContext<'a> {
         match self.declare_local(name, range, function_scoped)? {
             Some(home) => self.move_to(range, home, value),
             None => {
-                let id = builder.intern(Constant::String(name.to_owned()), range)?;
+                let id = builder.intern(Constant::String(EcmaString::from_utf8(name)), range)?;
                 self.emit(range, Instruction::StoreGlobal { name: id, value })?;
                 Ok(())
             }
@@ -782,7 +787,7 @@ impl<'a> FunctionContext<'a> {
             return self.undefined(builder, range);
         }
         // Free name: read from the environment.
-        let id = builder.intern(Constant::String(name.to_owned()), range)?;
+        let id = builder.intern(Constant::String(EcmaString::from_utf8(name)), range)?;
         let dst = self.alloc_register(range)?;
         self.emit(range, Instruction::LoadGlobal { dst, name: id })?;
         Ok(dst)
@@ -800,7 +805,7 @@ impl<'a> FunctionContext<'a> {
         if let Some(Binding::Local(home)) = self.resolve(name) {
             return self.move_to(range, home, value);
         }
-        let id = builder.intern(Constant::String(name.to_owned()), range)?;
+        let id = builder.intern(Constant::String(EcmaString::from_utf8(name)), range)?;
         self.emit(range, Instruction::StoreGlobal { name: id, value })?;
         Ok(())
     }
@@ -1860,7 +1865,7 @@ impl<'a> FunctionContext<'a> {
                 || (name == "arguments" && !matches!(self.arguments_source, ArgumentsSource::None))
                 || name == "undefined";
             if !resolved {
-                let id = builder.intern(Constant::String(name), range)?;
+                let id = builder.intern(Constant::String(EcmaString::from_utf8(&name)), range)?;
                 let dst = self.alloc_register(range)?;
                 self.emit(range, Instruction::TypeOfGlobal { dst, name: id })?;
                 return Ok(dst);
@@ -2833,7 +2838,7 @@ impl<'a> FunctionContext<'a> {
                 },
             )?;
         }
-        let raw_key = self.string_reg(builder, "raw".to_owned(), range)?;
+        let raw_key = self.string_reg(builder, EcmaString::from_utf8("raw"), range)?;
         self.emit(
             range,
             Instruction::SetProperty {
@@ -2874,7 +2879,10 @@ impl<'a> FunctionContext<'a> {
         Ok(dst)
     }
 
-    fn cooked_template_parts(&self, template: &TemplateLiteral) -> Result<Vec<String>, LowerError> {
+    fn cooked_template_parts(
+        &self,
+        template: &TemplateLiteral,
+    ) -> Result<Vec<EcmaString>, LowerError> {
         template
             .elements
             .iter()
@@ -2882,7 +2890,10 @@ impl<'a> FunctionContext<'a> {
             .collect()
     }
 
-    fn raw_template_parts(&self, template: &TemplateLiteral) -> Result<Vec<String>, LowerError> {
+    fn raw_template_parts(
+        &self,
+        template: &TemplateLiteral,
+    ) -> Result<Vec<EcmaString>, LowerError> {
         template
             .elements
             .iter()
@@ -2896,19 +2907,19 @@ impl<'a> FunctionContext<'a> {
         &self,
         element: &TemplateElementNode,
         cook: bool,
-    ) -> Result<String, LowerError> {
+    ) -> Result<EcmaString, LowerError> {
         let token = element.data().token();
         if token.is_missing() {
-            return Ok(String::new());
+            return Ok(EcmaString::default());
         }
         let Some(text) = self.file.token_text(token) else {
-            return Ok(String::new());
+            return Ok(EcmaString::default());
         };
         let interior = trim_template_delimiters(text, token.kind());
         if cook {
             Ok(cook_escapes(interior))
         } else {
-            Ok(interior.to_owned())
+            Ok(EcmaString::from_utf8(interior))
         }
     }
 
@@ -2928,8 +2939,9 @@ impl<'a> FunctionContext<'a> {
             .ok_or_else(|| self.error(range, LowerErrorKind::InvalidRegexLiteral))?;
         let (pattern, flags) = split_regex(lexeme)
             .ok_or_else(|| self.error(range, LowerErrorKind::InvalidRegexLiteral))?;
-        let pattern_id = builder.intern(Constant::String(pattern), range)?;
-        let flags_id = builder.intern(Constant::String(flags), range)?;
+        let pattern_id =
+            builder.intern(Constant::String(EcmaString::from_utf8(&pattern)), range)?;
+        let flags_id = builder.intern(Constant::String(EcmaString::from_utf8(&flags)), range)?;
         let dst = self.alloc_register(range)?;
         self.emit(
             range,
@@ -2986,7 +2998,7 @@ impl<'a> FunctionContext<'a> {
         self.load_constant(builder, number_constant(value), range)
     }
 
-    fn string_literal_value(&self, string: &StringLiteralNode) -> Result<String, LowerError> {
+    fn string_literal_value(&self, string: &StringLiteralNode) -> Result<EcmaString, LowerError> {
         let range = string.range();
         let token = string.data().token();
         let missing = || self.missing(range, NodeKind::StringLiteral);
@@ -3024,7 +3036,7 @@ impl<'a> FunctionContext<'a> {
         match property {
             MemberProperty::Named(identifier) => {
                 let name = self.identifier_text(identifier)?;
-                self.string_reg(builder, name, identifier.range())
+                self.string_reg(builder, EcmaString::from_utf8(&name), identifier.range())
             }
             MemberProperty::Computed(expression) => self.lower_expression(builder, expression),
             MemberProperty::Private(private) => {
@@ -3043,7 +3055,7 @@ impl<'a> FunctionContext<'a> {
         match name {
             PropertyName::Identifier(identifier) => {
                 let text = self.identifier_text(identifier)?;
-                self.string_reg(builder, text, identifier.range())
+                self.string_reg(builder, EcmaString::from_utf8(&text), identifier.range())
             }
             PropertyName::String(string) => {
                 let value = self.string_literal_value(string)?;
@@ -3051,7 +3063,7 @@ impl<'a> FunctionContext<'a> {
             }
             PropertyName::Number(number) => {
                 let key = numeric_key_text(self, number)?;
-                self.string_reg(builder, key, number.range())
+                self.string_reg(builder, EcmaString::from_utf8(&key), number.range())
             }
             PropertyName::Computed(expression) => self.lower_expression(builder, expression),
             PropertyName::Private(private) => {
@@ -3152,7 +3164,7 @@ impl<'a> FunctionContext<'a> {
         object: Register,
         name: &str,
     ) -> Result<Register, LowerError> {
-        let key = self.string_reg(builder, name.to_owned(), range)?;
+        let key = self.string_reg(builder, EcmaString::from_utf8(name), range)?;
         let dst = self.alloc_register(range)?;
         self.emit(range, Instruction::GetProperty { dst, object, key })?;
         Ok(dst)
@@ -3170,7 +3182,7 @@ impl<'a> FunctionContext<'a> {
             return Ok(());
         }
         let src = self.read_name(builder, local, range)?;
-        let name = builder.intern(Constant::String(exported.to_owned()), range)?;
+        let name = builder.intern(Constant::String(EcmaString::from_utf8(exported)), range)?;
         self.emit(range, Instruction::Export { name, src })?;
         Ok(())
     }
@@ -3186,7 +3198,7 @@ impl<'a> FunctionContext<'a> {
             debug_assert_eq!(exported, "default");
             return self.store_binding(builder, "*default*", src, range, false);
         }
-        let name = builder.intern(Constant::String(exported.to_owned()), range)?;
+        let name = builder.intern(Constant::String(EcmaString::from_utf8(exported)), range)?;
         self.emit(range, Instruction::Export { name, src })?;
         Ok(())
     }
@@ -3297,7 +3309,10 @@ impl<'a> FunctionContext<'a> {
     fn module_export_name(&self, name: &ModuleExportName) -> Result<String, LowerError> {
         match name {
             ModuleExportName::Identifier(identifier) => self.identifier_text(identifier),
-            ModuleExportName::String(string) => self.string_literal_value(string),
+            ModuleExportName::String(string) => self
+                .string_literal_value(string)?
+                .to_utf8_strict()
+                .map_err(|_| self.error(string.range(), LowerErrorKind::IllFormedMetadataString)),
             ModuleExportName::Missing(missing) => Err(self.error(
                 zero_range(),
                 LowerErrorKind::MissingSyntax {
@@ -3803,7 +3818,9 @@ impl<'a> FunctionContext<'a> {
             }
         }
         let name_constant = match name {
-            Some(name) => Some(builder.intern(Constant::String(name), range)?),
+            Some(name) => {
+                Some(builder.intern(Constant::String(EcmaString::from_utf8(&name)), range)?)
+            }
             None => None,
         };
         let assembled = inner.into_function(name_constant, flags);
@@ -4043,7 +4060,7 @@ impl<'a> FunctionContext<'a> {
             )?;
         }
         // ctor.prototype = prototype.
-        let prototype_key = self.string_reg(builder, "prototype".to_owned(), range)?;
+        let prototype_key = self.string_reg(builder, EcmaString::from_utf8("prototype"), range)?;
         self.emit(
             range,
             Instruction::SetProperty {
@@ -4091,7 +4108,8 @@ impl<'a> FunctionContext<'a> {
                 if !seen.insert(text.clone()) {
                     continue;
                 }
-                let description = builder.intern(Constant::String(text.clone()), range)?;
+                let description =
+                    builder.intern(Constant::String(EcmaString::from_utf8(&text)), range)?;
                 let dst = self.alloc_register(range)?;
                 self.emit(range, Instruction::CreatePrivateName { dst, description })?;
                 self.declare(text, Binding::Local(dst), false);
@@ -5169,29 +5187,31 @@ fn trim_template_delimiters(text: &str, kind: TokenKind) -> &str {
 
 /// Cooks JavaScript escape sequences in a string/template interior. Malformed
 /// escapes degrade to their literal characters rather than failing.
-fn cook_escapes(input: &str) -> String {
+fn cook_escapes(input: &str) -> EcmaString {
     if !input.contains('\\') {
-        return input.to_owned();
+        return EcmaString::from_utf8(input);
     }
-    let mut output = String::with_capacity(input.len());
+    let mut output = EcmaStringBuilder::with_capacity(input.encode_utf16().count());
     let mut chars = input.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch != '\\' {
-            output.push(ch);
+            output
+                .push_code_point(u32::from(ch))
+                .expect("a Rust char is a Unicode scalar");
             continue;
         }
         let Some(escape) = chars.next() else {
-            output.push('\\');
+            output.push_unit(b'\\'.into());
             break;
         };
         match escape {
-            'n' => output.push('\n'),
-            't' => output.push('\t'),
-            'r' => output.push('\r'),
-            'b' => output.push('\u{8}'),
-            'f' => output.push('\u{c}'),
-            'v' => output.push('\u{b}'),
-            '0' if !chars.peek().is_some_and(|c| c.is_ascii_digit()) => output.push('\0'),
+            'n' => output.push_unit(b'\n'.into()),
+            't' => output.push_unit(b'\t'.into()),
+            'r' => output.push_unit(b'\r'.into()),
+            'b' => output.push_unit(0x0008),
+            'f' => output.push_unit(0x000C),
+            'v' => output.push_unit(0x000B),
+            '0' if !chars.peek().is_some_and(|c| c.is_ascii_digit()) => output.push_unit(0),
             '\n' => {}
             '\r' => {
                 if chars.peek() == Some(&'\n') {
@@ -5203,21 +5223,25 @@ fn cook_escapes(input: &str) -> String {
                 let lo = chars.next();
                 if let (Some(hi), Some(lo)) = (hi, lo)
                     && let (Some(h), Some(l)) = (hi.to_digit(16), lo.to_digit(16))
-                    && let Some(decoded) = char::from_u32(h * 16 + l)
                 {
-                    output.push(decoded);
+                    output.push_unit((h * 16 + l) as u16);
                 } else {
-                    output.push('x');
+                    output.push_unit(b'x'.into());
                 }
             }
             'u' => cook_unicode_escape(&mut chars, &mut output),
-            other => output.push(other),
+            other => output
+                .push_code_point(u32::from(other))
+                .expect("a Rust char is a Unicode scalar"),
         }
     }
-    output
+    output.finish()
 }
 
-fn cook_unicode_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, output: &mut String) {
+fn cook_unicode_escape(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    output: &mut EcmaStringBuilder,
+) {
     if chars.peek() == Some(&'{') {
         chars.next();
         let mut value = 0u32;
@@ -5232,26 +5256,26 @@ fn cook_unicode_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, out
             any = true;
             chars.next();
         }
-        if any && let Some(decoded) = char::from_u32(value) {
-            output.push(decoded);
+        if any && value <= 0x10_FFFF {
+            output
+                .push_code_point(value)
+                .expect("a bounded code point is representable");
         }
         return;
     }
-    let mut value = 0u32;
+    let mut value = 0u16;
     let mut count = 0;
     while count < 4 {
         let Some(&c) = chars.peek() else { break };
         let Some(digit) = c.to_digit(16) else { break };
-        value = value * 16 + digit;
+        value = value * 16 + digit as u16;
         chars.next();
         count += 1;
     }
-    if count == 4
-        && let Some(decoded) = char::from_u32(value)
-    {
-        output.push(decoded);
+    if count == 4 {
+        output.push_unit(value);
     } else {
-        output.push('u');
+        output.push_unit(b'u'.into());
     }
 }
 
@@ -5344,7 +5368,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use super::{LowerOptions, lower};
+    use super::{LowerOptions, cook_escapes, lower};
     use crate::parser::parse;
     use crate::scanner::scan;
     use crate::source::{ScriptKind, SourceId, SourceText};
@@ -5441,6 +5465,13 @@ mod tests {
     }
 
     #[test]
+    fn cooking_preserves_lone_surrogate_units() {
+        assert_eq!(cook_escapes("\\uD800").as_units(), [0xD800]);
+        assert_eq!(cook_escapes("\\uD83D\\uDE03").as_units(), [0xD83D, 0xDE03]);
+        assert_eq!(cook_escapes("\\u{1F603}").as_units(), [0xD83D, 0xDE03]);
+    }
+
+    #[test]
     fn all_declared_corpus_sources_lower_to_verified_modules() {
         let root = repository_root();
         let sources = declared_corpus_sources(&root);
@@ -5476,7 +5507,7 @@ mod tests {
         );
     }
 
-    use bamts_bytecode::{DecodeLimits, Instruction, Module, Verified, decode_verified};
+    use bamts_bytecode::{Constant, DecodeLimits, Instruction, Module, Verified, decode_verified};
 
     fn lower_js(src: &str) -> Module<Verified> {
         let source = Arc::new(SourceText::new(src.to_owned()));
@@ -5489,6 +5520,21 @@ mod tests {
             },
         )
         .expect("snippet lowers to a verified module")
+    }
+
+    #[test]
+    fn lowering_preserves_lone_surrogate_escapes() {
+        let module = lower_js("const lone = '\\uD800'; const face = '\\u{1F603}';");
+        let strings: Vec<_> = module
+            .constants()
+            .iter()
+            .filter_map(|constant| match constant {
+                Constant::String(value) => Some(value.as_units()),
+                _ => None,
+            })
+            .collect();
+        assert!(strings.iter().any(|units| *units == [0xD800]));
+        assert!(strings.iter().any(|units| *units == [0xD83D, 0xDE03]));
     }
 
     fn any_instruction(

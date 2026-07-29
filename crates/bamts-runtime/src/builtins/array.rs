@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
+use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
 use super::{
@@ -12,13 +13,13 @@ use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyKey};
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
-    globals: &mut BTreeMap<String, Value>,
+    globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.array_prototype();
     let constructor = install_function(heap, builtins, "Array", 1, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
-    globals.insert("Array".to_owned(), constructor);
+    globals.insert(EcmaString::from_utf8("Array"), constructor);
     for (name, length, handler) in [
         ("isArray", 1, is_array::<H> as BuiltinHandler<H>),
         ("from", 1, from::<H>),
@@ -80,7 +81,7 @@ fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: 
         panic!("Array constructor must be native")
     };
     properties.insert(
-        PropertyKey::Named(name.to_owned()),
+        PropertyKey::Named(EcmaString::from_utf8(name)),
         super::builtin_property(value),
     );
 }
@@ -125,9 +126,21 @@ fn from<H: Host>(
     let mut elements = if let Some(values) = machine.array_elements(source)? {
         values
     } else if let Some(text) = machine.string_value(source) {
-        text.encode_utf16()
-            .map(|unit| allocate_string(machine, String::from_utf16_lossy(&[unit])))
-            .collect::<Result<Vec<_>, _>>()?
+        let pieces: Vec<EcmaString> = text
+            .code_points()
+            .map(|(_, code_point)| {
+                let mut builder = bamts_bytecode::EcmaStringBuilder::new();
+                builder
+                    .push_code_point(code_point)
+                    .expect("EcmaString code point is valid");
+                builder.finish()
+            })
+            .collect();
+        let mut values = Vec::with_capacity(pieces.len());
+        for piece in pieces {
+            values.push(allocate_string(machine, piece)?);
+        }
+        values
     } else {
         return Err(type_error("Array.from requires an array-like object"));
     };
@@ -317,26 +330,29 @@ fn join<H: Host>(
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let values = elements(machine, this)?;
-    let sep = if args.is_empty() || args[0] == Value::UNDEFINED {
-        ",".to_owned()
+    let separator = if args.is_empty() || args[0] == Value::UNDEFINED {
+        EcmaString::from_utf8(",")
     } else {
         machine.to_string(args[0])?
     };
-    let mut parts = Vec::with_capacity(values.len());
-    for value in values {
-        parts.push(
-            if value == Value::HOLE
-                || matches!(value.decode(), Some(Decoded::Undefined | Decoded::Null))
-            {
-                String::new()
-            } else {
-                machine.to_string(value)?
-            },
-        );
+    let mut output = bamts_bytecode::EcmaStringBuilder::new();
+    for (index, value) in values.into_iter().enumerate() {
+        if index != 0 {
+            for &unit in separator.as_units() {
+                output.push_unit(unit);
+            }
+        }
+        if value != Value::HOLE
+            && !matches!(value.decode(), Some(Decoded::Undefined | Decoded::Null))
+        {
+            for &unit in machine.to_string(value)?.as_units() {
+                output.push_unit(unit);
+            }
+        }
     }
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
-        parts.join(&sep),
+        output.finish(),
     )?))
 }
 fn from_index<H: Host>(
@@ -705,7 +721,7 @@ fn sort<H: Host>(
             }
         } else {
             match (machine.to_string(*a), machine.to_string(*b)) {
-                (Ok(a), Ok(b)) => a.encode_utf16().cmp(b.encode_utf16()),
+                (Ok(a), Ok(b)) => a.cmp(&b),
                 (Err(e), _) | (_, Err(e)) => {
                     error = Some(e);
                     Ordering::Equal

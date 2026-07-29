@@ -25,9 +25,9 @@ use std::error::Error;
 use std::fmt;
 
 use bamts_bytecode::{
-    AccessorKind, BinaryOp, BindingId, BindingKind, Constant, ConstantId, EdgeId, EdgeTarget,
-    Function, FunctionId, Instruction, IteratorKind, Module, ModuleId, Pc, Program, ResolvedExport,
-    UnaryOp, Verified,
+    AccessorKind, BinaryOp, BindingId, BindingKind, Constant, ConstantId, EcmaString,
+    EcmaStringBuilder, EdgeId, EdgeTarget, Function, FunctionId, Instruction, IteratorKind, Module,
+    ModuleId, Pc, Program, ResolvedExport, UnaryOp, Verified,
 };
 use bamts_native::{Decoded, SlotId, Value};
 
@@ -140,12 +140,13 @@ pub enum ThrowOrigin {
     TypeError { operation: &'static str },
     RangeError { operation: &'static str },
     ReferenceError { operation: &'static str },
+    UriError { operation: &'static str },
 }
 
 /// Source metadata attached to every machine failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeSource {
-    pub function_name: Option<String>,
+    pub function_name: Option<EcmaString>,
     pub instruction: Instruction,
 }
 
@@ -217,7 +218,7 @@ impl fmt::Display for RuntimeError {
             self.pc.get()
         )?;
         if let Some(name) = &self.source.function_name {
-            write!(formatter, " ({name})")?;
+            write!(formatter, " ({})", name.to_utf8_lossy())?;
         }
         write!(formatter, ": ")?;
         match &self.kind {
@@ -308,22 +309,26 @@ pub fn constant_value(constant: &Constant) -> Option<Value> {
 /// Two identity-bearing allocations with the same description remain distinct keys.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum PropertyKey {
-    Named(String),
+    Named(EcmaString),
     Symbol(u32),
     Private(u32),
 }
 
 impl PropertyKey {
-    fn as_str(&self) -> Option<&str> {
+    fn as_string(&self) -> Option<&EcmaString> {
         match self {
             PropertyKey::Named(text) => Some(text),
             PropertyKey::Symbol(_) | PropertyKey::Private(_) => None,
         }
     }
 
+    fn eq_ascii(&self, ascii: &str) -> bool {
+        matches!(self, PropertyKey::Named(text) if text.eq_ascii(ascii))
+    }
+
     fn charge_bytes(&self) -> usize {
         match self {
-            PropertyKey::Named(text) => text.len() + 8,
+            PropertyKey::Named(text) => text.len_units().saturating_mul(2).saturating_add(8),
             PropertyKey::Symbol(_) | PropertyKey::Private(_) => 16,
         }
     }
@@ -381,6 +386,13 @@ impl PropertyMap {
         self.get(key).is_some()
     }
 
+    fn get_ascii(&self, ascii: &str) -> Option<&Property> {
+        debug_assert!(ascii.is_ascii());
+        self.0
+            .iter()
+            .find_map(|(key, property)| key.eq_ascii(ascii).then_some(property))
+    }
+
     fn insert(&mut self, key: PropertyKey, property: Property) -> Option<Property> {
         if let Some(existing) = self.get_mut(&key) {
             return Some(std::mem::replace(existing, property));
@@ -416,7 +428,7 @@ impl<'a> IntoIterator for &'a PropertyMap {
 
 #[derive(Clone, Debug)]
 enum HeapEntry {
-    String(String),
+    String(EcmaString),
     BigInt(String),
     Object {
         properties: PropertyMap,
@@ -443,7 +455,7 @@ enum HeapEntry {
         module: ModuleId,
     },
     ExternalModuleNamespace {
-        specifier: &'static str,
+        specifier: EcmaString,
     },
     HashState {
         algorithm: String,
@@ -453,21 +465,22 @@ enum HeapEntry {
         digest: Value,
     },
     Symbol {
-        description: String,
+        description: EcmaString,
     },
     PrivateName {
-        description: String,
+        description: EcmaString,
     },
     RegExp {
-        pattern: String,
-        flags: String,
+        pattern: EcmaString,
+        flags: EcmaString,
         properties: PropertyMap,
+        prototype: Option<Value>,
         extensible: bool,
     },
     Iterator {
         source: Value,
         index: usize,
-        keys: Option<Vec<String>>,
+        keys: Option<Vec<EcmaString>>,
     },
     ProcessEnv {
         prototype: Option<Value>,
@@ -485,10 +498,13 @@ impl HeapEntry {
     fn initial_bytes(&self) -> usize {
         match self {
             Self::String(text)
-            | Self::BigInt(text)
             | Self::Symbol { description: text }
-            | Self::PrivateName { description: text } => text.len(),
-            Self::RegExp { pattern, flags, .. } => pattern.len() + flags.len(),
+            | Self::PrivateName { description: text } => text.len_units().saturating_mul(2),
+            Self::BigInt(text) => text.len(),
+            Self::RegExp { pattern, flags, .. } => pattern
+                .len_units()
+                .saturating_add(flags.len_units())
+                .saturating_mul(2),
             Self::HashState {
                 algorithm, data, ..
             } => algorithm.len() + data.len(),
@@ -592,7 +608,7 @@ enum GetOutcome {
     /// A ready ABI value.
     Value(Value),
     /// Text that must be interned as a fresh heap string.
-    Text(String),
+    Text(EcmaString),
     /// An accessor getter to invoke with the receiver as `this`.
     Getter(Value),
 }
@@ -610,7 +626,7 @@ enum SetOutcome {
 #[derive(Clone, Debug)]
 enum Found {
     Value(Value),
-    Text(String),
+    Text(EcmaString),
     Getter(Value),
     Failure(RuntimeErrorKind),
     /// An accessor property with no getter resolves to `undefined`.
@@ -646,7 +662,7 @@ pub struct Machine<'a, H: Host> {
     live_registers: usize,
     native_depth: usize,
     fuel: u64,
-    globals: BTreeMap<String, Value>,
+    globals: BTreeMap<EcmaString, Value>,
     last_completion: Option<Value>,
     intrinsics: intrinsics::Intrinsics<H>,
     current_builtin_id: Option<intrinsics::BuiltinId>,
@@ -657,13 +673,13 @@ pub struct Machine<'a, H: Host> {
 struct ModuleRegistry {
     modules: Vec<ModuleInstance>,
     cells: Vec<Cell>,
-    external: BTreeMap<&'static str, ExternalModuleInstance>,
+    external: BTreeMap<EcmaString, ExternalModuleInstance>,
 }
 
 #[derive(Clone, Debug)]
 struct ExternalModuleInstance {
     namespace: Value,
-    exports: BTreeMap<&'static str, ExternalExport>,
+    exports: BTreeMap<EcmaString, ExternalExport>,
     internals: BTreeMap<&'static str, Value>,
 }
 
@@ -754,7 +770,9 @@ impl<'a, H: Host> Machine<'a, H> {
         let argv_text = host.argv().to_vec();
         let argv_values: Vec<Value> = argv_text
             .into_iter()
-            .map(|text| intrinsics::push(&mut heap, HeapEntry::String(text)))
+            .map(|text| {
+                intrinsics::push(&mut heap, HeapEntry::String(EcmaString::from_utf8(&text)))
+            })
             .collect();
         let process = intrinsics
             .global("process")
@@ -766,9 +784,7 @@ impl<'a, H: Host> Machine<'a, H> {
         let HeapEntry::Object { properties, .. } = &heap[process_index] else {
             unreachable!("process is an ordinary object");
         };
-        let Some(Property::Data { value: argv, .. }) =
-            properties.get(&PropertyKey::Named("argv".to_owned()))
-        else {
+        let Some(Property::Data { value: argv, .. }) = properties.get_ascii("argv") else {
             unreachable!("process owns argv");
         };
         let Some(Decoded::HeapRef(argv_id)) = argv.decode() else {
@@ -805,7 +821,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             .map(|(name, value)| (name, ExternalExport { value, cell: None }))
                             .collect();
                         exports.insert(
-                            "default",
+                            EcmaString::from_utf8("default"),
                             ExternalExport {
                                 value: module.namespace,
                                 cell: None,
@@ -920,7 +936,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         let dependency = program.modules()[module_index].edges[edge.get() as usize];
                         match dependency.target {
                             EdgeTarget::External => {
-                                let name = self.constant_text(module_id, name).to_owned();
+                                let name = self.constant_text(module_id, name).clone();
                                 self.external_export_cell(module_id, edge, &name)?
                             }
                             EdgeTarget::Local(target) => match program
@@ -932,7 +948,7 @@ impl<'a, H: Host> Machine<'a, H> {
                                         .expect("own cells are allocated before aliases link")
                                 }
                                 Some(ResolvedExport::External { module, edge, name }) => {
-                                    let name = self.constant_text(module, name).to_owned();
+                                    let name = self.constant_text(module, name).clone();
                                     self.external_export_cell(module, edge, &name)?
                                 }
                                 None => {
@@ -993,16 +1009,16 @@ impl<'a, H: Host> Machine<'a, H> {
         if let Some(value) = self.registry.modules[target.get() as usize].namespace {
             return Ok(value);
         }
-        let exported_names: Vec<String> = self.program().modules()[target.get() as usize]
+        let exported_names: Vec<EcmaString> = self.program().modules()[target.get() as usize]
             .exports
             .iter()
-            .map(|export| self.constant_text(target, export.name).to_owned())
+            .map(|export| self.constant_text(target, export.name).clone())
             .collect();
         for exported_name in exported_names {
             if let Some(ResolvedExport::External { module, edge, name }) =
                 self.program().resolve_export(target, &exported_name)
             {
-                let name = self.constant_text(module, name).to_owned();
+                let name = self.constant_text(module, name).clone();
                 self.external_export_cell(module, edge, &name)?;
             }
         }
@@ -1013,13 +1029,13 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(value)
     }
 
-    fn external_specifier(&self, module: ModuleId, edge: EdgeId) -> Option<&'static str> {
+    fn external_specifier(&self, module: ModuleId, edge: EdgeId) -> Option<EcmaString> {
         let dependency = self.program().modules()[module.get() as usize].edges[edge.get() as usize];
         let specifier = self.constant_text(module, dependency.specifier);
         self.registry
             .external
-            .get_key_value(specifier)
-            .map(|(&name, _)| name)
+            .contains_key(specifier)
+            .then(|| specifier.clone())
     }
 
     fn external_namespace(
@@ -1033,22 +1049,22 @@ impl<'a, H: Host> Machine<'a, H> {
                 RuntimeErrorKind::ExternalModuleUnavailable { module, edge },
             ));
         };
-        let export_names: Vec<&'static str> = self.registry.external[specifier]
+        let export_names: Vec<EcmaString> = self.registry.external[&specifier]
             .exports
             .keys()
-            .copied()
+            .cloned()
             .collect();
         for name in export_names {
-            self.external_export_cell(module, edge, name)?;
+            self.external_export_cell(module, edge, &name)?;
         }
-        Ok(self.registry.external[specifier].namespace)
+        Ok(self.registry.external[&specifier].namespace)
     }
 
     fn external_export_cell(
         &mut self,
         module: ModuleId,
         edge: EdgeId,
-        name: &str,
+        name: &EcmaString,
     ) -> Result<CellId, RuntimeError> {
         let Some(specifier) = self.external_specifier(module, edge) else {
             return Err(self.program_error(
@@ -1056,7 +1072,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 RuntimeErrorKind::ExternalModuleUnavailable { module, edge },
             ));
         };
-        let Some(export) = self.registry.external[specifier].exports.get(name).copied() else {
+        let Some(export) = self.registry.external[&specifier]
+            .exports
+            .get(name)
+            .copied()
+        else {
             return Err(self.program_error(
                 module,
                 RuntimeErrorKind::ExternalModuleUnavailable { module, edge },
@@ -1068,7 +1088,7 @@ impl<'a, H: Host> Machine<'a, H> {
         let cell = self.allocate_cell(export.value, module)?;
         self.registry
             .external
-            .get_mut(specifier)
+            .get_mut(&specifier)
             .expect("external module remains registered")
             .exports
             .get_mut(name)
@@ -1202,7 +1222,7 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    pub(crate) fn constant_text(&self, module: ModuleId, id: ConstantId) -> &str {
+    pub(crate) fn constant_text(&self, module: ModuleId, id: ConstantId) -> &EcmaString {
         match &self.module_code(module).constants()[id.get() as usize] {
             Constant::String(text) => text,
             _ => unreachable!("verified module names are strings"),
@@ -1501,10 +1521,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     let text = match self.load_global(module_id, name) {
                         Ok(value) => value.map_or("undefined", |value| self.type_of(value)),
                         Err(kind) => return Err(self.error_here_at(kind, pc)),
-                    }
-                    .to_owned();
+                    };
                     let value = self
-                        .allocate(HeapEntry::String(text))
+                        .allocate(HeapEntry::String(EcmaString::from_utf8(text)))
                         .map_err(|kind| self.error_at(kind, function_index, pc))?;
                     self.write_register(frame_index, dst.get(), value);
                     self.frames[frame_index].pc = pc + 1;
@@ -1557,7 +1576,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     }
                 }
                 Instruction::CreatePrivateName { dst, description } => {
-                    let description = self.constant_string(description).to_owned();
+                    let description = self.constant_string(description).clone();
                     let value = self
                         .allocate(HeapEntry::PrivateName { description })
                         .map_err(|kind| self.error_at(kind, function_index, pc))?;
@@ -1569,13 +1588,14 @@ impl<'a, H: Host> Machine<'a, H> {
                     pattern,
                     flags,
                 } => {
-                    let pattern = self.constant_string(pattern).to_owned();
-                    let flags = self.constant_string(flags).to_owned();
+                    let pattern = self.constant_string(pattern).clone();
+                    let flags = self.constant_string(flags).clone();
                     let value = self
                         .allocate(HeapEntry::RegExp {
                             pattern,
                             flags,
                             properties: PropertyMap::default(),
+                            prototype: Some(self.intrinsics.regexp_prototype()),
                             extensible: true,
                         })
                         .map_err(|kind| self.error_at(kind, function_index, pc))?;
@@ -1677,7 +1697,7 @@ impl<'a, H: Host> Machine<'a, H> {
         self.frames[frame].registers[register as usize] = value;
     }
 
-    fn constant_string(&self, id: ConstantId) -> &str {
+    fn constant_string(&self, id: ConstantId) -> &EcmaString {
         self.constant_text(self.active_module_id(), id)
     }
 
@@ -1809,11 +1829,13 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     /// Resolves a true realm global after module bindings have been considered.
-    fn resolve_global_binding(&self, name: &str) -> Option<Value> {
-        self.globals
-            .get(name)
-            .copied()
-            .or_else(|| self.intrinsics.global(name))
+    fn resolve_global_binding(&self, name: &EcmaString) -> Option<Value> {
+        self.globals.get(name).copied().or_else(|| {
+            self.intrinsics
+                .globals
+                .iter()
+                .find_map(|(candidate, value)| (candidate == name).then_some(*value))
+        })
     }
 
     /// Classifies a callee into the shared dispatch categories.
@@ -2201,7 +2223,7 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(())
     }
 
-    pub(crate) fn string_value(&self, value: Value) -> Option<String> {
+    pub(crate) fn string_value(&self, value: Value) -> Option<EcmaString> {
         let index = self.runtime_slot(value).ok().flatten()?;
         match &self.heap[index] {
             HeapEntry::String(text) => Some(text.clone()),
@@ -2214,10 +2236,21 @@ impl<'a, H: Host> Machine<'a, H> {
         object: Value,
         name: &str,
     ) -> Result<Value, EvalFailure> {
-        self.get_property(object, &PropertyKey::Named(name.to_owned()))
+        self.get_property_ascii(object, name)
     }
 
-    pub(crate) fn get_property(
+    fn get_property_ascii(&mut self, object: Value, name: &str) -> Result<Value, EvalFailure> {
+        debug_assert!(name.is_ascii());
+        match self.resolve_get_ascii(object, name)? {
+            GetOutcome::Value(value) => Ok(value),
+            GetOutcome::Text(text) => self
+                .allocate(HeapEntry::String(text))
+                .map_err(EvalFailure::Runtime),
+            GetOutcome::Getter(getter) => self.call_value(getter, object, &[]),
+        }
+    }
+
+    pub(crate) fn get_property_key(
         &mut self,
         object: Value,
         key: &PropertyKey,
@@ -2237,7 +2270,11 @@ impl<'a, H: Host> Machine<'a, H> {
         name: &str,
         value: Value,
     ) -> Result<(), EvalFailure> {
-        self.set_data_property_key(object, PropertyKey::Named(name.to_owned()), value)
+        self.set_data_property_key(
+            object,
+            PropertyKey::Named(EcmaString::from_utf8(name)),
+            value,
+        )
     }
 
     pub(crate) fn set_data_property_key(
@@ -2253,14 +2290,6 @@ impl<'a, H: Host> Machine<'a, H> {
                 Ok(())
             }
         }
-    }
-
-    pub(crate) fn delete_named_property(
-        &mut self,
-        object: Value,
-        name: &str,
-    ) -> Result<bool, EvalFailure> {
-        self.delete_property(object, &PropertyKey::Named(name.to_owned()))
     }
 
     pub(crate) fn is_callable(&self, value: Value) -> Result<bool, EvalFailure> {
@@ -2323,13 +2352,13 @@ impl<'a, H: Host> Machine<'a, H> {
         id: intrinsics::BuiltinId,
         message: String,
     ) -> EvalFailure {
-        let message = match self.allocate(HeapEntry::String(message)) {
+        let message = match self.allocate(HeapEntry::String(EcmaString::from_utf8(&message))) {
             Ok(value) => value,
             Err(kind) => return EvalFailure::Runtime(kind),
         };
         let mut properties = PropertyMap::default();
         properties.insert(
-            PropertyKey::Named("message".to_owned()),
+            PropertyKey::Named(EcmaString::from_utf8("message")),
             Property::Data {
                 value: message,
                 writable: true,
@@ -2574,7 +2603,11 @@ impl<'a, H: Host> Machine<'a, H> {
                     let PropertyKey::Named(name) = key else {
                         return Ok(GetOutcome::Value(Value::UNDEFINED));
                     };
-                    let text = self.host.env(name).map(str::to_owned);
+                    let text = name
+                        .to_utf8_strict()
+                        .ok()
+                        .and_then(|name| self.host.env(&name))
+                        .map(EcmaString::from_utf8);
                     return match text {
                         Some(text) => self
                             .allocate(HeapEntry::String(text))
@@ -2625,6 +2658,69 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(GetOutcome::Value(Value::UNDEFINED))
     }
 
+    fn resolve_get_ascii(&mut self, object: Value, name: &str) -> Result<GetOutcome, EvalFailure> {
+        debug_assert!(name.is_ascii());
+        let slot = self.runtime_slot(object).map_err(EvalFailure::Runtime)?;
+        let start = match slot {
+            Some(index) => {
+                if matches!(self.heap[index], HeapEntry::ProcessEnv { .. }) {
+                    return match self.host.env(name).map(EcmaString::from_utf8) {
+                        Some(text) => self
+                            .allocate(HeapEntry::String(text))
+                            .map(GetOutcome::Value)
+                            .map_err(EvalFailure::Runtime),
+                        None => Ok(GetOutcome::Value(Value::UNDEFINED)),
+                    };
+                }
+                if let HeapEntry::String(text) = &self.heap[index] {
+                    if name == "length" {
+                        return Ok(GetOutcome::Value(number_value(text.len_units() as f64)));
+                    }
+                    if let Some(offset) = array_index_ascii(name)
+                        && let Some(unit) = text.unit_at(offset as usize)
+                    {
+                        return Ok(GetOutcome::Text(EcmaString::from_units(&[unit])));
+                    }
+                }
+                match self.heap[index] {
+                    HeapEntry::String(_) => self
+                        .runtime_slot(self.intrinsics.string_prototype)
+                        .map_err(EvalFailure::Runtime)?,
+                    HeapEntry::BigInt(_) | HeapEntry::PrivateName { .. } => self
+                        .runtime_slot(self.intrinsics.object_prototype)
+                        .map_err(EvalFailure::Runtime)?,
+                    HeapEntry::Symbol { .. } => self
+                        .runtime_slot(self.intrinsics.builtins.symbol_prototype())
+                        .map_err(EvalFailure::Runtime)?,
+                    _ => Some(index),
+                }
+            }
+            None => {
+                let prototype = match object.decode() {
+                    Some(Decoded::Boolean(_)) => self.intrinsics.boolean_prototype,
+                    Some(Decoded::Number(_) | Decoded::Int32(_)) => {
+                        self.intrinsics.number_prototype
+                    }
+                    _ => return Ok(GetOutcome::Value(Value::UNDEFINED)),
+                };
+                self.runtime_slot(prototype).map_err(EvalFailure::Runtime)?
+            }
+        };
+        let Some(mut node) = start else {
+            return Ok(GetOutcome::Value(Value::UNDEFINED));
+        };
+        for _ in 0..=self.heap.len() {
+            if let Some(found) = self.own_get_ascii(node, name) {
+                return Self::found_outcome(found);
+            }
+            match self.prototype_index(node)? {
+                Some(next) => node = next,
+                None => return Ok(GetOutcome::Value(Value::UNDEFINED)),
+            }
+        }
+        Ok(GetOutcome::Value(Value::UNDEFINED))
+    }
+
     fn found_outcome(found: Found) -> Result<GetOutcome, EvalFailure> {
         match found {
             Found::Value(value) => Ok(GetOutcome::Value(value)),
@@ -2639,16 +2735,137 @@ impl<'a, H: Host> Machine<'a, H> {
         if let HeapEntry::String(text) = &self.heap[index]
             && let PropertyKey::Named(name) = key
         {
-            if name == "length" {
-                return Some(Found::Value(number_value(text.chars().count() as f64)));
+            if name.eq_ascii("length") {
+                return Some(Found::Value(number_value(text.len_units() as f64)));
             }
             if let Some(offset) = array_index(name)
-                && let Some(character) = text.chars().nth(offset as usize)
+                && let Some(unit) = text.unit_at(offset as usize)
             {
-                return Some(Found::Text(character.to_string()));
+                return Some(Found::Text(EcmaString::from_units(&[unit])));
             }
         }
         None
+    }
+    fn own_get_ascii(&self, index: usize, name: &str) -> Option<Found> {
+        debug_assert!(name.is_ascii());
+        let slot = |value| self.runtime_slot(value).ok().flatten();
+        if slot(self.intrinsics.object_prototype) == Some(index) && name == "toString" {
+            return Some(Found::Value(self.intrinsics.object_to_string()));
+        }
+        if (slot(self.intrinsics.function_prototype) == Some(index)
+            || matches!(
+                self.heap[index],
+                HeapEntry::Function { .. } | HeapEntry::NativeFunction { .. }
+            ))
+            && name == "call"
+        {
+            return Some(Found::Value(self.intrinsics.function_call()));
+        }
+        match &self.heap[index] {
+            HeapEntry::Object { properties, .. } | HeapEntry::NativeFunction { properties, .. } => {
+                property_lookup_ascii(properties, name)
+            }
+            HeapEntry::Array {
+                elements,
+                properties,
+                ..
+            } => {
+                if name == "length" {
+                    return Some(Found::Value(number_value(elements.len() as f64)));
+                }
+                if let Some(offset) = array_index_ascii(name)
+                    && let Some(element) = elements.get(offset as usize)
+                    && *element != Value::HOLE
+                {
+                    return Some(Found::Value(*element));
+                }
+                property_lookup_ascii(properties, name)
+            }
+            HeapEntry::Function {
+                module,
+                function,
+                properties,
+                ..
+            } => {
+                if let Some(found) = property_lookup_ascii(properties, name) {
+                    return Some(found);
+                }
+                let metadata = &self.module_code(*module).functions()[function.get() as usize];
+                if name == "length" {
+                    return Some(Found::Value(
+                        number_value(metadata.parameter_count() as f64),
+                    ));
+                }
+                if name == "name" {
+                    return Some(Found::Text(
+                        metadata
+                            .name()
+                            .map(|id| self.constant_text(*module, id).clone())
+                            .unwrap_or_default(),
+                    ));
+                }
+                None
+            }
+            HeapEntry::ModuleNamespace { module } => {
+                let key = self.program().modules()[module.get() as usize]
+                    .exports
+                    .iter()
+                    .map(|export| self.constant_text(*module, export.name))
+                    .find(|candidate| candidate.eq_ascii(name))?
+                    .clone();
+                match self.namespace_export(*module, &key) {
+                    Ok(Some(value)) => Some(Found::Value(value)),
+                    Ok(None) => None,
+                    Err(kind) => Some(Found::Failure(kind)),
+                }
+            }
+            HeapEntry::ExternalModuleNamespace { specifier } => {
+                let export = self.registry.external[specifier]
+                    .exports
+                    .iter()
+                    .find_map(|(candidate, export)| candidate.eq_ascii(name).then_some(export))?;
+                let cell = export
+                    .cell
+                    .expect("external namespace exports link before evaluation");
+                Some(Found::Value(self.registry.cells[cell.0].value))
+            }
+            HeapEntry::RegExp {
+                pattern,
+                flags,
+                properties,
+                ..
+            } => {
+                if let Some(found) = property_lookup_ascii(properties, name) {
+                    return Some(found);
+                }
+                let flag = |unit| {
+                    Found::Value(Value::boolean(flags.as_units().contains(&u16::from(unit))))
+                };
+                match name {
+                    "source" => Some(Found::Text(pattern.clone())),
+                    "flags" => Some(Found::Text(flags.clone())),
+                    "global" => Some(flag(b'g')),
+                    "ignoreCase" => Some(flag(b'i')),
+                    "multiline" => Some(flag(b'm')),
+                    "sticky" => Some(flag(b'y')),
+                    "unicode" => Some(flag(b'u')),
+                    "dotAll" => Some(flag(b's')),
+                    "lastIndex" => Some(Found::Value(Value::int32(0))),
+                    _ => None,
+                }
+            }
+            HeapEntry::HashState { update, digest, .. } => match name {
+                "update" => Some(Found::Value(*update)),
+                "digest" => Some(Found::Value(*digest)),
+                _ => None,
+            },
+            HeapEntry::ProcessEnv { .. }
+            | HeapEntry::String(_)
+            | HeapEntry::BigInt(_)
+            | HeapEntry::Symbol { .. }
+            | HeapEntry::PrivateName { .. }
+            | HeapEntry::Iterator { .. } => None,
+        }
     }
 
     /// Looks up an own property of the heap entry at `index`, returning `None`
@@ -2656,16 +2873,16 @@ impl<'a, H: Host> Machine<'a, H> {
     fn own_get(&self, index: usize, key: &PropertyKey) -> Option<Found> {
         if let PropertyKey::Named(name) = key {
             let slot = |value| self.runtime_slot(value).ok().flatten();
-            if slot(self.intrinsics.object_prototype) == Some(index) && name == "toString" {
+            if slot(self.intrinsics.object_prototype) == Some(index) && name.eq_ascii("toString") {
                 return Some(Found::Value(self.intrinsics.object_to_string()));
             }
-            if slot(self.intrinsics.function_prototype) == Some(index) && name == "call" {
+            if slot(self.intrinsics.function_prototype) == Some(index) && name.eq_ascii("call") {
                 return Some(Found::Value(self.intrinsics.function_call()));
             }
             if matches!(
                 self.heap[index],
                 HeapEntry::Function { .. } | HeapEntry::NativeFunction { .. }
-            ) && name == "call"
+            ) && name.eq_ascii("call")
             {
                 return Some(Found::Value(self.intrinsics.function_call()));
             }
@@ -2678,7 +2895,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 ..
             } => {
                 if let PropertyKey::Named(name) = key {
-                    if name == "length" {
+                    if name.eq_ascii("length") {
                         return Some(Found::Value(number_value(elements.len() as f64)));
                     }
                     if let Some(offset) = array_index(name)
@@ -2701,21 +2918,18 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 if let PropertyKey::Named(name) = key {
                     let metadata = &self.module_code(*module).functions()[function.get() as usize];
-                    match name.as_str() {
-                        "length" => {
-                            return Some(Found::Value(number_value(
-                                metadata.parameter_count() as f64
-                            )));
-                        }
-                        "name" => {
-                            return Some(Found::Text(
-                                metadata
-                                    .name()
-                                    .map(|id| self.constant_text(*module, id).to_owned())
-                                    .unwrap_or_default(),
-                            ));
-                        }
-                        _ => {}
+                    if name.eq_ascii("length") {
+                        return Some(Found::Value(
+                            number_value(metadata.parameter_count() as f64),
+                        ));
+                    }
+                    if name.eq_ascii("name") {
+                        return Some(Found::Text(
+                            metadata
+                                .name()
+                                .map(|id| self.constant_text(*module, id).clone())
+                                .unwrap_or_default(),
+                        ));
                     }
                 }
                 None
@@ -2734,9 +2948,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 let PropertyKey::Named(name) = key else {
                     return None;
                 };
-                let export = self.registry.external[specifier]
-                    .exports
-                    .get(name.as_str())?;
+                let export = self.registry.external[specifier].exports.get(name)?;
                 let cell = export
                     .cell
                     .expect("external namespace exports link before evaluation");
@@ -2753,18 +2965,37 @@ impl<'a, H: Host> Machine<'a, H> {
                     return Some(found);
                 }
                 if let PropertyKey::Named(name) = key {
-                    let flag = |ch: char| Found::Value(Value::boolean(flags.contains(ch)));
-                    match name.as_str() {
-                        "source" => return Some(Found::Text(pattern.clone())),
-                        "flags" => return Some(Found::Text(flags.clone())),
-                        "global" => return Some(flag('g')),
-                        "ignoreCase" => return Some(flag('i')),
-                        "multiline" => return Some(flag('m')),
-                        "sticky" => return Some(flag('y')),
-                        "unicode" => return Some(flag('u')),
-                        "dotAll" => return Some(flag('s')),
-                        "lastIndex" => return Some(Found::Value(Value::int32(0))),
-                        _ => {}
+                    let flag = |ascii: &str| {
+                        Found::Value(Value::boolean(
+                            flags.as_units().contains(&u16::from(ascii.as_bytes()[0])),
+                        ))
+                    };
+                    if name.eq_ascii("source") {
+                        return Some(Found::Text(pattern.clone()));
+                    }
+                    if name.eq_ascii("flags") {
+                        return Some(Found::Text(flags.clone()));
+                    }
+                    if name.eq_ascii("global") {
+                        return Some(flag("g"));
+                    }
+                    if name.eq_ascii("ignoreCase") {
+                        return Some(flag("i"));
+                    }
+                    if name.eq_ascii("multiline") {
+                        return Some(flag("m"));
+                    }
+                    if name.eq_ascii("sticky") {
+                        return Some(flag("y"));
+                    }
+                    if name.eq_ascii("unicode") {
+                        return Some(flag("u"));
+                    }
+                    if name.eq_ascii("dotAll") {
+                        return Some(flag("s"));
+                    }
+                    if name.eq_ascii("lastIndex") {
+                        return Some(Found::Value(Value::int32(0)));
                     }
                 }
                 None
@@ -2773,10 +3004,12 @@ impl<'a, H: Host> Machine<'a, H> {
                 let PropertyKey::Named(name) = key else {
                     return None;
                 };
-                match name.as_str() {
-                    "update" => Some(Found::Value(*update)),
-                    "digest" => Some(Found::Value(*digest)),
-                    _ => None,
+                if name.eq_ascii("update") {
+                    Some(Found::Value(*update))
+                } else if name.eq_ascii("digest") {
+                    Some(Found::Value(*digest))
+                } else {
+                    None
                 }
             }
             HeapEntry::ProcessEnv { .. }
@@ -2791,7 +3024,7 @@ impl<'a, H: Host> Machine<'a, H> {
     fn namespace_export(
         &self,
         module: ModuleId,
-        name: &str,
+        name: &EcmaString,
     ) -> Result<Option<Value>, RuntimeErrorKind> {
         match self.program().resolve_export(module, name) {
             Some(ResolvedExport::Local { module, binding }) => {
@@ -2810,7 +3043,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     return Err(RuntimeErrorKind::ExternalModuleUnavailable { module, edge });
                 };
                 let name = self.constant_text(module, name);
-                let Some(export) = self.registry.external[specifier].exports.get(name) else {
+                let Some(export) = self.registry.external[&specifier].exports.get(name) else {
                     return Err(RuntimeErrorKind::ExternalModuleUnavailable { module, edge });
                 };
                 let Some(cell) = export.cell else {
@@ -2831,7 +3064,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::RegExp { properties, .. } => properties,
             _ => return None,
         };
-        match properties.get(&PropertyKey::Named(name.to_owned())) {
+        match properties.get_ascii(name) {
             Some(Property::Data { value, .. }) => Some(*value),
             _ => None,
         }
@@ -2842,9 +3075,9 @@ impl<'a, H: Host> Machine<'a, H> {
             HeapEntry::Object { prototype, .. }
             | HeapEntry::Array { prototype, .. }
             | HeapEntry::Function { prototype, .. }
+            | HeapEntry::RegExp { prototype, .. }
             | HeapEntry::ProcessEnv { prototype, .. } => *prototype,
             HeapEntry::NativeFunction { .. } => Some(self.intrinsics.function_prototype),
-            HeapEntry::RegExp { .. } => Some(self.intrinsics.object_prototype),
             _ => None,
         };
         match prototype {
@@ -2872,8 +3105,12 @@ impl<'a, H: Host> Machine<'a, H> {
                     let PropertyKey::Named(name) = &key else {
                         return Ok(SetOutcome::Done);
                     };
+                    let Ok(name) = name.to_utf8_strict() else {
+                        return Ok(SetOutcome::Done);
+                    };
                     let text = self.to_string(value)?;
-                    self.host.set_env(name, &text);
+                    let text = crate::host_objects::env_value_text_lossy(&text);
+                    self.host.set_env(&name, &text);
                     return Ok(SetOutcome::Done);
                 }
                 if let Some(setter) = self.find_setter(index, &key)? {
@@ -2936,7 +3173,7 @@ impl<'a, H: Host> Machine<'a, H> {
         match &self.heap[index] {
             HeapEntry::Array { elements, .. } => {
                 if let PropertyKey::Named(name) = key {
-                    if name == "length" {
+                    if name.eq_ascii("length") {
                         return true;
                     }
                     if let Some(offset) = array_index(name) {
@@ -2948,10 +3185,14 @@ impl<'a, H: Host> Machine<'a, H> {
                 false
             }
             HeapEntry::Function { .. } => {
-                matches!(key.as_str(), Some("length") | Some("name"))
-                    && self
-                        .own_data_property(index, key.as_str().unwrap())
-                        .is_none()
+                (key.eq_ascii("length") || key.eq_ascii("name"))
+                    && match key {
+                        PropertyKey::Named(name) if name.eq_ascii("length") => {
+                            self.own_data_property(index, "length").is_none()
+                        }
+                        PropertyKey::Named(_) => self.own_data_property(index, "name").is_none(),
+                        _ => false,
+                    }
             }
             _ => false,
         }
@@ -2963,7 +3204,7 @@ impl<'a, H: Host> Machine<'a, H> {
         key: PropertyKey,
         value: Value,
     ) -> Result<(), EvalFailure> {
-        if matches!(key, PropertyKey::Named(ref name) if name == "length")
+        if matches!(key, PropertyKey::Named(ref name) if name.eq_ascii("length"))
             && matches!(self.heap[index], HeapEntry::Array { .. })
         {
             let HeapEntry::Array {
@@ -2988,7 +3229,7 @@ impl<'a, H: Host> Machine<'a, H> {
             length_writable,
             ..
         } = &self.heap[index]
-            && let Some(offset) = key.as_str().and_then(array_index)
+            && let Some(offset) = key.as_string().and_then(array_index)
             && offset as usize >= elements.len()
             && !*length_writable
         {
@@ -3023,8 +3264,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 extensible,
                 ..
             } => {
-                let virtual_exists = key.as_str().is_some_and(|name| {
-                    name == "length"
+                let virtual_exists = key.as_string().is_some_and(|name| {
+                    name.eq_ascii("length")
                         || array_index(name).is_some_and(|offset| {
                             elements
                                 .get(offset as usize)
@@ -3065,7 +3306,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 properties,
                 ..
             } => match &key {
-                PropertyKey::Named(name) if name == "length" => 0,
+                PropertyKey::Named(name) if name.eq_ascii("length") => 0,
                 PropertyKey::Named(name) => {
                     if let Some(offset) = array_index(name) {
                         (offset as usize + 1).saturating_sub(elements.len()) * 8
@@ -3288,7 +3529,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         return Ok(true);
                     }
                     if let PropertyKey::Named(name) = key {
-                        if name == "length" {
+                        if name.eq_ascii("length") {
                             return Ok(false);
                         }
                         if let Some(offset) = array_index(name) {
@@ -3304,7 +3545,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     let PropertyKey::Named(name) = key else {
                         return Ok(true);
                     };
-                    Ok(self.host.delete_env(name))
+                    Ok(name
+                        .to_utf8_strict()
+                        .is_ok_and(|name| self.host.delete_env(&name)))
                 }
                 HeapEntry::String(_)
                 | HeapEntry::BigInt(_)
@@ -3327,7 +3570,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     let PropertyKey::Named(name) = key else {
                         return Ok(false);
                     };
-                    return Ok(self.host.env(name).is_some());
+                    return Ok(name
+                        .to_utf8_strict()
+                        .is_ok_and(|name| self.host.env(&name).is_some()));
                 }
                 if matches!(key, PropertyKey::Private(_)) {
                     return Ok(self.own_get(index, key).is_some());
@@ -3444,11 +3689,20 @@ impl<'a, H: Host> Machine<'a, H> {
                     })
                     .collect()),
                 HeapEntry::String(text) => {
-                    let chars: Vec<char> = text.chars().collect();
-                    let mut values = Vec::with_capacity(chars.len());
-                    for ch in chars {
+                    let pieces: Vec<EcmaString> = text
+                        .code_points()
+                        .map(|(_, code_point)| {
+                            let mut builder = EcmaStringBuilder::new();
+                            builder
+                                .push_code_point(code_point)
+                                .expect("EcmaString code point is valid");
+                            builder.finish()
+                        })
+                        .collect();
+                    let mut values = Vec::with_capacity(pieces.len());
+                    for piece in pieces {
                         values.push(
-                            self.allocate(HeapEntry::String(ch.to_string()))
+                            self.allocate(HeapEntry::String(piece))
                                 .map_err(EvalFailure::Runtime)?,
                         );
                     }
@@ -3483,7 +3737,7 @@ impl<'a, H: Host> Machine<'a, H> {
         // Own enumerable data properties of the source are copied. `null` and
         // `undefined` sources are a no-op, matching `{ ...null }`.
         let mut pairs: Vec<(PropertyKey, Value)> = Vec::new();
-        let mut char_pairs: Vec<(String, char)> = Vec::new();
+        let mut char_pairs: Vec<(EcmaString, EcmaString)> = Vec::new();
         if let Some(index) = self.runtime_slot(source).map_err(EvalFailure::Runtime)? {
             match &self.heap[index] {
                 HeapEntry::Object { properties, .. } => {
@@ -3508,7 +3762,10 @@ impl<'a, H: Host> Machine<'a, H> {
                 } => {
                     for (offset, element) in elements.iter().enumerate() {
                         if *element != Value::HOLE {
-                            pairs.push((PropertyKey::Named(offset.to_string()), *element));
+                            pairs.push((
+                                PropertyKey::Named(EcmaString::from_utf8(&offset.to_string())),
+                                *element,
+                            ));
                         }
                     }
                     for (key, property) in properties {
@@ -3527,16 +3784,21 @@ impl<'a, H: Host> Machine<'a, H> {
                     }
                 }
                 HeapEntry::String(text) => {
-                    for (offset, ch) in text.chars().enumerate() {
-                        char_pairs.push((offset.to_string(), ch));
+                    for offset in 0..text.len_units() {
+                        char_pairs.push((
+                            EcmaString::from_utf8(&offset.to_string()),
+                            EcmaString::from_units(&[text
+                                .unit_at(offset)
+                                .expect("offset is in bounds")]),
+                        ));
                     }
                 }
                 _ => {}
             }
         }
-        for (name, ch) in char_pairs {
+        for (name, text) in char_pairs {
             let value = self
-                .allocate(HeapEntry::String(ch.to_string()))
+                .allocate(HeapEntry::String(text))
                 .map_err(EvalFailure::Runtime)?;
             pairs.push((PropertyKey::Named(name), value));
         }
@@ -3568,6 +3830,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     prototype: slot, ..
                 }
                 | HeapEntry::Function {
+                    prototype: slot, ..
+                }
+                | HeapEntry::RegExp {
                     prototype: slot, ..
                 } => {
                     *slot = prototype;
@@ -3633,10 +3898,12 @@ impl<'a, H: Host> Machine<'a, H> {
                 } => {
                     let mut keys: Vec<PropertyKey> = (0..elements.len())
                         .filter(|offset| elements[*offset] != Value::HOLE)
-                        .map(|offset| PropertyKey::Named(offset.to_string()))
+                        .map(|offset| {
+                            PropertyKey::Named(EcmaString::from_utf8(&offset.to_string()))
+                        })
                         .collect();
                     keys.extend(ordered_property_keys(properties).into_iter().filter(|key| {
-                        key.as_str().and_then(array_index).is_none_or(|offset| {
+                        key.as_string().and_then(array_index).is_none_or(|offset| {
                             elements
                                 .get(offset as usize)
                                 .is_none_or(|element| *element == Value::HOLE)
@@ -3644,14 +3911,15 @@ impl<'a, H: Host> Machine<'a, H> {
                     }));
                     Ok(keys)
                 }
-                HeapEntry::String(text) => Ok((0..text.chars().count())
-                    .map(|index| PropertyKey::Named(index.to_string()))
+                HeapEntry::String(text) => Ok((0..text.len_units())
+                    .map(|index| PropertyKey::Named(EcmaString::from_utf8(&index.to_string())))
                     .collect()),
                 HeapEntry::ModuleNamespace { module } => {
-                    let mut names: Vec<String> = self.program().modules()[module.get() as usize]
+                    let mut names: Vec<EcmaString> = self.program().modules()
+                        [module.get() as usize]
                         .exports
                         .iter()
-                        .map(|export| self.constant_text(*module, export.name).to_owned())
+                        .map(|export| self.constant_text(*module, export.name).clone())
                         .collect();
                     names.sort();
                     Ok(names.into_iter().map(PropertyKey::Named).collect())
@@ -3660,7 +3928,8 @@ impl<'a, H: Host> Machine<'a, H> {
                     [specifier]
                     .exports
                     .keys()
-                    .map(|name| PropertyKey::Named((*name).to_owned()))
+                    .cloned()
+                    .map(PropertyKey::Named)
                     .collect()),
                 HeapEntry::ProcessEnv { .. }
                 | HeapEntry::BigInt(_)
@@ -3673,7 +3942,7 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    fn enumerable_keys(&self, src: Value) -> Result<Vec<String>, EvalFailure> {
+    fn enumerable_keys(&self, src: Value) -> Result<Vec<EcmaString>, EvalFailure> {
         let keys = self.own_property_keys(src)?;
         let Some(index) = self.runtime_slot(src).map_err(EvalFailure::Runtime)? else {
             return Ok(Vec::new());
@@ -3699,8 +3968,9 @@ impl<'a, H: Host> Machine<'a, H> {
                         },
                         Property::enumerable,
                     ),
-                    HeapEntry::String(text) => array_index(name)
-                        .is_some_and(|offset| (offset as usize) < text.chars().count()),
+                    HeapEntry::String(text) => {
+                        array_index(name).is_some_and(|offset| (offset as usize) < text.len_units())
+                    }
                     HeapEntry::ModuleNamespace { .. } => true,
                     HeapEntry::Object { properties, .. }
                     | HeapEntry::Function { properties, .. }
@@ -3755,7 +4025,7 @@ impl<'a, H: Host> Machine<'a, H> {
 
         enum Step {
             Element(Option<Value>),
-            Char(Option<char>),
+            Text(Option<EcmaString>),
         }
         let step = match self.runtime_slot(source).map_err(EvalFailure::Runtime)? {
             Some(source_index) => match &self.heap[source_index] {
@@ -3768,7 +4038,16 @@ impl<'a, H: Host> Machine<'a, H> {
                         }
                     }))
                 }
-                HeapEntry::String(text) => Step::Char(text.chars().nth(current)),
+                HeapEntry::String(text) => {
+                    let Some((offset, _)) = text.code_points().nth(current) else {
+                        return Ok((true, Value::UNDEFINED));
+                    };
+                    let next_offset = text
+                        .code_points()
+                        .nth(current + 1)
+                        .map_or(text.len_units(), |(next, _)| next);
+                    Step::Text(Some(text.slice_units(offset..next_offset)))
+                }
                 _ => return Ok((true, Value::UNDEFINED)),
             },
             None => return Ok((true, Value::UNDEFINED)),
@@ -3779,14 +4058,14 @@ impl<'a, H: Host> Machine<'a, H> {
                 Ok((false, value))
             }
             Step::Element(None) => Ok((true, Value::UNDEFINED)),
-            Step::Char(Some(ch)) => {
+            Step::Text(Some(text)) => {
                 let value = self
-                    .allocate(HeapEntry::String(ch.to_string()))
+                    .allocate(HeapEntry::String(text))
                     .map_err(EvalFailure::Runtime)?;
                 self.advance_iterator(iterator_index);
                 Ok((false, value))
             }
-            Step::Char(None) => Ok((true, Value::UNDEFINED)),
+            Step::Text(None) => Ok((true, Value::UNDEFINED)),
         }
     }
 
@@ -3802,7 +4081,7 @@ impl<'a, H: Host> Machine<'a, H> {
         match op {
             UnaryOp::Void => Ok(Value::UNDEFINED),
             UnaryOp::TypeOf => {
-                let text = self.type_of(operand).to_owned();
+                let text = EcmaString::from_utf8(self.type_of(operand));
                 self.allocate(HeapEntry::String(text))
                     .map_err(EvalFailure::Runtime)
             }
@@ -3899,16 +4178,25 @@ impl<'a, H: Host> Machine<'a, H> {
         let left_string = self.add_string_primitive(left)?;
         let right_string = self.add_string_primitive(right)?;
         if left_string.is_some() || right_string.is_some() {
-            let mut text = match left_string {
+            let left = match left_string {
                 Some(text) => text,
                 None => self.value_to_string(left, 0)?,
             };
-            match right_string {
-                Some(right) => text.push_str(&right),
-                None => text.push_str(&self.value_to_string(right, 0)?),
+            let right = match right_string {
+                Some(text) => text,
+                None => self.value_to_string(right, 0)?,
+            };
+            let mut builder = EcmaStringBuilder::with_capacity(
+                left.len_units().saturating_add(right.len_units()),
+            );
+            for &unit in left.as_units() {
+                builder.push_unit(unit);
+            }
+            for &unit in right.as_units() {
+                builder.push_unit(unit);
             }
             return self
-                .allocate(HeapEntry::String(text))
+                .allocate(HeapEntry::String(builder.finish()))
                 .map_err(EvalFailure::Runtime);
         }
         let left_bigint = self.bigint_text(left).map(str::to_owned);
@@ -4093,8 +4381,8 @@ impl<'a, H: Host> Machine<'a, H> {
             (Some(Decoded::HeapRef(_)), Some(Decoded::HeapRef(_))) => {
                 match (self.runtime_slot(left), self.runtime_slot(right)) {
                     (Ok(Some(a)), Ok(Some(b))) => match (&self.heap[a], &self.heap[b]) {
-                        (HeapEntry::String(a), HeapEntry::String(b))
-                        | (HeapEntry::BigInt(a), HeapEntry::BigInt(b)) => a == b,
+                        (HeapEntry::String(a), HeapEntry::String(b)) => a == b,
+                        (HeapEntry::BigInt(a), HeapEntry::BigInt(b)) => a == b,
                         _ => left == right,
                     },
                     _ => left == right,
@@ -4155,8 +4443,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         operation: "instanceof",
                     }));
                 }
-                let target = match self.own_get(index, &PropertyKey::Named("prototype".to_owned()))
-                {
+                let target = match self.own_get_ascii(index, "prototype") {
                     Some(Found::Value(value)) if self.is_object(value) => value,
                     _ => {
                         return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
@@ -4192,7 +4479,7 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    fn add_string_primitive(&self, value: Value) -> Result<Option<String>, EvalFailure> {
+    fn add_string_primitive(&self, value: Value) -> Result<Option<EcmaString>, EvalFailure> {
         match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
             Some(index) => match &self.heap[index] {
                 HeapEntry::String(text) => Ok(Some(text.clone())),
@@ -4214,29 +4501,51 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    fn value_to_string(&self, value: Value, depth: u8) -> Result<String, EvalFailure> {
+    fn value_to_string(&self, value: Value, depth: u8) -> Result<EcmaString, EvalFailure> {
         if depth >= 32 {
-            return Ok(String::new());
+            return Ok(EcmaString::default());
         }
+        let ascii = |text: String| EcmaString::from_utf8(&text);
         match value.decode() {
-            Some(Decoded::Number(number)) => Ok(Self::ordinary_number_to_string(number)),
-            Some(Decoded::Int32(raw)) => Ok((raw as i32).to_string()),
-            Some(Decoded::Undefined | Decoded::Uninitialized) => Ok("undefined".to_owned()),
-            Some(Decoded::Null) => Ok("null".to_owned()),
-            Some(Decoded::Boolean(value)) => Ok(value.to_string()),
-            Some(Decoded::Hole) => Ok(String::new()),
+            Some(Decoded::Number(number)) => Ok(ascii(Self::ordinary_number_to_string(number))),
+            Some(Decoded::Int32(raw)) => Ok(ascii((raw as i32).to_string())),
+            Some(Decoded::Undefined | Decoded::Uninitialized) => {
+                Ok(EcmaString::from_utf8("undefined"))
+            }
+            Some(Decoded::Null) => Ok(EcmaString::from_utf8("null")),
+            Some(Decoded::Boolean(value)) => {
+                Ok(EcmaString::from_utf8(if value { "true" } else { "false" }))
+            }
+            Some(Decoded::Hole) => Ok(EcmaString::default()),
             Some(Decoded::HeapRef(_)) => {
                 match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
                     Some(index) => match &self.heap[index] {
-                        HeapEntry::String(text) | HeapEntry::BigInt(text) => Ok(text.clone()),
+                        HeapEntry::String(text) => Ok(text.clone()),
+                        HeapEntry::BigInt(text) => Ok(EcmaString::from_utf8(text)),
                         HeapEntry::Object { .. }
                         | HeapEntry::ModuleNamespace { .. }
                         | HeapEntry::ExternalModuleNamespace { .. }
                         | HeapEntry::ProcessEnv { .. }
                         | HeapEntry::Iterator { .. }
-                        | HeapEntry::HashState { .. } => Ok("[object Object]".to_owned()),
+                        | HeapEntry::HashState { .. } => {
+                            Ok(EcmaString::from_utf8("[object Object]"))
+                        }
                         HeapEntry::RegExp { pattern, flags, .. } => {
-                            Ok(format!("/{pattern}/{flags}"))
+                            let mut builder = EcmaStringBuilder::with_capacity(
+                                pattern
+                                    .len_units()
+                                    .saturating_add(flags.len_units())
+                                    .saturating_add(2),
+                            );
+                            builder.push_unit(u16::from(b'/'));
+                            for &unit in pattern.as_units() {
+                                builder.push_unit(unit);
+                            }
+                            builder.push_unit(u16::from(b'/'));
+                            for &unit in flags.as_units() {
+                                builder.push_unit(unit);
+                            }
+                            Ok(builder.finish())
                         }
                         HeapEntry::Symbol { .. } => {
                             Err(EvalFailure::Throw(ThrowOrigin::TypeError {
@@ -4254,31 +4563,36 @@ impl<'a, H: Host> Machine<'a, H> {
                             let flags = self.module_code(*module).functions()
                                 [function.get() as usize]
                                 .flags();
-                            Ok(match (flags.is_async, flags.is_generator) {
-                                (true, true) => "async function* () { [bytecode] }",
-                                (true, false) => "async function () { [bytecode] }",
-                                (false, true) => "function* () { [bytecode] }",
-                                (false, false) => "function () { [bytecode] }",
-                            }
-                            .to_owned())
+                            Ok(EcmaString::from_utf8(
+                                match (flags.is_async, flags.is_generator) {
+                                    (true, true) => "async function* () { [bytecode] }",
+                                    (true, false) => "async function () { [bytecode] }",
+                                    (false, true) => "function* () { [bytecode] }",
+                                    (false, false) => "function () { [bytecode] }",
+                                },
+                            ))
                         }
                         HeapEntry::NativeFunction { .. } => {
-                            Ok("function () { [native code] }".to_owned())
+                            Ok(EcmaString::from_utf8("function () { [native code] }"))
                         }
                         HeapEntry::Array { elements, .. } => {
-                            let mut text = String::new();
+                            let mut text = EcmaStringBuilder::new();
                             for (index, element) in elements.iter().copied().enumerate() {
                                 if index != 0 {
-                                    text.push(',');
+                                    text.push_unit(u16::from(b','));
                                 }
                                 if element != Value::HOLE
                                     && element != Value::NULL
                                     && element != Value::UNDEFINED
                                 {
-                                    text.push_str(&self.value_to_string(element, depth + 1)?);
+                                    for &unit in
+                                        self.value_to_string(element, depth + 1)?.as_units()
+                                    {
+                                        text.push_unit(unit);
+                                    }
                                 }
                             }
-                            Ok(text)
+                            Ok(text.finish())
                         }
                     },
                     None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
@@ -4292,7 +4606,7 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    fn string_text(&self, value: Value) -> Option<&str> {
+    fn string_text(&self, value: Value) -> Option<&EcmaString> {
         let index = self.runtime_slot(value).ok()??;
         match &self.heap[index] {
             HeapEntry::String(text) => Some(text),
@@ -4353,6 +4667,17 @@ fn property_lookup(properties: &PropertyMap, key: &PropertyKey) -> Option<Found>
     }
 }
 
+fn property_lookup_ascii(properties: &PropertyMap, name: &str) -> Option<Found> {
+    match properties.get_ascii(name) {
+        Some(Property::Data { value, .. }) => Some(Found::Value(*value)),
+        Some(Property::Accessor { getter, .. }) => Some(match getter {
+            Some(getter) => Found::Getter(*getter),
+            None => Found::NoGetter,
+        }),
+        None => None,
+    }
+}
+
 fn innermost_handler(function: &Function, pc: usize) -> Option<bamts_bytecode::ExceptionHandler> {
     function
         .handlers()
@@ -4387,7 +4712,14 @@ fn number_value(number: f64) -> Value {
     }
 }
 
-fn parse_number(text: &str) -> f64 {
+fn parse_number(text: &EcmaString) -> f64 {
+    let Ok(text) = text.to_utf8_strict() else {
+        return f64::NAN;
+    };
+    parse_number_utf8(&text)
+}
+
+fn parse_number_utf8(text: &str) -> f64 {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         0.0
@@ -4474,11 +4806,34 @@ fn to_int32(number: f64) -> i32 {
     to_uint32(number) as i32
 }
 
-fn array_index(key: &str) -> Option<u32> {
-    if key.is_empty() || (key.len() > 1 && key.starts_with('0')) {
+fn array_index_ascii(key: &str) -> Option<u32> {
+    if !key.is_ascii() || key.is_empty() || (key.len() > 1 && key.as_bytes()[0] == b'0') {
         return None;
     }
-    let index = key.parse::<u32>().ok()?;
+    let mut index = 0_u32;
+    for byte in key.bytes() {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        index = index.checked_mul(10)?.checked_add(u32::from(byte - b'0'))?;
+    }
+    (index != u32::MAX).then_some(index)
+}
+
+fn array_index(key: &EcmaString) -> Option<u32> {
+    let units = key.as_units();
+    if units.is_empty() || (units.len() > 1 && units[0] == u16::from(b'0')) {
+        return None;
+    }
+    let mut index = 0_u32;
+    for &unit in units {
+        if !(u16::from(b'0')..=u16::from(b'9')).contains(&unit) {
+            return None;
+        }
+        index = index
+            .checked_mul(10)?
+            .checked_add(u32::from(unit - u16::from(b'0')))?;
+    }
     (index != u32::MAX).then_some(index)
 }
 
@@ -4505,7 +4860,7 @@ pub(crate) fn apply_array_length(
         .iter()
         .filter_map(|(key, property)| {
             (!property.configurable())
-                .then(|| key.as_str().and_then(array_index))
+                .then(|| key.as_string().and_then(array_index))
                 .flatten()
         })
         .map(|offset| offset as usize)
@@ -4513,7 +4868,7 @@ pub(crate) fn apply_array_length(
         .max();
     let effective_length = blocked.map_or(length, |offset| offset + 1);
     properties.0.retain(|(key, _)| {
-        key.as_str()
+        key.as_string()
             .and_then(array_index)
             .is_none_or(|offset| (offset as usize) < effective_length)
     });
@@ -4725,7 +5080,7 @@ mod tests {
 
     fn verified(mut constants: Vec<Constant>, functions: Vec<Function>) -> Program<Verified> {
         let name = ConstantId::new(constants.len() as u32);
-        constants.push(Constant::String("<test>".to_owned()));
+        constants.push(Constant::String(EcmaString::from_utf8("<test>")));
         let code = Module::new(constants, functions, FunctionId::new(0))
             .verify()
             .expect("valid test bytecode");
@@ -4749,7 +5104,7 @@ mod tests {
         bindings: Vec<Binding>,
         exports: Vec<Export>,
     ) -> ProgramModule<Verified> {
-        constants.insert(0, Constant::String(name.to_owned()));
+        constants.insert(0, Constant::String(EcmaString::from_utf8(name)));
         let code = Module::new(constants, functions, FunctionId::new(0))
             .verify()
             .expect("valid test bytecode");
@@ -4865,8 +5220,8 @@ mod tests {
         // key = "a" + "b"; obj[key] = 7; return obj[key].
         let module = verified(
             vec![
-                Constant::String("a".into()),
-                Constant::String("b".into()),
+                Constant::String(EcmaString::from_utf8("a")),
+                Constant::String(EcmaString::from_utf8("b")),
                 Constant::Int32(7),
             ],
             vec![function(
@@ -4913,7 +5268,10 @@ mod tests {
     #[test]
     fn property_delete_and_array_holes_are_real_mutations() {
         let module = verified(
-            vec![Constant::String("0".into()), Constant::Int32(5)],
+            vec![
+                Constant::String(EcmaString::from_utf8("0")),
+                Constant::Int32(5),
+            ],
             vec![function(
                 0,
                 5,
@@ -5086,7 +5444,7 @@ mod tests {
             vec![
                 Constant::Int32(1),
                 Constant::Undefined,
-                Constant::String("length".into()),
+                Constant::String(EcmaString::from_utf8("length")),
             ],
             vec![entry, callee],
         );
@@ -5149,7 +5507,7 @@ mod tests {
                 Constant::Int32(1),
                 Constant::Int32(2),
                 Constant::Int32(3),
-                Constant::String("length".into()),
+                Constant::String(EcmaString::from_utf8("length")),
             ],
             vec![entry],
         );
@@ -5164,7 +5522,10 @@ mod tests {
             constant: cid(c),
         };
         let module = verified(
-            vec![Constant::String("x".into()), Constant::Int32(9)],
+            vec![
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::Int32(9),
+            ],
             vec![function(
                 0,
                 4,
@@ -5204,7 +5565,7 @@ mod tests {
         // Two private names with the same description are distinct keys.
         let module = verified(
             vec![
-                Constant::String("x".into()),
+                Constant::String(EcmaString::from_utf8("x")),
                 Constant::Int32(1),
                 Constant::Int32(2),
             ],
@@ -5314,7 +5675,10 @@ mod tests {
             vec![],
         );
         let module = verified(
-            vec![Constant::String("g".into()), Constant::Int32(99)],
+            vec![
+                Constant::String(EcmaString::from_utf8("g")),
+                Constant::Int32(99),
+            ],
             vec![entry, getter],
         );
         assert_eq!(run_ok(&module).value, Value::int32(99));
@@ -5391,9 +5755,9 @@ mod tests {
         let ctor = function(0, 1, vec![Instruction::Halt], vec![]);
         let module = verified(
             vec![
-                Constant::String("m".into()),
+                Constant::String(EcmaString::from_utf8("m")),
                 Constant::Int32(5),
-                Constant::String("prototype".into()),
+                Constant::String(EcmaString::from_utf8("prototype")),
             ],
             vec![entry, ctor],
         );
@@ -5501,7 +5865,10 @@ mod tests {
             vec![],
         );
         let module = verified(
-            vec![Constant::String("a".into()), Constant::Int32(1)],
+            vec![
+                Constant::String(EcmaString::from_utf8("a")),
+                Constant::Int32(1),
+            ],
             vec![entry],
         );
         let execution = run_ok(&module);
@@ -5582,8 +5949,8 @@ mod tests {
         );
         let module = verified(
             vec![
-                Constant::String("x".into()),
-                Constant::String("y".into()),
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::from_utf8("y")),
                 Constant::Int32(5),
             ],
             vec![entry],
@@ -5594,7 +5961,7 @@ mod tests {
     #[test]
     fn load_undeclared_global_throws_reference_error() {
         let module = verified(
-            vec![Constant::String("missing".into())],
+            vec![Constant::String(EcmaString::from_utf8("missing"))],
             vec![function(
                 0,
                 2,
@@ -5626,7 +5993,7 @@ mod tests {
     #[test]
     fn uncaught_reference_error_reports_origin() {
         let module = verified(
-            vec![Constant::String("missing".into())],
+            vec![Constant::String(EcmaString::from_utf8("missing"))],
             vec![function(
                 0,
                 1,
@@ -5654,15 +6021,168 @@ mod tests {
         ));
     }
 
+    fn assert_uri_error(global: &str, argument: EcmaString) {
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8(global)),
+                Constant::String(argument),
+                Constant::Undefined,
+            ],
+            vec![function(
+                0,
+                5,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(1),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(2),
+                    },
+                    Instruction::CreateArray { dst: reg(3) },
+                    Instruction::ArrayPush {
+                        array: reg(3),
+                        value: reg(1),
+                    },
+                    Instruction::Call {
+                        dst: reg(4),
+                        callee: reg(0),
+                        this_value: reg(2),
+                        arguments: reg(3),
+                    },
+                    Instruction::Return { value: reg(4) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let error = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap_err();
+        assert_eq!(error.pc, pc(5));
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::UriError {
+                    operation: "URI malformed"
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn uri_builtins_report_uri_error() {
+        for (global, argument) in [
+            ("encodeURIComponent", EcmaString::from_units(&[0xd800])),
+            ("decodeURIComponent", EcmaString::from_utf8("%")),
+            ("decodeURIComponent", EcmaString::from_utf8("%GG")),
+            ("decodeURIComponent", EcmaString::from_utf8("%FF")),
+            ("decodeURIComponent", EcmaString::from_utf8("%80")),
+            ("decodeURIComponent", EcmaString::from_utf8("%C0%80")),
+            ("decodeURIComponent", EcmaString::from_utf8("%E2%82")),
+            ("decodeURIComponent", EcmaString::from_utf8("%ED%A0%80")),
+            ("decodeURIComponent", EcmaString::from_utf8("%F4%90%80%80")),
+            (
+                "decodeURIComponent",
+                EcmaString::from_utf8("%F8%80%80%80%80"),
+            ),
+        ] {
+            assert_uri_error(global, argument);
+        }
+    }
+
+    fn assert_uri_decode(argument: EcmaString, expected: EcmaString) {
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("decodeURIComponent")),
+                Constant::String(argument),
+                Constant::Undefined,
+                Constant::String(expected),
+            ],
+            vec![function(
+                0,
+                7,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(1),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(2),
+                    },
+                    Instruction::CreateArray { dst: reg(3) },
+                    Instruction::ArrayPush {
+                        array: reg(3),
+                        value: reg(1),
+                    },
+                    Instruction::Call {
+                        dst: reg(4),
+                        callee: reg(0),
+                        this_value: reg(2),
+                        arguments: reg(3),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(5),
+                        constant: cid(3),
+                    },
+                    Instruction::Binary {
+                        dst: reg(6),
+                        op: BinaryOp::StrictEqual,
+                        left: reg(4),
+                        right: reg(5),
+                    },
+                    Instruction::Return { value: reg(6) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let execution = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap();
+        assert_eq!(execution.value, Value::TRUE);
+    }
+
+    #[test]
+    fn decode_uri_component_preserves_units_and_decodes_utf8() {
+        let exact = EcmaString::from_units(&[0xd800, 0x61, 0xdfff]);
+        for (argument, expected) in [
+            (exact.clone(), exact),
+            (EcmaString::from_utf8("%2F"), EcmaString::from_utf8("/")),
+            (
+                EcmaString::from_utf8("%F0%9F%98%80"),
+                EcmaString::from_utf8("😀"),
+            ),
+            (
+                EcmaString::from_utf8("%E4%B8%ADA"),
+                EcmaString::from_utf8("中A"),
+            ),
+            (EcmaString::from_utf8("%00"), EcmaString::from_units(&[0])),
+        ] {
+            assert_uri_decode(argument, expected);
+        }
+    }
+
     #[test]
     fn regexp_is_object_with_source_and_flags() {
         // typeof re === "object" is not directly returnable; return re.source.
         let module = verified(
             vec![
-                Constant::String("ab".into()),
-                Constant::String("gi".into()),
-                Constant::String("source".into()),
-                Constant::String("global".into()),
+                Constant::String(EcmaString::from_utf8("ab")),
+                Constant::String(EcmaString::from_utf8("gi")),
+                Constant::String(EcmaString::from_utf8("source")),
+                Constant::String(EcmaString::from_utf8("global")),
             ],
             vec![function(
                 0,
@@ -5818,8 +6338,8 @@ mod tests {
         );
         let module = verified(
             vec![
-                Constant::String("prototype".into()),
-                Constant::String("nt".into()),
+                Constant::String(EcmaString::from_utf8("prototype")),
+                Constant::String(EcmaString::from_utf8("nt")),
             ],
             vec![entry, ctor],
         );
@@ -5878,7 +6398,10 @@ mod tests {
             vec![],
         );
         let module = verified(
-            vec![Constant::Int32(42), Constant::String("0".into())],
+            vec![
+                Constant::Int32(42),
+                Constant::String(EcmaString::from_utf8("0")),
+            ],
             vec![entry, callee],
         );
         assert_eq!(run_ok(&module).value, Value::int32(42));
@@ -6135,7 +6658,10 @@ mod tests {
             vec![],
         );
         let module = verified(
-            vec![Constant::String("marker".into()), Constant::Int32(5)],
+            vec![
+                Constant::String(EcmaString::from_utf8("marker")),
+                Constant::Int32(5),
+            ],
             vec![entry, returns_object],
         );
         assert_eq!(run_ok(&module).value, Value::int32(5));
@@ -6180,14 +6706,14 @@ mod tests {
             machine
                 .set_own_data(
                     index,
-                    PropertyKey::Named(key.to_owned()),
+                    PropertyKey::Named(EcmaString::from_utf8(key)),
                     Value::int32(value),
                 )
                 .unwrap();
         }
         assert_eq!(
             machine.enumerable_keys(object).unwrap(),
-            ["1", "2", "b", "a"]
+            ["1", "2", "b", "a"].map(EcmaString::from_utf8)
         );
     }
 
@@ -6227,7 +6753,11 @@ mod tests {
             (function, "[object Function]"),
         ] {
             let tag = machine.call_value(to_string, value, &[]).unwrap();
-            assert_eq!(machine.string_text(tag), Some(expected));
+            assert!(
+                machine
+                    .string_text(tag)
+                    .is_some_and(|text| text.eq_ascii(expected))
+            );
         }
     }
 
@@ -6272,9 +6802,11 @@ mod tests {
             let console = machine.intrinsics.global("console").unwrap();
             let log = machine.get_named_property(console, "log").unwrap();
             let string = machine
-                .allocate(HeapEntry::String("hello".to_owned()))
+                .allocate(HeapEntry::String(EcmaString::from_utf8("hello")))
                 .unwrap();
-            let array_string = machine.allocate(HeapEntry::String("x".to_owned())).unwrap();
+            let array_string = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .unwrap();
             let array = machine
                 .allocate(HeapEntry::Array {
                     elements: vec![Value::int32(1), array_string],
@@ -6286,7 +6818,7 @@ mod tests {
                 .unwrap();
             let mut inner_properties = PropertyMap::default();
             inner_properties.insert(
-                PropertyKey::Named("answer".to_owned()),
+                PropertyKey::Named(EcmaString::from_utf8("answer")),
                 Property::Data {
                     value: Value::int32(42),
                     writable: true,
@@ -6304,7 +6836,7 @@ mod tests {
                 .unwrap();
             let mut outer_properties = PropertyMap::default();
             outer_properties.insert(
-                PropertyKey::Named("nested".to_owned()),
+                PropertyKey::Named(EcmaString::from_utf8("nested")),
                 Property::Data {
                     value: inner,
                     writable: true,
@@ -6322,7 +6854,7 @@ mod tests {
                 .unwrap();
             let symbol = machine
                 .allocate(HeapEntry::Symbol {
-                    description: "token".to_owned(),
+                    description: EcmaString::from_utf8("token"),
                 })
                 .unwrap();
             for value in [
@@ -6370,8 +6902,19 @@ mod tests {
                 .set_data_property(env, "BAMTS_MODE", Value::int32(7))
                 .unwrap();
             let value = machine.get_named_property(env, "BAMTS_MODE").unwrap();
-            assert_eq!(machine.string_text(value), Some("7"));
-            assert!(machine.delete_named_property(env, "BAMTS_MODE").unwrap());
+            assert!(
+                machine
+                    .string_text(value)
+                    .is_some_and(|text| text.eq_ascii("7"))
+            );
+            assert!(
+                machine
+                    .delete_property(
+                        env,
+                        &PropertyKey::Named(EcmaString::from_utf8("BAMTS_MODE"))
+                    )
+                    .unwrap()
+            );
             assert_eq!(
                 machine.get_named_property(env, "BAMTS_MODE").unwrap(),
                 Value::UNDEFINED
@@ -6385,7 +6928,10 @@ mod tests {
         let dependency = |name: &str, value: i32| {
             program_module(
                 name,
-                vec![Constant::String("x".into()), Constant::Int32(value)],
+                vec![
+                    Constant::String(EcmaString::from_utf8("x")),
+                    Constant::Int32(value),
+                ],
                 vec![function(
                     0,
                     1,
@@ -6416,9 +6962,9 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String("left".into()),
-                Constant::String("right".into()),
-                Constant::String("x".into()),
+                Constant::String(EcmaString::from_utf8("left")),
+                Constant::String(EcmaString::from_utf8("right")),
+                Constant::String(EcmaString::from_utf8("x")),
             ],
             vec![function(
                 0,
@@ -6493,10 +7039,10 @@ mod tests {
         let dependency = program_module(
             "dependency",
             vec![
-                Constant::String("x".into()),
+                Constant::String(EcmaString::from_utf8("x")),
                 Constant::Int32(1),
                 Constant::Int32(2),
-                Constant::String("set".into()),
+                Constant::String(EcmaString::from_utf8("set")),
             ],
             vec![
                 function(
@@ -6567,9 +7113,9 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String("x".into()),
-                Constant::String("set".into()),
-                Constant::String("dep".into()),
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::from_utf8("set")),
+                Constant::String(EcmaString::from_utf8("dep")),
             ],
             vec![function(
                 0,
@@ -6628,9 +7174,9 @@ mod tests {
         let dependency = program_module(
             "dependency",
             vec![
-                Constant::String("x".into()),
+                Constant::String(EcmaString::from_utf8("x")),
                 Constant::Int32(10),
-                Constant::String("read".into()),
+                Constant::String(EcmaString::from_utf8("read")),
             ],
             vec![
                 function(
@@ -6691,10 +7237,10 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String("x".into()),
+                Constant::String(EcmaString::from_utf8("x")),
                 Constant::Int32(20),
-                Constant::String("read".into()),
-                Constant::String("dep".into()),
+                Constant::String(EcmaString::from_utf8("read")),
+                Constant::String(EcmaString::from_utf8("dep")),
             ],
             vec![function(
                 0,
@@ -6754,9 +7300,9 @@ mod tests {
         let first = program_module(
             "first",
             vec![
-                Constant::String("a".into()),
+                Constant::String(EcmaString::from_utf8("a")),
                 Constant::Int32(1),
-                Constant::String("second".into()),
+                Constant::String(EcmaString::from_utf8("second")),
             ],
             vec![function(
                 0,
@@ -6791,8 +7337,8 @@ mod tests {
         let second = program_module(
             "second",
             vec![
-                Constant::String("a".into()),
-                Constant::String("first".into()),
+                Constant::String(EcmaString::from_utf8("a")),
+                Constant::String(EcmaString::from_utf8("first")),
             ],
             vec![function(
                 0,
@@ -6837,9 +7383,9 @@ mod tests {
         let first = program_module(
             "first",
             vec![
-                Constant::String("a".into()),
+                Constant::String(EcmaString::from_utf8("a")),
                 Constant::Int32(1),
-                Constant::String("second".into()),
+                Constant::String(EcmaString::from_utf8("second")),
             ],
             vec![function(
                 0,
@@ -6874,8 +7420,8 @@ mod tests {
         let second = program_module(
             "second",
             vec![
-                Constant::String("a".into()),
-                Constant::String("first".into()),
+                Constant::String(EcmaString::from_utf8("a")),
+                Constant::String(EcmaString::from_utf8("first")),
             ],
             vec![function(
                 0,
@@ -6914,9 +7460,9 @@ mod tests {
         let dependency = program_module(
             "dependency",
             vec![
-                Constant::String("z".into()),
-                Constant::String("a".into()),
-                Constant::String("mutate".into()),
+                Constant::String(EcmaString::from_utf8("z")),
+                Constant::String(EcmaString::from_utf8("a")),
+                Constant::String(EcmaString::from_utf8("mutate")),
                 Constant::Int32(1),
                 Constant::Int32(2),
                 Constant::Int32(3),
@@ -7006,19 +7552,19 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String("ns1".into()),
-                Constant::String("ns2".into()),
-                Constant::String("mutate".into()),
-                Constant::String("z".into()),
-                Constant::String("a".into()),
-                Constant::String("dep".into()),
-                Constant::String("Object".into()),
-                Constant::String("getOwnPropertyDescriptor".into()),
-                Constant::String("value".into()),
-                Constant::String("writable".into()),
-                Constant::String("enumerable".into()),
-                Constant::String("configurable".into()),
-                Constant::String("missing".into()),
+                Constant::String(EcmaString::from_utf8("ns1")),
+                Constant::String(EcmaString::from_utf8("ns2")),
+                Constant::String(EcmaString::from_utf8("mutate")),
+                Constant::String(EcmaString::from_utf8("z")),
+                Constant::String(EcmaString::from_utf8("a")),
+                Constant::String(EcmaString::from_utf8("dep")),
+                Constant::String(EcmaString::from_utf8("Object")),
+                Constant::String(EcmaString::from_utf8("getOwnPropertyDescriptor")),
+                Constant::String(EcmaString::from_utf8("value")),
+                Constant::String(EcmaString::from_utf8("writable")),
+                Constant::String(EcmaString::from_utf8("enumerable")),
+                Constant::String(EcmaString::from_utf8("configurable")),
+                Constant::String(EcmaString::from_utf8("missing")),
             ],
             vec![function(
                 0,
@@ -7237,7 +7783,7 @@ mod tests {
             let dependency = program_module(
                 "dependency",
                 vec![
-                    Constant::String("count".into()),
+                    Constant::String(EcmaString::from_utf8("count")),
                     Constant::Int32(0),
                     Constant::Int32(1),
                 ],
@@ -7305,9 +7851,9 @@ mod tests {
             let root = program_module(
                 "root",
                 vec![
-                    Constant::String("count".into()),
-                    Constant::String("dep-one".into()),
-                    Constant::String("dep-two".into()),
+                    Constant::String(EcmaString::from_utf8("count")),
+                    Constant::String(EcmaString::from_utf8("dep-one")),
+                    Constant::String(EcmaString::from_utf8("dep-two")),
                 ],
                 vec![function(
                     0,
@@ -7378,7 +7924,7 @@ mod tests {
     fn external_static_edge_is_a_typed_runtime_error() {
         let module = program_module(
             "root",
-            vec![Constant::String("external".into())],
+            vec![Constant::String(EcmaString::from_utf8("external"))],
             vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
             vec![Edge {
                 specifier: cid(1),
@@ -7401,10 +7947,67 @@ mod tests {
     }
 
     #[test]
+    fn external_module_and_export_names_preserve_unicode() {
+        for (specifier, export) in [("módulo", "value"), ("external", "café")] {
+            let module = program_module(
+                "root",
+                vec![
+                    Constant::String(EcmaString::from_utf8(export)),
+                    Constant::String(EcmaString::from_utf8(specifier)),
+                ],
+                vec![function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(1),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                )],
+                vec![Edge {
+                    specifier: cid(2),
+                    target: EdgeTarget::External,
+                    kind: EdgeKind::Static,
+                }],
+                vec![Binding {
+                    name: cid(1),
+                    kind: BindingKind::Imported {
+                        edge: EdgeId::new(0),
+                        name: cid(1),
+                    },
+                }],
+                Vec::new(),
+            );
+            let program = linked(vec![module], 0);
+            let mut host = TestHost;
+            let mut machine = Machine::new(&program, &mut host, Limits::default());
+            machine.registry.external.insert(
+                EcmaString::from_utf8(specifier),
+                ExternalModuleInstance {
+                    namespace: Value::UNDEFINED,
+                    exports: BTreeMap::from([(
+                        EcmaString::from_utf8(export),
+                        ExternalExport {
+                            value: Value::int32(7),
+                            cell: None,
+                        },
+                    )]),
+                    internals: BTreeMap::new(),
+                },
+            );
+
+            assert_eq!(machine.run().unwrap().value, Value::int32(7));
+        }
+    }
+
+    #[test]
     fn dynamic_import_is_a_typed_runtime_error() {
         let module = program_module(
             "root",
-            vec![Constant::String("dynamic".into())],
+            vec![Constant::String(EcmaString::from_utf8("dynamic"))],
             vec![function(
                 0,
                 1,
@@ -7439,7 +8042,10 @@ mod tests {
     #[test]
     fn unbound_global_names_fall_back_to_the_realm_global_map() {
         let program = verified(
-            vec![Constant::String("realmOnly".into()), Constant::Int32(7)],
+            vec![
+                Constant::String(EcmaString::from_utf8("realmOnly")),
+                Constant::Int32(7),
+            ],
             vec![function(
                 0,
                 1,
@@ -7468,7 +8074,7 @@ mod tests {
     fn module_cell_limit_is_enforced_before_evaluation() {
         let module = program_module(
             "root",
-            vec![Constant::String("x".into())],
+            vec![Constant::String(EcmaString::from_utf8("x"))],
             vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
             Vec::new(),
             vec![Binding {
@@ -7498,7 +8104,10 @@ mod tests {
     fn imported_binding_store_throws_without_mutating_the_exporter() {
         let dependency = program_module(
             "dependency",
-            vec![Constant::String("x".into()), Constant::Int32(1)],
+            vec![
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::Int32(1),
+            ],
             vec![function(
                 0,
                 1,
@@ -7528,9 +8137,9 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String("x".into()),
+                Constant::String(EcmaString::from_utf8("x")),
                 Constant::Int32(2),
-                Constant::String("dep".into()),
+                Constant::String(EcmaString::from_utf8("dep")),
             ],
             vec![function(
                 0,
@@ -7578,9 +8187,9 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String("x".into()),
+                Constant::String(EcmaString::from_utf8("x")),
                 Constant::Int32(1),
-                Constant::String("dependency".into()),
+                Constant::String(EcmaString::from_utf8("dependency")),
             ],
             vec![function(
                 0,
@@ -7615,11 +8224,11 @@ mod tests {
         let dependency = program_module(
             "dependency",
             vec![
-                Constant::String("ns".into()),
-                Constant::String("root".into()),
-                Constant::String("Object".into()),
-                Constant::String("getOwnPropertyDescriptor".into()),
-                Constant::String("x".into()),
+                Constant::String(EcmaString::from_utf8("ns")),
+                Constant::String(EcmaString::from_utf8("root")),
+                Constant::String(EcmaString::from_utf8("Object")),
+                Constant::String(EcmaString::from_utf8("getOwnPropertyDescriptor")),
+                Constant::String(EcmaString::from_utf8("x")),
             ],
             vec![namespace_descriptor_entry()],
             vec![Edge {
@@ -7652,8 +8261,8 @@ mod tests {
         let exported = program_module(
             "exported",
             vec![
-                Constant::String("x".into()),
-                Constant::String("external".into()),
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::from_utf8("external")),
             ],
             vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
             vec![Edge {
@@ -7673,11 +8282,11 @@ mod tests {
         let importer = program_module(
             "importer",
             vec![
-                Constant::String("ns".into()),
-                Constant::String("exported".into()),
-                Constant::String("Object".into()),
-                Constant::String("getOwnPropertyDescriptor".into()),
-                Constant::String("x".into()),
+                Constant::String(EcmaString::from_utf8("ns")),
+                Constant::String(EcmaString::from_utf8("exported")),
+                Constant::String(EcmaString::from_utf8("Object")),
+                Constant::String(EcmaString::from_utf8("getOwnPropertyDescriptor")),
+                Constant::String(EcmaString::from_utf8("x")),
             ],
             vec![namespace_descriptor_entry()],
             vec![Edge {

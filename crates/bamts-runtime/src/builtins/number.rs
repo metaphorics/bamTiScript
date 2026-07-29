@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
 use super::{
@@ -10,13 +11,13 @@ use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyKey};
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
-    globals: &mut BTreeMap<String, Value>,
+    globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.number_prototype();
     let constructor = install_function(heap, builtins, "Number", 1, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
-    globals.insert("Number".to_owned(), constructor);
+    globals.insert(EcmaString::from_utf8("Number"), constructor);
     for (name, length, handler) in [
         ("isInteger", 1, is_integer::<H> as BuiltinHandler<H>),
         ("isSafeInteger", 1, is_safe_integer::<H>),
@@ -55,7 +56,7 @@ fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: 
         panic!("Number constructor must be native")
     };
     properties.insert(
-        PropertyKey::Named(name.to_owned()),
+        PropertyKey::Named(EcmaString::from_utf8(name)),
         super::builtin_property(value),
     );
 }
@@ -152,7 +153,12 @@ pub(super) fn parse_float<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let s = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let Ok(s) = machine
+        .to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?
+        .to_utf8_strict()
+    else {
+        return Ok(BuiltinOutcome::Value(crate::number_value(f64::NAN)));
+    };
     let s = trim_js(&s);
     let value = if s.starts_with("Infinity") {
         f64::INFINITY
@@ -179,7 +185,12 @@ pub(super) fn parse_int<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let text = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let Ok(text) = machine
+        .to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?
+        .to_utf8_strict()
+    else {
+        return Ok(BuiltinOutcome::Value(crate::number_value(f64::NAN)));
+    };
     let mut s = trim_js(&text);
     let mut sign = 1.0;
     if let Some(rest) = s.strip_prefix('-') {
@@ -200,12 +211,18 @@ pub(super) fn parse_int<H: Host>(
     }
     let mut value = 0.0;
     let mut found = false;
-    for ch in s.chars() {
-        let Some(d) = ch.to_digit(radix as u32) else {
-            break;
+    for byte in s.bytes() {
+        let digit = match byte {
+            b'0'..=b'9' => u32::from(byte - b'0'),
+            b'a'..=b'z' => u32::from(byte - b'a') + 10,
+            b'A'..=b'Z' => u32::from(byte - b'A') + 10,
+            _ => break,
         };
+        if digit >= radix as u32 {
+            break;
+        }
         found = true;
-        value = value * radix as f64 + f64::from(d)
+        value = value * radix as f64 + f64::from(digit);
     }
     Ok(BuiltinOutcome::Value(crate::number_value(if found {
         sign * value
@@ -254,7 +271,10 @@ fn to_string<H: Host>(
     } else {
         radix_string(n, radix)
     };
-    Ok(BuiltinOutcome::Value(allocate_string(machine, text)?))
+    Ok(BuiltinOutcome::Value(allocate_string(
+        machine,
+        EcmaString::from_utf8(&text),
+    )?))
 }
 fn radix_string(n: f64, radix: u32) -> String {
     const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
@@ -294,7 +314,10 @@ fn to_fixed<H: Host>(
     } else {
         format!("{:.*}", digits as usize, n)
     };
-    Ok(BuiltinOutcome::Value(allocate_string(machine, text)?))
+    Ok(BuiltinOutcome::Value(allocate_string(
+        machine,
+        EcmaString::from_utf8(&text),
+    )?))
 }
 fn value_of<H: Host>(
     machine: &mut Machine<'_, H>,

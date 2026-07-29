@@ -420,8 +420,8 @@ fn write_u64(bytes: &mut [u8], offset: usize, value: u64, little_endian: bool) {
 mod tests {
     use super::*;
     use bamts_bytecode::{
-        Constant, ConstantId, Function as BytecodeFunction, FunctionFlags, FunctionId, Instruction,
-        Module, ModuleId, Program, ProgramDecodeLimits, ProgramModule, Register,
+        Constant, ConstantId, EcmaString, Function as BytecodeFunction, FunctionFlags, FunctionId,
+        Instruction, Module, ModuleId, Program, ProgramDecodeLimits, ProgramModule, Register,
         decode_verified_program,
     };
     use cranelift_object::object::{
@@ -457,7 +457,10 @@ mod tests {
         ProgramModule {
             name: ConstantId::new(0),
             code: Module::new(
-                vec![Constant::String(name.to_owned()), Constant::Int32(value)],
+                vec![
+                    Constant::String(EcmaString::from_utf8(name)),
+                    Constant::Int32(value),
+                ],
                 vec![function(code, u32::from(loads_constant))],
                 FunctionId::new(0),
             )

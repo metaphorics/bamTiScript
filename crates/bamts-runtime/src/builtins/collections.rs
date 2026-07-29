@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
 use super::{
@@ -18,7 +19,7 @@ type CollectionParts = (Vec<Value>, Vec<Value>, Vec<Value>);
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
-    globals: &mut BTreeMap<String, Value>,
+    globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     install_map(heap, globals, builtins);
@@ -29,7 +30,7 @@ pub(super) fn install<H: Host>(
 
 fn install_map<H: Host>(
     heap: &mut Vec<HeapEntry>,
-    globals: &mut BTreeMap<String, Value>,
+    globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
@@ -53,12 +54,12 @@ fn install_map<H: Host>(
     define_getter(heap, prototype, "size", size);
     let entries = named_property(heap, prototype, "entries");
     define_symbol(heap, prototype, builtins.symbol_iterator(), entries);
-    globals.insert("Map".to_owned(), constructor);
+    globals.insert(EcmaString::from_utf8("Map"), constructor);
 }
 
 fn install_set<H: Host>(
     heap: &mut Vec<HeapEntry>,
-    globals: &mut BTreeMap<String, Value>,
+    globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
@@ -81,12 +82,12 @@ fn install_set<H: Host>(
     define_getter(heap, prototype, "size", size);
     let values = named_property(heap, prototype, "values");
     define_symbol(heap, prototype, builtins.symbol_iterator(), values);
-    globals.insert("Set".to_owned(), constructor);
+    globals.insert(EcmaString::from_utf8("Set"), constructor);
 }
 
 fn install_weak_map<H: Host>(
     heap: &mut Vec<HeapEntry>,
-    globals: &mut BTreeMap<String, Value>,
+    globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
@@ -101,12 +102,12 @@ fn install_weak_map<H: Host>(
         let function = install_function(heap, builtins, name, length, handler);
         define_data(heap, prototype, name, function);
     }
-    globals.insert("WeakMap".to_owned(), constructor);
+    globals.insert(EcmaString::from_utf8("WeakMap"), constructor);
 }
 
 fn install_weak_set<H: Host>(
     heap: &mut Vec<HeapEntry>,
-    globals: &mut BTreeMap<String, Value>,
+    globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
@@ -120,12 +121,12 @@ fn install_weak_set<H: Host>(
         let function = install_function(heap, builtins, name, length, handler);
         define_data(heap, prototype, name, function);
     }
-    globals.insert("WeakSet".to_owned(), constructor);
+    globals.insert(EcmaString::from_utf8("WeakSet"), constructor);
 }
 
 pub(super) fn install_iterator_prototype<H: Host>(
     heap: &mut Vec<HeapEntry>,
-    globals: &mut BTreeMap<String, Value>,
+    globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
@@ -139,7 +140,7 @@ pub(super) fn install_iterator_prototype<H: Host>(
     );
     define_data(heap, prototype, "next", next);
     define_symbol(heap, prototype, builtins.symbol_iterator(), identity);
-    globals.insert("\0Iterator.prototype".to_owned(), prototype);
+    globals.insert(EcmaString::from_utf8("\0Iterator.prototype"), prototype);
 }
 
 pub(super) fn iterator<H: Host>(
@@ -665,7 +666,7 @@ fn constructor_prototype<H: Host>(
     let HeapEntry::NativeFunction { properties, .. } = &machine.heap[index] else {
         return Err(type_error("invalid collection constructor"));
     };
-    match properties.get(&PropertyKey::Named("prototype".to_owned())) {
+    match properties.get(&PropertyKey::Named(EcmaString::from_utf8("prototype"))) {
         Some(Property::Data { value, .. }) => Ok(*value),
         _ => Err(type_error("missing collection prototype")),
     }
@@ -696,7 +697,7 @@ fn ordinary_runtime<H: Host>(
 }
 fn hidden(properties: &mut PropertyMap, name: &str, value: Value) {
     properties.insert(
-        PropertyKey::Named(name.to_owned()),
+        PropertyKey::Named(EcmaString::from_utf8(name)),
         Property::Data {
             value,
             writable: true,
@@ -710,7 +711,7 @@ fn define_getter(heap: &mut [HeapEntry], object: Value, name: &str, getter: Valu
         unreachable!()
     };
     properties.insert(
-        PropertyKey::Named(name.to_owned()),
+        PropertyKey::Named(EcmaString::from_utf8(name)),
         Property::Accessor {
             getter: Some(getter),
             setter: None,
@@ -732,7 +733,7 @@ fn named_property(heap: &[HeapEntry], object: Value, name: &str) -> Value {
     let HeapEntry::Object { properties, .. } = &heap[heap_index(object)] else {
         unreachable!()
     };
-    match properties.get(&PropertyKey::Named(name.to_owned())) {
+    match properties.get(&PropertyKey::Named(EcmaString::from_utf8(name))) {
         Some(Property::Data { value, .. }) => *value,
         _ => unreachable!(),
     }

@@ -537,14 +537,14 @@ mod tests {
     #[test]
     fn linked_descriptor_decodes_whole_program_and_tuple_entry() {
         use bamts_bytecode::{
-            Constant, ConstantId, Function, FunctionFlags, FunctionId, Instruction, Module,
-            ModuleId, Program, ProgramModule,
+            Constant, ConstantId, EcmaString, Function, FunctionFlags, FunctionId, Instruction,
+            Module, ModuleId, Program, ProgramModule,
         };
 
         let module = |name: &str| ProgramModule {
             name: ConstantId::new(0),
             code: Module::new(
-                vec![Constant::String(name.to_owned())],
+                vec![Constant::String(EcmaString::from_utf8(name))],
                 vec![Function::new(
                     None,
                     0,

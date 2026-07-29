@@ -4,8 +4,8 @@ use std::fmt;
 use std::marker::PhantomData;
 
 use crate::{
-    Constant, ConstantId, DecodeError, DecodeLimits, Instruction, Module, Unverified, Verified,
-    VerifyError, decode,
+    Constant, ConstantId, DecodeError, DecodeLimits, EcmaString, Instruction, Module, Unverified,
+    Verified, VerifyError, decode,
 };
 
 /// `BMTPC\0\0\1`: the canonical whole-program container, distinct from module magic.
@@ -296,13 +296,14 @@ impl Program<Verified> {
         output
     }
 
-    /// Resolves a verified export without allocating or copying names.
+    /// Resolves a verified export by its exact ECMAScript name.
     #[must_use]
-    pub fn resolve_export(&self, module: ModuleId, name: &str) -> Option<ResolvedExport> {
+    pub fn resolve_export(&self, module: ModuleId, name: &EcmaString) -> Option<ResolvedExport> {
         let mut module_id = module;
-        let mut export_name = name;
+        let mut linked_name = None;
         loop {
             let current = self.module(module_id)?;
+            let export_name = linked_name.unwrap_or(name);
             let export = current
                 .exports
                 .iter()
@@ -316,7 +317,7 @@ impl Program<Verified> {
                             match edge.target {
                                 EdgeTarget::Local(target) => {
                                     module_id = target;
-                                    export_name = string(&current.code, name)?;
+                                    linked_name = Some(string(&current.code, name)?);
                                 }
                                 EdgeTarget::External => {
                                     return Some(ResolvedExport::External {
@@ -343,7 +344,7 @@ impl Program<Verified> {
                     match edge.target {
                         EdgeTarget::Local(target) => {
                             module_id = target;
-                            export_name = string(&current.code, name)?;
+                            linked_name = Some(string(&current.code, name)?);
                         }
                         EdgeTarget::External => {
                             return Some(ResolvedExport::External {
@@ -528,6 +529,9 @@ pub enum ProgramVerifyErrorKind {
         constant: ConstantId,
     },
     InvalidModuleName,
+    MetadataStringIllFormed {
+        constant: ConstantId,
+    },
     DuplicateModuleName {
         first: ModuleId,
     },
@@ -1246,11 +1250,29 @@ fn verify_module_metadata(
     }
 
     for (function_index, function) in module.code.functions().iter().enumerate() {
+        if let Some(name) = function.name()
+            && !string(&module.code, name)
+                .expect("module verifier checked function-name string")
+                .is_well_formed()
+        {
+            return Err(module_error(
+                module_id,
+                ProgramVerifyErrorKind::MetadataStringIllFormed { constant: name },
+            ));
+        }
         for (pc, instruction) in function.code().iter().copied().enumerate() {
             match instruction {
                 Instruction::Import { specifier, .. } => {
                     let import_name =
                         string(&module.code, specifier).expect("module verifier checked string");
+                    if !import_name.is_well_formed() {
+                        return Err(module_error(
+                            module_id,
+                            ProgramVerifyErrorKind::MetadataStringIllFormed {
+                                constant: specifier,
+                            },
+                        ));
+                    }
                     if !specifiers
                         .get(import_name)
                         .is_some_and(|edge| module.edges[edge.get() as usize].kind.has_dynamic())
@@ -1283,10 +1305,14 @@ fn required_string(
     id: ConstantId,
     bounds: ProgramVerifyErrorKind,
     kind: ProgramVerifyErrorKind,
-) -> Result<&str, ProgramVerifyError> {
+) -> Result<&EcmaString, ProgramVerifyError> {
     match module.code.constants().get(id.get() as usize) {
         None => Err(module_error(module_id, bounds)),
-        Some(Constant::String(value)) => Ok(value),
+        Some(Constant::String(value)) if value.is_well_formed() => Ok(value),
+        Some(Constant::String(_)) => Err(module_error(
+            module_id,
+            ProgramVerifyErrorKind::MetadataStringIllFormed { constant: id },
+        )),
         Some(_) => Err(module_error(module_id, kind)),
     }
 }
@@ -1337,7 +1363,7 @@ fn verify_imported_bindings(modules: &[ProgramModule<Verified>]) -> Result<(), P
 fn verify_export_resolutions(
     modules: &[ProgramModule<Verified>],
 ) -> Result<(), ProgramVerifyError> {
-    let export_indices: Vec<HashMap<&str, usize>> = modules
+    let export_indices: Vec<HashMap<&EcmaString, usize>> = modules
         .iter()
         .map(|module| {
             module
@@ -1450,36 +1476,46 @@ fn verify_export_resolutions(
     Ok(())
 }
 
-fn string(module: &Module<Verified>, id: ConstantId) -> Option<&str> {
+fn string(module: &Module<Verified>, id: ConstantId) -> Option<&EcmaString> {
     match module.constants().get(id.get() as usize) {
         Some(Constant::String(value)) => Some(value),
         _ => None,
     }
 }
 
-fn is_normalized_module_name(name: &str) -> bool {
-    if name.is_empty()
-        || name.starts_with('/')
-        || name.contains('\\')
-        || name.contains('\0')
-        || name
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
+fn is_normalized_module_name(name: &EcmaString) -> bool {
+    let units = name.as_units();
+    if units.is_empty()
+        || units.first() == Some(&u16::from(b'/'))
+        || units.contains(&u16::from(b'\\'))
+        || units.contains(&0)
+        || units.split(|&unit| unit == u16::from(b'/')).any(|part| {
+            part.is_empty()
+                || part == [u16::from(b'.')]
+                || part == [u16::from(b'.'), u16::from(b'.')]
+        })
     {
         return false;
     }
-    let first = name.split('/').next().unwrap_or_default();
-    !first.contains(':')
+    !units
+        .split(|&unit| unit == u16::from(b'/'))
+        .next()
+        .unwrap_or_default()
+        .contains(&u16::from(b':'))
 }
 
-fn is_absolute_specifier(specifier: &str) -> bool {
-    let bytes = specifier.as_bytes();
-    specifier.starts_with('/')
-        || specifier.starts_with('\\')
-        || specifier
-            .get(..5)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
-        || matches!(bytes, [drive, b':', ..] if drive.is_ascii_alphabetic())
+fn is_absolute_specifier(specifier: &EcmaString) -> bool {
+    let units = specifier.as_units();
+    units.starts_with(&[u16::from(b'/')])
+        || units.starts_with(&[u16::from(b'\\')])
+        || units.get(..5).is_some_and(|prefix| {
+            prefix.iter().copied().zip(*b"file:").all(|(unit, ascii)| {
+                unit == u16::from(ascii)
+                    || (ascii.is_ascii_alphabetic()
+                        && unit == u16::from(ascii.to_ascii_uppercase()))
+            })
+        })
+        || matches!(units, [drive, colon, ..] if (*drive >= u16::from(b'a') && *drive <= u16::from(b'z') || *drive >= u16::from(b'A') && *drive <= u16::from(b'Z')) && *colon == u16::from(b':'))
 }
 
 const fn program_error(kind: ProgramVerifyErrorKind) -> ProgramVerifyError {
@@ -1512,11 +1548,11 @@ mod tests {
     use crate::{Function, FunctionFlags, FunctionId, Register};
 
     fn verified_module(name: &str, extra: &[&str]) -> Module<Verified> {
-        let mut constants = vec![Constant::String(name.to_owned())];
+        let mut constants = vec![Constant::String(EcmaString::from_utf8(name))];
         constants.extend(
             extra
                 .iter()
-                .map(|value| Constant::String((*value).to_owned())),
+                .map(|value| Constant::String(EcmaString::from_utf8(value))),
         );
         Module::new(
             constants,
@@ -1587,12 +1623,48 @@ mod tests {
     }
 
     #[test]
+    fn metadata_strings_must_be_well_formed_utf16() {
+        let code = Module::new(
+            vec![Constant::String(EcmaString::from_units(&[0xD800]))],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                1,
+                FunctionFlags::default(),
+                vec![Instruction::Halt],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("a literal string may contain an unpaired surrogate");
+        let error = Program::link(
+            vec![ProgramModule {
+                name: ConstantId::new(0),
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect_err("module metadata cannot contain an unpaired surrogate");
+        assert_eq!(
+            error.kind,
+            ProgramVerifyErrorKind::MetadataStringIllFormed {
+                constant: ConstantId::new(0),
+            }
+        );
+    }
+
+    #[test]
     fn round_trip_reencode_is_identical() {
         let encoded = valid_program().encode();
         let decoded = decode_verified_program(&encoded, &ProgramDecodeLimits::default()).unwrap();
         assert_eq!(decoded.encode(), encoded);
         assert_eq!(
-            decoded.resolve_export(ModuleId::new(0), "x"),
+            decoded.resolve_export(ModuleId::new(0), &EcmaString::from_utf8("x")),
             Some(ResolvedExport::Local {
                 module: ModuleId::new(0),
                 binding: BindingId::new(0),
@@ -1847,20 +1919,20 @@ mod tests {
     }
 
     #[test]
-    fn invalid_utf8_inside_module_blob_is_typed_decode_error() {
+    fn malformed_utf16_metadata_inside_module_blob_is_typed_verify_error() {
         let mut encoded = valid_program().encode();
-        let needle = [2, 4, b'm', b'a', b'i', b'n'];
+        let needle = [2, 4, b'm', 0, b'a', 0, b'i', 0, b'n', 0];
         let at = encoded
             .windows(needle.len())
             .position(|window| window == needle)
             .unwrap();
-        encoded[at + 2] = 0xff;
+        encoded[at + 2..at + 4].copy_from_slice(&0xD800_u16.to_le_bytes());
         assert!(matches!(
-            decode_program(&encoded, &ProgramDecodeLimits::default()),
-            Err(ProgramDecodeError {
-                kind: ProgramDecodeErrorKind::Module { .. },
+            decode_verified_program(&encoded, &ProgramDecodeLimits::default()),
+            Err(ProgramLoadError::Verify(ProgramVerifyError {
+                kind: ProgramVerifyErrorKind::MetadataStringIllFormed { .. },
                 ..
-            })
+            }))
         ));
     }
 
@@ -2019,7 +2091,10 @@ mod tests {
     #[test]
     fn every_metadata_string_reference_checks_bounds_and_kind() {
         let code = Module::new(
-            vec![Constant::String("main".to_owned()), Constant::Int32(7)],
+            vec![
+                Constant::String(EcmaString::from_utf8("main")),
+                Constant::Int32(7),
+            ],
             vec![Function::new(
                 None,
                 0,
@@ -2218,7 +2293,7 @@ mod tests {
         };
         let program = Program::link(vec![module], ModuleId::new(0)).unwrap();
         assert_eq!(
-            program.resolve_export(ModuleId::new(0), "x"),
+            program.resolve_export(ModuleId::new(0), &EcmaString::from_utf8("x")),
             Some(ResolvedExport::External {
                 module: ModuleId::new(0),
                 edge: EdgeId::new(0),
@@ -2254,8 +2329,8 @@ mod tests {
     fn dynamic_imports_require_dynamic_capability() {
         let code = Module::new(
             vec![
-                Constant::String("main".to_owned()),
-                Constant::String("./dep".to_owned()),
+                Constant::String(EcmaString::from_utf8("main")),
+                Constant::String(EcmaString::from_utf8("./dep")),
             ],
             vec![Function::new(
                 None,
@@ -2333,9 +2408,9 @@ mod tests {
     fn static_and_dynamic_edge_satisfies_both_linkage_capabilities() {
         let code = Module::new(
             vec![
-                Constant::String("main".to_owned()),
-                Constant::String("./dep".to_owned()),
-                Constant::String("value".to_owned()),
+                Constant::String(EcmaString::from_utf8("main")),
+                Constant::String(EcmaString::from_utf8("./dep")),
+                Constant::String(EcmaString::from_utf8("value")),
             ],
             vec![Function::new(
                 None,
@@ -2382,7 +2457,7 @@ mod tests {
     #[test]
     fn executable_program_rejects_snapshot_exports() {
         let module = Module::new(
-            vec![Constant::String("main".to_owned())],
+            vec![Constant::String(EcmaString::from_utf8("main"))],
             vec![Function::new(
                 None,
                 0,
@@ -2427,9 +2502,9 @@ mod tests {
     fn post_import_mutation_keeps_external_binding_as_live_identity() {
         let code = Module::new(
             vec![
-                Constant::String("main".to_owned()),
-                Constant::String("x".to_owned()),
-                Constant::String("builtin:live".to_owned()),
+                Constant::String(EcmaString::from_utf8("main")),
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::from_utf8("builtin:live")),
             ],
             vec![Function::new(
                 None,
@@ -2491,7 +2566,7 @@ mod tests {
         };
         let program = Program::link(vec![module], ModuleId::new(0)).unwrap();
         assert_eq!(
-            program.resolve_export(ModuleId::new(0), "x"),
+            program.resolve_export(ModuleId::new(0), &EcmaString::from_utf8("x")),
             Some(ResolvedExport::External {
                 module: ModuleId::new(0),
                 edge: EdgeId::new(0),
@@ -2564,8 +2639,14 @@ mod tests {
             module: ModuleId::new(2),
             binding: BindingId::new(0),
         });
-        assert_eq!(program.resolve_export(ModuleId::new(0), "x"), leaf);
-        assert_eq!(program.resolve_export(ModuleId::new(1), "x"), leaf);
+        assert_eq!(
+            program.resolve_export(ModuleId::new(0), &EcmaString::from_utf8("x")),
+            leaf
+        );
+        assert_eq!(
+            program.resolve_export(ModuleId::new(1), &EcmaString::from_utf8("x")),
+            leaf
+        );
 
         let mut importer = program_module("importer");
         importer.edges.push(Edge {

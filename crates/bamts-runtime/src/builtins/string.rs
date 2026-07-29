@@ -1,24 +1,24 @@
 use std::collections::BTreeMap;
 
-use bamts_bytecode::EcmaString;
+use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
 
 use super::{
     allocate_array, allocate_string, define_data, install_function, range_error,
-    to_integer_or_infinity, type_error, value_number,
+    to_integer_or_infinity, type_error, uri_error, value_number,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyKey};
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
-    globals: &mut BTreeMap<String, Value>,
+    globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.string_prototype();
     let constructor = install_function(heap, builtins, "String", 1, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
-    globals.insert("String".to_owned(), constructor);
+    globals.insert(EcmaString::from_utf8("String"), constructor);
     for (name, length, handler) in [
         ("fromCharCode", 1, from_char_code::<H> as BuiltinHandler<H>),
         ("raw", 1, raw::<H>),
@@ -73,7 +73,7 @@ fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: 
         panic!("String constructor must be native")
     };
     properties.insert(
-        PropertyKey::Named(name.to_owned()),
+        PropertyKey::Named(EcmaString::from_utf8(name)),
         super::builtin_property(value),
     );
 }
@@ -84,7 +84,7 @@ fn constructor<H: Host>(
     constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let text = if args.is_empty() {
-        String::new()
+        EcmaString::default()
     } else {
         machine.to_string(args[0])?
     };
@@ -95,17 +95,16 @@ fn constructor<H: Host>(
         Ok(BuiltinOutcome::Value(value))
     }
 }
-fn text<H: Host>(machine: &Machine<'_, H>, this: Value) -> Result<String, EvalFailure> {
+fn text<H: Host>(machine: &Machine<'_, H>, this: Value) -> Result<EcmaString, EvalFailure> {
     if matches!(this.decode(), Some(Decoded::Undefined | Decoded::Null)) {
         return Err(type_error("String method called on null or undefined"));
     }
     machine.to_string(machine.unbox_primitive_or_self(this)?)
 }
-fn units(s: &str) -> Vec<u16> {
-    s.encode_utf16().collect()
-}
-fn from_units(v: &[u16]) -> String {
-    String::from_utf16_lossy(v)
+fn append(out: &mut EcmaStringBuilder, text: &EcmaString) {
+    for &unit in text.as_units() {
+        out.push_unit(unit);
+    }
 }
 fn integer<H: Host>(machine: &Machine<'_, H>, value: Value) -> Result<isize, EvalFailure> {
     Ok(to_integer_or_infinity(machine, value)? as isize)
@@ -116,13 +115,13 @@ fn from_char_code<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let mut out = Vec::with_capacity(args.len());
+    let mut out = EcmaStringBuilder::with_capacity(args.len());
     for arg in args {
-        out.push(value_number(machine.to_number(*arg)?) as u16)
+        out.push_unit(value_number(machine.to_number(*arg)?) as u16);
     }
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
-        from_units(&out),
+        out.finish(),
     )?))
 }
 fn raw<H: Host>(
@@ -136,14 +135,20 @@ fn raw<H: Host>(
     let values = machine
         .array_elements(raw)?
         .ok_or_else(|| type_error("String.raw requires template.raw"))?;
-    let mut out = String::new();
+    let mut out = EcmaStringBuilder::new();
     for (i, value) in values.iter().enumerate() {
-        out.push_str(&machine.to_string(*value)?);
+        append(&mut out, &machine.to_string(*value)?);
         if i + 1 < values.len() {
-            out.push_str(&machine.to_string(args.get(i + 1).copied().unwrap_or(Value::UNDEFINED))?)
+            append(
+                &mut out,
+                &machine.to_string(args.get(i + 1).copied().unwrap_or(Value::UNDEFINED))?,
+            );
         }
     }
-    Ok(BuiltinOutcome::Value(allocate_string(machine, out)?))
+    Ok(BuiltinOutcome::Value(allocate_string(
+        machine,
+        out.finish(),
+    )?))
 }
 fn char_at<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -151,15 +156,16 @@ fn char_at<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let s = text(machine, this)?;
-    let u = units(&s);
-    let i = integer(machine, args.first().copied().unwrap_or(Value::int32(0)))?;
-    let out = if i < 0 || i as usize >= u.len() {
-        String::new()
+    let string = text(machine, this)?;
+    let index = integer(machine, args.first().copied().unwrap_or(Value::int32(0)))?;
+    let result = if index < 0 {
+        EcmaString::default()
     } else {
-        from_units(&u[i as usize..=i as usize])
+        string
+            .unit_at(index as usize)
+            .map_or_else(EcmaString::default, |unit| EcmaString::from_units(&[unit]))
     };
-    Ok(BuiltinOutcome::Value(allocate_string(machine, out)?))
+    Ok(BuiltinOutcome::Value(allocate_string(machine, result)?))
 }
 fn char_code_at<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -167,15 +173,14 @@ fn char_code_at<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let u = units(&text(machine, this)?);
-    let i = integer(machine, args.first().copied().unwrap_or(Value::int32(0)))?;
-    Ok(BuiltinOutcome::Value(crate::number_value(
-        if i < 0 || i as usize >= u.len() {
-            f64::NAN
-        } else {
-            f64::from(u[i as usize])
-        },
-    )))
+    let string = text(machine, this)?;
+    let index = integer(machine, args.first().copied().unwrap_or(Value::int32(0)))?;
+    let result = if index < 0 {
+        f64::NAN
+    } else {
+        string.unit_at(index as usize).map_or(f64::NAN, f64::from)
+    };
+    Ok(BuiltinOutcome::Value(crate::number_value(result)))
 }
 fn code_point_at<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -183,21 +188,19 @@ fn code_point_at<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let u = units(&text(machine, this)?);
-    let i = integer(machine, args.first().copied().unwrap_or(Value::int32(0)))?;
-    if i < 0 || i as usize >= u.len() {
+    let string = text(machine, this)?;
+    let index = integer(machine, args.first().copied().unwrap_or(Value::int32(0)))?;
+    if index < 0 || index as usize >= string.len_units() {
         return Ok(BuiltinOutcome::Value(Value::UNDEFINED));
     }
-    let first = u[i as usize];
-    let cp = if (0xD800..=0xDBFF).contains(&first)
-        && u.get(i as usize + 1)
-            .is_some_and(|x| (0xDC00..=0xDFFF).contains(x))
-    {
-        0x10000 + ((u32::from(first) - 0xD800) << 10) + (u32::from(u[i as usize + 1]) - 0xDC00)
-    } else {
-        u32::from(first)
-    };
-    Ok(BuiltinOutcome::Value(crate::number_value(cp as f64)))
+    let offset = index as usize;
+    let code_point = string
+        .code_points()
+        .find_map(|(candidate, code_point)| (candidate == offset).then_some(code_point))
+        .unwrap_or_else(|| u32::from(string.unit_at(offset).expect("offset is in bounds")));
+    Ok(BuiltinOutcome::Value(crate::number_value(
+        code_point as f64,
+    )))
 }
 fn at<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -205,20 +208,21 @@ fn at<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let s = text(machine, this)?;
-    let u = units(&s);
-    let mut i = integer(machine, args.first().copied().unwrap_or(Value::UNDEFINED))?;
-    if i < 0 {
-        i += u.len() as isize
+    let string = text(machine, this)?;
+    let mut index = integer(machine, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    if index < 0 {
+        index += string.len_units() as isize;
     }
-    if i < 0 || i as usize >= u.len() {
-        Ok(BuiltinOutcome::Value(Value::UNDEFINED))
-    } else {
-        Ok(BuiltinOutcome::Value(allocate_string(
-            machine,
-            from_units(&u[i as usize..=i as usize]),
-        )?))
-    }
+    let Some(unit) = (index >= 0)
+        .then(|| string.unit_at(index as usize))
+        .flatten()
+    else {
+        return Ok(BuiltinOutcome::Value(Value::UNDEFINED));
+    };
+    Ok(BuiltinOutcome::Value(allocate_string(
+        machine,
+        EcmaString::from_units(&[unit]),
+    )?))
 }
 fn rel(i: isize, len: usize) -> usize {
     if i < 0 {
@@ -233,28 +237,26 @@ fn slice<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let u = units(&text(machine, this)?);
-    let a = rel(
+    let string = text(machine, this)?;
+    let start = rel(
         integer(machine, args.first().copied().unwrap_or(Value::int32(0)))?,
-        u.len(),
+        string.len_units(),
     );
-    let b = rel(
+    let end = rel(
         integer(
             machine,
             args.get(1)
                 .copied()
-                .unwrap_or(crate::number_value(u.len() as f64)),
+                .unwrap_or(crate::number_value(string.len_units() as f64)),
         )?,
-        u.len(),
+        string.len_units(),
     );
-    Ok(BuiltinOutcome::Value(allocate_string(
-        machine,
-        if b > a {
-            from_units(&u[a..b])
-        } else {
-            String::new()
-        },
-    )?))
+    let result = if end > start {
+        string.slice_units(start..end)
+    } else {
+        EcmaString::default()
+    };
+    Ok(BuiltinOutcome::Value(allocate_string(machine, result)?))
 }
 fn substring<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -262,21 +264,22 @@ fn substring<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let u = units(&text(machine, this)?);
-    let mut a = integer(machine, args.first().copied().unwrap_or(Value::int32(0)))?.max(0) as usize;
-    a = a.min(u.len());
-    let mut b = if args.len() < 2 || args[1] == Value::UNDEFINED {
-        u.len()
+    let string = text(machine, this)?;
+    let mut start =
+        integer(machine, args.first().copied().unwrap_or(Value::int32(0)))?.max(0) as usize;
+    start = start.min(string.len_units());
+    let mut end = if args.len() < 2 || args[1] == Value::UNDEFINED {
+        string.len_units()
     } else {
         integer(machine, args[1])?.max(0) as usize
     };
-    b = b.min(u.len());
-    if a > b {
-        std::mem::swap(&mut a, &mut b)
+    end = end.min(string.len_units());
+    if start > end {
+        std::mem::swap(&mut start, &mut end);
     }
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
-        from_units(&u[a..b]),
+        string.slice_units(start..end),
     )?))
 }
 fn search_units(h: &[u16], n: &[u16], start: usize) -> Option<usize> {
@@ -294,11 +297,11 @@ fn index_of<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let h = units(&text(machine, this)?);
-    let n = units(&machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?);
+    let haystack = text(machine, this)?;
+    let needle = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let start = integer(machine, args.get(1).copied().unwrap_or(Value::int32(0)))?.max(0) as usize;
     Ok(BuiltinOutcome::Value(crate::number_value(
-        search_units(&h, &n, start).map_or(-1.0, |i| i as f64),
+        search_units(haystack.as_units(), needle.as_units(), start).map_or(-1.0, |i| i as f64),
     )))
 }
 fn last_index_of<H: Host>(
@@ -307,17 +310,20 @@ fn last_index_of<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let h = units(&text(machine, this)?);
-    let n = units(&machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?);
+    let haystack = text(machine, this)?;
+    let needle = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let end = if args.len() < 2 || args[1] == Value::UNDEFINED {
-        h.len()
+        haystack.len_units()
     } else {
         integer(machine, args[1])?.max(0) as usize
     }
-    .min(h.len());
-    let found = (0..=end)
-        .rev()
-        .find(|i| h.get(*i..i.saturating_add(n.len())).is_some_and(|w| w == n));
+    .min(haystack.len_units());
+    let found = (0..=end).rev().find(|index| {
+        haystack
+            .as_units()
+            .get(*index..index.saturating_add(needle.len_units()))
+            .is_some_and(|window| window == needle.as_units())
+    });
     Ok(BuiltinOutcome::Value(crate::number_value(
         found.map_or(-1.0, |i| i as f64),
     )))
@@ -341,11 +347,15 @@ fn starts_with<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let h = units(&text(machine, this)?);
-    let n = units(&machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?);
-    let p = integer(machine, args.get(1).copied().unwrap_or(Value::int32(0)))?.max(0) as usize;
+    let haystack = text(machine, this)?;
+    let needle = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let position =
+        integer(machine, args.get(1).copied().unwrap_or(Value::int32(0)))?.max(0) as usize;
     Ok(BuiltinOutcome::Value(Value::boolean(
-        h.get(p..p + n.len()).is_some_and(|w| w == n),
+        haystack
+            .as_units()
+            .get(position..position.saturating_add(needle.len_units()))
+            .is_some_and(|window| window == needle.as_units()),
     )))
 }
 fn ends_with<H: Host>(
@@ -354,16 +364,17 @@ fn ends_with<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let h = units(&text(machine, this)?);
-    let n = units(&machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?);
+    let haystack = text(machine, this)?;
+    let needle = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let end = if args.len() < 2 || args[1] == Value::UNDEFINED {
-        h.len()
+        haystack.len_units()
     } else {
         integer(machine, args[1])?.max(0) as usize
     }
-    .min(h.len());
+    .min(haystack.len_units());
     Ok(BuiltinOutcome::Value(Value::boolean(
-        end >= n.len() && h[end - n.len()..end] == n,
+        end >= needle.len_units()
+            && haystack.as_units()[end - needle.len_units()..end] == *needle.as_units(),
     )))
 }
 
@@ -378,7 +389,7 @@ fn split<H: Host>(
     {
         return split_regexp(machine, this, args);
     }
-    let s = text(machine, this)?;
+    let string = text(machine, this)?;
     let limit = value_number(
         machine.to_number(
             args.get(1)
@@ -389,46 +400,86 @@ fn split<H: Host>(
     if limit == 0 {
         return Ok(BuiltinOutcome::Value(allocate_array(machine, Vec::new())?));
     }
-    let parts: Vec<String> = if args.is_empty() || args[0] == Value::UNDEFINED {
-        vec![s]
+    let parts = if args.is_empty() || args[0] == Value::UNDEFINED {
+        vec![string]
     } else {
-        let sep = machine.to_string(args[0])?;
-        if sep.is_empty() {
-            units(&s).into_iter().map(|u| from_units(&[u])).collect()
+        let separator = machine.to_string(args[0])?;
+        if separator.is_empty() {
+            string
+                .as_units()
+                .iter()
+                .map(|unit| EcmaString::from_units(&[*unit]))
+                .collect()
         } else {
-            s.split(&sep).map(str::to_owned).collect()
+            let mut parts = Vec::new();
+            let mut cursor = 0;
+            while let Some(offset) = search_units(string.as_units(), separator.as_units(), cursor) {
+                parts.push(string.slice_units(cursor..offset));
+                cursor = offset + separator.len_units();
+            }
+            parts.push(string.slice_units(cursor..string.len_units()));
+            parts
         }
     };
-    let mut out = Vec::new();
-    for p in parts.into_iter().take(limit) {
-        out.push(allocate_string(machine, p)?)
+    let mut values = Vec::new();
+    for part in parts.into_iter().take(limit) {
+        values.push(allocate_string(machine, part)?);
     }
-    Ok(BuiltinOutcome::Value(allocate_array(machine, out)?))
+    Ok(BuiltinOutcome::Value(allocate_array(machine, values)?))
 }
 fn replacement<H: Host>(
     machine: &mut Machine<'_, H>,
     replacer: Value,
-    matched: &str,
+    matched: &EcmaString,
     index: usize,
-    whole: &str,
-) -> Result<String, EvalFailure> {
+    whole: &EcmaString,
+) -> Result<EcmaString, EvalFailure> {
     if machine.is_callable(replacer)? {
-        let m = allocate_string(machine, matched.to_owned())?;
-        let w = allocate_string(machine, whole.to_owned())?;
+        let matched_value = allocate_string(machine, matched.clone())?;
+        let whole_value = allocate_string(machine, whole.clone())?;
         return machine
             .call_value(
                 replacer,
                 Value::UNDEFINED,
-                &[m, crate::number_value(index as f64), w],
+                &[
+                    matched_value,
+                    crate::number_value(index as f64),
+                    whole_value,
+                ],
             )
-            .and_then(|v| machine.to_string(v));
+            .and_then(|value| machine.to_string(value));
     }
-    let r = machine.to_string(replacer)?;
-    Ok(r.replace("$$", "\0")
-        .replace("$&", matched)
-        .replace("$`", &whole[..index])
-        .replace("$'", &whole[index + matched.len()..])
-        .replace('\0', "$"))
+    let template = machine.to_string(replacer)?;
+    let mut output = EcmaStringBuilder::new();
+    let units = template.as_units();
+    let mut offset = 0;
+    while offset < units.len() {
+        if units[offset] != u16::from(b'$') || offset + 1 == units.len() {
+            output.push_unit(units[offset]);
+            offset += 1;
+            continue;
+        }
+        match units[offset + 1] {
+            unit if unit == u16::from(b'$') => output.push_unit(u16::from(b'$')),
+            unit if unit == u16::from(b'&') => append(&mut output, matched),
+            unit if unit == u16::from(b'`') => {
+                append(&mut output, &whole.slice_units(0..index));
+            }
+            unit if unit == u16::from(b'\'') => {
+                append(
+                    &mut output,
+                    &whole.slice_units(index + matched.len_units()..whole.len_units()),
+                );
+            }
+            _ => {
+                output.push_unit(units[offset]);
+                offset += 1;
+                continue;
+            }
+        }
+        offset += 2;
+    }
+    Ok(output.finish())
 }
 fn replace_impl<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -441,31 +492,39 @@ fn replace_impl<H: Host>(
     {
         return replace_regexp(machine, this, args, all);
     }
-    let s = text(machine, this)?;
+    let string = text(machine, this)?;
     let needle = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let replacer = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-    let mut out = String::new();
+    let mut output = EcmaStringBuilder::new();
     let mut cursor = 0;
-    let matches: Vec<usize> = if all {
-        s.match_indices(&needle).map(|(i, _)| i).collect()
-    } else {
-        s.find(&needle).into_iter().collect()
-    };
-    for i in matches {
-        if i < cursor {
-            continue;
+    while cursor <= string.len_units() {
+        let Some(index) = search_units(string.as_units(), needle.as_units(), cursor) else {
+            break;
+        };
+        append(&mut output, &string.slice_units(cursor..index));
+        append(
+            &mut output,
+            &replacement(machine, replacer, &needle, index, &string)?,
+        );
+        cursor = index + needle.len_units();
+        if !all {
+            break;
         }
-        out.push_str(&s[cursor..i]);
-        out.push_str(&replacement(machine, replacer, &needle, i, &s)?);
-        cursor = i + needle.len();
-        if needle.is_empty() && cursor < s.len() {
-            let ch = s[cursor..].chars().next().expect("nonempty");
-            out.push(ch);
-            cursor += ch.len_utf8()
+        if needle.is_empty() && cursor < string.len_units() {
+            output.push_unit(string.unit_at(cursor).expect("cursor is in bounds"));
+            cursor += 1;
+        } else if needle.is_empty() && cursor == string.len_units() {
+            break;
         }
     }
-    out.push_str(&s[cursor..]);
-    Ok(BuiltinOutcome::Value(allocate_string(machine, out)?))
+    append(
+        &mut output,
+        &string.slice_units(cursor.min(string.len_units())..string.len_units()),
+    );
+    Ok(BuiltinOutcome::Value(allocate_string(
+        machine,
+        output.finish(),
+    )?))
 }
 fn replace<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -483,33 +542,86 @@ fn replace_all<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     replace_impl(machine, this, args, true)
 }
+fn is_js_whitespace(unit: u16) -> bool {
+    matches!(
+        unit,
+        0x0009..=0x000D
+            | 0x0020
+            | 0x00A0
+            | 0x1680
+            | 0x2000..=0x200A
+            | 0x2028
+            | 0x2029
+            | 0x202F
+            | 0x205F
+            | 0x3000
+            | 0xFEFF
+    )
+}
+
+fn trim_range(text: &EcmaString, trim_start: bool, trim_end: bool) -> EcmaString {
+    let units = text.as_units();
+    let start = if trim_start {
+        units
+            .iter()
+            .position(|unit| !is_js_whitespace(*unit))
+            .unwrap_or(units.len())
+    } else {
+        0
+    };
+    let end = if trim_end {
+        units
+            .iter()
+            .rposition(|unit| !is_js_whitespace(*unit))
+            .map_or(start, |index| index + 1)
+    } else {
+        units.len()
+    };
+    text.slice_units(start..end.max(start))
+}
+
 macro_rules! trim_fn {
-    ($n:ident,$m:ident) => {
-        fn $n<H: Host>(
+    ($name:ident, $start:literal, $end:literal) => {
+        fn $name<H: Host>(
             machine: &mut Machine<'_, H>,
             this: Value,
             _: &[Value],
             _: bool,
         ) -> Result<BuiltinOutcome, EvalFailure> {
-            let s = text(machine, this)?;
+            let string = text(machine, this)?;
             Ok(BuiltinOutcome::Value(allocate_string(
                 machine,
-                s.$m().to_owned(),
+                trim_range(&string, $start, $end),
             )?))
         }
     };
 }
-trim_fn!(trim, trim);
-trim_fn!(trim_start, trim_start);
-trim_fn!(trim_end, trim_end);
+trim_fn!(trim, true, true);
+trim_fn!(trim_start, true, false);
+trim_fn!(trim_end, false, true);
 fn to_upper<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     _: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let s = text(machine, this)?.to_uppercase();
-    Ok(BuiltinOutcome::Value(allocate_string(machine, s)?))
+    let source = text(machine, this)?;
+    let mut output = EcmaStringBuilder::new();
+    for (_, code_point) in source.code_points() {
+        if let Some(character) = char::from_u32(code_point) {
+            for mapped in character.to_uppercase() {
+                output
+                    .push_code_point(mapped as u32)
+                    .expect("Rust char is valid");
+            }
+        } else {
+            output.push_unit(code_point as u16);
+        }
+    }
+    Ok(BuiltinOutcome::Value(allocate_string(
+        machine,
+        output.finish(),
+    )?))
 }
 fn to_lower<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -517,8 +629,23 @@ fn to_lower<H: Host>(
     _: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let s = text(machine, this)?.to_lowercase();
-    Ok(BuiltinOutcome::Value(allocate_string(machine, s)?))
+    let source = text(machine, this)?;
+    let mut output = EcmaStringBuilder::new();
+    for (_, code_point) in source.code_points() {
+        if let Some(character) = char::from_u32(code_point) {
+            for mapped in character.to_lowercase() {
+                output
+                    .push_code_point(mapped as u32)
+                    .expect("Rust char is valid");
+            }
+        } else {
+            output.push_unit(code_point as u16);
+        }
+    }
+    Ok(BuiltinOutcome::Value(allocate_string(
+        machine,
+        output.finish(),
+    )?))
 }
 fn pad<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -526,30 +653,42 @@ fn pad<H: Host>(
     args: &[Value],
     start: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let s = text(machine, this)?;
-    let len = units(&s).len();
+    let string = text(machine, this)?;
     let target = to_integer_or_infinity(machine, args.first().copied().unwrap_or(Value::UNDEFINED))?
         .max(0.0) as usize;
-    if target <= len {
-        return Ok(BuiltinOutcome::Value(allocate_string(machine, s)?));
+    if target <= string.len_units() {
+        return Ok(BuiltinOutcome::Value(allocate_string(machine, string)?));
     }
     let filler = if args.len() < 2 || args[1] == Value::UNDEFINED {
-        " ".to_owned()
+        EcmaString::from_utf8(" ")
     } else {
         machine.to_string(args[1])?
     };
     if filler.is_empty() {
-        return Ok(BuiltinOutcome::Value(allocate_string(machine, s)?));
+        return Ok(BuiltinOutcome::Value(allocate_string(machine, string)?));
     }
-    let f = units(&filler);
-    let need = target - len;
-    let p: Vec<u16> = f.iter().copied().cycle().take(need).collect();
-    let out = if start {
-        format!("{}{}", from_units(&p), s)
+    let needed = target - string.len_units();
+    let padding = EcmaString::from_units(
+        &filler
+            .as_units()
+            .iter()
+            .copied()
+            .cycle()
+            .take(needed)
+            .collect::<Vec<_>>(),
+    );
+    let mut output = EcmaStringBuilder::with_capacity(target);
+    if start {
+        append(&mut output, &padding);
+        append(&mut output, &string);
     } else {
-        format!("{}{}", s, from_units(&p))
-    };
-    Ok(BuiltinOutcome::Value(allocate_string(machine, out)?))
+        append(&mut output, &string);
+        append(&mut output, &padding);
+    }
+    Ok(BuiltinOutcome::Value(allocate_string(
+        machine,
+        output.finish(),
+    )?))
 }
 fn pad_start<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -573,14 +712,19 @@ fn repeat<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let s = text(machine, this)?;
-    let n = to_integer_or_infinity(machine, args.first().copied().unwrap_or(Value::UNDEFINED))?;
-    if n < 0.0 || n.is_infinite() {
+    let string = text(machine, this)?;
+    let count = to_integer_or_infinity(machine, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    if count < 0.0 || count.is_infinite() {
         return Err(range_error("Invalid count value"));
+    }
+    let mut output =
+        EcmaStringBuilder::with_capacity(string.len_units().saturating_mul(count as usize));
+    for _ in 0..count as usize {
+        append(&mut output, &string);
     }
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
-        s.repeat(n as usize),
+        output.finish(),
     )?))
 }
 fn concat<H: Host>(
@@ -589,11 +733,15 @@ fn concat<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let mut s = text(machine, this)?;
-    for a in args {
-        s.push_str(&machine.to_string(*a)?)
+    let mut output = EcmaStringBuilder::new();
+    append(&mut output, &text(machine, this)?);
+    for argument in args {
+        append(&mut output, &machine.to_string(*argument)?);
     }
-    Ok(BuiltinOutcome::Value(allocate_string(machine, s)?))
+    Ok(BuiltinOutcome::Value(allocate_string(
+        machine,
+        output.finish(),
+    )?))
 }
 fn normalize<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -601,9 +749,13 @@ fn normalize<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    if let Some(form) = args.first().filter(|v| **v != Value::UNDEFINED) {
-        let f = machine.to_string(*form)?;
-        if !matches!(f.as_str(), "NFC" | "NFD" | "NFKC" | "NFKD") {
+    if let Some(form) = args.first().filter(|value| **value != Value::UNDEFINED) {
+        let form = machine.to_string(*form)?;
+        if !form.eq_ascii("NFC")
+            && !form.eq_ascii("NFD")
+            && !form.eq_ascii("NFKC")
+            && !form.eq_ascii("NFKD")
+        {
             return Err(range_error(
                 "The normalization form should be one of NFC, NFD, NFKC, NFKD",
             ));
@@ -623,45 +775,91 @@ pub(super) fn encode_uri_component<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let s = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-    let mut out = String::new();
-    for b in s.bytes() {
-        if uri_unescaped(b) {
-            out.push(char::from(b))
+    let source = machine
+        .to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?
+        .to_utf8_strict()
+        .map_err(|_| uri_error("URI malformed"))?;
+    let mut output = String::new();
+    for byte in source.bytes() {
+        if uri_unescaped(byte) {
+            output.push(char::from(byte));
         } else {
-            out.push_str(&format!("%{b:02X}"))
+            output.push_str(&format!("%{byte:02X}"));
         }
     }
-    Ok(BuiltinOutcome::Value(allocate_string(machine, out)?))
+    Ok(BuiltinOutcome::Value(allocate_string(
+        machine,
+        EcmaString::from_utf8(&output),
+    )?))
 }
+fn hex_value(unit: u16) -> Option<u8> {
+    match unit {
+        0x30..=0x39 => Some((unit - 0x30) as u8),
+        0x41..=0x46 => Some((unit - 0x41 + 10) as u8),
+        0x61..=0x66 => Some((unit - 0x61 + 10) as u8),
+        _ => None,
+    }
+}
+
+fn percent_octet(units: &[u16], offset: usize) -> Option<u8> {
+    if units.get(offset) != Some(&u16::from(b'%')) {
+        return None;
+    }
+    let high = hex_value(*units.get(offset + 1)?)?;
+    let low = hex_value(*units.get(offset + 2)?)?;
+    Some((high << 4) | low)
+}
+
+fn utf8_sequence_len(first: u8) -> Option<usize> {
+    match first {
+        0x00..=0x7f => Some(1),
+        0xc0..=0xdf => Some(2),
+        0xe0..=0xef => Some(3),
+        0xf0..=0xf7 => Some(4),
+        _ => None,
+    }
+}
+
 pub(super) fn decode_uri_component<H: Host>(
     machine: &mut Machine<'_, H>,
     _: Value,
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let s = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-    let bytes = s.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 2 >= bytes.len() {
-                return Err(type_error("URI malformed"));
-            }
-            let h = std::str::from_utf8(&bytes[i + 1..i + 3])
-                .ok()
-                .and_then(|x| u8::from_str_radix(x, 16).ok())
-                .ok_or_else(|| type_error("URI malformed"))?;
-            out.push(h);
-            i += 3
-        } else {
-            out.push(bytes[i]);
-            i += 1
+    let source = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let units = source.as_units();
+    let mut output = EcmaStringBuilder::with_capacity(units.len());
+    let mut offset = 0;
+    while offset < units.len() {
+        if units[offset] != u16::from(b'%') {
+            output.push_unit(units[offset]);
+            offset += 1;
+            continue;
         }
+
+        let first = percent_octet(units, offset).ok_or_else(|| uri_error("URI malformed"))?;
+        let sequence_len = utf8_sequence_len(first).ok_or_else(|| uri_error("URI malformed"))?;
+        if sequence_len == 1 {
+            output.push_unit(u16::from(first));
+            offset += 3;
+            continue;
+        }
+
+        let mut octets = [0; 4];
+        octets[0] = first;
+        for octet in &mut octets[1..sequence_len] {
+            offset += 3;
+            *octet = percent_octet(units, offset).ok_or_else(|| uri_error("URI malformed"))?;
+        }
+        let decoded =
+            std::str::from_utf8(&octets[..sequence_len]).map_err(|_| uri_error("URI malformed"))?;
+        output.push_utf8(decoded);
+        offset += 3;
     }
-    let text = String::from_utf8(out).map_err(|_| type_error("URI malformed"))?;
-    Ok(BuiltinOutcome::Value(allocate_string(machine, text)?))
+    Ok(BuiltinOutcome::Value(allocate_string(
+        machine,
+        output.finish(),
+    )?))
 }
 
 fn string_iterator<H: Host>(
@@ -670,10 +868,20 @@ fn string_iterator<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let values = text(machine, this)?
-        .chars()
-        .map(|character| allocate_string(machine, character.to_string()))
-        .collect::<Result<Vec<_>, _>>()?;
+    let pieces: Vec<EcmaString> = text(machine, this)?
+        .code_points()
+        .map(|(_, code_point)| {
+            let mut builder = EcmaStringBuilder::new();
+            builder
+                .push_code_point(code_point)
+                .expect("EcmaString code point is valid");
+            builder.finish()
+        })
+        .collect();
+    let mut values = Vec::with_capacity(pieces.len());
+    for piece in pieces {
+        values.push(allocate_string(machine, piece)?);
+    }
     let source = allocate_array(machine, values)?;
     Ok(BuiltinOutcome::Value(super::collections::iterator(
         machine, source,
@@ -691,7 +899,10 @@ fn regexp_for_argument<H: Host>(
         ))
     } else {
         let pattern = machine.to_string(value)?;
-        Ok((super::regexp::compile(machine, &pattern, "")?, None))
+        Ok((
+            super::regexp::compile(machine, &pattern, &EcmaString::default())?,
+            None,
+        ))
     }
 }
 
@@ -701,8 +912,7 @@ fn string_match<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let input_text = text(machine, this)?;
-    let input = EcmaString::from_utf8(&input_text);
+    let input = text(machine, this)?;
     let argument = args.first().copied().unwrap_or(Value::UNDEFINED);
     let (regex, object) = regexp_for_argument(machine, argument)?;
     if !regex.flags().global {
@@ -728,7 +938,7 @@ fn string_match<H: Host>(
     for matched in matches {
         values.push(allocate_string(
             machine,
-            super::regexp::slice_units(&input, matched.range).to_utf8_lossy(),
+            super::regexp::slice_units(&input, matched.range),
         )?);
     }
     Ok(BuiltinOutcome::Value(allocate_array(machine, values)?))
@@ -740,8 +950,7 @@ fn match_all<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let input_text = text(machine, this)?;
-    let input = EcmaString::from_utf8(&input_text);
+    let input = text(machine, this)?;
     let argument = args.first().copied().unwrap_or(Value::UNDEFINED);
     let (regex, object) = regexp_for_argument(machine, argument)?;
     if object.is_some() && !regex.flags().global {
@@ -765,8 +974,7 @@ fn search<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let input_text = text(machine, this)?;
-    let input = EcmaString::from_utf8(&input_text);
+    let input = text(machine, this)?;
     let argument = args.first().copied().unwrap_or(Value::UNDEFINED);
     let (regex, _) = regexp_for_argument(machine, argument)?;
     Ok(BuiltinOutcome::Value(crate::number_value(
@@ -812,12 +1020,19 @@ fn split_regexp<H: Host>(
     this: Value,
     args: &[Value],
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let input_text = text(machine, this)?;
-    let input = EcmaString::from_utf8(&input_text);
+    let input = text(machine, this)?;
     let separator = args[0];
     let (pattern, flags) =
         super::regexp::regexp_parts(machine, separator).expect("caller checked RegExp argument");
-    let regex = super::regexp::compile(machine, &pattern, &flags.replace('y', ""))?;
+    let stickyless_flags = EcmaString::from_units(
+        &flags
+            .as_units()
+            .iter()
+            .copied()
+            .filter(|unit| *unit != u16::from(b'y'))
+            .collect::<Vec<_>>(),
+    );
+    let regex = super::regexp::compile(machine, &pattern, &stickyless_flags)?;
     let limit = value_number(
         machine.to_number(
             args.get(1)
@@ -864,7 +1079,7 @@ fn split_regexp<H: Host>(
     }
     let mut values = Vec::new();
     for piece in pieces.into_iter().take(limit) {
-        values.push(allocate_string(machine, piece.to_utf8_lossy())?);
+        values.push(allocate_string(machine, piece)?);
     }
     Ok(BuiltinOutcome::Value(allocate_array(machine, values)?))
 }
@@ -875,8 +1090,7 @@ fn replace_regexp<H: Host>(
     args: &[Value],
     replace_all_call: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let input_text = text(machine, this)?;
-    let input = EcmaString::from_utf8(&input_text);
+    let input = text(machine, this)?;
     let regexp = args[0];
     let (pattern, flags) =
         super::regexp::regexp_parts(machine, regexp).expect("caller checked RegExp argument");
@@ -888,20 +1102,30 @@ fn replace_regexp<H: Host>(
     }
     let replacer = args.get(1).copied().unwrap_or(Value::UNDEFINED);
     let matches = collect_matches(&regex, &input);
-    let mut output = String::new();
+    let mut output = EcmaStringBuilder::new();
     let mut cursor = 0;
     for matched in matches {
-        output.push_str(
-            &super::regexp::slice_units(&input, cursor..matched.range.start).to_utf8_lossy(),
+        append(
+            &mut output,
+            &super::regexp::slice_units(&input, cursor..matched.range.start),
         );
-        output.push_str(&regexp_replacement(machine, replacer, &input, &matched)?);
+        append(
+            &mut output,
+            &regexp_replacement(machine, replacer, &input, &matched)?,
+        );
         cursor = matched.range.end;
         if !regex.flags().global {
             break;
         }
     }
-    output.push_str(&super::regexp::slice_units(&input, cursor..input.len_units()).to_utf8_lossy());
-    Ok(BuiltinOutcome::Value(allocate_string(machine, output)?))
+    append(
+        &mut output,
+        &super::regexp::slice_units(&input, cursor..input.len_units()),
+    );
+    Ok(BuiltinOutcome::Value(allocate_string(
+        machine,
+        output.finish(),
+    )?))
 }
 
 fn regexp_replacement<H: Host>(
@@ -909,59 +1133,59 @@ fn regexp_replacement<H: Host>(
     replacer: Value,
     input: &EcmaString,
     matched: &crate::intrinsics::regexp::Match,
-) -> Result<String, EvalFailure> {
-    let matched_text = super::regexp::slice_units(input, matched.range.clone()).to_utf8_lossy();
+) -> Result<EcmaString, EvalFailure> {
+    let matched_text = super::regexp::slice_units(input, matched.range.clone());
     if machine.is_callable(replacer)? {
         let mut arguments = Vec::with_capacity(matched.captures.len() + 2);
         for capture in &matched.captures {
             arguments.push(match capture {
-                Some(range) => allocate_string(
-                    machine,
-                    super::regexp::slice_units(input, range.clone()).to_utf8_lossy(),
-                )?,
+                Some(range) => {
+                    allocate_string(machine, super::regexp::slice_units(input, range.clone()))?
+                }
                 None => Value::UNDEFINED,
             });
         }
         arguments.push(crate::number_value(matched.range.start as f64));
-        arguments.push(allocate_string(machine, input.to_utf8_lossy())?);
+        arguments.push(allocate_string(machine, input.clone())?);
         return machine
             .call_value(replacer, Value::UNDEFINED, &arguments)
             .and_then(|value| machine.to_string(value));
     }
     let replacement = machine.to_string(replacer)?;
-    let before = super::regexp::slice_units(input, 0..matched.range.start).to_utf8_lossy();
-    let after =
-        super::regexp::slice_units(input, matched.range.end..input.len_units()).to_utf8_lossy();
-    let mut output = String::new();
-    let mut chars = replacement.chars().peekable();
-    while let Some(character) = chars.next() {
-        if character != '$' {
-            output.push(character);
+    let before = super::regexp::slice_units(input, 0..matched.range.start);
+    let after = super::regexp::slice_units(input, matched.range.end..input.len_units());
+    let mut output = EcmaStringBuilder::new();
+    let units = replacement.as_units();
+    let mut offset = 0;
+    while offset < units.len() {
+        if units[offset] != u16::from(b'$') || offset + 1 == units.len() {
+            output.push_unit(units[offset]);
+            offset += 1;
             continue;
         }
-        let Some(next) = chars.peek().copied() else {
-            output.push('$');
-            break;
-        };
-        match next {
-            '$' => output.push('$'),
-            '&' => output.push_str(&matched_text),
-            '`' => output.push_str(&before),
-            '\'' => output.push_str(&after),
-            digit if digit.is_ascii_digit() && digit != '0' => {
-                let capture = digit.to_digit(10).expect("digit") as usize;
-                if let Some(Some(range)) = matched.captures.get(capture) {
-                    output.push_str(
-                        &super::regexp::slice_units(input, range.clone()).to_utf8_lossy(),
-                    );
-                }
+        let next = units[offset + 1];
+        if next == u16::from(b'$') {
+            output.push_unit(u16::from(b'$'));
+        } else if next == u16::from(b'&') {
+            append(&mut output, &matched_text);
+        } else if next == u16::from(b'`') {
+            append(&mut output, &before);
+        } else if next == u16::from(b'\'') {
+            append(&mut output, &after);
+        } else if (u16::from(b'1')..=u16::from(b'9')).contains(&next) {
+            let capture = usize::from(next - u16::from(b'0'));
+            if let Some(Some(range)) = matched.captures.get(capture) {
+                append(
+                    &mut output,
+                    &super::regexp::slice_units(input, range.clone()),
+                );
             }
-            other => {
-                output.push('$');
-                output.push(other);
-            }
+        } else {
+            output.push_unit(units[offset]);
+            offset += 1;
+            continue;
         }
-        chars.next();
+        offset += 2;
     }
-    Ok(output)
+    Ok(output.finish())
 }

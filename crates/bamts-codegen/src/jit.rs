@@ -271,7 +271,7 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use bamts_bytecode::{
-        BinaryOp, Constant, ConstantId, ExceptionHandler, Function as BytecodeFunction,
+        BinaryOp, Constant, ConstantId, EcmaString, ExceptionHandler, Function as BytecodeFunction,
         FunctionFlags, FunctionId, Instruction, Module, ModuleId, Pc, Program, ProgramModule,
         Register,
     };
@@ -305,7 +305,7 @@ mod tests {
         ProgramModule {
             name: ConstantId::new(0),
             code: Module::new(
-                vec![Constant::String(name.to_owned())],
+                vec![Constant::String(EcmaString::from_utf8(name))],
                 vec![BytecodeFunction::new(
                     None,
                     0,
@@ -362,10 +362,10 @@ mod tests {
 
     fn callback_reentry_program() -> Program<bamts_bytecode::Verified> {
         let constants = vec![
-            Constant::String("entry".to_owned()),
-            Constant::String("Array".to_owned()),
-            Constant::String("prototype".to_owned()),
-            Constant::String("map".to_owned()),
+            Constant::String(EcmaString::from_utf8("entry")),
+            Constant::String(EcmaString::from_utf8("Array")),
+            Constant::String(EcmaString::from_utf8("prototype")),
+            Constant::String(EcmaString::from_utf8("map")),
             Constant::Int32(1),
         ];
         let entry = BytecodeFunction::new(
@@ -516,7 +516,10 @@ mod tests {
     #[test]
     fn jit_charges_each_mixed_instruction_once_at_exact_boundaries() {
         let bytecode = one_function_program(
-            vec![Constant::String("entry".to_owned()), Constant::Int32(1)],
+            vec![
+                Constant::String(EcmaString::from_utf8("entry")),
+                Constant::Int32(1),
+            ],
             3,
             vec![
                 Instruction::LoadConst {
@@ -573,7 +576,7 @@ mod tests {
     #[test]
     fn jit_jump_to_self_exhausts_fuel() {
         let bytecode = one_function_program(
-            vec![Constant::String("entry".to_owned())],
+            vec![Constant::String(EcmaString::from_utf8("entry"))],
             0,
             vec![Instruction::Jump { target: Pc::new(0) }],
             Vec::new(),
@@ -672,7 +675,10 @@ mod tests {
     #[test]
     fn jit_fuel_exhaustion_bypasses_bytecode_handler() {
         let bytecode = one_function_program(
-            vec![Constant::String("entry".to_owned()), Constant::Undefined],
+            vec![
+                Constant::String(EcmaString::from_utf8("entry")),
+                Constant::Undefined,
+            ],
             1,
             vec![
                 Instruction::LoadConst {
@@ -709,10 +715,10 @@ mod tests {
     fn jit_zero_fuel_prevents_stdout_side_effects() {
         let bytecode = one_function_program(
             vec![
-                Constant::String("entry".to_owned()),
-                Constant::String("console".to_owned()),
-                Constant::String("log".to_owned()),
-                Constant::String("hello".to_owned()),
+                Constant::String(EcmaString::from_utf8("entry")),
+                Constant::String(EcmaString::from_utf8("console")),
+                Constant::String(EcmaString::from_utf8("log")),
+                Constant::String(EcmaString::from_utf8("hello")),
             ],
             6,
             vec![

@@ -43,21 +43,21 @@ impl Flags {
         Ok(flags)
     }
 
-    pub(crate) fn canonical(self) -> String {
-        let mut result = String::new();
+    pub(crate) fn canonical(self) -> EcmaString {
+        let mut result = bamts_bytecode::EcmaStringBuilder::new();
         for (enabled, flag) in [
-            (self.global, 'g'),
-            (self.ignore_case, 'i'),
-            (self.multiline, 'm'),
-            (self.dot_all, 's'),
-            (self.unicode, 'u'),
-            (self.sticky, 'y'),
+            (self.global, b'g'),
+            (self.ignore_case, b'i'),
+            (self.multiline, b'm'),
+            (self.dot_all, b's'),
+            (self.unicode, b'u'),
+            (self.sticky, b'y'),
         ] {
             if enabled {
-                result.push(flag);
+                result.push_unit(u16::from(flag));
             }
         }
-        result
+        result.finish()
     }
 }
 
@@ -356,13 +356,14 @@ impl Regex {
 
 pub(crate) fn next_code_point(input: &[u16], position: usize, unicode: bool) -> (u32, usize) {
     let first = input[position];
-    if unicode && (0xd800..=0xdbff).contains(&first) {
-        if let Some(second @ 0xdc00..=0xdfff) = input.get(position + 1).copied() {
-            return (
-                0x1_0000 + ((u32::from(first) - 0xd800) << 10) + (u32::from(second) - 0xdc00),
-                2,
-            );
-        }
+    if unicode
+        && (0xd800..=0xdbff).contains(&first)
+        && let Some(second @ 0xdc00..=0xdfff) = input.get(position + 1).copied()
+    {
+        return (
+            0x1_0000 + ((u32::from(first) - 0xd800) << 10) + (u32::from(second) - 0xdc00),
+            2,
+        );
     }
     (u32::from(first), 1)
 }
@@ -699,12 +700,12 @@ impl<'a> Parser<'a> {
                 let first = self.hex_escape(4)?;
                 if self.unicode && (0xd800..=0xdbff).contains(&first) {
                     let checkpoint = self.position;
-                    if self.next() == Some(0x5c) && self.next() == Some(0x75) {
-                        if let Ok(second) = self.hex_escape(4) {
-                            if (0xdc00..=0xdfff).contains(&second) {
-                                return Ok(combine_surrogates(first as u16, second as u16));
-                            }
-                        }
+                    if self.next() == Some(0x5c)
+                        && self.next() == Some(0x75)
+                        && let Ok(second) = self.hex_escape(4)
+                        && (0xdc00..=0xdfff).contains(&second)
+                    {
+                        return Ok(combine_surrogates(first as u16, second as u16));
                     }
                     self.position = checkpoint;
                 }
@@ -923,7 +924,7 @@ mod tests {
 
     #[test]
     fn flags_are_canonical_like_node_24() {
-        assert_eq!(regex("", "yusmig").flags().canonical(), "gimsuy");
+        assert!(regex("", "yusmig").flags().canonical().eq_ascii("gimsuy"));
         assert!(Regex::compile(&text(""), &text("gg")).is_err());
     }
 

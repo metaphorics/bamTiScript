@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use bamts_bytecode::EcmaString;
 use bamts_native::Value;
 
 use super::{BuiltinDef, BuiltinOutcome, BuiltinTable, native_function, push};
@@ -19,7 +20,7 @@ mod symbol;
 
 pub(crate) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
-    globals: &mut BTreeMap<String, Value>,
+    globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     symbol::install(heap, globals, builtins);
@@ -36,7 +37,8 @@ pub(crate) fn install<H: Host>(
     install_globals(heap, globals, builtins);
     json::install(heap, globals, builtins);
     let json = *globals
-        .get("JSON")
+        .iter()
+        .find_map(|(name, value)| name.eq_ascii("JSON").then_some(value))
         .expect("JSON builtin installs its namespace");
     define_to_string_tag(heap, json, builtins.symbol_to_string_tag(), "JSON");
     install_errors(heap, globals, builtins);
@@ -65,7 +67,10 @@ fn define_data(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) 
         | HeapEntry::Array { properties, .. }
         | HeapEntry::Function { properties, .. }
         | HeapEntry::RegExp { properties, .. } => {
-            properties.insert(PropertyKey::Named(name.to_owned()), builtin_property(value));
+            properties.insert(
+                PropertyKey::Named(EcmaString::from_utf8(name)),
+                builtin_property(value),
+            );
         }
         _ => panic!("intrinsic property target must be an ordinary object"),
     }
@@ -77,7 +82,7 @@ pub(super) fn define_to_string_tag(
     symbol: Value,
     tag: &str,
 ) {
-    let value = push(heap, HeapEntry::String(tag.to_owned()));
+    let value = push(heap, HeapEntry::String(EcmaString::from_utf8(tag)));
     let index = heap_index(object);
     let HeapEntry::Object { properties, .. } = &mut heap[index] else {
         panic!("namespace tag target must be an ordinary object");
@@ -107,7 +112,7 @@ fn heap_index(value: Value) -> usize {
 
 fn allocate_string<H: Host>(
     machine: &mut Machine<'_, H>,
-    text: String,
+    text: EcmaString,
 ) -> Result<Value, EvalFailure> {
     machine
         .allocate(HeapEntry::String(text))
@@ -157,6 +162,10 @@ fn range_error(operation: &'static str) -> EvalFailure {
     EvalFailure::Throw(ThrowOrigin::RangeError { operation })
 }
 
+fn uri_error(operation: &'static str) -> EvalFailure {
+    EvalFailure::Throw(ThrowOrigin::UriError { operation })
+}
+
 fn define_array_length(
     elements: &mut Vec<Value>,
     properties: &mut PropertyMap,
@@ -171,13 +180,13 @@ fn define_array_length(
 
 fn install_boolean<H: Host>(
     heap: &mut Vec<HeapEntry>,
-    globals: &mut BTreeMap<String, Value>,
+    globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.boolean_prototype();
     let constructor = install_function(heap, builtins, "Boolean", 1, boolean_constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
-    globals.insert("Boolean".to_owned(), constructor);
+    globals.insert(EcmaString::from_utf8("Boolean"), constructor);
     let value_of = install_function(heap, builtins, "valueOf", 0, boolean_value_of::<H>);
     define_data(heap, prototype, "valueOf", value_of);
 }
@@ -213,7 +222,7 @@ fn boolean_value_of<H: Host>(
 
 fn install_math<H: Host>(
     heap: &mut Vec<HeapEntry>,
-    globals: &mut BTreeMap<String, Value>,
+    globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let math = push(
@@ -245,7 +254,7 @@ fn install_math<H: Host>(
         define_data(heap, math, name, function);
     }
     define_to_string_tag(heap, math, builtins.symbol_to_string_tag(), "Math");
-    globals.insert("Math".to_owned(), math);
+    globals.insert(EcmaString::from_utf8("Math"), math);
 }
 
 fn numeric_args<H: Host>(
@@ -413,7 +422,7 @@ fn math_imul<H: Host>(
 
 fn install_globals<H: Host>(
     heap: &mut Vec<HeapEntry>,
-    globals: &mut BTreeMap<String, Value>,
+    globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     for (name, length, handler) in [
@@ -430,13 +439,13 @@ fn install_globals<H: Host>(
         ("structuredClone", 1, object::structured_clone::<H>),
     ] {
         let value = install_function(heap, builtins, name, length, handler);
-        globals.insert(name.to_owned(), value);
+        globals.insert(EcmaString::from_utf8(name), value);
     }
 }
 
 fn install_errors<H: Host>(
     heap: &mut Vec<HeapEntry>,
-    globals: &mut BTreeMap<String, Value>,
+    globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let error_prototype = push(
@@ -492,20 +501,20 @@ fn install_errors<H: Host>(
 
 fn install_error_type<H: Host>(
     heap: &mut Vec<HeapEntry>,
-    globals: &mut BTreeMap<String, Value>,
+    globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
     name: &'static str,
     length: u32,
     prototype: Value,
     _error_prototype: Value,
 ) {
-    let name_value = push(heap, HeapEntry::String(name.to_owned()));
-    let empty = push(heap, HeapEntry::String(String::new()));
+    let name_value = push(heap, HeapEntry::String(EcmaString::from_utf8(name)));
+    let empty = push(heap, HeapEntry::String(EcmaString::default()));
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(prototype)] else {
         unreachable!()
     };
     properties.insert(
-        PropertyKey::Named("name".to_owned()),
+        PropertyKey::Named(EcmaString::from_utf8("name")),
         Property::Data {
             value: name_value,
             writable: true,
@@ -514,7 +523,7 @@ fn install_error_type<H: Host>(
         },
     );
     properties.insert(
-        PropertyKey::Named("message".to_owned()),
+        PropertyKey::Named(EcmaString::from_utf8("message")),
         Property::Data {
             value: empty,
             writable: true,
@@ -525,7 +534,7 @@ fn install_error_type<H: Host>(
     let constructor = install_function(heap, builtins, name, length, error_constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     builtins.set_error_prototype(heap, constructor, prototype);
-    globals.insert(name.to_owned(), constructor);
+    globals.insert(EcmaString::from_utf8(name), constructor);
 }
 
 fn error_constructor<H: Host>(
@@ -571,7 +580,7 @@ fn error_constructor<H: Host>(
         .copied()
         .filter(|value| *value != Value::UNDEFINED)
     {
-        let cause_key = PropertyKey::Named("cause".to_owned());
+        let cause_key = PropertyKey::Named(EcmaString::from_utf8("cause"));
         if machine.has_property(options, &cause_key)? {
             let cause = machine.get_named_property(options, "cause")?;
             machine.set_data_property(object, "cause", cause)?;
@@ -579,12 +588,16 @@ fn error_constructor<H: Host>(
     }
     let message_value = machine.get_named_property(object, "message")?;
     let message = machine.to_string(message_value)?;
-    let stack = if message.is_empty() {
-        format!("{name}\n    at <bamts>")
-    } else {
-        format!("{name}: {message}\n    at <bamts>")
-    };
-    let stack = allocate_string(machine, stack)?;
+    let mut stack = bamts_bytecode::EcmaStringBuilder::new();
+    stack.push_utf8(name);
+    if !message.is_empty() {
+        stack.push_utf8(": ");
+        for &unit in message.as_units() {
+            stack.push_unit(unit);
+        }
+    }
+    stack.push_utf8("\n    at <bamts>");
+    let stack = allocate_string(machine, stack.finish())?;
     machine.set_data_property(object, "stack", stack)?;
     Ok(BuiltinOutcome::Value(object))
 }
@@ -604,7 +617,19 @@ fn error_to_string<H: Host>(
     } else if message.is_empty() {
         name
     } else {
-        format!("{name}: {message}")
+        let mut text = bamts_bytecode::EcmaStringBuilder::with_capacity(
+            name.len_units()
+                .saturating_add(message.len_units())
+                .saturating_add(2),
+        );
+        for &unit in name.as_units() {
+            text.push_unit(unit);
+        }
+        text.push_utf8(": ");
+        for &unit in message.as_units() {
+            text.push_unit(unit);
+        }
+        text.finish()
     };
     Ok(BuiltinOutcome::Value(allocate_string(machine, text)?))
 }
@@ -773,7 +798,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 length_writable,
                 ..
             } => {
-                if matches!(key, PropertyKey::Named(name) if name == "length") {
+                if matches!(key, PropertyKey::Named(name) if name.eq_ascii("length")) {
                     return Ok(Some(Property::Data {
                         value: crate::number_value(elements.len() as f64),
                         writable: *length_writable,
@@ -816,7 +841,7 @@ impl<'a, H: Host> Machine<'a, H> {
         let Some(index) = self.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
             return Err(type_error("Object.defineProperty called on non-object"));
         };
-        if matches!(key, PropertyKey::Named(ref name) if name == "length")
+        if matches!(&key, PropertyKey::Named(name) if name.eq_ascii("length"))
             && matches!(self.heap[index], HeapEntry::Array { .. })
         {
             let Property::Data {
@@ -881,7 +906,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 ..
             } => {
                 let array_index = key
-                    .as_str()
+                    .as_string()
                     .and_then(crate::array_index)
                     .map(|offset| offset as usize);
                 let exists = properties.contains_key(&key)

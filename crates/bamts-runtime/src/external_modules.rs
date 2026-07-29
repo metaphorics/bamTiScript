@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
 use crate::intrinsics::{self, BuiltinDef, BuiltinOutcome, BuiltinTable};
@@ -8,9 +9,9 @@ use crate::{
 };
 
 pub(crate) struct InstalledModule {
-    pub(crate) specifier: &'static str,
+    pub(crate) specifier: EcmaString,
     pub(crate) namespace: Value,
-    pub(crate) exports: Vec<(&'static str, Value)>,
+    pub(crate) exports: Vec<(EcmaString, Value)>,
     pub(crate) internals: BTreeMap<&'static str, Value>,
 }
 
@@ -19,18 +20,20 @@ pub(crate) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
     object_prototype: Value,
 ) -> Vec<InstalledModule> {
+    let util_specifier = EcmaString::from_utf8("node:util");
     let util_namespace = intrinsics::push(
         heap,
         HeapEntry::ExternalModuleNamespace {
-            specifier: "node:util",
+            specifier: util_specifier.clone(),
         },
     );
     let parse_args = register(heap, builtins, "parseArgs", 0, parse_args::<H>);
 
+    let crypto_specifier = EcmaString::from_utf8("node:crypto");
     let crypto_namespace = intrinsics::push(
         heap,
         HeapEntry::ExternalModuleNamespace {
-            specifier: "node:crypto",
+            specifier: crypto_specifier.clone(),
         },
     );
     let create_hash = register(heap, builtins, "createHash", 2, create_hash::<H>);
@@ -40,15 +43,15 @@ pub(crate) fn install<H: Host>(
     let _ = object_prototype;
     vec![
         InstalledModule {
-            specifier: "node:util",
+            specifier: util_specifier,
             namespace: util_namespace,
-            exports: vec![("parseArgs", parse_args)],
+            exports: vec![(EcmaString::from_utf8("parseArgs"), parse_args)],
             internals: BTreeMap::new(),
         },
         InstalledModule {
-            specifier: "node:crypto",
+            specifier: crypto_specifier,
             namespace: crypto_namespace,
-            exports: vec![("createHash", create_hash)],
+            exports: vec![(EcmaString::from_utf8("createHash"), create_hash)],
             internals: BTreeMap::from([("hash.update", hash_update), ("hash.digest", hash_digest)]),
         },
     ]
@@ -103,6 +106,10 @@ struct ParsedToken {
 
 fn type_error(operation: &'static str) -> EvalFailure {
     EvalFailure::Throw(ThrowOrigin::TypeError { operation })
+}
+
+fn strict_host_text(text: &EcmaString, operation: &'static str) -> Result<String, EvalFailure> {
+    text.to_utf8_strict().map_err(|_| type_error(operation))
 }
 
 fn parse_args<H: Host>(
@@ -329,8 +336,8 @@ fn parse_config<H: Host>(
                 .get("type")
                 .and_then(|value| machine.string_text(*value))
             {
-                Some("string") => OptionType::String,
-                Some("boolean") => OptionType::Boolean,
+                Some(text) if text.eq_ascii("string") => OptionType::String,
+                Some(text) if text.eq_ascii("boolean") => OptionType::Boolean,
                 _ => {
                     return Err(type_error(
                         "parseArgs option type must be string or boolean",
@@ -342,6 +349,8 @@ fn parse_config<H: Host>(
                 let Some(text) = machine.string_text(value) else {
                     return Err(type_error("parseArgs short option must be a string"));
                 };
+                let text =
+                    strict_host_text(text, "parseArgs short option must be well-formed UTF-16")?;
                 let mut chars = text.chars();
                 let Some(short) = chars.next().filter(|_| chars.next().is_none()) else {
                     return Err(type_error("parseArgs short option must be one character"));
@@ -393,7 +402,10 @@ fn object_properties<H: Host>(
         let Property::Data { value, .. } = property else {
             return Err(type_error("parseArgs accessors are unsupported"));
         };
-        result.insert(name.clone(), *value);
+        result.insert(
+            strict_host_text(name, "parseArgs option name must be well-formed UTF-16")?,
+            *value,
+        );
     }
     Ok(result)
 }
@@ -432,8 +444,10 @@ fn string_array<H: Host>(
         .map(|value| {
             machine
                 .string_text(*value)
-                .map(str::to_owned)
                 .ok_or_else(|| type_error("parseArgs args must contain strings"))
+                .and_then(|text| {
+                    strict_host_text(text, "parseArgs args must be well-formed UTF-16")
+                })
         })
         .collect()
 }
@@ -580,7 +594,7 @@ fn alloc_string_array<H: Host>(
 
 fn alloc_string<H: Host>(machine: &mut Machine<'_, H>, value: &str) -> Result<Value, EvalFailure> {
     machine
-        .allocate(HeapEntry::String(value.to_owned()))
+        .allocate(HeapEntry::String(EcmaString::from_utf8(value)))
         .map_err(EvalFailure::Runtime)
 }
 
@@ -628,7 +642,7 @@ fn put<H: Host>(
         _ => unreachable!("external module result is object-like"),
     };
     properties.insert(
-        PropertyKey::Named(name.to_owned()),
+        PropertyKey::Named(EcmaString::from_utf8(name)),
         Property::Data {
             value,
             writable: true,
@@ -651,14 +665,25 @@ fn create_hash<H: Host>(
     let Some(algorithm) = args
         .first()
         .and_then(|value| machine.string_text(*value))
-        .map(str::to_owned)
+        .map(|text| {
+            strict_host_text(
+                text,
+                "crypto.createHash algorithm must be well-formed UTF-16",
+            )
+        })
+        .transpose()?
     else {
         return Err(type_error("crypto.createHash algorithm must be a string"));
     };
     if machine.host.hash(&algorithm, &[]).is_none() {
         return Err(type_error("unsupported hash algorithm"));
     }
-    let crypto = &machine.registry.external["node:crypto"];
+    let crypto = machine
+        .registry
+        .external
+        .iter()
+        .find_map(|(specifier, module)| specifier.eq_ascii("node:crypto").then_some(module))
+        .expect("node:crypto is installed");
     let update = crypto.internals["hash.update"];
     let digest = crypto.internals["hash.digest"];
     let value = machine
@@ -685,7 +710,8 @@ fn hash_update<H: Host>(
     let Some(text) = args
         .first()
         .and_then(|value| machine.string_text(*value))
-        .map(str::to_owned)
+        .map(|text| strict_host_text(text, "hash.update data must be well-formed UTF-16"))
+        .transpose()?
     else {
         return Err(type_error("hash.update data must be a string"));
     };
@@ -693,8 +719,8 @@ fn hash_update<H: Host>(
         None | Some(Value::UNDEFINED) => "utf8".to_owned(),
         Some(value) => machine
             .string_text(value)
-            .map(str::to_owned)
-            .ok_or_else(|| type_error("hash.update encoding must be a string"))?,
+            .ok_or_else(|| type_error("hash.update encoding must be a string"))
+            .and_then(|text| strict_host_text(text, "hash.update encoding must be ASCII"))?,
     };
     let bytes = decode_input(&text, &encoding)?;
     let Some(index) = machine.runtime_slot(this).map_err(EvalFailure::Runtime)? else {
@@ -728,7 +754,8 @@ fn hash_digest<H: Host>(
     let Some(encoding) = args
         .first()
         .and_then(|value| machine.string_text(*value))
-        .map(str::to_owned)
+        .map(|text| strict_host_text(text, "hash.digest encoding must be ASCII"))
+        .transpose()?
     else {
         return Err(type_error(
             "hash.digest without a string encoding is unsupported",
@@ -980,7 +1007,8 @@ mod tests {
         machine
             .string_text(value)
             .expect("expected string")
-            .to_owned()
+            .to_utf8_strict()
+            .expect("test string is well-formed UTF-16")
     }
 
     fn call_parse_args(
@@ -1040,7 +1068,7 @@ mod tests {
 
     fn blank_program() -> Program<Verified> {
         program(
-            vec![Constant::String("main".to_owned())],
+            vec![Constant::String(EcmaString::from_utf8("main"))],
             function(0, vec![Instruction::Halt]),
             Vec::new(),
             Vec::new(),
@@ -1051,11 +1079,11 @@ mod tests {
     fn named_default_and_namespace_imports_share_external_cells() {
         let program = program(
             vec![
-                Constant::String("main".to_owned()),
-                Constant::String("node:util".to_owned()),
-                Constant::String("parseArgs".to_owned()),
-                Constant::String("default".to_owned()),
-                Constant::String("util".to_owned()),
+                Constant::String(EcmaString::from_utf8("main")),
+                Constant::String(EcmaString::from_utf8("node:util")),
+                Constant::String(EcmaString::from_utf8("parseArgs")),
+                Constant::String(EcmaString::from_utf8("default")),
+                Constant::String(EcmaString::from_utf8("util")),
             ],
             function(1, vec![Instruction::Halt]),
             vec![external_edge(1)],
@@ -1092,7 +1120,7 @@ mod tests {
         assert_eq!(default, namespace);
         let namespace_index = machine.runtime_slot(namespace).unwrap().unwrap();
         assert!(matches!(
-            machine.own_get(namespace_index, &PropertyKey::Named("parseArgs".to_owned())),
+            machine.own_get(namespace_index, &PropertyKey::Named(EcmaString::from_utf8("parseArgs"))),
             Some(crate::Found::Value(value)) if value == named
         ));
     }
@@ -1101,8 +1129,8 @@ mod tests {
     fn unknown_external_module_keeps_typed_runtime_error() {
         let program = program(
             vec![
-                Constant::String("main".to_owned()),
-                Constant::String("node:missing".to_owned()),
+                Constant::String(EcmaString::from_utf8("main")),
+                Constant::String(EcmaString::from_utf8("node:missing")),
             ],
             function(0, vec![Instruction::Halt]),
             vec![external_edge(1)],
@@ -1292,14 +1320,14 @@ mod tests {
 
     fn hash_program() -> Program<Verified> {
         let constants = vec![
-            Constant::String("main".to_owned()),
-            Constant::String("node:crypto".to_owned()),
-            Constant::String("createHash".to_owned()),
-            Constant::String("echo".to_owned()),
-            Constant::String("update".to_owned()),
-            Constant::String("616263".to_owned()),
-            Constant::String("hex".to_owned()),
-            Constant::String("digest".to_owned()),
+            Constant::String(EcmaString::from_utf8("main")),
+            Constant::String(EcmaString::from_utf8("node:crypto")),
+            Constant::String(EcmaString::from_utf8("createHash")),
+            Constant::String(EcmaString::from_utf8("echo")),
+            Constant::String(EcmaString::from_utf8("update")),
+            Constant::String(EcmaString::from_utf8("616263")),
+            Constant::String(EcmaString::from_utf8("hex")),
+            Constant::String(EcmaString::from_utf8("digest")),
         ];
         let code = vec![
             Instruction::LoadGlobal {

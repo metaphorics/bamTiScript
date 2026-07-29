@@ -4,6 +4,17 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 const EXPECTED_STDOUT: &[u8] = b"hello from bamts\n";
+const UTF16_PROGRAM: &str = r#"const s = "\uD800";
+console.log(s.length);
+console.log(s.charCodeAt(0).toString(16));
+console.log(s.codePointAt(0).toString(16));
+console.log(/./gu.exec("\u{1F600}")[0].length);
+console.log("\u{10003}" < "\u{E000}");
+const key = Object.keys({["\u{1F600}"]: 3})[0];
+console.log(key.length);
+console.log(key.codePointAt(0).toString(16));
+"#;
+const UTF16_STDOUT: &[u8] = b"1\nd800\nd800\n2\ntrue\n2\n1f600\n";
 static NEXT_DIRECTORY: AtomicU32 = AtomicU32::new(0);
 
 #[test]
@@ -85,6 +96,46 @@ fn aot_runs_two_module_program_with_live_imported_mutation() {
         .expect("two-module AOT executable starts");
     assert_success(&output, "compiled two-module program");
     assert_eq!(output.stdout, b"2\n");
+}
+
+#[test]
+fn jit_preserves_lone_surrogates_end_to_end() {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", UTF16_PROGRAM);
+
+    let output = Command::new(bamts_binary())
+        .args(["run", "--target", "jit", "main.ts"])
+        .current_dir(&project.path)
+        .output()
+        .expect("bamts JIT run starts");
+
+    assert_success(&output, "bamts run UTF-16 JIT");
+    assert_eq!(output.stdout, UTF16_STDOUT);
+}
+
+#[test]
+fn aot_preserves_lone_surrogates_end_to_end() {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", UTF16_PROGRAM);
+    let executable = project
+        .path
+        .join(format!("utf16{}", std::env::consts::EXE_SUFFIX));
+
+    let compile = Command::new(bamts_binary())
+        .args(["compile", "--target", "aot", "--output"])
+        .arg(&executable)
+        .arg("main.ts")
+        .current_dir(&project.path)
+        .env("BAMTS_CACHE_DIR", project.path.join("cache"))
+        .output()
+        .expect("bamts AOT compile starts");
+    assert_success(&compile, "bamts compile UTF-16 AOT");
+
+    let output = Command::new(&executable)
+        .output()
+        .expect("UTF-16 AOT executable starts");
+    assert_success(&output, "compiled UTF-16 program");
+    assert_eq!(output.stdout, UTF16_STDOUT);
 }
 
 #[test]

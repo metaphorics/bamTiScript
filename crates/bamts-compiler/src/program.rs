@@ -8,9 +8,9 @@ use std::{
 };
 
 use bamts_bytecode::{
-    Binding, BindingId, BindingKind, Constant, ConstantId, Edge, EdgeId, EdgeKind, EdgeTarget,
-    Export, ExportSource, ModuleId, Program as BytecodeProgram, ProgramModule, ProgramVerifyError,
-    Verified,
+    Binding, BindingId, BindingKind, Constant, ConstantId, EcmaString, EcmaStringBuilder, Edge,
+    EdgeId, EdgeKind, EdgeTarget, Export, ExportSource, ModuleId, Program as BytecodeProgram,
+    ProgramModule, ProgramVerifyError, Verified,
 };
 
 use crate::{
@@ -251,6 +251,10 @@ pub enum ProgramLoadError {
     },
     UnsupportedSource(PathBuf),
     TooManySources,
+    IllFormedModuleSpecifier {
+        importer: PathBuf,
+        range: TextRange,
+    },
     InvalidSpecifier {
         diagnostic: UnresolvedModuleDiagnostic,
         source: ModuleResolutionError,
@@ -294,6 +298,11 @@ impl fmt::Display for ProgramLoadError {
             Self::TooManySources => {
                 formatter.write_str("program contains more than u32::MAX sources")
             }
+            Self::IllFormedModuleSpecifier { importer, .. } => write!(
+                formatter,
+                "module specifier in {} is not well-formed UTF-16",
+                importer.display()
+            ),
             Self::InvalidSpecifier { diagnostic, source } => write!(
                 formatter,
                 "invalid module specifier {:?} in {}: {source}",
@@ -664,7 +673,12 @@ impl LoadState<'_> {
         })?;
         let source = Arc::new(SourceText::new(text));
         let parsed = parser::parse(scanner::scan(source_id, script_kind, Arc::clone(&source)));
-        let unresolved = collect_edges(parsed.product());
+        let unresolved = collect_edges(parsed.product()).map_err(|range| {
+            ProgramLoadError::IllFormedModuleSpecifier {
+                importer: path.clone(),
+                range,
+            }
+        })?;
         let mut dependencies = Vec::with_capacity(unresolved.len());
         for edge in unresolved {
             let target = match self.loader.resolve_edge(&path, &edge)? {
@@ -697,7 +711,7 @@ struct UnresolvedEdge {
     range: TextRange,
 }
 
-fn collect_edges(source: &SourceFile) -> Vec<UnresolvedEdge> {
+fn collect_edges(source: &SourceFile) -> Result<Vec<UnresolvedEdge>, TextRange> {
     let mut edges = Vec::new();
     for statement in source.statements() {
         match statement.data() {
@@ -708,7 +722,7 @@ fn collect_edges(source: &SourceFile) -> Vec<UnresolvedEdge> {
                 } else {
                     ModuleEdgeKind::StaticRuntime
                 };
-                push_literal_edge(source, &mut edges, kind, &import.source);
+                push_literal_edge(source, &mut edges, kind, &import.source)?;
             }
             Statement::ImportEquals(import) => {
                 if let crate::syntax::ExternalModuleReference::Require(specifier) =
@@ -719,7 +733,7 @@ fn collect_edges(source: &SourceFile) -> Vec<UnresolvedEdge> {
                     } else {
                         ModuleEdgeKind::StaticRuntime
                     };
-                    push_literal_edge(source, &mut edges, kind, specifier);
+                    push_literal_edge(source, &mut edges, kind, specifier)?;
                 }
             }
             Statement::Export(ExportDeclaration::All(export)) => {
@@ -728,7 +742,7 @@ fn collect_edges(source: &SourceFile) -> Vec<UnresolvedEdge> {
                 } else {
                     ModuleEdgeKind::StaticRuntime
                 };
-                push_literal_edge(source, &mut edges, kind, &export.source);
+                push_literal_edge(source, &mut edges, kind, &export.source)?;
             }
             Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
                 type_only,
@@ -750,16 +764,23 @@ fn collect_edges(source: &SourceFile) -> Vec<UnresolvedEdge> {
                         ModuleEdgeKind::StaticRuntime
                     },
                     module,
-                );
+                )?;
             }
             _ => {}
         }
     }
-    DynamicEdgeCollector {
-        source,
-        edges: &mut edges,
+    let ill_formed = {
+        let mut collector = DynamicEdgeCollector {
+            source,
+            edges: &mut edges,
+            ill_formed: None,
+        };
+        collector.scan_statements(source.statements());
+        collector.ill_formed
+    };
+    if let Some(range) = ill_formed {
+        return Err(range);
     }
-    .scan_statements(source.statements());
     let tokens: Vec<_> = source
         .tokens()
         .iter()
@@ -781,23 +802,36 @@ fn collect_edges(source: &SourceFile) -> Vec<UnresolvedEdge> {
         {
             continue;
         }
-        if let Some(specifier) = source.token_text(window[2]).and_then(unquote) {
-            edges.push(UnresolvedEdge {
-                kind: ModuleEdgeKind::TypeOnly,
-                specifier: Arc::from(specifier),
-                range: window[2].range(),
-            });
-        }
+        let Some(value) = source.token_text(window[2]).and_then(unquote) else {
+            continue;
+        };
+        let specifier = value.to_utf8_strict().map_err(|_| window[2].range())?;
+        edges.push(UnresolvedEdge {
+            kind: ModuleEdgeKind::TypeOnly,
+            specifier: Arc::from(specifier),
+            range: window[2].range(),
+        });
     }
-    edges
+    Ok(edges)
 }
 
 struct DynamicEdgeCollector<'a> {
     source: &'a SourceFile,
     edges: &'a mut Vec<UnresolvedEdge>,
+    ill_formed: Option<TextRange>,
 }
 
 impl DynamicEdgeCollector<'_> {
+    fn push_literal_edge(
+        &mut self,
+        kind: ModuleEdgeKind,
+        literal: &crate::syntax::StringLiteralNode,
+    ) {
+        if self.ill_formed.is_none() {
+            self.ill_formed = push_literal_edge(self.source, self.edges, kind, literal).err();
+        }
+    }
+
     fn scan_statements(&mut self, statements: &[crate::syntax::Stmt]) {
         for statement in statements {
             self.scan_statement(statement);
@@ -1142,12 +1176,7 @@ impl DynamicEdgeCollector<'_> {
             Expression::NonNull(value) => self.scan_expression(&value.expression),
             Expression::Import(value) => {
                 if let Expression::Literal(Literal::String(literal)) = value.source.data() {
-                    push_literal_edge(
-                        self.source,
-                        self.edges,
-                        ModuleEdgeKind::DynamicRuntime,
-                        literal,
-                    );
+                    self.push_literal_edge(ModuleEdgeKind::DynamicRuntime, literal);
                 }
                 self.scan_expression(&value.source);
                 if let Some(options) = &value.options {
@@ -1227,29 +1256,32 @@ fn push_literal_edge(
     edges: &mut Vec<UnresolvedEdge>,
     kind: ModuleEdgeKind,
     literal: &crate::syntax::StringLiteralNode,
-) {
-    if let Some(specifier) = source.token_text(literal.data().token()).and_then(unquote) {
-        edges.push(UnresolvedEdge {
-            kind,
-            specifier: Arc::from(specifier),
-            range: literal.range(),
-        });
-    }
+) -> Result<(), TextRange> {
+    let Some(value) = source.token_text(literal.data().token()).and_then(unquote) else {
+        return Ok(());
+    };
+    let specifier = value.to_utf8_strict().map_err(|_| literal.range())?;
+    edges.push(UnresolvedEdge {
+        kind,
+        specifier: Arc::from(specifier),
+        range: literal.range(),
+    });
+    Ok(())
 }
 
-fn unquote(text: &str) -> Option<String> {
+fn unquote(text: &str) -> Option<EcmaString> {
     let quote = text.as_bytes().first().copied()?;
     if !matches!(quote, b'\'' | b'"') || text.as_bytes().last().copied() != Some(quote) {
         return None;
     }
     let body = &text[1..text.len() - 1];
     let bytes = body.as_bytes();
-    let mut output = String::with_capacity(body.len());
+    let mut output = EcmaStringBuilder::with_capacity(body.encode_utf16().count());
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] != b'\\' {
             let character = body[index..].chars().next()?;
-            output.push(character);
+            output.push_code_point(u32::from(character)).ok()?;
             index += character.len_utf8();
             continue;
         }
@@ -1257,13 +1289,13 @@ fn unquote(text: &str) -> Option<String> {
         let escaped = *bytes.get(index)?;
         index += 1;
         match escaped {
-            b'b' => output.push('\u{0008}'),
-            b'f' => output.push('\u{000c}'),
-            b'n' => output.push('\n'),
-            b'r' => output.push('\r'),
-            b't' => output.push('\t'),
-            b'v' => output.push('\u{000b}'),
-            b'0' => output.push('\0'),
+            b'b' => output.push_unit(0x0008),
+            b'f' => output.push_unit(0x000C),
+            b'n' => output.push_unit(u16::from(b'\n')),
+            b'r' => output.push_unit(u16::from(b'\r')),
+            b't' => output.push_unit(u16::from(b'\t')),
+            b'v' => output.push_unit(0x000B),
+            b'0' => output.push_unit(0),
             b'\n' => {}
             b'\r' => {
                 if bytes.get(index) == Some(&b'\n') {
@@ -1272,39 +1304,29 @@ fn unquote(text: &str) -> Option<String> {
             }
             b'x' => {
                 let value = parse_hex(bytes.get(index..index + 2)?)?;
-                output.push(char::from_u32(value)?);
+                output.push_unit(value as u16);
                 index += 2;
             }
             b'u' if bytes.get(index) == Some(&b'{') => {
                 let end = bytes[index + 1..].iter().position(|byte| *byte == b'}')? + index + 1;
                 let value = parse_hex(bytes.get(index + 1..end)?)?;
-                output.push(char::from_u32(value)?);
+                output.push_code_point(value).ok()?;
                 index = end + 1;
             }
             b'u' => {
-                let first = parse_hex(bytes.get(index..index + 4)?)?;
+                let value = parse_hex(bytes.get(index..index + 4)?)?;
+                output.push_unit(value as u16);
                 index += 4;
-                if (0xd800..=0xdbff).contains(&first) && bytes.get(index..index + 2) == Some(b"\\u")
-                {
-                    let second = parse_hex(bytes.get(index + 2..index + 6)?)?;
-                    if (0xdc00..=0xdfff).contains(&second) {
-                        let scalar = 0x1_0000 + ((first - 0xd800) << 10) + (second - 0xdc00);
-                        output.push(char::from_u32(scalar)?);
-                        index += 6;
-                        continue;
-                    }
-                }
-                output.push(char::from_u32(first)?);
             }
-            _ if escaped.is_ascii() => output.push(char::from(escaped)),
+            _ if escaped.is_ascii() => output.push_unit(u16::from(escaped)),
             _ => {
                 let character = body[index - 1..].chars().next()?;
-                output.push(character);
+                output.push_code_point(u32::from(character)).ok()?;
                 index += character.len_utf8() - 1;
             }
         }
     }
-    Some(output)
+    Some(output.finish())
 }
 
 fn parse_hex(bytes: &[u8]) -> Option<u32> {
@@ -1462,6 +1484,7 @@ pub enum ProgramLowerErrorKind {
         source: SourceId,
     },
     InvalidModuleName,
+    IllFormedMetadataString,
     MissingRuntimeEdge {
         specifier: String,
     },
@@ -1734,6 +1757,7 @@ fn collect_raw_module(
     let mut stars = Vec::new();
     for statement in file.statements() {
         collect_top_level_statement(
+            module,
             file,
             statement.data(),
             &edge,
@@ -1765,6 +1789,7 @@ fn collect_raw_module(
 }
 
 fn collect_top_level_statement(
+    module: &ResolvedModule,
     file: &SourceFile,
     statement: &Statement,
     edge: &impl Fn(String) -> Result<EdgeId, ProgramLowerError>,
@@ -1787,7 +1812,7 @@ fn collect_top_level_statement(
             if !runtime {
                 return Ok(());
             }
-            let edge_id = edge(string_literal(file, &import.source))?;
+            let edge_id = edge(metadata_string_literal(module, file, &import.source)?)?;
             if let Some(clause) = &import.clause {
                 if let Some(default) = &clause.default {
                     bindings.push(RawBinding {
@@ -1813,7 +1838,7 @@ fn collect_top_level_statement(
                                 name: identifier(file, &specifier.local),
                                 kind: RawBindingKind::Imported {
                                     edge: edge_id,
-                                    name: module_export_name(file, &specifier.imported),
+                                    name: metadata_export_name(module, file, &specifier.imported)?,
                                 },
                             });
                         }
@@ -1852,13 +1877,16 @@ fn collect_top_level_statement(
                 });
             }
         }
-        Statement::Export(export) => collect_export(file, export, edge, bindings, exports, stars)?,
+        Statement::Export(export) => {
+            collect_export(module, file, export, edge, bindings, exports, stars)?
+        }
         _ => {}
     }
     Ok(())
 }
 
 fn collect_export(
+    module: &ResolvedModule,
     file: &SourceFile,
     declaration: &ExportDeclaration,
     edge: &impl Fn(String) -> Result<EdgeId, ProgramLowerError>,
@@ -1868,7 +1896,15 @@ fn collect_export(
 ) -> Result<(), ProgramLowerError> {
     match declaration {
         ExportDeclaration::Named(ExportNamedDeclaration::Declaration(statement)) => {
-            collect_top_level_statement(file, statement.data(), edge, bindings, exports, stars)?;
+            collect_top_level_statement(
+                module,
+                file,
+                statement.data(),
+                edge,
+                bindings,
+                exports,
+                stars,
+            )?;
             let has_runtime_value = !matches!(
                 statement.data(),
                 Statement::Function(declaration) if declaration.function.body.is_none()
@@ -1889,17 +1925,17 @@ fn collect_export(
             ..
         }) if !type_only => {
             if let Some(source) = source {
-                let edge_id = edge(string_literal(file, source))?;
+                let edge_id = edge(metadata_string_literal(module, file, source)?)?;
                 for specifier in specifiers {
                     let specifier = specifier.data();
                     if specifier.mode == ExportSpecifierMode::TypeOnly {
                         continue;
                     }
                     exports.push(RawExport {
-                        name: module_export_name(file, &specifier.exported),
+                        name: metadata_export_name(module, file, &specifier.exported)?,
                         source: RawExportSource::Indirect {
                             edge: edge_id,
-                            name: module_export_name(file, &specifier.local),
+                            name: metadata_export_name(module, file, &specifier.local)?,
                         },
                     });
                 }
@@ -1910,16 +1946,20 @@ fn collect_export(
                         continue;
                     }
                     exports.push(RawExport {
-                        name: module_export_name(file, &specifier.exported),
-                        source: RawExportSource::Local(module_export_name(file, &specifier.local)),
+                        name: metadata_export_name(module, file, &specifier.exported)?,
+                        source: RawExportSource::Local(metadata_export_name(
+                            module,
+                            file,
+                            &specifier.local,
+                        )?),
                     });
                 }
             }
         }
         ExportDeclaration::All(all) if !all.type_only => {
-            let edge_id = edge(string_literal(file, &all.source))?;
+            let edge_id = edge(metadata_string_literal(module, file, &all.source)?)?;
             if let Some(exported) = &all.exported {
-                let exported = module_export_name(file, exported);
+                let exported = metadata_export_name(module, file, exported)?;
                 let binding = format!("*namespace:{exported}*");
                 bindings.push(RawBinding {
                     name: binding.clone(),
@@ -2141,7 +2181,7 @@ fn materialize_program_module(
         ConstantId::new(
             code.constants()
                 .iter()
-                .position(|constant| matches!(constant, Constant::String(text) if text == value))
+                .position(|constant| matches!(constant, Constant::String(text) if text.as_units().iter().copied().eq(value.encode_utf16())))
                 .expect("all linkage strings were interned before verification") as u32,
         )
     };
@@ -2218,20 +2258,38 @@ fn identifier(file: &SourceFile, node: &crate::syntax::IdentifierNode) -> String
         .to_owned()
 }
 
-fn string_literal(file: &SourceFile, node: &crate::syntax::StringLiteralNode) -> String {
-    unquote(
-        file.token_text(node.data().token())
-            .expect("parser string range belongs to its source"),
-    )
-    .expect("parser string literal has delimiters")
+fn metadata_string_literal(
+    module: &ResolvedModule,
+    file: &SourceFile,
+    node: &crate::syntax::StringLiteralNode,
+) -> Result<String, ProgramLowerError> {
+    let value = file
+        .token_text(node.data().token())
+        .and_then(unquote)
+        .ok_or_else(|| malformed_metadata_error(module))?;
+    value
+        .to_utf8_strict()
+        .map_err(|_| malformed_metadata_error(module))
 }
 
-fn module_export_name(file: &SourceFile, name: &ModuleExportName) -> String {
+fn metadata_export_name(
+    module: &ResolvedModule,
+    file: &SourceFile,
+    name: &ModuleExportName,
+) -> Result<String, ProgramLowerError> {
     match name {
-        ModuleExportName::Identifier(identifier_node) => identifier(file, identifier_node),
-        ModuleExportName::String(string) => string_literal(file, string),
-        ModuleExportName::Missing(_) => String::new(),
+        ModuleExportName::Identifier(identifier_node) => Ok(identifier(file, identifier_node)),
+        ModuleExportName::String(string) => metadata_string_literal(module, file, string),
+        ModuleExportName::Missing(_) => Ok(String::new()),
     }
+}
+
+fn malformed_metadata_error(module: &ResolvedModule) -> ProgramLowerError {
+    program_lower_error(
+        module.path(),
+        ProgramLowerPhase::Metadata,
+        ProgramLowerErrorKind::IllFormedMetadataString,
+    )
 }
 
 fn program_lower_error(
@@ -2267,7 +2325,7 @@ mod tests {
         project::{ProjectConfig, ProjectRoot},
     };
     use bamts_bytecode::{
-        BindingKind, EdgeKind, EdgeTarget, ExportSource, Instruction, ProgramModule,
+        BindingKind, EcmaString, EdgeKind, EdgeTarget, ExportSource, Instruction, ProgramModule,
         ProgramVerifyErrorKind, ResolvedExport, Verified,
     };
 
@@ -2318,9 +2376,29 @@ mod tests {
         .unwrap()
     }
 
-    fn module_name(module: &ProgramModule<Verified>) -> &str {
+    #[test]
+    fn malformed_surrogate_metadata_is_a_typed_error() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "const x = 1; export { x as \"\\uD800\" };");
+        let resolved = fixture.loader().load("main.ts").unwrap();
+        let frontend = compile_program_frontend(&resolved, FrontendMode::Check);
+        let error = lower_program(
+            &resolved,
+            &frontend,
+            LowerOptions {
+                javascript_compatibility: true,
+            },
+        )
+        .expect_err("ill-formed metadata must not reach host String conversion");
+        assert_eq!(error.phase, ProgramLowerPhase::Metadata);
+        assert_eq!(error.kind, ProgramLowerErrorKind::IllFormedMetadataString);
+    }
+
+    fn module_name(module: &ProgramModule<Verified>) -> String {
         match &module.code().constants()[module.name().get() as usize] {
-            bamts_bytecode::Constant::String(name) => name,
+            bamts_bytecode::Constant::String(name) => name
+                .to_utf8_strict()
+                .expect("compiler-produced module metadata is well-formed"),
             _ => panic!("verified module name is a string"),
         }
     }
@@ -2334,9 +2412,11 @@ mod tests {
             .unwrap_or_else(|| panic!("missing module {name}"))
     }
 
-    fn constant_string(module: &ProgramModule<Verified>, id: bamts_bytecode::ConstantId) -> &str {
+    fn constant_string(module: &ProgramModule<Verified>, id: bamts_bytecode::ConstantId) -> String {
         match &module.code().constants()[id.get() as usize] {
-            bamts_bytecode::Constant::String(value) => value,
+            bamts_bytecode::Constant::String(value) => value
+                .to_utf8_strict()
+                .expect("compiler-produced linkage metadata is well-formed"),
             _ => panic!("verified linkage constant is a string"),
         }
     }
@@ -2391,7 +2471,7 @@ mod tests {
             .unwrap();
         assert!(matches!(export.source, ExportSource::Local(_)));
         assert!(matches!(
-            executable.wire().resolve_export(main_id, "observed"),
+            executable.wire().resolve_export(main_id, &EcmaString::from_utf8("observed")),
             Some(ResolvedExport::Local { module, .. })
                 if module != main_id
         ));
@@ -2439,7 +2519,7 @@ mod tests {
         assert!(matches!(
             executable
                 .wire()
-                .resolve_export(executable.wire().entry(), "renamed"),
+                .resolve_export(executable.wire().entry(), &EcmaString::from_utf8("renamed")),
             Some(ResolvedExport::Local { module, .. })
                 if module != executable.wire().entry()
         ));
@@ -2465,9 +2545,9 @@ mod tests {
             .iter()
             .map(|export| constant_string(main, export.name))
             .collect();
-        assert!(names.contains(&"onlyA"));
-        assert!(names.contains(&"onlyB"));
-        assert!(!names.contains(&"collision"));
+        assert!(names.iter().any(|name| name == "onlyA"));
+        assert!(names.iter().any(|name| name == "onlyB"));
+        assert!(!names.iter().any(|name| name == "collision"));
     }
 
     #[test]
@@ -2489,7 +2569,7 @@ mod tests {
         assert!(
             executable
                 .wire()
-                .resolve_export(executable.wire().entry(), "value")
+                .resolve_export(executable.wire().entry(), &EcmaString::from_utf8("value"))
                 .is_some()
         );
     }
@@ -2511,9 +2591,10 @@ mod tests {
             1
         );
         assert!(matches!(
-            executable
-                .wire()
-                .resolve_export(executable.wire().entry(), "readFile"),
+            executable.wire().resolve_export(
+                executable.wire().entry(),
+                &EcmaString::from_utf8("readFile")
+            ),
             Some(ResolvedExport::External { .. })
         ));
     }
@@ -2558,8 +2639,8 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(stored.contains(&"Foo"));
-        assert!(stored.contains(&"*default*"));
+        assert!(stored.iter().any(|name| name == "Foo"));
+        assert!(stored.iter().any(|name| name == "*default*"));
     }
 
     #[test]
@@ -2870,6 +2951,22 @@ mod tests {
         let program = fixture.loader().load("main.ts").unwrap();
 
         assert_eq!(names(&program), ["foo.ts", "main.ts"]);
+    }
+
+    #[test]
+    fn rejects_ill_formed_utf16_module_specifiers() {
+        for source in [
+            r#"import type { T } from "\uD800";"#,
+            r#"type T = import("\uD800").T;"#,
+        ] {
+            let fixture = Fixture::new();
+            fixture.write("main.ts", source);
+
+            assert!(matches!(
+                fixture.loader().load("main.ts"),
+                Err(ProgramLoadError::IllFormedModuleSpecifier { .. })
+            ));
+        }
     }
 
     #[test]

@@ -51,7 +51,9 @@ use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::fmt;
 
-use bamts_bytecode::{ConstantId, FunctionId, Instruction, Module, ModuleId, Program, Verified};
+use bamts_bytecode::{
+    ConstantId, EcmaString, FunctionId, Instruction, Module, ModuleId, Program, Verified,
+};
 pub use bamts_native::AbiError;
 use bamts_native::{
     Completion, CompletionTag, HelperCall, HelperResult, NativeEntryTable, NativeFrame, NativeOps,
@@ -1154,11 +1156,11 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         }
     }
 
-    fn constant_text(&self, module: ModuleId, id: u32) -> String {
+    fn constant_text(&self, module: ModuleId, id: u32) -> EcmaString {
         self.machine
             .borrow()
             .constant_text(module, ConstantId::new(id))
-            .to_owned()
+            .clone()
     }
 
     /// Materializes the `arguments` object for the current activation, caching it.
@@ -1696,8 +1698,8 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     .borrow()
                     .load_global(module, ConstantId::new(name));
                 let text = match resolved {
-                    Ok(Some(value)) => self.machine.borrow().type_of(value).to_owned(),
-                    Ok(None) => "undefined".to_owned(),
+                    Ok(Some(value)) => EcmaString::from_utf8(self.machine.borrow().type_of(value)),
+                    Ok(None) => EcmaString::from_utf8("undefined"),
                     Err(kind) => return self.fatal(kind),
                 };
                 self.allocated(HeapEntry::String(text))
@@ -1750,10 +1752,12 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
             HelperCall::CreateRegExp { pattern, flags } => {
                 let pattern = self.constant_text(module, pattern);
                 let flags = self.constant_text(module, flags);
+                let prototype = self.machine.borrow().intrinsics.regexp_prototype();
                 self.allocated(HeapEntry::RegExp {
                     pattern,
                     flags,
                     properties: PropertyMap::default(),
+                    prototype: Some(prototype),
                     extensible: true,
                 })
             }
@@ -1872,6 +1876,7 @@ mod tests {
 
     use crate::{Host, Limits, Machine, RuntimeError, RuntimeErrorKind, ThrowOrigin};
 
+    use super::EcmaString;
     use super::{
         Backend, InvokeOutcome, NativeEngine, NativeError, PendingThrow, run_linked_program,
     };
@@ -1926,7 +1931,7 @@ mod tests {
         bindings: Vec<Binding>,
         exports: Vec<Export>,
     ) -> ProgramModule<Verified> {
-        constants.insert(0, Constant::String(name.to_owned()));
+        constants.insert(0, Constant::String(EcmaString::from_utf8(name)));
         ProgramModule {
             name: cid(0),
             code: Module::new(constants, functions, FunctionId::new(0))
@@ -2115,7 +2120,10 @@ mod tests {
         let dependency = |name: &str, value: i32| {
             program_module(
                 name,
-                vec![Constant::String("x".into()), Constant::Int32(value)],
+                vec![
+                    Constant::String(EcmaString::from_utf8("x")),
+                    Constant::Int32(value),
+                ],
                 vec![module_function(
                     0,
                     1,
@@ -2145,11 +2153,11 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String("left".into()),
-                Constant::String("right".into()),
-                Constant::String("x".into()),
-                Constant::String("one".into()),
-                Constant::String("two".into()),
+                Constant::String(EcmaString::from_utf8("left")),
+                Constant::String(EcmaString::from_utf8("right")),
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::from_utf8("one")),
+                Constant::String(EcmaString::from_utf8("two")),
             ],
             vec![module_function(
                 0,
@@ -2215,10 +2223,10 @@ mod tests {
         let dependency = program_module(
             "dependency",
             vec![
-                Constant::String("x".into()),
+                Constant::String(EcmaString::from_utf8("x")),
                 Constant::Int32(1),
                 Constant::Int32(2),
-                Constant::String("set".into()),
+                Constant::String(EcmaString::from_utf8("set")),
             ],
             vec![
                 module_function(
@@ -2287,9 +2295,9 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String("set".into()),
-                Constant::String("x".into()),
-                Constant::String("dependency".into()),
+                Constant::String(EcmaString::from_utf8("set")),
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::from_utf8("dependency")),
             ],
             vec![module_function(
                 0,
@@ -2349,9 +2357,9 @@ mod tests {
         let first = program_module(
             "first",
             vec![
-                Constant::String("a".into()),
+                Constant::String(EcmaString::from_utf8("a")),
                 Constant::Int32(1),
-                Constant::String("second".into()),
+                Constant::String(EcmaString::from_utf8("second")),
             ],
             vec![module_function(
                 0,
@@ -2385,8 +2393,8 @@ mod tests {
         let second = program_module(
             "second",
             vec![
-                Constant::String("a".into()),
-                Constant::String("first".into()),
+                Constant::String(EcmaString::from_utf8("a")),
+                Constant::String(EcmaString::from_utf8("first")),
             ],
             vec![module_function(
                 0,
@@ -2425,7 +2433,10 @@ mod tests {
     fn native_program_namespace_reads_shared_export_cell() {
         let dependency = program_module(
             "dependency",
-            vec![Constant::String("x".into()), Constant::Int32(7)],
+            vec![
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::Int32(7),
+            ],
             vec![module_function(
                 0,
                 1,
@@ -2454,9 +2465,9 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String("ns".into()),
-                Constant::String("x".into()),
-                Constant::String("dependency".into()),
+                Constant::String(EcmaString::from_utf8("ns")),
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::from_utf8("dependency")),
             ],
             vec![module_function(
                 0,
@@ -2504,7 +2515,7 @@ mod tests {
         let dependency = program_module(
             "dependency",
             vec![
-                Constant::String("count".into()),
+                Constant::String(EcmaString::from_utf8("count")),
                 Constant::Int32(0),
                 Constant::Int32(1),
             ],
@@ -2559,9 +2570,9 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String("count".into()),
-                Constant::String("dependency".into()),
-                Constant::String("dependency-again".into()),
+                Constant::String(EcmaString::from_utf8("count")),
+                Constant::String(EcmaString::from_utf8("dependency")),
+                Constant::String(EcmaString::from_utf8("dependency-again")),
             ],
             vec![module_function(
                 0,
@@ -2814,7 +2825,10 @@ mod tests {
     #[test]
     fn native_matches_interpreter_on_object_property_roundtrip() {
         let module = verified(
-            vec![Constant::String("x".to_owned()), Constant::Int32(5)],
+            vec![
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::Int32(5),
+            ],
             vec![entry_function(
                 3,
                 vec![
@@ -2927,7 +2941,7 @@ mod tests {
     fn one_module_program(module: &Module<Verified>) -> Program<Verified> {
         let mut constants = module.constants().to_vec();
         let name = ConstantId::new(constants.len() as u32);
-        constants.push(Constant::String("test-module".to_owned()));
+        constants.push(Constant::String(EcmaString::from_utf8("test-module")));
         let code = Module::new(constants, module.functions().to_vec(), module.entry())
             .verify()
             .expect("test module remains verified");
@@ -2978,7 +2992,7 @@ mod tests {
 
     fn trivial_program() -> Program<Verified> {
         let code = verified(
-            vec![Constant::String("<test>".to_owned())],
+            vec![Constant::String(EcmaString::from_utf8("<test>"))],
             vec![entry_function(1, vec![Instruction::Halt])],
         );
         Program::link(
@@ -3075,7 +3089,7 @@ mod tests {
         let first = single.modules()[0].clone();
         let second = program_module(
             "entry",
-            vec![Constant::String("dependency".into())],
+            vec![Constant::String(EcmaString::from_utf8("dependency"))],
             vec![entry_function(1, vec![Instruction::Halt])],
             vec![Edge {
                 specifier: cid(1),
@@ -3099,11 +3113,11 @@ mod tests {
     fn native_functions_call_and_construct_with_engine_parity() {
         let module = verified(
             vec![
-                Constant::String("Object".to_owned()),
-                Constant::String("prototype".to_owned()),
-                Constant::String("toString".to_owned()),
-                Constant::String("call".to_owned()),
-                Constant::String("[object Object]".to_owned()),
+                Constant::String(EcmaString::from_utf8("Object")),
+                Constant::String(EcmaString::from_utf8("prototype")),
+                Constant::String(EcmaString::from_utf8("toString")),
+                Constant::String(EcmaString::from_utf8("call")),
+                Constant::String(EcmaString::from_utf8("[object Object]")),
                 Constant::Undefined,
             ],
             vec![entry_function(
