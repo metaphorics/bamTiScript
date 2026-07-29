@@ -7,13 +7,13 @@ use super::{
     allocate_array, builtin_property, define_data, heap_index, install_function, type_error,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
-use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
+use crate::{
+    EvalFailure, HeapEntry, Host, IterationKind, Machine, Property, PropertyKey, PropertyMap,
+};
 
 const KEYS: &str = "\0collection.keys";
 const VALUES: &str = "\0collection.values";
 const ENTRIES: &str = "\0collection.entries";
-const ITER_SOURCE: &str = "\0iterator.source";
-const ITER_INDEX: &str = "\0iterator.index";
 
 type CollectionParts = (Vec<Value>, Vec<Value>, Vec<Value>);
 
@@ -144,18 +144,17 @@ pub(super) fn install_iterator_prototype<H: Host>(
 
 pub(super) fn iterator<H: Host>(
     machine: &mut Machine<'_, H>,
-    values: Value,
+    source: Value,
+    kind: IterationKind,
 ) -> Result<Value, EvalFailure> {
-    let prototype = machine.intrinsics.builtins.iterator_prototype();
-    let mut properties = PropertyMap::default();
-    hidden(&mut properties, ITER_SOURCE, values);
-    hidden(&mut properties, ITER_INDEX, Value::int32(0));
     machine
-        .allocate(HeapEntry::Object {
-            properties,
-            prototype: Some(prototype),
+        .allocate(HeapEntry::BuiltinIterator {
+            source,
+            kind,
+            position: Some(0),
+            properties: PropertyMap::default(),
+            prototype: Some(machine.intrinsics.builtins.iterator_prototype()),
             extensible: true,
-            boxed_primitive: None,
         })
         .map_err(EvalFailure::Runtime)
 }
@@ -175,16 +174,50 @@ fn iterator_next<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let source = machine.get_named_property(this, ITER_SOURCE)?;
-    let index = number_index(machine.get_named_property(this, ITER_INDEX)?)?;
-    let values = machine
-        .array_elements(source)?
-        .ok_or_else(|| type_error("iterator next called on incompatible receiver"))?;
-    let done = index >= values.len();
-    let value = values.get(index).copied().unwrap_or(Value::UNDEFINED);
-    if !done {
-        machine.set_data_property(this, ITER_INDEX, crate::number_value((index + 1) as f64))?;
-    }
+    let Some(iterator_index) = machine.runtime_slot(this).map_err(EvalFailure::Runtime)? else {
+        return Err(type_error("iterator next called on incompatible receiver"));
+    };
+    let HeapEntry::BuiltinIterator {
+        source,
+        kind,
+        position,
+        ..
+    } = machine.heap[iterator_index]
+    else {
+        return Err(type_error("iterator next called on incompatible receiver"));
+    };
+    let (done, value, next_position) = match position {
+        None => (true, Value::UNDEFINED, None),
+        Some(index) => {
+            let source_index = machine
+                .runtime_slot(source)
+                .map_err(EvalFailure::Runtime)?
+                .ok_or_else(|| type_error("iterator next called on incompatible receiver"))?;
+            let HeapEntry::Array { elements, .. } = &machine.heap[source_index] else {
+                return Err(type_error("iterator next called on incompatible receiver"));
+            };
+            if index >= elements.len() {
+                (true, Value::UNDEFINED, None)
+            } else {
+                let element = match elements[index] {
+                    Value::HOLE => Value::UNDEFINED,
+                    value => value,
+                };
+                let value = match kind {
+                    IterationKind::Key => crate::number_value(index as f64),
+                    IterationKind::Value => element,
+                    IterationKind::Entry => {
+                        allocate_array(machine, vec![crate::number_value(index as f64), element])?
+                    }
+                };
+                (false, value, Some(index + 1))
+            }
+        }
+    };
+    let HeapEntry::BuiltinIterator { position, .. } = &mut machine.heap[iterator_index] else {
+        unreachable!("iterator brand was checked")
+    };
+    *position = next_position;
     let result = ordinary_runtime(machine, None)?;
     machine.set_data_property(result, "value", value)?;
     machine.set_data_property(result, "done", Value::boolean(done))?;
@@ -632,7 +665,11 @@ fn collection_iterator<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     collection_parts(machine, object)?;
     let source = machine.get_named_property(object, property)?;
-    Ok(BuiltinOutcome::Value(iterator(machine, source)?))
+    Ok(BuiltinOutcome::Value(iterator(
+        machine,
+        source,
+        IterationKind::Value,
+    )?))
 }
 fn require_weak_key<H: Host>(machine: &Machine<'_, H>, key: Value) -> Result<(), EvalFailure> {
     let Some(index) = machine.runtime_slot(key).map_err(EvalFailure::Runtime)? else {
@@ -732,12 +769,5 @@ fn named_property(heap: &[HeapEntry], object: Value, name: &str) -> Value {
     match properties.get(&PropertyKey::Named(EcmaString::from_utf8(name))) {
         Some(Property::Data { value, .. }) => *value,
         _ => unreachable!(),
-    }
-}
-fn number_index(value: Value) -> Result<usize, EvalFailure> {
-    match value.decode() {
-        Some(Decoded::Int32(value)) => Ok(value as usize),
-        Some(Decoded::Number(value)) if value >= 0.0 => Ok(value as usize),
-        _ => Err(type_error("invalid iterator index")),
     }
 }

@@ -640,6 +640,14 @@ mod tests {
         value
     }
 
+    fn next_value(machine: &mut Machine<'_, TestHost>, iterator: Value) -> (Value, bool) {
+        let next = machine.get_named_property(iterator, "next").unwrap();
+        let result = machine.call_value(next, iterator, &[]).unwrap();
+        let value = machine.get_named_property(result, "value").unwrap();
+        let done = machine.get_named_property(result, "done").unwrap();
+        (value, machine.to_boolean(done))
+    }
+
     #[test]
     fn collections_symbols_errors_regexp_and_date_match_node_24_observables() {
         let module = module();
@@ -796,5 +804,95 @@ mod tests {
             panic!("cloned pair remains an array")
         };
         assert_eq!(elements[0], elements[1]);
+    }
+
+    #[test]
+    fn builtin_iterators_keep_typed_live_state() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let array = machine
+            .allocate(HeapEntry::Array {
+                elements: vec![Value::HOLE, Value::int32(1)],
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.array_prototype),
+                extensible: true,
+                length_writable: true,
+            })
+            .unwrap();
+
+        let values = machine.get_named_property(array, "values").unwrap();
+        let values_iterator = machine.call_value(values, array, &[]).unwrap();
+        assert!(
+            machine
+                .own_property_keys(values_iterator)
+                .unwrap()
+                .is_empty()
+        );
+        machine
+            .set_data_property(values_iterator, "\0iterator.index", Value::int32(99))
+            .unwrap();
+        assert_eq!(
+            next_value(&mut machine, values_iterator),
+            (Value::UNDEFINED, false)
+        );
+        assert_eq!(
+            next_value(&mut machine, values_iterator),
+            (Value::int32(1), false)
+        );
+        assert_eq!(
+            next_value(&mut machine, values_iterator),
+            (Value::UNDEFINED, true)
+        );
+        machine
+            .set_data_property(array, "2", Value::int32(2))
+            .unwrap();
+        assert_eq!(
+            next_value(&mut machine, values_iterator),
+            (Value::UNDEFINED, true)
+        );
+
+        let keys = machine.get_named_property(array, "keys").unwrap();
+        let keys_iterator = machine.call_value(keys, array, &[]).unwrap();
+        machine
+            .set_data_property(array, "3", Value::int32(3))
+            .unwrap();
+        for expected in 0..4 {
+            assert_eq!(
+                next_value(&mut machine, keys_iterator),
+                (Value::int32(expected), false)
+            );
+        }
+        assert_eq!(
+            next_value(&mut machine, keys_iterator),
+            (Value::UNDEFINED, true)
+        );
+
+        let entries = machine.get_named_property(array, "entries").unwrap();
+        let entries_iterator = machine.call_value(entries, array, &[]).unwrap();
+        let (first_entry, done) = next_value(&mut machine, entries_iterator);
+        assert!(!done);
+        let entry_index = machine.runtime_slot(first_entry).unwrap().unwrap();
+        let HeapEntry::Array { elements, .. } = &machine.heap[entry_index] else {
+            panic!("array entries yield pair arrays")
+        };
+        assert_eq!(elements, &[Value::int32(0), Value::UNDEFINED]);
+
+        let forged = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .unwrap();
+        machine
+            .set_data_property(forged, "\0iterator.source", array)
+            .unwrap();
+        machine
+            .set_data_property(forged, "\0iterator.index", Value::int32(0))
+            .unwrap();
+        let next = machine.get_named_property(values_iterator, "next").unwrap();
+        assert!(machine.call_value(next, forged, &[]).is_err());
     }
 }

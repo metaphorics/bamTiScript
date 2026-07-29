@@ -8,7 +8,7 @@ use super::{
     to_integer_or_infinity, type_error, uri_error, value_number,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
-use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyKey};
+use crate::{EvalFailure, HeapEntry, Host, IterationKind, Machine, PropertyKey};
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -884,7 +884,9 @@ fn string_iterator<H: Host>(
     }
     let source = allocate_array(machine, values)?;
     Ok(BuiltinOutcome::Value(super::collections::iterator(
-        machine, source,
+        machine,
+        source,
+        IterationKind::Value,
     )?))
 }
 
@@ -964,7 +966,9 @@ fn match_all<H: Host>(
     }
     let source = allocate_array(machine, values)?;
     Ok(BuiltinOutcome::Value(super::collections::iterator(
-        machine, source,
+        machine,
+        source,
+        IterationKind::Value,
     )?))
 }
 

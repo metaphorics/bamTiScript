@@ -9,7 +9,7 @@ use super::{
     type_error, value_number,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
-use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyKey};
+use crate::{EvalFailure, HeapEntry, Host, IterationKind, Machine, PropertyKey};
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -847,13 +847,11 @@ fn keys_iterator<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let length = elements(machine, this)?.len();
-    let keys = (0..length)
-        .map(|index| crate::number_value(index as f64))
-        .collect();
-    let source = allocate_array(machine, keys)?;
+    elements(machine, this)?;
     Ok(BuiltinOutcome::Value(super::collections::iterator(
-        machine, source,
+        machine,
+        this,
+        IterationKind::Key,
     )?))
 }
 
@@ -865,7 +863,9 @@ fn values_iterator<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     elements(machine, this)?;
     Ok(BuiltinOutcome::Value(super::collections::iterator(
-        machine, this,
+        machine,
+        this,
+        IterationKind::Value,
     )?))
 }
 
@@ -875,23 +875,10 @@ fn entries_iterator<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let values = elements(machine, this)?;
-    let mut entries = Vec::with_capacity(values.len());
-    for (index, value) in values.into_iter().enumerate() {
-        entries.push(allocate_array(
-            machine,
-            vec![
-                crate::number_value(index as f64),
-                if value == Value::HOLE {
-                    Value::UNDEFINED
-                } else {
-                    value
-                },
-            ],
-        )?);
-    }
-    let source = allocate_array(machine, entries)?;
+    elements(machine, this)?;
     Ok(BuiltinOutcome::Value(super::collections::iterator(
-        machine, source,
+        machine,
+        this,
+        IterationKind::Entry,
     )?))
 }
