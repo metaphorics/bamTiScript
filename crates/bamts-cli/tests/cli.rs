@@ -15,6 +15,48 @@ console.log(key.length);
 console.log(key.codePointAt(0).toString(16));
 "#;
 const UTF16_STDOUT: &[u8] = b"1\nd800\nd800\n2\ntrue\n2\n1f600\n";
+const CALLABLE_PROGRAM: &str = r#"function probe(a: unknown, b: unknown) {
+    const values = [this, a, b];
+    return values;
+}
+
+const receiver = { tag: "right" };
+const ignored = { tag: "wrong" };
+const applied = probe.apply(receiver, { 0: 7, 1: 8, length: 2 });
+if (applied[0] !== receiver || applied[1] !== 7 || applied[2] !== 8) {
+    throw "apply mismatch";
+}
+
+const bound = probe.bind(receiver, 1);
+const called = bound.call(ignored, 2);
+if (called[0] !== receiver || called[1] !== 1 || called[2] !== 2) {
+    throw "bind mismatch";
+}
+if (bound.length !== 1 || bound.name !== "bound probe") {
+    throw "bound metadata mismatch";
+}
+if (Object.hasOwn(bound, "prototype")) {
+    throw "bound shape mismatch";
+}
+
+function Box(a: number, b: number) {
+    this.sum = a + b;
+}
+Object.defineProperty(Box, "prototype", {
+    value: { kind: "box" },
+    writable: true,
+});
+const BoundBox = Box.bind({ sum: 99 }, 4);
+const box = new BoundBox(5);
+if (
+    box.sum !== 9 ||
+    box.kind !== "box" ||
+    !(box instanceof Box) ||
+    !(box instanceof BoundBox)
+) {
+    throw "bound construction mismatch";
+}
+"#;
 static NEXT_DIRECTORY: AtomicU32 = AtomicU32::new(0);
 
 #[test]
@@ -136,6 +178,46 @@ fn aot_preserves_lone_surrogates_end_to_end() {
         .expect("UTF-16 AOT executable starts");
     assert_success(&output, "compiled UTF-16 program");
     assert_eq!(output.stdout, UTF16_STDOUT);
+}
+
+#[test]
+fn jit_supports_apply_and_bound_callables() {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", CALLABLE_PROGRAM);
+
+    let output = Command::new(bamts_binary())
+        .args(["run", "--target", "jit", "main.ts"])
+        .current_dir(&project.path)
+        .output()
+        .expect("bamts callable JIT run starts");
+
+    assert_success(&output, "bamts run callable JIT");
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn aot_supports_apply_and_bound_callables() {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", CALLABLE_PROGRAM);
+    let executable = project
+        .path
+        .join(format!("callable{}", std::env::consts::EXE_SUFFIX));
+
+    let compile = Command::new(bamts_binary())
+        .args(["compile", "--target", "aot", "--output"])
+        .arg(&executable)
+        .arg("main.ts")
+        .current_dir(&project.path)
+        .env("BAMTS_CACHE_DIR", project.path.join("cache"))
+        .output()
+        .expect("bamts callable AOT compile starts");
+    assert_success(&compile, "bamts compile callable AOT");
+
+    let output = Command::new(&executable)
+        .output()
+        .expect("callable AOT executable starts");
+    assert_success(&output, "compiled callable program");
+    assert!(output.stdout.is_empty());
 }
 
 #[test]

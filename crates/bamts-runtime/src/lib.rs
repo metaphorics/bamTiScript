@@ -19,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -599,11 +600,23 @@ enum HeapEntry {
         extensible: bool,
     },
     NativeFunction {
-        id: intrinsics::BuiltinId,
+        callable: NativeCallable,
         properties: PropertyMap,
-        bound_this: Option<Value>,
         extensible: bool,
     },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum NativeCallable {
+    Builtin(intrinsics::BuiltinId),
+    Bound(Box<BoundCallable>),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BoundCallable {
+    pub(crate) target: Value,
+    pub(crate) this_value: Value,
+    pub(crate) arguments: Vec<Value>,
 }
 
 impl HeapEntry {
@@ -624,13 +637,16 @@ impl HeapEntry {
                 .len()
                 .saturating_mul(CollectionEntry::BYTES)
                 .saturating_add(1),
+            Self::NativeFunction { callable, .. } => match callable {
+                NativeCallable::Builtin(_) => 1,
+                NativeCallable::Bound(bound) => bound.arguments.len().saturating_add(1),
+            },
             Self::Object { .. }
             | Self::Array { .. }
             | Self::Function { .. }
             | Self::Script { .. }
             | Self::ModuleNamespace { .. }
             | Self::ExternalModuleNamespace { .. }
-            | Self::NativeFunction { .. }
             | Self::ProcessEnv { .. }
             | Self::Date { .. }
             | Self::BuiltinIterator { .. }
@@ -656,6 +672,12 @@ struct CallRequest<'a> {
     call_pc: usize,
     constructed: Option<Value>,
     new_target: Value,
+}
+
+pub(crate) struct BoundCall {
+    pub(crate) target: Value,
+    pub(crate) this_value: Value,
+    pub(crate) arguments: Vec<Value>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -770,8 +792,8 @@ enum CalleeKind {
     },
     Builtin {
         id: intrinsics::BuiltinId,
-        bound_this: Option<Value>,
     },
+    Bound,
     NotCallable,
 }
 
@@ -2280,13 +2302,75 @@ impl<'a, H: Host> Machine<'a, H> {
                     },
                     captures: captures.clone(),
                 }),
-                HeapEntry::NativeFunction { id, bound_this, .. } => Ok(CalleeKind::Builtin {
-                    id: *id,
-                    bound_this: *bound_this,
-                }),
+                HeapEntry::NativeFunction { callable, .. } => match callable {
+                    NativeCallable::Builtin(id) => Ok(CalleeKind::Builtin { id: *id }),
+                    NativeCallable::Bound(_) => Ok(CalleeKind::Bound),
+                },
                 _ => Ok(CalleeKind::NotCallable),
             },
             None => Ok(CalleeKind::NotCallable),
+        }
+    }
+
+    pub(crate) fn flatten_bound(
+        &self,
+        callee: Value,
+        this_value: Value,
+        arguments: &[Value],
+    ) -> Result<BoundCall, RuntimeErrorKind> {
+        let mut target = callee;
+        let mut receiver = this_value;
+        let mut segments = Vec::new();
+        let mut total = arguments.len();
+        while let Some(index) = self.runtime_slot(target)? {
+            let HeapEntry::NativeFunction {
+                callable: NativeCallable::Bound(bound),
+                ..
+            } = &self.heap[index]
+            else {
+                break;
+            };
+            total = total.checked_add(bound.arguments.len()).ok_or(
+                RuntimeErrorKind::ArgumentLimitExceeded {
+                    limit: self.limits.max_argument_count,
+                    requested: u32::MAX,
+                },
+            )?;
+            if total > self.limits.max_argument_count as usize {
+                return Err(RuntimeErrorKind::ArgumentLimitExceeded {
+                    limit: self.limits.max_argument_count,
+                    requested: u32::try_from(total).unwrap_or(u32::MAX),
+                });
+            }
+            segments.push(bound.arguments.as_slice());
+            receiver = bound.this_value;
+            target = bound.target;
+        }
+        let mut flattened = Vec::with_capacity(total);
+        for segment in segments.iter().rev() {
+            flattened.extend_from_slice(segment);
+        }
+        flattened.extend_from_slice(arguments);
+        Ok(BoundCall {
+            target,
+            this_value: receiver,
+            arguments: flattened,
+        })
+    }
+
+    fn bound_target(&self, mut value: Value) -> Result<Value, RuntimeErrorKind> {
+        loop {
+            let Some(index) = self.runtime_slot(value)? else {
+                return Ok(value);
+            };
+            let HeapEntry::NativeFunction {
+                callable: NativeCallable::Bound(bound),
+                ..
+            } = &self.heap[index]
+            else {
+                return Ok(value);
+            };
+            value = bound.target;
         }
     }
 
@@ -2494,7 +2578,7 @@ impl<'a, H: Host> Machine<'a, H> {
         self.live_registers -= register_count;
     }
 
-    fn execute_call(&mut self, request: CallRequest) -> Result<(), RuntimeError> {
+    fn execute_call(&mut self, request: CallRequest<'_>) -> Result<(), RuntimeError> {
         let CallRequest {
             callee,
             this_value,
@@ -2504,49 +2588,61 @@ impl<'a, H: Host> Machine<'a, H> {
             constructed,
             new_target,
         } = request;
-        match self.callee_kind(callee) {
-            Ok(CalleeKind::Runtime { target, captures }) => self.push_frame(
-                target,
-                &captures,
-                this_value,
-                new_target,
-                arguments,
-                Some(ReturnTo {
-                    destination: destination.map(|register| register as usize),
-                    call_pc,
-                    constructed,
-                }),
-            ),
-            Ok(CalleeKind::Builtin { id, bound_this }) => {
-                let this_value = bound_this.unwrap_or(this_value);
-                match self.call_builtin(id, this_value, arguments, false) {
-                    Ok(intrinsics::BuiltinOutcome::Value(value)) => {
-                        if let Some(register) = destination {
-                            self.write_register(self.frames.len() - 1, register, value);
-                        }
-                        Ok(())
-                    }
-                    Ok(intrinsics::BuiltinOutcome::Call {
-                        callee,
+        let mut callee = callee;
+        let mut this_value = this_value;
+        let mut arguments = Cow::Borrowed(arguments);
+        loop {
+            match self.callee_kind(callee) {
+                Ok(CalleeKind::Runtime { target, captures }) => {
+                    return self.push_frame(
+                        target,
+                        &captures,
                         this_value,
-                        argument_start,
-                    }) => self.execute_call(CallRequest {
-                        callee,
-                        this_value,
-                        arguments: &arguments[argument_start..],
-                        destination,
-                        call_pc,
-                        constructed,
                         new_target,
-                    }),
-                    Ok(intrinsics::BuiltinOutcome::ConstructCall { .. }) => {
-                        self.throw_type("call", call_pc)
-                    }
-                    Err(failure) => self.resolve_failure(failure, call_pc),
+                        arguments.as_ref(),
+                        Some(ReturnTo {
+                            destination: destination.map(|register| register as usize),
+                            call_pc,
+                            constructed,
+                        }),
+                    );
                 }
+                Ok(CalleeKind::Builtin { id }) => {
+                    match self.call_builtin(id, this_value, arguments.as_ref(), false) {
+                        Ok(intrinsics::BuiltinOutcome::Value(value)) => {
+                            if let Some(register) = destination {
+                                self.write_register(self.frames.len() - 1, register, value);
+                            }
+                            return Ok(());
+                        }
+                        Ok(intrinsics::BuiltinOutcome::Call {
+                            callee: next,
+                            this_value: next_this,
+                            arguments: next_arguments,
+                        }) => {
+                            callee = next;
+                            this_value = next_this;
+                            arguments = Cow::Owned(next_arguments);
+                        }
+                        Ok(intrinsics::BuiltinOutcome::ConstructCall { .. }) => {
+                            return self.throw_type("call", call_pc);
+                        }
+                        Err(failure) => return self.resolve_failure(failure, call_pc),
+                    }
+                }
+                Ok(CalleeKind::Bound) => {
+                    let bound = self
+                        .flatten_bound(callee, this_value, arguments.as_ref())
+                        .map_err(|kind| self.error_here_at(kind, call_pc))?;
+                    callee = bound.target;
+                    if constructed.is_none() {
+                        this_value = bound.this_value;
+                    }
+                    arguments = Cow::Owned(bound.arguments);
+                }
+                Ok(CalleeKind::NotCallable) => return self.throw_type("call", call_pc),
+                Err(kind) => return Err(self.error_here_at(kind, call_pc)),
             }
-            Ok(CalleeKind::NotCallable) => self.throw_type("call", call_pc),
-            Err(kind) => Err(self.error_here_at(kind, call_pc)),
         }
     }
 
@@ -2557,61 +2653,76 @@ impl<'a, H: Host> Machine<'a, H> {
         destination: u32,
         call_pc: usize,
     ) -> Result<(), RuntimeError> {
-        match self.runtime_slot(callee) {
-            Ok(Some(index)) => {
-                if let HeapEntry::NativeFunction { id, .. } = self.heap[index] {
-                    match self.call_builtin(id, Value::UNDEFINED, arguments, true) {
-                        Ok(intrinsics::BuiltinOutcome::Value(value)) => {
-                            self.write_register(self.frames.len() - 1, destination, value);
-                            return Ok(());
-                        }
-                        Ok(intrinsics::BuiltinOutcome::Call { .. }) => {
-                            return self.throw_type("construct", call_pc);
-                        }
-                        Ok(intrinsics::BuiltinOutcome::ConstructCall {
-                            callee: continuation,
-                            this_value,
-                            argument_start,
-                            prototype,
-                        }) => {
-                            let object = self
-                                .allocate_constructed_receiver_with(prototype)
-                                .map_err(|kind| self.error_here_at(kind, call_pc))?;
-                            return self.execute_call(CallRequest {
-                                callee: continuation,
-                                this_value,
-                                arguments: &arguments[argument_start..],
-                                destination: Some(destination),
-                                call_pc,
-                                constructed: Some(object),
-                                new_target: Value::UNDEFINED,
-                            });
-                        }
-                        Err(failure) => return self.resolve_failure(failure, call_pc),
-                    }
-                }
-                if !matches!(
-                    self.heap[index],
-                    HeapEntry::Function { .. } | HeapEntry::NativeFunction { .. }
-                ) {
-                    return self.throw_type("construct", call_pc);
-                }
-                let object = self
-                    .allocate_constructed_receiver(callee)
-                    .map_err(|kind| self.error_here_at(kind, call_pc))?;
-                self.execute_call(CallRequest {
-                    callee,
-                    this_value: object,
-                    arguments,
-                    destination: Some(destination),
-                    call_pc,
-                    constructed: Some(object),
-                    new_target: callee,
-                })
-            }
-            Ok(None) => self.throw_type("construct", call_pc),
-            Err(kind) => Err(self.error_here_at(kind, call_pc)),
+        let mut callee = callee;
+        let mut arguments = Cow::Borrowed(arguments);
+        if matches!(self.callee_kind(callee), Ok(CalleeKind::Bound)) {
+            let bound = self
+                .flatten_bound(callee, Value::UNDEFINED, arguments.as_ref())
+                .map_err(|kind| self.error_here_at(kind, call_pc))?;
+            callee = bound.target;
+            arguments = Cow::Owned(bound.arguments);
         }
+        let index = match self.runtime_slot(callee) {
+            Ok(Some(index)) => index,
+            Ok(None) => return self.throw_type("construct", call_pc),
+            Err(kind) => return Err(self.error_here_at(kind, call_pc)),
+        };
+        let builtin = match &self.heap[index] {
+            HeapEntry::NativeFunction {
+                callable: NativeCallable::Builtin(id),
+                ..
+            } => Some(*id),
+            _ => None,
+        };
+        if let Some(id) = builtin {
+            return match self.call_builtin(id, Value::UNDEFINED, arguments.as_ref(), true) {
+                Ok(intrinsics::BuiltinOutcome::Value(value)) => {
+                    self.write_register(self.frames.len() - 1, destination, value);
+                    Ok(())
+                }
+                Ok(intrinsics::BuiltinOutcome::Call { .. }) => {
+                    self.throw_type("construct", call_pc)
+                }
+                Ok(intrinsics::BuiltinOutcome::ConstructCall {
+                    callee: continuation,
+                    this_value,
+                    arguments: continuation_arguments,
+                    prototype,
+                }) => {
+                    let object = self
+                        .allocate_constructed_receiver_with(prototype)
+                        .map_err(|kind| self.error_here_at(kind, call_pc))?;
+                    self.execute_call(CallRequest {
+                        callee: continuation,
+                        this_value,
+                        arguments: &continuation_arguments,
+                        destination: Some(destination),
+                        call_pc,
+                        constructed: Some(object),
+                        new_target: callee,
+                    })
+                }
+                Err(failure) => self.resolve_failure(failure, call_pc),
+            };
+        }
+        if !matches!(
+            self.heap[index],
+            HeapEntry::Function { .. } | HeapEntry::NativeFunction { .. }
+        ) {
+            return self.throw_type("construct", call_pc);
+        }
+        let object = self
+            .allocate_constructed_receiver(callee)
+            .map_err(|kind| self.error_here_at(kind, call_pc))?;
+        self.execute_call(CallRequest {
+            callee,
+            this_value: object,
+            arguments: arguments.as_ref(),
+            destination: Some(destination),
+            call_pc,
+            constructed: Some(object),
+            new_target: callee,
+        })
     }
 
     fn constructed_prototype(&self, callee: Value) -> Result<Value, RuntimeErrorKind> {
@@ -2852,60 +2963,78 @@ impl<'a, H: Host> Machine<'a, H> {
         this_value: Value,
         arguments: &[Value],
     ) -> Result<Value, EvalFailure> {
-        match self.callee_kind(callee).map_err(EvalFailure::Runtime)? {
-            CalleeKind::Builtin { id, bound_this } => {
-                let receiver = bound_this.unwrap_or(this_value);
-                match self.call_builtin(id, receiver, arguments, false)? {
-                    intrinsics::BuiltinOutcome::Value(value) => Ok(value),
-                    intrinsics::BuiltinOutcome::Call {
-                        callee,
-                        this_value,
-                        argument_start,
-                    } => self.call_value(callee, this_value, &arguments[argument_start..]),
-                    intrinsics::BuiltinOutcome::ConstructCall { .. } => {
-                        Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                            operation: "call",
-                        }))
-                    }
-                }
-            }
-            CalleeKind::Runtime { target, captures } => {
-                let stop_depth = self.frames.len();
-                let return_to = self.frames.last().map(|frame| ReturnTo {
-                    destination: None,
-                    call_pc: frame.pc,
-                    constructed: None,
-                });
-                self.push_frame(
-                    target,
-                    &captures,
-                    this_value,
-                    Value::UNDEFINED,
-                    arguments,
-                    return_to,
-                )
-                .map_err(|error| EvalFailure::Runtime(error.kind))?;
-                match self.run_loop(stop_depth) {
-                    Ok(None) => self.last_completion.take().ok_or(EvalFailure::Runtime(
-                        RuntimeErrorKind::InvalidValue {
-                            value: Value::UNDEFINED,
-                        },
-                    )),
-                    Ok(Some(execution)) => Ok(execution.value),
-                    Err(error) => {
-                        self.unwind_frames_to(stop_depth);
-                        match error.kind {
-                            RuntimeErrorKind::UncaughtThrow { value, .. } => {
-                                Err(EvalFailure::ThrowValue(value))
-                            }
-                            kind => Err(EvalFailure::Runtime(kind)),
+        let mut callee = callee;
+        let mut this_value = this_value;
+        let mut arguments = Cow::Borrowed(arguments);
+        loop {
+            match self.callee_kind(callee).map_err(EvalFailure::Runtime)? {
+                CalleeKind::Builtin { id } => {
+                    match self.call_builtin(id, this_value, arguments.as_ref(), false)? {
+                        intrinsics::BuiltinOutcome::Value(value) => return Ok(value),
+                        intrinsics::BuiltinOutcome::Call {
+                            callee: next,
+                            this_value: next_this,
+                            arguments: next_arguments,
+                        } => {
+                            callee = next;
+                            this_value = next_this;
+                            arguments = Cow::Owned(next_arguments);
+                        }
+                        intrinsics::BuiltinOutcome::ConstructCall { .. } => {
+                            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                                operation: "call",
+                            }));
                         }
                     }
                 }
+                CalleeKind::Runtime { target, captures } => {
+                    let stop_depth = self.frames.len();
+                    let return_to = self.frames.last().map(|frame| ReturnTo {
+                        destination: None,
+                        call_pc: frame.pc,
+                        constructed: None,
+                    });
+                    self.push_frame(
+                        target,
+                        &captures,
+                        this_value,
+                        Value::UNDEFINED,
+                        arguments.as_ref(),
+                        return_to,
+                    )
+                    .map_err(|error| EvalFailure::Runtime(error.kind))?;
+                    return match self.run_loop(stop_depth) {
+                        Ok(None) => self.last_completion.take().ok_or(EvalFailure::Runtime(
+                            RuntimeErrorKind::InvalidValue {
+                                value: Value::UNDEFINED,
+                            },
+                        )),
+                        Ok(Some(execution)) => Ok(execution.value),
+                        Err(error) => {
+                            self.unwind_frames_to(stop_depth);
+                            match error.kind {
+                                RuntimeErrorKind::UncaughtThrow { value, .. } => {
+                                    Err(EvalFailure::ThrowValue(value))
+                                }
+                                kind => Err(EvalFailure::Runtime(kind)),
+                            }
+                        }
+                    };
+                }
+                CalleeKind::Bound => {
+                    let bound = self
+                        .flatten_bound(callee, this_value, arguments.as_ref())
+                        .map_err(EvalFailure::Runtime)?;
+                    callee = bound.target;
+                    this_value = bound.this_value;
+                    arguments = Cow::Owned(bound.arguments);
+                }
+                CalleeKind::NotCallable => {
+                    return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "call",
+                    }));
+                }
             }
-            CalleeKind::NotCallable => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "call",
-            })),
         }
     }
 
@@ -3225,15 +3354,6 @@ impl<'a, H: Host> Machine<'a, H> {
         if slot(self.intrinsics.object_prototype) == Some(index) && name == "toString" {
             return Some(Found::Value(self.intrinsics.object_to_string()));
         }
-        if (slot(self.intrinsics.function_prototype) == Some(index)
-            || matches!(
-                self.heap[index],
-                HeapEntry::Function { .. } | HeapEntry::NativeFunction { .. }
-            ))
-            && name == "call"
-        {
-            return Some(Found::Value(self.intrinsics.function_call()));
-        }
         match &self.heap[index] {
             HeapEntry::Object { properties, .. }
             | HeapEntry::Script { properties, .. }
@@ -3352,16 +3472,6 @@ impl<'a, H: Host> Machine<'a, H> {
             let slot = |value| self.runtime_slot(value).ok().flatten();
             if slot(self.intrinsics.object_prototype) == Some(index) && name.eq_ascii("toString") {
                 return Some(Found::Value(self.intrinsics.object_to_string()));
-            }
-            if slot(self.intrinsics.function_prototype) == Some(index) && name.eq_ascii("call") {
-                return Some(Found::Value(self.intrinsics.function_call()));
-            }
-            if matches!(
-                self.heap[index],
-                HeapEntry::Function { .. } | HeapEntry::NativeFunction { .. }
-            ) && name.eq_ascii("call")
-            {
-                return Some(Found::Value(self.intrinsics.function_call()));
             }
         }
         match &self.heap[index] {
@@ -4975,6 +5085,9 @@ impl<'a, H: Host> Machine<'a, H> {
     /// `value instanceof constructor`: walks `value`'s prototype chain for the
     /// constructor's own `prototype` object, matching by heap identity.
     fn instance_of(&mut self, value: Value, constructor: Value) -> Result<bool, EvalFailure> {
+        let constructor = self
+            .bound_target(constructor)
+            .map_err(EvalFailure::Runtime)?;
         match self
             .runtime_slot(constructor)
             .map_err(EvalFailure::Runtime)?

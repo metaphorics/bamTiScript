@@ -1,13 +1,17 @@
 use std::collections::BTreeMap;
 
-use bamts_bytecode::EcmaString;
+use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
 
 use super::{
-    allocate_array, allocate_string, define_data, install_function, range_error, type_error,
+    allocate_array, allocate_string, define_data, install_function, range_error,
+    to_integer_or_infinity, type_error,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
-use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
+use crate::{
+    BoundCallable, EvalFailure, HeapEntry, Host, Machine, NativeCallable, Property, PropertyKey,
+    PropertyMap, RuntimeErrorKind,
+};
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -58,9 +62,14 @@ pub(super) fn install<H: Host>(
             builtins.set_object_to_string(function);
         }
     }
-    let call = install_function(heap, builtins, "call", 1, function_call::<H>);
-    define_data(heap, builtins.function_prototype(), "call", call);
-    builtins.set_function_call(call);
+    for (name, length, handler) in [
+        ("call", 1, function_call::<H> as BuiltinHandler<H>),
+        ("apply", 2, function_apply::<H>),
+        ("bind", 1, function_bind::<H>),
+    ] {
+        let function = install_function(heap, builtins, name, length, handler);
+        define_data(heap, builtins.function_prototype(), name, function);
+    }
 }
 
 fn machine_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: Value) {
@@ -745,13 +754,147 @@ fn function_call<H: Host>(
     _machine: &mut Machine<'_, H>,
     this: Value,
     args: &[Value],
-    _constructing: bool,
+    constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
+    if constructing {
+        return Err(type_error("Function.prototype.call is not a constructor"));
+    }
     Ok(BuiltinOutcome::Call {
         callee: this,
         this_value: args.first().copied().unwrap_or(Value::UNDEFINED),
-        argument_start: usize::from(!args.is_empty()),
+        arguments: args.get(1..).unwrap_or_default().to_vec(),
     })
+}
+
+fn function_apply<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if constructing {
+        return Err(type_error("Function.prototype.apply is not a constructor"));
+    }
+    if !machine.is_callable(this)? {
+        return Err(type_error(
+            "Function.prototype.apply receiver is not callable",
+        ));
+    }
+    let this_value = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let source = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    let arguments = if matches!(source.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+        Vec::new()
+    } else {
+        create_list_from_array_like(machine, source)?
+    };
+    Ok(BuiltinOutcome::Call {
+        callee: this,
+        this_value,
+        arguments,
+    })
+}
+
+fn create_list_from_array_like<H: Host>(
+    machine: &mut Machine<'_, H>,
+    source: Value,
+) -> Result<Vec<Value>, EvalFailure> {
+    if !machine.is_object(source) {
+        return Err(type_error(
+            "Function.prototype.apply arguments are not an object",
+        ));
+    }
+    let length_value = machine.get_named_property(source, "length")?;
+    let length = to_integer_or_infinity(machine, length_value)?.clamp(0.0, 9_007_199_254_740_991.0);
+    if length > f64::from(machine.limits.max_argument_count) {
+        return Err(EvalFailure::Runtime(
+            RuntimeErrorKind::ArgumentLimitExceeded {
+                limit: machine.limits.max_argument_count,
+                requested: length.min(f64::from(u32::MAX)) as u32,
+            },
+        ));
+    }
+    let length = length as usize;
+    let mut arguments = Vec::with_capacity(length);
+    for index in 0..length {
+        let key = PropertyKey::Named(EcmaString::from_utf8(&index.to_string()));
+        arguments.push(machine.get_property_key(source, &key)?);
+    }
+    Ok(arguments)
+}
+
+fn function_bind<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if constructing {
+        return Err(type_error("Function.prototype.bind is not a constructor"));
+    }
+    if !machine.is_callable(this)? {
+        return Err(type_error(
+            "Function.prototype.bind receiver is not callable",
+        ));
+    }
+    let bound_arguments = args.get(1..).unwrap_or_default().to_vec();
+    let length_key = PropertyKey::Named(EcmaString::from_utf8("length"));
+    let length = if machine.has_own_property_key(this, &length_key)? {
+        let target_length = machine.get_property_key(this, &length_key)?;
+        match target_length.decode() {
+            Some(Decoded::Number(_) | Decoded::Int32(_)) => {
+                let value = to_integer_or_infinity(machine, target_length)?;
+                if value == f64::INFINITY {
+                    value
+                } else {
+                    (value.max(0.0) - bound_arguments.len() as f64).max(0.0)
+                }
+            }
+            _ => 0.0,
+        }
+    } else {
+        0.0
+    };
+    let target_name = machine.get_named_property(this, "name")?;
+    let target_name = machine
+        .string_value(target_name)
+        .unwrap_or_else(|| EcmaString::from_utf8(""));
+    let mut name = EcmaStringBuilder::with_capacity(target_name.len_units().saturating_add(6));
+    name.push_utf8("bound ");
+    for unit in target_name.as_units() {
+        name.push_unit(*unit);
+    }
+    let name = allocate_string(machine, name.finish())?;
+    let mut properties = PropertyMap::default();
+    properties.insert(
+        length_key,
+        Property::Data {
+            value: crate::number_value(length),
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        },
+    );
+    properties.insert(
+        PropertyKey::Named(EcmaString::from_utf8("name")),
+        Property::Data {
+            value: name,
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        },
+    );
+    let value = machine
+        .allocate(HeapEntry::NativeFunction {
+            callable: NativeCallable::Bound(Box::new(BoundCallable {
+                target: this,
+                this_value: args.first().copied().unwrap_or(Value::UNDEFINED),
+                arguments: bound_arguments,
+            })),
+            properties,
+            extensible: true,
+        })
+        .map_err(EvalFailure::Runtime)?;
+    Ok(BuiltinOutcome::Value(value))
 }
 
 pub(super) fn structured_clone<H: Host>(
@@ -872,7 +1015,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::Limits;
+    use crate::{Limits, ThrowOrigin};
 
     #[derive(Default)]
     struct TestHost;
@@ -1795,5 +1938,548 @@ mod tests {
                 ..
             }) if value == crate::number_value(4.0)
         ));
+    }
+    fn probe_handler<H: Host>(
+        machine: &mut Machine<'_, H>,
+        this: Value,
+        args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let mut values = Vec::with_capacity(args.len() + 1);
+        values.push(this);
+        values.extend_from_slice(args);
+        Ok(BuiltinOutcome::Value(allocate_array(machine, values)?))
+    }
+
+    fn probe(machine: &mut Machine<'_, TestHost>, name: &'static str, length: u32) -> Value {
+        let id = machine
+            .intrinsics
+            .builtins
+            .register(crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler: probe_handler::<TestHost>,
+            });
+        crate::intrinsics::native_function(&mut machine.heap, id, name, length)
+    }
+
+    fn call_method(
+        machine: &mut Machine<'_, TestHost>,
+        target: Value,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Value, EvalFailure> {
+        let method = machine.get_named_property(target, name)?;
+        machine.call_value(method, target, args)
+    }
+
+    #[test]
+    fn apply_forwards_array_like_arguments_and_receiver() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = probe(&mut machine, "probe", 2);
+        let receiver = object(&mut machine);
+        let arguments = object(&mut machine);
+        machine
+            .set_data_property(arguments, "length", Value::int32(2))
+            .unwrap();
+        machine
+            .set_data_property(arguments, "0", Value::int32(11))
+            .unwrap();
+        machine
+            .set_data_property(arguments, "1", Value::int32(22))
+            .unwrap();
+
+        let array = allocate_array(&mut machine, vec![Value::int32(11), Value::int32(22)]).unwrap();
+        let array_result = call_method(&mut machine, target, "apply", &[receiver, array]).unwrap();
+        assert_eq!(
+            machine.array_elements(array_result).unwrap().unwrap(),
+            vec![receiver, Value::int32(11), Value::int32(22)]
+        );
+
+        let result = call_method(&mut machine, target, "apply", &[receiver, arguments]).unwrap();
+
+        assert_eq!(
+            machine.array_elements(result).unwrap().unwrap(),
+            vec![receiver, Value::int32(11), Value::int32(22)]
+        );
+        let empty =
+            call_method(&mut machine, target, "apply", &[receiver, Value::UNDEFINED]).unwrap();
+        assert_eq!(
+            machine.array_elements(empty).unwrap().unwrap(),
+            vec![receiver]
+        );
+        let empty = call_method(&mut machine, target, "apply", &[receiver, Value::NULL]).unwrap();
+        assert_eq!(
+            machine.array_elements(empty).unwrap().unwrap(),
+            vec![receiver]
+        );
+        for primitive in [
+            machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("not array-like")))
+                .unwrap(),
+            Value::int32(1),
+            Value::TRUE,
+        ] {
+            assert!(matches!(
+                call_method(&mut machine, target, "apply", &[receiver, primitive]),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+        }
+    }
+
+    #[test]
+    fn apply_reads_length_once_then_indices_in_order() {
+        fn length_getter<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            if machine.get_named_property(this, "reads")? != Value::int32(0) {
+                return Err(type_error("length was read more than once"));
+            }
+            machine.set_data_property(this, "reads", Value::int32(1))?;
+            machine.define_descriptor(
+                this,
+                PropertyKey::Named(EcmaString::from_utf8("length")),
+                Property::Data {
+                    value: Value::int32(0),
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                },
+            )?;
+            Ok(BuiltinOutcome::Value(Value::int32(2)))
+        }
+
+        fn index_zero_getter<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            if machine.get_named_property(this, "next")? != Value::int32(0) {
+                return Err(type_error("array-like indices were read out of order"));
+            }
+            machine.set_data_property(this, "next", Value::int32(1))?;
+            Ok(BuiltinOutcome::Value(Value::int32(11)))
+        }
+
+        fn index_one_getter<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            if machine.get_named_property(this, "next")? != Value::int32(1) {
+                return Err(type_error("array-like indices were read out of order"));
+            }
+            machine.set_data_property(this, "next", Value::int32(2))?;
+            Ok(BuiltinOutcome::Value(Value::int32(22)))
+        }
+
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = probe(&mut machine, "probe", 2);
+        let receiver = object(&mut machine);
+        let arguments = object(&mut machine);
+        machine
+            .set_data_property(arguments, "reads", Value::int32(0))
+            .unwrap();
+        machine
+            .set_data_property(arguments, "next", Value::int32(0))
+            .unwrap();
+        let handlers = [
+            (
+                "length getter",
+                length_getter::<TestHost> as BuiltinHandler<TestHost>,
+            ),
+            ("index 0 getter", index_zero_getter::<TestHost>),
+            ("index 1 getter", index_one_getter::<TestHost>),
+        ];
+        for ((name, handler), key) in handlers.into_iter().zip(["length", "0", "1"]) {
+            let id = machine
+                .intrinsics
+                .builtins
+                .register(crate::intrinsics::BuiltinDef {
+                    name,
+                    length: 0,
+                    handler,
+                });
+            let getter = crate::intrinsics::native_function(&mut machine.heap, id, name, 0);
+            machine
+                .define_descriptor(
+                    arguments,
+                    PropertyKey::Named(EcmaString::from_utf8(key)),
+                    Property::Accessor {
+                        getter: Some(getter),
+                        setter: None,
+                        enumerable: true,
+                        configurable: true,
+                    },
+                )
+                .unwrap();
+        }
+
+        let result = call_method(&mut machine, target, "apply", &[receiver, arguments]).unwrap();
+
+        assert_eq!(
+            machine.array_elements(result).unwrap().unwrap(),
+            vec![receiver, Value::int32(11), Value::int32(22)]
+        );
+        assert_eq!(
+            machine.get_named_property(arguments, "reads").unwrap(),
+            Value::int32(1)
+        );
+        assert_eq!(
+            machine.get_named_property(arguments, "next").unwrap(),
+            Value::int32(2)
+        );
+    }
+
+    #[test]
+    fn apply_rejects_non_callable_before_reading_arguments() {
+        fn mark_length<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            machine.set_data_property(this, "touched", Value::TRUE)?;
+            Ok(BuiltinOutcome::Value(Value::int32(0)))
+        }
+
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let getter_id = machine
+            .intrinsics
+            .builtins
+            .register(crate::intrinsics::BuiltinDef {
+                name: "mark length",
+                length: 0,
+                handler: mark_length::<TestHost>,
+            });
+        let getter =
+            crate::intrinsics::native_function(&mut machine.heap, getter_id, "mark length", 0);
+        let arguments = object(&mut machine);
+        machine
+            .define_descriptor(
+                arguments,
+                PropertyKey::Named(EcmaString::from_utf8("length")),
+                Property::Accessor {
+                    getter: Some(getter),
+                    setter: None,
+                    enumerable: false,
+                    configurable: true,
+                },
+            )
+            .unwrap();
+        let invalid = object(&mut machine);
+        let apply = machine
+            .get_named_property(machine.intrinsics.function_prototype, "apply")
+            .unwrap();
+
+        assert!(matches!(
+            machine.call_value(apply, invalid, &[Value::UNDEFINED, arguments]),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+        assert_eq!(
+            machine.get_named_property(arguments, "touched").unwrap(),
+            Value::UNDEFINED
+        );
+    }
+
+    #[test]
+    fn bind_pins_receiver_prepends_arguments_and_sets_metadata() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = probe(&mut machine, "probe", 2);
+        let receiver = object(&mut machine);
+        let ignored = object(&mut machine);
+        let no_arguments = call_method(&mut machine, target, "bind", &[]).unwrap();
+        assert_eq!(
+            machine.get_named_property(no_arguments, "length").unwrap(),
+            crate::number_value(2.0)
+        );
+        let saturated = call_method(
+            &mut machine,
+            target,
+            "bind",
+            &[receiver, Value::int32(1), Value::int32(2), Value::int32(3)],
+        )
+        .unwrap();
+        assert_eq!(
+            machine.get_named_property(saturated, "length").unwrap(),
+            crate::number_value(0.0)
+        );
+        let bound =
+            call_method(&mut machine, target, "bind", &[receiver, Value::int32(1)]).unwrap();
+
+        let result = machine
+            .call_value(bound, ignored, &[Value::int32(2)])
+            .unwrap();
+        assert_eq!(
+            machine.array_elements(result).unwrap().unwrap(),
+            vec![receiver, Value::int32(1), Value::int32(2)]
+        );
+        assert_eq!(
+            machine.get_named_property(bound, "length").unwrap(),
+            crate::number_value(1.0)
+        );
+        let name = machine.get_named_property(bound, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name)
+                .is_some_and(|name| name.eq_ascii("bound probe"))
+        );
+        assert_eq!(
+            machine.prototype_value(bound).unwrap(),
+            Some(machine.intrinsics.function_prototype)
+        );
+        assert!(
+            !machine
+                .has_own_property_key(
+                    bound,
+                    &PropertyKey::Named(EcmaString::from_utf8("prototype")),
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            machine.own_property_keys(bound).unwrap(),
+            vec![
+                PropertyKey::Named(EcmaString::from_utf8("length")),
+                PropertyKey::Named(EcmaString::from_utf8("name")),
+            ]
+        );
+
+        let nested = call_method(&mut machine, bound, "bind", &[ignored, Value::int32(3)]).unwrap();
+        let nested_result = machine
+            .call_value(nested, Value::UNDEFINED, &[Value::int32(4)])
+            .unwrap();
+        assert_eq!(
+            machine.array_elements(nested_result).unwrap().unwrap(),
+            vec![receiver, Value::int32(1), Value::int32(3), Value::int32(4),]
+        );
+        let name = machine.get_named_property(nested, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name)
+                .is_some_and(|name| name.eq_ascii("bound bound probe"))
+        );
+    }
+
+    #[test]
+    fn bound_constructor_uses_target_prototype_and_instanceof() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let prototype = object(&mut machine);
+        let mut properties = PropertyMap::default();
+        properties.insert(
+            PropertyKey::Named(EcmaString::from_utf8("prototype")),
+            Property::Data {
+                value: prototype,
+                writable: true,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        let target = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(0),
+                captures: Vec::new(),
+                properties,
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        let bound_this = object(&mut machine);
+        let bound =
+            call_method(&mut machine, target, "bind", &[bound_this, Value::int32(1)]).unwrap();
+        machine.execute_construct(bound, &[], 0, 0).unwrap();
+        assert_eq!(machine.frames.len(), 2);
+        assert!(machine.run_loop(1).unwrap().is_none());
+        let instance = machine.read_register(0, 0);
+
+        assert_eq!(machine.prototype_value(instance).unwrap(), Some(prototype));
+        assert!(machine.instance_of(instance, bound).unwrap());
+        assert!(machine.instance_of(instance, target).unwrap());
+    }
+    #[test]
+    fn function_prototype_methods_reject_invalid_receivers_and_construction() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = probe(&mut machine, "probe", 2);
+        let invalid = object(&mut machine);
+
+        for name in ["call", "apply", "bind"] {
+            let method = machine
+                .get_named_property(machine.intrinsics.function_prototype, name)
+                .unwrap();
+            assert!(matches!(
+                machine.call_value(method, invalid, &[]),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+            let index = machine.runtime_slot(method).unwrap().unwrap();
+            let HeapEntry::NativeFunction {
+                callable: NativeCallable::Builtin(id),
+                ..
+            } = machine.heap[index]
+            else {
+                panic!("Function.prototype method is a builtin");
+            };
+            assert!(matches!(
+                machine.call_builtin(id, target, &[], true),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+        }
+    }
+
+    #[test]
+    fn bound_function_reports_callable_identity() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = probe(&mut machine, "probe", 2);
+        let bound = call_method(&mut machine, target, "bind", &[]).unwrap();
+
+        assert_eq!(machine.type_of(bound), "function");
+        let tag = machine
+            .call_value(machine.intrinsics.object_to_string(), bound, &[])
+            .unwrap();
+        assert!(
+            machine
+                .string_value(tag)
+                .is_some_and(|text| text.eq_ascii("[object Function]"))
+        );
+        assert_eq!(
+            machine.prototype_value(bound).unwrap(),
+            Some(machine.intrinsics.function_prototype)
+        );
+        assert!(
+            machine
+                .to_string(bound)
+                .is_ok_and(|text| text.eq_ascii("function () { [native code] }"))
+        );
+    }
+
+    #[test]
+    fn function_prototype_methods_are_ordinary_own_properties() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = probe(&mut machine, "probe", 2);
+        let call_key = PropertyKey::Named(EcmaString::from_utf8("call"));
+
+        assert!(!machine.has_own_property_key(target, &call_key).unwrap());
+        machine
+            .set_data_property_key(target, call_key.clone(), Value::int32(1))
+            .unwrap();
+        assert_eq!(
+            machine.get_property_key(target, &call_key).unwrap(),
+            Value::int32(1)
+        );
+        for name in ["call", "apply", "bind"] {
+            let method = machine
+                .get_named_property(machine.intrinsics.function_prototype, name)
+                .unwrap();
+            assert!(machine.is_callable(method).unwrap());
+        }
+    }
+
+    #[test]
+    fn bound_and_applied_argument_lists_respect_the_limit() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(
+            &module,
+            &mut host,
+            Limits {
+                max_argument_count: 4,
+                ..Limits::default()
+            },
+        );
+        let target = probe(&mut machine, "probe", 2);
+        let receiver = object(&mut machine);
+        let bound = call_method(
+            &mut machine,
+            target,
+            "bind",
+            &[
+                receiver,
+                Value::int32(1),
+                Value::int32(2),
+                Value::int32(3),
+                Value::int32(4),
+            ],
+        )
+        .unwrap();
+        assert!(matches!(
+            machine.call_value(bound, Value::UNDEFINED, &[Value::int32(5)]),
+            Err(EvalFailure::Runtime(
+                RuntimeErrorKind::ArgumentLimitExceeded {
+                    limit: 4,
+                    requested: 5,
+                }
+            ))
+        ));
+
+        let arguments = allocate_array(&mut machine, vec![Value::UNDEFINED; 5]).unwrap();
+        assert!(matches!(
+            call_method(&mut machine, target, "apply", &[receiver, arguments]),
+            Err(EvalFailure::Runtime(
+                RuntimeErrorKind::ArgumentLimitExceeded {
+                    limit: 4,
+                    requested: 5,
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn deep_bound_call_chains_use_constant_native_stack() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = probe(&mut machine, "probe", 2);
+        let call = machine
+            .get_named_property(machine.intrinsics.function_prototype, "call")
+            .unwrap();
+        let mut head = target;
+        for _ in 0..50_000 {
+            head = machine
+                .allocate(HeapEntry::NativeFunction {
+                    callable: NativeCallable::Bound(Box::new(BoundCallable {
+                        target: call,
+                        this_value: head,
+                        arguments: Vec::new(),
+                    })),
+                    properties: PropertyMap::default(),
+                    extensible: true,
+                })
+                .unwrap();
+        }
+        let result = machine.call_value(head, Value::UNDEFINED, &[]).unwrap();
+        assert_eq!(
+            machine.array_elements(result).unwrap().unwrap(),
+            vec![Value::UNDEFINED]
+        );
+
+        let receiver = object(&mut machine);
+        let mut arguments = Vec::with_capacity(machine.limits.max_argument_count as usize);
+        arguments.push(target);
+        arguments.push(receiver);
+        arguments.resize(machine.limits.max_argument_count as usize, Value::UNDEFINED);
+        let result = machine.call_value(call, call, &arguments).unwrap();
+        let values = machine.array_elements(result).unwrap().unwrap();
+        assert_eq!(values.len(), machine.limits.max_argument_count as usize - 1);
+        assert_eq!(values[0], receiver);
     }
 }

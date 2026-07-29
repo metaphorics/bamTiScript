@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
-use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyMap, ThrowOrigin};
+use crate::{EvalFailure, HeapEntry, Host, Machine, NativeCallable, PropertyMap, ThrowOrigin};
 
 #[path = "builtins/mod.rs"]
 pub(crate) mod builtins;
@@ -15,18 +15,18 @@ mod regexp;
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct BuiltinId(usize);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum BuiltinOutcome {
     Value(Value),
     Call {
         callee: Value,
         this_value: Value,
-        argument_start: usize,
+        arguments: Vec<Value>,
     },
     ConstructCall {
         callee: Value,
         this_value: Value,
-        argument_start: usize,
+        arguments: Vec<Value>,
         prototype: Value,
     },
 }
@@ -57,7 +57,6 @@ pub(crate) struct BuiltinTable<H: Host> {
     symbol_iterator: Option<Value>,
     symbol_to_string_tag: Option<Value>,
     symbol_prototype: Option<Value>,
-    function_call: Option<Value>,
     object_to_string: Option<Value>,
     regexp_prototype: Option<Value>,
     iterator_prototype: Option<Value>,
@@ -85,7 +84,6 @@ impl<H: Host> BuiltinTable<H> {
             symbol_iterator: None,
             symbol_to_string_tag: None,
             symbol_prototype: None,
-            function_call: None,
             object_to_string: None,
             regexp_prototype: None,
             iterator_prototype: None,
@@ -152,15 +150,6 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn symbol_to_string_tag(&self) -> Value {
         self.symbol_to_string_tag
             .expect("Symbol builtins install first")
-    }
-
-    pub(crate) fn set_function_call(&mut self, function: Value) {
-        self.function_call = Some(function);
-    }
-
-    pub(crate) fn function_call(&self) -> Value {
-        self.function_call
-            .expect("Function builtins install Function.prototype.call")
     }
 
     pub(crate) fn set_object_to_string(&mut self, function: Value) {
@@ -239,7 +228,11 @@ impl<H: Host> BuiltinTable<H> {
         prototype: Value,
     ) {
         let index = heap_index(constructor);
-        let HeapEntry::NativeFunction { id, .. } = heap[index] else {
+        let HeapEntry::NativeFunction {
+            callable: NativeCallable::Builtin(id),
+            ..
+        } = heap[index]
+        else {
             panic!("error constructor is a native function");
         };
         self.error_prototypes.push((id, prototype));
@@ -334,10 +327,6 @@ impl<H: Host> Intrinsics<H> {
             .expect("every error builtin has a realm prototype")
     }
 
-    pub(crate) fn function_call(&self) -> Value {
-        self.builtins.function_call()
-    }
-
     pub(crate) fn object_to_string(&self) -> Value {
         self.builtins.object_to_string()
     }
@@ -384,9 +373,8 @@ pub(crate) fn native_function(
     push(
         heap,
         HeapEntry::NativeFunction {
-            id,
+            callable: NativeCallable::Builtin(id),
             properties,
-            bound_this: None,
             extensible: true,
         },
     )
@@ -655,7 +643,11 @@ mod tests {
     ) -> Value {
         let constructor = machine.intrinsics.global(name).expect("global exists");
         let index = machine.runtime_slot(constructor).unwrap().unwrap();
-        let HeapEntry::NativeFunction { id, .. } = machine.heap[index] else {
+        let HeapEntry::NativeFunction {
+            callable: NativeCallable::Builtin(id),
+            ..
+        } = machine.heap[index]
+        else {
             panic!("constructor is native")
         };
         let BuiltinOutcome::Value(value) = machine

@@ -314,7 +314,11 @@ mod tests {
             .allocate(HeapEntry::String(EcmaString::from_utf8(flags)))
             .unwrap();
         let index = machine.runtime_slot(constructor).unwrap().unwrap();
-        let HeapEntry::NativeFunction { id, .. } = machine.heap[index] else {
+        let HeapEntry::NativeFunction {
+            callable: crate::NativeCallable::Builtin(id),
+            ..
+        } = machine.heap[index]
+        else {
             panic!("RegExp constructor is native")
         };
         let BuiltinOutcome::Value(value) = machine

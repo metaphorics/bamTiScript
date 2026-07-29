@@ -179,7 +179,7 @@ fn run_in_this_context<H: Host>(
         ScriptAllocation::Call
     };
     let entry = compile_entry(machine, code, name, allocation)?;
-    call_entry(machine, entry, args.len(), prototype)
+    call_entry(machine, entry, prototype)
 }
 
 fn script_run_in_this_context<H: Host>(
@@ -211,7 +211,7 @@ fn script_run_in_this_context<H: Host>(
             "Script.prototype.runInThisContext called on incompatible receiver",
         ));
     };
-    call_entry(machine, *entry, args.len(), None)
+    call_entry(machine, *entry, None)
 }
 
 fn source_arguments<H: Host>(
@@ -306,7 +306,6 @@ fn script_prototype<H: Host>(machine: &Machine<'_, H>) -> Value {
 fn call_entry<H: Host>(
     machine: &Machine<'_, H>,
     entry: Value,
-    argument_start: usize,
     prototype: Option<Value>,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let this_value = machine
@@ -317,13 +316,13 @@ fn call_entry<H: Host>(
         Some(prototype) => BuiltinOutcome::ConstructCall {
             callee: entry,
             this_value,
-            argument_start,
+            arguments: Vec::new(),
             prototype,
         },
         None => BuiltinOutcome::Call {
             callee: entry,
             this_value,
-            argument_start,
+            arguments: Vec::new(),
         },
     })
 }
@@ -442,7 +441,11 @@ mod tests {
             .runtime_slot(value)
             .expect("builtin value is valid")
             .expect("builtin is a runtime object");
-        let HeapEntry::NativeFunction { id, .. } = &machine.heap[index] else {
+        let HeapEntry::NativeFunction {
+            callable: crate::NativeCallable::Builtin(id),
+            ..
+        } = &machine.heap[index]
+        else {
             panic!("module export is a native function");
         };
         *id

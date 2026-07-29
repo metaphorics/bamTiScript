@@ -47,6 +47,7 @@
 //! [`bamts_native::NativeFrame::new`] are safe constructors, and all raw-pointer
 //! dereferencing stays inside `bamts-native`.
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::fmt;
@@ -986,52 +987,82 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         args: &[Value],
         new_target: Value,
     ) -> InvokeOutcome {
-        let kind = self.machine.borrow().callee_kind(callee);
-        match kind {
-            Ok(CalleeKind::Runtime { target, captures }) => {
-                self.invoke_runtime(target, &captures, this, new_target, args)
-            }
-            Ok(CalleeKind::Builtin { id, bound_this }) => {
-                let this = bound_this.unwrap_or(this);
-                let result = self
-                    .machine
-                    .borrow_mut()
-                    .call_builtin(id, this, args, false);
-                match result {
-                    Ok(BuiltinOutcome::Value(value)) => InvokeOutcome::Value(value),
-                    Ok(BuiltinOutcome::Call {
-                        callee,
-                        this_value,
-                        argument_start,
-                    }) => self.invoke_callee(
-                        callee,
-                        this_value,
-                        &args[argument_start..],
-                        Value::UNDEFINED,
-                    ),
-                    Ok(BuiltinOutcome::ConstructCall { .. }) => InvokeOutcome::Threw(
-                        Value::UNDEFINED,
-                        ThrowOrigin::TypeError { operation: "call" },
-                    ),
-                    Err(EvalFailure::Throw(origin)) => {
-                        InvokeOutcome::Threw(Value::UNDEFINED, origin)
-                    }
-                    Err(EvalFailure::ThrowValue(value)) => {
-                        InvokeOutcome::Threw(value, ThrowOrigin::Bytecode)
-                    }
-                    Err(EvalFailure::Runtime(kind)) => {
-                        self.pending_fatal_kind.set(Some(kind));
-                        InvokeOutcome::Fatal
+        let mut callee = callee;
+        let mut this = this;
+        let mut args = Cow::Borrowed(args);
+        let mut new_target = new_target;
+        loop {
+            let kind = self.machine.borrow().callee_kind(callee);
+            match kind {
+                Ok(CalleeKind::Runtime { target, captures }) => {
+                    return self.invoke_runtime(target, &captures, this, new_target, args.as_ref());
+                }
+                Ok(CalleeKind::Builtin { id }) => {
+                    let result =
+                        self.machine
+                            .borrow_mut()
+                            .call_builtin(id, this, args.as_ref(), false);
+                    match result {
+                        Ok(BuiltinOutcome::Value(value)) => {
+                            return InvokeOutcome::Value(value);
+                        }
+                        Ok(BuiltinOutcome::Call {
+                            callee: next,
+                            this_value: next_this,
+                            arguments: next_arguments,
+                        }) => {
+                            callee = next;
+                            this = next_this;
+                            args = Cow::Owned(next_arguments);
+                            new_target = Value::UNDEFINED;
+                        }
+                        Ok(BuiltinOutcome::ConstructCall { .. }) => {
+                            return InvokeOutcome::Threw(
+                                Value::UNDEFINED,
+                                ThrowOrigin::TypeError { operation: "call" },
+                            );
+                        }
+                        Err(EvalFailure::Throw(origin)) => {
+                            return InvokeOutcome::Threw(Value::UNDEFINED, origin);
+                        }
+                        Err(EvalFailure::ThrowValue(value)) => {
+                            return InvokeOutcome::Threw(value, ThrowOrigin::Bytecode);
+                        }
+                        Err(EvalFailure::Runtime(kind)) => {
+                            self.pending_fatal_kind.set(Some(kind));
+                            return InvokeOutcome::Fatal;
+                        }
                     }
                 }
-            }
-            Ok(CalleeKind::NotCallable) => InvokeOutcome::Threw(
-                Value::UNDEFINED,
-                ThrowOrigin::TypeError { operation: "call" },
-            ),
-            Err(kind) => {
-                self.pending_fatal_kind.set(Some(kind));
-                InvokeOutcome::Fatal
+                Ok(CalleeKind::Bound) => {
+                    let bound = self
+                        .machine
+                        .borrow()
+                        .flatten_bound(callee, this, args.as_ref());
+                    match bound {
+                        Ok(bound) => {
+                            callee = bound.target;
+                            if new_target == Value::UNDEFINED {
+                                this = bound.this_value;
+                            }
+                            args = Cow::Owned(bound.arguments);
+                        }
+                        Err(kind) => {
+                            self.pending_fatal_kind.set(Some(kind));
+                            return InvokeOutcome::Fatal;
+                        }
+                    }
+                }
+                Ok(CalleeKind::NotCallable) => {
+                    return InvokeOutcome::Threw(
+                        Value::UNDEFINED,
+                        ThrowOrigin::TypeError { operation: "call" },
+                    );
+                }
+                Err(kind) => {
+                    self.pending_fatal_kind.set(Some(kind));
+                    return InvokeOutcome::Fatal;
+                }
             }
         }
     }
@@ -1350,13 +1381,33 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     /// invoke with `new.target`, and override a non-object return with the
     /// instance — the shared construct semantics, over native activations.
     fn construct(&self, callee: Value, arguments: &[Value]) -> HelperResult {
+        let mut callee = callee;
+        let mut arguments = Cow::Borrowed(arguments);
+        if matches!(
+            self.machine.borrow().callee_kind(callee),
+            Ok(CalleeKind::Bound)
+        ) {
+            let bound =
+                self.machine
+                    .borrow()
+                    .flatten_bound(callee, Value::UNDEFINED, arguments.as_ref());
+            match bound {
+                Ok(bound) => {
+                    callee = bound.target;
+                    arguments = Cow::Owned(bound.arguments);
+                }
+                Err(kind) => return self.fatal(kind),
+            }
+        }
         let kind = self.machine.borrow().callee_kind(callee);
         match kind {
-            Ok(CalleeKind::Builtin { id, .. }) => {
-                let result =
-                    self.machine
-                        .borrow_mut()
-                        .call_builtin(id, Value::UNDEFINED, arguments, true);
+            Ok(CalleeKind::Builtin { id }) => {
+                let result = self.machine.borrow_mut().call_builtin(
+                    id,
+                    Value::UNDEFINED,
+                    arguments.as_ref(),
+                    true,
+                );
                 match result {
                     Ok(BuiltinOutcome::Value(value)) => HelperResult::normal(value),
                     Ok(BuiltinOutcome::Call { .. }) => {
@@ -1371,7 +1422,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     Ok(BuiltinOutcome::ConstructCall {
                         callee: continuation,
                         this_value,
-                        argument_start,
+                        arguments: continuation_arguments,
                         prototype,
                     }) => {
                         let instance = match self
@@ -1385,8 +1436,8 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         let outcome = self.invoke_callee(
                             continuation,
                             this_value,
-                            &arguments[argument_start..],
-                            Value::UNDEFINED,
+                            &continuation_arguments,
+                            callee,
                         );
                         match outcome {
                             InvokeOutcome::Value(returned) => {
@@ -1410,7 +1461,8 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         Err(kind) => return self.fatal(kind),
                     }
                 };
-                let outcome = self.invoke_runtime(target, &captures, instance, callee, arguments);
+                let outcome =
+                    self.invoke_runtime(target, &captures, instance, callee, arguments.as_ref());
                 match outcome {
                     InvokeOutcome::Value(returned) => {
                         let is_object = self.machine.borrow().is_object(returned);
@@ -1419,6 +1471,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     other => self.outcome_result(other),
                 }
             }
+            Ok(CalleeKind::Bound) => self.fatal(RuntimeErrorKind::InvalidValue { value: callee }),
             Ok(CalleeKind::NotCallable) => {
                 self.pending_throw.set(Some(PendingThrow {
                     value: Value::UNDEFINED,
@@ -2069,6 +2122,57 @@ mod tests {
             FunctionFlags::default(),
             code,
             Vec::new(),
+        )
+    }
+
+    fn receiver_sum_function() -> Function {
+        module_function(
+            0,
+            5,
+            vec![
+                Instruction::LoadThis { dst: reg(0) },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(1),
+                },
+                Instruction::GetProperty {
+                    dst: reg(2),
+                    object: reg(0),
+                    key: reg(1),
+                },
+                Instruction::LoadArguments { dst: reg(3) },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(2),
+                },
+                Instruction::GetProperty {
+                    dst: reg(4),
+                    object: reg(3),
+                    key: reg(1),
+                },
+                Instruction::Binary {
+                    dst: reg(2),
+                    op: BinaryOp::Add,
+                    left: reg(2),
+                    right: reg(4),
+                },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(3),
+                },
+                Instruction::GetProperty {
+                    dst: reg(4),
+                    object: reg(3),
+                    key: reg(1),
+                },
+                Instruction::Binary {
+                    dst: reg(2),
+                    op: BinaryOp::Add,
+                    left: reg(2),
+                    right: reg(4),
+                },
+                Instruction::Return { value: reg(2) },
+            ],
         )
     }
 
@@ -3506,6 +3610,406 @@ mod tests {
             )],
         );
         assert_eq!(assert_parity(&module, || SilentHost), Value::TRUE);
+    }
+
+    #[test]
+    fn bound_calls_match_between_engines() {
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("bind")),
+                Constant::String(EcmaString::from_utf8("marker")),
+                Constant::String(EcmaString::from_utf8("0")),
+                Constant::String(EcmaString::from_utf8("1")),
+                Constant::Int32(7),
+                Constant::Int32(1),
+                Constant::Int32(2),
+            ],
+            vec![
+                entry_function(
+                    8,
+                    vec![
+                        Instruction::CreateArray { dst: reg(0) },
+                        Instruction::CreateClosure {
+                            dst: reg(0),
+                            function: FunctionId::new(1),
+                            captures: reg(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(0),
+                        },
+                        Instruction::GetProperty {
+                            dst: reg(2),
+                            object: reg(0),
+                            key: reg(1),
+                        },
+                        Instruction::CreateObject { dst: reg(3) },
+                        Instruction::LoadConst {
+                            dst: reg(4),
+                            constant: cid(1),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(6),
+                            constant: cid(4),
+                        },
+                        Instruction::SetProperty {
+                            object: reg(3),
+                            key: reg(4),
+                            value: reg(6),
+                        },
+                        Instruction::CreateArray { dst: reg(5) },
+                        Instruction::ArrayPush {
+                            array: reg(5),
+                            value: reg(3),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(6),
+                            constant: cid(5),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(5),
+                            value: reg(6),
+                        },
+                        Instruction::Call {
+                            dst: reg(7),
+                            callee: reg(2),
+                            this_value: reg(0),
+                            arguments: reg(5),
+                        },
+                        Instruction::CreateArray { dst: reg(5) },
+                        Instruction::LoadConst {
+                            dst: reg(6),
+                            constant: cid(6),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(5),
+                            value: reg(6),
+                        },
+                        Instruction::Call {
+                            dst: reg(7),
+                            callee: reg(7),
+                            this_value: reg(3),
+                            arguments: reg(5),
+                        },
+                        Instruction::Return { value: reg(7) },
+                    ],
+                ),
+                receiver_sum_function(),
+            ],
+        );
+
+        assert_eq!(
+            assert_parity(&module, || SilentHost),
+            crate::number_value(10.0)
+        );
+    }
+
+    #[test]
+    fn applied_calls_match_between_engines() {
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("apply")),
+                Constant::String(EcmaString::from_utf8("marker")),
+                Constant::String(EcmaString::from_utf8("0")),
+                Constant::String(EcmaString::from_utf8("1")),
+                Constant::Int32(7),
+                Constant::Int32(1),
+                Constant::Int32(2),
+                Constant::String(EcmaString::from_utf8("length")),
+                Constant::Undefined,
+            ],
+            vec![
+                entry_function(
+                    8,
+                    vec![
+                        Instruction::CreateArray { dst: reg(0) },
+                        Instruction::CreateClosure {
+                            dst: reg(0),
+                            function: FunctionId::new(1),
+                            captures: reg(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(0),
+                        },
+                        Instruction::GetProperty {
+                            dst: reg(2),
+                            object: reg(0),
+                            key: reg(1),
+                        },
+                        Instruction::CreateObject { dst: reg(3) },
+                        Instruction::LoadConst {
+                            dst: reg(4),
+                            constant: cid(1),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(6),
+                            constant: cid(4),
+                        },
+                        Instruction::SetProperty {
+                            object: reg(3),
+                            key: reg(4),
+                            value: reg(6),
+                        },
+                        Instruction::CreateArray { dst: reg(5) },
+                        Instruction::LoadConst {
+                            dst: reg(6),
+                            constant: cid(5),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(5),
+                            value: reg(6),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(6),
+                            constant: cid(6),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(5),
+                            value: reg(6),
+                        },
+                        Instruction::CreateArray { dst: reg(6) },
+                        Instruction::ArrayPush {
+                            array: reg(6),
+                            value: reg(3),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(6),
+                            value: reg(5),
+                        },
+                        Instruction::Call {
+                            dst: reg(7),
+                            callee: reg(2),
+                            this_value: reg(0),
+                            arguments: reg(6),
+                        },
+                        Instruction::CreateArray { dst: reg(0) },
+                        Instruction::CreateClosure {
+                            dst: reg(0),
+                            function: FunctionId::new(2),
+                            captures: reg(0),
+                        },
+                        Instruction::GetProperty {
+                            dst: reg(2),
+                            object: reg(0),
+                            key: reg(1),
+                        },
+                        Instruction::CreateArray { dst: reg(6) },
+                        Instruction::ArrayPush {
+                            array: reg(6),
+                            value: reg(3),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(4),
+                            constant: cid(8),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(6),
+                            value: reg(4),
+                        },
+                        Instruction::Call {
+                            dst: reg(4),
+                            callee: reg(2),
+                            this_value: reg(0),
+                            arguments: reg(6),
+                        },
+                        Instruction::Binary {
+                            dst: reg(7),
+                            op: BinaryOp::Add,
+                            left: reg(7),
+                            right: reg(4),
+                        },
+                        Instruction::Return { value: reg(7) },
+                    ],
+                ),
+                receiver_sum_function(),
+                module_function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadArguments { dst: reg(0) },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(7),
+                        },
+                        Instruction::GetProperty {
+                            dst: reg(2),
+                            object: reg(0),
+                            key: reg(1),
+                        },
+                        Instruction::Return { value: reg(2) },
+                    ],
+                ),
+            ],
+        );
+
+        assert_eq!(
+            assert_parity(&module, || SilentHost),
+            crate::number_value(10.0)
+        );
+    }
+
+    #[test]
+    fn bound_construction_matches_between_engines() {
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("bind")),
+                Constant::String(EcmaString::from_utf8("prototype")),
+                Constant::String(EcmaString::from_utf8("sum")),
+                Constant::String(EcmaString::from_utf8("0")),
+                Constant::String(EcmaString::from_utf8("1")),
+                Constant::Int32(4),
+                Constant::Int32(5),
+                Constant::Int32(9),
+                Constant::Undefined,
+            ],
+            vec![
+                entry_function(
+                    10,
+                    vec![
+                        Instruction::CreateArray { dst: reg(0) },
+                        Instruction::CreateClosure {
+                            dst: reg(0),
+                            function: FunctionId::new(1),
+                            captures: reg(0),
+                        },
+                        Instruction::CreateObject { dst: reg(2) },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(1),
+                        },
+                        Instruction::SetProperty {
+                            object: reg(0),
+                            key: reg(1),
+                            value: reg(2),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(0),
+                        },
+                        Instruction::GetProperty {
+                            dst: reg(3),
+                            object: reg(0),
+                            key: reg(1),
+                        },
+                        Instruction::CreateObject { dst: reg(4) },
+                        Instruction::CreateArray { dst: reg(5) },
+                        Instruction::ArrayPush {
+                            array: reg(5),
+                            value: reg(4),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(6),
+                            constant: cid(5),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(5),
+                            value: reg(6),
+                        },
+                        Instruction::Call {
+                            dst: reg(7),
+                            callee: reg(3),
+                            this_value: reg(0),
+                            arguments: reg(5),
+                        },
+                        Instruction::CreateArray { dst: reg(5) },
+                        Instruction::LoadConst {
+                            dst: reg(6),
+                            constant: cid(6),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(5),
+                            value: reg(6),
+                        },
+                        Instruction::Construct {
+                            dst: reg(8),
+                            callee: reg(7),
+                            arguments: reg(5),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(2),
+                        },
+                        Instruction::GetProperty {
+                            dst: reg(9),
+                            object: reg(8),
+                            key: reg(1),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(6),
+                            constant: cid(7),
+                        },
+                        Instruction::Binary {
+                            dst: reg(9),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(9),
+                            right: reg(6),
+                        },
+                        Instruction::Binary {
+                            dst: reg(6),
+                            op: BinaryOp::InstanceOf,
+                            left: reg(8),
+                            right: reg(7),
+                        },
+                        Instruction::Binary {
+                            dst: reg(9),
+                            op: BinaryOp::BitAnd,
+                            left: reg(9),
+                            right: reg(6),
+                        },
+                        Instruction::Return { value: reg(9) },
+                    ],
+                ),
+                module_function(
+                    0,
+                    6,
+                    vec![
+                        Instruction::LoadThis { dst: reg(0) },
+                        Instruction::LoadArguments { dst: reg(1) },
+                        Instruction::LoadConst {
+                            dst: reg(2),
+                            constant: cid(3),
+                        },
+                        Instruction::GetProperty {
+                            dst: reg(3),
+                            object: reg(1),
+                            key: reg(2),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(2),
+                            constant: cid(4),
+                        },
+                        Instruction::GetProperty {
+                            dst: reg(4),
+                            object: reg(1),
+                            key: reg(2),
+                        },
+                        Instruction::Binary {
+                            dst: reg(3),
+                            op: BinaryOp::Add,
+                            left: reg(3),
+                            right: reg(4),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(2),
+                            constant: cid(2),
+                        },
+                        Instruction::SetProperty {
+                            object: reg(0),
+                            key: reg(2),
+                            value: reg(3),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(5),
+                            constant: cid(8),
+                        },
+                        Instruction::Return { value: reg(5) },
+                    ],
+                ),
+            ],
+        );
+
+        assert_eq!(assert_parity(&module, || SilentHost), Value::int32(1));
     }
 
     #[test]
