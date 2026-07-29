@@ -374,7 +374,7 @@ fn decode_aot_program(
     bamts_bytecode::decode_verified_program(bytes, &bamts_bytecode::ProgramDecodeLimits::default())
 }
 
-#[cfg(feature = "aot-main")]
+#[cfg(all(feature = "aot-main", not(test)))]
 fn run_aot_main() -> i32 {
     use bamts_native::linked_program;
     use bamts_runtime::{Limits, run_linked_program};
@@ -391,11 +391,16 @@ fn run_aot_main() -> i32 {
     if let Err(error) =
         initialize_aot_process_context(&mut host, std::env::args_os(), std::env::vars_os())
     {
-        return finish_aot_process(&host, AotCompletion::Failure(AotMainFailure::Context(error)));
+        return finish_aot_process(
+            &host,
+            AotCompletion::Failure(AotMainFailure::Context(error)),
+        );
     }
     let outcome = match run_linked_program(&program, &linked, &mut host, &Limits::default()) {
         Ok(outcome) => outcome,
-        Err(_) => return finish_aot_process(&host, AotCompletion::Failure(AotMainFailure::Runtime)),
+        Err(_) => {
+            return finish_aot_process(&host, AotCompletion::Failure(AotMainFailure::Runtime));
+        }
     };
     finish_aot_process(&host, AotCompletion::Success(&outcome))
 }
@@ -466,7 +471,7 @@ fn write_aot_completion(
     Ok(exit_code)
 }
 
-#[cfg(feature = "aot-main")]
+#[cfg(all(feature = "aot-main", not(test)))]
 fn finish_aot_process(host: &NodeHost, completion: AotCompletion<'_>) -> i32 {
     let mut stdout = std::io::stdout().lock();
     let mut stderr = std::io::stderr().lock();
