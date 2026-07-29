@@ -55,15 +55,12 @@ pub(super) fn install<H: Host>(
         let function = install_function(heap, builtins, name, length, handler);
         define_data(heap, prototype, name, function);
         if name == "toString" {
-            globals.insert(
-                EcmaString::from_utf8("\0Object.prototype.toString"),
-                function,
-            );
+            builtins.set_object_to_string(function);
         }
     }
     let call = install_function(heap, builtins, "call", 1, function_call::<H>);
     define_data(heap, builtins.function_prototype(), "call", call);
-    globals.insert(EcmaString::from_utf8("\0Function.prototype.call"), call);
+    builtins.set_function_call(call);
 }
 
 fn machine_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: Value) {

@@ -51,6 +51,10 @@ pub(crate) struct BuiltinTable<H: Host> {
     symbol_iterator: Option<Value>,
     symbol_to_string_tag: Option<Value>,
     symbol_prototype: Option<Value>,
+    function_call: Option<Value>,
+    object_to_string: Option<Value>,
+    regexp_prototype: Option<Value>,
+    iterator_prototype: Option<Value>,
     marker: PhantomData<fn() -> H>,
 }
 
@@ -75,6 +79,10 @@ impl<H: Host> BuiltinTable<H> {
             symbol_iterator: None,
             symbol_to_string_tag: None,
             symbol_prototype: None,
+            function_call: None,
+            object_to_string: None,
+            regexp_prototype: None,
+            iterator_prototype: None,
             marker: PhantomData,
         }
     }
@@ -140,6 +148,42 @@ impl<H: Host> BuiltinTable<H> {
             .expect("Symbol builtins install first")
     }
 
+    pub(crate) fn set_function_call(&mut self, function: Value) {
+        self.function_call = Some(function);
+    }
+
+    pub(crate) fn function_call(&self) -> Value {
+        self.function_call
+            .expect("Function builtins install Function.prototype.call")
+    }
+
+    pub(crate) fn set_object_to_string(&mut self, function: Value) {
+        self.object_to_string = Some(function);
+    }
+
+    pub(crate) fn object_to_string(&self) -> Value {
+        self.object_to_string
+            .expect("Object builtins install Object.prototype.toString")
+    }
+
+    pub(crate) fn set_regexp_prototype(&mut self, prototype: Value) {
+        self.regexp_prototype = Some(prototype);
+    }
+
+    pub(crate) fn regexp_prototype(&self) -> Value {
+        self.regexp_prototype
+            .expect("RegExp builtins install their prototype")
+    }
+
+    pub(crate) fn set_iterator_prototype(&mut self, prototype: Value) {
+        self.iterator_prototype = Some(prototype);
+    }
+
+    pub(crate) fn iterator_prototype(&self) -> Value {
+        self.iterator_prototype
+            .expect("iterator builtins install their prototype")
+    }
+
     pub(crate) fn set_constructor_prototype(
         &mut self,
         heap: &mut [HeapEntry],
@@ -184,6 +228,7 @@ impl<H: Host> BuiltinTable<H> {
 
 pub(crate) struct Intrinsics<H: Host> {
     pub(crate) globals: BTreeMap<EcmaString, Value>,
+    pub(crate) symbol_registry: BTreeMap<EcmaString, Value>,
     pub(crate) object_prototype: Value,
     pub(crate) function_prototype: Value,
     pub(crate) array_prototype: Value,
@@ -191,8 +236,6 @@ pub(crate) struct Intrinsics<H: Host> {
     pub(crate) number_prototype: Value,
     pub(crate) boolean_prototype: Value,
     pub(crate) builtins: BuiltinTable<H>,
-    function_call: Value,
-    object_to_string: Value,
 }
 
 impl<H: Host> Intrinsics<H> {
@@ -232,25 +275,9 @@ impl<H: Host> Intrinsics<H> {
         builtins::install(heap, &mut globals, &mut builtins);
         crate::host_objects::install(heap, &mut globals, &mut builtins);
 
-        let function_call_key = globals
-            .keys()
-            .find(|key| key.eq_ascii("\0Function.prototype.call"))
-            .cloned()
-            .expect("core builtins install Function.prototype.call");
-        let function_call = globals
-            .remove(&function_call_key)
-            .expect("key remains present");
-        let object_to_string_key = globals
-            .keys()
-            .find(|key| key.eq_ascii("\0Object.prototype.toString"))
-            .cloned()
-            .expect("core builtins install Object.prototype.toString");
-        let object_to_string = globals
-            .remove(&object_to_string_key)
-            .expect("key remains present");
-
         Self {
             globals,
+            symbol_registry: BTreeMap::new(),
             object_prototype,
             function_prototype,
             array_prototype,
@@ -258,8 +285,6 @@ impl<H: Host> Intrinsics<H> {
             number_prototype,
             boolean_prototype,
             builtins,
-            function_call,
-            object_to_string,
         }
     }
 
@@ -271,8 +296,7 @@ impl<H: Host> Intrinsics<H> {
     }
 
     pub(crate) fn regexp_prototype(&self) -> Value {
-        self.global("\0RegExp.prototype")
-            .expect("RegExp builtins install their prototype")
+        self.builtins.regexp_prototype()
     }
 
     pub(crate) fn error_prototype(&self, id: BuiltinId) -> Value {
@@ -284,11 +308,11 @@ impl<H: Host> Intrinsics<H> {
     }
 
     pub(crate) fn function_call(&self) -> Value {
-        self.function_call
+        self.builtins.function_call()
     }
 
     pub(crate) fn object_to_string(&self) -> Value {
-        self.object_to_string
+        self.builtins.object_to_string()
     }
 }
 
@@ -689,5 +713,31 @@ mod tests {
                 .unwrap()
                 .eq_ascii("1970-01-01T00:00:00.000Z")
         );
+    }
+
+    #[test]
+    fn realm_handles_never_enter_public_globals() {
+        let module = module();
+        let mut host = TestHost;
+        let machine = Machine::new(&module, &mut host, Limits::default());
+        assert!(
+            machine
+                .intrinsics
+                .globals
+                .keys()
+                .all(|name| name.as_units().first() != Some(&0))
+        );
+
+        let global_this = machine
+            .intrinsics
+            .global("globalThis")
+            .expect("globalThis is installed");
+        let keys = machine
+            .own_property_keys(global_this)
+            .expect("globalThis is an object");
+        assert!(keys.into_iter().all(|key| {
+            key.as_string()
+                .is_none_or(|name| name.as_units().first() != Some(&0))
+        }));
     }
 }

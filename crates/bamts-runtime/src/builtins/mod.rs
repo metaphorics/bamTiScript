@@ -24,7 +24,7 @@ pub(crate) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     symbol::install(heap, globals, builtins);
-    collections::install_iterator_prototype(heap, globals, builtins);
+    collections::install_iterator_prototype(heap, builtins);
     collections::install(heap, globals, builtins);
     date::install(heap, globals, builtins);
     object::install(heap, globals, builtins);

@@ -24,9 +24,8 @@ pub(super) fn install<H: Host>(
     ] {
         let function = install_function(heap, builtins, name, length, handler);
         define_data(heap, prototype, name, function);
-        globals.insert(EcmaString::from_utf8(&format!("\0RegExp.{name}")), function);
     }
-    globals.insert(EcmaString::from_utf8("\0RegExp.prototype"), prototype);
+    builtins.set_regexp_prototype(prototype);
     globals.insert(EcmaString::from_utf8("RegExp"), constructor);
 }
 

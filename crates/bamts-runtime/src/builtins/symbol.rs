@@ -15,7 +15,6 @@ pub(super) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
-    let registry = super::super::ordinary_prototype(heap, builtins.object_prototype());
     let iterator = symbol(heap, "Symbol.iterator");
     let async_iterator = symbol(heap, "Symbol.asyncIterator");
     let has_instance = symbol(heap, "Symbol.hasInstance");
@@ -61,7 +60,6 @@ pub(super) fn install<H: Host>(
     );
 
     globals.insert(EcmaString::from_utf8("Symbol"), constructor);
-    globals.insert(EcmaString::from_utf8("\0Symbol.registry"), registry);
 }
 
 fn symbol(heap: &mut Vec<HeapEntry>, description: &str) -> Value {
@@ -131,12 +129,7 @@ fn symbol_for<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let key = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-    let registry = machine
-        .intrinsics
-        .global("\0Symbol.registry")
-        .expect("symbol registry installed");
-    let existing = machine.get_property_key(registry, &PropertyKey::Named(key.clone()))?;
-    if existing != Value::UNDEFINED {
+    if let Some(existing) = machine.intrinsics.symbol_registry.get(&key).copied() {
         return Ok(BuiltinOutcome::Value(existing));
     }
     let symbol = machine
@@ -144,7 +137,10 @@ fn symbol_for<H: Host>(
             description: key.clone(),
         })
         .map_err(EvalFailure::Runtime)?;
-    machine.set_data_property_key(registry, PropertyKey::Named(key), symbol)?;
+    machine
+        .charge_heap(PropertyKey::Named(key.clone()).charge_bytes())
+        .map_err(EvalFailure::Runtime)?;
+    machine.intrinsics.symbol_registry.insert(key, symbol);
     Ok(BuiltinOutcome::Value(symbol))
 }
 

@@ -126,7 +126,6 @@ fn install_weak_set<H: Host>(
 
 pub(super) fn install_iterator_prototype<H: Host>(
     heap: &mut Vec<HeapEntry>,
-    globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
@@ -140,17 +139,14 @@ pub(super) fn install_iterator_prototype<H: Host>(
     );
     define_data(heap, prototype, "next", next);
     define_symbol(heap, prototype, builtins.symbol_iterator(), identity);
-    globals.insert(EcmaString::from_utf8("\0Iterator.prototype"), prototype);
+    builtins.set_iterator_prototype(prototype);
 }
 
 pub(super) fn iterator<H: Host>(
     machine: &mut Machine<'_, H>,
     values: Value,
 ) -> Result<Value, EvalFailure> {
-    let prototype = machine
-        .intrinsics
-        .global("\0Iterator.prototype")
-        .expect("iterator prototype installed");
+    let prototype = machine.intrinsics.builtins.iterator_prototype();
     let mut properties = PropertyMap::default();
     hidden(&mut properties, ITER_SOURCE, values);
     hidden(&mut properties, ITER_INDEX, Value::int32(0));
