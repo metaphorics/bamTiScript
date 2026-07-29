@@ -895,4 +895,113 @@ mod tests {
         let next = machine.get_named_property(values_iterator, "next").unwrap();
         assert!(machine.call_value(next, forged, &[]).is_err());
     }
+
+    #[test]
+    fn collections_hide_state_and_keep_iterator_positions() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let map = construct_builtin(&mut machine, "Map", &[]);
+        let set = machine.get_named_property(map, "set").unwrap();
+        for (key, value) in [(1, 10), (2, 20), (3, 30)] {
+            machine
+                .call_value(set, map, &[Value::int32(key), Value::int32(value)])
+                .unwrap();
+        }
+        assert!(machine.own_property_keys(map).unwrap().is_empty());
+
+        let derived = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(map),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .unwrap();
+        let get = machine.get_named_property(map, "get").unwrap();
+        assert!(
+            machine
+                .call_value(get, derived, &[Value::int32(1)])
+                .is_err()
+        );
+
+        machine
+            .set_data_property(map, "\0collection.keys", Value::UNDEFINED)
+            .unwrap();
+        assert_eq!(
+            machine.get_named_property(map, "size").unwrap(),
+            Value::int32(3)
+        );
+
+        let keys = machine.get_named_property(map, "keys").unwrap();
+        let iterator = machine.call_value(keys, map, &[]).unwrap();
+        assert_eq!(next_value(&mut machine, iterator), (Value::int32(1), false));
+        let delete = machine.get_named_property(map, "delete").unwrap();
+        assert_eq!(
+            machine.call_value(delete, map, &[Value::int32(1)]).unwrap(),
+            Value::TRUE
+        );
+        assert_eq!(next_value(&mut machine, iterator), (Value::int32(2), false));
+
+        let clear = machine.get_named_property(map, "clear").unwrap();
+        machine.call_value(clear, map, &[]).unwrap();
+        machine
+            .call_value(set, map, &[Value::int32(4), Value::int32(40)])
+            .unwrap();
+        assert_eq!(next_value(&mut machine, iterator), (Value::int32(4), false));
+        assert_eq!(next_value(&mut machine, iterator), (Value::UNDEFINED, true));
+        machine
+            .call_value(set, map, &[Value::int32(5), Value::int32(50)])
+            .unwrap();
+        assert_eq!(next_value(&mut machine, iterator), (Value::UNDEFINED, true));
+
+        machine
+            .call_value(set, map, &[Value::int32(9), map])
+            .unwrap();
+        let structured_clone = machine.intrinsics.global("structuredClone").unwrap();
+        let clone = machine
+            .call_value(structured_clone, Value::UNDEFINED, &[map])
+            .unwrap();
+        let cloned_get = machine.get_named_property(clone, "get").unwrap();
+        assert_eq!(
+            machine
+                .call_value(cloned_get, clone, &[Value::int32(9)])
+                .unwrap(),
+            clone
+        );
+
+        let churn = construct_builtin(&mut machine, "Map", &[]);
+        let churn_keys = machine.get_named_property(churn, "keys").unwrap();
+        let churn_iterator = machine.call_value(churn_keys, churn, &[]).unwrap();
+        for key in 0..1_024 {
+            machine
+                .call_value(set, churn, &[Value::int32(key), Value::int32(key)])
+                .unwrap();
+            assert_eq!(
+                machine
+                    .call_value(delete, churn, &[Value::int32(key)])
+                    .unwrap(),
+                Value::TRUE
+            );
+        }
+        machine
+            .call_value(set, churn, &[Value::int32(2_048), Value::int32(2_048)])
+            .unwrap();
+        assert_eq!(
+            next_value(&mut machine, churn_iterator),
+            (Value::int32(2_048), false)
+        );
+        let churn_index = machine.runtime_slot(churn).unwrap().unwrap();
+        let HeapEntry::Collection {
+            entries,
+            next_order,
+            ..
+        } = &machine.heap[churn_index]
+        else {
+            panic!("Map owns typed collection storage")
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, Value::int32(2_048));
+        assert_eq!(*next_order, 1_025);
+    }
 }

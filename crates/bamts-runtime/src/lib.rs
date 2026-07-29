@@ -433,6 +433,17 @@ enum IterationKind {
     Entry,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CollectionEntry {
+    order: u64,
+    key: Value,
+    value: Value,
+}
+
+impl CollectionEntry {
+    const BYTES: usize = std::mem::size_of::<Self>();
+}
+
 #[derive(Clone, Debug)]
 enum HeapEntry {
     String(EcmaString),
@@ -490,10 +501,20 @@ enum HeapEntry {
         prototype: Option<Value>,
         extensible: bool,
     },
+    /// Entries stay in insertion order. Iterators track order IDs, so deletion
+    /// can remove storage without moving an iterator's logical cursor.
+    /// Weak collections share this strong storage until the runtime has a collector.
+    Collection {
+        entries: Vec<CollectionEntry>,
+        next_order: u64,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+        extensible: bool,
+    },
     BuiltinIterator {
         source: Value,
         kind: IterationKind,
-        position: Option<usize>,
+        position: Option<u64>,
         properties: PropertyMap,
         prototype: Option<Value>,
         extensible: bool,
@@ -529,6 +550,10 @@ impl HeapEntry {
             Self::HashState {
                 algorithm, data, ..
             } => algorithm.len() + data.len(),
+            Self::Collection { entries, .. } => entries
+                .len()
+                .saturating_mul(CollectionEntry::BYTES)
+                .saturating_add(1),
             Self::Object { .. }
             | Self::Array { .. }
             | Self::Function { .. }
@@ -2788,9 +2813,8 @@ impl<'a, H: Host> Machine<'a, H> {
             HeapEntry::Object { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
             | HeapEntry::Date { properties, .. }
-            | HeapEntry::BuiltinIterator { properties, .. } => {
-                property_lookup_ascii(properties, name)
-            }
+            | HeapEntry::BuiltinIterator { properties, .. }
+            | HeapEntry::Collection { properties, .. } => property_lookup_ascii(properties, name),
             HeapEntry::Array {
                 elements,
                 properties,
@@ -2916,7 +2940,8 @@ impl<'a, H: Host> Machine<'a, H> {
         match &self.heap[index] {
             HeapEntry::Object { properties, .. }
             | HeapEntry::Date { properties, .. }
-            | HeapEntry::BuiltinIterator { properties, .. } => property_lookup(properties, key),
+            | HeapEntry::BuiltinIterator { properties, .. }
+            | HeapEntry::Collection { properties, .. } => property_lookup(properties, key),
             HeapEntry::Array {
                 elements,
                 properties,
@@ -3091,7 +3116,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::NativeFunction { properties, .. }
             | HeapEntry::RegExp { properties, .. }
             | HeapEntry::Date { properties, .. }
-            | HeapEntry::BuiltinIterator { properties, .. } => properties,
+            | HeapEntry::BuiltinIterator { properties, .. }
+            | HeapEntry::Collection { properties, .. } => properties,
             _ => return None,
         };
         match properties.get_ascii(name) {
@@ -3108,6 +3134,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::RegExp { prototype, .. }
             | HeapEntry::Date { prototype, .. }
             | HeapEntry::BuiltinIterator { prototype, .. }
+            | HeapEntry::Collection { prototype, .. }
             | HeapEntry::ProcessEnv { prototype, .. } => *prototype,
             HeapEntry::NativeFunction { .. } => Some(self.intrinsics.function_prototype),
             _ => None,
@@ -3178,7 +3205,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::NativeFunction { properties, .. }
                 | HeapEntry::RegExp { properties, .. }
                 | HeapEntry::Date { properties, .. }
-                | HeapEntry::BuiltinIterator { properties, .. } => match properties.get(key) {
+                | HeapEntry::BuiltinIterator { properties, .. }
+                | HeapEntry::Collection { properties, .. } => match properties.get(key) {
                     Some(Property::Accessor { setter, .. }) => Some(Some(*setter)),
                     Some(Property::Data { .. }) => Some(None),
                     None => None,
@@ -3301,6 +3329,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 properties,
                 extensible,
                 ..
+            }
+            | HeapEntry::Collection {
+                properties,
+                extensible,
+                ..
             } => (Some(properties), *extensible, false),
             HeapEntry::Array {
                 elements,
@@ -3344,7 +3377,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::NativeFunction { properties, .. }
             | HeapEntry::RegExp { properties, .. }
             | HeapEntry::Date { properties, .. }
-            | HeapEntry::BuiltinIterator { properties, .. } => {
+            | HeapEntry::BuiltinIterator { properties, .. }
+            | HeapEntry::Collection { properties, .. } => {
                 usize::from(!properties.contains_key(&key)) * key.charge_bytes()
             }
             HeapEntry::Array {
@@ -3399,7 +3433,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::NativeFunction { properties, .. }
             | HeapEntry::RegExp { properties, .. }
             | HeapEntry::Date { properties, .. }
-            | HeapEntry::BuiltinIterator { properties, .. } => {
+            | HeapEntry::BuiltinIterator { properties, .. }
+            | HeapEntry::Collection { properties, .. } => {
                 properties.insert(
                     key,
                     Property::Data {
@@ -3510,6 +3545,11 @@ impl<'a, H: Host> Machine<'a, H> {
                         properties,
                         extensible,
                         ..
+                    }
+                    | HeapEntry::Collection {
+                        properties,
+                        extensible,
+                        ..
                     } => (properties, *extensible),
                     _ => {
                         return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
@@ -3564,7 +3604,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::NativeFunction { properties, .. }
                 | HeapEntry::RegExp { properties, .. }
                 | HeapEntry::Date { properties, .. }
-                | HeapEntry::BuiltinIterator { properties, .. } => {
+                | HeapEntry::BuiltinIterator { properties, .. }
+                | HeapEntry::Collection { properties, .. } => {
                     if properties
                         .get(key)
                         .is_some_and(|property| !property.configurable())
@@ -3802,7 +3843,8 @@ impl<'a, H: Host> Machine<'a, H> {
             match &self.heap[index] {
                 HeapEntry::Object { properties, .. }
                 | HeapEntry::Date { properties, .. }
-                | HeapEntry::BuiltinIterator { properties, .. } => {
+                | HeapEntry::BuiltinIterator { properties, .. }
+                | HeapEntry::Collection { properties, .. } => {
                     for (key, property) in properties {
                         if let (
                             PropertyKey::Named(_),
@@ -3902,6 +3944,9 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 | HeapEntry::BuiltinIterator {
                     prototype: slot, ..
+                }
+                | HeapEntry::Collection {
+                    prototype: slot, ..
                 } => {
                     *slot = prototype;
                     Ok(())
@@ -3960,9 +4005,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::NativeFunction { properties, .. }
                 | HeapEntry::RegExp { properties, .. }
                 | HeapEntry::Date { properties, .. }
-                | HeapEntry::BuiltinIterator { properties, .. } => {
-                    Ok(ordered_property_keys(properties))
-                }
+                | HeapEntry::BuiltinIterator { properties, .. }
+                | HeapEntry::Collection { properties, .. } => Ok(ordered_property_keys(properties)),
                 HeapEntry::Array {
                     elements,
                     properties,
@@ -4049,7 +4093,8 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::NativeFunction { properties, .. }
                     | HeapEntry::RegExp { properties, .. }
                     | HeapEntry::Date { properties, .. }
-                    | HeapEntry::BuiltinIterator { properties, .. } => {
+                    | HeapEntry::BuiltinIterator { properties, .. }
+                    | HeapEntry::Collection { properties, .. } => {
                         properties.get(&key).is_some_and(Property::enumerable)
                     }
                     _ => false,
@@ -4377,6 +4422,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         | HeapEntry::RegExp { .. }
                         | HeapEntry::Date { .. }
                         | HeapEntry::BuiltinIterator { .. }
+                        | HeapEntry::Collection { .. }
                         | HeapEntry::ProcessEnv { .. }
                         | HeapEntry::Iterator { .. } => Ok(Value::number(f64::NAN)),
                     },
@@ -4414,6 +4460,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::RegExp { .. }
                     | HeapEntry::Date { .. }
                     | HeapEntry::BuiltinIterator { .. }
+                    | HeapEntry::Collection { .. }
                     | HeapEntry::ProcessEnv { .. }
                     | HeapEntry::Iterator { .. } => true,
                 },
@@ -4444,6 +4491,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::RegExp { .. }
                     | HeapEntry::Date { .. }
                     | HeapEntry::BuiltinIterator { .. }
+                    | HeapEntry::Collection { .. }
                     | HeapEntry::ProcessEnv { .. }
                     | HeapEntry::Iterator { .. } => "object",
                 },
@@ -4572,6 +4620,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::RegExp { .. }
                 | HeapEntry::Date { .. }
                 | HeapEntry::BuiltinIterator { .. }
+                | HeapEntry::Collection { .. }
                 | HeapEntry::Iterator { .. }
                 | HeapEntry::ProcessEnv { .. }
                 | HeapEntry::Symbol { .. }
@@ -4607,6 +4656,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         HeapEntry::Object { .. }
                         | HeapEntry::Date { .. }
                         | HeapEntry::BuiltinIterator { .. }
+                        | HeapEntry::Collection { .. }
                         | HeapEntry::ModuleNamespace { .. }
                         | HeapEntry::ExternalModuleNamespace { .. }
                         | HeapEntry::ProcessEnv { .. }

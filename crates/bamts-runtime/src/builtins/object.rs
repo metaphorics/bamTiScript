@@ -832,6 +832,27 @@ fn clone_value<H: Host>(
             seen.insert(index, clone);
             Ok(clone)
         }
+        HeapEntry::Collection {
+            entries, prototype, ..
+        } => {
+            let clone = machine
+                .allocate(HeapEntry::Collection {
+                    entries: Vec::new(),
+                    next_order: 0,
+                    properties: PropertyMap::default(),
+                    prototype,
+                    extensible: true,
+                })
+                .map_err(EvalFailure::Runtime)?;
+            seen.insert(index, clone);
+            let clone_index = machine.runtime_slot(clone).unwrap().unwrap();
+            for entry in entries {
+                let key = clone_value(machine, entry.key, seen)?;
+                let value = clone_value(machine, entry.value, seen)?;
+                super::collections::append_collection_entry(machine, clone_index, key, value)?;
+            }
+            Ok(clone)
+        }
         _ => Err(type_error("value could not be cloned")),
     }
 }

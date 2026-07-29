@@ -11,12 +11,6 @@ use crate::{
     EvalFailure, HeapEntry, Host, IterationKind, Machine, Property, PropertyKey, PropertyMap,
 };
 
-const KEYS: &str = "\0collection.keys";
-const VALUES: &str = "\0collection.values";
-const ENTRIES: &str = "\0collection.entries";
-
-type CollectionParts = (Vec<Value>, Vec<Value>, Vec<Value>);
-
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -188,29 +182,51 @@ fn iterator_next<H: Host>(
     };
     let (done, value, next_position) = match position {
         None => (true, Value::UNDEFINED, None),
-        Some(index) => {
+        Some(cursor) => {
             let source_index = machine
                 .runtime_slot(source)
                 .map_err(EvalFailure::Runtime)?
                 .ok_or_else(|| type_error("iterator next called on incompatible receiver"))?;
-            let HeapEntry::Array { elements, .. } = &machine.heap[source_index] else {
-                return Err(type_error("iterator next called on incompatible receiver"));
+            let item = match &machine.heap[source_index] {
+                HeapEntry::Array { elements, .. } => {
+                    usize::try_from(cursor).ok().and_then(|index| {
+                        elements.get(index).map(|element| {
+                            let value = if *element == Value::HOLE {
+                                Value::UNDEFINED
+                            } else {
+                                *element
+                            };
+                            let next = cursor
+                                .checked_add(1)
+                                .expect("array bounds keep iterator positions below u64::MAX");
+                            (next, crate::number_value(index as f64), value)
+                        })
+                    })
+                }
+                HeapEntry::Collection { entries, .. } => {
+                    let index = entries.partition_point(|entry| entry.order < cursor);
+                    entries.get(index).map(|entry| {
+                        let next = entry
+                            .order
+                            .checked_add(1)
+                            .expect("heap limits keep collection order below u64::MAX");
+                        (next, entry.key, entry.value)
+                    })
+                }
+                _ => {
+                    return Err(type_error("iterator next called on incompatible receiver"));
+                }
             };
-            if index >= elements.len() {
-                (true, Value::UNDEFINED, None)
-            } else {
-                let element = match elements[index] {
-                    Value::HOLE => Value::UNDEFINED,
-                    value => value,
-                };
-                let value = match kind {
-                    IterationKind::Key => crate::number_value(index as f64),
-                    IterationKind::Value => element,
-                    IterationKind::Entry => {
-                        allocate_array(machine, vec![crate::number_value(index as f64), element])?
-                    }
-                };
-                (false, value, Some(index + 1))
+            match item {
+                None => (true, Value::UNDEFINED, None),
+                Some((next, key, item_value)) => {
+                    let value = match kind {
+                        IterationKind::Key => key,
+                        IterationKind::Value => item_value,
+                        IterationKind::Entry => allocate_array(machine, vec![key, item_value])?,
+                    };
+                    (false, value, Some(next))
+                }
             }
         }
     };
@@ -361,12 +377,15 @@ fn map_get<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let (keys, values, _) = collection_parts(machine, this)?;
+    let slot = collection_slot(machine, this)?;
     let key = args.first().copied().unwrap_or(Value::UNDEFINED);
-    let found = keys
+    let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
+        unreachable!("collection brand was checked")
+    };
+    let found = entries
         .iter()
-        .position(|candidate| machine.same_value_zero(*candidate, key))
-        .map_or(Value::UNDEFINED, |index| values[index]);
+        .find(|entry| machine.same_value_zero(entry.key, key))
+        .map_or(Value::UNDEFINED, |entry| entry.value);
     Ok(BuiltinOutcome::Value(found))
 }
 fn map_has<H: Host>(
@@ -375,11 +394,16 @@ fn map_has<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let (keys, _, _) = collection_parts(machine, this)?;
+    let slot = collection_slot(machine, this)?;
     let key = args.first().copied().unwrap_or(Value::UNDEFINED);
-    Ok(BuiltinOutcome::Value(Value::boolean(keys.iter().any(
-        |candidate| machine.same_value_zero(*candidate, key),
-    ))))
+    let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
+        unreachable!("collection brand was checked")
+    };
+    Ok(BuiltinOutcome::Value(Value::boolean(
+        entries
+            .iter()
+            .any(|entry| machine.same_value_zero(entry.key, key)),
+    )))
 }
 fn map_delete<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -387,17 +411,23 @@ fn map_delete<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let (mut keys, mut values, _) = collection_parts(machine, this)?;
+    let slot = collection_slot(machine, this)?;
     let key = args.first().copied().unwrap_or(Value::UNDEFINED);
-    let Some(index) = keys
-        .iter()
-        .position(|candidate| machine.same_value_zero(*candidate, key))
-    else {
+    let index = {
+        let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
+            unreachable!("collection brand was checked")
+        };
+        entries
+            .iter()
+            .position(|entry| machine.same_value_zero(entry.key, key))
+    };
+    let Some(index) = index else {
         return Ok(BuiltinOutcome::Value(Value::FALSE));
     };
-    keys.remove(index);
-    values.remove(index);
-    replace_collection(machine, this, keys, values)?;
+    let HeapEntry::Collection { entries, .. } = &mut machine.heap[slot] else {
+        unreachable!("collection brand was checked")
+    };
+    entries.remove(index);
     Ok(BuiltinOutcome::Value(Value::TRUE))
 }
 fn map_clear<H: Host>(
@@ -406,8 +436,11 @@ fn map_clear<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    collection_parts(machine, this)?;
-    replace_collection(machine, this, Vec::new(), Vec::new())?;
+    let slot = collection_slot(machine, this)?;
+    let HeapEntry::Collection { entries, .. } = &mut machine.heap[slot] else {
+        unreachable!("collection brand was checked")
+    };
+    entries.clear();
     Ok(BuiltinOutcome::Value(Value::UNDEFINED))
 }
 fn map_size<H: Host>(
@@ -416,8 +449,12 @@ fn map_size<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
+    let slot = collection_slot(machine, this)?;
+    let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
+        unreachable!("collection brand was checked")
+    };
     Ok(BuiltinOutcome::Value(crate::number_value(
-        collection_parts(machine, this)?.0.len() as f64,
+        entries.len() as f64
     )))
 }
 fn map_keys<H: Host>(
@@ -426,7 +463,7 @@ fn map_keys<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    collection_iterator(machine, this, KEYS)
+    collection_iterator(machine, this, IterationKind::Key)
 }
 fn map_values<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -434,7 +471,7 @@ fn map_values<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    collection_iterator(machine, this, VALUES)
+    collection_iterator(machine, this, IterationKind::Value)
 }
 fn map_entries<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -442,7 +479,7 @@ fn map_entries<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    collection_iterator(machine, this, ENTRIES)
+    collection_iterator(machine, this, IterationKind::Entry)
 }
 fn map_for_each<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -454,16 +491,11 @@ fn map_for_each<H: Host>(
     if !machine.is_callable(callback)? {
         return Err(type_error("Map.forEach callback is not callable"));
     }
-    let (_, values, entries) = collection_parts(machine, this)?;
-    for (index, entry) in entries.into_iter().enumerate() {
-        let key = machine
-            .array_elements(entry)?
-            .and_then(|pair| pair.first().copied())
-            .unwrap_or(Value::UNDEFINED);
+    for (key, value) in collection_snapshot(machine, this)? {
         machine.call_value(
             callback,
             args.get(1).copied().unwrap_or(Value::UNDEFINED),
-            &[values[index], key, this],
+            &[value, key, this],
         )?;
     }
     Ok(BuiltinOutcome::Value(Value::UNDEFINED))
@@ -531,7 +563,7 @@ fn set_values<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    collection_iterator(machine, this, KEYS)
+    collection_iterator(machine, this, IterationKind::Value)
 }
 fn set_entries<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -539,7 +571,7 @@ fn set_entries<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    collection_iterator(machine, this, ENTRIES)
+    collection_iterator(machine, this, IterationKind::Entry)
 }
 fn set_for_each<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -551,8 +583,7 @@ fn set_for_each<H: Host>(
     if !machine.is_callable(callback)? {
         return Err(type_error("Set.forEach callback is not callable"));
     }
-    let (values, _, _) = collection_parts(machine, this)?;
-    for value in values {
+    for (_, value) in collection_snapshot(machine, this)? {
         machine.call_value(
             callback,
             args.get(1).copied().unwrap_or(Value::UNDEFINED),
@@ -568,31 +599,70 @@ fn map_put<H: Host>(
     key: Value,
     value: Value,
 ) -> Result<(), EvalFailure> {
-    let (mut keys, mut values, _) = collection_parts(machine, object)?;
-    if let Some(index) = keys
-        .iter()
-        .position(|candidate| machine.same_value_zero(*candidate, key))
-    {
-        values[index] = value;
-    } else {
-        keys.push(key);
-        values.push(value);
+    let slot = collection_slot(machine, object)?;
+    let existing = {
+        let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
+            unreachable!("collection brand was checked")
+        };
+        entries
+            .iter()
+            .position(|entry| machine.same_value_zero(entry.key, key))
+    };
+    if let Some(index) = existing {
+        let HeapEntry::Collection { entries, .. } = &mut machine.heap[slot] else {
+            unreachable!("collection brand was checked")
+        };
+        entries[index].value = value;
+        return Ok(());
     }
-    replace_collection(machine, object, keys, values)
+    append_collection_entry(machine, slot, key, value)
 }
 fn set_put<H: Host>(
     machine: &mut Machine<'_, H>,
     object: Value,
     value: Value,
 ) -> Result<(), EvalFailure> {
-    let (mut values, _, _) = collection_parts(machine, object)?;
-    if !values
-        .iter()
-        .any(|candidate| machine.same_value_zero(*candidate, value))
-    {
-        values.push(value);
-        replace_collection(machine, object, values.clone(), values)?;
+    let slot = collection_slot(machine, object)?;
+    let exists = {
+        let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
+            unreachable!("collection brand was checked")
+        };
+        entries
+            .iter()
+            .any(|entry| machine.same_value_zero(entry.key, value))
+    };
+    if exists {
+        return Ok(());
     }
+    append_collection_entry(machine, slot, value, value)
+}
+
+pub(super) fn append_collection_entry<H: Host>(
+    machine: &mut Machine<'_, H>,
+    slot: usize,
+    key: Value,
+    value: Value,
+) -> Result<(), EvalFailure> {
+    let order = match machine.heap[slot] {
+        HeapEntry::Collection { next_order, .. } => next_order,
+        _ => unreachable!("collection slot owns collection storage"),
+    };
+    let next_order = order
+        .checked_add(1)
+        .expect("heap limits keep collection order below u64::MAX");
+    machine
+        .charge_heap(crate::CollectionEntry::BYTES)
+        .map_err(EvalFailure::Runtime)?;
+    let HeapEntry::Collection {
+        entries,
+        next_order: stored_next_order,
+        ..
+    } = &mut machine.heap[slot]
+    else {
+        unreachable!("collection slot owns collection storage")
+    };
+    entries.push(crate::CollectionEntry { order, key, value });
+    *stored_next_order = next_order;
     Ok(())
 }
 
@@ -600,76 +670,50 @@ fn collection<H: Host>(
     machine: &mut Machine<'_, H>,
     prototype: Value,
 ) -> Result<Value, EvalFailure> {
-    let keys = allocate_array(machine, Vec::new())?;
-    let values = allocate_array(machine, Vec::new())?;
-    let entries = allocate_array(machine, Vec::new())?;
-    let mut properties = PropertyMap::default();
-    hidden(&mut properties, KEYS, keys);
-    hidden(&mut properties, VALUES, values);
-    hidden(&mut properties, ENTRIES, entries);
     machine
-        .allocate(HeapEntry::Object {
-            properties,
+        .allocate(HeapEntry::Collection {
+            entries: Vec::new(),
+            next_order: 0,
+            properties: PropertyMap::default(),
             prototype: Some(prototype),
             extensible: true,
-            boxed_primitive: None,
         })
         .map_err(EvalFailure::Runtime)
 }
-fn collection_parts<H: Host>(
-    machine: &mut Machine<'_, H>,
-    object: Value,
-) -> Result<CollectionParts, EvalFailure> {
-    let keys = machine.get_named_property(object, KEYS)?;
-    let values = machine.get_named_property(object, VALUES)?;
-    let entries = machine.get_named_property(object, ENTRIES)?;
-    let Some(keys) = machine.array_elements(keys)? else {
+fn collection_slot<H: Host>(machine: &Machine<'_, H>, object: Value) -> Result<usize, EvalFailure> {
+    let Some(index) = machine.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
         return Err(type_error(
             "collection method called on incompatible receiver",
         ));
     };
-    let Some(values) = machine.array_elements(values)? else {
+    if !matches!(machine.heap[index], HeapEntry::Collection { .. }) {
         return Err(type_error(
             "collection method called on incompatible receiver",
         ));
-    };
-    let Some(entries) = machine.array_elements(entries)? else {
-        return Err(type_error(
-            "collection method called on incompatible receiver",
-        ));
-    };
-    Ok((keys, values, entries))
-}
-fn replace_collection<H: Host>(
-    machine: &mut Machine<'_, H>,
-    object: Value,
-    keys: Vec<Value>,
-    values: Vec<Value>,
-) -> Result<(), EvalFailure> {
-    let entries = keys
-        .iter()
-        .copied()
-        .zip(values.iter().copied())
-        .map(|(key, value)| allocate_array(machine, vec![key, value]))
-        .collect::<Result<Vec<_>, _>>()?;
-    for (name, data) in [(KEYS, keys), (VALUES, values), (ENTRIES, entries)] {
-        let array = machine.get_named_property(object, name)?;
-        machine.replace_array_elements(array, data)?;
     }
-    Ok(())
+    Ok(index)
+}
+
+fn collection_snapshot<H: Host>(
+    machine: &Machine<'_, H>,
+    object: Value,
+) -> Result<Vec<(Value, Value)>, EvalFailure> {
+    let slot = collection_slot(machine, object)?;
+    let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
+        unreachable!("collection brand was checked")
+    };
+    Ok(entries
+        .iter()
+        .map(|entry| (entry.key, entry.value))
+        .collect())
 }
 fn collection_iterator<H: Host>(
     machine: &mut Machine<'_, H>,
     object: Value,
-    property: &str,
+    kind: IterationKind,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    collection_parts(machine, object)?;
-    let source = machine.get_named_property(object, property)?;
-    Ok(BuiltinOutcome::Value(iterator(
-        machine,
-        source,
-        IterationKind::Value,
-    )?))
+    collection_slot(machine, object)?;
+    Ok(BuiltinOutcome::Value(iterator(machine, object, kind)?))
 }
 fn require_weak_key<H: Host>(machine: &Machine<'_, H>, key: Value) -> Result<(), EvalFailure> {
     let Some(index) = machine.runtime_slot(key).map_err(EvalFailure::Runtime)? else {
@@ -727,17 +771,6 @@ fn ordinary_runtime<H: Host>(
             boxed_primitive: None,
         })
         .map_err(EvalFailure::Runtime)
-}
-fn hidden(properties: &mut PropertyMap, name: &str, value: Value) {
-    properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8(name)),
-        Property::Data {
-            value,
-            writable: true,
-            enumerable: false,
-            configurable: false,
-        },
-    );
 }
 fn define_getter(heap: &mut [HeapEntry], object: Value, name: &str, getter: Value) {
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(object)] else {

@@ -330,7 +330,8 @@ impl<H: Host> Machine<'_, H> {
                     }
                     HeapEntry::Object { properties, .. }
                     | HeapEntry::Date { properties, .. }
-                    | HeapEntry::BuiltinIterator { properties, .. } => {
+                    | HeapEntry::BuiltinIterator { properties, .. }
+                    | HeapEntry::Collection { properties, .. } => {
                         if depth >= 2 {
                             return Ok("[Object]".to_owned());
                         }
