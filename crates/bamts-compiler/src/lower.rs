@@ -4763,19 +4763,6 @@ impl<'a> FunctionContext<'a> {
                 None => None,
             },
         };
-        if let Some(name) = &name {
-            let site = class
-                .name
-                .as_ref()
-                .map_or(binding_site(range), |identifier| binding_site(identifier.range()));
-            self.predeclare_captured_binding(
-                builder,
-                name,
-                range,
-                site,
-                DeclarationScope::Lexical,
-            )?;
-        }
         let value = self.lower_class_value(builder, range, class, name.as_deref())?;
         if let Some(name) = &name {
             let site = class
@@ -4794,7 +4781,7 @@ impl<'a> FunctionContext<'a> {
         builder: &mut ModuleBuilder,
         range: TextRange,
         class: &ClassDeclaration,
-        _name: Option<&str>,
+        name: Option<&str>,
     ) -> Result<Register, LowerError> {
         if let Some(decorator) = class.decorators.first() {
             return Err(self.unsupported(
@@ -4802,13 +4789,27 @@ impl<'a> FunctionContext<'a> {
                 UnsupportedConstruct::DecoratedDeclaration,
             ));
         }
-        self.push_scope();
-        self.create_private_names(builder, range, class)?;
-        // The parent (superclass) constructor, if any.
+        // Evaluate the superclass before creating the declaration cell so
+        // direct class TDZ behavior stays unchanged; members observe that cell.
         let parent = match &class.extends {
             Some(heritage) => Some(self.lower_expression(builder, &heritage.expression)?),
             None => None,
         };
+        if let Some(name) = name {
+            let site = class
+                .name
+                .as_ref()
+                .map_or(binding_site(range), |identifier| binding_site(identifier.range()));
+            self.predeclare_captured_binding(
+                builder,
+                name,
+                range,
+                site,
+                DeclarationScope::Lexical,
+            )?;
+        }
+        self.push_scope();
+        self.create_private_names(builder, range, class)?;
         // Constructor function.
         let constructor = self.find_constructor(class);
         let ctor = self.build_constructor(builder, range, class, constructor, parent)?;
@@ -5622,6 +5623,7 @@ impl<'a> FreeVarScanner<'a> {
                 self.scan_function_like(&declaration.function);
             }
             Statement::Class(class) => {
+                self.scan_class_heritage(class);
                 if let Some(name) = &class.name
                     && let Some(text) = identifier_name(self.file, name)
                 {
@@ -5754,6 +5756,7 @@ impl<'a> FreeVarScanner<'a> {
                     self.scan_function_like(function);
                 }
                 ExportDefaultValue::Class(class) => {
+                    self.scan_class_heritage(class);
                     if let Some(name) = &class.name
                         && let Some(text) = identifier_name(self.file, name)
                     {
@@ -5833,6 +5836,12 @@ impl<'a> FreeVarScanner<'a> {
         self.function_depth -= 1;
     }
 
+    fn scan_class_heritage(&mut self, class: &ClassDeclaration) {
+        if let Some(heritage) = &class.extends {
+            self.scan_expression(&heritage.expression);
+        }
+    }
+
     fn scan_class(&mut self, class: &ClassDeclaration) {
         self.push();
         let mut seen_private = HashSet::new();
@@ -5850,10 +5859,6 @@ impl<'a> FreeVarScanner<'a> {
                 self.bind_lexical(text, private.range());
             }
         }
-        if let Some(heritage) = &class.extends {
-            self.scan_expression(&heritage.expression);
-        }
-
         let constructor = class.members.iter().find_map(|member| match member.data() {
             ClassMember::Constructor(constructor) => Some(constructor),
             _ => None,
@@ -5987,7 +5992,10 @@ impl<'a> FreeVarScanner<'a> {
                 }
             }
             Expression::Function(function) => self.scan_function_like(&function.function),
-            Expression::Class(class) => self.scan_class(&class.class),
+            Expression::Class(class) => {
+                self.scan_class_heritage(&class.class);
+                self.scan_class(&class.class);
+            }
             Expression::Arrow(arrow) => self.scan_arrow(arrow),
             Expression::Call(call) => {
                 self.scan_expression(&call.callee);
