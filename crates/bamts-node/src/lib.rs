@@ -19,6 +19,7 @@ pub struct NodeHost {
     env: BTreeMap<String, String>,
     started: Instant,
     random_state: u64,
+    compiler: Option<Box<dyn bamts_runtime::CompileProvider>>,
 }
 
 impl Default for NodeHost {
@@ -38,6 +39,7 @@ impl NodeHost {
             env: BTreeMap::new(),
             started: Instant::now(),
             random_state: 0x6a09_e667_f3bc_c909,
+            compiler: None,
         }
     }
 
@@ -76,6 +78,10 @@ impl NodeHost {
 
     pub fn delete_env(&mut self, name: &str) -> bool {
         self.env.remove(name).is_some()
+    }
+
+    pub fn set_script_compiler(&mut self, compiler: Box<dyn bamts_runtime::CompileProvider>) {
+        self.compiler = Some(compiler);
     }
 }
 
@@ -132,6 +138,10 @@ impl Host for NodeHost {
         self.random_state = state;
         let bits = state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11;
         (bits as f64) * (1.0 / ((1_u64 << 53) as f64))
+    }
+
+    fn script_compiler(&mut self) -> Option<&mut (dyn bamts_runtime::CompileProvider + 'static)> {
+        self.compiler.as_deref_mut()
     }
 
     fn hash(&mut self, algorithm: &str, data: &[u8]) -> Option<Vec<u8>> {

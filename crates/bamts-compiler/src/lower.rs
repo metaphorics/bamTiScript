@@ -90,6 +90,17 @@ pub struct LowerOptions {
     pub javascript_compatibility: bool,
 }
 
+/// The executable artifact this lowerer is producing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LoweringGoal {
+    /// A standalone module whose imports and exports are bytecode instructions.
+    Module,
+    /// A member of a linked program whose linkage lives in program metadata.
+    ProgramModule,
+    /// An ECMAScript classic script with no module syntax and a completion value.
+    ClassicScript,
+}
+
 /// Structural production ceilings, mirroring the bytecode verifier's limits.
 /// Two instruction slots are always reserved for a function's terminating
 /// epilogue so a body can never leave no room for its own terminator.
@@ -161,6 +172,12 @@ pub enum UnsupportedConstruct {
     DecoratedDeclaration,
     /// A dynamic `import(expr)` whose specifier is not a string literal.
     DynamicImportExpression,
+    /// An import declaration is invalid in a classic script.
+    ImportDeclarationInScript,
+    /// An export declaration is invalid in a classic script.
+    ExportDeclarationInScript,
+    /// A dynamic import expression is invalid in a classic script.
+    DynamicImportInScript,
     /// `import.meta` (no host meta-object primitive).
     ImportMeta,
     /// An identifier spelled with unicode escape sequences.
@@ -236,6 +253,9 @@ impl fmt::Display for UnsupportedConstruct {
             Self::ExportAssignment => "`export =` assignment",
             Self::DecoratedDeclaration => "decorated declaration",
             Self::DynamicImportExpression => "dynamic `import()` with a non-literal specifier",
+            Self::ImportDeclarationInScript => "`import` declaration in a classic script",
+            Self::ExportDeclarationInScript => "`export` declaration in a classic script",
+            Self::DynamicImportInScript => "dynamic `import()` in a classic script",
             Self::ImportMeta => "`import.meta` meta property",
             Self::EscapedIdentifier => "identifier containing escape sequences",
             Self::NonDecimalBigInt => "non-decimal bigint literal",
@@ -293,7 +313,7 @@ pub(crate) fn assemble(
     file: &SourceFile,
     options: LowerOptions,
 ) -> Result<Module<bamts_bytecode::Unverified>, LowerError> {
-    assemble_with_linkage_strings(file, options, &[], false)
+    assemble_with_linkage_strings(file, options, &[], LoweringGoal::Module)
 }
 
 pub(crate) fn assemble_program_module(
@@ -301,14 +321,35 @@ pub(crate) fn assemble_program_module(
     options: LowerOptions,
     linkage_strings: &[String],
 ) -> Result<Module<bamts_bytecode::Unverified>, LowerError> {
-    assemble_with_linkage_strings(file, options, linkage_strings, true)
+    assemble_with_linkage_strings(file, options, linkage_strings, LoweringGoal::ProgramModule)
+}
+
+/// Assembles a classic script without the final verification pass.
+pub(crate) fn assemble_classic_script(
+    file: &SourceFile,
+    options: LowerOptions,
+) -> Result<Module<bamts_bytecode::Unverified>, LowerError> {
+    assemble_classic_script_named(file, options, "evalmachine.<anonymous>")
+}
+
+pub(crate) fn assemble_classic_script_named(
+    file: &SourceFile,
+    options: LowerOptions,
+    module_name: &str,
+) -> Result<Module<bamts_bytecode::Unverified>, LowerError> {
+    assemble_with_linkage_strings(
+        file,
+        options,
+        &[module_name.to_owned()],
+        LoweringGoal::ClassicScript,
+    )
 }
 
 fn assemble_with_linkage_strings(
     file: &SourceFile,
     options: LowerOptions,
     linkage_strings: &[String],
-    program_mode: bool,
+    goal: LoweringGoal,
 ) -> Result<Module<bamts_bytecode::Unverified>, LowerError> {
     validate_script_kind(file, options)?;
 
@@ -322,9 +363,21 @@ fn assemble_with_linkage_strings(
     }
     let entry = builder.reserve_function(file.range())?;
 
-    let mut context = FunctionContext::new_top_level(file, program_mode);
+    let mut context = FunctionContext::new_top_level(file, goal);
+    let completion = if goal == LoweringGoal::ClassicScript {
+        let completion = context.alloc_register(file.range())?;
+        let undefined = context.undefined(&mut builder, file.range())?;
+        context.move_to(file.range(), completion, undefined)?;
+        context.completion = Some(completion);
+        Some(completion)
+    } else {
+        None
+    };
     context.lower_top_level(&mut builder, file.statements())?;
-    context.emit(file.range(), Instruction::Halt)?;
+    match completion {
+        Some(value) => context.emit(file.range(), Instruction::Return { value })?,
+        None => context.emit(file.range(), Instruction::Halt)?,
+    };
     let assembled = context.into_function(None, FunctionFlags::default());
     builder.fill_function(entry, assembled);
 
@@ -481,7 +534,12 @@ struct FunctionContext<'a> {
     /// `true` for the module entry function, whose bindings are the module
     /// environment (named globals) rather than register homes.
     top_level: bool,
-    program_mode: bool,
+    goal: LoweringGoal,
+    /// Innermost statement-value target, present only for a classic script entry.
+    completion: Option<Register>,
+    /// Reusable statement-value registers indexed by normalizing-statement depth.
+    completion_pool: Vec<Register>,
+    completion_depth: usize,
     /// `Some(reg)` when `this` is a captured cell (arrow); `None` when the
     /// activation owns `this` (`LoadThis`).
     this_capture: Option<Register>,
@@ -492,7 +550,7 @@ struct FunctionContext<'a> {
 }
 
 impl<'a> FunctionContext<'a> {
-    fn new_top_level(file: &'a SourceFile, program_mode: bool) -> Self {
+    fn new_top_level(file: &'a SourceFile, goal: LoweringGoal) -> Self {
         Self {
             file,
             code: Vec::new(),
@@ -504,7 +562,10 @@ impl<'a> FunctionContext<'a> {
             handlers: Vec::new(),
             finally_stack: Vec::new(),
             top_level: true,
-            program_mode,
+            goal,
+            completion: None,
+            completion_pool: Vec::new(),
+            completion_depth: 0,
             this_capture: None,
             new_target_capture: None,
             arguments_source: ArgumentsSource::None,
@@ -613,6 +674,46 @@ impl<'a> FunctionContext<'a> {
     ) -> Result<(), LowerError> {
         self.emit(range, Instruction::Move { dst, src })?;
         Ok(())
+    }
+
+    fn lower_normalizing_statement(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        lower: impl FnOnce(&mut Self, &mut ModuleBuilder) -> Result<(), LowerError>,
+    ) -> Result<(), LowerError> {
+        let Some(outer) = self.completion else {
+            return lower(self, builder);
+        };
+        let depth = self.completion_depth;
+        let inner = match self.completion_pool.get(depth).copied() {
+            Some(register) => register,
+            None => {
+                let register = self.alloc_register(range)?;
+                self.completion_pool.push(register);
+                register
+            }
+        };
+        let undefined = self.undefined(builder, range)?;
+        self.move_to(range, inner, undefined)?;
+        self.completion = Some(inner);
+        self.completion_depth += 1;
+        let result = lower(self, builder);
+        self.completion_depth -= 1;
+        self.completion = Some(outer);
+        result?;
+        self.move_to(range, outer, inner)
+    }
+
+    fn lower_without_completion(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        lower: impl FnOnce(&mut Self, &mut ModuleBuilder) -> Result<(), LowerError>,
+    ) -> Result<(), LowerError> {
+        let completion = self.completion.take();
+        let result = lower(self, builder);
+        self.completion = completion;
+        result
     }
 
     // ------------------------------------------------------------------
@@ -890,7 +991,9 @@ impl<'a> FunctionContext<'a> {
             Statement::Interface(_) | Statement::TypeAlias(_) | Statement::Declare(_) => Ok(()),
             Statement::Import(import) => self.lower_import(builder, range, import),
             Statement::ImportEquals(import) => {
-                if import.is_type_only {
+                if self.goal == LoweringGoal::ClassicScript {
+                    Err(self.unsupported(range, UnsupportedConstruct::ImportDeclarationInScript))
+                } else if import.is_type_only {
                     Ok(())
                 } else {
                     Err(self.unsupported(range, UnsupportedConstruct::RuntimeImportEquals))
@@ -918,17 +1021,52 @@ impl<'a> FunctionContext<'a> {
             }
             Statement::Empty => Ok(()),
             Statement::Expression(expression) => {
-                self.lower_expression(builder, &expression.expression)?;
+                let value = self.lower_expression(builder, &expression.expression)?;
+                if let Some(completion) = self.completion {
+                    self.move_to(range, completion, value)?;
+                }
                 Ok(())
             }
-            Statement::If(if_statement) => self.lower_if(builder, if_statement),
-            Statement::Switch(switch) => self.lower_switch(builder, range, switch),
-            Statement::For(for_statement) => self.lower_for(builder, for_statement),
-            Statement::ForIn(for_in) => self.lower_for_in(builder, range, for_in),
-            Statement::ForOf(for_of) => self.lower_for_of(builder, range, for_of),
-            Statement::While(while_statement) => self.lower_while(builder, while_statement),
-            Statement::DoWhile(do_while) => self.lower_do_while(builder, do_while),
-            Statement::Try(try_statement) => self.lower_try(builder, range, try_statement),
+            Statement::If(if_statement) => {
+                self.lower_normalizing_statement(builder, range, |this, builder| {
+                    this.lower_if(builder, if_statement)
+                })
+            }
+            Statement::Switch(switch) => {
+                self.lower_normalizing_statement(builder, range, |this, builder| {
+                    this.lower_switch(builder, range, switch)
+                })
+            }
+            Statement::For(for_statement) => {
+                self.lower_normalizing_statement(builder, range, |this, builder| {
+                    this.lower_for(builder, for_statement)
+                })
+            }
+            Statement::ForIn(for_in) => {
+                self.lower_normalizing_statement(builder, range, |this, builder| {
+                    this.lower_for_in(builder, range, for_in)
+                })
+            }
+            Statement::ForOf(for_of) => {
+                self.lower_normalizing_statement(builder, range, |this, builder| {
+                    this.lower_for_of(builder, range, for_of)
+                })
+            }
+            Statement::While(while_statement) => {
+                self.lower_normalizing_statement(builder, range, |this, builder| {
+                    this.lower_while(builder, while_statement)
+                })
+            }
+            Statement::DoWhile(do_while) => {
+                self.lower_normalizing_statement(builder, range, |this, builder| {
+                    this.lower_do_while(builder, do_while)
+                })
+            }
+            Statement::Try(try_statement) => {
+                self.lower_normalizing_statement(builder, range, |this, builder| {
+                    this.lower_try(builder, range, try_statement)
+                })
+            }
             Statement::With(_) => Err(self.unsupported(range, UnsupportedConstruct::WithStatement)),
             Statement::Labeled(_) => {
                 Err(self.unsupported(range, UnsupportedConstruct::LabeledStatement))
@@ -1474,6 +1612,10 @@ impl<'a> FunctionContext<'a> {
 
         let catch_register = self.alloc_register(range)?;
         let handler_pc = self.next_pc();
+        if let Some(completion) = self.completion {
+            let undefined = self.undefined(builder, range)?;
+            self.move_to(range, completion, undefined)?;
+        }
         self.push_scope();
         let clause = handler_clause.data();
         if let Some(binding) = &clause.binding {
@@ -1542,6 +1684,10 @@ impl<'a> FunctionContext<'a> {
             let catch_register = self.alloc_register(range)?;
             let handler_pc = self.next_pc();
             if let Some(handler_clause) = &try_statement.handler {
+                if let Some(completion) = self.completion {
+                    let undefined = self.undefined(builder, range)?;
+                    self.move_to(range, completion, undefined)?;
+                }
                 self.push_scope();
                 let clause = handler_clause.data();
                 if let Some(binding) = &clause.binding {
@@ -1585,7 +1731,9 @@ impl<'a> FunctionContext<'a> {
             });
         }
         self.push_scope();
-        let finally_result = self.lower_block(builder, finalizer.data());
+        let finally_result = self.lower_without_completion(builder, |this, builder| {
+            this.lower_block(builder, finalizer.data())
+        });
         self.pop_scope();
         finally_result?;
         self.emit_finally_dispatch(builder, range, kind_reg, value_reg)
@@ -3089,7 +3237,10 @@ impl<'a> FunctionContext<'a> {
         range: TextRange,
         import: &ImportDeclaration,
     ) -> Result<(), LowerError> {
-        if import.type_only || self.program_mode {
+        if self.goal == LoweringGoal::ClassicScript {
+            return Err(self.unsupported(range, UnsupportedConstruct::ImportDeclarationInScript));
+        }
+        if import.type_only || self.goal == LoweringGoal::ProgramModule {
             return Ok(());
         }
         let specifier = self.string_literal_value(&import.source)?;
@@ -3138,8 +3289,9 @@ impl<'a> FunctionContext<'a> {
         range: TextRange,
         import: &crate::syntax::ImportExpression,
     ) -> Result<Register, LowerError> {
-        // `import("literal")` loads the module namespace; a non-literal
-        // specifier has no static linkage entry.
+        if self.goal == LoweringGoal::ClassicScript {
+            return Err(self.unsupported(range, UnsupportedConstruct::DynamicImportInScript));
+        }
         if let Expression::Literal(Literal::String(string)) = import.source.data() {
             let specifier = self.string_literal_value(string)?;
             let specifier_id = builder.intern(Constant::String(specifier), range)?;
@@ -3178,7 +3330,7 @@ impl<'a> FunctionContext<'a> {
         local: &str,
         exported: &str,
     ) -> Result<(), LowerError> {
-        if self.program_mode {
+        if self.goal == LoweringGoal::ProgramModule {
             return Ok(());
         }
         let src = self.read_name(builder, local, range)?;
@@ -3194,7 +3346,7 @@ impl<'a> FunctionContext<'a> {
         exported: &str,
         src: Register,
     ) -> Result<(), LowerError> {
-        if self.program_mode {
+        if self.goal == LoweringGoal::ProgramModule {
             debug_assert_eq!(exported, "default");
             return self.store_binding(builder, "*default*", src, range, false);
         }
@@ -3209,6 +3361,10 @@ impl<'a> FunctionContext<'a> {
         range: TextRange,
         export: &ExportDeclaration,
     ) -> Result<(), LowerError> {
+        if self.goal == LoweringGoal::ClassicScript {
+            return Err(self.unsupported(range, UnsupportedConstruct::ExportDeclarationInScript));
+        }
+
         match export {
             ExportDeclaration::Named(ExportNamedDeclaration::Declaration(statement)) => {
                 self.lower_statement(builder, statement)?;
@@ -3223,7 +3379,7 @@ impl<'a> FunctionContext<'a> {
                 source,
                 ..
             }) => {
-                if *type_only || self.program_mode {
+                if *type_only || self.goal == LoweringGoal::ProgramModule {
                     return Ok(());
                 }
                 if let Some(source) = source {
@@ -3262,7 +3418,7 @@ impl<'a> FunctionContext<'a> {
                 Ok(())
             }
             ExportDeclaration::All(all) => {
-                if all.type_only || self.program_mode {
+                if all.type_only || self.goal == LoweringGoal::ProgramModule {
                     Ok(())
                 } else {
                     Err(self.unsupported(range, UnsupportedConstruct::RuntimeExportAll))
@@ -3763,7 +3919,10 @@ impl<'a> FunctionContext<'a> {
             handlers: Vec::new(),
             finally_stack: Vec::new(),
             top_level: false,
-            program_mode: self.program_mode,
+            goal: self.goal,
+            completion: None,
+            completion_pool: Vec::new(),
+            completion_depth: 0,
             this_capture: None,
             new_target_capture: None,
             arguments_source: if is_arrow {
@@ -4202,7 +4361,10 @@ impl<'a> FunctionContext<'a> {
             handlers: Vec::new(),
             finally_stack: Vec::new(),
             top_level: false,
-            program_mode: self.program_mode,
+            goal: self.goal,
+            completion: None,
+            completion_pool: Vec::new(),
+            completion_depth: 0,
             this_capture: None,
             new_target_capture: None,
             arguments_source: ArgumentsSource::Own,

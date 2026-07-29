@@ -798,6 +798,11 @@ fn clone_value<H: Host>(
             properties,
             prototype,
             ..
+        }
+        | HeapEntry::Script {
+            properties,
+            prototype,
+            ..
         } => {
             let clone = machine
                 .allocate(HeapEntry::Object {

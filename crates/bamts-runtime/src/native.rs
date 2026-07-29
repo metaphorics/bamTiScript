@@ -50,6 +50,7 @@
 use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use bamts_bytecode::{
     ConstantId, EcmaString, FunctionId, Instruction, Module, ModuleId, Program, Verified,
@@ -188,10 +189,30 @@ impl From<AbiError> for NativeError {
 /// Which entry-invocation seam a nested runtime call re-enters.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Backend {
-    /// The compiler-free driver: nested calls recurse into [`NativeEngine::execute`].
+    /// The compiler-free driver; nested calls recurse into [`NativeEngine::execute`].
     Reference,
-    /// Compiled entries: nested calls go through the [`NativeEntryTable`].
+    /// Compiled entries; nested calls go through the [`NativeEntryTable`].
     Linked,
+}
+
+/// A resolved bytecode owner that outlives a temporary machine borrow.
+enum CodeRef<'m> {
+    Root(&'m Program<Verified>),
+    Dynamic(Arc<Program<Verified>>),
+}
+
+impl CodeRef<'_> {
+    fn code(&self, module: ModuleId) -> &Module<Verified> {
+        match self {
+            Self::Root(program) => {
+                &program
+                    .module(module)
+                    .expect("verified native module id remains in bounds")
+                    .code
+            }
+            Self::Dynamic(program) => &program.modules()[0].code,
+        }
+    }
 }
 
 /// A native activation record. It holds only per-call *metadata*; the register
@@ -349,11 +370,29 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     }
 
     fn module(&self, module: ModuleId) -> &Module<Verified> {
+        debug_assert!((module.get() as usize) < self.machine.borrow().dynamic_base);
         &self
             .program
             .module(module)
             .expect("verified native module id remains in bounds")
             .code
+    }
+
+    fn code_ref(&self, module: ModuleId) -> CodeRef<'m> {
+        let dynamic = {
+            let machine = self.machine.borrow();
+            let index = module.get() as usize;
+            (index >= machine.dynamic_base).then(|| {
+                machine.dynamic[index - machine.dynamic_base]
+                    .program
+                    .clone()
+            })
+        };
+        dynamic.map_or(CodeRef::Root(self.program), CodeRef::Dynamic)
+    }
+
+    fn is_dynamic_module(&self, module: ModuleId) -> bool {
+        module.get() as usize >= self.machine.borrow().dynamic_base
     }
 
     // -- Reference backend: control-flow driver ------------------------------
@@ -455,12 +494,12 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     /// uninitialized — identical to the interpreter's frame prologue.
     fn seed_registers(
         &self,
-        module: ModuleId,
+        code: &Module<Verified>,
         function: usize,
         captures: &[Value],
         args: &[Value],
     ) -> Vec<Value> {
-        let metadata = &self.module(module).functions()[function];
+        let metadata = &code.functions()[function];
         let register_count = metadata.register_count() as usize;
         let capture_count = metadata.capture_count() as usize;
         let parameter_count = metadata.parameter_count() as usize;
@@ -491,8 +530,10 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         args: Vec<Value>,
         captures: &[Value],
     ) -> Result<(FrameCompletion, Vec<Value>), RuntimeError> {
-        let register_count = self.module(module).functions()[function].register_count() as usize;
-        let mut registers = self.seed_registers(module, function, captures, &args);
+        let handle = self.code_ref(module);
+        let code = handle.code(module);
+        let register_count = code.functions()[function].register_count() as usize;
+        let mut registers = self.seed_registers(code, function, captures, &args);
         let reserved = self
             .machine
             .borrow_mut()
@@ -505,7 +546,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             arguments_object: None,
             pending_resume: None,
         });
-        let completion = self.run_frame(module, function, &mut registers);
+        let completion = self.run_frame(module, function, code, &mut registers);
         self.activations.borrow_mut().pop();
         self.machine
             .borrow_mut()
@@ -519,6 +560,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         &self,
         module: ModuleId,
         function: usize,
+        code: &Module<Verified>,
         registers: &mut Vec<Value>,
     ) -> Result<FrameCompletion, RuntimeError> {
         let length = u16::try_from(registers.len()).map_err(|_| {
@@ -544,9 +586,13 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 )
             })?;
 
+        let target = crate::RuntimeFunction {
+            module,
+            function: FunctionId::new(function as u32),
+        };
         let mut pc = 0usize;
         loop {
-            let instruction = self.module(module).functions()[function].code()[pc];
+            let instruction = code.functions()[function].code()[pc];
             if is_inline_instruction(instruction) {
                 let consumed = self.machine.borrow_mut().consume_fuel(1);
                 if let Err(kind) = consumed {
@@ -588,7 +634,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     let thrown = frame.register(value.get());
                     match self.raise(
                         &mut frame,
-                        module,
+                        code,
                         function,
                         pc,
                         thrown,
@@ -604,7 +650,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 Instruction::Suspend { .. } => {
                     match self.raise(
                         &mut frame,
-                        module,
+                        code,
                         function,
                         pc,
                         Value::UNDEFINED,
@@ -622,7 +668,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 other => {
                     let (call, dst) = self.lower(other, &frame);
                     let result = self.dispatch(&mut frame, call);
-                    match self.apply(&mut frame, module, function, pc, dst, result)? {
+                    match self.apply(&mut frame, target, code, pc, dst, result)? {
                         Flow::Next => pc += 1,
                         Flow::Goto(target) => pc = target,
                         Flow::Unwind(value, origin) => {
@@ -856,12 +902,13 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     fn apply(
         &self,
         frame: &mut NativeFrame<'_>,
-        module: ModuleId,
-        function: usize,
+        target: crate::RuntimeFunction,
+        code: &Module<Verified>,
         pc: usize,
         dst: Option<u32>,
         result: HelperResult,
     ) -> Result<Flow, RuntimeError> {
+        let function = target.function.get() as usize;
         match result.tag {
             CompletionTag::Normal => {
                 if let Some(register) = dst {
@@ -874,13 +921,13 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     Some(pending) => (pending.value, pending.origin),
                     None => (result.value, ThrowOrigin::Bytecode),
                 };
-                Ok(self.raise(frame, module, function, pc, value, origin))
+                Ok(self.raise(frame, code, function, pc, value, origin))
             }
             CompletionTag::Suspend => {
                 // The reference driver drives `Suspend` inline; a helper never
                 // returns it. Treat as a malformed completion.
                 Err(self.error_at(
-                    module,
+                    target.module,
                     RuntimeErrorKind::InvalidValue {
                         value: result.value,
                     },
@@ -897,7 +944,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         value: result.value,
                     }
                 });
-                Err(self.error_at(module, kind, function, pc))
+                Err(self.error_at(target.module, kind, function, pc))
             }
         }
     }
@@ -907,13 +954,13 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     fn raise(
         &self,
         frame: &mut NativeFrame<'_>,
-        module: ModuleId,
+        code: &Module<Verified>,
         function: usize,
         pc: usize,
         value: Value,
         origin: ThrowOrigin,
     ) -> Flow {
-        match crate::innermost_handler(&self.module(module).functions()[function], pc) {
+        match crate::innermost_handler(&code.functions()[function], pc) {
             Some(handler) => {
                 frame.set_register(handler.catch_register.get(), value);
                 Flow::Goto(handler.handler.get() as usize)
@@ -957,6 +1004,10 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         &args[argument_start..],
                         Value::UNDEFINED,
                     ),
+                    Ok(BuiltinOutcome::ConstructCall { .. }) => InvokeOutcome::Threw(
+                        Value::UNDEFINED,
+                        ThrowOrigin::TypeError { operation: "call" },
+                    ),
                     Err(EvalFailure::Throw(origin)) => {
                         InvokeOutcome::Threw(Value::UNDEFINED, origin)
                     }
@@ -991,28 +1042,26 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         args: &[Value],
     ) -> InvokeOutcome {
         let index = target.function.get() as usize;
-        match self.backend {
-            Backend::Reference => {
-                match self.execute(
-                    target.module,
-                    index,
-                    this,
-                    new_target,
-                    args.to_vec(),
-                    captures,
-                ) {
-                    Ok((FrameCompletion::Normal(value), _)) => InvokeOutcome::Value(value),
-                    Ok((FrameCompletion::Unwind(value, origin, _), _)) => {
-                        InvokeOutcome::Threw(value, origin)
-                    }
-                    Err(error) => {
-                        self.pending_error.set(Some(error));
-                        InvokeOutcome::Fatal
-                    }
+        if self.backend == Backend::Reference || self.is_dynamic_module(target.module) {
+            return match self.execute(
+                target.module,
+                index,
+                this,
+                new_target,
+                args.to_vec(),
+                captures,
+            ) {
+                Ok((FrameCompletion::Normal(value), _)) => InvokeOutcome::Value(value),
+                Ok((FrameCompletion::Unwind(value, origin, _), _)) => {
+                    InvokeOutcome::Threw(value, origin)
                 }
-            }
-            Backend::Linked => self.invoke_linked(target, captures, this, new_target, args),
+                Err(error) => {
+                    self.pending_error.set(Some(error));
+                    InvokeOutcome::Fatal
+                }
+            };
         }
+        self.invoke_linked(target, captures, this, new_target, args)
     }
 
     /// Invokes a compiled entry through the borrowed [`NativeEntryTable`],
@@ -1025,10 +1074,12 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         new_target: Value,
         args: &[Value],
     ) -> InvokeOutcome {
+        debug_assert!(!self.is_dynamic_module(target.module));
         let index = target.function.get() as usize;
-        let register_count =
-            self.module(target.module).functions()[index].register_count() as usize;
-        let mut registers = self.seed_registers(target.module, index, captures, args);
+        let handle = self.code_ref(target.module);
+        let code = handle.code(target.module);
+        let register_count = code.functions()[index].register_count() as usize;
+        let mut registers = self.seed_registers(code, index, captures, args);
         let length = match u16::try_from(registers.len()) {
             Ok(length) => length,
             Err(_) => {
@@ -1217,30 +1268,43 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         }));
                         HelperResult::throw(Value::UNDEFINED)
                     }
+                    Ok(BuiltinOutcome::ConstructCall {
+                        callee: continuation,
+                        this_value,
+                        argument_start,
+                        prototype,
+                    }) => {
+                        let instance = match self
+                            .machine
+                            .borrow_mut()
+                            .allocate_constructed_receiver_with(prototype)
+                        {
+                            Ok(value) => value,
+                            Err(kind) => return self.fatal(kind),
+                        };
+                        let outcome = self.invoke_callee(
+                            continuation,
+                            this_value,
+                            &arguments[argument_start..],
+                            Value::UNDEFINED,
+                        );
+                        match outcome {
+                            InvokeOutcome::Value(returned) => {
+                                let is_object = self.machine.borrow().is_object(returned);
+                                HelperResult::normal(if is_object { returned } else { instance })
+                            }
+                            other => self.outcome_result(other),
+                        }
+                    }
                     Err(failure) => self.fail(failure),
                 }
             }
             Ok(CalleeKind::Runtime { target, captures }) => {
-                let prototype = {
-                    let machine = self.machine.borrow();
-                    match machine.runtime_slot(callee) {
-                        Ok(Some(index)) => match machine.own_data_property(index, "prototype") {
-                            Some(value) if machine.is_object(value) => Some(value),
-                            _ => Some(machine.intrinsics.object_prototype),
-                        },
-                        _ => {
-                            drop(machine);
-                            return self.fatal(RuntimeErrorKind::InvalidValue { value: callee });
-                        }
-                    }
-                };
                 let instance = {
-                    let allocated = self.machine.borrow_mut().allocate(HeapEntry::Object {
-                        properties: PropertyMap::default(),
-                        prototype,
-                        boxed_primitive: None,
-                        extensible: true,
-                    });
+                    let allocated = self
+                        .machine
+                        .borrow_mut()
+                        .allocate_constructed_receiver(callee);
                     match allocated {
                         Ok(value) => value,
                         Err(kind) => return self.fatal(kind),
@@ -1340,9 +1404,10 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     }
 
     fn invoke_linked_entry(&mut self, module: ModuleId) -> Result<Execution, NativeError> {
-        let function_id = self.module(module).entry();
+        let code = self.module(module);
+        let function_id = code.entry();
         let function = function_id.get() as usize;
-        let register_count = self.module(module).functions()[function].register_count() as usize;
+        let register_count = code.functions()[function].register_count() as usize;
         if self.max_call_depth() < 1 {
             return Err(NativeError::Runtime(self.error_at(
                 module,
@@ -1363,7 +1428,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 0,
             )));
         }
-        let mut registers = self.seed_registers(module, function, &[], &[]);
+        let mut registers = self.seed_registers(code, function, &[], &[]);
         let length = u16::try_from(register_count).map_err(|_| {
             NativeError::Runtime(self.error_at(
                 module,
@@ -1866,6 +1931,7 @@ pub fn run_linked_program<H: Host>(
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::sync::Arc;
 
     use bamts_bytecode::{
         BinaryOp, Binding, BindingId, BindingKind, Constant, ConstantId, Edge, EdgeId, EdgeKind,
@@ -3305,5 +3371,54 @@ mod tests {
                 }))
             ));
         }
+    }
+
+    #[test]
+    fn linked_backend_routes_dynamic_targets_away_from_entry_table() {
+        let root = one_module_program(&verified(
+            Vec::new(),
+            vec![entry_function(1, vec![Instruction::Halt])],
+        ));
+        let script = Arc::new(one_module_program(&verified(
+            vec![Constant::Int32(42)],
+            vec![entry_function(
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+            )],
+        )));
+        let entries = RecordingEntries::default();
+        let mut host = SilentHost;
+        let engine = NativeEngine::build(
+            &root,
+            &entries,
+            &mut host,
+            Limits::default(),
+            Backend::Linked,
+        );
+        engine.machine.borrow_mut().instantiate_modules().unwrap();
+        let module = engine
+            .machine
+            .borrow_mut()
+            .install_script_reserving(script, 0, 0)
+            .unwrap();
+
+        let outcome = engine.invoke_runtime(
+            crate::RuntimeFunction {
+                module,
+                function: FunctionId::new(0),
+            },
+            &[],
+            Value::UNDEFINED,
+            Value::UNDEFINED,
+            &[],
+        );
+        assert!(matches!(outcome, InvokeOutcome::Value(value) if value == Value::int32(42)));
+        assert!(entries.invoked.borrow().is_empty());
     }
 }

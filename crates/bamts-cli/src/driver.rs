@@ -427,6 +427,7 @@ fn run(args: &CliArgs, frontend: &LoadedProgramFrontend) -> Result<CommandOutcom
     .map_err(DriverError::Lower)?;
     let program = bamts_codegen::compile_jit(executable.wire()).map_err(DriverError::Jit)?;
     let mut host = bamts_node::NodeHost::new();
+    host.set_script_compiler(Box::new(bamts::ScriptCompiler));
     host.set_argv(
         ["bamts".to_owned(), entrypoint.display().to_string()]
             .into_iter()
@@ -910,5 +911,53 @@ mod tests {
             table.level_for_source(typescript_only, SourceDialect::JavaScript),
             LintLevel::Allow
         );
+    }
+
+    #[test]
+    fn run_executes_node_vm_scripts_with_the_linked_backend()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cases = [
+            (
+                "default-import",
+                "import vm from 'node:vm'; process.stdout.write(String(vm.runInThisContext('1+1')) + '\\n');",
+                b"2\n".as_slice(),
+            ),
+            (
+                "named-import",
+                "import { runInThisContext } from 'node:vm'; process.stdout.write(String(runInThisContext('1+1')) + '\\n');",
+                b"2\n".as_slice(),
+            ),
+            (
+                "syntax-error",
+                "import vm from 'node:vm'; try { new vm.Script('('); } catch (error) { process.stdout.write(error.name + '\\n'); }",
+                b"SyntaxError\n".as_slice(),
+            ),
+            (
+                "escaped-function",
+                "import vm from 'node:vm'; const script = new vm.Script('(function(){ return 42; })'); const f = script.runInThisContext(); process.stdout.write(String(f()) + '\\n');",
+                b"42\n".as_slice(),
+            ),
+            (
+                "construct-runner",
+                "import vm from 'node:vm'; const runner = vm.runInThisContext; const before = runner.prototype; const after = {}; const options = { get filename() { runner.prototype = after; return 'changed.js'; } }; const fallback = new runner('1', options); const result = new runner('({ answer: 42 })'); process.stdout.write(String(Object.getPrototypeOf(fallback) === before) + ',' + String(runner.prototype === after) + ',' + String(result.answer) + '\\n');",
+                b"true,true,42\n".as_slice(),
+            ),
+        ];
+
+        for (name, source, expected_stdout) in cases {
+            let directory =
+                std::env::temp_dir().join(format!("bamts-cli-vm-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&directory);
+            std::fs::create_dir_all(&directory)?;
+            let entrypoint = directory.join("main.ts");
+            std::fs::write(&entrypoint, source)?;
+
+            let args = parse_args(["run", entrypoint.to_str().expect("UTF-8 temp path")])?;
+            let outcome = super::execute(&args)?;
+            assert_eq!(outcome.stdout, expected_stdout, "{name}");
+            assert_eq!(outcome.exit_code, 0, "{name}");
+            std::fs::remove_dir_all(directory)?;
+        }
+        Ok(())
     }
 }

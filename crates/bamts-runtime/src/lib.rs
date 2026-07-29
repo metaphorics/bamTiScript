@@ -23,11 +23,12 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use bamts_bytecode::{
     AccessorKind, BinaryOp, BindingId, BindingKind, Constant, ConstantId, EcmaString,
     EcmaStringBuilder, EdgeId, EdgeTarget, Function, FunctionId, Instruction, IteratorKind, Module,
-    ModuleId, Pc, Program, ResolvedExport, UnaryOp, Verified,
+    ModuleId, Pc, Program, ProgramModule, ResolvedExport, UnaryOp, Verified,
 };
 use bamts_native::{Decoded, SlotId, Value};
 
@@ -35,6 +36,7 @@ mod external_modules;
 mod host_objects;
 mod intrinsics;
 mod native;
+mod vm;
 
 pub use native::{NativeEngine, NativeError, run_linked_program};
 
@@ -72,6 +74,8 @@ pub struct Limits {
     pub max_heap_bytes: usize,
     /// Ceiling on engine-owned module binding cells.
     pub max_module_cells: usize,
+    /// Ceiling on host-compiled scripts retained by one machine.
+    pub max_dynamic_modules: usize,
 }
 
 impl Default for Limits {
@@ -84,8 +88,45 @@ impl Default for Limits {
             max_heap_slots: 1 << 20,
             max_heap_bytes: 64 << 20,
             max_module_cells: 1 << 20,
+            max_dynamic_modules: 1 << 10,
         }
     }
+}
+
+/// The exact source of one classic script. Source and resource name preserve
+/// UTF-16 code units verbatim, including unpaired surrogates.
+pub struct ScriptSource<'a> {
+    pub source: &'a [u16],
+    pub name: &'a [u16],
+}
+
+/// Why a host compiler refused a classic script.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ScriptCompileError {
+    IllFormedSource {
+        unit_offset: usize,
+    },
+    Syntax {
+        message: String,
+        line: u32,
+        column: u32,
+    },
+    Unsupported {
+        message: String,
+        line: u32,
+        column: u32,
+    },
+    Capacity {
+        message: String,
+    },
+}
+
+/// A host capability for compiling a classic script without observing machine state.
+pub trait CompileProvider {
+    fn compile_script(
+        &mut self,
+        source: ScriptSource<'_>,
+    ) -> Result<Arc<Program<Verified>>, ScriptCompileError>;
 }
 
 /// External capabilities available to the JavaScript runtime.
@@ -130,6 +171,14 @@ pub trait Host {
     }
 
     fn hash(&mut self, _algorithm: &str, _data: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// This host's script compiler, or `None` when it provides none.
+    ///
+    /// Presence MUST remain stable for the lifetime of one machine because it
+    /// determines whether `node:vm` is installed during construction.
+    fn script_compiler(&mut self) -> Option<&mut (dyn CompileProvider + 'static)> {
         None
     }
 }
@@ -185,6 +234,12 @@ pub enum RuntimeErrorKind {
     },
     ModuleCellLimitExceeded {
         limit: usize,
+    },
+    DynamicModuleLimitExceeded {
+        limit: usize,
+    },
+    InvalidDynamicScript {
+        reason: &'static str,
     },
     TemporalDeadZone {
         module: ModuleId,
@@ -248,6 +303,12 @@ impl fmt::Display for RuntimeError {
             }
             RuntimeErrorKind::ModuleCellLimitExceeded { limit } => {
                 write!(formatter, "module cell limit {limit} exceeded")
+            }
+            RuntimeErrorKind::DynamicModuleLimitExceeded { limit } => {
+                write!(formatter, "dynamic module limit {limit} exceeded")
+            }
+            RuntimeErrorKind::InvalidDynamicScript { reason } => {
+                write!(formatter, "invalid dynamic script: {reason}")
             }
             RuntimeErrorKind::TemporalDeadZone { module, binding } => write!(
                 formatter,
@@ -469,6 +530,13 @@ enum HeapEntry {
         prototype: Option<Value>,
         extensible: bool,
     },
+    /// A `vm.Script` whose entry function retains its machine-owned dynamic module.
+    Script {
+        entry: Value,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+        extensible: bool,
+    },
     ModuleNamespace {
         module: ModuleId,
     },
@@ -557,6 +625,7 @@ impl HeapEntry {
             Self::Object { .. }
             | Self::Array { .. }
             | Self::Function { .. }
+            | Self::Script { .. }
             | Self::ModuleNamespace { .. }
             | Self::ExternalModuleNamespace { .. }
             | Self::NativeFunction { .. }
@@ -715,6 +784,17 @@ pub struct Machine<'a, H: Host> {
     intrinsics: intrinsics::Intrinsics<H>,
     current_builtin_id: Option<intrinsics::BuiltinId>,
     registry: ModuleRegistry,
+    /// First machine-wide module ID reserved for host-compiled script modules.
+    dynamic_base: usize,
+    /// Host-compiled programs retained for the machine lifetime so their
+    /// closures remain executable after the originating Script object dies.
+    dynamic: Vec<DynamicModule>,
+}
+
+#[derive(Clone, Debug)]
+struct DynamicModule {
+    program: Arc<Program<Verified>>,
+    bytes: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -810,10 +890,12 @@ impl<'a, H: Host> Machine<'a, H> {
         let live_registers = frame.registers.len();
         let mut heap = Vec::new();
         let mut intrinsics = intrinsics::Intrinsics::<H>::initialize(&mut heap);
+        let script_compiler = host.script_compiler().is_some();
         let installed_external = external_modules::install(
             &mut heap,
             &mut intrinsics.builtins,
             intrinsics.object_prototype,
+            script_compiler,
         );
         let argv_text = host.argv().to_vec();
         let argv_values: Vec<Value> = argv_text
@@ -887,6 +969,8 @@ impl<'a, H: Host> Machine<'a, H> {
                     .collect(),
                 ..ModuleRegistry::default()
             },
+            dynamic_base: program.map_or(1, |program| program.modules().len()),
+            dynamic: Vec::new(),
             current_builtin_id: None,
             intrinsics,
         }
@@ -918,6 +1002,10 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn module_code(&self, module: ModuleId) -> &Module<Verified> {
+        let index = module.get() as usize;
+        if index >= self.dynamic_base {
+            return &self.dynamic[index - self.dynamic_base].program.modules()[0].code;
+        }
         match self.program {
             Some(program) => {
                 &program
@@ -927,6 +1015,146 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             None => self.module,
         }
+    }
+
+    fn program_module(&self, module: ModuleId) -> &ProgramModule<Verified> {
+        let index = module.get() as usize;
+        if index >= self.dynamic_base {
+            return &self.dynamic[index - self.dynamic_base].program.modules()[0];
+        }
+        self.program
+            .and_then(|program| program.module(module))
+            .expect("verified module id remains in bounds")
+    }
+
+    /// Validates host-provided code against this machine's classic-script realm.
+    fn validate_dynamic_script(program: &Program<Verified>) -> Result<(), &'static str> {
+        if program.modules().len() != 1 {
+            return Err("script program must contain exactly one module");
+        }
+        if program.entry() != ModuleId::new(0) {
+            return Err("script program entry must be module zero");
+        }
+        let module = &program.modules()[0];
+        if !module.edges.is_empty() || !module.bindings.is_empty() || !module.exports.is_empty() {
+            return Err("script program must not contain linkage metadata");
+        }
+        if module
+            .code
+            .functions()
+            .iter()
+            .flat_map(|function| function.code())
+            .any(|instruction| {
+                matches!(
+                    instruction,
+                    Instruction::Import { .. } | Instruction::Export { .. }
+                )
+            })
+        {
+            return Err("script program must not contain import or export instructions");
+        }
+        Ok(())
+    }
+
+    fn script_heap_cost(program: &Program<Verified>) -> usize {
+        const MODULE_BYTES: usize = 64;
+        const FUNCTION_BYTES: usize = 32;
+        program.modules().iter().fold(0usize, |total, module| {
+            let constant_bytes = module
+                .code
+                .constants()
+                .iter()
+                .fold(0usize, |bytes, constant| {
+                    let payload = match constant {
+                        Constant::String(text) => text.len_units().saturating_mul(2),
+                        Constant::BigInt(value) => value.as_str().len(),
+                        Constant::Number(_)
+                        | Constant::Int32(_)
+                        | Constant::Boolean(_)
+                        | Constant::Null
+                        | Constant::Undefined => 0,
+                    };
+                    bytes
+                        .saturating_add(std::mem::size_of::<Constant>())
+                        .saturating_add(payload)
+                });
+            let function_bytes =
+                module
+                    .code
+                    .functions()
+                    .iter()
+                    .fold(0usize, |bytes, function| {
+                        bytes
+                            .saturating_add(FUNCTION_BYTES)
+                            .saturating_add(
+                                function
+                                    .code()
+                                    .len()
+                                    .saturating_mul(std::mem::size_of::<Instruction>()),
+                            )
+                            .saturating_add(function.handlers().len().saturating_mul(
+                                std::mem::size_of::<bamts_bytecode::ExceptionHandler>(),
+                            ))
+                    });
+            total
+                .saturating_add(MODULE_BYTES)
+                .saturating_add(constant_bytes)
+                .saturating_add(function_bytes)
+                .saturating_add(module.code.verification_bytes())
+        })
+    }
+
+    fn install_script_reserving(
+        &mut self,
+        program: Arc<Program<Verified>>,
+        reserved_slots: usize,
+        reserved_bytes: usize,
+    ) -> Result<ModuleId, RuntimeErrorKind> {
+        Self::validate_dynamic_script(&program)
+            .map_err(|reason| RuntimeErrorKind::InvalidDynamicScript { reason })?;
+        if self.dynamic.len() >= self.limits.max_dynamic_modules {
+            return Err(RuntimeErrorKind::DynamicModuleLimitExceeded {
+                limit: self.limits.max_dynamic_modules,
+            });
+        }
+        let bytes = Self::script_heap_cost(&program);
+        let retained_bytes =
+            bytes
+                .checked_add(reserved_bytes)
+                .ok_or(RuntimeErrorKind::HeapByteLimitExceeded {
+                    limit: self.limits.max_heap_bytes,
+                })?;
+        self.ensure_allocation_capacity(reserved_slots, retained_bytes)?;
+        self.charge_heap(bytes)?;
+        let index = self.dynamic_base.checked_add(self.dynamic.len()).ok_or(
+            RuntimeErrorKind::DynamicModuleLimitExceeded {
+                limit: self.limits.max_dynamic_modules,
+            },
+        )?;
+        let module = ModuleId::new(u32::try_from(index).map_err(|_| {
+            RuntimeErrorKind::DynamicModuleLimitExceeded {
+                limit: self.limits.max_dynamic_modules,
+            }
+        })?);
+        self.dynamic.push(DynamicModule { program, bytes });
+        self.registry.modules.push(ModuleInstance {
+            binding_cells: Vec::new(),
+            constant_cells: Vec::new(),
+            namespace: None,
+            state: ModuleState::Unevaluated,
+        });
+        debug_assert_eq!(
+            self.dynamic
+                .last()
+                .expect("installed script remains retained")
+                .bytes,
+            bytes
+        );
+        debug_assert_eq!(
+            self.registry.modules.len(),
+            self.dynamic_base + self.dynamic.len()
+        );
+        Ok(module)
     }
 
     fn allocate_cell(&mut self, value: Value, module: ModuleId) -> Result<CellId, RuntimeError> {
@@ -944,6 +1172,10 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     pub(crate) fn instantiate_modules(&mut self) -> Result<(), RuntimeError> {
+        debug_assert!(
+            self.dynamic.is_empty(),
+            "module instantiation precedes dynamic script installation"
+        );
         let program = self
             .program
             .expect("module registry operations require a whole program");
@@ -1057,7 +1289,8 @@ impl<'a, H: Host> Machine<'a, H> {
         if let Some(value) = self.registry.modules[target.get() as usize].namespace {
             return Ok(value);
         }
-        let exported_names: Vec<EcmaString> = self.program().modules()[target.get() as usize]
+        let exported_names: Vec<EcmaString> = self
+            .program_module(target)
             .exports
             .iter()
             .map(|export| self.constant_text(target, export.name).clone())
@@ -1078,7 +1311,7 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn external_specifier(&self, module: ModuleId, edge: EdgeId) -> Option<EcmaString> {
-        let dependency = self.program().modules()[module.get() as usize].edges[edge.get() as usize];
+        let dependency = self.program_module(module).edges[edge.get() as usize];
         let specifier = self.constant_text(module, dependency.specifier);
         self.registry
             .external
@@ -1216,7 +1449,8 @@ impl<'a, H: Host> Machine<'a, H> {
         self.registry.modules[module.get() as usize].state = ModuleState::Evaluating;
 
         let mut dependencies = Vec::new();
-        for (edge_index, edge) in self.program().modules()[module.get() as usize]
+        for (edge_index, edge) in self
+            .program_module(module)
             .edges
             .iter()
             .copied()
@@ -1760,14 +1994,9 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn allocate(&mut self, entry: HeapEntry) -> Result<Value, RuntimeErrorKind> {
-        if self.heap.len().saturating_sub(self.intrinsic_slots) >= self.limits.max_heap_slots
-            || self.heap.len() == u32::MAX as usize
-        {
-            return Err(RuntimeErrorKind::HeapSlotLimitExceeded {
-                limit: self.limits.max_heap_slots,
-            });
-        }
-        self.charge_heap(entry.initial_bytes())?;
+        let bytes = entry.initial_bytes();
+        self.ensure_allocation_capacity(1, bytes)?;
+        self.heap_bytes += bytes;
         let slot = self.heap.len() as u32 + 1;
         self.heap.push(entry);
         let id = SlotId::from_parts(RUNTIME_HEAP_SEGMENT, slot)
@@ -1775,18 +2004,40 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(Value::heap_ref(id))
     }
 
-    fn charge_heap(&mut self, bytes: usize) -> Result<(), RuntimeErrorKind> {
-        let Some(total) = self.heap_bytes.checked_add(bytes) else {
-            return Err(RuntimeErrorKind::HeapByteLimitExceeded {
-                limit: self.limits.max_heap_bytes,
+    fn ensure_allocation_capacity(
+        &self,
+        additional_slots: usize,
+        additional_bytes: usize,
+    ) -> Result<(), RuntimeErrorKind> {
+        let used_slots = self.heap.len().saturating_sub(self.intrinsic_slots);
+        let slots_fit_limit = used_slots
+            .checked_add(additional_slots)
+            .is_some_and(|total| total <= self.limits.max_heap_slots);
+        let slots_fit_value = self
+            .heap
+            .len()
+            .checked_add(additional_slots)
+            .is_some_and(|total| total <= u32::MAX as usize);
+        if !slots_fit_limit || !slots_fit_value {
+            return Err(RuntimeErrorKind::HeapSlotLimitExceeded {
+                limit: self.limits.max_heap_slots,
             });
-        };
-        if total > self.limits.max_heap_bytes {
+        }
+        let bytes_fit = self
+            .heap_bytes
+            .checked_add(additional_bytes)
+            .is_some_and(|total| total <= self.limits.max_heap_bytes);
+        if !bytes_fit {
             return Err(RuntimeErrorKind::HeapByteLimitExceeded {
                 limit: self.limits.max_heap_bytes,
             });
         }
-        self.heap_bytes = total;
+        Ok(())
+    }
+
+    fn charge_heap(&mut self, bytes: usize) -> Result<(), RuntimeErrorKind> {
+        self.ensure_allocation_capacity(0, bytes)?;
+        self.heap_bytes += bytes;
         Ok(())
     }
 
@@ -1861,7 +2112,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 .position(|candidate| *candidate == Some(cell))
                 .expect("mapped module cell belongs to a binding");
             if matches!(
-                self.program().modules()[module.get() as usize].bindings[binding].kind,
+                self.program_module(module).bindings[binding].kind,
                 BindingKind::Imported { .. } | BindingKind::Namespace { .. }
             ) {
                 return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
@@ -2167,6 +2418,9 @@ impl<'a, H: Host> Machine<'a, H> {
                         constructed,
                         new_target,
                     }),
+                    Ok(intrinsics::BuiltinOutcome::ConstructCall { .. }) => {
+                        self.throw_type("call", call_pc)
+                    }
                     Err(failure) => self.resolve_failure(failure, call_pc),
                 }
             }
@@ -2193,6 +2447,25 @@ impl<'a, H: Host> Machine<'a, H> {
                         Ok(intrinsics::BuiltinOutcome::Call { .. }) => {
                             return self.throw_type("construct", call_pc);
                         }
+                        Ok(intrinsics::BuiltinOutcome::ConstructCall {
+                            callee: continuation,
+                            this_value,
+                            argument_start,
+                            prototype,
+                        }) => {
+                            let object = self
+                                .allocate_constructed_receiver_with(prototype)
+                                .map_err(|kind| self.error_here_at(kind, call_pc))?;
+                            return self.execute_call(CallRequest {
+                                callee: continuation,
+                                this_value,
+                                arguments: &arguments[argument_start..],
+                                destination: Some(destination),
+                                call_pc,
+                                constructed: Some(object),
+                                new_target: Value::UNDEFINED,
+                            });
+                        }
                         Err(failure) => return self.resolve_failure(failure, call_pc),
                     }
                 }
@@ -2202,19 +2475,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 ) {
                     return self.throw_type("construct", call_pc);
                 }
-                // The instance's [[Prototype]] is the constructor's own
-                // `prototype` data property when it is an object.
-                let instance_prototype = match self.own_data_property(index, "prototype") {
-                    Some(value) if self.is_object(value) => Some(value),
-                    _ => Some(self.intrinsics.object_prototype),
-                };
                 let object = self
-                    .allocate(HeapEntry::Object {
-                        properties: PropertyMap::default(),
-                        prototype: instance_prototype,
-                        boxed_primitive: None,
-                        extensible: true,
-                    })
+                    .allocate_constructed_receiver(callee)
                     .map_err(|kind| self.error_here_at(kind, call_pc))?;
                 self.execute_call(CallRequest {
                     callee,
@@ -2229,6 +2491,33 @@ impl<'a, H: Host> Machine<'a, H> {
             Ok(None) => self.throw_type("construct", call_pc),
             Err(kind) => Err(self.error_here_at(kind, call_pc)),
         }
+    }
+
+    fn constructed_prototype(&self, callee: Value) -> Result<Value, RuntimeErrorKind> {
+        let index = self
+            .runtime_slot(callee)?
+            .ok_or(RuntimeErrorKind::InvalidValue { value: callee })?;
+        Ok(match self.own_data_property(index, "prototype") {
+            Some(value) if self.is_object(value) => value,
+            _ => self.intrinsics.object_prototype,
+        })
+    }
+
+    fn allocate_constructed_receiver(&mut self, callee: Value) -> Result<Value, RuntimeErrorKind> {
+        let prototype = self.constructed_prototype(callee)?;
+        self.allocate_constructed_receiver_with(prototype)
+    }
+
+    fn allocate_constructed_receiver_with(
+        &mut self,
+        prototype: Value,
+    ) -> Result<Value, RuntimeErrorKind> {
+        self.allocate(HeapEntry::Object {
+            properties: PropertyMap::default(),
+            prototype: Some(prototype),
+            boxed_primitive: None,
+            extensible: true,
+        })
     }
 
     pub(crate) fn array_elements(&self, value: Value) -> Result<Option<Vec<Value>>, EvalFailure> {
@@ -2452,6 +2741,11 @@ impl<'a, H: Host> Machine<'a, H> {
                         this_value,
                         argument_start,
                     } => self.call_value(callee, this_value, &arguments[argument_start..]),
+                    intrinsics::BuiltinOutcome::ConstructCall { .. } => {
+                        Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                            operation: "call",
+                        }))
+                    }
                 }
             }
             CalleeKind::Runtime { target, captures } => {
@@ -2811,6 +3105,7 @@ impl<'a, H: Host> Machine<'a, H> {
         }
         match &self.heap[index] {
             HeapEntry::Object { properties, .. }
+            | HeapEntry::Script { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
@@ -2857,7 +3152,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 None
             }
             HeapEntry::ModuleNamespace { module } => {
-                let key = self.program().modules()[module.get() as usize]
+                let key = self
+                    .program_module(*module)
                     .exports
                     .iter()
                     .map(|export| self.constant_text(*module, export.name))
@@ -2939,6 +3235,7 @@ impl<'a, H: Host> Machine<'a, H> {
         }
         match &self.heap[index] {
             HeapEntry::Object { properties, .. }
+            | HeapEntry::Script { properties, .. }
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. } => property_lookup(properties, key),
@@ -3002,10 +3299,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     return None;
                 };
                 let export = self.registry.external[specifier].exports.get(name)?;
-                let cell = export
-                    .cell
-                    .expect("external namespace exports link before evaluation");
-                Some(Found::Value(self.registry.cells[cell.0].value))
+                Some(Found::Value(export.cell.map_or(export.value, |cell| {
+                    self.registry.cells[cell.0].value
+                })))
             }
             HeapEntry::NativeFunction { properties, .. } => property_lookup(properties, key),
             HeapEntry::RegExp {
@@ -3079,6 +3375,9 @@ impl<'a, H: Host> Machine<'a, H> {
         module: ModuleId,
         name: &EcmaString,
     ) -> Result<Option<Value>, RuntimeErrorKind> {
+        if module.get() as usize >= self.dynamic_base {
+            return Ok(None);
+        }
         match self.program().resolve_export(module, name) {
             Some(ResolvedExport::Local { module, binding }) => {
                 let cell = self.registry.modules[module.get() as usize].binding_cells
@@ -3111,6 +3410,7 @@ impl<'a, H: Host> Machine<'a, H> {
     fn own_data_property(&self, index: usize, name: &str) -> Option<Value> {
         let properties = match &self.heap[index] {
             HeapEntry::Object { properties, .. }
+            | HeapEntry::Script { properties, .. }
             | HeapEntry::Array { properties, .. }
             | HeapEntry::Function { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
@@ -3129,6 +3429,7 @@ impl<'a, H: Host> Machine<'a, H> {
     fn prototype_index(&self, index: usize) -> Result<Option<usize>, EvalFailure> {
         let prototype = match &self.heap[index] {
             HeapEntry::Object { prototype, .. }
+            | HeapEntry::Script { prototype, .. }
             | HeapEntry::Array { prototype, .. }
             | HeapEntry::Function { prototype, .. }
             | HeapEntry::RegExp { prototype, .. }
@@ -3200,6 +3501,7 @@ impl<'a, H: Host> Machine<'a, H> {
         loop {
             let accessor = match &self.heap[node] {
                 HeapEntry::Object { properties, .. }
+                | HeapEntry::Script { properties, .. }
                 | HeapEntry::Array { properties, .. }
                 | HeapEntry::Function { properties, .. }
                 | HeapEntry::NativeFunction { properties, .. }
@@ -3305,6 +3607,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 extensible,
                 ..
             }
+            | HeapEntry::Script {
+                properties,
+                extensible,
+                ..
+            }
             | HeapEntry::Function {
                 properties,
                 extensible,
@@ -3373,6 +3680,7 @@ impl<'a, H: Host> Machine<'a, H> {
 
         let growth = match &self.heap[index] {
             HeapEntry::Object { properties, .. }
+            | HeapEntry::Script { properties, .. }
             | HeapEntry::Function { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
             | HeapEntry::RegExp { properties, .. }
@@ -3429,6 +3737,7 @@ impl<'a, H: Host> Machine<'a, H> {
         self.charge_heap(growth).map_err(EvalFailure::Runtime)?;
         match &mut self.heap[index] {
             HeapEntry::Object { properties, .. }
+            | HeapEntry::Script { properties, .. }
             | HeapEntry::Function { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
             | HeapEntry::RegExp { properties, .. }
@@ -3512,6 +3821,11 @@ impl<'a, H: Host> Machine<'a, H> {
                     .map_err(EvalFailure::Runtime)?;
                 let (properties, extensible) = match &mut self.heap[index] {
                     HeapEntry::Object {
+                        properties,
+                        extensible,
+                        ..
+                    }
+                    | HeapEntry::Script {
                         properties,
                         extensible,
                         ..
@@ -3600,6 +3914,7 @@ impl<'a, H: Host> Machine<'a, H> {
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => match &mut self.heap[index] {
                 HeapEntry::Object { properties, .. }
+                | HeapEntry::Script { properties, .. }
                 | HeapEntry::Function { properties, .. }
                 | HeapEntry::NativeFunction { properties, .. }
                 | HeapEntry::RegExp { properties, .. }
@@ -3824,7 +4139,7 @@ impl<'a, H: Host> Machine<'a, H> {
             Some(index)
                 if matches!(
                     self.heap[index],
-                    HeapEntry::Object { .. } | HeapEntry::Array { .. }
+                    HeapEntry::Object { .. } | HeapEntry::Script { .. } | HeapEntry::Array { .. }
                 ) =>
             {
                 index
@@ -3842,6 +4157,7 @@ impl<'a, H: Host> Machine<'a, H> {
         if let Some(index) = self.runtime_slot(source).map_err(EvalFailure::Runtime)? {
             match &self.heap[index] {
                 HeapEntry::Object { properties, .. }
+                | HeapEntry::Script { properties, .. }
                 | HeapEntry::Date { properties, .. }
                 | HeapEntry::BuiltinIterator { properties, .. }
                 | HeapEntry::Collection { properties, .. } => {
@@ -3930,6 +4246,9 @@ impl<'a, H: Host> Machine<'a, H> {
                 HeapEntry::Object {
                     prototype: slot, ..
                 }
+                | HeapEntry::Script {
+                    prototype: slot, ..
+                }
                 | HeapEntry::Array {
                     prototype: slot, ..
                 }
@@ -4001,6 +4320,7 @@ impl<'a, H: Host> Machine<'a, H> {
         match self.runtime_slot(src).map_err(EvalFailure::Runtime)? {
             Some(index) => match &self.heap[index] {
                 HeapEntry::Object { properties, .. }
+                | HeapEntry::Script { properties, .. }
                 | HeapEntry::Function { properties, .. }
                 | HeapEntry::NativeFunction { properties, .. }
                 | HeapEntry::RegExp { properties, .. }
@@ -4031,8 +4351,8 @@ impl<'a, H: Host> Machine<'a, H> {
                     .map(|index| PropertyKey::Named(EcmaString::from_utf8(&index.to_string())))
                     .collect()),
                 HeapEntry::ModuleNamespace { module } => {
-                    let mut names: Vec<EcmaString> = self.program().modules()
-                        [module.get() as usize]
+                    let mut names: Vec<EcmaString> = self
+                        .program_module(*module)
                         .exports
                         .iter()
                         .map(|export| self.constant_text(*module, export.name).clone())
@@ -4089,6 +4409,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     }
                     HeapEntry::ModuleNamespace { .. } => true,
                     HeapEntry::Object { properties, .. }
+                    | HeapEntry::Script { properties, .. }
                     | HeapEntry::Function { properties, .. }
                     | HeapEntry::NativeFunction { properties, .. }
                     | HeapEntry::RegExp { properties, .. }
@@ -4413,6 +4734,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             }))
                         }
                         HeapEntry::Object { .. }
+                        | HeapEntry::Script { .. }
                         | HeapEntry::Array { .. }
                         | HeapEntry::Function { .. }
                         | HeapEntry::ModuleNamespace { .. }
@@ -4449,6 +4771,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     HeapEntry::String(text) => !text.is_empty(),
                     HeapEntry::BigInt(text) => text != "0",
                     HeapEntry::Object { .. }
+                    | HeapEntry::Script { .. }
                     | HeapEntry::Array { .. }
                     | HeapEntry::Function { .. }
                     | HeapEntry::ModuleNamespace { .. }
@@ -4484,6 +4807,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     HeapEntry::Symbol { .. } => "symbol",
                     HeapEntry::PrivateName { .. } => "object",
                     HeapEntry::Object { .. }
+                    | HeapEntry::Script { .. }
                     | HeapEntry::Array { .. }
                     | HeapEntry::ModuleNamespace { .. }
                     | HeapEntry::ExternalModuleNamespace { .. }
@@ -4612,6 +4936,7 @@ impl<'a, H: Host> Machine<'a, H> {
             Some(index) => match &self.heap[index] {
                 HeapEntry::String(text) => Ok(Some(text.clone())),
                 HeapEntry::Object { .. }
+                | HeapEntry::Script { .. }
                 | HeapEntry::Array { .. }
                 | HeapEntry::Function { .. }
                 | HeapEntry::ModuleNamespace { .. }
@@ -4654,6 +4979,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         HeapEntry::String(text) => Ok(text.clone()),
                         HeapEntry::BigInt(text) => Ok(EcmaString::from_utf8(text)),
                         HeapEntry::Object { .. }
+                        | HeapEntry::Script { .. }
                         | HeapEntry::Date { .. }
                         | HeapEntry::BuiltinIterator { .. }
                         | HeapEntry::Collection { .. }
@@ -5160,6 +5486,8 @@ pub(crate) fn accessor_from_selector(kind: u32) -> Option<AccessorKind> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use bamts_bytecode::{
         Binding, Edge, EdgeKind, ExceptionHandler, Export, ExportSource, FunctionFlags, NumberBits,
@@ -8446,5 +8774,142 @@ mod tests {
             RuntimeErrorKind::ExternalModuleUnavailable { module, edge }
                 if module == ModuleId::new(0) && edge == EdgeId::new(0)
         ));
+    }
+
+    #[test]
+    fn installed_script_uses_machine_wide_id_and_keeps_its_code() {
+        let root = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+        let script = Arc::new(verified(
+            vec![Constant::Int32(42)],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+        ));
+        let mut host = TestHost;
+        let mut machine = Machine::new(&root, &mut host, Limits::default());
+        machine.instantiate_modules().unwrap();
+        let module = machine.install_script_reserving(script, 0, 0).unwrap();
+
+        assert_eq!(module, ModuleId::new(root.modules().len() as u32));
+        assert!(machine.program().module(module).is_none());
+        assert_eq!(
+            machine.module_code(module).constants()[0],
+            Constant::Int32(42)
+        );
+
+        let closure = machine
+            .allocate(HeapEntry::Function {
+                module,
+                function: FunctionId::new(0),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        assert!(matches!(
+            machine.call_value(closure, Value::UNDEFINED, &[]),
+            Ok(value) if value == Value::int32(42)
+        ));
+    }
+
+    #[test]
+    fn installed_script_rejects_non_classic_programs_and_enforces_limit() {
+        let root = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+        let two_modules = Arc::new(linked(
+            vec![
+                program_module(
+                    "first",
+                    Vec::new(),
+                    vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                program_module(
+                    "second",
+                    Vec::new(),
+                    vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            ],
+            0,
+        ));
+        let script = Arc::new(verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        ));
+        let mut host = TestHost;
+        let mut machine = Machine::new(
+            &root,
+            &mut host,
+            Limits {
+                max_dynamic_modules: 1,
+                ..Limits::default()
+            },
+        );
+        machine.instantiate_modules().unwrap();
+
+        assert!(matches!(
+            machine.install_script_reserving(two_modules, 0, 0),
+            Err(RuntimeErrorKind::InvalidDynamicScript { .. })
+        ));
+        machine
+            .install_script_reserving(script.clone(), 0, 0)
+            .unwrap();
+        assert!(matches!(
+            machine.install_script_reserving(script, 0, 0),
+            Err(RuntimeErrorKind::DynamicModuleLimitExceeded { limit: 1 })
+        ));
+    }
+
+    #[test]
+    fn script_heap_cost_counts_scalar_constant_slots() {
+        let entry = || vec![function(0, 1, vec![Instruction::Halt], Vec::new())];
+        let empty = verified(Vec::new(), entry());
+        let constants = vec![Constant::Int32(0); 128];
+        let scalars = verified(constants.clone(), entry());
+
+        let added = Machine::<TestHost>::script_heap_cost(&scalars)
+            - Machine::<TestHost>::script_heap_cost(&empty);
+
+        assert!(added >= constants.len() * std::mem::size_of::<Constant>());
+    }
+
+    #[test]
+    fn script_heap_cost_includes_verification_storage() {
+        let small = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+        let large = verified(
+            Vec::new(),
+            vec![function(0, 130, vec![Instruction::Halt], Vec::new())],
+        );
+        let small_verification = small.modules()[0].code.verification_bytes();
+        let large_verification = large.modules()[0].code.verification_bytes();
+
+        assert_eq!(
+            Machine::<TestHost>::script_heap_cost(&large)
+                - Machine::<TestHost>::script_heap_cost(&small),
+            large_verification - small_verification
+        );
     }
 }

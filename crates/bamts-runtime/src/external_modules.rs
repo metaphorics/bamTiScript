@@ -19,6 +19,7 @@ pub(crate) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     builtins: &mut BuiltinTable<H>,
     object_prototype: Value,
+    script_compiler: bool,
 ) -> Vec<InstalledModule> {
     let util_specifier = EcmaString::from_utf8("node:util");
     let util_namespace = intrinsics::push(
@@ -40,8 +41,7 @@ pub(crate) fn install<H: Host>(
     let hash_update = register(heap, builtins, "update", 2, hash_update::<H>);
     let hash_digest = register(heap, builtins, "digest", 1, hash_digest::<H>);
 
-    let _ = object_prototype;
-    vec![
+    let mut modules = vec![
         InstalledModule {
             specifier: util_specifier,
             namespace: util_namespace,
@@ -54,7 +54,11 @@ pub(crate) fn install<H: Host>(
             exports: vec![(EcmaString::from_utf8("createHash"), create_hash)],
             internals: BTreeMap::from([("hash.update", hash_update), ("hash.digest", hash_digest)]),
         },
-    ]
+    ];
+    if script_compiler {
+        modules.push(crate::vm::install(heap, builtins, object_prototype));
+    }
+    modules
 }
 
 fn register<H: Host>(

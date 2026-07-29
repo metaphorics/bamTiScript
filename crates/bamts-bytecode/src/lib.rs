@@ -982,6 +982,14 @@ impl Module<Verified> {
         self.certificates.get(function.get() as usize)
     }
 
+    /// Heap bytes retained by this module's verification certificates.
+    #[must_use]
+    pub fn verification_bytes(&self) -> usize {
+        self.certificates.iter().fold(0usize, |bytes, certificate| {
+            bytes.saturating_add(certificate.retained_bytes())
+        })
+    }
+
     /// Emits one deterministic canonical representation.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -1010,6 +1018,19 @@ pub struct Certificate {
 }
 
 impl Certificate {
+    fn retained_bytes(&self) -> usize {
+        self.facts.iter().fold(
+            std::mem::size_of::<Self>().saturating_add(
+                self.facts
+                    .len()
+                    .saturating_mul(std::mem::size_of::<RegisterSet>()),
+            ),
+            |bytes, facts| {
+                bytes.saturating_add(facts.words.len().saturating_mul(std::mem::size_of::<u64>()))
+            },
+        )
+    }
+
     #[must_use]
     pub fn instruction_count(&self) -> usize {
         self.facts.len()
@@ -4671,6 +4692,41 @@ mod tests {
         );
         // Missing certificate for an out-of-range function -> None.
         assert!(verified.certificate(FunctionId::new(9)).is_none());
+    }
+
+    #[test]
+    fn verification_bytes_counts_certificate_storage() {
+        let instruction_count = 2usize;
+        let register_count = 130u32;
+        let module = Module::new(
+            vec![],
+            vec![Function::new(
+                None,
+                0,
+                1,
+                register_count,
+                flags(),
+                vec![
+                    Instruction::Move {
+                        dst: Register::new(129),
+                        src: Register::new(0),
+                    },
+                    Instruction::Return {
+                        value: Register::new(129),
+                    },
+                ],
+                vec![],
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("test module verifies");
+        let words = RegisterSet::words_for(register_count);
+        let expected = std::mem::size_of::<Certificate>()
+            + instruction_count * std::mem::size_of::<RegisterSet>()
+            + instruction_count * words * std::mem::size_of::<u64>();
+
+        assert_eq!(module.verification_bytes(), expected);
     }
 
     #[test]

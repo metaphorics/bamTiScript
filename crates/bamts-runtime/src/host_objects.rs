@@ -329,6 +329,7 @@ impl<H: Host> Machine<'_, H> {
                         Ok(format!("[ {} ]", parts.join(", ")))
                     }
                     HeapEntry::Object { properties, .. }
+                    | HeapEntry::Script { properties, .. }
                     | HeapEntry::Date { properties, .. }
                     | HeapEntry::BuiltinIterator { properties, .. }
                     | HeapEntry::Collection { properties, .. } => {

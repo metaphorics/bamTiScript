@@ -9,6 +9,7 @@ name = "bamts"
 path = "src/main.rs"
 
 [dependencies]
+bamts = { path = "../bamts", features = ["node-host"] }
 bamts-compiler = { path = "../bamts-compiler" }
 bamts-runtime = { path = "../bamts-runtime" }
 bamts-codegen = { path = "../bamts-codegen", features = ["aot", "host-jit"] }

@@ -10,7 +10,9 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use bamts_bytecode::{Program, Verified};
 use bamts_compiler::diagnostic::{Diagnostic, DiagnosticSeverity};
 use bamts_compiler::lower::LowerOptions;
 use bamts_compiler::pipeline::{FrontendMode, compile_program_frontend};
@@ -122,6 +124,55 @@ impl From<bamts_runtime::RuntimeError> for Error {
 /// Result type returned by facade convenience entry points.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// The facade's classic-script compiler capability.
+#[derive(Default)]
+pub struct ScriptCompiler;
+
+impl bamts_runtime::CompileProvider for ScriptCompiler {
+    fn compile_script(
+        &mut self,
+        source: bamts_runtime::ScriptSource<'_>,
+    ) -> std::result::Result<Arc<Program<Verified>>, bamts_runtime::ScriptCompileError> {
+        bamts_compiler::compile_classic_script(
+            source.source,
+            &String::from_utf16_lossy(source.name),
+        )
+        .map(Arc::new)
+        .map_err(map_script_compile_error)
+    }
+}
+
+fn map_script_compile_error(
+    error: bamts_compiler::ScriptCompileError,
+) -> bamts_runtime::ScriptCompileError {
+    match error {
+        bamts_compiler::ScriptCompileError::IllFormedSource { unit_offset } => {
+            bamts_runtime::ScriptCompileError::IllFormedSource { unit_offset }
+        }
+        bamts_compiler::ScriptCompileError::Syntax {
+            message,
+            line,
+            column,
+        } => bamts_runtime::ScriptCompileError::Syntax {
+            message,
+            line,
+            column,
+        },
+        bamts_compiler::ScriptCompileError::Unsupported {
+            message,
+            line,
+            column,
+        } => bamts_runtime::ScriptCompileError::Unsupported {
+            message,
+            line,
+            column,
+        },
+        bamts_compiler::ScriptCompileError::Capacity { message } => {
+            bamts_runtime::ScriptCompileError::Capacity { message }
+        }
+    }
+}
+
 /// Compiles an entrypoint and its complete local module graph into one executable program.
 ///
 /// ```
@@ -224,6 +275,7 @@ pub fn compile_source_file(
 pub fn run_program(path: impl AsRef<Path>) -> Result<ProgramOutput> {
     let executable = compile_source_file(path)?;
     let mut host = bamts_node::NodeHost::new();
+    host.set_script_compiler(Box::new(ScriptCompiler));
     bamts_runtime::run(
         executable.wire(),
         &mut host,
@@ -317,6 +369,17 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "node-host")]
+    fn script_fixture(name: &str, source: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+        let directory =
+            std::env::temp_dir().join(format!("bamts-facade-script-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory)?;
+        let entrypoint = directory.join("main.ts");
+        std::fs::write(&entrypoint, source)?;
+        Ok((directory, entrypoint))
+    }
+
     #[test]
     fn compiles_complete_program_with_module_local_function_ids() -> Result<(), Box<dyn Error>> {
         let (directory, entrypoint) = fixture("compile")?;
@@ -342,6 +405,96 @@ mod tests {
         assert_eq!(output.stdout, b"2\n");
         assert_eq!(output.exit_code, 0);
         remove_fixture(&directory)
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn runs_node_vm_scripts() -> Result<(), Box<dyn Error>> {
+        let cases = [
+            (
+                "default-import",
+                "import vm from 'node:vm'; process.stdout.write(String(vm.runInThisContext('1+1')) + '\\n');",
+                b"2\n".as_slice(),
+            ),
+            (
+                "named-import",
+                "import { runInThisContext } from 'node:vm'; process.stdout.write(String(runInThisContext('1+1')) + '\\n');",
+                b"2\n".as_slice(),
+            ),
+            (
+                "syntax-error",
+                "import vm from 'node:vm'; try { new vm.Script('('); } catch (error) { process.stdout.write(error.name + '\\n'); }",
+                b"SyntaxError\n".as_slice(),
+            ),
+            (
+                "escaped-function",
+                "import vm from 'node:vm'; const script = new vm.Script('(function(){ return 42; })'); const f = script.runInThisContext(); process.stdout.write(String(f()) + '\\n');",
+                b"42\n".as_slice(),
+            ),
+            (
+                "construct-runner",
+                "import vm from 'node:vm'; const runner = vm.runInThisContext; const before = runner.prototype; const after = {}; const options = { get filename() { runner.prototype = after; return 'changed.js'; } }; const fallback = new runner('1', options); const result = new runner('({ answer: 42 })'); process.stdout.write(String(Object.getPrototypeOf(fallback) === before) + ',' + String(runner.prototype === after) + ',' + String(result.answer) + '\\n');",
+                b"true,true,42\n".as_slice(),
+            ),
+        ];
+
+        for (name, source, expected_stdout) in cases {
+            let (directory, entrypoint) = script_fixture(name, source)?;
+            let output = run_program(&entrypoint)?;
+            assert_eq!(output.stdout, expected_stdout, "{name}");
+            assert_eq!(output.exit_code, 0, "{name}");
+            remove_fixture(&directory)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn classic_script_completion_matches_node_24() -> Result<(), Box<dyn Error>> {
+        let cases = [
+            ("expression", "1+1", b"2\n".as_slice()),
+            ("declaration", "var x=5", b"undefined\n".as_slice()),
+            ("if-value", "if(true){42}", b"42\n".as_slice()),
+            ("if-empty", "1;if(true){}", b"undefined\n".as_slice()),
+            ("block", "{7}", b"7\n".as_slice()),
+            ("for", "for(let i=0;i<3;i++){i}", b"2\n".as_slice()),
+            (
+                "while-empty",
+                "1;while(false){2}",
+                b"undefined\n".as_slice(),
+            ),
+            ("finally", "try{1}finally{2}", b"1\n".as_slice()),
+            (
+                "catch-empty",
+                "try{1;throw 2}catch(e){}",
+                b"undefined\n".as_slice(),
+            ),
+            ("catch-value", "try{throw 1}catch(e){4}", b"4\n".as_slice()),
+            (
+                "catch-empty-finally",
+                "try{1;throw 2}catch(e){}finally{3}",
+                b"undefined\n".as_slice(),
+            ),
+            (
+                "try-value-finally",
+                "try{1}catch(e){}finally{3}",
+                b"1\n".as_slice(),
+            ),
+            ("switch", "switch(1){case 1:5}", b"5\n".as_slice()),
+            ("function", "function f(){}", b"undefined\n".as_slice()),
+        ];
+
+        for (name, script, expected_stdout) in cases {
+            let source = format!(
+                "import vm from 'node:vm'; process.stdout.write(String(vm.runInThisContext({script:?})) + '\\n');"
+            );
+            let (directory, entrypoint) = script_fixture(&format!("completion-{name}"), &source)?;
+            let output = run_program(&entrypoint)?;
+            assert_eq!(output.stdout, expected_stdout, "{name}");
+            assert_eq!(output.exit_code, 0, "{name}");
+            remove_fixture(&directory)?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "aot")]

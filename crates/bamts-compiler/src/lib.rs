@@ -9,6 +9,9 @@ pub mod program;
 pub mod project;
 pub mod rules;
 pub mod scanner;
+pub mod script;
 pub mod source;
 pub mod syntax;
 pub mod warning;
+
+pub use script::{ScriptCompileError, compile_classic_script};

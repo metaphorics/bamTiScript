@@ -54,6 +54,7 @@ version = "0.0.0"
 name = "bamts-cli"
 version = "0.0.0"
 dependencies = [
+ "bamts",
  "bamts-codegen",
  "bamts-compiler",
  "bamts-node",

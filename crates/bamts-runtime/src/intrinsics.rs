@@ -7,7 +7,7 @@ use bamts_native::{Decoded, Value};
 use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyMap, ThrowOrigin};
 
 #[path = "builtins/mod.rs"]
-mod builtins;
+pub(crate) mod builtins;
 
 #[path = "regexp.rs"]
 mod regexp;
@@ -22,6 +22,12 @@ pub(crate) enum BuiltinOutcome {
         callee: Value,
         this_value: Value,
         argument_start: usize,
+    },
+    ConstructCall {
+        callee: Value,
+        this_value: Value,
+        argument_start: usize,
+        prototype: Value,
     },
 }
 
@@ -199,6 +205,27 @@ impl<H: Host> BuiltinTable<H> {
             crate::Property::Data {
                 value: prototype,
                 writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+    }
+
+    pub(crate) fn set_function_prototype(
+        &mut self,
+        heap: &mut [HeapEntry],
+        function: Value,
+        prototype: Value,
+    ) {
+        let index = heap_index(function);
+        let HeapEntry::NativeFunction { properties, .. } = &mut heap[index] else {
+            panic!("builtin function is a native function");
+        };
+        properties.insert(
+            crate::PropertyKey::Named(EcmaString::from_utf8("prototype")),
+            crate::Property::Data {
+                value: prototype,
+                writable: true,
                 enumerable: false,
                 configurable: false,
             },

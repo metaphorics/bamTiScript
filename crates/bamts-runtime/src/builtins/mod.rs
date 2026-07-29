@@ -60,12 +60,13 @@ fn install_function<H: Host>(
     native_function(heap, id, definition.name, definition.length)
 }
 
-fn define_data(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) {
+pub(crate) fn define_data(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) {
     let index = heap_index(object);
     match &mut heap[index] {
         HeapEntry::Object { properties, .. }
         | HeapEntry::Array { properties, .. }
         | HeapEntry::Function { properties, .. }
+        | HeapEntry::Script { properties, .. }
         | HeapEntry::RegExp { properties, .. } => {
             properties.insert(
                 PropertyKey::Named(EcmaString::from_utf8(name)),
@@ -690,6 +691,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 extensible,
                 ..
             }
+            | HeapEntry::Script {
+                properties,
+                extensible,
+                ..
+            }
             | HeapEntry::NativeFunction {
                 properties,
                 extensible,
@@ -754,6 +760,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 ..
             }
             | HeapEntry::Function {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::Script {
                 properties,
                 extensible,
                 ..
@@ -855,6 +866,7 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             HeapEntry::Object { properties, .. }
             | HeapEntry::Function { properties, .. }
+            | HeapEntry::Script { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
             | HeapEntry::RegExp { properties, .. }
             | HeapEntry::Date { properties, .. }
@@ -914,6 +926,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 ..
             }
             | HeapEntry::Function {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::Script {
                 properties,
                 extensible,
                 ..
