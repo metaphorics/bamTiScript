@@ -15304,9 +15304,10 @@ mod tests {
         first.frames.clear();
         first.live_registers = 0;
         install_order_array(&mut first);
+        let first_job = timer_fn(&mut first, 2);
         first
             .globals
-            .insert(EcmaString::from_utf8("job"), timer_fn(&mut first, 2));
+            .insert(EcmaString::from_utf8("job"), first_job);
         let snapshot = first.evaluate().unwrap();
         assert!(order_markers(&first).is_empty());
         first.run_to_quiescence().unwrap();
@@ -15318,9 +15319,10 @@ mod tests {
         second.frames.clear();
         second.live_registers = 0;
         install_order_array(&mut second);
+        let second_job = timer_fn(&mut second, 2);
         second
             .globals
-            .insert(EcmaString::from_utf8("job"), timer_fn(&mut second, 2));
+            .insert(EcmaString::from_utf8("job"), second_job);
         let execution = second.run().unwrap();
         assert_eq!(execution, snapshot);
     }

@@ -3120,13 +3120,14 @@ mod tests {
         function: FunctionId,
     ) {
         let mut machine = engine.machine.borrow_mut();
+        let prototype = machine.intrinsics.function_prototype;
         let callback = machine
             .allocate(HeapEntry::Function {
                 module: ModuleId::new(0),
                 function,
                 captures: Vec::new(),
                 properties: PropertyMap::default(),
-                prototype: Some(machine.intrinsics.function_prototype),
+                prototype: Some(prototype),
                 extensible: true,
             })
             .expect("microtask callback allocates");
