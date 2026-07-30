@@ -1431,9 +1431,11 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             InvokeOutcome::Value(method) => method,
             other => return other,
         };
+        let mut from_sync = false;
         if kind == bamts_bytecode::IteratorKind::Async
             && matches!(method, Value::UNDEFINED | Value::NULL)
         {
+            from_sync = true;
             let symbol = self.machine.borrow().intrinsics.builtins.symbol_iterator();
             let key = match self.machine.borrow_mut().to_property_key(symbol) {
                 Ok(key) => key,
@@ -1473,10 +1475,15 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             InvokeOutcome::Value(next) => next,
             other => return other,
         };
-        let created = self
-            .machine
-            .borrow_mut()
-            .create_protocol_iterator(iterator, next);
+        let created = if from_sync {
+            self.machine
+                .borrow_mut()
+                .create_async_from_sync_iterator(iterator, next)
+        } else {
+            self.machine
+                .borrow_mut()
+                .create_protocol_iterator(iterator, next)
+        };
         self.eval_outcome(created)
     }
 
@@ -1492,6 +1499,19 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     InvokeOutcome::Value(result) => Ok(result),
                     other => Err(other),
                 }
+            }
+            Ok(IteratorNextPrepared::AsyncFromSyncCall { callee, this_value }) => {
+                let call = match self.invoke_callee(callee, this_value, &[], Value::UNDEFINED) {
+                    InvokeOutcome::Value(result) => Ok(result),
+                    InvokeOutcome::Threw(value, origin) => {
+                        Err(EvalFailure::ThrowValueOrigin { value, origin })
+                    }
+                    InvokeOutcome::Fatal => return Err(InvokeOutcome::Fatal),
+                };
+                self.machine
+                    .borrow_mut()
+                    .async_from_sync_continuation(this_value, call)
+                    .map_err(|failure| self.failure_outcome(failure))
             }
             Err(failure) => Err(self.failure_outcome(failure)),
         }
@@ -1521,7 +1541,24 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     }
 
     fn iterator_next_active(&self, iterator: Value) -> Result<(bool, Value), InvokeOutcome> {
-        let result = self.iterator_step_active(iterator)?;
+        // Fused sync consumption reads the raw result directly; the
+        // async-from-sync adapter wraps only the `for await` step path.
+        let prepared = self.machine.borrow_mut().prepare_iterator_next(iterator);
+        let result = match prepared {
+            Ok(IteratorNextPrepared::Ready { done, value }) => self
+                .machine
+                .borrow_mut()
+                .iterator_result(value, done)
+                .map_err(|failure| self.failure_outcome(failure))?,
+            Ok(IteratorNextPrepared::Call { callee, this_value })
+            | Ok(IteratorNextPrepared::AsyncFromSyncCall { callee, this_value }) => {
+                match self.invoke_callee(callee, this_value, &[], Value::UNDEFINED) {
+                    InvokeOutcome::Value(result) => result,
+                    other => return Err(other),
+                }
+            }
+            Err(failure) => return Err(self.failure_outcome(failure)),
+        };
         self.iterator_result_active(result)
     }
 

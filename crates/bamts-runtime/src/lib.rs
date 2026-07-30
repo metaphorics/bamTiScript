@@ -628,14 +628,40 @@ impl CollectionEntry {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum IteratorNextPrepared {
-    Ready { done: bool, value: Value },
-    Call { callee: Value, this_value: Value },
+    Ready {
+        done: bool,
+        value: Value,
+    },
+    Call {
+        callee: Value,
+        this_value: Value,
+    },
+    /// Calls the sync `next` method of an async-from-sync wrapper; the raw
+    /// result must flow through the adapter continuation (ECMA-262 27.1.5)
+    /// before it may be awaited.
+    AsyncFromSyncCall {
+        callee: Value,
+        this_value: Value,
+    },
 }
 
 #[derive(Clone, Debug)]
 enum IteratorState {
-    Keys { index: usize, keys: Vec<EcmaString> },
-    Protocol { iterator: Value, next: Value },
+    Keys {
+        index: usize,
+        keys: Vec<EcmaString>,
+    },
+    Protocol {
+        iterator: Value,
+        next: Value,
+    },
+    /// Async-from-sync adapter record (ECMA-262 27.1.5): created when an
+    /// async iterator lookup falls back to `Symbol.iterator`. Holds the sync
+    /// iterator and its `next` method.
+    AsyncFromSync {
+        iterator: Value,
+        next: Value,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -819,6 +845,21 @@ pub(crate) enum PromiseReaction {
     /// same uncaught throw.
     ModuleDepReject {
         parent: ModuleId,
+    },
+    /// Rebuilds the iterator result of an async-from-sync step: the reaction
+    /// value is the already-unwrapped `value`; `done` was read from the sync
+    /// result before any await.
+    AsyncFromSyncFulfill {
+        derived: Value,
+        done: bool,
+    },
+    /// Rejects the derived step promise of an async-from-sync step. Closes
+    /// the underlying sync iterator first when the step was not done; a done
+    /// step propagates the rejection without closing.
+    AsyncFromSyncReject {
+        derived: Value,
+        sync_iterator: Value,
+        done: bool,
     },
 }
 
@@ -2188,6 +2229,29 @@ impl<'a, H: Host> Machine<'a, H> {
             PromiseReaction::ModuleDepReject { parent } => {
                 self.on_module_dep_rejected(parent, value, origin)
             }
+            PromiseReaction::AsyncFromSyncFulfill { derived, done } => {
+                match self.iterator_result(value, done) {
+                    Ok(result) => self.fulfill_promise(derived, result),
+                    Err(EvalFailure::Runtime(kind)) => Err(kind),
+                    Err(failure) => {
+                        self.reject_promise_failure(derived, failure)
+                            .map_err(|failure| match failure {
+                                EvalFailure::Runtime(kind) => kind,
+                                _ => RuntimeErrorKind::InvalidValue { value: derived },
+                            })
+                    }
+                }
+            }
+            PromiseReaction::AsyncFromSyncReject {
+                derived,
+                sync_iterator,
+                done,
+            } => {
+                if !done {
+                    self.close_protocol_iterator_preserving_abrupt(sync_iterator)?;
+                }
+                self.reject_promise(derived, value, origin)
+            }
         }
     }
 
@@ -2893,18 +2957,40 @@ impl<'a, H: Host> Machine<'a, H> {
         let Some(index) = self.runtime_slot(iterator).map_err(EvalFailure::Runtime)? else {
             return Ok(());
         };
-        let HeapEntry::Iterator {
-            state: IteratorState::Protocol { iterator, .. },
-        } = &self.heap[index]
-        else {
-            return Ok(());
+        let iterator = match &self.heap[index] {
+            HeapEntry::Iterator {
+                state:
+                    IteratorState::Protocol { iterator, .. }
+                    | IteratorState::AsyncFromSync { iterator, .. },
+            } => *iterator,
+            _ => return Ok(()),
         };
-        let iterator = *iterator;
+        self.close_protocol_iterator(iterator)
+    }
+
+    fn close_protocol_iterator(&mut self, iterator: Value) -> Result<(), EvalFailure> {
         let close = self.get_named_property(iterator, "return")?;
         if self.is_callable(close)? {
             let _ = self.call_value(close, iterator, &[])?;
         }
         Ok(())
+    }
+
+    /// A user's close throw cannot replace an existing abrupt completion.
+    /// Engine failures remain fatal because execution cannot resume safely.
+    fn close_protocol_iterator_preserving_abrupt(
+        &mut self,
+        iterator: Value,
+    ) -> Result<(), RuntimeErrorKind> {
+        match self.close_protocol_iterator(iterator) {
+            Err(EvalFailure::Runtime(kind)) => Err(kind),
+            Ok(())
+            | Err(
+                EvalFailure::Throw(_)
+                | EvalFailure::ThrowValue(_)
+                | EvalFailure::ThrowValueOrigin { .. },
+            ) => Ok(()),
+        }
     }
 
     fn mark_promise_all_settled(&mut self, aggregate: Value) -> Result<bool, EvalFailure> {
@@ -8548,20 +8634,20 @@ impl<'a, H: Host> Machine<'a, H> {
                 .map_err(EvalFailure::Runtime);
         }
 
-        let method = match kind {
+        let (method, from_sync) = match kind {
             IteratorKind::Async => {
                 let key = self.to_property_key(self.intrinsics.builtins.symbol_async_iterator())?;
                 let method = self.get_property_key(src, &key)?;
                 if matches!(method.decode(), Some(Decoded::Undefined | Decoded::Null)) {
                     let key = self.to_property_key(self.intrinsics.builtins.symbol_iterator())?;
-                    self.get_property_key(src, &key)?
+                    (self.get_property_key(src, &key)?, true)
                 } else {
-                    method
+                    (method, false)
                 }
             }
             IteratorKind::Sync => {
                 let key = self.to_property_key(self.intrinsics.builtins.symbol_iterator())?;
-                self.get_property_key(src, &key)?
+                (self.get_property_key(src, &key)?, false)
             }
             IteratorKind::Keys => unreachable!("key iteration returns before method lookup"),
         };
@@ -8577,7 +8663,11 @@ impl<'a, H: Host> Machine<'a, H> {
             }));
         }
         let next = self.get_named_property(iterator, "next")?;
-        self.create_protocol_iterator(iterator, next)
+        if from_sync {
+            self.create_async_from_sync_iterator(iterator, next)
+        } else {
+            self.create_protocol_iterator(iterator, next)
+        }
     }
 
     pub(crate) fn create_protocol_iterator(
@@ -8587,6 +8677,19 @@ impl<'a, H: Host> Machine<'a, H> {
     ) -> Result<Value, EvalFailure> {
         self.allocate(HeapEntry::Iterator {
             state: IteratorState::Protocol { iterator, next },
+        })
+        .map_err(EvalFailure::Runtime)
+    }
+
+    /// Allocates the async-from-sync adapter record (ECMA-262 27.1.5) for an
+    /// async iterator lookup that fell back to `Symbol.iterator`.
+    pub(crate) fn create_async_from_sync_iterator(
+        &mut self,
+        iterator: Value,
+        next: Value,
+    ) -> Result<Value, EvalFailure> {
+        self.allocate(HeapEntry::Iterator {
+            state: IteratorState::AsyncFromSync { iterator, next },
         })
         .map_err(EvalFailure::Runtime)
     }
@@ -8743,9 +8846,16 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn iterator_next(&mut self, iterator: Value) -> Result<(bool, Value), EvalFailure> {
-        let result = self.iterator_step(iterator)?;
-        let (done, value) = self.iterator_result_parts(result)?;
-        Ok((done, value))
+        // Fused sync consumption reads the raw result directly; the
+        // async-from-sync adapter wraps only the `for await` step path.
+        let result = match self.prepare_iterator_next(iterator)? {
+            IteratorNextPrepared::Ready { done, value } => self.iterator_result(value, done)?,
+            IteratorNextPrepared::Call { callee, this_value }
+            | IteratorNextPrepared::AsyncFromSyncCall { callee, this_value } => {
+                self.call_value(callee, this_value, &[])?
+            }
+        };
+        self.iterator_result_parts(result)
     }
 
     /// Spec `IteratorNext`: performs the `next()` call (or takes the recorded
@@ -8756,6 +8866,10 @@ impl<'a, H: Host> Machine<'a, H> {
             IteratorNextPrepared::Ready { done, value } => self.iterator_result(value, done),
             IteratorNextPrepared::Call { callee, this_value } => {
                 self.call_value(callee, this_value, &[])
+            }
+            IteratorNextPrepared::AsyncFromSyncCall { callee, this_value } => {
+                let result = self.call_value(callee, this_value, &[]);
+                self.async_from_sync_continuation(this_value, result)
             }
         }
     }
@@ -8779,6 +8893,127 @@ impl<'a, H: Host> Machine<'a, H> {
         }
         let value = self.get_named_property(result, "value")?;
         Ok((false, value))
+    }
+
+    /// ECMA-262 27.1.5.2.2 `AsyncFromSyncIteratorContinuation`: parses the
+    /// raw sync iterator-result object before any await, PromiseResolves only
+    /// its `value`, and settles a derived step promise with a freshly built
+    /// `{ value: unwrapped, done }` result. The raw result object itself is
+    /// never assimilated. A failed step and a rejected non-done value close
+    /// the sync iterator; a done step propagates a value rejection without
+    /// closing. Shared by the interpreter and the native helper path so every
+    /// backend observes the same semantics.
+    pub(crate) fn async_from_sync_continuation(
+        &mut self,
+        sync_iterator: Value,
+        result: Result<Value, EvalFailure>,
+    ) -> Result<Value, EvalFailure> {
+        let derived = self.create_promise()?;
+        match result.and_then(|result| self.async_from_sync_result_parts(result)) {
+            Err(failure) => {
+                self.close_protocol_iterator_preserving_abrupt(sync_iterator)
+                    .map_err(EvalFailure::Runtime)?;
+                self.reject_promise_failure(derived, failure)?;
+            }
+            Ok((done, value)) => {
+                let resolved = self.promise_resolve(value)?;
+                self.attach_async_from_sync_reactions(sync_iterator, derived, resolved, done)?;
+            }
+        }
+        Ok(derived)
+    }
+
+    /// `IteratorComplete` + `IteratorValue` for the async-from-sync adapter:
+    /// unlike the fused sync path, `value` is read even when the result is
+    /// done, matching the spec continuation.
+    fn async_from_sync_result_parts(
+        &mut self,
+        result: Value,
+    ) -> Result<(bool, Value), EvalFailure> {
+        if !self.is_object(result) {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "iterator result is not an object",
+            }));
+        }
+        let done = self.get_named_property(result, "done")?;
+        let done = self.truthy(done);
+        let value = self.get_named_property(result, "value")?;
+        Ok((done, value))
+    }
+
+    /// Attaches the two adapter reactions to the PromiseResolved step value,
+    /// mirroring `promise_then`'s settled/pending split and its reaction and
+    /// microtask charging.
+    fn attach_async_from_sync_reactions(
+        &mut self,
+        sync_iterator: Value,
+        derived: Value,
+        resolved: Value,
+        done: bool,
+    ) -> Result<(), EvalFailure> {
+        let index = self
+            .runtime_slot(resolved)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: resolved,
+            }))?;
+        let settled = match &self.heap[index] {
+            HeapEntry::Promise {
+                state: PromiseState::Pending { .. },
+                ..
+            } => None,
+            HeapEntry::Promise {
+                state: PromiseState::Fulfilled { value },
+                ..
+            } => Some((true, *value, ThrowOrigin::Bytecode)),
+            HeapEntry::Promise {
+                state: PromiseState::Rejected { reason, origin },
+                ..
+            } => Some((false, *reason, *origin)),
+            _ => {
+                return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                    value: resolved,
+                }));
+            }
+        };
+        if let Some((fulfilled, value, origin)) = settled {
+            self.ensure_microtask_capacity(1)
+                .map_err(EvalFailure::Runtime)?;
+            let reaction = if fulfilled {
+                PromiseReaction::AsyncFromSyncFulfill { derived, done }
+            } else {
+                PromiseReaction::AsyncFromSyncReject {
+                    derived,
+                    sync_iterator,
+                    done,
+                }
+            };
+            self.microtasks.push_back(MicrotaskJob::Reaction {
+                reaction,
+                value,
+                origin,
+            });
+            return Ok(());
+        }
+        self.charge_promise_reactions(2)?;
+        let HeapEntry::Promise {
+            state:
+                PromiseState::Pending {
+                    fulfill_reactions,
+                    reject_reactions,
+                },
+            ..
+        } = &mut self.heap[index]
+        else {
+            unreachable!("pending Promise state was checked before reaction registration");
+        };
+        fulfill_reactions.push(PromiseReaction::AsyncFromSyncFulfill { derived, done });
+        reject_reactions.push(PromiseReaction::AsyncFromSyncReject {
+            derived,
+            sync_iterator,
+            done,
+        });
+        Ok(())
     }
 
     pub(crate) fn prepare_iterator_next(
@@ -8810,6 +9045,12 @@ impl<'a, H: Host> Machine<'a, H> {
             HeapEntry::Iterator {
                 state: IteratorState::Protocol { iterator, next },
             } => Ok(IteratorNextPrepared::Call {
+                callee: *next,
+                this_value: *iterator,
+            }),
+            HeapEntry::Iterator {
+                state: IteratorState::AsyncFromSync { iterator, next },
+            } => Ok(IteratorNextPrepared::AsyncFromSyncCall {
                 callee: *next,
                 this_value: *iterator,
             }),

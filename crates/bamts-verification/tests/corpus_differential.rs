@@ -61,6 +61,127 @@ fn p_map_matches_node_in_every_execution_mode() {
 }
 
 #[test]
+fn for_await_sync_thenable_unwrap_and_iterator_result_not_assimilated() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("for-await-sync-thenable-{}", process::id());
+    let entrypoint = format!("target/{id}.ts");
+    let path = root.join(&entrypoint);
+    fs::write(
+        &path,
+        r#"(async () => {
+  const out: string[] = [];
+
+  for await (const v of [Promise.resolve(42)]) {
+    out.push(`promise.unwrapped=${v === 42}`);
+  }
+
+  let thenableCounter = 0;
+  const thenableIterator = {
+    [Symbol.iterator]() {
+      let step = 0;
+      return {
+        next() {
+          if (step++ === 0) {
+            return {
+              value: "raw",
+              done: false,
+              then(resolve: (value: string) => void, _reject: unknown) {
+                thenableCounter += 1;
+                resolve("assimilated");
+              },
+            };
+          }
+          return { value: undefined, done: true };
+        },
+      };
+    },
+  };
+
+  for await (const v of thenableIterator) {
+    out.push(`thenable.yield=${v}`);
+    out.push(`thenable.counter=${thenableCounter}`);
+  }
+
+  let rejectionCloseCount = 0;
+  const rejectingIterator = {
+    [Symbol.iterator]() {
+      let step = 0;
+      return {
+        next() {
+          if (step++ === 0) {
+            return { value: Promise.reject("value-rejection"), done: false };
+          }
+          return { value: undefined, done: true };
+        },
+        return() {
+          rejectionCloseCount = rejectionCloseCount + 1;
+          return { value: undefined, done: true };
+        },
+      };
+    },
+  };
+
+  try {
+    for await (const _v of rejectingIterator) {}
+  } catch (error) {
+    out.push(`rejection.reason=${error === "value-rejection"}`);
+  }
+  out.push(`rejection.close-count=${rejectionCloseCount}`);
+
+  let stepFailureCloseCount = 0;
+  const failingStepIterator = {
+    [Symbol.iterator]() {
+      return {
+        next() {
+          throw "step-failure";
+        },
+        return() {
+          stepFailureCloseCount = stepFailureCloseCount + 1;
+          return { value: undefined, done: true };
+        },
+      };
+    },
+  };
+
+  try {
+    for await (const _v of failingStepIterator) {}
+  } catch (error) {
+    out.push(`step-failure.reason=${error === "step-failure"}`);
+  }
+  out.push(`step-failure.close-count=${stepFailureCloseCount}`);
+  console.log(out.join("\n"));
+})();"#,
+    )
+    .expect("write for-await thenable fixture");
+    let spec = CaseSpec {
+        id,
+        repository: "local".to_owned(),
+        commit: "0".repeat(40),
+        license: "UNLICENSED".to_owned(),
+        source_dir: "target".to_owned(),
+        entrypoint,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+    };
+    let oracle = NodeOracle::discover(&root).expect("the pinned Node oracle must be available");
+    let bamts = BamtsRunner::new(&root);
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_file(path).expect("remove for-await thenable fixture");
+    assert!(
+        failures.is_empty(),
+        "for-await sync thenable differential failures:\n{}",
+        failures.join("\n\n")
+    );
+}
+
+#[test]
 fn declaration_owned_self_captures_match_node_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("task-106-self-captures-{}", process::id());
