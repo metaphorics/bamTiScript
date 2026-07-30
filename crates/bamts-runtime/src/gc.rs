@@ -102,7 +102,7 @@ impl GcState {
             trace_activation(activation, &machine.heap, &mut self.marks, &mut self.work);
         }
         for job in &machine.microtasks {
-            trace_microtask(job, &machine.heap, &mut self.marks, &mut self.work);
+            trace_microtask(&job.job, &machine.heap, &mut self.marks, &mut self.work);
         }
         for timer in machine.timers.values() {
             self.mark_value(&machine.heap, timer.callback);

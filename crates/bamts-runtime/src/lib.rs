@@ -540,6 +540,13 @@ impl Property {
             Self::Data { configurable, .. } | Self::Accessor { configurable, .. } => *configurable,
         }
     }
+
+    fn charge_bytes(&self) -> usize {
+        match self {
+            Self::Data { .. } => 0,
+            Self::Accessor { .. } => std::mem::size_of::<Value>(),
+        }
+    }
 }
 
 /// Own properties in creation order. ECMAScript enumerates array-index keys
@@ -588,8 +595,10 @@ impl PropertyMap {
         self.0.iter().map(|(key, property)| (key, property))
     }
     fn charge_bytes(&self) -> usize {
-        self.0.iter().fold(0, |bytes, (key, _)| {
-            bytes.saturating_add(key.charge_bytes())
+        self.0.iter().fold(0, |bytes, (key, property)| {
+            bytes
+                .saturating_add(key.charge_bytes())
+                .saturating_add(property.charge_bytes())
         })
     }
 }
@@ -881,6 +890,21 @@ pub(crate) enum MicrotaskJob {
     },
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct QueuedMicrotask {
+    job: MicrotaskJob,
+    retained_bytes: usize,
+}
+
+impl QueuedMicrotask {
+    fn uncharged(job: MicrotaskJob) -> Self {
+        Self {
+            job,
+            retained_bytes: 0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MicrotaskExceptionPolicy {
     CollectAndContinue,
@@ -1161,8 +1185,16 @@ impl HeapEntry {
             Self::Object { properties, .. } | Self::Timeout { properties, .. } => {
                 properties.charge_bytes().saturating_add(1)
             }
-            Self::Array { .. }
-            | Self::Function { .. }
+            Self::Array {
+                elements,
+                properties,
+                ..
+            } => elements
+                .len()
+                .saturating_mul(std::mem::size_of::<Value>())
+                .saturating_add(properties.charge_bytes())
+                .saturating_add(1),
+            Self::Function { .. }
             | Self::Script { .. }
             | Self::ModuleNamespace { .. }
             | Self::ExternalModuleNamespace { .. }
@@ -1360,7 +1392,7 @@ pub struct Machine<'a, H: Host> {
     pending_generator_resume: Option<GeneratorResume>,
     async_boundaries: Vec<usize>,
     pending_async_suspend: Option<(Value, SuspendedActivation)>,
-    microtasks: VecDeque<MicrotaskJob>,
+    microtasks: VecDeque<QueuedMicrotask>,
     microtask_drain_active: bool,
     next_timer_id: Option<u64>,
     next_timer_sequence: Option<u64>,
@@ -2082,13 +2114,14 @@ impl<'a, H: Host> Machine<'a, H> {
             while self.microtasks.front().is_some() {
                 self.consume_fuel(1)
                     .map_err(|kind| self.checkpoint_error(kind))?;
-                let job = self
+                let queued = self
                     .microtasks
                     .pop_front()
                     .expect("the queued microtask remains present after fuel charging");
+                self.refund_machine(queued.retained_bytes);
                 report.executed = report.executed.saturating_add(1);
                 let Some(exception) = self
-                    .execute_microtask_job(job)
+                    .execute_microtask_job(queued.job)
                     .map_err(|kind| self.checkpoint_error(kind))?
                 else {
                     continue;
@@ -2492,11 +2525,12 @@ impl<'a, H: Host> Machine<'a, H> {
             } else {
                 PromiseReaction::ModuleDepReject { parent }
             };
-            self.microtasks.push_back(MicrotaskJob::Reaction {
-                reaction,
-                value,
-                origin,
-            });
+            self.microtasks
+                .push_back(QueuedMicrotask::uncharged(MicrotaskJob::Reaction {
+                    reaction,
+                    value,
+                    origin,
+                }));
             return Ok(());
         }
         self.charge_promise_reactions(index, 2)?;
@@ -2536,7 +2570,9 @@ impl<'a, H: Host> Machine<'a, H> {
         self.ensure_microtask_capacity(1)
             .map_err(EvalFailure::Runtime)?;
         self.microtasks
-            .push_back(MicrotaskJob::Callback { callback });
+            .push_back(QueuedMicrotask::uncharged(MicrotaskJob::Callback {
+                callback,
+            }));
         Ok(())
     }
 
@@ -2707,11 +2743,12 @@ impl<'a, H: Host> Machine<'a, H> {
                     derived,
                 }
             };
-            self.microtasks.push_back(MicrotaskJob::Reaction {
-                reaction,
-                value,
-                origin,
-            });
+            self.microtasks
+                .push_back(QueuedMicrotask::uncharged(MicrotaskJob::Reaction {
+                    reaction,
+                    value,
+                    origin,
+                }));
             return Ok(derived);
         }
         self.charge_promise_reactions(index, 2)?;
@@ -2776,15 +2813,16 @@ impl<'a, H: Host> Machine<'a, H> {
         if let Some((fulfilled, value, origin)) = settled {
             self.ensure_microtask_capacity(1)
                 .map_err(EvalFailure::Runtime)?;
-            self.microtasks.push_back(MicrotaskJob::Reaction {
-                reaction: reaction(if fulfilled {
-                    PromiseCompletion::Fulfilled
-                } else {
-                    PromiseCompletion::Rejected
-                }),
-                value,
-                origin,
-            });
+            self.microtasks
+                .push_back(QueuedMicrotask::uncharged(MicrotaskJob::Reaction {
+                    reaction: reaction(if fulfilled {
+                        PromiseCompletion::Fulfilled
+                    } else {
+                        PromiseCompletion::Rejected
+                    }),
+                    value,
+                    origin,
+                }));
             return Ok(derived);
         }
         self.charge_promise_reactions(index, 2)?;
@@ -2953,8 +2991,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
             }
         }
-        if let Some(values) = self.finish_promise_all(aggregate)? {
-            let array = self.create_array(values)?;
+        if self.finish_promise_all(aggregate)? {
+            let array = self.move_promise_all_values_to_array(aggregate)?;
             self.fulfill_promise(promise, array)
                 .map_err(EvalFailure::Runtime)?;
         }
@@ -3061,6 +3099,16 @@ impl<'a, H: Host> Machine<'a, H> {
                 }));
             }
         };
+        self.ensure_allocation_capacity(0, std::mem::size_of::<Value>())
+            .map_err(EvalFailure::Runtime)?;
+        let HeapEntry::PromiseAll { values, .. } = &mut self.heap[index] else {
+            unreachable!("Promise.all aggregate was checked before reserving value storage");
+        };
+        values.try_reserve(1).map_err(|_| {
+            EvalFailure::Runtime(RuntimeErrorKind::HeapByteLimitExceeded {
+                limit: self.limits.max_heap_bytes,
+            })
+        })?;
         self.charge_slot(index, std::mem::size_of::<Value>())
             .map_err(EvalFailure::Runtime)?;
         let HeapEntry::PromiseAll {
@@ -3069,18 +3117,13 @@ impl<'a, H: Host> Machine<'a, H> {
         else {
             unreachable!("Promise.all aggregate was checked before its heap charge");
         };
-        values.try_reserve(1).map_err(|_| {
-            EvalFailure::Runtime(RuntimeErrorKind::HeapByteLimitExceeded {
-                limit: self.limits.max_heap_bytes,
-            })
-        })?;
         let index = values.len();
         values.push(Value::UNDEFINED);
         *remaining = next_remaining;
         Ok(index)
     }
 
-    fn finish_promise_all(&mut self, aggregate: Value) -> Result<Option<Vec<Value>>, EvalFailure> {
+    fn finish_promise_all(&mut self, aggregate: Value) -> Result<bool, EvalFailure> {
         let index = self
             .runtime_slot(aggregate)
             .map_err(EvalFailure::Runtime)?
@@ -3088,10 +3131,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 operation: "Promise.all target",
             }))?;
         let HeapEntry::PromiseAll {
-            values,
-            remaining,
-            settled,
-            ..
+            remaining, settled, ..
         } = &mut self.heap[index]
         else {
             return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
@@ -3099,14 +3139,48 @@ impl<'a, H: Host> Machine<'a, H> {
             }));
         };
         if *settled {
-            return Ok(None);
+            return Ok(false);
         }
         *remaining -= 1;
         if *remaining != 0 {
-            return Ok(None);
+            return Ok(false);
         }
         *settled = true;
-        Ok(Some(std::mem::take(values)))
+        Ok(true)
+    }
+
+    fn move_promise_all_values_to_array(&mut self, aggregate: Value) -> Result<Value, EvalFailure> {
+        let aggregate_index = self
+            .runtime_slot(aggregate)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.all target",
+            }))?;
+        if !matches!(self.heap[aggregate_index], HeapEntry::PromiseAll { .. }) {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.all target",
+            }));
+        }
+        let array = self.create_array(Vec::new())?;
+        let array_index = self
+            .runtime_slot(array)
+            .map_err(EvalFailure::Runtime)?
+            .expect("new runtime array has a runtime slot");
+        let values = match &mut self.heap[aggregate_index] {
+            HeapEntry::PromiseAll { values, .. } => std::mem::take(values),
+            _ => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "Promise.all target",
+                }));
+            }
+        };
+        let bytes = values.len().saturating_mul(std::mem::size_of::<Value>());
+        let HeapEntry::Array { elements, .. } = &mut self.heap[array_index] else {
+            unreachable!("create_array returned a non-array");
+        };
+        *elements = values;
+        self.transfer_slot_charge(aggregate_index, array_index, bytes);
+        Ok(array)
     }
 
     pub(crate) fn resolve_promise_all_element(
@@ -3143,7 +3217,7 @@ impl<'a, H: Host> Machine<'a, H> {
             .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
                 operation: "Promise.all target",
             }))?;
-        let (promise, values) = {
+        let (promise, completed) = {
             let HeapEntry::PromiseAll {
                 promise,
                 values,
@@ -3160,14 +3234,14 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             values[output_index] = value;
             *remaining -= 1;
-            let values = (*remaining == 0).then(|| {
+            let completed = *remaining == 0;
+            if completed {
                 *settled = true;
-                std::mem::take(values)
-            });
-            (*promise, values)
+            }
+            (*promise, completed)
         };
-        if let Some(values) = values {
-            let array = self.create_array(values)?;
+        if completed {
+            let array = self.move_promise_all_values_to_array(aggregate)?;
             self.fulfill_promise(promise, array)
                 .map_err(EvalFailure::Runtime)?;
         }
@@ -3266,11 +3340,12 @@ impl<'a, H: Host> Machine<'a, H> {
             return self.fulfill_promise(promise, value);
         }
         self.ensure_microtask_capacity(1)?;
-        self.microtasks.push_back(MicrotaskJob::Thenable {
-            promise,
-            thenable: value,
-            then,
-        });
+        self.microtasks
+            .push_back(QueuedMicrotask::uncharged(MicrotaskJob::Thenable {
+                promise,
+                thenable: value,
+                then,
+            }));
         Ok(())
     }
 
@@ -3295,7 +3370,7 @@ impl<'a, H: Host> Machine<'a, H> {
         let index = self
             .runtime_slot(promise)?
             .ok_or(RuntimeErrorKind::InvalidValue { value: promise })?;
-        let reaction_count = match &self.heap[index] {
+        let (reaction_count, pending_charge) = match &self.heap[index] {
             HeapEntry::Promise {
                 state:
                     PromiseState::Pending {
@@ -3303,11 +3378,20 @@ impl<'a, H: Host> Machine<'a, H> {
                         reject_reactions,
                     },
                 ..
-            } => match &terminal {
-                PromiseState::Fulfilled { .. } => fulfill_reactions.len(),
-                PromiseState::Rejected { .. } => reject_reactions.len(),
-                PromiseState::Pending { .. } => unreachable!("Promise settlement is terminal"),
-            },
+            } => {
+                let reaction_count = match &terminal {
+                    PromiseState::Fulfilled { .. } => fulfill_reactions.len(),
+                    PromiseState::Rejected { .. } => reject_reactions.len(),
+                    PromiseState::Pending { .. } => unreachable!("Promise settlement is terminal"),
+                };
+                let pending_count = fulfill_reactions
+                    .len()
+                    .saturating_add(reject_reactions.len());
+                (
+                    reaction_count,
+                    pending_count.saturating_mul(std::mem::size_of::<PromiseReaction>()),
+                )
+            }
             HeapEntry::Promise { .. } => return Ok(()),
             _ => return Err(RuntimeErrorKind::InvalidValue { value: promise }),
         };
@@ -3337,11 +3421,19 @@ impl<'a, H: Host> Machine<'a, H> {
             PromiseState::Rejected { reason, origin } => (reason, origin),
             PromiseState::Pending { .. } => unreachable!("Promise settlement is terminal"),
         };
+        let queued_charge = reactions
+            .len()
+            .saturating_mul(std::mem::size_of::<PromiseReaction>());
+        self.transfer_slot_to_machine(index, queued_charge);
+        self.refund_slot(index, pending_charge.saturating_sub(queued_charge));
         for reaction in reactions {
-            self.microtasks.push_back(MicrotaskJob::Reaction {
-                reaction,
-                value,
-                origin,
+            self.microtasks.push_back(QueuedMicrotask {
+                job: MicrotaskJob::Reaction {
+                    reaction,
+                    value,
+                    origin,
+                },
+                retained_bytes: std::mem::size_of::<PromiseReaction>(),
             });
         }
         Ok(())
@@ -4915,6 +5007,27 @@ impl<'a, H: Host> Machine<'a, H> {
             .expect("slot refund cannot exceed heap charge");
     }
 
+    fn transfer_slot_to_machine(&mut self, index: usize, bytes: usize) {
+        self.sync_slot_ledger();
+        self.slot_bytes[index] = self.slot_bytes[index]
+            .checked_sub(bytes)
+            .expect("slot transfer cannot exceed its charge");
+        self.machine_bytes = self
+            .machine_bytes
+            .checked_add(bytes)
+            .expect("machine charge cannot overflow");
+    }
+
+    fn transfer_slot_charge(&mut self, from: usize, to: usize, bytes: usize) {
+        self.sync_slot_ledger();
+        self.slot_bytes[from] = self.slot_bytes[from]
+            .checked_sub(bytes)
+            .expect("slot transfer cannot exceed its charge");
+        self.slot_bytes[to] = self.slot_bytes[to]
+            .checked_add(bytes)
+            .expect("slot charge cannot overflow");
+    }
+
     fn sync_slot_ledger(&mut self) {
         debug_assert!(self.slot_bytes.len() <= self.heap.len());
         self.slot_bytes.resize(self.heap.len(), 0);
@@ -4925,6 +5038,19 @@ impl<'a, H: Host> Machine<'a, H> {
         self.machine_bytes += bytes;
         self.heap_bytes += bytes;
         Ok(())
+    }
+
+    fn refund_machine(&mut self, bytes: usize) {
+        debug_assert!(self.machine_bytes >= bytes);
+        debug_assert!(self.heap_bytes >= bytes);
+        self.machine_bytes = self
+            .machine_bytes
+            .checked_sub(bytes)
+            .expect("machine refund cannot exceed its charge");
+        self.heap_bytes = self
+            .heap_bytes
+            .checked_sub(bytes)
+            .expect("machine refund cannot exceed heap charge");
     }
 
     #[cfg(test)]
@@ -6827,25 +6953,57 @@ impl<'a, H: Host> Machine<'a, H> {
         key: PropertyKey,
         value: Value,
     ) -> Result<(), EvalFailure> {
-        if matches!(key, PropertyKey::Named(ref name) if name.eq_ascii("length"))
+        if matches!(&key, PropertyKey::Named(name) if name.eq_ascii("length"))
             && matches!(self.heap[index], HeapEntry::Array { .. })
         {
-            let HeapEntry::Array {
-                elements,
-                properties,
-                length_writable,
-                ..
-            } = &mut self.heap[index]
-            else {
-                unreachable!("array checked above");
+            let length =
+                exact_array_length(value).ok_or(EvalFailure::Throw(ThrowOrigin::RangeError {
+                    operation: "set array length",
+                }))?;
+            let (old_length, old_property_bytes, length_writable) = match &self.heap[index] {
+                HeapEntry::Array {
+                    elements,
+                    properties,
+                    length_writable,
+                    ..
+                } => (elements.len(), properties.charge_bytes(), *length_writable),
+                _ => unreachable!("array checked above"),
             };
-            return array_set_length(
-                elements,
-                properties,
-                *length_writable,
-                value,
-                "set array length",
-            );
+            if !length_writable {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "set array length",
+                }));
+            }
+            let growth = length
+                .saturating_sub(old_length)
+                .saturating_mul(std::mem::size_of::<Value>());
+            self.charge_slot(index, growth)
+                .map_err(EvalFailure::Runtime)?;
+            let result = {
+                let HeapEntry::Array {
+                    elements,
+                    properties,
+                    ..
+                } = &mut self.heap[index]
+                else {
+                    unreachable!("array checked above");
+                };
+                apply_array_length(elements, properties, length, "set array length")
+            };
+            let (new_length, new_property_bytes) = match &self.heap[index] {
+                HeapEntry::Array {
+                    elements,
+                    properties,
+                    ..
+                } => (elements.len(), properties.charge_bytes()),
+                _ => unreachable!("array checked above"),
+            };
+            let released = old_length
+                .saturating_sub(new_length)
+                .saturating_mul(std::mem::size_of::<Value>())
+                .saturating_add(old_property_bytes.saturating_sub(new_property_bytes));
+            self.refund_slot(index, released);
+            return result;
         }
         if let HeapEntry::Array {
             elements,
@@ -6975,7 +7133,9 @@ impl<'a, H: Host> Machine<'a, H> {
                 PropertyKey::Named(name) if name.eq_ascii("length") => 0,
                 PropertyKey::Named(name) => {
                     if let Some(offset) = array_index(name) {
-                        (offset as usize + 1).saturating_sub(elements.len()) * 8
+                        (offset as usize + 1)
+                            .saturating_sub(elements.len())
+                            .saturating_mul(std::mem::size_of::<Value>())
                     } else {
                         usize::from(!properties.contains_key(&key)) * key.charge_bytes()
                     }
@@ -7176,8 +7336,10 @@ impl<'a, H: Host> Machine<'a, H> {
                             }));
                         }
                         match existing {
-                            None => key.charge_bytes() + 8,
-                            Some(Property::Data { .. }) => 8,
+                            None => key
+                                .charge_bytes()
+                                .saturating_add(std::mem::size_of::<Value>()),
+                            Some(Property::Data { .. }) => std::mem::size_of::<Value>(),
                             Some(Property::Accessor { .. }) => 0,
                         }
                     }
@@ -7235,79 +7397,83 @@ impl<'a, H: Host> Machine<'a, H> {
 
     fn delete_property(&mut self, object: Value, key: &PropertyKey) -> Result<bool, EvalFailure> {
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
-            Some(index) => match &mut self.heap[index] {
-                HeapEntry::Object { properties, .. }
-                | HeapEntry::Generator { properties, .. }
-                | HeapEntry::AsyncGenerator { properties, .. }
-                | HeapEntry::Script { properties, .. }
-                | HeapEntry::Function { properties, .. }
-                | HeapEntry::NativeFunction { properties, .. }
-                | HeapEntry::RegExp { properties, .. }
-                | HeapEntry::Date { properties, .. }
-                | HeapEntry::BuiltinIterator { properties, .. }
-                | HeapEntry::Collection { properties, .. }
-                | HeapEntry::Promise { properties, .. }
-                | HeapEntry::Timeout { properties, .. } => {
-                    if properties
-                        .get(key)
-                        .is_some_and(|property| !property.configurable())
-                    {
-                        return Ok(false);
-                    }
-                    properties.remove(key);
-                    Ok(true)
-                }
-                HeapEntry::Array {
-                    elements,
-                    properties,
-                    ..
-                } => {
-                    if properties
-                        .get(key)
-                        .is_some_and(|property| !property.configurable())
-                    {
-                        return Ok(false);
-                    }
-                    if properties.remove(key).is_some() {
-                        return Ok(true);
-                    }
-                    if let PropertyKey::Named(name) = key {
-                        if name.eq_ascii("length") {
+            Some(index) => {
+                let released = match &mut self.heap[index] {
+                    HeapEntry::Object { properties, .. }
+                    | HeapEntry::Generator { properties, .. }
+                    | HeapEntry::AsyncGenerator { properties, .. }
+                    | HeapEntry::Script { properties, .. }
+                    | HeapEntry::Function { properties, .. }
+                    | HeapEntry::NativeFunction { properties, .. }
+                    | HeapEntry::RegExp { properties, .. }
+                    | HeapEntry::Date { properties, .. }
+                    | HeapEntry::BuiltinIterator { properties, .. }
+                    | HeapEntry::Collection { properties, .. }
+                    | HeapEntry::Promise { properties, .. }
+                    | HeapEntry::Timeout { properties, .. } => {
+                        let Some(property) = properties.get(key) else {
+                            return Ok(true);
+                        };
+                        if !property.configurable() {
                             return Ok(false);
                         }
-                        if let Some(offset) = array_index(name) {
-                            if let Some(element) = elements.get_mut(offset as usize) {
-                                *element = Value::HOLE;
+                        let released = key.charge_bytes().saturating_add(property.charge_bytes());
+                        properties.remove(key);
+                        released
+                    }
+                    HeapEntry::Array {
+                        elements,
+                        properties,
+                        ..
+                    } => {
+                        if let Some(property) = properties.get(key) {
+                            if !property.configurable() {
+                                return Ok(false);
                             }
-                            return Ok(true);
+                            let released =
+                                key.charge_bytes().saturating_add(property.charge_bytes());
+                            properties.remove(key);
+                            released
+                        } else {
+                            if let PropertyKey::Named(name) = key {
+                                if name.eq_ascii("length") {
+                                    return Ok(false);
+                                }
+                                if let Some(offset) = array_index(name)
+                                    && let Some(element) = elements.get_mut(offset as usize)
+                                {
+                                    *element = Value::HOLE;
+                                }
+                            }
+                            0
                         }
                     }
-                    Ok(true)
-                }
-                HeapEntry::ProcessEnv { .. } => {
-                    let PropertyKey::Named(name) = key else {
-                        return Ok(true);
-                    };
-                    Ok(name
-                        .to_utf8_strict()
-                        .is_ok_and(|name| self.host.delete_env(&name)))
-                }
-                HeapEntry::String(_)
-                | HeapEntry::BigInt(_)
-                | HeapEntry::Symbol { .. }
-                | HeapEntry::PrivateName { .. }
-                | HeapEntry::Iterator { .. }
-                | HeapEntry::PromiseResolver { .. }
-                | HeapEntry::PromiseFinally { .. }
-                | HeapEntry::PromiseAll { .. }
-                | HeapEntry::AsyncActivation { .. }
-                | HeapEntry::PromiseAllElement { .. }
-                | HeapEntry::HashState { .. } => Ok(true),
-                HeapEntry::ModuleNamespace { .. } | HeapEntry::ExternalModuleNamespace { .. } => {
-                    Ok(false)
-                }
-                HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
-            },
+                    HeapEntry::ProcessEnv { .. } => {
+                        let PropertyKey::Named(name) = key else {
+                            return Ok(true);
+                        };
+                        return Ok(name
+                            .to_utf8_strict()
+                            .is_ok_and(|name| self.host.delete_env(&name)));
+                    }
+                    HeapEntry::String(_)
+                    | HeapEntry::BigInt(_)
+                    | HeapEntry::Symbol { .. }
+                    | HeapEntry::PrivateName { .. }
+                    | HeapEntry::Iterator { .. }
+                    | HeapEntry::PromiseResolver { .. }
+                    | HeapEntry::PromiseFinally { .. }
+                    | HeapEntry::PromiseAll { .. }
+                    | HeapEntry::AsyncActivation { .. }
+                    | HeapEntry::PromiseAllElement { .. }
+                    | HeapEntry::HashState { .. } => return Ok(true),
+                    HeapEntry::ModuleNamespace { .. }
+                    | HeapEntry::ExternalModuleNamespace { .. } => return Ok(false),
+                    HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
+                };
+                self.refund_slot(index, released);
+                Ok(true)
+            }
             None => Ok(true),
         }
     }
@@ -7355,29 +7521,42 @@ impl<'a, H: Host> Machine<'a, H> {
     pub(crate) fn array_push(&mut self, array: Value, value: Value) -> Result<(), EvalFailure> {
         match self.runtime_slot(array).map_err(EvalFailure::Runtime)? {
             Some(index) => {
-                if !matches!(self.heap[index], HeapEntry::Array { .. }) {
+                let (offset, extensible, length_writable) = match &self.heap[index] {
+                    HeapEntry::Array {
+                        elements,
+                        extensible,
+                        length_writable,
+                        ..
+                    } => (elements.len(), *extensible, *length_writable),
+                    _ => {
+                        return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                            operation: "push on non-array",
+                        }));
+                    }
+                };
+                if !length_writable {
                     return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                        operation: "push on non-array",
+                        operation: "push beyond non-writable array length",
                     }));
                 }
-                self.charge_slot(index, 8).map_err(EvalFailure::Runtime)?;
-                if let HeapEntry::Array {
-                    elements,
-                    properties,
-                    length_writable,
-                    ..
-                } = &mut self.heap[index]
-                {
-                    let offset = elements.len();
-                    array_set_length(
-                        elements,
-                        properties,
-                        *length_writable,
-                        number_value((offset + 1) as f64),
-                        "push beyond non-writable array length",
-                    )?;
-                    elements[offset] = value;
+                if !extensible {
+                    return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "add property to non-extensible object",
+                    }));
                 }
+                let next_length = offset
+                    .checked_add(1)
+                    .filter(|length| *length <= u32::MAX as usize)
+                    .ok_or(EvalFailure::Throw(ThrowOrigin::RangeError {
+                        operation: "push beyond maximum array length",
+                    }))?;
+                self.charge_slot(index, std::mem::size_of::<Value>())
+                    .map_err(EvalFailure::Runtime)?;
+                let HeapEntry::Array { elements, .. } = &mut self.heap[index] else {
+                    unreachable!("array checked before its heap charge");
+                };
+                elements.resize(next_length, Value::HOLE);
+                elements[offset] = value;
                 Ok(())
             }
             None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
@@ -8256,11 +8435,12 @@ impl<'a, H: Host> Machine<'a, H> {
             } else {
                 PromiseReaction::AsyncGeneratorReject { generator }
             };
-            self.microtasks.push_back(MicrotaskJob::Reaction {
-                reaction,
-                value,
-                origin,
-            });
+            self.microtasks
+                .push_back(QueuedMicrotask::uncharged(MicrotaskJob::Reaction {
+                    reaction,
+                    value,
+                    origin,
+                }));
             return Ok(());
         }
         self.charge_promise_reactions(index, 2)?;
@@ -8535,11 +8715,12 @@ impl<'a, H: Host> Machine<'a, H> {
             } else {
                 PromiseReaction::AsyncReject { activation: record }
             };
-            self.microtasks.push_back(MicrotaskJob::Reaction {
-                reaction,
-                value,
-                origin,
-            });
+            self.microtasks
+                .push_back(QueuedMicrotask::uncharged(MicrotaskJob::Reaction {
+                    reaction,
+                    value,
+                    origin,
+                }));
             return Ok(());
         }
         self.charge_promise_reactions(index, 2)?;
@@ -9078,11 +9259,12 @@ impl<'a, H: Host> Machine<'a, H> {
                     done,
                 }
             };
-            self.microtasks.push_back(MicrotaskJob::Reaction {
-                reaction,
-                value,
-                origin,
-            });
+            self.microtasks
+                .push_back(QueuedMicrotask::uncharged(MicrotaskJob::Reaction {
+                    reaction,
+                    value,
+                    origin,
+                }));
             return Ok(());
         }
         self.charge_promise_reactions(index, 2)?;
@@ -10525,6 +10707,329 @@ mod tests {
                 assert_eq!(machine.heap_bytes, failed_heap_bytes);
                 machine.assert_heap_ledger();
             }
+        });
+    }
+
+    #[test]
+    fn failed_array_index_and_push_leave_storage_and_ledger_unchanged() {
+        with_machine(Limits::default(), |machine| {
+            let array = machine
+                .allocate(HeapEntry::Array {
+                    elements: Vec::new(),
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.array_prototype),
+                    extensible: true,
+                    length_writable: false,
+                })
+                .unwrap();
+            let index = machine.runtime_slot(array).unwrap().unwrap();
+            let key = PropertyKey::Named(EcmaString::from_utf8("0"));
+            let baseline_slot = machine.slot_bytes[index];
+            let baseline_heap = machine.heap_bytes;
+
+            for _ in 0..3 {
+                assert!(matches!(
+                    machine.set_own_data(index, key.clone(), Value::int32(1)),
+                    Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+                ));
+                assert!(matches!(
+                    machine.array_push(array, Value::int32(1)),
+                    Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+                ));
+                assert_eq!(machine.slot_bytes[index], baseline_slot);
+                assert_eq!(machine.heap_bytes, baseline_heap);
+                let HeapEntry::Array { elements, .. } = &machine.heap[index] else {
+                    panic!("array remains an array");
+                };
+                assert!(elements.is_empty());
+                machine.assert_heap_ledger();
+            }
+
+            let HeapEntry::Array {
+                extensible,
+                length_writable,
+                ..
+            } = &mut machine.heap[index]
+            else {
+                panic!("array remains an array");
+            };
+            *extensible = false;
+            *length_writable = true;
+            for _ in 0..3 {
+                assert!(matches!(
+                    machine.set_own_data(index, key.clone(), Value::int32(1)),
+                    Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+                ));
+                assert!(matches!(
+                    machine.array_push(array, Value::int32(1)),
+                    Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+                ));
+                assert_eq!(machine.slot_bytes[index], baseline_slot);
+                assert_eq!(machine.heap_bytes, baseline_heap);
+                machine.assert_heap_ledger();
+            }
+        });
+    }
+
+    #[test]
+    fn nonempty_array_shrink_refunds_its_initial_element_charge() {
+        with_machine(Limits::default(), |machine| {
+            let array = machine
+                .allocate(HeapEntry::Array {
+                    elements: vec![Value::int32(1), Value::int32(2)],
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.array_prototype),
+                    extensible: true,
+                    length_writable: true,
+                })
+                .unwrap();
+            let index = machine.runtime_slot(array).unwrap().unwrap();
+            let element_bytes = std::mem::size_of::<Value>();
+            // An array allocated with two elements owns the element storage it
+            // can later shrink away, plus the base slot charge.
+            let initial_charge = element_bytes.saturating_mul(2).saturating_add(1);
+            assert_eq!(machine.slot_bytes[index], initial_charge);
+            machine.assert_heap_ledger();
+
+            machine
+                .set_data_property(array, "length", Value::int32(1))
+                .unwrap();
+
+            // The shrink refund must not underflow and must leave exactly the
+            // one remaining element plus the base slot charge.
+            let shrunk_charge = element_bytes.saturating_add(1);
+            assert_eq!(machine.slot_bytes[index], shrunk_charge);
+            machine.assert_heap_ledger();
+            let HeapEntry::Array { elements, .. } = &machine.heap[index] else {
+                panic!("array remains an array");
+            };
+            assert_eq!(*elements, vec![Value::int32(1)]);
+        });
+    }
+
+    #[test]
+    fn object_add_delete_churn_refunds_data_and_accessor_charges() {
+        with_machine(Limits::default(), |machine| {
+            let object = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let index = machine.runtime_slot(object).unwrap().unwrap();
+            let data = PropertyKey::Named(EcmaString::from_utf8("data"));
+            let accessor = PropertyKey::Named(EcmaString::from_utf8("accessor"));
+            let baseline_slot = machine.slot_bytes[index];
+            let baseline_heap = machine.heap_bytes;
+
+            for _ in 0..3 {
+                machine
+                    .set_own_data(index, data.clone(), Value::int32(1))
+                    .unwrap();
+                assert!(machine.delete_property(object, &data).unwrap());
+                machine
+                    .define_accessor(
+                        object,
+                        accessor.clone(),
+                        Value::int32(2),
+                        AccessorKind::Getter,
+                    )
+                    .unwrap();
+                assert!(machine.delete_property(object, &accessor).unwrap());
+                assert_eq!(machine.slot_bytes[index], baseline_slot);
+                assert_eq!(machine.heap_bytes, baseline_heap);
+                machine.assert_heap_ledger();
+            }
+        });
+    }
+
+    #[test]
+    fn array_grow_shrink_churn_refunds_elements_and_indexed_properties() {
+        with_machine(Limits::default(), |machine| {
+            let array = machine
+                .allocate(HeapEntry::Array {
+                    elements: Vec::new(),
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.array_prototype),
+                    extensible: true,
+                    length_writable: true,
+                })
+                .unwrap();
+            let index = machine.runtime_slot(array).unwrap().unwrap();
+            let element = PropertyKey::Named(EcmaString::from_utf8("3"));
+            let indexed_accessor = PropertyKey::Named(EcmaString::from_utf8("5"));
+            let length = PropertyKey::Named(EcmaString::from_utf8("length"));
+            let baseline_slot = machine.slot_bytes[index];
+            let baseline_heap = machine.heap_bytes;
+
+            for _ in 0..3 {
+                machine
+                    .set_own_data(index, element.clone(), Value::int32(1))
+                    .unwrap();
+                machine
+                    .define_accessor(
+                        array,
+                        indexed_accessor.clone(),
+                        Value::int32(2),
+                        AccessorKind::Getter,
+                    )
+                    .unwrap();
+                machine
+                    .set_own_data(index, length.clone(), Value::int32(0))
+                    .unwrap();
+                assert_eq!(machine.slot_bytes[index], baseline_slot);
+                assert_eq!(machine.heap_bytes, baseline_heap);
+                let HeapEntry::Array {
+                    elements,
+                    properties,
+                    ..
+                } = &machine.heap[index]
+                else {
+                    panic!("array remains an array");
+                };
+                assert!(elements.is_empty());
+                assert!(properties.get(&indexed_accessor).is_none());
+                machine.assert_heap_ledger();
+            }
+        });
+    }
+
+    #[test]
+    fn settled_promise_reaction_charge_survives_source_collection_in_queue() {
+        with_machine(Limits::default(), |machine| {
+            let source = machine.create_promise().unwrap();
+            let source_index = machine.runtime_slot(source).unwrap().unwrap();
+            machine
+                .promise_then(source, Value::UNDEFINED, Value::UNDEFINED)
+                .unwrap();
+            machine.fulfill_promise(source, Value::int32(1)).unwrap();
+            assert_eq!(machine.microtasks.len(), 1);
+            assert_eq!(
+                machine.microtasks.front().unwrap().retained_bytes,
+                std::mem::size_of::<PromiseReaction>()
+            );
+            machine.assert_heap_ledger();
+
+            machine.collect_garbage();
+            assert!(matches!(machine.heap[source_index], HeapEntry::Vacant));
+            assert_eq!(machine.slot_bytes[source_index], 0);
+            assert!(machine.machine_bytes >= std::mem::size_of::<PromiseReaction>());
+            machine.assert_heap_ledger();
+        });
+    }
+
+    #[test]
+    fn dequeued_promise_job_refunds_machine_owned_reaction_charge() {
+        with_machine(Limits::default(), |machine| {
+            let source = machine.create_promise().unwrap();
+            let machine_baseline = machine.machine_bytes;
+            machine
+                .promise_then(source, Value::UNDEFINED, Value::UNDEFINED)
+                .unwrap();
+            machine.fulfill_promise(source, Value::int32(1)).unwrap();
+            assert_eq!(
+                machine.machine_bytes,
+                machine_baseline + std::mem::size_of::<PromiseReaction>()
+            );
+            machine.assert_heap_ledger();
+
+            let drain = machine.drain_microtasks().unwrap();
+            assert_eq!(drain.executed, 1);
+            assert_eq!(machine.machine_bytes, machine_baseline);
+            assert!(machine.microtasks.is_empty());
+            machine.assert_heap_ledger();
+
+            let failing_source = machine.create_promise().unwrap();
+            let failing_index = machine.runtime_slot(failing_source).unwrap().unwrap();
+            machine.charge_promise_reactions(failing_index, 2).unwrap();
+            let HeapEntry::Promise {
+                state:
+                    PromiseState::Pending {
+                        fulfill_reactions,
+                        reject_reactions,
+                    },
+                ..
+            } = &mut machine.heap[failing_index]
+            else {
+                panic!("new Promise is pending");
+            };
+            fulfill_reactions.push(PromiseReaction::Fulfilled {
+                handler: Value::UNDEFINED,
+                derived: Value::int32(0),
+            });
+            reject_reactions.push(PromiseReaction::Rejected {
+                handler: Value::UNDEFINED,
+                derived: Value::int32(0),
+            });
+            machine
+                .fulfill_promise(failing_source, Value::int32(1))
+                .unwrap();
+            assert_eq!(
+                machine.machine_bytes,
+                machine_baseline + std::mem::size_of::<PromiseReaction>()
+            );
+            assert!(machine.drain_microtasks().is_err());
+            assert_eq!(machine.machine_bytes, machine_baseline);
+            assert!(machine.microtasks.is_empty());
+            machine.assert_heap_ledger();
+        });
+    }
+
+    #[test]
+    fn promise_all_values_charge_moves_to_output_before_aggregate_collection() {
+        with_machine(Limits::default(), |machine| {
+            let promise = machine.create_promise().unwrap();
+            let aggregate = machine
+                .allocate(HeapEntry::PromiseAll {
+                    promise,
+                    values: Vec::new(),
+                    remaining: 1,
+                    settled: false,
+                })
+                .unwrap();
+            let aggregate_index = machine.runtime_slot(aggregate).unwrap().unwrap();
+            let output_index = machine.add_promise_all_element(aggregate).unwrap();
+            let element = machine
+                .allocate(HeapEntry::PromiseAllElement {
+                    aggregate,
+                    index: output_index,
+                    called: false,
+                })
+                .unwrap();
+            assert!(!machine.finish_promise_all(aggregate).unwrap());
+            machine
+                .resolve_promise_all_element(element, Value::int32(7))
+                .unwrap();
+            let promise_index = machine.runtime_slot(promise).unwrap().unwrap();
+            let HeapEntry::Promise {
+                state: PromiseState::Fulfilled { value: output },
+                ..
+            } = &machine.heap[promise_index]
+            else {
+                panic!("Promise.all result is fulfilled");
+            };
+            let output = *output;
+            let output_index = machine.runtime_slot(output).unwrap().unwrap();
+            assert_eq!(machine.slot_bytes[aggregate_index], 1);
+            assert_eq!(
+                machine.slot_bytes[output_index],
+                1 + std::mem::size_of::<Value>()
+            );
+            machine.assert_heap_ledger();
+
+            machine
+                .globals
+                .insert(EcmaString::from_utf8("promiseAllOutput"), output);
+            machine.collect_garbage();
+            assert!(matches!(machine.heap[aggregate_index], HeapEntry::Vacant));
+            assert_eq!(machine.slot_bytes[aggregate_index], 0);
+            assert_eq!(
+                machine.slot_bytes[output_index],
+                1 + std::mem::size_of::<Value>()
+            );
+            machine.assert_heap_ledger();
         });
     }
 
