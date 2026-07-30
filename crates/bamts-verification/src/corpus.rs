@@ -29,6 +29,7 @@ use std::{
     io::{ErrorKind, Read},
     path::{Component, Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
+    sync::atomic::AtomicUsize,
     thread,
     time::{Duration, Instant},
 };
@@ -688,6 +689,7 @@ impl CorpusFailure {
             bamts::Error::Diagnostics { .. } => CorpusStage::Check,
             bamts::Error::Lower(error) => program_lower_stage(error),
             bamts::Error::Runtime(_) => CorpusStage::Evaluate,
+            bamts::Error::Aot(error) => aot_stage(error),
         };
         Self {
             stage,
@@ -1015,6 +1017,8 @@ fn bounded_output(mut output: Vec<u8>, cap: usize) -> (Vec<u8>, bool) {
     (output, truncated)
 }
 
+static NEXT_ARTIFACT_DIRECTORY_ID: AtomicUsize = AtomicUsize::new(0);
+
 struct ArtifactDirectory(PathBuf);
 
 impl ArtifactDirectory {
@@ -1022,7 +1026,12 @@ impl ArtifactDirectory {
         let path = root
             .join("target/corpus-differential")
             .join(&spec.id)
-            .join(ExecutionMode::Aot.as_str());
+            .join(ExecutionMode::Aot.as_str())
+            .join(format!(
+                "{}-{}",
+                std::process::id(),
+                NEXT_ARTIFACT_DIRECTORY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
         if path.exists() {
             fs::remove_dir_all(&path).map_err(|error| io_error(&path, &error))?;
         }
@@ -1581,6 +1590,21 @@ mod tests {
         dir
     }
 
+    fn aot_case(id: &str, expected_timeout_ms: u64) -> CaseSpec {
+        CaseSpec {
+            id: id.to_owned(),
+            repository: format!("https://example.com/{id}"),
+            commit: "a".repeat(40),
+            license: "MIT".into(),
+            source_dir: format!("corpus/projects/{id}"),
+            entrypoint: format!("corpus/cases/{id}.ts"),
+            node_args: Vec::new(),
+            expected_timeout_ms,
+            constructs: Vec::new(),
+            source_files: Vec::new(),
+        }
+    }
+
     fn run_script(cwd: &Path, source: &str, limits: OracleLimits) -> OracleOutcome {
         let node = locate_node().expect("node on PATH");
         fs::write(cwd.join("case.js"), source).expect("write script");
@@ -2049,22 +2073,31 @@ mod tests {
 
     #[test]
     fn aot_executable_uses_the_full_case_timeout() {
-        let spec = CaseSpec {
-            id: "aot-budget".into(),
-            repository: "https://example.com/aot-budget".into(),
-            commit: "a".repeat(40),
-            license: "MIT".into(),
-            source_dir: "corpus/projects/aot-budget".into(),
-            entrypoint: "corpus/cases/aot-budget.ts".into(),
-            node_args: Vec::new(),
-            expected_timeout_ms: 250,
-            constructs: Vec::new(),
-            source_files: Vec::new(),
-        };
+        let spec = aot_case("aot-budget", 250);
 
         let limits = aot_execution_limits(&spec, 123);
         assert_eq!(limits.timeout, Duration::from_millis(250));
         assert_eq!(limits.max_output_bytes, 123);
+    }
+
+    #[test]
+    fn live_aot_artifact_directories_never_overlap() {
+        let root = scratch("aot-artifacts");
+        let spec = aot_case("same-case", 250);
+        let first = ArtifactDirectory::create(&root, &spec).expect("create first directory");
+        let second = ArtifactDirectory::create(&root, &spec).expect("create second directory");
+        let first_executable = first.executable(&spec);
+        let second_executable = second.executable(&spec);
+        assert_ne!(first_executable, second_executable);
+        fs::write(&first_executable, b"first").expect("write first artifact");
+        fs::write(&second_executable, b"second").expect("write second artifact");
+        drop(first);
+        assert_eq!(
+            fs::read(&second_executable).expect("second artifact remains live"),
+            b"second"
+        );
+        drop(second);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

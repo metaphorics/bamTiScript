@@ -9,7 +9,7 @@ repository.workspace = true
 description = "Verification and compliance test suite for BamTS"
 
 [dependencies]
-bamts = { path = "../bamts", version = "0.1.0" }
+bamts = { path = "../bamts", version = "0.1.0", features = ["aot"] }
 bamts-bytecode = { path = "../bamts-bytecode", version = "0.1.0" }
 bamts-cli = { path = "../bamts-cli", version = "0.1.0" }
 bamts-codegen = { path = "../bamts-codegen", version = "0.1.0" }

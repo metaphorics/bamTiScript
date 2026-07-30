@@ -952,7 +952,7 @@ fn expected_internal_graph() -> InternalGraph {
     graph.insert(
         "bamts-verification".to_owned(),
         BTreeMap::from([
-            ("bamts".to_owned(), internal_dependency(false, &[])),
+            ("bamts".to_owned(), internal_dependency(false, &["aot"])),
             ("bamts-bytecode".to_owned(), internal_dependency(false, &[])),
             ("bamts-cli".to_owned(), internal_dependency(false, &[])),
             ("bamts-codegen".to_owned(), internal_dependency(false, &[])),
