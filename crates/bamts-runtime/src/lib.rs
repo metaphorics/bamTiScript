@@ -2321,8 +2321,15 @@ impl<'a, H: Host> Machine<'a, H> {
         value: Value,
         origin: ThrowOrigin,
     ) -> Result<(), RuntimeErrorKind> {
-        let Some(pending) = self.take_module_async_pending(parent)? else {
-            return Ok(());
+        let pending = match &self.registry.modules[parent.get() as usize].state {
+            ModuleState::EvaluatingAsync {
+                record, promise, ..
+            } => ModulePending {
+                record: *record,
+                promise: *promise,
+            },
+            // The first rejection already settled or aborted the parent.
+            _ => return Ok(()),
         };
         let error = self.program_error(parent, RuntimeErrorKind::UncaughtThrow { value, origin });
         self.store_async_module_completion(pending.record, Some(Err(error.clone())))

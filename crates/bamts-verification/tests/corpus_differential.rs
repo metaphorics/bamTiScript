@@ -313,6 +313,100 @@ setTimeout(() => {
 }
 
 #[test]
+fn first_tla_rejection_aborts_root_body_before_pending_dependency_completes() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("tla-reject-{}", process::id());
+    let entrypoint = format!("target/{id}.ts");
+    let root_path = root.join(&entrypoint);
+    let rejecting_path = root.join(format!("target/{id}-rejecting.ts"));
+    let pending_path = root.join(format!("target/{id}-pending.ts"));
+
+    fs::write(
+        &rejecting_path,
+        "await Promise.resolve();\nthrow 'first-rejection';\n",
+    )
+    .expect("write rejecting dependency");
+    fs::write(
+        &pending_path,
+        "await Promise.resolve();\nawait Promise.resolve();\n",
+    )
+    .expect("write pending dependency");
+    fs::write(
+        &root_path,
+        format!(
+            "import './{id}-rejecting.ts';\nimport './{id}-pending.ts';\nconsole.log('ROOT-BODY-EXECUTED');\n"
+        ),
+    )
+    .expect("write root fixture");
+
+    let spec = CaseSpec {
+        id,
+        repository: "local".to_owned(),
+        commit: "0".repeat(40),
+        license: "UNLICENSED".to_owned(),
+        source_dir: "target".to_owned(),
+        entrypoint,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+    };
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let bamts = BamtsRunner::new(&root);
+    let mut failures = Vec::new();
+    match &expected {
+        Ok(outcome)
+            if outcome.is_reliable()
+                && outcome.exit_code == Some(1)
+                && outcome.stdout.is_empty() => {}
+        Ok(outcome) => failures.push(format!(
+            "case `{}` / Node: expected a clean rejection with no root output; got {}",
+            spec.id,
+            evidence(outcome)
+        )),
+        Err(error) => failures.push(format!(
+            "case `{}` / Node: oracle failed before comparison: {error}",
+            spec.id
+        )),
+    }
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&spec, mode);
+        match mode {
+            ExecutionMode::Aot => {
+                compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+            }
+            ExecutionMode::Interpreter | ExecutionMode::Jit => match actual {
+                Err(error) => {
+                    let text = error.to_string();
+                    if !text.contains("stage=evaluate") {
+                        failures.push(format!(
+                            "case `{}` / {}: rejection reached the wrong stage: {text}",
+                            spec.id,
+                            mode.as_str()
+                        ));
+                    }
+                }
+                Ok(outcome) => failures.push(format!(
+                    "case `{}` / {}: rejected graph completed successfully: {}",
+                    spec.id,
+                    mode.as_str(),
+                    evidence(&outcome)
+                )),
+            },
+        }
+    }
+    fs::remove_file(root_path).expect("remove root fixture");
+    fs::remove_file(rejecting_path).expect("remove rejecting fixture");
+    fs::remove_file(pending_path).expect("remove pending fixture");
+    assert!(
+        failures.is_empty(),
+        "TLA first-rejection differential failures:\n{}",
+        failures.join("\n\n")
+    );
+}
+
+#[test]
 fn interpreter_runtime_errors_classify_as_evaluate() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("task-113-interpreter-throw-{}", process::id());

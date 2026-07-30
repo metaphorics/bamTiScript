@@ -4915,9 +4915,9 @@ mod tests {
     }
 
     #[test]
-    fn static_dependency_tla_rejection_skips_the_native_graph() {
-        let dependency = program_module(
-            "dependency",
+    fn first_static_dependency_tla_rejection_skips_the_native_graph() {
+        let rejecting = program_module(
+            "rejecting",
             vec![Constant::Undefined, Constant::Int32(9)],
             vec![entry_function(
                 2,
@@ -4942,19 +4942,90 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        let root = program_module(
-            "root",
-            vec![Constant::String(EcmaString::from_utf8("dependency"))],
-            vec![entry_function(0, vec![Instruction::Halt])],
-            vec![Edge {
-                specifier: cid(1),
-                target: EdgeTarget::Local(ModuleId::new(0)),
-                kind: EdgeKind::Static,
-            }],
+        let pending = program_module(
+            "pending",
+            vec![Constant::Undefined],
+            vec![entry_function(
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::Await {
+                        dst: reg(0),
+                        src: reg(0),
+                        resume: pc(2),
+                    },
+                    Instruction::Await {
+                        dst: reg(0),
+                        src: reg(0),
+                        resume: pc(3),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+            )],
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         );
-        let program = linked(vec![dependency, root], 1);
+        let root = program_module(
+            "root",
+            vec![
+                Constant::String(EcmaString::from_utf8("rejecting")),
+                Constant::String(EcmaString::from_utf8("pending")),
+                Constant::String(EcmaString::from_utf8("root-ran")),
+                Constant::Int32(1),
+            ],
+            vec![entry_function(
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(4),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(3),
+                        value: reg(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+            )],
+            vec![
+                Edge {
+                    specifier: cid(1),
+                    target: EdgeTarget::Local(ModuleId::new(0)),
+                    kind: EdgeKind::Static,
+                },
+                Edge {
+                    specifier: cid(2),
+                    target: EdgeTarget::Local(ModuleId::new(1)),
+                    kind: EdgeKind::Static,
+                },
+            ],
+            Vec::new(),
+            Vec::new(),
+        );
+        let program = linked(vec![rejecting, pending, root], 2);
+
+        let mut interpreter_host = SilentHost;
+        let mut machine = Machine::new(&program, &mut interpreter_host, Limits::default());
+        let error = machine
+            .evaluate()
+            .expect_err("interpreter propagates the first dependency rejection");
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                value,
+                ..
+            } if value == Value::int32(9)
+        ));
+        assert!(
+            !machine
+                .globals
+                .contains_key(&EcmaString::from_utf8("root-ran")),
+            "the root body must not run after a dependency rejects"
+        );
 
         let mut reference_host = SilentHost;
         let error = NativeEngine::new(&program, &NoEntries, &mut reference_host, Limits::default())
@@ -4996,6 +5067,14 @@ mod tests {
         assert!(
             !entries.invoked.get(),
             "the rejected async graph must not run a linked entry"
+        );
+        assert!(
+            !engine
+                .machine
+                .borrow()
+                .globals
+                .contains_key(&EcmaString::from_utf8("root-ran")),
+            "the linked root body must not run after a dependency rejects"
         );
     }
 
