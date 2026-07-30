@@ -4834,15 +4834,10 @@ impl<'a, H: Host> Machine<'a, H> {
             .map_err(|kind| self.error_at(kind, function, pc))
     }
 
-    fn sync_slot_ledger(&mut self) {
-        debug_assert!(self.slot_bytes.len() <= self.heap.len());
-        self.slot_bytes.resize(self.heap.len(), 0);
-    }
-
     fn allocate(&mut self, entry: HeapEntry) -> Result<Value, RuntimeErrorKind> {
-        self.sync_slot_ledger();
         let bytes = entry.initial_bytes();
         self.ensure_allocation_capacity(1, bytes)?;
+        self.sync_slot_ledger();
         let slot = self.heap.len() as u32 + 1;
         self.heap.push(entry);
         self.slot_bytes.push(bytes);
@@ -4905,6 +4900,24 @@ impl<'a, H: Host> Machine<'a, H> {
         self.slot_bytes[index] += bytes;
         self.heap_bytes += bytes;
         Ok(())
+    }
+
+    pub(crate) fn refund_slot(&mut self, index: usize, bytes: usize) {
+        self.sync_slot_ledger();
+        debug_assert!(self.slot_bytes[index] >= bytes);
+        debug_assert!(self.heap_bytes >= bytes);
+        self.slot_bytes[index] = self.slot_bytes[index]
+            .checked_sub(bytes)
+            .expect("slot refund cannot exceed its charge");
+        self.heap_bytes = self
+            .heap_bytes
+            .checked_sub(bytes)
+            .expect("slot refund cannot exceed heap charge");
+    }
+
+    fn sync_slot_ledger(&mut self) {
+        debug_assert!(self.slot_bytes.len() <= self.heap.len());
+        self.slot_bytes.resize(self.heap.len(), 0);
     }
 
     pub(crate) fn charge_machine(&mut self, bytes: usize) -> Result<(), RuntimeErrorKind> {
@@ -7093,9 +7106,7 @@ impl<'a, H: Host> Machine<'a, H> {
     ) -> Result<(), EvalFailure> {
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => {
-                self.charge_slot(index, key.charge_bytes() + 8)
-                    .map_err(EvalFailure::Runtime)?;
-                let (properties, extensible) = match &mut self.heap[index] {
+                let growth = match &self.heap[index] {
                     HeapEntry::Object {
                         properties,
                         extensible,
@@ -7155,24 +7166,45 @@ impl<'a, H: Host> Machine<'a, H> {
                         properties,
                         extensible,
                         ..
-                    } => (properties, *extensible),
+                    } => {
+                        let existing = properties.get(&key);
+                        if existing.is_some_and(|property| !property.configurable())
+                            || (existing.is_none() && !extensible)
+                        {
+                            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                                operation: "define accessor on non-configurable object",
+                            }));
+                        }
+                        match existing {
+                            None => key.charge_bytes() + 8,
+                            Some(Property::Data { .. }) => 8,
+                            Some(Property::Accessor { .. }) => 0,
+                        }
+                    }
                     _ => {
                         return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                             operation: "define accessor on primitive",
                         }));
                     }
                 };
-                if properties
-                    .get(&key)
-                    .is_some_and(|property| !property.configurable())
-                    || (!properties.contains_key(&key) && !extensible)
-                {
-                    return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                        operation: "define accessor on non-configurable object",
-                    }));
-                }
-                let property = properties.get_mut(&key);
-                match property {
+                self.charge_slot(index, growth)
+                    .map_err(EvalFailure::Runtime)?;
+                let properties = match &mut self.heap[index] {
+                    HeapEntry::Object { properties, .. }
+                    | HeapEntry::Generator { properties, .. }
+                    | HeapEntry::AsyncGenerator { properties, .. }
+                    | HeapEntry::Script { properties, .. }
+                    | HeapEntry::Array { properties, .. }
+                    | HeapEntry::Function { properties, .. }
+                    | HeapEntry::NativeFunction { properties, .. }
+                    | HeapEntry::RegExp { properties, .. }
+                    | HeapEntry::Date { properties, .. }
+                    | HeapEntry::BuiltinIterator { properties, .. }
+                    | HeapEntry::Collection { properties, .. }
+                    | HeapEntry::Promise { properties, .. } => properties,
+                    _ => unreachable!("validated object cannot change heap entry kind"),
+                };
+                match properties.get_mut(&key) {
                     Some(Property::Accessor { getter, setter, .. }) => match kind {
                         AccessorKind::Getter => *getter = Some(accessor),
                         AccessorKind::Setter => *setter = Some(accessor),
@@ -10442,6 +10474,57 @@ mod tests {
             assert_eq!(machine.slot_bytes[index], 5);
             assert_eq!(machine.machine_bytes, 5);
             machine.assert_heap_ledger();
+        });
+    }
+
+    #[test]
+    fn define_accessor_charges_only_net_growth_after_validation() {
+        with_machine(Limits::default(), |machine| {
+            let object = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    extensible: true,
+                    boxed_primitive: None,
+                })
+                .unwrap();
+            let index = machine.runtime_slot(object).unwrap().unwrap();
+            let key = PropertyKey::Named(EcmaString::from_utf8("accessor"));
+
+            machine
+                .define_accessor(object, key.clone(), Value::int32(1), AccessorKind::Getter)
+                .unwrap();
+            let replacement_slot_bytes = machine.slot_bytes[index];
+            let replacement_heap_bytes = machine.heap_bytes;
+            machine
+                .define_accessor(object, key.clone(), Value::int32(2), AccessorKind::Getter)
+                .unwrap();
+            machine
+                .define_accessor(object, key.clone(), Value::int32(3), AccessorKind::Setter)
+                .unwrap();
+            assert_eq!(machine.slot_bytes[index], replacement_slot_bytes);
+            assert_eq!(machine.heap_bytes, replacement_heap_bytes);
+            machine.assert_heap_ledger();
+
+            let HeapEntry::Object { properties, .. } = &mut machine.heap[index] else {
+                panic!("allocated object remains an object");
+            };
+            let Some(Property::Accessor { configurable, .. }) = properties.get_mut(&key) else {
+                panic!("accessor definition stored an accessor");
+            };
+            *configurable = false;
+
+            let failed_slot_bytes = machine.slot_bytes[index];
+            let failed_heap_bytes = machine.heap_bytes;
+            for accessor in [Value::int32(4), Value::int32(5)] {
+                assert!(matches!(
+                    machine.define_accessor(object, key.clone(), accessor, AccessorKind::Getter),
+                    Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+                ));
+                assert_eq!(machine.slot_bytes[index], failed_slot_bytes);
+                assert_eq!(machine.heap_bytes, failed_heap_bytes);
+                machine.assert_heap_ledger();
+            }
         });
     }
 

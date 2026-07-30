@@ -214,10 +214,7 @@ impl GcState {
                 }
                 _ => 0,
             };
-            let refund = removed * CollectionEntry::BYTES;
-            debug_assert!(machine.slot_bytes[index] >= refund);
-            machine.slot_bytes[index] -= refund;
-            machine.heap_bytes -= refund;
+            machine.refund_slot(index, removed * CollectionEntry::BYTES);
         }
     }
 

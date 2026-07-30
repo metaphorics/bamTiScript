@@ -546,6 +546,7 @@ fn map_delete_for<H: Host>(
         unreachable!("collection brand was checked")
     };
     entries.remove(index);
+    machine.refund_slot(slot, crate::CollectionEntry::BYTES);
     Ok(BuiltinOutcome::Value(Value::TRUE))
 }
 
@@ -556,10 +557,20 @@ fn map_clear<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let slot = collection_slot(machine, this, CollectionKind::Map)?;
-    let HeapEntry::Collection { entries, .. } = &mut machine.heap[slot] else {
-        unreachable!("collection brand was checked")
+    let removed = {
+        let HeapEntry::Collection { entries, .. } = &mut machine.heap[slot] else {
+            unreachable!("collection brand was checked")
+        };
+        let removed = entries.len();
+        entries.clear();
+        removed
     };
-    entries.clear();
+    machine.refund_slot(
+        slot,
+        removed
+            .checked_mul(crate::CollectionEntry::BYTES)
+            .expect("collection entry charge fits heap limits"),
+    );
     Ok(BuiltinOutcome::Value(Value::UNDEFINED))
 }
 
@@ -697,10 +708,20 @@ fn set_clear<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let slot = collection_slot(machine, this, CollectionKind::Set)?;
-    let HeapEntry::Collection { entries, .. } = &mut machine.heap[slot] else {
-        unreachable!("collection brand was checked")
+    let removed = {
+        let HeapEntry::Collection { entries, .. } = &mut machine.heap[slot] else {
+            unreachable!("collection brand was checked")
+        };
+        let removed = entries.len();
+        entries.clear();
+        removed
     };
-    entries.clear();
+    machine.refund_slot(
+        slot,
+        removed
+            .checked_mul(crate::CollectionEntry::BYTES)
+            .expect("collection entry charge fits heap limits"),
+    );
     Ok(BuiltinOutcome::Value(Value::UNDEFINED))
 }
 
@@ -1812,6 +1833,149 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn collection_mutations_refund_exact_entry_charges() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let assert_ledger = |machine: &Machine<'_, TestHost>| {
+            assert_eq!(
+                machine.heap_bytes,
+                machine.machine_bytes + machine.slot_bytes.iter().sum::<usize>()
+            );
+        };
+
+        let map = construct_builtin(&mut machine, "Map", &[]);
+        let map_slot = slot(&machine, map);
+        let map_before = machine.slot_bytes[map_slot];
+        map_put(
+            &mut machine,
+            map,
+            Value::int32(1),
+            Value::int32(2),
+            CollectionKind::Map,
+        )
+        .unwrap();
+        assert_eq!(
+            machine.slot_bytes[map_slot],
+            map_before + CollectionEntry::BYTES
+        );
+        assert_ledger(&machine);
+        assert!(matches!(
+            map_delete_for(&mut machine, map, &[Value::int32(9)], CollectionKind::Map),
+            Ok(BuiltinOutcome::Value(Value::FALSE))
+        ));
+        assert_eq!(
+            machine.slot_bytes[map_slot],
+            map_before + CollectionEntry::BYTES
+        );
+        assert_ledger(&machine);
+        assert!(matches!(
+            map_delete_for(&mut machine, map, &[Value::int32(1)], CollectionKind::Map),
+            Ok(BuiltinOutcome::Value(Value::TRUE))
+        ));
+        assert_eq!(machine.slot_bytes[map_slot], map_before);
+        assert_ledger(&machine);
+
+        let weak_map = construct_builtin(&mut machine, "WeakMap", &[]);
+        let weak_map_slot = slot(&machine, weak_map);
+        let weak_map_before = machine.slot_bytes[weak_map_slot];
+        let weak_map_key = object(&mut machine);
+        map_put(
+            &mut machine,
+            weak_map,
+            weak_map_key,
+            Value::int32(2),
+            CollectionKind::WeakMap,
+        )
+        .unwrap();
+        assert_eq!(
+            machine.slot_bytes[weak_map_slot],
+            weak_map_before + CollectionEntry::BYTES
+        );
+        assert_ledger(&machine);
+        map_delete_for(
+            &mut machine,
+            weak_map,
+            &[weak_map_key],
+            CollectionKind::WeakMap,
+        )
+        .unwrap();
+        assert_eq!(machine.slot_bytes[weak_map_slot], weak_map_before);
+        assert_ledger(&machine);
+
+        let set = construct_builtin(&mut machine, "Set", &[]);
+        let set_slot = slot(&machine, set);
+        let set_before = machine.slot_bytes[set_slot];
+        set_put(&mut machine, set, Value::int32(3), CollectionKind::Set).unwrap();
+        assert_eq!(
+            machine.slot_bytes[set_slot],
+            set_before + CollectionEntry::BYTES
+        );
+        assert_ledger(&machine);
+        map_delete_for(&mut machine, set, &[Value::int32(3)], CollectionKind::Set).unwrap();
+        assert_eq!(machine.slot_bytes[set_slot], set_before);
+        assert_ledger(&machine);
+
+        let weak_set = construct_builtin(&mut machine, "WeakSet", &[]);
+        let weak_set_slot = slot(&machine, weak_set);
+        let weak_set_before = machine.slot_bytes[weak_set_slot];
+        let weak_set_key = object(&mut machine);
+        set_put(
+            &mut machine,
+            weak_set,
+            weak_set_key,
+            CollectionKind::WeakSet,
+        )
+        .unwrap();
+        assert_eq!(
+            machine.slot_bytes[weak_set_slot],
+            weak_set_before + CollectionEntry::BYTES
+        );
+        assert_ledger(&machine);
+        map_delete_for(
+            &mut machine,
+            weak_set,
+            &[weak_set_key],
+            CollectionKind::WeakSet,
+        )
+        .unwrap();
+        assert_eq!(machine.slot_bytes[weak_set_slot], weak_set_before);
+        assert_ledger(&machine);
+
+        map_put(
+            &mut machine,
+            map,
+            Value::int32(4),
+            Value::int32(5),
+            CollectionKind::Map,
+        )
+        .unwrap();
+        map_put(
+            &mut machine,
+            map,
+            Value::int32(6),
+            Value::int32(7),
+            CollectionKind::Map,
+        )
+        .unwrap();
+        map_clear(&mut machine, map, &[], false).unwrap();
+        assert_eq!(machine.slot_bytes[map_slot], map_before);
+        assert_ledger(&machine);
+        map_clear(&mut machine, map, &[], false).unwrap();
+        assert_eq!(machine.slot_bytes[map_slot], map_before);
+        assert_ledger(&machine);
+
+        set_put(&mut machine, set, Value::int32(8), CollectionKind::Set).unwrap();
+        set_put(&mut machine, set, Value::int32(9), CollectionKind::Set).unwrap();
+        set_clear(&mut machine, set, &[], false).unwrap();
+        assert_eq!(machine.slot_bytes[set_slot], set_before);
+        assert_ledger(&machine);
+        set_clear(&mut machine, set, &[], false).unwrap();
+        assert_eq!(machine.slot_bytes[set_slot], set_before);
+        assert_ledger(&machine);
+    }
+
     fn root(machine: &mut Machine<'_, TestHost>, name: &str, value: Value) {
         machine.globals.insert(EcmaString::from_utf8(name), value);
     }
@@ -1988,8 +2152,8 @@ mod tests {
         machine.collect_garbage();
 
         assert!(collection_entries(&machine, weak_map).is_empty());
-        assert!(matches!(machine.runtime_slot(key), Err(_)));
-        assert!(matches!(machine.runtime_slot(value), Err(_)));
+        assert!(machine.runtime_slot(key).is_err());
+        assert!(machine.runtime_slot(value).is_err());
     }
 
     #[test]
@@ -2013,8 +2177,8 @@ mod tests {
         machine.collect_garbage();
 
         assert!(collection_entries(&machine, weak_map).is_empty());
-        assert!(matches!(machine.runtime_slot(symbol), Err(_)));
-        assert!(matches!(machine.runtime_slot(value), Err(_)));
+        assert!(machine.runtime_slot(symbol).is_err());
+        assert!(machine.runtime_slot(value).is_err());
     }
 
     #[test]
