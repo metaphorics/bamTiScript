@@ -681,9 +681,9 @@ fn inspect_internal_dependency(
         member.manifest_path.display()
     );
     for key in attributes.keys() {
-        if !matches!(key.as_str(), "path" | "optional" | "features") {
+        if !matches!(key.as_str(), "path" | "version" | "optional" | "features") {
             return Err(workspace_error(format!(
-                "{context}: internal dependencies may only declare `path`, `optional`, and `features`"
+                "{context}: internal dependencies may only declare `path`, `version`, `optional`, and `features`"
             )));
         }
     }
