@@ -5,6 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bamts_compiler::lower::LowerOptions;
 use bamts_compiler::pipeline::{
@@ -26,6 +27,7 @@ use crate::diagnostics::{self, DiagnosticSource};
 const NODE_STATICLIB: &[u8] = include_bytes!(env!("BAMTS_NODE_STATICLIB"));
 const HOST_TARGET: &str = env!("BAMTS_HOST_TARGET");
 const BUILD_TARGET: &str = env!("BAMTS_BUILD_TARGET");
+static NEXT_CACHE_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// Bytes and process status produced by one successful CLI command.
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -554,37 +556,33 @@ fn cached_node_archive() -> Result<PathBuf, DriverError> {
     if path.is_file() {
         return Ok(path);
     }
-    let temporary = path.with_extension(format!("{extension}.{}.tmp", std::process::id()));
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-    {
-        Ok(mut file) => {
-            write_cached_archive(&mut file, &temporary)?;
-            match fs::rename(&temporary, &path) {
-                Ok(()) => Ok(path),
-                Err(_error) if path.is_file() => {
-                    let _ = fs::remove_file(&temporary);
-                    Ok(path)
-                }
-                Err(source) => Err(DriverError::CacheArchive { path, source }),
-            }
-        }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            if path.is_file() {
-                Ok(path)
-            } else {
-                Err(DriverError::CacheArchive {
+    let (temporary, mut file) = loop {
+        let id = NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let temporary =
+            path.with_extension(format!("{extension}.{}.{}.tmp", std::process::id(), id));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(DriverError::CacheArchive {
                     path: temporary,
-                    source: error,
-                })
+                    source,
+                });
             }
         }
-        Err(source) => Err(DriverError::CacheArchive {
-            path: temporary,
-            source,
-        }),
+    };
+    write_cached_archive(&mut file, &temporary)?;
+    match fs::rename(&temporary, &path) {
+        Ok(()) => Ok(path),
+        Err(_error) if path.is_file() => {
+            let _ = fs::remove_file(&temporary);
+            Ok(path)
+        }
+        Err(source) => Err(DriverError::CacheArchive { path, source }),
     }
 }
 
