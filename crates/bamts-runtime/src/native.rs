@@ -3072,13 +3072,32 @@ mod tests {
                     entry_function(
                         7,
                         vec![
-                            Instruction::LoadGlobal { dst: reg(0), name: cid(1) },
-                            Instruction::LoadConst { dst: reg(2), constant: cid(3) },
-                            Instruction::LoadConst { dst: reg(1), constant: cid(2) },
-                            Instruction::GetProperty { dst: reg(1), object: reg(0), key: reg(1) },
+                            Instruction::LoadGlobal {
+                                dst: reg(0),
+                                name: cid(1),
+                            },
+                            Instruction::LoadConst {
+                                dst: reg(2),
+                                constant: cid(3),
+                            },
+                            Instruction::LoadConst {
+                                dst: reg(1),
+                                constant: cid(2),
+                            },
+                            Instruction::GetProperty {
+                                dst: reg(1),
+                                object: reg(0),
+                                key: reg(1),
+                            },
                             Instruction::CreateArray { dst: reg(3) },
-                            Instruction::ArrayPush { array: reg(3), value: reg(2) },
-                            Instruction::LoadConst { dst: reg(4), constant: cid(7) },
+                            Instruction::ArrayPush {
+                                array: reg(3),
+                                value: reg(2),
+                            },
+                            Instruction::LoadConst {
+                                dst: reg(4),
+                                constant: cid(7),
+                            },
                             Instruction::Call {
                                 dst: reg(5),
                                 callee: reg(1),
@@ -3091,17 +3110,29 @@ mod tests {
                                 function: FunctionId::new(1),
                                 captures: reg(3),
                             },
-                            Instruction::LoadGlobal { dst: reg(6), name: cid(5) },
+                            Instruction::LoadGlobal {
+                                dst: reg(6),
+                                name: cid(5),
+                            },
                             Instruction::CreateArray { dst: reg(3) },
-                            Instruction::ArrayPush { array: reg(3), value: reg(1) },
-                            Instruction::LoadConst { dst: reg(4), constant: cid(7) },
+                            Instruction::ArrayPush {
+                                array: reg(3),
+                                value: reg(1),
+                            },
+                            Instruction::LoadConst {
+                                dst: reg(4),
+                                constant: cid(7),
+                            },
                             Instruction::Call {
                                 dst: reg(5),
                                 callee: reg(6),
                                 this_value: reg(4),
                                 arguments: reg(3),
                             },
-                            Instruction::LoadConst { dst: reg(0), constant: cid(6) },
+                            Instruction::LoadConst {
+                                dst: reg(0),
+                                constant: cid(6),
+                            },
                             Instruction::Return { value: reg(0) },
                         ],
                     ),
@@ -3146,13 +3177,32 @@ mod tests {
             0,
             4,
             vec![
-                Instruction::LoadGlobal { dst: reg(0), name: cid(1) },
-                Instruction::LoadConst { dst: reg(2), constant: cid(4) },
-                Instruction::LoadConst { dst: reg(1), constant: cid(2) },
-                Instruction::GetProperty { dst: reg(1), object: reg(0), key: reg(1) },
+                Instruction::LoadGlobal {
+                    dst: reg(0),
+                    name: cid(1),
+                },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(4),
+                },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(2),
+                },
+                Instruction::GetProperty {
+                    dst: reg(1),
+                    object: reg(0),
+                    key: reg(1),
+                },
                 Instruction::CreateArray { dst: reg(3) },
-                Instruction::ArrayPush { array: reg(3), value: reg(2) },
-                Instruction::LoadConst { dst: reg(0), constant: cid(7) },
+                Instruction::ArrayPush {
+                    array: reg(3),
+                    value: reg(2),
+                },
+                Instruction::LoadConst {
+                    dst: reg(0),
+                    constant: cid(7),
+                },
                 Instruction::Call {
                     dst: reg(2),
                     callee: reg(1),
@@ -3217,7 +3267,10 @@ mod tests {
             0,
             1,
             vec![
-                Instruction::LoadConst { dst: reg(0), constant: cid(6) },
+                Instruction::LoadConst {
+                    dst: reg(0),
+                    constant: cid(6),
+                },
                 Instruction::Throw { value: reg(0) },
             ],
         ));
@@ -3233,9 +3286,10 @@ mod tests {
         assert_eq!(thrown, Value::int32(42));
 
         let mut native_host = SilentHost;
-        let native_err = NativeEngine::new(&program, &NoEntries, &mut native_host, Limits::default())
-            .run()
-            .expect_err("reference native surfaces the uncaught callback");
+        let native_err =
+            NativeEngine::new(&program, &NoEntries, &mut native_host, Limits::default())
+                .run()
+                .expect_err("reference native surfaces the uncaught callback");
         assert_eq!(native_err.kind, interpreter_err.kind);
 
         let mut linked_host = SilentHost;
@@ -3257,7 +3311,8 @@ mod tests {
                 .expect_err("linked native surfaces the uncaught callback")
         };
         match linked_err {
-            NativeError::Runtime(RuntimeError { ref kind, .. }) if *kind == interpreter_err.kind => {}
+            NativeError::Runtime(RuntimeError { ref kind, .. })
+                if *kind == interpreter_err.kind => {}
             other => panic!("linked mapped the callback throw: {other:?}"),
         }
     }

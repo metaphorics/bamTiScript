@@ -786,6 +786,13 @@ pub struct TimerRun {
     pub uncaught: Vec<CallbackException>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimerWait {
+    Ready,
+    Stale,
+    Idle,
+}
+
 #[derive(Clone, Debug)]
 enum HeapEntry {
     String(EcmaString),
@@ -1501,27 +1508,36 @@ impl<'a, H: Host> Machine<'a, H> {
     /// Blocks in the host provider until an expiry report is available.
     /// Returns whether at least one live timer became ready.
     pub fn wait_for_timer_expiry(&mut self) -> Result<bool, RuntimeError> {
+        Ok(self.wait_for_timer_expiry_state()? == TimerWait::Ready)
+    }
+
+    fn wait_for_timer_expiry_state(&mut self) -> Result<TimerWait, RuntimeError> {
         if self.timer_checkpoint_active {
             return Err(self.checkpoint_error(RuntimeErrorKind::TimerCheckpointReentry));
         }
         if !self.ready_timers.is_empty() {
-            return Ok(true);
+            return Ok(TimerWait::Ready);
         }
         self.timer_checkpoint_active = true;
         let result = (|| {
             let wakeup = match self.host.timers() {
                 Some(provider) => provider.wait_expired(),
-                None => return Ok(false),
+                None => return Ok(TimerWait::Idle),
             }
             .map_err(|error| {
                 self.checkpoint_error(RuntimeErrorKind::TimerProviderFailure {
                     message: error.to_string(),
                 })
             })?;
-            if let Some(wakeup) = wakeup {
-                self.promote_timer_wakeup(wakeup);
-            }
-            Ok(!self.ready_timers.is_empty())
+            let Some(wakeup) = wakeup else {
+                return Ok(TimerWait::Idle);
+            };
+            self.promote_timer_wakeup(wakeup);
+            Ok(if self.ready_timers.is_empty() {
+                TimerWait::Stale
+            } else {
+                TimerWait::Ready
+            })
         })();
         self.timer_checkpoint_active = false;
         result
@@ -1546,25 +1562,23 @@ impl<'a, H: Host> Machine<'a, H> {
     /// pending. Promise handler throws settle their derived promises and never
     /// abort the loop. Fatal runtime failures propagate unchanged.
     ///
-    /// A false wait retries only while the host still exposes the timer
-    /// capability and the provider reports an armed timer; otherwise the loop
-    /// fails with [`RuntimeErrorKind::TimerProviderFailure`] instead of
-    /// spinning. Existing fuel is the only work bound: recursive jobs or
-    /// timers eventually fail with [`RuntimeErrorKind::FuelExhausted`].
-    pub fn run_to_quiescence(&mut self) -> Result<(), RuntimeError> {
+    /// A stale report retries. A missing report or timer capability while a
+    /// machine timer remains fails with [`RuntimeErrorKind::TimerProviderFailure`]
+    /// instead of spinning. Existing fuel bounds recursive jobs and timers;
+    /// exhausted work fails with [`RuntimeErrorKind::FuelExhausted`].
+    pub(crate) fn run_to_quiescence(&mut self) -> Result<(), RuntimeError> {
         self.drain_microtasks_automatic()?;
         while self.has_pending_timers() {
-            if !self.wait_for_timer_expiry()? {
-                let retry = self
-                    .host
-                    .timers()
-                    .is_some_and(|provider| provider.has_pending());
-                if !retry {
-                    return Err(self.checkpoint_error(RuntimeErrorKind::TimerProviderFailure {
-                        message: "the timer provider lost a live machine timer".to_owned(),
-                    }));
+            match self.wait_for_timer_expiry_state()? {
+                TimerWait::Ready => {}
+                TimerWait::Stale => continue,
+                TimerWait::Idle => {
+                    return Err(
+                        self.checkpoint_error(RuntimeErrorKind::TimerProviderFailure {
+                            message: "the timer provider lost a live machine timer".to_owned(),
+                        }),
+                    );
                 }
-                continue;
             }
             let run = self.run_one_expired_timer()?;
             if let Some(exception) = run.uncaught.into_iter().next() {
@@ -14347,6 +14361,7 @@ mod tests {
         reports: std::collections::VecDeque<TimerWakeup>,
         scheduled: Vec<(u64, u32)>,
         cancelled: Vec<u64>,
+        auto_report: bool,
         fail_schedule: bool,
         fail_poll: bool,
     }
@@ -14365,6 +14380,12 @@ mod tests {
             }
             let deadline = u64::from(delay_ms);
             state.live.insert(id, deadline);
+            if state.auto_report {
+                state.reports.push_back(TimerWakeup {
+                    id,
+                    deadline_ms: deadline,
+                });
+            }
             Ok(deadline)
         }
 
@@ -14517,6 +14538,22 @@ mod tests {
             .expect("test installs nested callback");
         let set_timeout = set_timeout_global(machine);
         machine.call_value(set_timeout, Value::UNDEFINED, &[callback, Value::int32(1)])?;
+        Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+    }
+
+    fn schedule_recursive_timer(
+        machine: &mut Machine<'_, TimerTestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let callback = machine
+            .globals
+            .get(&EcmaString::from_utf8("recursiveTimerCallback"))
+            .copied()
+            .expect("test installs recursive timer callback");
+        let set_timeout = set_timeout_global(machine);
+        machine.call_value(set_timeout, Value::UNDEFINED, &[callback, Value::int32(0)])?;
         Ok(BuiltinOutcome::Value(Value::UNDEFINED))
     }
 
@@ -15010,10 +15047,10 @@ mod tests {
         verified(
             vec![
                 Constant::String(EcmaString::from_utf8("order")), // 0
-                Constant::Int32(1),                                // 1
-                Constant::Int32(2),                                // 2
-                Constant::Int32(3),                                // 3
-                Constant::Int32(4),                                // 4
+                Constant::Int32(1),                               // 1
+                Constant::Int32(2),                               // 2
+                Constant::Int32(3),                               // 3
+                Constant::Int32(4),                               // 4
                 Constant::String(EcmaString::from_utf8("queueMicrotask")), // 5
                 Constant::String(EcmaString::from_utf8("job")),   // 6
                 Constant::Undefined,                              // 7
@@ -15279,7 +15316,6 @@ mod tests {
         schedule_global_job(machine, "nestedCallback")
     }
 
-
     #[test]
     fn automatic_loop_leaves_an_idle_machine_untouched() {
         let program = timer_program();
@@ -15338,9 +15374,7 @@ mod tests {
         let first = timer_fn(&mut machine, 1); // pushes 1, queues "job"
         let second = timer_fn(&mut machine, 2); // pushes 2
         let third = timer_fn(&mut machine, 3); // pushes 3
-        machine
-            .globals
-            .insert(EcmaString::from_utf8("job"), third);
+        machine.globals.insert(EcmaString::from_utf8("job"), third);
         let queue = machine.intrinsics.global("queueMicrotask").unwrap();
         machine
             .call_value(queue, Value::UNDEFINED, &[first])
@@ -15412,17 +15446,10 @@ mod tests {
             .insert(EcmaString::from_utf8("nestedCallback"), nested);
         let creator = timer_native(&mut machine, "schedule nested", schedule_nested_timer);
         let set_timeout = set_timeout_global(&machine);
+        shared.borrow_mut().auto_report = true;
         machine
             .call_value(set_timeout, Value::UNDEFINED, &[creator, Value::int32(1)])
             .unwrap();
-        shared.borrow_mut().reports.push_back(TimerWakeup {
-            id: 1,
-            deadline_ms: 1,
-        });
-        shared.borrow_mut().reports.push_back(TimerWakeup {
-            id: 2,
-            deadline_ms: 1,
-        });
 
         machine.run_to_quiescence().unwrap();
         assert_eq!(read_global(&machine, "b"), Some(Value::int32(1)));
@@ -15465,7 +15492,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_loop_fails_with_typed_error_when_provider_loses_a_live_timer() {
+    fn automatic_loop_rejects_an_empty_wait_while_a_timer_is_live() {
         let program = timer_program();
         let mut host = TimerTestHost::default();
         let shared = host.provider.state.clone();
@@ -15477,8 +15504,7 @@ mod tests {
         machine
             .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(5)])
             .unwrap();
-        // Simulate the provider losing the armed timer without reporting it.
-        shared.borrow_mut().live.remove(&1);
+        // A broken nonblocking provider returns no report for an armed timer.
 
         let error = machine.run_to_quiescence().unwrap_err();
         assert!(matches!(
@@ -15487,6 +15513,7 @@ mod tests {
         ));
         // The machine-owned live record and flags survive the failure.
         assert!(machine.has_pending_timers());
+        assert!(shared.borrow().live.contains_key(&1));
         assert!(!machine.microtask_drain_active);
         assert!(!machine.timer_checkpoint_active);
     }
@@ -15531,9 +15558,10 @@ mod tests {
         machine.frames.clear();
         machine.live_registers = 0;
         let suppressed_microtask = timer_fn(&mut machine, 2); // stores b = 1
-        machine
-            .globals
-            .insert(EcmaString::from_utf8("nestedCallback"), suppressed_microtask);
+        machine.globals.insert(
+            EcmaString::from_utf8("nestedCallback"),
+            suppressed_microtask,
+        );
         let thrower = timer_native(&mut machine, "queue then throw", queue_job_then_throw);
         let later_timer = timer_fn(&mut machine, 1); // stores a = 1
         let set_timeout = set_timeout_global(&machine);
@@ -15541,7 +15569,11 @@ mod tests {
             .call_value(set_timeout, Value::UNDEFINED, &[thrower, Value::int32(1)])
             .unwrap();
         machine
-            .call_value(set_timeout, Value::UNDEFINED, &[later_timer, Value::int32(2)])
+            .call_value(
+                set_timeout,
+                Value::UNDEFINED,
+                &[later_timer, Value::int32(2)],
+            )
             .unwrap();
         shared.borrow_mut().reports.push_back(TimerWakeup {
             id: 1,
@@ -15641,13 +15673,36 @@ mod tests {
         machine.fuel = 16;
 
         let error = machine.run_to_quiescence().unwrap_err();
-        assert!(matches!(
-            error.kind,
-            RuntimeErrorKind::FuelExhausted { .. }
-        ));
+        assert!(matches!(error.kind, RuntimeErrorKind::FuelExhausted { .. }));
         // Recursive work never reaches quiescence; fuel was fully spent.
         assert_eq!(machine.fuel, 0);
         assert!(!machine.microtask_drain_active);
+    }
+
+    #[test]
+    fn recursive_timer_work_reaches_existing_fuel() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        shared.borrow_mut().auto_report = true;
+        let respawn = timer_native(&mut machine, "respawn timer", schedule_recursive_timer);
+        machine
+            .globals
+            .insert(EcmaString::from_utf8("recursiveTimerCallback"), respawn);
+        let set_timeout = set_timeout_global(&machine);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[respawn, Value::int32(0)])
+            .unwrap();
+        machine.fuel = 16;
+
+        let error = machine.run_to_quiescence().unwrap_err();
+        assert!(matches!(error.kind, RuntimeErrorKind::FuelExhausted { .. }));
+        assert_eq!(machine.fuel, 0);
+        assert!(machine.has_pending_timers());
+        assert!(!machine.timer_checkpoint_active);
     }
 
     #[test]

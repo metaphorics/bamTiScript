@@ -919,8 +919,7 @@ mod tests {
             }, 2);
         "#;
         let (directory, entrypoint) = script_fixture("uncaught-timer", source)?;
-        let error = run_program(&entrypoint)
-            .expect_err("an uncaught timer callback fails the run");
+        let error = run_program(&entrypoint).expect_err("an uncaught timer callback fails the run");
         let super::Error::Runtime(runtime) = error else {
             panic!("expected a runtime error, got {error:?}");
         };
