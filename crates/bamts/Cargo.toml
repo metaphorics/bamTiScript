@@ -1,8 +1,12 @@
 [package]
 name = "bamts"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "BamTS compiler and runtime framework"
 
 [features]
 default = []
@@ -11,11 +15,11 @@ host-jit = ["dep:bamts-codegen", "bamts-codegen/host-jit"]
 node-host = ["dep:bamts-node", "bamts-node/node-host", "bamts-node/script-compiler"]
 
 [dependencies]
-bamts-bytecode = { path = "../bamts-bytecode" }
-bamts-codegen = { path = "../bamts-codegen", optional = true }
-bamts-compiler = { path = "../bamts-compiler" }
-bamts-node = { path = "../bamts-node", optional = true }
-bamts-runtime = { path = "../bamts-runtime" }
+bamts-bytecode = { path = "../bamts-bytecode", version = "0.1.0" }
+bamts-codegen = { path = "../bamts-codegen", version = "0.1.0", optional = true }
+bamts-compiler = { path = "../bamts-compiler", version = "0.1.0" }
+bamts-node = { path = "../bamts-node", version = "0.1.0", optional = true }
+bamts-runtime = { path = "../bamts-runtime", version = "0.1.2" }
 
 [lints]
 workspace = true

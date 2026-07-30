@@ -1,17 +1,21 @@
 [package]
 name = "bamts-verification"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Verification and compliance test suite for BamTS"
 
 [dependencies]
-bamts-bytecode = { path = "../bamts-bytecode" }
-bamts-cli = { path = "../bamts-cli" }
-bamts-codegen = { path = "../bamts-codegen" }
-bamts-compiler = { path = "../bamts-compiler" }
-bamts-native = { path = "../bamts-native" }
-bamts-node = { path = "../bamts-node" }
-bamts-runtime = { path = "../bamts-runtime" }
+bamts-bytecode = { path = "../bamts-bytecode", version = "0.1.0" }
+bamts-cli = { path = "../bamts-cli", version = "0.1.0" }
+bamts-codegen = { path = "../bamts-codegen", version = "0.1.0" }
+bamts-compiler = { path = "../bamts-compiler", version = "0.1.0" }
+bamts-native = { path = "../bamts-native", version = "0.1.0" }
+bamts-node = { path = "../bamts-node", version = "0.1.0" }
+bamts-runtime = { path = "../bamts-runtime", version = "0.1.2" }
 anyhow = "=1.0.104"
 quint-connect = "=0.1.2"
 serde = { version = "=1.0.229", features = ["derive"] }

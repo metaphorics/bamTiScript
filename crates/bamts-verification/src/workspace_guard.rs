@@ -148,7 +148,7 @@ fn validate_root_manifest(manifest: &Value) -> Result<()> {
         "1.97.1",
         "root [workspace.package]",
     )?;
-    require_exact_bool(package, "publish", false, "root [workspace.package]")?;
+    require_exact_bool(package, "publish", true, "root [workspace.package]")?;
 
     let lints = required_table(workspace, "lints", "root [workspace]")?;
     let rust = required_table(lints, "rust", "root [workspace.lints]")?;
@@ -1292,7 +1292,7 @@ resolver = "3"
 [workspace.package]
 edition = "2024"
 rust-version = "1.97.1"
-publish = false
+publish = true
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

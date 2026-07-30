@@ -753,6 +753,12 @@ pub(crate) enum MicrotaskJob {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MicrotaskExceptionPolicy {
+    CollectAndContinue,
+    StopAtFirst,
+}
+
 /// An exception reported by a microtask or timer callback.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CallbackException {
@@ -1393,8 +1399,15 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
+    /// Evaluates the program, drives the automatic event loop to quiescence,
+    /// and returns the synchronous [`Execution`] snapshot taken right after
+    /// evaluation. Callbacks may mutate globals and append host output, but
+    /// the returned value and entry register snapshot stay those of the
+    /// synchronous evaluation.
     pub fn run(mut self) -> Result<Execution, RuntimeError> {
-        self.evaluate()
+        let execution = self.evaluate()?;
+        self.run_to_quiescence()?;
+        Ok(execution)
     }
 
     /// Evaluates the program without draining queued microtasks.
@@ -1518,6 +1531,51 @@ impl<'a, H: Host> Machine<'a, H> {
     #[must_use]
     pub fn has_pending_timers(&self) -> bool {
         !self.timers.is_empty()
+    }
+
+    /// Drives the automatic event loop to quiescence after synchronous
+    /// evaluation.
+    ///
+    /// Drains every queued microtask first. While a live machine timer
+    /// remains, waits for one deadline to become ready, runs exactly one
+    /// timer callback, and drains microtasks again. A timer created by a
+    /// callback therefore waits for a later timer turn. The first uncaught
+    /// `queueMicrotask` or timer callback exception stops the loop and becomes
+    /// [`RuntimeErrorKind::UncaughtThrow`]; a timer exception is converted
+    /// before any later drain, so its queued microtasks and later timers stay
+    /// pending. Promise handler throws settle their derived promises and never
+    /// abort the loop. Fatal runtime failures propagate unchanged.
+    ///
+    /// A false wait retries only while the host still exposes the timer
+    /// capability and the provider reports an armed timer; otherwise the loop
+    /// fails with [`RuntimeErrorKind::TimerProviderFailure`] instead of
+    /// spinning. Existing fuel is the only work bound: recursive jobs or
+    /// timers eventually fail with [`RuntimeErrorKind::FuelExhausted`].
+    pub fn run_to_quiescence(&mut self) -> Result<(), RuntimeError> {
+        self.drain_microtasks_automatic()?;
+        while self.has_pending_timers() {
+            if !self.wait_for_timer_expiry()? {
+                let retry = self
+                    .host
+                    .timers()
+                    .is_some_and(|provider| provider.has_pending());
+                if !retry {
+                    return Err(self.checkpoint_error(RuntimeErrorKind::TimerProviderFailure {
+                        message: "the timer provider lost a live machine timer".to_owned(),
+                    }));
+                }
+                continue;
+            }
+            let run = self.run_one_expired_timer()?;
+            if let Some(exception) = run.uncaught.into_iter().next() {
+                return Err(self.checkpoint_error(RuntimeErrorKind::UncaughtThrow {
+                    value: exception.value,
+                    origin: exception.origin,
+                }));
+            }
+            self.drain_microtasks_automatic()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn schedule_timeout(
@@ -1672,6 +1730,34 @@ impl<'a, H: Host> Machine<'a, H> {
     /// throws settle their derived promises. Throws from `queueMicrotask`
     /// callbacks are returned in [`MicrotaskDrain::uncaught`].
     pub fn drain_microtasks(&mut self) -> Result<MicrotaskDrain, RuntimeError> {
+        self.drain_microtasks_core(MicrotaskExceptionPolicy::CollectAndContinue)
+    }
+
+    /// Automatic drain for the event loop: the first uncaught `queueMicrotask`
+    /// callback exception stops the checkpoint and becomes
+    /// [`RuntimeErrorKind::UncaughtThrow`], leaving later jobs queued. All
+    /// other semantics match the public manual checkpoint.
+    fn drain_microtasks_automatic(&mut self) -> Result<(), RuntimeError> {
+        let report = self.drain_microtasks_core(MicrotaskExceptionPolicy::StopAtFirst)?;
+        let Some(exception) = report.uncaught.into_iter().next() else {
+            return Ok(());
+        };
+        Err(self.checkpoint_error(RuntimeErrorKind::UncaughtThrow {
+            value: exception.value,
+            origin: exception.origin,
+        }))
+    }
+
+    /// Shared microtask checkpoint. Both drains share the reentry guard,
+    /// fuel-before-pop charging, FIFO execution, Promise reaction semantics,
+    /// fatal-error propagation, and flag cleanup. Manual drains collect every
+    /// callback exception and continue; automatic drains stop after the first,
+    /// leaving the rest of the queue untouched. The exceptionless path performs
+    /// no allocation.
+    fn drain_microtasks_core(
+        &mut self,
+        exception_policy: MicrotaskExceptionPolicy,
+    ) -> Result<MicrotaskDrain, RuntimeError> {
         if self.microtask_drain_active {
             return Err(self.checkpoint_error(RuntimeErrorKind::MicrotaskDrainReentry));
         }
@@ -1686,8 +1772,21 @@ impl<'a, H: Host> Machine<'a, H> {
                     .pop_front()
                     .expect("the queued microtask remains present after fuel charging");
                 report.executed = report.executed.saturating_add(1);
-                self.execute_microtask_job(job, &mut report)
-                    .map_err(|kind| self.checkpoint_error(kind))?;
+                let Some(exception) = self
+                    .execute_microtask_job(job)
+                    .map_err(|kind| self.checkpoint_error(kind))?
+                else {
+                    continue;
+                };
+                report.uncaught.try_reserve(1).map_err(|_| {
+                    self.checkpoint_error(RuntimeErrorKind::HeapByteLimitExceeded {
+                        limit: self.limits.max_heap_bytes,
+                    })
+                })?;
+                report.uncaught.push(exception);
+                if exception_policy == MicrotaskExceptionPolicy::StopAtFirst {
+                    break;
+                }
             }
             Ok(report)
         })();
@@ -1713,35 +1812,39 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
+    /// Runs one popped microtask job. Promise reaction and thenable jobs
+    /// settle their derived promises and never surface a callback exception;
+    /// a `queueMicrotask` callback throw is classified and returned for the
+    /// checkpoint to collect or stop on.
     fn execute_microtask_job(
         &mut self,
         job: MicrotaskJob,
-        report: &mut MicrotaskDrain,
-    ) -> Result<(), RuntimeErrorKind> {
+    ) -> Result<Option<CallbackException>, RuntimeErrorKind> {
         match job {
             MicrotaskJob::Reaction {
                 reaction,
                 value,
                 origin,
-            } => self.execute_promise_reaction(reaction, value, origin),
+            } => self
+                .execute_promise_reaction(reaction, value, origin)
+                .map(|()| None),
             MicrotaskJob::Thenable {
                 promise,
                 thenable,
                 then,
-            } => self.execute_thenable_job(promise, thenable, then),
-            MicrotaskJob::Callback { callback } => {
-                self.execute_callback_microtask(callback, report)
-            }
+            } => self
+                .execute_thenable_job(promise, thenable, then)
+                .map(|()| None),
+            MicrotaskJob::Callback { callback } => self.execute_callback_microtask(callback),
         }
     }
 
     fn execute_callback_microtask(
         &mut self,
         callback: Value,
-        report: &mut MicrotaskDrain,
-    ) -> Result<(), RuntimeErrorKind> {
+    ) -> Result<Option<CallbackException>, RuntimeErrorKind> {
         match self.call_value(callback, Value::UNDEFINED, &[]) {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(None),
             Err(EvalFailure::Runtime(kind)) => Err(kind),
             Err(failure) => {
                 let (value, origin) =
@@ -1750,13 +1853,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             EvalFailure::Runtime(kind) => kind,
                             _ => RuntimeErrorKind::InvalidValue { value: callback },
                         })?;
-                report.uncaught.try_reserve(1).map_err(|_| {
-                    RuntimeErrorKind::HeapByteLimitExceeded {
-                        limit: self.limits.max_heap_bytes,
-                    }
-                })?;
-                report.uncaught.push(CallbackException { value, origin });
-                Ok(())
+                Ok(Some(CallbackException { value, origin }))
             }
         }
     }
@@ -14901,5 +14998,692 @@ mod tests {
         assert!(machine.wait_for_timer_expiry().unwrap());
         assert_eq!(machine.run_one_expired_timer().unwrap().executed, 1);
         assert_eq!(read_global(&machine, "a"), Some(Value::int32(1)));
+    }
+
+    // ---- automatic event loop ---------------------------------------------
+
+    /// A program whose entry queues the global `"job"` microtask, with helper
+    /// functions that push a marker onto the global `"order"` array. Function 1
+    /// also queues `"job"` so a microtask can be created during a drain or a
+    /// timer turn. The entry function is only exercised by `evaluate`.
+    fn loop_test_program() -> Program<Verified> {
+        verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("order")), // 0
+                Constant::Int32(1),                                // 1
+                Constant::Int32(2),                                // 2
+                Constant::Int32(3),                                // 3
+                Constant::Int32(4),                                // 4
+                Constant::String(EcmaString::from_utf8("queueMicrotask")), // 5
+                Constant::String(EcmaString::from_utf8("job")),   // 6
+                Constant::Undefined,                              // 7
+            ],
+            vec![
+                function(
+                    0,
+                    7,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(5),
+                        },
+                        Instruction::LoadGlobal {
+                            dst: reg(1),
+                            name: cid(6),
+                        },
+                        Instruction::CreateArray { dst: reg(2) },
+                        Instruction::ArrayPush {
+                            array: reg(2),
+                            value: reg(1),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(3),
+                            constant: cid(7),
+                        },
+                        Instruction::Call {
+                            dst: reg(4),
+                            callee: reg(0),
+                            this_value: reg(3),
+                            arguments: reg(2),
+                        },
+                        Instruction::Return { value: reg(3) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    7,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(1),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(0),
+                            value: reg(1),
+                        },
+                        Instruction::LoadGlobal {
+                            dst: reg(2),
+                            name: cid(5),
+                        },
+                        Instruction::LoadGlobal {
+                            dst: reg(3),
+                            name: cid(6),
+                        },
+                        Instruction::CreateArray { dst: reg(4) },
+                        Instruction::ArrayPush {
+                            array: reg(4),
+                            value: reg(3),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(5),
+                            constant: cid(7),
+                        },
+                        Instruction::Call {
+                            dst: reg(6),
+                            callee: reg(2),
+                            this_value: reg(5),
+                            arguments: reg(4),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(2),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(0),
+                            value: reg(1),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(3),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(0),
+                            value: reg(1),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(4),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(0),
+                            value: reg(1),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        )
+    }
+
+    fn promise_throw_program() -> Program<Verified> {
+        verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("resolve")), // 0
+                Constant::String(EcmaString::from_utf8("reject")),  // 1
+                Constant::String(EcmaString::from_utf8("observed")), // 2
+                Constant::Int32(7),                                 // 3
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    2,
+                    2,
+                    vec![
+                        Instruction::StoreGlobal {
+                            name: cid(0),
+                            value: reg(0),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(1),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    1,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(3),
+                        },
+                        Instruction::Throw { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    1,
+                    1,
+                    vec![
+                        Instruction::StoreGlobal {
+                            name: cid(2),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        )
+    }
+
+    fn install_order_array(machine: &mut Machine<'_, TimerTestHost>) -> Value {
+        let order = machine
+            .allocate(HeapEntry::Array {
+                elements: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.array_prototype),
+                extensible: true,
+                length_writable: true,
+            })
+            .unwrap();
+        machine
+            .globals
+            .insert(EcmaString::from_utf8("order"), order);
+        order
+    }
+
+    fn order_markers(machine: &Machine<'_, TimerTestHost>) -> Vec<Value> {
+        let order = machine
+            .globals
+            .get(&EcmaString::from_utf8("order"))
+            .copied()
+            .expect("order array is installed");
+        let index = machine
+            .runtime_slot(order)
+            .expect("order resolves")
+            .expect("order is a heap value");
+        let HeapEntry::Array { elements, .. } = &machine.heap[index] else {
+            panic!("order remains an array");
+        };
+        elements.clone()
+    }
+
+    fn schedule_global_job(
+        machine: &mut Machine<'_, TimerTestHost>,
+        global: &str,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let job = machine
+            .globals
+            .get(&EcmaString::from_utf8(global))
+            .copied()
+            .unwrap_or_else(|| panic!("test installs the {global} job"));
+        let queue = machine
+            .intrinsics
+            .global("queueMicrotask")
+            .expect("queueMicrotask is installed");
+        machine.call_value(queue, Value::UNDEFINED, &[job])?;
+        Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+    }
+
+    fn queue_job_then_throw(
+        machine: &mut Machine<'_, TimerTestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        schedule_global_job(machine, "nestedCallback")?;
+        Err(EvalFailure::ThrowValue(Value::int32(7)))
+    }
+
+    fn respawn_job(
+        machine: &mut Machine<'_, TimerTestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        schedule_global_job(machine, "nestedCallback")
+    }
+
+
+    #[test]
+    fn automatic_loop_leaves_an_idle_machine_untouched() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let fuel = machine.fuel;
+        machine.run_to_quiescence().unwrap();
+        assert_eq!(machine.fuel, fuel);
+        assert!(machine.microtasks.is_empty());
+        assert!(!machine.has_pending_timers());
+        assert!(!machine.microtask_drain_active);
+        assert!(!machine.timer_checkpoint_active);
+    }
+
+    #[test]
+    fn run_returns_the_synchronous_execution_snapshot() {
+        let program = loop_test_program();
+        let mut host = TimerTestHost::default();
+        let mut first = Machine::new(&program, &mut host, Limits::default());
+        first.frames.clear();
+        first.live_registers = 0;
+        install_order_array(&mut first);
+        first
+            .globals
+            .insert(EcmaString::from_utf8("job"), timer_fn(&mut first, 2));
+        let snapshot = first.evaluate().unwrap();
+        assert!(order_markers(&first).is_empty());
+        first.run_to_quiescence().unwrap();
+        assert_eq!(order_markers(&first), vec![Value::int32(2)]);
+        drop(first);
+
+        let mut host = TimerTestHost::default();
+        let mut second = Machine::new(&program, &mut host, Limits::default());
+        second.frames.clear();
+        second.live_registers = 0;
+        install_order_array(&mut second);
+        second
+            .globals
+            .insert(EcmaString::from_utf8("job"), timer_fn(&mut second, 2));
+        let execution = second.run().unwrap();
+        assert_eq!(execution, snapshot);
+    }
+
+    #[test]
+    fn automatic_loop_drains_nested_microtasks_in_fifo_order() {
+        let program = loop_test_program();
+        let mut host = TimerTestHost::default();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        install_order_array(&mut machine);
+        let first = timer_fn(&mut machine, 1); // pushes 1, queues "job"
+        let second = timer_fn(&mut machine, 2); // pushes 2
+        let third = timer_fn(&mut machine, 3); // pushes 3
+        machine
+            .globals
+            .insert(EcmaString::from_utf8("job"), third);
+        let queue = machine.intrinsics.global("queueMicrotask").unwrap();
+        machine
+            .call_value(queue, Value::UNDEFINED, &[first])
+            .unwrap();
+        machine
+            .call_value(queue, Value::UNDEFINED, &[second])
+            .unwrap();
+
+        machine.run_to_quiescence().unwrap();
+        assert_eq!(
+            order_markers(&machine),
+            vec![Value::int32(1), Value::int32(2), Value::int32(3)]
+        );
+        assert!(machine.microtasks.is_empty());
+    }
+
+    #[test]
+    fn automatic_loop_runs_two_timers_with_a_full_drain_between_turns() {
+        let program = loop_test_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        install_order_array(&mut machine);
+        let first = timer_fn(&mut machine, 1); // pushes 1, queues "job"
+        let second = timer_fn(&mut machine, 3); // pushes 3
+        let microtask = timer_fn(&mut machine, 2); // pushes 2
+        machine
+            .globals
+            .insert(EcmaString::from_utf8("job"), microtask);
+        let set_timeout = set_timeout_global(&machine);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[first, Value::int32(5)])
+            .unwrap();
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[second, Value::int32(5)])
+            .unwrap();
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 5,
+        });
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 2,
+            deadline_ms: 5,
+        });
+
+        machine.run_to_quiescence().unwrap();
+        // The first timer's microtask (2) runs before the second timer (3).
+        assert_eq!(
+            order_markers(&machine),
+            vec![Value::int32(1), Value::int32(2), Value::int32(3)]
+        );
+        assert!(machine.microtasks.is_empty());
+        assert!(!machine.has_pending_timers());
+    }
+
+    #[test]
+    fn automatic_loop_runs_a_timer_created_timer_in_a_later_turn() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let nested = timer_fn(&mut machine, 2);
+        machine
+            .globals
+            .insert(EcmaString::from_utf8("nestedCallback"), nested);
+        let creator = timer_native(&mut machine, "schedule nested", schedule_nested_timer);
+        let set_timeout = set_timeout_global(&machine);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[creator, Value::int32(1)])
+            .unwrap();
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 1,
+        });
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 2,
+            deadline_ms: 1,
+        });
+
+        machine.run_to_quiescence().unwrap();
+        assert_eq!(read_global(&machine, "b"), Some(Value::int32(1)));
+        assert!(!machine.has_pending_timers());
+        assert!(machine.microtasks.is_empty());
+    }
+
+    #[test]
+    fn automatic_loop_ignores_stale_and_premature_reports_until_real_expiry() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let a = timer_fn(&mut machine, 1);
+        let set_timeout = set_timeout_global(&machine);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(50)])
+            .unwrap();
+        // A stale wakeup for an unknown id must not terminate the loop.
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 999,
+            deadline_ms: 10,
+        });
+        // A premature wakeup for the live timer cannot fire it before its deadline.
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 10,
+        });
+        // The real expiry report finally fires the callback.
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 50,
+        });
+
+        machine.run_to_quiescence().unwrap();
+        assert_eq!(read_global(&machine, "a"), Some(Value::int32(1)));
+        assert!(!machine.has_pending_timers());
+    }
+
+    #[test]
+    fn automatic_loop_fails_with_typed_error_when_provider_loses_a_live_timer() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let a = timer_fn(&mut machine, 1);
+        let set_timeout = set_timeout_global(&machine);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(5)])
+            .unwrap();
+        // Simulate the provider losing the armed timer without reporting it.
+        shared.borrow_mut().live.remove(&1);
+
+        let error = machine.run_to_quiescence().unwrap_err();
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::TimerProviderFailure { .. }
+        ));
+        // The machine-owned live record and flags survive the failure.
+        assert!(machine.has_pending_timers());
+        assert!(!machine.microtask_drain_active);
+        assert!(!machine.timer_checkpoint_active);
+    }
+
+    #[test]
+    fn automatic_loop_maps_the_first_uncaught_microtask_throw_and_stops() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let throwing = timer_fn(&mut machine, 4); // throws 7
+        let observer = timer_fn(&mut machine, 1); // stores a = 1
+        let queue = machine.intrinsics.global("queueMicrotask").unwrap();
+        machine
+            .call_value(queue, Value::UNDEFINED, &[throwing])
+            .unwrap();
+        machine
+            .call_value(queue, Value::UNDEFINED, &[observer])
+            .unwrap();
+
+        let error = machine.run_to_quiescence().unwrap_err();
+        assert_eq!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                value: Value::int32(7),
+                origin: ThrowOrigin::Bytecode,
+            }
+        );
+        // The later job stays queued and unrun.
+        assert_eq!(read_global(&machine, "a"), None);
+        assert_eq!(machine.microtasks.len(), 1);
+        assert!(!machine.microtask_drain_active);
+    }
+
+    #[test]
+    fn automatic_loop_timer_throw_suppresses_queued_microtasks_and_later_timers() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let suppressed_microtask = timer_fn(&mut machine, 2); // stores b = 1
+        machine
+            .globals
+            .insert(EcmaString::from_utf8("nestedCallback"), suppressed_microtask);
+        let thrower = timer_native(&mut machine, "queue then throw", queue_job_then_throw);
+        let later_timer = timer_fn(&mut machine, 1); // stores a = 1
+        let set_timeout = set_timeout_global(&machine);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[thrower, Value::int32(1)])
+            .unwrap();
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[later_timer, Value::int32(2)])
+            .unwrap();
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 1,
+        });
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 2,
+            deadline_ms: 2,
+        });
+
+        let error = machine.run_to_quiescence().unwrap_err();
+        assert_eq!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                value: Value::int32(7),
+                origin: ThrowOrigin::Bytecode,
+            }
+        );
+        // The exception converts before any drain, so the queued microtask and
+        // the later timer both stay pending.
+        assert_eq!(read_global(&machine, "b"), None);
+        assert_eq!(read_global(&machine, "a"), None);
+        assert_eq!(machine.microtasks.len(), 1);
+        assert!(machine.has_pending_timers());
+        assert!(!machine.microtask_drain_active);
+        assert!(!machine.timer_checkpoint_active);
+    }
+
+    #[test]
+    fn automatic_loop_settles_derived_promises_when_a_handler_throws() {
+        let program = promise_throw_program();
+        let mut host = TimerTestHost::default();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let executor = timer_fn(&mut machine, 1);
+        let throwing = timer_fn(&mut machine, 2);
+        let observer = timer_fn(&mut machine, 3);
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let constructor_index = machine.runtime_slot(constructor).unwrap().unwrap();
+        let HeapEntry::NativeFunction {
+            callable: NativeCallable::Builtin(constructor_id),
+            ..
+        } = machine.heap[constructor_index]
+        else {
+            panic!("Promise must be a native constructor");
+        };
+        let BuiltinOutcome::Value(promise) = machine
+            .call_builtin(constructor_id, Value::UNDEFINED, &[executor], true)
+            .unwrap()
+        else {
+            panic!("Promise construction returns a Promise");
+        };
+        let resolve = machine
+            .globals
+            .get(&EcmaString::from_utf8("resolve"))
+            .copied()
+            .unwrap();
+        machine
+            .call_value(resolve, Value::UNDEFINED, &[Value::int32(1)])
+            .unwrap();
+        let then = machine.get_named_property(promise, "then").unwrap();
+        let derived = machine.call_value(then, promise, &[throwing]).unwrap();
+        let then_again = machine.get_named_property(derived, "then").unwrap();
+        machine
+            .call_value(then_again, derived, &[Value::UNDEFINED, observer])
+            .unwrap();
+
+        machine.run_to_quiescence().unwrap();
+        // The thrown handler rejects the derived promise, whose rejection
+        // observer runs instead of aborting the loop.
+        assert_eq!(
+            machine
+                .globals
+                .get(&EcmaString::from_utf8("observed"))
+                .copied(),
+            Some(Value::int32(7))
+        );
+        assert!(machine.microtasks.is_empty());
+    }
+
+    #[test]
+    fn recursive_microtask_work_reaches_existing_fuel() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let respawn = timer_native(&mut machine, "respawn", respawn_job);
+        machine
+            .globals
+            .insert(EcmaString::from_utf8("nestedCallback"), respawn);
+        let queue = machine.intrinsics.global("queueMicrotask").unwrap();
+        machine
+            .call_value(queue, Value::UNDEFINED, &[respawn])
+            .unwrap();
+        machine.fuel = 16;
+
+        let error = machine.run_to_quiescence().unwrap_err();
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::FuelExhausted { .. }
+        ));
+        // Recursive work never reaches quiescence; fuel was fully spent.
+        assert_eq!(machine.fuel, 0);
+        assert!(!machine.microtask_drain_active);
+    }
+
+    #[test]
+    fn manual_drain_still_collects_every_throw_and_continues() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let throwing = timer_fn(&mut machine, 4); // throws 7
+        let observer = timer_fn(&mut machine, 1); // stores a = 1
+        let queue = machine.intrinsics.global("queueMicrotask").unwrap();
+        machine
+            .call_value(queue, Value::UNDEFINED, &[throwing])
+            .unwrap();
+        machine
+            .call_value(queue, Value::UNDEFINED, &[observer])
+            .unwrap();
+        machine
+            .call_value(queue, Value::UNDEFINED, &[throwing])
+            .unwrap();
+
+        let drain = machine.drain_microtasks().unwrap();
+        assert_eq!(drain.executed, 3);
+        assert_eq!(
+            drain.uncaught,
+            vec![
+                CallbackException {
+                    value: Value::int32(7),
+                    origin: ThrowOrigin::Bytecode,
+                },
+                CallbackException {
+                    value: Value::int32(7),
+                    origin: ThrowOrigin::Bytecode,
+                },
+            ]
+        );
+        assert_eq!(read_global(&machine, "a"), Some(Value::int32(1)));
+        assert!(machine.microtasks.is_empty());
     }
 }

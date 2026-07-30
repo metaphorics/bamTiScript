@@ -412,11 +412,13 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
 
     // -- Reference backend: control-flow driver ------------------------------
 
-    /// Executes the program entry with the reference driver. Never invokes
-    /// [`Machine::run`].
+    /// Executes the program entry with the reference driver, then drives the
+    /// shared automatic event loop to quiescence. Never invokes [`Machine::run`];
+    /// it reuses the machine's own loop driver directly.
     pub fn run(self) -> Result<Execution, RuntimeError> {
         self.machine.borrow_mut().instantiate_modules()?;
-        self.evaluate_reference_module(self.program.entry())?
+        let execution = self
+            .evaluate_reference_module(self.program.entry())?
             .ok_or_else(|| {
                 let module = self.program.entry();
                 let function = self.module(module).entry().get() as usize;
@@ -429,7 +431,13 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     function,
                     0,
                 )
-            })
+            })?;
+        // After successful synchronous evaluation, drain microtasks and timers
+        // to quiescence on the single borrowed machine. The guard spans only this
+        // statement: the loop runs through the machine's own &mut methods, so no
+        // nested RefCell borrow is taken and no native callback overlaps it.
+        self.machine.borrow_mut().run_to_quiescence()?;
+        Ok(execution)
     }
 
     fn evaluate_reference_module(
@@ -2132,6 +2140,13 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 0,
             ))
         })?;
+        // The linked backend shares the interpreter's automatic loop policy: it
+        // drives the machine to quiescence after successful evaluation. Driver
+        // failures are runtime failures, surfaced through `NativeError::Runtime`.
+        self.machine
+            .borrow_mut()
+            .run_to_quiescence()
+            .map_err(NativeError::Runtime)?;
         Ok(execution.outcome)
     }
 
@@ -3023,6 +3038,227 @@ mod tests {
         assert_eq!(interpreter_drain, native_drain);
         assert_eq!(interpreter_value, Some(Value::int32(7)));
         assert_eq!(native_value, interpreter_value);
+    }
+
+    #[derive(Default)]
+    struct RecordingHost {
+        stdout: Vec<u8>,
+    }
+
+    impl Host for RecordingHost {
+        fn write_stdout(&mut self, bytes: &[u8]) {
+            self.stdout.extend_from_slice(bytes);
+        }
+    }
+
+    fn first_window(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    fn automatic_loop_program(callback: Function) -> Program<Verified> {
+        linked(
+            vec![program_module(
+                "root",
+                vec![
+                    Constant::String(EcmaString::from_utf8("console")),
+                    Constant::String(EcmaString::from_utf8("log")),
+                    Constant::String(EcmaString::from_utf8("sync")),
+                    Constant::String(EcmaString::from_utf8("async")),
+                    Constant::String(EcmaString::from_utf8("queueMicrotask")),
+                    Constant::Int32(42),
+                    Constant::Undefined,
+                ],
+                vec![
+                    entry_function(
+                        7,
+                        vec![
+                            Instruction::LoadGlobal { dst: reg(0), name: cid(1) },
+                            Instruction::LoadConst { dst: reg(2), constant: cid(3) },
+                            Instruction::LoadConst { dst: reg(1), constant: cid(2) },
+                            Instruction::GetProperty { dst: reg(1), object: reg(0), key: reg(1) },
+                            Instruction::CreateArray { dst: reg(3) },
+                            Instruction::ArrayPush { array: reg(3), value: reg(2) },
+                            Instruction::LoadConst { dst: reg(4), constant: cid(7) },
+                            Instruction::Call {
+                                dst: reg(5),
+                                callee: reg(1),
+                                this_value: reg(4),
+                                arguments: reg(3),
+                            },
+                            Instruction::CreateArray { dst: reg(3) },
+                            Instruction::CreateClosure {
+                                dst: reg(1),
+                                function: FunctionId::new(1),
+                                captures: reg(3),
+                            },
+                            Instruction::LoadGlobal { dst: reg(6), name: cid(5) },
+                            Instruction::CreateArray { dst: reg(3) },
+                            Instruction::ArrayPush { array: reg(3), value: reg(1) },
+                            Instruction::LoadConst { dst: reg(4), constant: cid(7) },
+                            Instruction::Call {
+                                dst: reg(5),
+                                callee: reg(6),
+                                this_value: reg(4),
+                                arguments: reg(3),
+                            },
+                            Instruction::LoadConst { dst: reg(0), constant: cid(6) },
+                            Instruction::Return { value: reg(0) },
+                        ],
+                    ),
+                    callback,
+                ],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )],
+            0,
+        )
+    }
+
+    fn queue_callback_microtask<H: Host>(
+        engine: &mut NativeEngine<'_, '_, H>,
+        function: FunctionId,
+    ) {
+        let mut machine = engine.machine.borrow_mut();
+        let callback = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function,
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .expect("microtask callback allocates");
+        let queue = machine
+            .intrinsics
+            .global("queueMicrotask")
+            .expect("queueMicrotask is installed");
+        machine
+            .call_value(queue, Value::UNDEFINED, &[callback])
+            .expect("microtask enqueues");
+    }
+
+    #[test]
+    fn automatic_loop_drains_microtasks_and_preserves_synchronous_result() {
+        let program = automatic_loop_program(module_function(
+            0,
+            4,
+            vec![
+                Instruction::LoadGlobal { dst: reg(0), name: cid(1) },
+                Instruction::LoadConst { dst: reg(2), constant: cid(4) },
+                Instruction::LoadConst { dst: reg(1), constant: cid(2) },
+                Instruction::GetProperty { dst: reg(1), object: reg(0), key: reg(1) },
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ArrayPush { array: reg(3), value: reg(2) },
+                Instruction::LoadConst { dst: reg(0), constant: cid(7) },
+                Instruction::Call {
+                    dst: reg(2),
+                    callee: reg(1),
+                    this_value: reg(0),
+                    arguments: reg(3),
+                },
+                Instruction::Return { value: reg(0) },
+            ],
+        ));
+
+        let mut interpreter_host = RecordingHost::default();
+        let interpreter = Machine::new(&program, &mut interpreter_host, Limits::default())
+            .run()
+            .expect("interpreter drains to quiescence");
+        assert_eq!(interpreter.value, Value::int32(42));
+        assert!(interpreter.outcome.stdout.is_empty());
+        let interp_sync = first_window(&interpreter_host.stdout, b"sync");
+        let interp_async = first_window(&interpreter_host.stdout, b"async");
+        assert!(
+            interp_sync.is_some_and(|s| interp_async.is_some_and(|a| s < a)),
+            "host received sync-then-async bytes: {:?}",
+            interpreter_host.stdout,
+        );
+
+        let mut native_host = RecordingHost::default();
+        let native = NativeEngine::new(&program, &NoEntries, &mut native_host, Limits::default())
+            .run()
+            .expect("reference native drains to quiescence");
+        assert_eq!(native.value, Value::int32(42));
+        assert!(native.outcome.stdout.is_empty());
+        assert_eq!(native_host.stdout, interpreter_host.stdout);
+
+        let mut linked_host = RecordingHost::default();
+        let linked_outcome = {
+            let entries = ForeignEntries {
+                program_bytes: program.encode(),
+                invoked: Cell::new(false),
+            };
+            let mut linked = NativeEngine::build(
+                &program,
+                &entries,
+                &mut linked_host,
+                Limits::default(),
+                Backend::Linked,
+            );
+            queue_callback_microtask(&mut linked, FunctionId::new(1));
+            linked
+                .run_linked()
+                .expect("linked native drains to quiescence")
+        };
+        assert!(linked_outcome.stdout.is_empty());
+        assert!(
+            first_window(&linked_host.stdout, b"async").is_some(),
+            "linked loop drained the pre-queued microtask: {:?}",
+            linked_host.stdout,
+        );
+    }
+
+    #[test]
+    fn automatic_loop_surfaces_uncaught_callback_error_across_entrypoints() {
+        let program = automatic_loop_program(module_function(
+            0,
+            1,
+            vec![
+                Instruction::LoadConst { dst: reg(0), constant: cid(6) },
+                Instruction::Throw { value: reg(0) },
+            ],
+        ));
+
+        let mut interpreter_host = SilentHost;
+        let interpreter_err = Machine::new(&program, &mut interpreter_host, Limits::default())
+            .run()
+            .expect_err("interpreter surfaces the uncaught callback");
+        let thrown = match &interpreter_err.kind {
+            RuntimeErrorKind::UncaughtThrow { value, .. } => *value,
+            other => panic!("expected UncaughtThrow, got {other:?}"),
+        };
+        assert_eq!(thrown, Value::int32(42));
+
+        let mut native_host = SilentHost;
+        let native_err = NativeEngine::new(&program, &NoEntries, &mut native_host, Limits::default())
+            .run()
+            .expect_err("reference native surfaces the uncaught callback");
+        assert_eq!(native_err.kind, interpreter_err.kind);
+
+        let mut linked_host = SilentHost;
+        let linked_err = {
+            let entries = ForeignEntries {
+                program_bytes: program.encode(),
+                invoked: Cell::new(false),
+            };
+            let mut linked = NativeEngine::build(
+                &program,
+                &entries,
+                &mut linked_host,
+                Limits::default(),
+                Backend::Linked,
+            );
+            queue_callback_microtask(&mut linked, FunctionId::new(1));
+            linked
+                .run_linked()
+                .expect_err("linked native surfaces the uncaught callback")
+        };
+        match linked_err {
+            NativeError::Runtime(RuntimeError { ref kind, .. }) if *kind == interpreter_err.kind => {}
+            other => panic!("linked mapped the callback throw: {other:?}"),
+        }
     }
 
     fn async_module_function(registers: u32, code: Vec<Instruction>) -> Function {

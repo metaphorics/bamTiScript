@@ -37,7 +37,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "bamts"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bamts-bytecode",
  "bamts-codegen",
@@ -48,11 +48,11 @@ dependencies = [
 
 [[package]]
 name = "bamts-bytecode"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "bamts-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bamts",
  "bamts-codegen",
@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "bamts-codegen"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bamts-bytecode",
  "bamts-native",
@@ -77,14 +77,14 @@ dependencies = [
 
 [[package]]
 name = "bamts-compiler"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bamts-bytecode",
 ]
 
 [[package]]
 name = "bamts-native"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "cranelift-jit",
  "cranelift-module",
@@ -92,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "bamts-node"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bamts-bytecode",
  "bamts-compiler",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "bamts-runtime"
-version = "0.0.0"
+version = "0.1.2"
 dependencies = [
  "bamts-bytecode",
  "bamts-native",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "bamts-verification"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "bamts-bytecode",

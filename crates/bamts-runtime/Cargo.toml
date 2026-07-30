@@ -1,8 +1,12 @@
 [package]
 name = "bamts-runtime"
+version = "0.1.2"
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Execution runtime and built-in intrinsics for BamTS"
 
 [lib]
 crate-type = ["rlib", "staticlib"]
@@ -16,8 +20,8 @@ default = []
 aot-main = []
 
 [dependencies]
-bamts-bytecode = { path = "../bamts-bytecode" }
-bamts-native = { path = "../bamts-native", features = ["gc"] }
+bamts-bytecode = { path = "../bamts-bytecode", version = "0.1.0" }
+bamts-native = { path = "../bamts-native", version = "0.1.0", features = ["gc"] }
 
 [lints]
 workspace = true

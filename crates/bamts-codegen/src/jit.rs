@@ -822,6 +822,31 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn finalized_jit_code_is_executable_and_not_writable() {
+        let program = compile_jit(&two_module_program()).expect("host JIT compiles");
+        let function = program.functions[0].function;
+        let address = program.module.get_finalized_function(function) as usize;
+        let maps = std::fs::read_to_string("/proc/self/maps").expect("process maps are readable");
+        let permissions = maps
+            .lines()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                let range = fields.next()?;
+                let permissions = fields.next()?;
+                let (start, end) = range.split_once('-')?;
+                let start = usize::from_str_radix(start, 16).ok()?;
+                let end = usize::from_str_radix(end, 16).ok()?;
+                (start <= address && address < end).then_some(permissions)
+            })
+            .expect("finalized function has a mapped page");
+
+        // `finalize_definitions` must publish code with an RW -> RX transition.
+        assert!(permissions.contains('x'), "{permissions}");
+        assert!(!permissions.contains('w'), "{permissions}");
+    }
+
+    #[test]
     fn unknown_module_and_function_tuples_are_rejected() {
         let program = compile_jit(&two_module_program()).expect("host JIT compiles");
         let mut register = Value::UNINITIALIZED;

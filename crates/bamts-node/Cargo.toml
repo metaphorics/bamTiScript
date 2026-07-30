@@ -1,8 +1,12 @@
 [package]
 name = "bamts-node"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Node.js host environment compatibility layer for BamTS"
 
 [lib]
 crate-type = ["rlib", "staticlib"]
@@ -21,10 +25,10 @@ aot-main = [
 ]
 
 [dependencies]
-bamts-bytecode = { path = "../bamts-bytecode", optional = true }
-bamts-compiler = { path = "../bamts-compiler", optional = true }
-bamts-native = { path = "../bamts-native" }
-bamts-runtime = { path = "../bamts-runtime" }
+bamts-bytecode = { path = "../bamts-bytecode", version = "0.1.0", optional = true }
+bamts-compiler = { path = "../bamts-compiler", version = "0.1.0", optional = true }
+bamts-native = { path = "../bamts-native", version = "0.1.0" }
+bamts-runtime = { path = "../bamts-runtime", version = "0.1.2" }
 tokio = { version = "=1.53.1", features = ["rt", "sync", "time"] }
 tokio-util = { version = "=0.7.19", features = ["time"] }
 

@@ -245,6 +245,51 @@ fn task_107_node_cases_match_node_in_jit_and_aot() {
     );
 }
 
+#[test]
+fn task_110_event_loop_drives_to_quiescence_in_jit_and_aot() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("task-110-event-loop-{}", process::id());
+    let entrypoint = format!("target/{id}.js");
+    let path = root.join(&entrypoint);
+    fs::write(
+        &path,
+        "console.log('sync');
+Promise.resolve().then(() => console.log('micro'));
+setTimeout(() => {
+  console.log('timer');
+  Promise.resolve().then(() => console.log('timer-micro'));
+}, 1);
+",
+    )
+    .expect("write event-loop fixture");
+    let spec = CaseSpec {
+        id,
+        repository: "local".to_owned(),
+        commit: "0".repeat(40),
+        license: "UNLICENSED".to_owned(),
+        source_dir: "target".to_owned(),
+        entrypoint,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+    };
+    let oracle = NodeOracle::discover(&root).expect("the pinned Node oracle must be available");
+    let bamts = BamtsRunner::new(&root);
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_file(path).expect("remove event-loop fixture");
+    assert!(
+        failures.is_empty(),
+        "Task 110 event-loop differential failures:\n{}",
+        failures.join("\n\n")
+    );
+}
+
 fn compare_case(
     case_id: &str,
     mode: ExecutionMode,

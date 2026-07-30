@@ -26,7 +26,7 @@ async function withTemporaryDirectory(callback) {
 
 test("the bamts shim resolves a present Linux artifact", async () => {
   await withTemporaryDirectory(async (directory) => {
-    const artifactDirectory = join(directory, "node_modules", "@bamti", "cli-linux-x64");
+    const artifactDirectory = join(directory, "node_modules", "bamti-cli-linux-x64");
     const binary = join(artifactDirectory, "bin", "bamts");
     await mkdir(dirname(binary), { recursive: true });
     await writeFile(join(artifactDirectory, "package.json"), "{}\n");
@@ -51,7 +51,7 @@ test("the bamts shim reports a missing platform artifact", async () => {
       () => resolveBinary({ platform: "linux", arch: "x64", resolvePackage: consumerRequire.resolve }),
       (error) =>
         error instanceof ArtifactNotFoundError &&
-        error.message.includes("@bamti/cli-linux-x64") &&
+        error.message.includes("bamti-cli-linux-x64") &&
         error.message.includes("optional dependencies enabled"),
     );
   });

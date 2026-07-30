@@ -866,6 +866,77 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn run_program_drains_microtasks_and_timers_to_quiescence_in_phase_order()
+    -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            process.stdout.write("sync\n");
+            Promise.resolve().then(() => {
+                process.stdout.write("promise\n");
+            });
+            setTimeout(() => {
+                process.stdout.write("timer\n");
+                Promise.resolve().then(() => {
+                    process.stdout.write("timer-promise\n");
+                });
+            }, 1);
+        "#;
+        let (directory, entrypoint) = script_fixture("quiescence-phase-order", source)?;
+        let output = run_program(&entrypoint)?;
+
+        assert_eq!(output.stdout, b"sync\npromise\ntimer\ntimer-promise\n");
+        assert_eq!(output.exit_code, 0);
+        remove_fixture(&directory)
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn run_program_keeps_alive_for_a_future_timer() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            process.stdout.write("start\n");
+            setTimeout(() => {
+                process.stdout.write("fired\n");
+            }, 2);
+        "#;
+        let (directory, entrypoint) = script_fixture("future-timer", source)?;
+        let output = run_program(&entrypoint)?;
+
+        assert_eq!(output.stdout, b"start\nfired\n");
+        assert_eq!(output.exit_code, 0);
+        remove_fixture(&directory)
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn run_program_maps_the_first_uncaught_timer_throw() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            setTimeout(() => {
+                throw 7;
+            }, 1);
+            setTimeout(() => {
+                throw 99;
+            }, 2);
+        "#;
+        let (directory, entrypoint) = script_fixture("uncaught-timer", source)?;
+        let error = run_program(&entrypoint)
+            .expect_err("an uncaught timer callback fails the run");
+        let super::Error::Runtime(runtime) = error else {
+            panic!("expected a runtime error, got {error:?}");
+        };
+        match runtime.kind {
+            bamts_runtime::RuntimeErrorKind::UncaughtThrow { value, .. } => {
+                assert_eq!(
+                    value,
+                    bamts_runtime::constant_value(&bamts_bytecode::Constant::Int32(7)).unwrap(),
+                    "expected the first timer's uncaught throw (7)"
+                );
+            }
+            other => panic!("expected UncaughtThrow, got {other:?}"),
+        }
+        remove_fixture(&directory)
+    }
+
     #[cfg(feature = "aot")]
     #[test]
     fn compiles_complete_program_to_native_object() -> Result<(), Box<dyn Error>> {
