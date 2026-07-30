@@ -310,6 +310,9 @@ impl<H: Host> Machine<'_, H> {
                         crate::RuntimeErrorKind::InvalidValue { value },
                     ))?;
                 match &self.heap[index] {
+                    HeapEntry::Vacant => {
+                        unreachable!("runtime_slot rejects vacant heap entries")
+                    }
                     HeapEntry::String(text) if top_level => Ok(env_value_text_lossy(text)),
                     HeapEntry::String(text) => Ok(quote(text)),
                     HeapEntry::BigInt(text) => Ok(format!("{text}n")),

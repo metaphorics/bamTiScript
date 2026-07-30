@@ -982,10 +982,14 @@ fn clone_value<H: Host>(
             Ok(clone)
         }
         HeapEntry::Collection {
-            entries, prototype, ..
+            kind,
+            entries,
+            prototype,
+            ..
         } => {
             let clone = machine
                 .allocate(HeapEntry::Collection {
+                    kind,
                     entries: Vec::new(),
                     next_order: 0,
                     properties: PropertyMap::default(),

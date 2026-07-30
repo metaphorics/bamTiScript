@@ -8,7 +8,8 @@ use super::{
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{
-    EvalFailure, HeapEntry, Host, IterationKind, Machine, Property, PropertyKey, PropertyMap,
+    CollectionKind, EvalFailure, HeapEntry, Host, IterationKind, Machine, Property, PropertyKey,
+    PropertyMap,
 };
 
 pub(super) fn install<H: Host>(
@@ -93,9 +94,9 @@ fn install_weak_map<H: Host>(
     builtins.set_constructor_prototype(heap, constructor, prototype);
     for (name, length, handler) in [
         ("set", 2, weak_map_set::<H> as BuiltinHandler<H>),
-        ("get", 1, map_get::<H>),
-        ("has", 1, map_has::<H>),
-        ("delete", 1, map_delete::<H>),
+        ("get", 1, weak_map_get::<H>),
+        ("has", 1, weak_map_has::<H>),
+        ("delete", 1, weak_map_delete::<H>),
     ] {
         let function = install_function(heap, builtins, name, length, handler);
         define_data(heap, prototype, name, function);
@@ -113,8 +114,8 @@ fn install_weak_set<H: Host>(
     builtins.set_constructor_prototype(heap, constructor, prototype);
     for (name, length, handler) in [
         ("add", 1, weak_set_add::<H> as BuiltinHandler<H>),
-        ("has", 1, set_has::<H>),
-        ("delete", 1, set_delete::<H>),
+        ("has", 1, weak_set_has::<H>),
+        ("delete", 1, weak_set_delete::<H>),
     ] {
         let function = install_function(heap, builtins, name, length, handler);
         define_data(heap, prototype, name, function);
@@ -310,7 +311,7 @@ fn map_constructor<H: Host>(
     args: &[Value],
     constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    map_like_constructor(machine, args, constructing, "Map")
+    map_like_constructor(machine, args, constructing, CollectionKind::Map)
 }
 
 fn set_constructor<H: Host>(
@@ -319,7 +320,7 @@ fn set_constructor<H: Host>(
     args: &[Value],
     constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    set_like_constructor(machine, args, constructing, "Set")
+    set_like_constructor(machine, args, constructing, CollectionKind::Set)
 }
 
 fn weak_map_constructor<H: Host>(
@@ -328,7 +329,7 @@ fn weak_map_constructor<H: Host>(
     args: &[Value],
     constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    map_like_constructor(machine, args, constructing, "WeakMap")
+    map_like_constructor(machine, args, constructing, CollectionKind::WeakMap)
 }
 
 fn weak_set_constructor<H: Host>(
@@ -337,19 +338,19 @@ fn weak_set_constructor<H: Host>(
     args: &[Value],
     constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    set_like_constructor(machine, args, constructing, "WeakSet")
+    set_like_constructor(machine, args, constructing, CollectionKind::WeakSet)
 }
 
 fn map_like_constructor<H: Host>(
     machine: &mut Machine<'_, H>,
     args: &[Value],
     constructing: bool,
-    name: &str,
+    kind: CollectionKind,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     if !constructing {
         return Err(type_error("collection constructor requires 'new'"));
     }
-    let object = collection(machine, constructor_prototype(machine, name)?)?;
+    let object = collection(machine, constructor_prototype(machine, kind)?, kind)?;
     if let Some(source) = args
         .first()
         .copied()
@@ -362,10 +363,10 @@ fn map_like_constructor<H: Host>(
             }
             let key = machine.get_named_property(entry, "0")?;
             let value = machine.get_named_property(entry, "1")?;
-            if name == "WeakMap" {
+            if kind == CollectionKind::WeakMap {
                 require_weak_key(machine, key)?;
             }
-            map_put(machine, object, key, value)?;
+            map_put(machine, object, key, value, kind)?;
         }
     }
     Ok(BuiltinOutcome::Value(object))
@@ -375,12 +376,12 @@ fn set_like_constructor<H: Host>(
     machine: &mut Machine<'_, H>,
     args: &[Value],
     constructing: bool,
-    name: &str,
+    kind: CollectionKind,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     if !constructing {
         return Err(type_error("collection constructor requires 'new'"));
     }
-    let object = collection(machine, constructor_prototype(machine, name)?)?;
+    let object = collection(machine, constructor_prototype(machine, kind)?, kind)?;
     if let Some(source) = args
         .first()
         .copied()
@@ -388,10 +389,10 @@ fn set_like_constructor<H: Host>(
     {
         let values = machine.iterable_values(source)?;
         for value in values {
-            if name == "WeakSet" {
+            if kind == CollectionKind::WeakSet {
                 require_weak_key(machine, value)?;
             }
-            set_put(machine, object, value)?;
+            set_put(machine, object, value, kind)?;
         }
     }
     Ok(BuiltinOutcome::Value(object))
@@ -408,15 +409,18 @@ fn map_set<H: Host>(
         this,
         args.first().copied().unwrap_or(Value::UNDEFINED),
         args.get(1).copied().unwrap_or(Value::UNDEFINED),
+        CollectionKind::Map,
     )?;
     Ok(BuiltinOutcome::Value(this))
 }
+
 fn weak_map_set<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
+    collection_slot(machine, this, CollectionKind::WeakMap)?;
     let key = args.first().copied().unwrap_or(Value::UNDEFINED);
     require_weak_key(machine, key)?;
     map_put(
@@ -424,16 +428,36 @@ fn weak_map_set<H: Host>(
         this,
         key,
         args.get(1).copied().unwrap_or(Value::UNDEFINED),
+        CollectionKind::WeakMap,
     )?;
     Ok(BuiltinOutcome::Value(this))
 }
+
 fn map_get<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let slot = collection_slot(machine, this)?;
+    map_get_for(machine, this, args, CollectionKind::Map)
+}
+
+fn weak_map_get<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    map_get_for(machine, this, args, CollectionKind::WeakMap)
+}
+
+fn map_get_for<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    expected: CollectionKind,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let slot = collection_slot(machine, this, expected)?;
     let key = args.first().copied().unwrap_or(Value::UNDEFINED);
     let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
         unreachable!("collection brand was checked")
@@ -444,13 +468,32 @@ fn map_get<H: Host>(
         .map_or(Value::UNDEFINED, |entry| entry.value);
     Ok(BuiltinOutcome::Value(found))
 }
+
 fn map_has<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let slot = collection_slot(machine, this)?;
+    map_has_for(machine, this, args, CollectionKind::Map)
+}
+
+fn weak_map_has<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    map_has_for(machine, this, args, CollectionKind::WeakMap)
+}
+
+fn map_has_for<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    expected: CollectionKind,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let slot = collection_slot(machine, this, expected)?;
     let key = args.first().copied().unwrap_or(Value::UNDEFINED);
     let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
         unreachable!("collection brand was checked")
@@ -461,13 +504,32 @@ fn map_has<H: Host>(
             .any(|entry| machine.same_value_zero(entry.key, key)),
     )))
 }
+
 fn map_delete<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let slot = collection_slot(machine, this)?;
+    map_delete_for(machine, this, args, CollectionKind::Map)
+}
+
+fn weak_map_delete<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    map_delete_for(machine, this, args, CollectionKind::WeakMap)
+}
+
+fn map_delete_for<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    expected: CollectionKind,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let slot = collection_slot(machine, this, expected)?;
     let key = args.first().copied().unwrap_or(Value::UNDEFINED);
     let index = {
         let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
@@ -486,26 +548,28 @@ fn map_delete<H: Host>(
     entries.remove(index);
     Ok(BuiltinOutcome::Value(Value::TRUE))
 }
+
 fn map_clear<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let slot = collection_slot(machine, this)?;
+    let slot = collection_slot(machine, this, CollectionKind::Map)?;
     let HeapEntry::Collection { entries, .. } = &mut machine.heap[slot] else {
         unreachable!("collection brand was checked")
     };
     entries.clear();
     Ok(BuiltinOutcome::Value(Value::UNDEFINED))
 }
+
 fn map_size<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let slot = collection_slot(machine, this)?;
+    let slot = collection_slot(machine, this, CollectionKind::Map)?;
     let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
         unreachable!("collection brand was checked")
     };
@@ -513,41 +577,46 @@ fn map_size<H: Host>(
         entries.len() as f64
     )))
 }
+
 fn map_keys<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    collection_iterator(machine, this, IterationKind::Key)
+    collection_iterator(machine, this, CollectionKind::Map, IterationKind::Key)
 }
+
 fn map_values<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    collection_iterator(machine, this, IterationKind::Value)
+    collection_iterator(machine, this, CollectionKind::Map, IterationKind::Value)
 }
+
 fn map_entries<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    collection_iterator(machine, this, IterationKind::Entry)
+    collection_iterator(machine, this, CollectionKind::Map, IterationKind::Entry)
 }
+
 fn map_for_each<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
+    let entries = collection_snapshot(machine, this, CollectionKind::Map)?;
     let callback = args.first().copied().unwrap_or(Value::UNDEFINED);
     if !machine.is_callable(callback)? {
         return Err(type_error("Map.forEach callback is not callable"));
     }
-    for (key, value) in collection_snapshot(machine, this)? {
+    for (key, value) in entries {
         machine.call_value(
             callback,
             args.get(1).copied().unwrap_or(Value::UNDEFINED),
@@ -567,79 +636,119 @@ fn set_add<H: Host>(
         machine,
         this,
         args.first().copied().unwrap_or(Value::UNDEFINED),
+        CollectionKind::Set,
     )?;
     Ok(BuiltinOutcome::Value(this))
 }
+
 fn weak_set_add<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
+    collection_slot(machine, this, CollectionKind::WeakSet)?;
     let value = args.first().copied().unwrap_or(Value::UNDEFINED);
     require_weak_key(machine, value)?;
-    set_put(machine, this, value)?;
+    set_put(machine, this, value, CollectionKind::WeakSet)?;
     Ok(BuiltinOutcome::Value(this))
 }
+
 fn set_has<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     args: &[Value],
-    constructing: bool,
+    _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    map_has(machine, this, args, constructing)
+    map_has_for(machine, this, args, CollectionKind::Set)
 }
+
+fn weak_set_has<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    map_has_for(machine, this, args, CollectionKind::WeakSet)
+}
+
 fn set_delete<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     args: &[Value],
-    constructing: bool,
+    _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    map_delete(machine, this, args, constructing)
+    map_delete_for(machine, this, args, CollectionKind::Set)
 }
+
+fn weak_set_delete<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    map_delete_for(machine, this, args, CollectionKind::WeakSet)
+}
+
 fn set_clear<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
-    args: &[Value],
-    constructing: bool,
+    _args: &[Value],
+    _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    map_clear(machine, this, args, constructing)
+    let slot = collection_slot(machine, this, CollectionKind::Set)?;
+    let HeapEntry::Collection { entries, .. } = &mut machine.heap[slot] else {
+        unreachable!("collection brand was checked")
+    };
+    entries.clear();
+    Ok(BuiltinOutcome::Value(Value::UNDEFINED))
 }
+
 fn set_size<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
-    args: &[Value],
-    constructing: bool,
+    _args: &[Value],
+    _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    map_size(machine, this, args, constructing)
+    let slot = collection_slot(machine, this, CollectionKind::Set)?;
+    let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
+        unreachable!("collection brand was checked")
+    };
+    Ok(BuiltinOutcome::Value(crate::number_value(
+        entries.len() as f64
+    )))
 }
+
 fn set_values<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    collection_iterator(machine, this, IterationKind::Value)
+    collection_iterator(machine, this, CollectionKind::Set, IterationKind::Value)
 }
+
 fn set_entries<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    collection_iterator(machine, this, IterationKind::Entry)
+    collection_iterator(machine, this, CollectionKind::Set, IterationKind::Entry)
 }
+
 fn set_for_each<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
+    let entries = collection_snapshot(machine, this, CollectionKind::Set)?;
     let callback = args.first().copied().unwrap_or(Value::UNDEFINED);
     if !machine.is_callable(callback)? {
         return Err(type_error("Set.forEach callback is not callable"));
     }
-    for (_, value) in collection_snapshot(machine, this)? {
+    for (_, value) in entries {
         machine.call_value(
             callback,
             args.get(1).copied().unwrap_or(Value::UNDEFINED),
@@ -654,8 +763,9 @@ fn map_put<H: Host>(
     object: Value,
     key: Value,
     value: Value,
+    expected: CollectionKind,
 ) -> Result<(), EvalFailure> {
-    let slot = collection_slot(machine, object)?;
+    let slot = collection_slot(machine, object, expected)?;
     let existing = {
         let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
             unreachable!("collection brand was checked")
@@ -673,12 +783,14 @@ fn map_put<H: Host>(
     }
     append_collection_entry(machine, slot, key, value)
 }
+
 fn set_put<H: Host>(
     machine: &mut Machine<'_, H>,
     object: Value,
     value: Value,
+    expected: CollectionKind,
 ) -> Result<(), EvalFailure> {
-    let slot = collection_slot(machine, object)?;
+    let slot = collection_slot(machine, object, expected)?;
     let exists = {
         let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
             unreachable!("collection brand was checked")
@@ -707,7 +819,7 @@ pub(super) fn append_collection_entry<H: Host>(
         .checked_add(1)
         .expect("heap limits keep collection order below u64::MAX");
     machine
-        .charge_heap(crate::CollectionEntry::BYTES)
+        .charge_slot(slot, crate::CollectionEntry::BYTES)
         .map_err(EvalFailure::Runtime)?;
     let HeapEntry::Collection {
         entries,
@@ -725,9 +837,11 @@ pub(super) fn append_collection_entry<H: Host>(
 fn collection<H: Host>(
     machine: &mut Machine<'_, H>,
     prototype: Value,
+    kind: CollectionKind,
 ) -> Result<Value, EvalFailure> {
     machine
         .allocate(HeapEntry::Collection {
+            kind,
             entries: Vec::new(),
             next_order: 0,
             properties: PropertyMap::default(),
@@ -736,13 +850,18 @@ fn collection<H: Host>(
         })
         .map_err(EvalFailure::Runtime)
 }
-fn collection_slot<H: Host>(machine: &Machine<'_, H>, object: Value) -> Result<usize, EvalFailure> {
+
+fn collection_slot<H: Host>(
+    machine: &Machine<'_, H>,
+    object: Value,
+    expected: CollectionKind,
+) -> Result<usize, EvalFailure> {
     let Some(index) = machine.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
         return Err(type_error(
             "collection method called on incompatible receiver",
         ));
     };
-    if !matches!(machine.heap[index], HeapEntry::Collection { .. }) {
+    if !matches!(machine.heap[index], HeapEntry::Collection { kind, .. } if kind == expected) {
         return Err(type_error(
             "collection method called on incompatible receiver",
         ));
@@ -753,8 +872,9 @@ fn collection_slot<H: Host>(machine: &Machine<'_, H>, object: Value) -> Result<u
 fn collection_snapshot<H: Host>(
     machine: &Machine<'_, H>,
     object: Value,
+    expected: CollectionKind,
 ) -> Result<Vec<(Value, Value)>, EvalFailure> {
-    let slot = collection_slot(machine, object)?;
+    let slot = collection_slot(machine, object, expected)?;
     let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
         unreachable!("collection brand was checked")
     };
@@ -763,31 +883,63 @@ fn collection_snapshot<H: Host>(
         .map(|entry| (entry.key, entry.value))
         .collect())
 }
+
 fn collection_iterator<H: Host>(
     machine: &mut Machine<'_, H>,
     object: Value,
+    expected: CollectionKind,
     kind: IterationKind,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    collection_slot(machine, object)?;
+    collection_slot(machine, object, expected)?;
     Ok(BuiltinOutcome::Value(iterator(machine, object, kind)?))
 }
+
 fn require_weak_key<H: Host>(machine: &Machine<'_, H>, key: Value) -> Result<(), EvalFailure> {
     let Some(index) = machine.runtime_slot(key).map_err(EvalFailure::Runtime)? else {
         return Err(type_error("Invalid value used as weak collection key"));
     };
-    if matches!(
-        machine.heap[index],
-        HeapEntry::String(_) | HeapEntry::BigInt(_)
-    ) {
-        return Err(type_error("Invalid value used as weak collection key"));
+    let valid = match &machine.heap[index] {
+        HeapEntry::Symbol { .. } => !machine
+            .intrinsics
+            .symbol_registry
+            .values()
+            .any(|registered| *registered == key),
+        HeapEntry::Object { .. }
+        | HeapEntry::Array { .. }
+        | HeapEntry::Function { .. }
+        | HeapEntry::Script { .. }
+        | HeapEntry::ModuleNamespace { .. }
+        | HeapEntry::ExternalModuleNamespace { .. }
+        | HeapEntry::HashState { .. }
+        | HeapEntry::RegExp { .. }
+        | HeapEntry::Date { .. }
+        | HeapEntry::Collection { .. }
+        | HeapEntry::BuiltinIterator { .. }
+        | HeapEntry::Generator { .. }
+        | HeapEntry::AsyncGenerator { .. }
+        | HeapEntry::ProcessEnv { .. }
+        | HeapEntry::Promise { .. }
+        | HeapEntry::Timeout { .. }
+        | HeapEntry::NativeFunction { .. } => true,
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(type_error("Invalid value used as weak collection key"))
     }
-    Ok(())
 }
 
 fn constructor_prototype<H: Host>(
     machine: &Machine<'_, H>,
-    name: &str,
+    kind: CollectionKind,
 ) -> Result<Value, EvalFailure> {
+    let name = match kind {
+        CollectionKind::Map => "Map",
+        CollectionKind::Set => "Set",
+        CollectionKind::WeakMap => "WeakMap",
+        CollectionKind::WeakSet => "WeakSet",
+    };
     let constructor = machine
         .intrinsics
         .global(name)
@@ -885,7 +1037,7 @@ mod tests {
 
     use super::*;
     use crate::intrinsics::BuiltinDef;
-    use crate::{Limits, NativeCallable, ThrowOrigin};
+    use crate::{CollectionEntry, Limits, NativeCallable, RuntimeErrorKind, ThrowOrigin};
 
     #[derive(Default)]
     struct TestHost;
@@ -1064,11 +1216,93 @@ mod tests {
     }
 
     fn collection_entries(machine: &Machine<'_, TestHost>, obj: Value) -> Vec<(Value, Value)> {
-        let slot = collection_slot(machine, obj).unwrap();
+        let slot = machine
+            .runtime_slot(obj)
+            .unwrap()
+            .expect("runtime collection");
         let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
             panic!("not a collection")
         };
-        entries.iter().map(|e| (e.key, e.value)).collect()
+        entries
+            .iter()
+            .map(|entry| (entry.key, entry.value))
+            .collect()
+    }
+
+    fn prototype_method_id(
+        machine: &mut Machine<'_, TestHost>,
+        constructor_name: &str,
+        method_name: &str,
+    ) -> crate::intrinsics::BuiltinId {
+        let constructor = machine
+            .intrinsics
+            .global(constructor_name)
+            .expect("global exists");
+        let prototype = machine
+            .get_named_property(constructor, "prototype")
+            .expect("constructor has prototype");
+        let function = machine
+            .get_named_property(prototype, method_name)
+            .expect("prototype method exists");
+        let index = machine.runtime_slot(function).unwrap().unwrap();
+        match machine.heap[index] {
+            HeapEntry::NativeFunction {
+                callable: NativeCallable::Builtin(id),
+                ..
+            } => id,
+            _ => panic!("prototype method is builtin"),
+        }
+    }
+
+    fn call_prototype_method(
+        machine: &mut Machine<'_, TestHost>,
+        constructor_name: &str,
+        method_name: &str,
+        receiver: Value,
+        arguments: &[Value],
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let id = prototype_method_id(machine, constructor_name, method_name);
+        machine.call_builtin(id, receiver, arguments, false)
+    }
+
+    fn assert_type_error(result: Result<BuiltinOutcome, EvalFailure>) {
+        assert!(matches!(
+            result,
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+    }
+
+    fn symbol_for(machine: &mut Machine<'_, TestHost>, key: Value) -> Value {
+        let symbol = machine.intrinsics.global("Symbol").expect("Symbol exists");
+        let function = machine
+            .get_named_property(symbol, "for")
+            .expect("Symbol.for exists");
+        let index = machine.runtime_slot(function).unwrap().unwrap();
+        let HeapEntry::NativeFunction {
+            callable: NativeCallable::Builtin(id),
+            ..
+        } = machine.heap[index]
+        else {
+            panic!("Symbol.for is builtin")
+        };
+        let BuiltinOutcome::Value(value) = machine
+            .call_builtin(id, Value::UNDEFINED, &[key], false)
+            .expect("Symbol.for returns a symbol")
+        else {
+            panic!("Symbol.for returns a value")
+        };
+        value
+    }
+
+    fn local_symbol(machine: &mut Machine<'_, TestHost>) -> Value {
+        let id = builtin_id(machine, "Symbol");
+        let BuiltinOutcome::Value(value) = machine
+            .call_builtin(id, Value::UNDEFINED, &[], false)
+            .expect("Symbol returns a symbol")
+        else {
+            panic!("Symbol returns a value")
+        };
+        value
     }
 
     // ---- tests -------------------------------------------------------------
@@ -1159,12 +1393,165 @@ mod tests {
         let source = custom_iterable(&mut machine, vec![e1]);
 
         let id = builtin_id(&machine, "WeakMap");
-        let result = machine.call_builtin(id, Value::UNDEFINED, &[source], true);
-        assert!(
-            result.is_err(),
-            "WeakMap must reject primitive key from iterable"
-        );
+        assert_type_error(machine.call_builtin(id, Value::UNDEFINED, &[source], true));
     }
+    #[test]
+    fn collection_methods_reject_every_other_collection_brand() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let map = construct_builtin(&mut machine, "Map", &[]);
+        let set = construct_builtin(&mut machine, "Set", &[]);
+        let weak_map = construct_builtin(&mut machine, "WeakMap", &[]);
+        let weak_set = construct_builtin(&mut machine, "WeakSet", &[]);
+        let key = object(&mut machine);
+
+        for receiver in [set, weak_map, weak_set] {
+            assert_type_error(call_prototype_method(
+                &mut machine,
+                "Map",
+                "set",
+                receiver,
+                &[key, Value::int32(1)],
+            ));
+        }
+        for receiver in [map, weak_map, weak_set] {
+            assert_type_error(call_prototype_method(
+                &mut machine,
+                "Set",
+                "add",
+                receiver,
+                &[key],
+            ));
+        }
+        for receiver in [map, set, weak_set] {
+            assert_type_error(call_prototype_method(
+                &mut machine,
+                "WeakMap",
+                "set",
+                receiver,
+                &[key, Value::int32(1)],
+            ));
+        }
+        for receiver in [map, set, weak_map] {
+            assert_type_error(call_prototype_method(
+                &mut machine,
+                "WeakSet",
+                "add",
+                receiver,
+                &[key],
+            ));
+        }
+        for receiver in [set, weak_map, weak_set] {
+            assert_type_error(call_prototype_method(
+                &mut machine,
+                "Map",
+                "keys",
+                receiver,
+                &[],
+            ));
+        }
+        for receiver in [map, weak_map, weak_set] {
+            assert_type_error(call_prototype_method(
+                &mut machine,
+                "Set",
+                "values",
+                receiver,
+                &[],
+            ));
+        }
+
+        for (constructor, receiver) in [
+            ("Map", map),
+            ("Set", set),
+            ("WeakMap", weak_map),
+            ("WeakSet", weak_set),
+        ] {
+            assert!(matches!(
+                call_prototype_method(&mut machine, constructor, "has", receiver, &[key]),
+                Ok(BuiltinOutcome::Value(Value::FALSE))
+            ));
+        }
+    }
+
+    #[test]
+    fn weak_collections_accept_local_symbol_keys() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let symbol = local_symbol(&mut machine);
+        let weak_map = construct_builtin(&mut machine, "WeakMap", &[]);
+        let weak_set = construct_builtin(&mut machine, "WeakSet", &[]);
+
+        assert!(matches!(
+            call_prototype_method(
+                &mut machine,
+                "WeakMap",
+                "set",
+                weak_map,
+                &[symbol, Value::int32(7)],
+            ),
+            Ok(BuiltinOutcome::Value(value)) if value == weak_map
+        ));
+        assert!(matches!(
+            call_prototype_method(&mut machine, "WeakMap", "get", weak_map, &[symbol]),
+            Ok(BuiltinOutcome::Value(value)) if value == Value::int32(7)
+        ));
+        assert!(matches!(
+            call_prototype_method(&mut machine, "WeakSet", "add", weak_set, &[symbol]),
+            Ok(BuiltinOutcome::Value(value)) if value == weak_set
+        ));
+        assert!(matches!(
+            call_prototype_method(&mut machine, "WeakSet", "has", weak_set, &[symbol]),
+            Ok(BuiltinOutcome::Value(Value::TRUE))
+        ));
+    }
+
+    #[test]
+    fn weak_collections_reject_registered_symbol_keys() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let symbol = symbol_for(&mut machine, Value::int32(1));
+        let weak_map = construct_builtin(&mut machine, "WeakMap", &[]);
+
+        assert_type_error(call_prototype_method(
+            &mut machine,
+            "WeakMap",
+            "set",
+            weak_map,
+            &[symbol, Value::int32(7)],
+        ));
+        let entry = entry_pair(&mut machine, symbol, Value::int32(7));
+        let source = custom_iterable(&mut machine, vec![entry]);
+        let id = builtin_id(&machine, "WeakMap");
+        assert_type_error(machine.call_builtin(id, Value::UNDEFINED, &[source], true));
+    }
+
+    #[test]
+    fn weak_collection_mutators_reject_primitive_keys() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let weak_map = construct_builtin(&mut machine, "WeakMap", &[]);
+        let weak_set = construct_builtin(&mut machine, "WeakSet", &[]);
+
+        assert_type_error(call_prototype_method(
+            &mut machine,
+            "WeakMap",
+            "set",
+            weak_map,
+            &[Value::int32(1), Value::int32(7)],
+        ));
+        assert_type_error(call_prototype_method(
+            &mut machine,
+            "WeakSet",
+            "add",
+            weak_set,
+            &[Value::int32(1)],
+        ));
+    }
+
     #[test]
     fn map_consumes_array_through_protocol() {
         let module = module();
@@ -1424,5 +1811,222 @@ mod tests {
                 (false, false, true)
             );
         }
+    }
+    fn root(machine: &mut Machine<'_, TestHost>, name: &str, value: Value) {
+        machine.globals.insert(EcmaString::from_utf8(name), value);
+    }
+
+    fn slot(machine: &Machine<'_, TestHost>, value: Value) -> usize {
+        machine
+            .runtime_slot(value)
+            .unwrap()
+            .expect("live runtime slot")
+    }
+
+    #[test]
+    fn collector_vacates_dead_slots_without_moving_survivors() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let dead = object(&mut machine);
+        let survivor = object(&mut machine);
+        let survivor_slot = slot(&machine, survivor);
+        let dead_slot = slot(&machine, dead);
+        root(&mut machine, "survivor", survivor);
+
+        machine.collect_garbage();
+
+        assert!(matches!(machine.heap[dead_slot], HeapEntry::Vacant));
+        assert_eq!(slot(&machine, survivor), survivor_slot);
+        assert_eq!(
+            machine.globals[&EcmaString::from_utf8("survivor")],
+            survivor
+        );
+        assert!(matches!(
+            machine.runtime_slot(dead),
+            Err(RuntimeErrorKind::InvalidRuntimeHeapReference { .. })
+        ));
+    }
+
+    #[test]
+    fn collector_traces_map_and_set_entries_strongly() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let map = construct_builtin(&mut machine, "Map", &[]);
+        let set = construct_builtin(&mut machine, "Set", &[]);
+        let map_key = object(&mut machine);
+        let map_value = object(&mut machine);
+        let set_value = object(&mut machine);
+        map_put(&mut machine, map, map_key, map_value, CollectionKind::Map).unwrap();
+        set_put(&mut machine, set, set_value, CollectionKind::Set).unwrap();
+        root(&mut machine, "map", map);
+        root(&mut machine, "set", set);
+
+        machine.collect_garbage();
+
+        assert!(machine.runtime_slot(map_key).unwrap().is_some());
+        assert!(machine.runtime_slot(map_value).unwrap().is_some());
+        assert!(machine.runtime_slot(set_value).unwrap().is_some());
+        assert_eq!(
+            collection_entries(&machine, map),
+            vec![(map_key, map_value)]
+        );
+        assert_eq!(
+            collection_entries(&machine, set),
+            vec![(set_value, set_value)]
+        );
+    }
+
+    #[test]
+    fn collector_purges_dead_weak_keys_and_refunds_entry_charges() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let weak_map = construct_builtin(&mut machine, "WeakMap", &[]);
+        let weak_set = construct_builtin(&mut machine, "WeakSet", &[]);
+        let map_key = object(&mut machine);
+        let map_value = object(&mut machine);
+        let set_key = object(&mut machine);
+        map_put(
+            &mut machine,
+            weak_map,
+            map_key,
+            map_value,
+            CollectionKind::WeakMap,
+        )
+        .unwrap();
+        set_put(&mut machine, weak_set, set_key, CollectionKind::WeakSet).unwrap();
+        root(&mut machine, "weakMap", weak_map);
+        root(&mut machine, "weakSet", weak_set);
+        let dead_slot_bytes = [map_key, map_value, set_key]
+            .into_iter()
+            .map(|value| machine.slot_bytes[slot(&machine, value)])
+            .sum::<usize>();
+        let before = machine.heap_bytes;
+
+        machine.collect_garbage();
+
+        assert!(collection_entries(&machine, weak_map).is_empty());
+        assert!(collection_entries(&machine, weak_set).is_empty());
+        assert_eq!(
+            machine.heap_bytes,
+            before - dead_slot_bytes - 2 * CollectionEntry::BYTES
+        );
+    }
+
+    #[test]
+    fn collector_keeps_weak_map_value_when_key_is_live() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let weak_map = construct_builtin(&mut machine, "WeakMap", &[]);
+        let key = object(&mut machine);
+        let value = object(&mut machine);
+        map_put(&mut machine, weak_map, key, value, CollectionKind::WeakMap).unwrap();
+        root(&mut machine, "weakMap", weak_map);
+        root(&mut machine, "key", key);
+
+        machine.collect_garbage();
+
+        assert!(machine.runtime_slot(value).unwrap().is_some());
+        assert_eq!(collection_entries(&machine, weak_map), vec![(key, value)]);
+    }
+
+    #[test]
+    fn collector_reaches_cross_weak_map_ephemeron_fixed_point() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let first = construct_builtin(&mut machine, "WeakMap", &[]);
+        let second = construct_builtin(&mut machine, "WeakMap", &[]);
+        let first_key = object(&mut machine);
+        let second_key = object(&mut machine);
+        let value = object(&mut machine);
+        map_put(
+            &mut machine,
+            first,
+            first_key,
+            second_key,
+            CollectionKind::WeakMap,
+        )
+        .unwrap();
+        map_put(
+            &mut machine,
+            second,
+            second_key,
+            value,
+            CollectionKind::WeakMap,
+        )
+        .unwrap();
+        root(&mut machine, "first", first);
+        root(&mut machine, "second", second);
+        root(&mut machine, "firstKey", first_key);
+
+        machine.collect_garbage();
+
+        assert!(machine.runtime_slot(second_key).unwrap().is_some());
+        assert!(machine.runtime_slot(value).unwrap().is_some());
+        assert_eq!(
+            collection_entries(&machine, second),
+            vec![(second_key, value)]
+        );
+    }
+
+    #[test]
+    fn collector_drops_weak_only_key_value_cycle() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let weak_map = construct_builtin(&mut machine, "WeakMap", &[]);
+        let key = object(&mut machine);
+        let value = object(&mut machine);
+        machine.set_data_property(value, "key", key).unwrap();
+        map_put(&mut machine, weak_map, key, value, CollectionKind::WeakMap).unwrap();
+        root(&mut machine, "weakMap", weak_map);
+
+        machine.collect_garbage();
+
+        assert!(collection_entries(&machine, weak_map).is_empty());
+        assert!(matches!(machine.runtime_slot(key), Err(_)));
+        assert!(matches!(machine.runtime_slot(value), Err(_)));
+    }
+
+    #[test]
+    fn collector_allows_local_symbol_weak_keys_to_die() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let weak_map = construct_builtin(&mut machine, "WeakMap", &[]);
+        let symbol = local_symbol(&mut machine);
+        let value = object(&mut machine);
+        map_put(
+            &mut machine,
+            weak_map,
+            symbol,
+            value,
+            CollectionKind::WeakMap,
+        )
+        .unwrap();
+        root(&mut machine, "weakMap", weak_map);
+
+        machine.collect_garbage();
+
+        assert!(collection_entries(&machine, weak_map).is_empty());
+        assert!(matches!(machine.runtime_slot(symbol), Err(_)));
+        assert!(matches!(machine.runtime_slot(value), Err(_)));
+    }
+
+    #[test]
+    fn collector_preserves_registered_symbol_roots() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let symbol = symbol_for(&mut machine, Value::int32(17));
+        let symbol_slot = slot(&machine, symbol);
+
+        machine.collect_garbage();
+
+        assert_eq!(slot(&machine, symbol), symbol_slot);
     }
 }

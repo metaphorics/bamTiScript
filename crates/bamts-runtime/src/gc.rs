@@ -1,0 +1,713 @@
+use super::*;
+
+#[derive(Default)]
+pub(super) struct GcState {
+    marks: Vec<bool>,
+    work: Vec<usize>,
+    weak_collections: Vec<usize>,
+    pending: bool,
+}
+
+impl<'a, H: Host> Machine<'a, H> {
+    pub(crate) fn collect_garbage(&mut self) {
+        let mut gc = std::mem::take(&mut self.gc);
+        gc.collect(self);
+        self.gc = gc;
+    }
+
+    pub(crate) fn collect_if_pending(&mut self) {
+        if self.gc.pending {
+            self.collect_garbage();
+        }
+    }
+
+    pub(crate) fn push_native_roots(&mut self, depth: usize, roots: &[Value]) {
+        assert_eq!(depth, self.native_roots.len(), "native root depth mismatch");
+        self.native_roots.push(roots.to_vec());
+    }
+
+    pub(crate) fn refresh_native_roots(&mut self, depth: usize, roots: &[Value]) {
+        assert_eq!(
+            depth + 1,
+            self.native_roots.len(),
+            "native root depth mismatch"
+        );
+        let frame = self
+            .native_roots
+            .last_mut()
+            .expect("a matching native root frame exists");
+        frame.clear();
+        frame.extend_from_slice(roots);
+    }
+
+    pub(crate) fn pop_native_roots(&mut self, depth: usize) {
+        assert_eq!(
+            depth + 1,
+            self.native_roots.len(),
+            "native root depth mismatch"
+        );
+        self.native_roots.pop();
+    }
+}
+
+impl GcState {
+    fn collect<H: Host>(&mut self, machine: &mut Machine<'_, H>) {
+        self.marks.resize(machine.heap.len(), false);
+        self.marks.fill(false);
+        self.work.clear();
+        self.weak_collections.clear();
+
+        self.trace_roots(machine);
+        self.drain(&machine.heap);
+        self.ephemeron_fixed_point(&machine.heap);
+        self.purge_weak_entries(machine);
+        self.sweep(machine);
+        self.pending = false;
+
+        debug_assert_eq!(machine.slot_bytes.len(), machine.heap.len());
+        debug_assert_eq!(
+            machine.heap_bytes,
+            machine.machine_bytes + machine.slot_bytes.iter().sum::<usize>()
+        );
+    }
+
+    fn trace_roots<H: Host>(&mut self, machine: &Machine<'_, H>) {
+        for index in 0..machine.intrinsic_slots {
+            mark_index(&machine.heap, &mut self.marks, &mut self.work, index);
+        }
+
+        for frame in &machine.frames {
+            self.mark_values(&machine.heap, &frame.registers);
+            self.mark_value(&machine.heap, frame.this_value);
+            self.mark_value(&machine.heap, frame.new_target);
+            self.mark_values(&machine.heap, &frame.args);
+            if let Some(value) = frame.arguments_object {
+                self.mark_value(&machine.heap, value);
+            }
+            if let Some(value) = frame.return_to.and_then(|return_to| return_to.constructed) {
+                self.mark_value(&machine.heap, value);
+            }
+        }
+        for value in machine.globals.values().copied() {
+            self.mark_value(&machine.heap, value);
+        }
+        if let Some(value) = machine.last_completion {
+            self.mark_value(&machine.heap, value);
+        }
+        if let Some(resume) = &machine.pending_generator_resume {
+            trace_generator_resume(resume, &machine.heap, &mut self.marks, &mut self.work);
+        }
+        if let Some((awaited, activation)) = &machine.pending_async_suspend {
+            mark_value(&machine.heap, &mut self.marks, &mut self.work, *awaited);
+            trace_activation(activation, &machine.heap, &mut self.marks, &mut self.work);
+        }
+        for job in &machine.microtasks {
+            trace_microtask(job, &machine.heap, &mut self.marks, &mut self.work);
+        }
+        for timer in machine.timers.values() {
+            self.mark_value(&machine.heap, timer.callback);
+            self.mark_values(&machine.heap, &timer.arguments);
+            self.mark_value(&machine.heap, timer.handle);
+        }
+        machine.intrinsics.for_each_value(|value| {
+            mark_value(&machine.heap, &mut self.marks, &mut self.work, value);
+        });
+        for module in &machine.registry.modules {
+            if let Some(value) = module.namespace {
+                self.mark_value(&machine.heap, value);
+            }
+            match &module.state {
+                ModuleState::Unevaluated | ModuleState::Evaluating => {}
+                ModuleState::EvaluatingAsync {
+                    record, promise, ..
+                } => {
+                    self.mark_value(&machine.heap, *record);
+                    self.mark_value(&machine.heap, *promise);
+                }
+                ModuleState::Evaluated(Ok(())) => {}
+                ModuleState::Evaluated(Err(error)) => {
+                    trace_runtime_error(error, &machine.heap, &mut self.marks, &mut self.work);
+                }
+            }
+        }
+        for cell in &machine.registry.cells {
+            self.mark_value(&machine.heap, cell.value);
+        }
+        for external in machine.registry.external.values() {
+            self.mark_value(&machine.heap, external.namespace);
+            for export in external.exports.values() {
+                self.mark_value(&machine.heap, export.value);
+            }
+            for value in external.internals.values().copied() {
+                self.mark_value(&machine.heap, value);
+            }
+        }
+        for roots in &machine.native_roots {
+            self.mark_values(&machine.heap, roots);
+        }
+    }
+
+    fn mark_value(&mut self, heap: &[HeapEntry], value: Value) {
+        mark_value(heap, &mut self.marks, &mut self.work, value);
+    }
+
+    fn mark_values(&mut self, heap: &[HeapEntry], values: &[Value]) {
+        for value in values {
+            self.mark_value(heap, *value);
+        }
+    }
+
+    fn drain(&mut self, heap: &[HeapEntry]) {
+        while let Some(index) = self.work.pop() {
+            trace_entry(
+                &heap[index],
+                index,
+                heap,
+                &mut self.marks,
+                &mut self.work,
+                &mut self.weak_collections,
+            );
+        }
+    }
+
+    fn ephemeron_fixed_point(&mut self, heap: &[HeapEntry]) {
+        loop {
+            let marked_before = self.marks.iter().filter(|marked| **marked).count();
+            let weak_count = self.weak_collections.len();
+            for list_index in 0..weak_count {
+                let slot = self.weak_collections[list_index];
+                let HeapEntry::Collection {
+                    kind: CollectionKind::WeakMap,
+                    entries,
+                    ..
+                } = &heap[slot]
+                else {
+                    continue;
+                };
+                for entry in entries {
+                    if is_marked_value(&self.marks, entry.key) {
+                        mark_value(heap, &mut self.marks, &mut self.work, entry.value);
+                    }
+                }
+            }
+            self.drain(heap);
+            if self.marks.iter().filter(|marked| **marked).count() == marked_before {
+                break;
+            }
+        }
+    }
+
+    fn purge_weak_entries<H: Host>(&self, machine: &mut Machine<'_, H>) {
+        for &index in &self.weak_collections {
+            if !self.marks[index] {
+                continue;
+            }
+            let removed = match &mut machine.heap[index] {
+                HeapEntry::Collection {
+                    kind: CollectionKind::WeakMap | CollectionKind::WeakSet,
+                    entries,
+                    ..
+                } => {
+                    let old_len = entries.len();
+                    entries.retain(|entry| is_marked_value(&self.marks, entry.key));
+                    old_len - entries.len()
+                }
+                _ => 0,
+            };
+            let refund = removed * CollectionEntry::BYTES;
+            debug_assert!(machine.slot_bytes[index] >= refund);
+            machine.slot_bytes[index] -= refund;
+            machine.heap_bytes -= refund;
+        }
+    }
+
+    fn sweep<H: Host>(&self, machine: &mut Machine<'_, H>) {
+        for index in machine.intrinsic_slots..machine.heap.len() {
+            if self.marks[index] || matches!(machine.heap[index], HeapEntry::Vacant) {
+                continue;
+            }
+            machine.heap[index] = HeapEntry::Vacant;
+            let charge = std::mem::take(&mut machine.slot_bytes[index]);
+            machine.heap_bytes -= charge;
+            machine.vacant_count += 1;
+        }
+    }
+}
+
+fn runtime_index(value: Value) -> Option<usize> {
+    let Decoded::HeapRef(id) = value.decode()? else {
+        return None;
+    };
+    (id.segment() == RUNTIME_HEAP_SEGMENT).then(|| id.slot() as usize - 1)
+}
+
+fn is_marked_value(marks: &[bool], value: Value) -> bool {
+    runtime_index(value).is_some_and(|index| marks.get(index).copied().unwrap_or(false))
+}
+
+fn mark_value(heap: &[HeapEntry], marks: &mut [bool], work: &mut Vec<usize>, value: Value) {
+    let Some(index) = runtime_index(value) else {
+        return;
+    };
+    mark_index(heap, marks, work, index);
+}
+
+fn mark_index(heap: &[HeapEntry], marks: &mut [bool], work: &mut Vec<usize>, index: usize) {
+    if index >= heap.len() || marks[index] || matches!(heap[index], HeapEntry::Vacant) {
+        return;
+    }
+    marks[index] = true;
+    work.push(index);
+}
+
+fn trace_property_map(
+    properties: &PropertyMap,
+    heap: &[HeapEntry],
+    marks: &mut [bool],
+    work: &mut Vec<usize>,
+) {
+    for (key, property) in properties {
+        match key {
+            PropertyKey::Named(_) => {}
+            PropertyKey::Symbol(index) | PropertyKey::Private(index) => {
+                mark_index(heap, marks, work, *index as usize);
+            }
+        }
+        match property {
+            Property::Data { value, .. } => mark_value(heap, marks, work, *value),
+            Property::Accessor { getter, setter, .. } => {
+                if let Some(value) = getter {
+                    mark_value(heap, marks, work, *value);
+                }
+                if let Some(value) = setter {
+                    mark_value(heap, marks, work, *value);
+                }
+            }
+        }
+    }
+}
+
+fn trace_properties_and_prototype(
+    properties: &PropertyMap,
+    prototype: Option<Value>,
+    heap: &[HeapEntry],
+    marks: &mut [bool],
+    work: &mut Vec<usize>,
+) {
+    trace_property_map(properties, heap, marks, work);
+    if let Some(value) = prototype {
+        mark_value(heap, marks, work, value);
+    }
+}
+
+fn trace_values(heap: &[HeapEntry], marks: &mut [bool], work: &mut Vec<usize>, values: &[Value]) {
+    for value in values {
+        mark_value(heap, marks, work, *value);
+    }
+}
+
+fn trace_activation(
+    activation: &SuspendedActivation,
+    heap: &[HeapEntry],
+    marks: &mut [bool],
+    work: &mut Vec<usize>,
+) {
+    trace_values(heap, marks, work, &activation.registers);
+    mark_value(heap, marks, work, activation.this_value);
+    mark_value(heap, marks, work, activation.new_target);
+    trace_values(heap, marks, work, &activation.args);
+    if let Some(value) = activation.arguments_object {
+        mark_value(heap, marks, work, value);
+    }
+}
+
+fn trace_generator_start(
+    start: &GeneratorStart,
+    heap: &[HeapEntry],
+    marks: &mut [bool],
+    work: &mut Vec<usize>,
+) {
+    trace_values(heap, marks, work, &start.captures);
+    mark_value(heap, marks, work, start.this_value);
+    mark_value(heap, marks, work, start.new_target);
+    trace_values(heap, marks, work, &start.args);
+}
+
+fn trace_generator_state(
+    state: &GeneratorState,
+    heap: &[HeapEntry],
+    marks: &mut [bool],
+    work: &mut Vec<usize>,
+) {
+    match state {
+        GeneratorState::SuspendedStart(start) => trace_generator_start(start, heap, marks, work),
+        GeneratorState::Suspended(activation) => trace_activation(activation, heap, marks, work),
+        GeneratorState::Executing | GeneratorState::Completed => {}
+    }
+}
+
+fn trace_async_generator_state(
+    state: &AsyncGeneratorState,
+    heap: &[HeapEntry],
+    marks: &mut [bool],
+    work: &mut Vec<usize>,
+) {
+    match state {
+        AsyncGeneratorState::SuspendedStart(start) => {
+            trace_generator_start(start, heap, marks, work)
+        }
+        AsyncGeneratorState::SuspendedYield(activation)
+        | AsyncGeneratorState::AwaitingOperand(activation)
+        | AsyncGeneratorState::AwaitingYield(activation) => {
+            trace_activation(activation, heap, marks, work);
+        }
+        AsyncGeneratorState::Executing
+        | AsyncGeneratorState::AwaitingReturn
+        | AsyncGeneratorState::Completed => {}
+    }
+}
+
+fn trace_generator_resume(
+    resume: &GeneratorResume,
+    heap: &[HeapEntry],
+    marks: &mut [bool],
+    work: &mut Vec<usize>,
+) {
+    match resume {
+        GeneratorResume::Yield { value, activation } => {
+            mark_value(heap, marks, work, *value);
+            trace_activation(activation, heap, marks, work);
+        }
+        GeneratorResume::Return(value) | GeneratorResume::Throw { value, .. } => {
+            mark_value(heap, marks, work, *value);
+        }
+    }
+}
+
+fn trace_promise_reaction(
+    reaction: &PromiseReaction,
+    heap: &[HeapEntry],
+    marks: &mut [bool],
+    work: &mut Vec<usize>,
+) {
+    match reaction {
+        PromiseReaction::Fulfilled { handler, derived }
+        | PromiseReaction::Rejected { handler, derived }
+        | PromiseReaction::Finally {
+            handler, derived, ..
+        } => {
+            mark_value(heap, marks, work, *handler);
+            mark_value(heap, marks, work, *derived);
+        }
+        PromiseReaction::AsyncFulfill { activation }
+        | PromiseReaction::AsyncReject { activation } => {
+            mark_value(heap, marks, work, *activation);
+        }
+        PromiseReaction::AsyncGeneratorFulfill { generator }
+        | PromiseReaction::AsyncGeneratorReject { generator } => {
+            mark_value(heap, marks, work, *generator);
+        }
+        PromiseReaction::ModuleDepFulfill { .. } | PromiseReaction::ModuleDepReject { .. } => {}
+        PromiseReaction::AsyncFromSyncFulfill { derived, .. } => {
+            mark_value(heap, marks, work, *derived);
+        }
+        PromiseReaction::AsyncFromSyncReject {
+            derived,
+            sync_iterator,
+            ..
+        } => {
+            mark_value(heap, marks, work, *derived);
+            mark_value(heap, marks, work, *sync_iterator);
+        }
+    }
+}
+
+fn trace_promise_state(
+    state: &PromiseState,
+    heap: &[HeapEntry],
+    marks: &mut [bool],
+    work: &mut Vec<usize>,
+) {
+    match state {
+        PromiseState::Pending {
+            fulfill_reactions,
+            reject_reactions,
+        } => {
+            for reaction in fulfill_reactions.iter().chain(reject_reactions) {
+                trace_promise_reaction(reaction, heap, marks, work);
+            }
+        }
+        PromiseState::Fulfilled { value } => mark_value(heap, marks, work, *value),
+        PromiseState::Rejected { reason, .. } => mark_value(heap, marks, work, *reason),
+    }
+}
+
+fn trace_microtask(
+    job: &MicrotaskJob,
+    heap: &[HeapEntry],
+    marks: &mut [bool],
+    work: &mut Vec<usize>,
+) {
+    match job {
+        MicrotaskJob::Reaction {
+            reaction, value, ..
+        } => {
+            trace_promise_reaction(reaction, heap, marks, work);
+            mark_value(heap, marks, work, *value);
+        }
+        MicrotaskJob::Thenable {
+            promise,
+            thenable,
+            then,
+        } => {
+            mark_value(heap, marks, work, *promise);
+            mark_value(heap, marks, work, *thenable);
+            mark_value(heap, marks, work, *then);
+        }
+        MicrotaskJob::Callback { callback } => mark_value(heap, marks, work, *callback),
+    }
+}
+
+fn trace_execution(
+    execution: &Execution,
+    heap: &[HeapEntry],
+    marks: &mut [bool],
+    work: &mut Vec<usize>,
+) {
+    mark_value(heap, marks, work, execution.value);
+    mark_value(heap, marks, work, execution.link);
+    trace_values(heap, marks, work, &execution.entry_registers);
+}
+
+fn trace_runtime_error(
+    error: &RuntimeError,
+    heap: &[HeapEntry],
+    marks: &mut [bool],
+    work: &mut Vec<usize>,
+) {
+    match &error.kind {
+        RuntimeErrorKind::UncaughtThrow { value, .. }
+        | RuntimeErrorKind::InvalidValue { value } => {
+            mark_value(heap, marks, work, *value);
+        }
+        RuntimeErrorKind::FuelExhausted { .. }
+        | RuntimeErrorKind::CallDepthExceeded { .. }
+        | RuntimeErrorKind::RegisterLimitExceeded { .. }
+        | RuntimeErrorKind::ArgumentLimitExceeded { .. }
+        | RuntimeErrorKind::HeapSlotLimitExceeded { .. }
+        | RuntimeErrorKind::HeapByteLimitExceeded { .. }
+        | RuntimeErrorKind::ModuleCellLimitExceeded { .. }
+        | RuntimeErrorKind::DynamicModuleLimitExceeded { .. }
+        | RuntimeErrorKind::MicrotaskQueueLimitExceeded { .. }
+        | RuntimeErrorKind::MicrotaskDrainReentry
+        | RuntimeErrorKind::TimerProviderFailure { .. }
+        | RuntimeErrorKind::TimerCapacityExceeded { .. }
+        | RuntimeErrorKind::TimerCheckpointReentry
+        | RuntimeErrorKind::InvalidDynamicScript { .. }
+        | RuntimeErrorKind::TemporalDeadZone { .. }
+        | RuntimeErrorKind::ExternalModuleUnavailable { .. }
+        | RuntimeErrorKind::DynamicImportEdgeMissing { .. }
+        | RuntimeErrorKind::InvalidVerifiedProgram { .. }
+        | RuntimeErrorKind::InvalidRuntimeHeapReference { .. }
+        | RuntimeErrorKind::ModuleEvaluationStalled { .. } => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_entry(
+    entry: &HeapEntry,
+    index: usize,
+    heap: &[HeapEntry],
+    marks: &mut [bool],
+    work: &mut Vec<usize>,
+    weak_collections: &mut Vec<usize>,
+) {
+    match entry {
+        HeapEntry::Vacant
+        | HeapEntry::String(_)
+        | HeapEntry::BigInt(_)
+        | HeapEntry::ModuleNamespace { .. }
+        | HeapEntry::ExternalModuleNamespace { .. }
+        | HeapEntry::Symbol { .. }
+        | HeapEntry::PrivateName { .. } => {}
+        HeapEntry::Object {
+            properties,
+            prototype,
+            boxed_primitive,
+            ..
+        } => {
+            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+            if let Some(value) = boxed_primitive {
+                mark_value(heap, marks, work, *value);
+            }
+        }
+        HeapEntry::Array {
+            elements,
+            properties,
+            prototype,
+            ..
+        } => {
+            trace_values(heap, marks, work, elements);
+            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+        }
+        HeapEntry::Function {
+            captures,
+            properties,
+            prototype,
+            ..
+        } => {
+            trace_values(heap, marks, work, captures);
+            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+        }
+        HeapEntry::Script {
+            entry,
+            properties,
+            prototype,
+            ..
+        } => {
+            mark_value(heap, marks, work, *entry);
+            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+        }
+        HeapEntry::HashState { update, digest, .. } => {
+            mark_value(heap, marks, work, *update);
+            mark_value(heap, marks, work, *digest);
+        }
+        HeapEntry::RegExp {
+            properties,
+            prototype,
+            ..
+        }
+        | HeapEntry::Date {
+            properties,
+            prototype,
+            ..
+        }
+        | HeapEntry::Timeout {
+            properties,
+            prototype,
+            ..
+        } => trace_properties_and_prototype(properties, *prototype, heap, marks, work),
+        HeapEntry::Collection {
+            kind,
+            entries,
+            properties,
+            prototype,
+            ..
+        } => {
+            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+            match kind {
+                CollectionKind::Map | CollectionKind::Set => {
+                    for entry in entries {
+                        mark_value(heap, marks, work, entry.key);
+                        mark_value(heap, marks, work, entry.value);
+                    }
+                }
+                CollectionKind::WeakMap | CollectionKind::WeakSet => {
+                    weak_collections.push(index);
+                }
+            }
+        }
+        HeapEntry::BuiltinIterator {
+            source,
+            properties,
+            prototype,
+            ..
+        } => {
+            mark_value(heap, marks, work, *source);
+            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+        }
+        HeapEntry::Iterator { state } => match state {
+            IteratorState::Keys { .. } => {}
+            IteratorState::Protocol { iterator, next }
+            | IteratorState::AsyncFromSync { iterator, next } => {
+                mark_value(heap, marks, work, *iterator);
+                mark_value(heap, marks, work, *next);
+            }
+        },
+        HeapEntry::Generator {
+            state,
+            properties,
+            prototype,
+            ..
+        } => {
+            trace_generator_state(state, heap, marks, work);
+            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+        }
+        HeapEntry::AsyncGenerator {
+            state,
+            queue,
+            properties,
+            prototype,
+            ..
+        } => {
+            trace_async_generator_state(state, heap, marks, work);
+            for request in queue {
+                mark_value(heap, marks, work, request.resume_value);
+                mark_value(heap, marks, work, request.capability);
+            }
+            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+        }
+        HeapEntry::ProcessEnv { prototype, .. } => {
+            if let Some(value) = prototype {
+                mark_value(heap, marks, work, *value);
+            }
+        }
+        HeapEntry::Promise {
+            state,
+            properties,
+            prototype,
+            ..
+        } => {
+            trace_promise_state(state, heap, marks, work);
+            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+        }
+        HeapEntry::PromiseResolver { promise, .. } => {
+            mark_value(heap, marks, work, *promise);
+        }
+        HeapEntry::PromiseFinally { derived, value, .. } => {
+            mark_value(heap, marks, work, *derived);
+            mark_value(heap, marks, work, *value);
+        }
+        HeapEntry::PromiseAll {
+            promise, values, ..
+        } => {
+            mark_value(heap, marks, work, *promise);
+            trace_values(heap, marks, work, values);
+        }
+        HeapEntry::PromiseAllElement { aggregate, .. } => {
+            mark_value(heap, marks, work, *aggregate);
+        }
+        HeapEntry::AsyncActivation {
+            activation,
+            promise,
+            completion,
+            ..
+        } => {
+            if let Some(activation) = activation {
+                trace_activation(activation, heap, marks, work);
+            }
+            mark_value(heap, marks, work, *promise);
+            if let Some(completion) = completion {
+                match completion {
+                    Ok(execution) => trace_execution(execution, heap, marks, work),
+                    Err(error) => trace_runtime_error(error, heap, marks, work),
+                }
+            }
+        }
+        HeapEntry::NativeFunction {
+            callable,
+            properties,
+            ..
+        } => {
+            match callable {
+                NativeCallable::Builtin(_) => {}
+                NativeCallable::Bound(bound) => {
+                    mark_value(heap, marks, work, bound.target);
+                    mark_value(heap, marks, work, bound.this_value);
+                    trace_values(heap, marks, work, &bound.arguments);
+                }
+            }
+            trace_property_map(properties, heap, marks, work);
+        }
+    }
+}

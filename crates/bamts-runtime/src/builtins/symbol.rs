@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use bamts_bytecode::EcmaString;
-use bamts_native::{Decoded, Value};
+use bamts_native::Value;
 
 use super::{
     allocate_string, builtin_property, define_data, heap_index, install_function, type_error,
@@ -141,7 +141,7 @@ fn symbol_for<H: Host>(
         })
         .map_err(EvalFailure::Runtime)?;
     machine
-        .charge_heap(PropertyKey::Named(key.clone()).charge_bytes())
+        .charge_machine(PropertyKey::Named(key.clone()).charge_bytes())
         .map_err(EvalFailure::Runtime)?;
     machine.intrinsics.symbol_registry.insert(key, symbol);
     Ok(BuiltinOutcome::Value(symbol))
@@ -151,12 +151,11 @@ fn symbol_description<H: Host>(
     machine: &Machine<'_, H>,
     value: Value,
 ) -> Result<EcmaString, EvalFailure> {
-    let Some(Decoded::HeapRef(id)) = value.decode() else {
+    let Some(index) = machine.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
         return Err(type_error("Symbol method called on incompatible receiver"));
     };
-    let index = id.slot() as usize - 1;
-    match machine.heap.get(index) {
-        Some(HeapEntry::Symbol { description }) => Ok(description.clone()),
+    match &machine.heap[index] {
+        HeapEntry::Symbol { description } => Ok(description.clone()),
         _ => Err(type_error("Symbol method called on incompatible receiver")),
     }
 }

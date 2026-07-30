@@ -36,6 +36,7 @@ use bamts_bytecode::{
 use bamts_native::{Decoded, SlotId, Value};
 
 mod external_modules;
+mod gc;
 mod host_objects;
 mod intrinsics;
 mod native;
@@ -920,8 +921,17 @@ enum TimerWait {
     Idle,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CollectionKind {
+    Map,
+    Set,
+    WeakMap,
+    WeakSet,
+}
+
 #[derive(Clone, Debug)]
 enum HeapEntry {
+    Vacant,
     String(EcmaString),
     BigInt(String),
     Object {
@@ -988,6 +998,7 @@ enum HeapEntry {
     /// can remove storage without moving an iterator's logical cursor.
     /// Weak collections share this strong storage until the runtime has a collector.
     Collection {
+        kind: CollectionKind,
         entries: Vec<CollectionEntry>,
         next_order: u64,
         properties: PropertyMap,
@@ -1091,6 +1102,7 @@ pub(crate) struct BoundCallable {
 impl HeapEntry {
     fn initial_bytes(&self) -> usize {
         match self {
+            Self::Vacant => 0,
             Self::String(text)
             | Self::Symbol { description: text }
             | Self::PrivateName { description: text } => text.len_units().saturating_mul(2),
@@ -1326,9 +1338,14 @@ pub struct Machine<'a, H: Host> {
     module: &'a Module<Verified>,
     host: &'a mut H,
     limits: Limits,
+    gc: gc::GcState,
+    native_roots: Vec<Vec<Value>>,
     frames: Vec<Frame>,
     heap: Vec<HeapEntry>,
+    slot_bytes: Vec<usize>,
+    machine_bytes: usize,
     intrinsic_slots: usize,
+    vacant_count: usize,
     heap_bytes: usize,
     live_registers: usize,
     native_depth: usize,
@@ -1549,17 +1566,23 @@ impl<'a, H: Host> Machine<'a, H> {
         };
         *elements = argv_values;
         let intrinsic_slots = heap.len();
+        let slot_bytes = vec![0; intrinsic_slots];
         let fuel = limits.fuel;
         Self {
             program,
             module,
             host,
             limits,
+            gc: gc::GcState::default(),
+            native_roots: Vec::new(),
             fuel,
             frames: vec![frame],
             heap,
-            heap_bytes: 0,
+            slot_bytes,
+            machine_bytes: 0,
             intrinsic_slots,
+            vacant_count: 0,
+            heap_bytes: 0,
             live_registers,
             native_depth: 0,
             last_completion: None,
@@ -2476,7 +2499,7 @@ impl<'a, H: Host> Machine<'a, H> {
             });
             return Ok(());
         }
-        self.charge_promise_reactions(2)?;
+        self.charge_promise_reactions(index, 2)?;
         let HeapEntry::Promise {
             state:
                 PromiseState::Pending {
@@ -2627,7 +2650,7 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(Some(*promise))
     }
 
-    fn charge_promise_reactions(&mut self, count: usize) -> Result<(), EvalFailure> {
+    fn charge_promise_reactions(&mut self, index: usize, count: usize) -> Result<(), EvalFailure> {
         let bytes = std::mem::size_of::<PromiseReaction>()
             .checked_mul(count)
             .ok_or(EvalFailure::Runtime(
@@ -2635,7 +2658,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     limit: self.limits.max_heap_bytes,
                 },
             ))?;
-        self.charge_heap(bytes).map_err(EvalFailure::Runtime)
+        self.charge_slot(index, bytes).map_err(EvalFailure::Runtime)
     }
 
     pub(crate) fn promise_then(
@@ -2691,7 +2714,7 @@ impl<'a, H: Host> Machine<'a, H> {
             });
             return Ok(derived);
         }
-        self.charge_promise_reactions(2)?;
+        self.charge_promise_reactions(index, 2)?;
         let HeapEntry::Promise {
             state:
                 PromiseState::Pending {
@@ -2764,7 +2787,7 @@ impl<'a, H: Host> Machine<'a, H> {
             });
             return Ok(derived);
         }
-        self.charge_promise_reactions(2)?;
+        self.charge_promise_reactions(index, 2)?;
         let HeapEntry::Promise {
             state:
                 PromiseState::Pending {
@@ -3038,7 +3061,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 }));
             }
         };
-        self.charge_heap(std::mem::size_of::<Value>())
+        self.charge_slot(index, std::mem::size_of::<Value>())
             .map_err(EvalFailure::Runtime)?;
         let HeapEntry::PromiseAll {
             values, remaining, ..
@@ -3496,7 +3519,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     limit: self.limits.max_heap_bytes,
                 })?;
         self.ensure_allocation_capacity(reserved_slots, retained_bytes)?;
-        self.charge_heap(bytes)?;
+        self.charge_machine(bytes)?;
         let index = self.dynamic_base.checked_add(self.dynamic.len()).ok_or(
             RuntimeErrorKind::DynamicModuleLimitExceeded {
                 limit: self.limits.max_dynamic_modules,
@@ -4811,12 +4834,19 @@ impl<'a, H: Host> Machine<'a, H> {
             .map_err(|kind| self.error_at(kind, function, pc))
     }
 
+    fn sync_slot_ledger(&mut self) {
+        debug_assert!(self.slot_bytes.len() <= self.heap.len());
+        self.slot_bytes.resize(self.heap.len(), 0);
+    }
+
     fn allocate(&mut self, entry: HeapEntry) -> Result<Value, RuntimeErrorKind> {
+        self.sync_slot_ledger();
         let bytes = entry.initial_bytes();
         self.ensure_allocation_capacity(1, bytes)?;
-        self.heap_bytes += bytes;
         let slot = self.heap.len() as u32 + 1;
         self.heap.push(entry);
+        self.slot_bytes.push(bytes);
+        self.heap_bytes += bytes;
         let id = SlotId::from_parts(RUNTIME_HEAP_SEGMENT, slot)
             .expect("runtime segment and one-based slot are nonzero");
         Ok(Value::heap_ref(id))
@@ -4827,7 +4857,7 @@ impl<'a, H: Host> Machine<'a, H> {
         additional_slots: usize,
         additional_bytes: usize,
     ) -> Result<(), RuntimeErrorKind> {
-        let used_slots = self.heap.len().saturating_sub(self.intrinsic_slots);
+        let used_slots = self.heap.len() - self.intrinsic_slots - self.vacant_count;
         let slots_fit_limit = used_slots
             .checked_add(additional_slots)
             .is_some_and(|total| total <= self.limits.max_heap_slots);
@@ -4865,10 +4895,32 @@ impl<'a, H: Host> Machine<'a, H> {
                 })?;
         self.ensure_allocation_capacity(1, bytes)
     }
-    fn charge_heap(&mut self, bytes: usize) -> Result<(), RuntimeErrorKind> {
+    pub(crate) fn charge_slot(
+        &mut self,
+        index: usize,
+        bytes: usize,
+    ) -> Result<(), RuntimeErrorKind> {
+        self.sync_slot_ledger();
         self.ensure_allocation_capacity(0, bytes)?;
+        self.slot_bytes[index] += bytes;
         self.heap_bytes += bytes;
         Ok(())
+    }
+
+    pub(crate) fn charge_machine(&mut self, bytes: usize) -> Result<(), RuntimeErrorKind> {
+        self.ensure_allocation_capacity(0, bytes)?;
+        self.machine_bytes += bytes;
+        self.heap_bytes += bytes;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn assert_heap_ledger(&self) {
+        assert_eq!(self.slot_bytes.len(), self.heap.len());
+        assert_eq!(
+            self.heap_bytes,
+            self.machine_bytes + self.slot_bytes.iter().sum::<usize>()
+        );
     }
 
     fn runtime_slot(&self, value: Value) -> Result<Option<usize>, RuntimeErrorKind> {
@@ -4882,7 +4934,7 @@ impl<'a, H: Host> Machine<'a, H> {
             return Err(RuntimeErrorKind::InvalidValue { value });
         }
         let index = id.slot() as usize - 1;
-        if index >= self.heap.len() {
+        if index >= self.heap.len() || matches!(self.heap[index], HeapEntry::Vacant) {
             return Err(RuntimeErrorKind::InvalidRuntimeHeapReference { slot: id.slot() });
         }
         Ok(Some(index))
@@ -6365,6 +6417,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::PromiseAll { .. }
             | HeapEntry::AsyncActivation { .. }
             | HeapEntry::PromiseAllElement { .. } => None,
+            HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
         }
     }
 
@@ -6522,6 +6575,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::PromiseAll { .. }
             | HeapEntry::AsyncActivation { .. }
             | HeapEntry::PromiseAllElement { .. } => None,
+            HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
         }
     }
 
@@ -6949,8 +7003,10 @@ impl<'a, H: Host> Machine<'a, H> {
                     operation: "assign to hash state",
                 }));
             }
+            HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
         };
-        self.charge_heap(growth).map_err(EvalFailure::Runtime)?;
+        self.charge_slot(index, growth)
+            .map_err(EvalFailure::Runtime)?;
         match &mut self.heap[index] {
             HeapEntry::Object { properties, .. }
             | HeapEntry::Generator { properties, .. }
@@ -7037,7 +7093,7 @@ impl<'a, H: Host> Machine<'a, H> {
     ) -> Result<(), EvalFailure> {
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => {
-                self.charge_heap(key.charge_bytes() + 8)
+                self.charge_slot(index, key.charge_bytes() + 8)
                     .map_err(EvalFailure::Runtime)?;
                 let (properties, extensible) = match &mut self.heap[index] {
                     HeapEntry::Object {
@@ -7218,6 +7274,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 HeapEntry::ModuleNamespace { .. } | HeapEntry::ExternalModuleNamespace { .. } => {
                     Ok(false)
                 }
+                HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
             },
             None => Ok(true),
         }
@@ -7271,7 +7328,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         operation: "push on non-array",
                     }));
                 }
-                self.charge_heap(8).map_err(EvalFailure::Runtime)?;
+                self.charge_slot(index, 8).map_err(EvalFailure::Runtime)?;
                 if let HeapEntry::Array {
                     elements,
                     properties,
@@ -8174,7 +8231,7 @@ impl<'a, H: Host> Machine<'a, H> {
             });
             return Ok(());
         }
-        self.charge_promise_reactions(2)?;
+        self.charge_promise_reactions(index, 2)?;
         let HeapEntry::Promise {
             state:
                 PromiseState::Pending {
@@ -8453,7 +8510,7 @@ impl<'a, H: Host> Machine<'a, H> {
             });
             return Ok(());
         }
-        self.charge_promise_reactions(2)?;
+        self.charge_promise_reactions(index, 2)?;
         let HeapEntry::Promise {
             state:
                 PromiseState::Pending {
@@ -8778,6 +8835,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::PromiseAll { .. }
                 | HeapEntry::AsyncActivation { .. }
                 | HeapEntry::PromiseAllElement { .. } => Ok(Vec::new()),
+                HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
             },
             None => Ok(Vec::new()),
         }
@@ -8995,7 +9053,7 @@ impl<'a, H: Host> Machine<'a, H> {
             });
             return Ok(());
         }
-        self.charge_promise_reactions(2)?;
+        self.charge_promise_reactions(index, 2)?;
         let HeapEntry::Promise {
             state:
                 PromiseState::Pending {
@@ -9397,6 +9455,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         | HeapEntry::ProcessEnv { .. }
                         | HeapEntry::Iterator { .. }
                         | HeapEntry::Timeout { .. } => Ok(Value::number(f64::NAN)),
+                        HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
                     },
                     None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                         operation: "coerce host object to number",
@@ -9445,6 +9504,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::ProcessEnv { .. }
                     | HeapEntry::Iterator { .. }
                     | HeapEntry::Timeout { .. } => true,
+                    HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
                 },
                 Ok(None) => true,
                 Err(_) => false,
@@ -9486,6 +9546,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::ProcessEnv { .. }
                     | HeapEntry::Iterator { .. }
                     | HeapEntry::Timeout { .. } => "object",
+                    HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
                 },
                 _ => "object",
             },
@@ -9708,6 +9769,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             }
                             Ok(text.finish())
                         }
+                        HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
                     },
                     None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                         operation: "coerce host object to string",
@@ -10355,6 +10417,109 @@ mod tests {
     #[derive(Default)]
     struct TestHost;
     impl Host for TestHost {}
+
+    fn with_machine(limits: Limits, test: impl FnOnce(&mut Machine<'_, TestHost>)) {
+        let program = verified(
+            vec![],
+            vec![function(0, 0, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, limits);
+        test(&mut machine);
+    }
+
+    #[test]
+    fn heap_ledger_tracks_slot_and_machine_charges() {
+        with_machine(Limits::default(), |machine| {
+            machine.assert_heap_ledger();
+            let value = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .unwrap();
+            let index = machine.runtime_slot(value).unwrap().unwrap();
+            machine.charge_slot(index, 3).unwrap();
+            machine.charge_machine(5).unwrap();
+
+            assert_eq!(machine.slot_bytes[index], 5);
+            assert_eq!(machine.machine_bytes, 5);
+            machine.assert_heap_ledger();
+        });
+    }
+
+    #[test]
+    fn vacant_runtime_handle_is_rejected() {
+        with_machine(Limits::default(), |machine| {
+            let value = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .unwrap();
+            let index = machine.runtime_slot(value).unwrap().unwrap();
+            machine.heap_bytes -= machine.slot_bytes[index];
+            machine.slot_bytes[index] = 0;
+            machine.heap[index] = HeapEntry::Vacant;
+            machine.vacant_count += 1;
+
+            let Some(Decoded::HeapRef(id)) = value.decode() else {
+                panic!("allocated value is a heap reference");
+            };
+            assert_eq!(
+                machine.runtime_slot(value),
+                Err(RuntimeErrorKind::InvalidRuntimeHeapReference { slot: id.slot() })
+            );
+            machine.assert_heap_ledger();
+        });
+    }
+
+    #[test]
+    fn slot_ids_stay_append_only_after_a_tombstone() {
+        with_machine(Limits::default(), |machine| {
+            let stale = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("stale")))
+                .unwrap();
+            let stale_index = machine.runtime_slot(stale).unwrap().unwrap();
+            machine.heap_bytes -= machine.slot_bytes[stale_index];
+            machine.slot_bytes[stale_index] = 0;
+            machine.heap[stale_index] = HeapEntry::Vacant;
+            machine.vacant_count += 1;
+
+            let live = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("live")))
+                .unwrap();
+            assert_ne!(stale, live);
+            assert!(matches!(
+                machine.runtime_slot(stale),
+                Err(RuntimeErrorKind::InvalidRuntimeHeapReference { .. })
+            ));
+            assert_eq!(machine.runtime_slot(live).unwrap(), Some(stale_index + 1));
+            machine.assert_heap_ledger();
+        });
+    }
+
+    #[test]
+    fn live_slot_limit_excludes_tombstones() {
+        with_machine(
+            Limits {
+                max_heap_slots: 1,
+                ..Limits::default()
+            },
+            |machine| {
+                let value = machine
+                    .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                    .unwrap();
+                assert!(matches!(
+                    machine.ensure_allocation_capacity(1, 0),
+                    Err(RuntimeErrorKind::HeapSlotLimitExceeded { limit: 1 })
+                ));
+
+                let index = machine.runtime_slot(value).unwrap().unwrap();
+                machine.heap_bytes -= machine.slot_bytes[index];
+                machine.slot_bytes[index] = 0;
+                machine.heap[index] = HeapEntry::Vacant;
+                machine.vacant_count += 1;
+
+                machine.ensure_allocation_capacity(1, 0).unwrap();
+                machine.assert_heap_ledger();
+            },
+        );
+    }
 
     #[test]
     fn async_await_setup_failure_releases_suspended_registers() {
@@ -12135,6 +12300,7 @@ mod tests {
             .unwrap();
         let set = machine
             .allocate(HeapEntry::Collection {
+                kind: CollectionKind::Set,
                 entries: vec![CollectionEntry {
                     order: 0,
                     key: Value::int32(7),

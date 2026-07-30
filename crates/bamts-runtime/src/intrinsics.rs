@@ -340,6 +340,46 @@ impl<H: Host> BuiltinTable<H> {
             .position(|definition| definition.name == name)
             .map(BuiltinId)
     }
+    fn for_each_value(&self, mut visit: impl FnMut(Value)) {
+        visit(self.object_prototype);
+        visit(self.function_prototype);
+        visit(self.array_prototype);
+        visit(self.string_prototype);
+        visit(self.number_prototype);
+        visit(self.boolean_prototype);
+        for (_, value) in &self.error_prototypes {
+            visit(*value);
+        }
+        for value in [
+            self.symbol_iterator,
+            self.symbol_async_iterator,
+            self.symbol_to_string_tag,
+            self.symbol_prototype,
+            self.object_to_string,
+            self.regexp_prototype,
+            self.iterator_prototype,
+            self.async_iterator_prototype,
+            self.generator_prototype,
+            self.async_generator_prototype,
+            self.promise_prototype,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            visit(value);
+        }
+        for (first, second) in [
+            self.promise_resolver_targets,
+            self.promise_finally_targets,
+            self.promise_all_targets,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            visit(first);
+            visit(second);
+        }
+    }
 }
 
 pub(crate) struct Intrinsics<H: Host> {
@@ -425,6 +465,18 @@ impl<H: Host> Intrinsics<H> {
 
     pub(crate) fn object_to_string(&self) -> Value {
         self.builtins.object_to_string()
+    }
+    pub(crate) fn for_each_value(&self, mut visit: impl FnMut(Value)) {
+        for value in self.globals.values().chain(self.symbol_registry.values()) {
+            visit(*value);
+        }
+        visit(self.object_prototype);
+        visit(self.function_prototype);
+        visit(self.array_prototype);
+        visit(self.string_prototype);
+        visit(self.number_prototype);
+        visit(self.boolean_prototype);
+        self.builtins.for_each_value(visit);
     }
 }
 

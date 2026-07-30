@@ -745,7 +745,7 @@ fn hash_update<H: Host>(
         return Err(type_error("hash already digested"));
     }
     machine
-        .charge_heap(bytes.len())
+        .charge_slot(index, bytes.len())
         .map_err(EvalFailure::Runtime)?;
     let HeapEntry::HashState { data, .. } = &mut machine.heap[index] else {
         unreachable!()
