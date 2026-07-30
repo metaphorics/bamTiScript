@@ -21,7 +21,7 @@ const MEMBERS: [(&str, &str); 9] = [
 ];
 
 const DEPENDENCY_TABLES: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
-const WORKSPACE_CHECKS: usize = 14;
+const WORKSPACE_CHECKS: usize = 15;
 
 #[derive(Debug)]
 struct MemberManifest {
@@ -296,11 +296,9 @@ fn validate_member_lints(name: &str, manifest: &Value, context: &str) -> Result<
     let root = root_table(manifest, context)?;
     let lints = required_table(root, "lints", context)?;
 
-    // `bamts-native` owns every unsafe operation; `bamts-node` owns only the
-    // edition-2024 `#[unsafe(no_mangle)]` marker on the AOT program entry. Both
-    // therefore declare their own `[lints.rust]` instead of inheriting the
-    // workspace `forbid(unsafe_code)`, and both are pinned exactly here.
-    if name == "bamts-native" || name == "bamts-node" {
+    // These crates own tightly-scoped unsafe boundaries, so they pin a local
+    // `deny` policy instead of inheriting the workspace-wide `forbid`.
+    if matches!(name, "bamts-native" | "bamts-node" | "bamts-codegen") {
         if lints.contains_key("workspace") {
             return Err(workspace_error(format!(
                 "{context}: {name} must not inherit workspace lints"
@@ -326,6 +324,14 @@ fn validate_member_lints(name: &str, manifest: &Value, context: &str) -> Result<
                 "deny",
                 &format!("{context} [lints.rust]"),
             )?;
+            if name == "bamts-codegen" {
+                require_exact_string(
+                    rust,
+                    "unsafe_op_in_unsafe_fn",
+                    "deny",
+                    &format!("{context} [lints.rust]"),
+                )?;
+            }
         }
         return Ok(());
     }
@@ -411,7 +417,13 @@ fn validate_codegen_features(manifest: &Value, context: &str) -> Result<()> {
     require_exact_feature_set(
         "host-jit",
         &host_jit,
-        &["dep:cranelift-jit", "dep:bamts-native"],
+        &[
+            "dep:bamts-native",
+            "dep:cranelift-jit",
+            "dep:libc",
+            "dep:region",
+            "dep:wasmtime-internal-jit-icache-coherence",
+        ],
         context,
     )
 }
@@ -1017,13 +1029,140 @@ fn visit_graph(
 }
 
 fn validate_feature_closures(root: &Path) -> Result<()> {
+    // Positive check: unified workspace metadata closure.
     let metadata = cargo_metadata(root, None)?;
     let closure = codegen_closure(&metadata)?;
     require_enabled_feature(&closure, "bamts-cli", "aot")?;
     require_enabled_feature(&closure, "bamts-cli", "host-jit")?;
     require_present_package(&closure, "bamts-cli", "cranelift-object")?;
     require_present_package(&closure, "bamts-cli", "cranelift-jit")?;
-    require_present_package(&closure, "bamts-cli", "bamts-native")
+    require_present_package(&closure, "bamts-cli", "bamts-native")?;
+
+    // Package-selected closure checks via `cargo tree`.
+    //
+    // Executable-memory packages that must only appear behind `host-jit` or
+    // `jit-entry` features:
+    let exec_memory: &[&str] = &[
+        "cranelift-jit",
+        "region",
+        "wasmtime-internal-jit-icache-coherence",
+    ];
+
+    // ── bamts-codegen default ────────────────────────────────────────────
+    let names = cargo_tree_package_names(root, "bamts-codegen", &[])?;
+    assert_forbidden_packages("bamts-codegen default", &names, exec_memory)?;
+
+    // ── bamts-codegen/aot ───────────────────────────────────────────────
+    let names = cargo_tree_package_names(root, "bamts-codegen", &["aot"])?;
+    assert_present_packages("bamts-codegen/aot", &names, &["cranelift-object"])?;
+    assert_forbidden_packages("bamts-codegen/aot", &names, exec_memory)?;
+
+    // ── bamts-codegen/host-jit ───────────────────────────────────────────
+    let names = cargo_tree_package_names(root, "bamts-codegen", &["host-jit"])?;
+    assert_present_packages(
+        "bamts-codegen/host-jit",
+        &names,
+        &[
+            "bamts-native",
+            "cranelift-jit",
+            "region",
+            "wasmtime-internal-jit-icache-coherence",
+        ],
+    )?;
+    assert_forbidden_packages("bamts-codegen/host-jit", &names, &["cranelift-object"])?;
+
+    // ── bamts-native non-JIT closures ────────────────────────────────────
+    for (label, features) in [
+        ("bamts-native default", &[][..]),
+        ("bamts-native/gc", &["gc"][..]),
+        ("bamts-native/node-host", &["node-host"][..]),
+        ("bamts-native/aot-image", &["aot-image"][..]),
+    ] {
+        let names = cargo_tree_package_names(root, "bamts-native", features)?;
+        assert_forbidden_packages(label, &names, exec_memory)?;
+    }
+
+    // ── bamts-native/jit-entry ───────────────────────────────────────────
+    let names = cargo_tree_package_names(root, "bamts-native", &["jit-entry"])?;
+    assert_present_packages(
+        "bamts-native/jit-entry",
+        &names,
+        &["cranelift-jit", "cranelift-module"],
+    )?;
+
+    // ── bamts non-JIT closures ───────────────────────────────────────────
+    let names = cargo_tree_package_names(root, "bamts", &[])?;
+    assert_forbidden_packages("bamts default", &names, exec_memory)?;
+    assert_forbidden_packages("bamts default", &names, &["bamts-codegen"])?;
+
+    let names = cargo_tree_package_names(root, "bamts", &["aot"])?;
+    assert_present_packages("bamts/aot", &names, &["bamts-codegen", "cranelift-object"])?;
+    assert_forbidden_packages("bamts/aot", &names, exec_memory)?;
+
+    let names = cargo_tree_package_names(root, "bamts", &["node-host"])?;
+    assert_present_packages("bamts/node-host", &names, &["bamts-node"])?;
+    assert_forbidden_packages("bamts/node-host", &names, exec_memory)?;
+    assert_forbidden_packages(
+        "bamts/node-host",
+        &names,
+        &["bamts-codegen", "cranelift-object"],
+    )?;
+
+    // ── bamts/host-jit ──────────────────────────────────────────────────
+    let names = cargo_tree_package_names(root, "bamts", &["host-jit"])?;
+    assert_present_packages(
+        "bamts/host-jit",
+        &names,
+        &[
+            "bamts-codegen",
+            "bamts-native",
+            "cranelift-jit",
+            "region",
+            "wasmtime-internal-jit-icache-coherence",
+        ],
+    )?;
+
+    assert_forbidden_packages("bamts/host-jit", &names, &["cranelift-object"])?;
+    // Feature activation: resolve closures through the correct root
+    // package so that feature flags on dependencies are captured accurately.
+    //
+    // `bamts-codegen/host-jit`: host-jit is a feature of bamts-codegen, so
+    // cargo_metadata + codegen_closure resolves correctly from bamts-codegen.
+    let meta = cargo_metadata(root, Some("bamts-codegen/host-jit"))?;
+    let closure = codegen_closure(&meta)?;
+    require_enabled_feature(&closure, "bamts-codegen/host-jit", "host-jit")?;
+    // `bamts-native/jit-entry` is activated transitively by
+    // `bamts-codegen/host-jit`; verify it on bamts-native's features.
+    let native_features = closure
+        .package_features
+        .get("bamts-native")
+        .ok_or_else(|| {
+            workspace_error("bamts-codegen/host-jit closure does not contain bamts-native features")
+        })?;
+    if !native_features.contains("jit-entry") {
+        return Err(workspace_error(
+            "bamts-codegen/host-jit closure does not enable bamts-native/jit-entry",
+        ));
+    }
+
+    // `bamts/host-jit`: host-jit is a feature of bamts (the facade), so we
+    // must resolve from `bamts`, not `bamts-codegen`.
+    let meta = cargo_metadata(root, Some("bamts/host-jit"))?;
+    let closure = resolve_closure_from(&meta, "bamts")?;
+    // Verify host-jit reaches bamts-codegen with host-jit enabled.
+    let codegen_features = closure
+        .package_features
+        .get("bamts-codegen")
+        .ok_or_else(|| {
+            workspace_error("bamts/host-jit closure does not contain bamts-codegen features")
+        })?;
+    if !codegen_features.contains("host-jit") {
+        return Err(workspace_error(
+            "bamts/host-jit closure does not enable bamts-codegen/host-jit",
+        ));
+    }
+
+    Ok(())
 }
 
 fn cargo_metadata(root: &Path, feature: Option<&str>) -> Result<CargoMetadata> {
@@ -1168,6 +1307,258 @@ fn require_present_package(closure: &ResolvedClosure, mode: &str, package: &str)
     Ok(())
 }
 
+/// Resolve the package-closure from the given root, returning package names
+/// and their enabled features. Unlike [`codegen_closure`], this works for
+/// any root package, not just `bamts-codegen`.
+fn resolve_closure_from(metadata: &CargoMetadata, root_name: &str) -> Result<ResolvedClosure> {
+    let resolve = metadata
+        .resolve
+        .as_ref()
+        .ok_or_else(|| workspace_error("cargo metadata did not include a resolve graph"))?;
+    let mut packages = BTreeMap::new();
+    let mut root = None;
+    for package in &metadata.packages {
+        if packages
+            .insert(package.id.as_str(), package.name.as_str())
+            .is_some()
+        {
+            return Err(workspace_error(format!(
+                "cargo metadata contains duplicate package id `{}`",
+                package.id
+            )));
+        }
+        if package.name == root_name && root.replace(package.id.as_str()).is_some() {
+            return Err(workspace_error(format!(
+                "cargo metadata contains multiple {root_name} packages",
+            )));
+        }
+    }
+    let root = root
+        .ok_or_else(|| workspace_error(format!("cargo metadata does not contain {root_name}")))?;
+
+    let mut nodes = BTreeMap::new();
+    for node in &resolve.nodes {
+        if nodes.insert(node.id.as_str(), node).is_some() {
+            return Err(workspace_error(format!(
+                "cargo metadata contains duplicate resolve node `{}`",
+                node.id
+            )));
+        }
+    }
+
+    let mut closure = ResolvedClosure::default();
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(package_id) = pending.pop() {
+        if !visited.insert(package_id) {
+            continue;
+        }
+        let node = nodes.get(package_id).ok_or_else(|| {
+            workspace_error(format!(
+                "cargo metadata resolve graph lacks package `{package_id}`"
+            ))
+        })?;
+        let name = packages.get(package_id).ok_or_else(|| {
+            workspace_error(format!("cargo metadata package table lacks `{package_id}`"))
+        })?;
+        closure.package_names.insert((*name).to_owned());
+        let features = closure
+            .package_features
+            .entry((*name).to_owned())
+            .or_default();
+        features.extend(node.features.iter().cloned());
+        for dependency in &node.deps {
+            let contributes_to_artifact = dependency
+                .dep_kinds
+                .iter()
+                .any(|kind| kind.kind.as_deref() != Some("dev"));
+            if contributes_to_artifact {
+                pending.push(dependency.pkg.as_str());
+            }
+        }
+    }
+
+    Ok(closure)
+}
+
+/// Run `cargo tree` for the given package and feature set, returning the
+/// deduplicated set of resolved package names.
+///
+/// Uses the exact command contract:
+/// ```text
+/// cargo tree --locked --offline -p PACKAGE --no-default-features \
+///   [--features FEATURES] -e normal,build --target all --prefix none \
+///   --format '{p}|{f}'
+/// ```
+///
+/// Duplicate markers `(*)` are handled deterministically. Fails closed on
+/// malformed nonempty lines or tool errors.
+fn cargo_tree_package_names(
+    root: &Path,
+    package: &str,
+    features: &[&str],
+) -> Result<BTreeSet<String>> {
+    let cargo = match env::var_os("CARGO") {
+        Some(path) => path,
+        None => "cargo".into(),
+    };
+    let mut command = Command::new(cargo);
+    command
+        .current_dir(root)
+        .arg("tree")
+        .arg("--locked")
+        .arg("--offline")
+        .arg("-p")
+        .arg(package)
+        .arg("--no-default-features")
+        .arg("-e")
+        .arg("normal,build")
+        .arg("--target")
+        .arg("all")
+        .arg("--prefix")
+        .arg("none")
+        .arg("--format")
+        .arg("{p}|{f}");
+    for feature in features {
+        command.arg("--features").arg(feature);
+    }
+
+    let output = command.output().map_err(|error| {
+        let code = if error.kind() == ErrorKind::NotFound {
+            ErrorCode::ToolMissing
+        } else {
+            ErrorCode::ToolFailed
+        };
+        VerificationError::new(
+            code,
+            format!("cargo tree -p {package} could not start: {error}"),
+        )
+    })?;
+    if !output.status.success() {
+        let status = match output.status.code() {
+            Some(code) => format!("exit status {code}"),
+            None => "terminated by signal".to_owned(),
+        };
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        return Err(VerificationError::new(
+            ErrorCode::ToolFailed,
+            format!("cargo tree -p {package} {status}: {stderr}"),
+        ));
+    }
+
+    parse_cargo_tree_package_names(&output.stdout, package)
+}
+
+/// Parse `cargo tree --format '{p}|{f}'` output into a set of unique
+/// package names.
+///
+/// Each nonempty line is expected to match one of:
+/// - `NAME SEMVER FEAT1,FEAT2,…`   (first occurrence)
+/// - `NAME SEMVER (*)`              (duplicate marker)
+///
+/// Fails closed on any line that does not match.
+fn parse_cargo_tree_package_names(stdout: &[u8], package: &str) -> Result<BTreeSet<String>> {
+    let text = std::str::from_utf8(stdout).map_err(|error| {
+        workspace_error(format!(
+            "cargo tree -p {package} output is not valid UTF-8: {error}"
+        ))
+    })?;
+
+    let mut names = BTreeSet::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+
+        // The format `{p}|{f}` produces lines like:
+        //   bamts-codegen 0.1.0|
+        //   region 1.0.0 (*)|
+        // After the `|` separator the rest is features (possibly empty).
+        // Split on `|` to separate the package identifier from features.
+        let Some(pipe) = line.find('|') else {
+            return Err(workspace_error(format!(
+                "cargo tree -p {package}: malformed line (no pipe separator): `{line}`"
+            )));
+        };
+
+        let ident = &line[..pipe];
+
+        // Ident portion: `NAME SEMVER` or `NAME SEMVER (*)`.
+        let trimmed = ident.trim();
+        if trimmed.is_empty() {
+            return Err(workspace_error(format!(
+                "cargo tree -p {package}: empty package identifier in `{line}`"
+            )));
+        }
+
+        let name_part = trimmed.strip_suffix("(*)").map_or(trimmed, str::trim);
+        let mut fields = name_part.split_whitespace();
+        let pkg_name = fields.next().ok_or_else(|| {
+            workspace_error(format!(
+                "cargo tree -p {package}: cannot extract package name from `{line}`"
+            ))
+        })?;
+        let version = fields.next().ok_or_else(|| {
+            workspace_error(format!(
+                "cargo tree -p {package}: missing package version in `{line}`"
+            ))
+        })?;
+        let version = version.strip_prefix('v').unwrap_or(version);
+        if !version
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_digit())
+        {
+            return Err(workspace_error(format!(
+                "cargo tree -p {package}: malformed package version in `{line}`"
+            )));
+        }
+        names.insert(pkg_name.to_owned());
+    }
+
+    // Anti-vacuity: the closure must contain at least the queried package.
+    if !names.contains(package) {
+        return Err(workspace_error(format!(
+            "cargo tree -p {package}: output does not contain the queried package"
+        )));
+    }
+
+    Ok(names)
+}
+
+/// Assert that `names` contains every `required` package. Fails with a
+/// descriptive message when any expected package is absent.
+fn assert_present_packages(label: &str, names: &BTreeSet<String>, required: &[&str]) -> Result<()> {
+    let expected: BTreeSet<String> = required.iter().map(|s| (*s).to_owned()).collect();
+    let missing: BTreeSet<String> = expected.difference(names).cloned().collect();
+    if !missing.is_empty() {
+        return Err(workspace_error(format!(
+            "{label}: missing required packages [{}]",
+            format_set(&missing)
+        )));
+    }
+    Ok(())
+}
+
+/// Assert that `names` contains none of the `forbidden` packages. Fails with
+/// a descriptive message when any forbidden package is present.
+fn assert_forbidden_packages(
+    label: &str,
+    names: &BTreeSet<String>,
+    forbidden: &[&str],
+) -> Result<()> {
+    let banned: BTreeSet<String> = forbidden.iter().map(|s| (*s).to_owned()).collect();
+    let found: BTreeSet<String> = banned.intersection(names).cloned().collect();
+    if !found.is_empty() {
+        return Err(workspace_error(format!(
+            "{label}: contains forbidden packages [{}]",
+            format_set(&found)
+        )));
+    }
+    Ok(())
+}
+
 fn root_table<'a>(value: &'a Value, context: &str) -> Result<&'a Table> {
     value
         .as_table()
@@ -1301,7 +1692,7 @@ unsafe_code = "forbid"
         ))
     }
 
-    fn assert_workspace_error(result: Result<()>) {
+    fn assert_workspace_error<T: std::fmt::Debug>(result: Result<T>) {
         let error = result.expect_err("fixture must fail");
         assert_eq!(error.code(), ErrorCode::Workspace);
     }
@@ -1373,5 +1764,81 @@ workspace = false
             .insert("bamts-compiler".to_owned(), internal_dependency(false, &[]));
 
         assert_workspace_error(validate_internal_graph(&graph));
+    }
+
+    // ── cargo tree parser tests ──────────────────────────────────────────
+
+    #[test]
+    fn cargo_tree_parser_extracts_unique_packages() {
+        let output = b"bamts-codegen v0.1.0|host-jit\nbamts-runtime 0.1.0|\ncranelift-jit 0.1.0|\nregion 1.0.0 (*)|\ncranelift-jit 0.1.0 (*)|\n";
+        let names = parse_cargo_tree_package_names(output, "bamts-codegen").expect("parse");
+        assert!(names.contains("bamts-codegen"));
+        assert!(names.contains("bamts-runtime"));
+        assert!(names.contains("cranelift-jit"));
+        assert!(names.contains("region"));
+        assert_eq!(names.len(), 4);
+    }
+
+    #[test]
+    fn cargo_tree_parser_rejects_malformed_line() {
+        for output in [
+            &b"bamts-codegen 0.1.0|\nno-pipe-here\n"[..],
+            &b"bamts-codegen|\n"[..],
+            &b"bamts-codegen nope|\n"[..],
+        ] {
+            assert_workspace_error(parse_cargo_tree_package_names(output, "bamts-codegen"));
+        }
+    }
+
+    #[test]
+    fn cargo_tree_parser_fails_when_queried_package_missing() {
+        // Output does not contain the queried package at all.
+        let output = b"some-other 1.0.0|\n";
+        let result = parse_cargo_tree_package_names(output, "bamts-codegen");
+        assert_workspace_error(result);
+    }
+
+    #[test]
+    fn assert_present_packages_detects_missing() {
+        let mut names = BTreeSet::new();
+        names.insert("bamts-codegen".to_owned());
+        names.insert("region".to_owned());
+        // `cranelift-jit` is required but missing.
+        let result = assert_present_packages("test", &names, &["cranelift-jit", "region"]);
+        assert_workspace_error(result);
+    }
+
+    #[test]
+    fn assert_forbidden_packages_detects_violation() {
+        let mut names = BTreeSet::new();
+        names.insert("bamts-runtime".to_owned());
+        names.insert("region".to_owned());
+        // `region` is in the forbidden set.
+        let result = assert_forbidden_packages("test", &names, &["region", "cranelift-jit"]);
+        assert_workspace_error(result);
+    }
+
+    #[test]
+    fn host_jit_feature_set_includes_provider_deps() {
+        // Verify that the host-jit feature set contains every
+        // executable-memory direct dependency. This is a pure structural
+        // assertion; it does not run cargo.
+        let manifest = parse_manifest(
+            r#"
+[features]
+default = []
+aot = ["dep:cranelift-object"]
+host-jit = [
+    "dep:bamts-native",
+    "dep:cranelift-jit",
+    "dep:libc",
+    "dep:region",
+    "dep:wasmtime-internal-jit-icache-coherence",
+]
+"#,
+        );
+
+        // Must not error — the exact set matches.
+        validate_codegen_features(&manifest, "fixture").expect("host-jit feature set");
     }
 }

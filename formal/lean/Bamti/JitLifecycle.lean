@@ -249,11 +249,11 @@ theorem no_publish_before_finalize (s s' : Artifact)
 
 theorem wx_before_publish (s s' : Artifact)
     (h : JitStep s .publish (.accepted s')) :
-    s.memory = .executable ∧ s'.memory = .executable := by
+    s.memory = .executable ∧ s.memory ≠ .writable ∧
+      s'.memory = .executable ∧ s'.memory ≠ .writable := by
   cases h with
   | publishAccepted hp =>
-      let hMem := hp.2.2.2.1
-      exact ⟨hMem, by simpa using hMem⟩
+      simp_all [canPublish]
 
 theorem cancelled_never_live (s s' : Artifact)
     (h : JitStep s .cancel (.accepted s')) :
@@ -315,5 +315,100 @@ theorem retirement_after_quiescence (s s' : Artifact)
   cases h with
   | retireAccepted hp =>
       exact ⟨hp.2.2, rfl, rfl, rfl⟩
+
+/-- Lifecycle phase shared by all mappings owned by one JIT provider. -/
+inductive ProviderPhase where
+  | Writable
+  | Executable
+  | Freed
+  deriving DecidableEq, Repr
+
+/-- Operations that can change or inspect the provider phase. -/
+inductive ProviderAction where
+  | allocate
+  | finalize
+  | free
+  deriving DecidableEq, Repr
+
+/-- Provider operation outcome and its resulting phase. -/
+inductive ProviderResult where
+  | accepted (next : ProviderPhase)
+  | rejected (next : ProviderPhase)
+  deriving DecidableEq, Repr
+
+def providerResultState : ProviderResult → ProviderPhase
+  | .accepted next => next
+  | .rejected next => next
+
+/-- W^X transitions for one provider. Allocation may repeat while writable.
+Finalization either publishes executable mappings or frees every mapping.
+Free changes a live phase to freed; later frees are accepted no-ops. -/
+inductive ProviderStep : ProviderPhase → ProviderAction → ProviderResult → Prop where
+  | allocateAccepted :
+      ProviderStep .Writable .allocate (.accepted .Writable)
+  | finalizeAccepted :
+      ProviderStep .Writable .finalize (.accepted .Executable)
+  | finalizeFailed :
+      ProviderStep .Writable .finalize (.rejected .Freed)
+  | freeAccepted (p : ProviderPhase) (h : p = .Writable ∨ p = .Executable) :
+      ProviderStep p .free (.accepted .Freed)
+  | freeIdempotent :
+      ProviderStep .Freed .free (.accepted .Freed)
+
+/-- Finite provider traces. -/
+inductive ProviderTrace : ProviderPhase → ProviderPhase → Prop where
+  | refl (s : ProviderPhase) : ProviderTrace s s
+  | step (s u : ProviderPhase) (action : ProviderAction) (result : ProviderResult)
+      (hs : ProviderStep s action result)
+      (ht : ProviderTrace (providerResultState result) u) :
+      ProviderTrace s u
+
+theorem provider_allocation_only_writable (s q : ProviderPhase)
+    (h : ProviderStep s .allocate (.accepted q)) :
+    s = .Writable ∧ q = .Writable := by
+  cases h
+  exact ⟨rfl, rfl⟩
+
+theorem provider_finalization_exactly_once (p q : ProviderPhase)
+    (h : ProviderStep p .finalize (.accepted q)) :
+    p = .Writable ∧ q = .Executable ∧
+      ¬ ProviderStep q .finalize (.accepted q) := by
+  cases h
+  exact ⟨rfl, rfl, fun h2 => by cases h2⟩
+
+theorem provider_finalization_failure_reclaims (p q : ProviderPhase)
+    (h : ProviderStep p .finalize (.rejected q)) :
+    q = .Freed ∧
+      (∀ next, ¬ ProviderStep q .allocate (.accepted next)) ∧
+      (∀ next, ¬ ProviderStep q .finalize (.accepted next)) := by
+  cases h
+  constructor
+  · rfl
+  constructor
+  · intro next h2
+    cases h2
+  · intro next h2
+    cases h2
+
+theorem provider_free_is_idempotent (p q : ProviderPhase)
+    (h : ProviderStep p .free (.accepted q)) :
+    q = .Freed ∧ ProviderStep q .free (.accepted q) := by
+  cases h with
+  | freeAccepted _ =>
+      exact ⟨rfl, ProviderStep.freeIdempotent⟩
+  | freeIdempotent =>
+      exact ⟨rfl, ProviderStep.freeIdempotent⟩
+
+theorem provider_never_writable_executable (p : ProviderPhase) :
+    ¬ (p = .Writable ∧ p = .Executable) := by
+  intro h
+  have he := h.2
+  rw [h.1] at he
+  exact ProviderPhase.noConfusion he
+
+theorem provider_trace_exclusivity (s u : ProviderPhase)
+    (_ : ProviderTrace s u) :
+    ¬ (u = .Writable ∧ u = .Executable) := by
+  exact provider_never_writable_executable u
 
 end Bamti

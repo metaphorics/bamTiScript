@@ -12,6 +12,7 @@ use cranelift_codegen::ir::{ExternalName, Function, UserExternalName};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, ModuleError, default_libcall_names};
 
+use crate::jit_memory::{FinalizedMemory, WxMemoryHandle, WxMemoryProvider};
 use crate::{HELPER_NAMESPACE, Helper, LoweredProgram, ProgramLowerError, lower_program};
 
 /// A typed host-JIT compilation failure.
@@ -72,11 +73,14 @@ struct JitUnit {
     function: FuncId,
 }
 
-/// A finalized host-native program. Its executable memory remains owned by the
-/// contained [`JITModule`] and entries are callable only through
-/// [`NativeEntryTable`].
+/// A finalized host-native program. It owns its [`JITModule`] *and* the
+/// `FinalizedMemory` receipt proving every owned mapping reached its exact
+/// final protection. Entries are callable only through [`NativeEntryTable`],
+/// reached through the receipt-owning program; its module remains private.
 pub struct JitProgram {
     module: JITModule,
+    /// Proof that every mapping finalized before this program was published.
+    _memory: FinalizedMemory,
     functions: Vec<JitUnit>,
     program_bytes: Vec<u8>,
     entry_module: u32,
@@ -126,16 +130,36 @@ impl NativeEntryTable for JitProgram {
 /// for the current host. Module-local ids remain local and native entries are
 /// keyed by `(module_id, function_id)`.
 pub fn compile_jit(bytecode: &BytecodeProgram<Verified>) -> Result<JitProgram, JitError> {
+    let (module, memory, program_bytes) = build_module(bytecode)?;
+    let lowered = lower_program(bytecode, module.target_config())?;
+    compile_lowered(module, memory, lowered, program_bytes)
+}
+
+/// Builds a `JITModule` with the W^X memory provider installed *before*
+/// [`JITModule::new`], and returns the lifecycle handle that mints the
+/// publication receipt once finalization completes.
+///
+/// The handle is held outside the module because `JITModule` consumes the
+/// provider: the provider moves into the module and is unreachable afterward,
+/// but everything `compile_lowered` needs (the receipt) is observable through
+/// the handle.
+fn build_module(
+    bytecode: &BytecodeProgram<Verified>,
+) -> Result<(JITModule, WxMemoryHandle, Vec<u8>), JitError> {
     let program_bytes = bytecode.encode();
     let mut builder = JITBuilder::new(default_libcall_names())?;
+    let (provider, memory) = WxMemoryProvider::new();
+    // Install the W^X provider before construction so no executable mapping is
+    // ever created through the default `SystemMemoryProvider` ceiling.
+    builder.memory_provider(Box::new(provider));
     bind_runtime_helpers(&mut builder);
     let module = JITModule::new(builder);
-    let lowered = lower_program(bytecode, module.target_config())?;
-    compile_lowered(module, lowered, program_bytes)
+    Ok((module, memory, program_bytes))
 }
 
 fn compile_lowered(
     mut module: JITModule,
+    memory: WxMemoryHandle,
     lowered: LoweredProgram,
     program_bytes: Vec<u8>,
 ) -> Result<JitProgram, JitError> {
@@ -182,8 +206,16 @@ fn compile_lowered(
     }
     module.finalize_definitions()?;
 
+    // Publication requires the receipt. `finalize_definitions` returned `Ok`, so
+    // the provider reached `Executable` only after every owned mapping
+    // transitioned to its exact final protection; `require_finalized` is then
+    // infallible in practice. No receipt exists in `Writable` or `Freed`, so a
+    // partially-finalized module (which errors above) can never publish.
+    let receipt = memory.require_finalized();
+
     Ok(JitProgram {
         module,
+        _memory: receipt,
         functions,
         program_bytes,
         entry_module: lowered.entry_module.get(),
@@ -283,10 +315,12 @@ mod tests {
     use bamts_runtime::{
         Host, Limits, NativeError, RuntimeError, RuntimeErrorKind, run_linked_program,
     };
+    use cranelift_module::Module as _;
 
-    use crate::Helper;
+    use crate::{Helper, lower_program};
 
-    use super::compile_jit;
+    use super::{JitProgram, build_module, compile_jit, compile_lowered};
+    use crate::jit_memory::WxPhase;
 
     struct SilentHost;
 
@@ -825,25 +859,63 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn finalized_jit_code_is_executable_and_not_writable() {
         let program = compile_jit(&two_module_program()).expect("host JIT compiles");
-        let function = program.functions[0].function;
-        let address = program.module.get_finalized_function(function) as usize;
         let maps = std::fs::read_to_string("/proc/self/maps").expect("process maps are readable");
-        let permissions = maps
-            .lines()
-            .find_map(|line| {
-                let mut fields = line.split_whitespace();
-                let range = fields.next()?;
-                let permissions = fields.next()?;
-                let (start, end) = range.split_once('-')?;
-                let start = usize::from_str_radix(start, 16).ok()?;
-                let end = usize::from_str_radix(end, 16).ok()?;
-                (start <= address && address < end).then_some(permissions)
-            })
-            .expect("finalized function has a mapped page");
 
-        // `finalize_definitions` must publish code with an RW -> RX transition.
-        assert!(permissions.contains('x'), "{permissions}");
-        assert!(!permissions.contains('w'), "{permissions}");
+        // Every compiled function address is executable and not writable, as an
+        // independent smoke test against `/proc/self/maps`.
+        for unit in &program.functions {
+            let address = program.module.get_finalized_function(unit.function) as usize;
+            let permissions = maps
+                .lines()
+                .find_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    let range = fields.next()?;
+                    let permissions = fields.next()?;
+                    let (start, end) = range.split_once('-')?;
+                    let start = usize::from_str_radix(start, 16).ok()?;
+                    let end = usize::from_str_radix(end, 16).ok()?;
+                    (start <= address && address < end).then_some(permissions)
+                })
+                .unwrap_or_else(|| panic!("finalized function at {address:#x} has no mapped page"));
+
+            // `finalize_definitions` must publish code with an RW -> RX transition.
+            assert!(permissions.contains('x'), "{permissions}");
+            assert!(!permissions.contains('w'), "{permissions}");
+        }
+    }
+
+    #[test]
+    fn compiled_jit_program_owns_executable_receipt_and_drops_to_freed() {
+        let bytecode = two_module_program();
+        let (module, memory, program_bytes) = build_module(&bytecode).expect("module builds");
+        let lowered = lower_program(&bytecode, module.target_config()).expect("program lowers");
+        let program = compile_lowered(module, memory.clone(), lowered, program_bytes)
+            .expect("host JIT compiles");
+
+        // The program was published, so it owns an executable receipt.
+        assert_eq!(memory.phase(), WxPhase::Executable);
+        drop(program);
+        // Dropping the program drops the module, whose provider marks `Freed`
+        // and unmaps every owned mapping exactly once.
+        assert_eq!(memory.phase(), WxPhase::Freed);
+    }
+
+    /// Compile-time proof that `JitProgram` is not `Sync`. `JITModule` carries a
+    /// `RefCell` and is not `Sync`; that guarantee is the ownership rule letting
+    /// `invoke(&self)` borrow the program safely without an active-call counter.
+    /// If `JitProgram: Sync` ever held, the trait resolution below would become
+    /// ambiguous and fail the build.
+    trait AmbiguousIfSync<A> {
+        #[allow(dead_code)]
+        fn token() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
+
+    #[test]
+    fn jit_program_is_not_sync() {
+        // If `JitProgram: Sync`, both impls apply and `A` is ambiguous.
+        let _ = <JitProgram as AmbiguousIfSync<_>>::token;
     }
 
     #[test]

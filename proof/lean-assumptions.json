@@ -222,6 +222,30 @@
     },
     {
       "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.provider_allocation_only_writable"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.provider_finalization_exactly_once"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.provider_finalization_failure_reclaims"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.provider_free_is_idempotent"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.provider_never_writable_executable"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.provider_trace_exclusivity"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
       "name": "Bamti.publication_after_finalization"
     },
     {
@@ -306,6 +330,6 @@
     }
   ],
   "schema": "bamti.lean-assumptions/v1",
-  "source_sha256": "926c943a0019c506685164428e9114e1c3fa25d10454787a8ecdd232cf5387b8",
+  "source_sha256": "0a7c857eee23cf063dea2be280555422f45e16ffb1deca3208b6fc3255f254a0",
   "user_axioms": []
 }

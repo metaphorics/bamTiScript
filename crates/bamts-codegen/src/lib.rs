@@ -11,7 +11,7 @@
 //!
 //! This slice performs **no** executable-memory allocation and **no** object
 //! linking; it only builds and verifies IR. Both later backends supply their
-//! own [`isa::TargetFrontendConfig`] (via `isa.frontend_config()`), so the ISA
+//! own `isa::TargetFrontendConfig` (via `isa.frontend_config()`), so the ISA
 //! choice, calling convention, and pointer type stay outside this crate.
 //!
 //! # Entry ABI
@@ -36,7 +36,7 @@
 //!
 //! Register `r[i]` lives at `frame.handles + i * 8` (one `Value`/`u64` slot).
 //! Every access derives the byte offset as `i64::from(register.get()) * 8`; the
-//! validation pass ([`validate_slots`]) proves this offset fits the `Offset32`
+//! validation pass (`validate_slots`) proves this offset fits the `Offset32`
 //! used by loads and stores, so `u32` register ids and CLIF addresses never mix
 //! widths inconsistently. This holds for register ids well past 127: a slot
 //! offset is a full 32-bit displacement, not a signed byte.
@@ -160,10 +160,13 @@
 //! [`Helper::ResumeValue`] is a **new required contract** the runtime must
 //! provide for any module that suspends.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 #[cfg(feature = "host-jit")]
 mod jit;
+#[cfg(feature = "host-jit")]
+#[allow(unsafe_code)]
+mod jit_memory;
 #[cfg(feature = "host-jit")]
 pub use jit::{JitError, JitProgram, compile_jit};
 
@@ -195,6 +198,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 /// Byte offset of `ShadowFrame.bytecode_pc` (a `u32`).
 const SHADOW_FRAME_PC_OFFSET: i32 = 8;
 /// Byte offset of `ShadowFrame.module_id` (a `u32`).
+#[cfg(feature = "host-jit")]
 const SHADOW_FRAME_MODULE_OFFSET: i32 = 12;
 /// Byte offset of `ShadowFrame.handles` (a `*mut Value`).
 const SHADOW_FRAME_HANDLES_OFFSET: i32 = 16;
@@ -301,10 +305,10 @@ pub enum Helper {
     /// constant named by `const_id` into `out.value`.
     LoadConstant,
     /// `bamts_unary(frame, op, operand, out)`: apply the unary operator `op`
-    /// (see [`unary_op_selector`]) to `operand`.
+    /// (see `unary_op_selector`) to `operand`.
     Unary,
     /// `bamts_binary(frame, op, left, right, out)`: apply the binary operator
-    /// `op` (see [`binary_op_selector`]) to `left` and `right`.
+    /// `op` (see `binary_op_selector`) to `left` and `right`.
     Binary,
     /// `bamts_create_object(frame, out)`: fresh empty object into `out.value`.
     CreateObject,
@@ -344,7 +348,7 @@ pub enum Helper {
     /// or `FatalTrap`.
     ResumeValue,
     /// `bamts_define_accessor(frame, object, key, accessor, kind, out)`: install
-    /// a getter or setter (`kind`, see [`accessor_kind_selector`]) under `key`.
+    /// a getter or setter (`kind`, see `accessor_kind_selector`) under `key`.
     DefineAccessor,
     /// `bamts_load_global(frame, name, out)`: `out.value = globalThis[name]`;
     /// throws a `ReferenceError` for an undeclared global.
@@ -381,7 +385,7 @@ pub enum Helper {
     /// the string-constant `pattern` and `flags` into `out.value`.
     CreateRegExp,
     /// `bamts_get_iterator(frame, src, kind, out)`: acquire an iterator over
-    /// `src` using protocol `kind` (see [`iterator_kind_selector`]).
+    /// `src` using protocol `kind` (see `iterator_kind_selector`).
     GetIterator,
     /// `bamts_iterator_next(frame, iterator, done_reg, value_reg, out)`: advance
     /// `iterator`, writing the done flag into `handles[done_reg]` and the

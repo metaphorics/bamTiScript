@@ -73,6 +73,9 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-object",
+ "libc",
+ "region",
+ "wasmtime-internal-jit-icache-coherence",
 ]
 
 [[package]]
