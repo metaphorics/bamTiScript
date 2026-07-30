@@ -111,8 +111,9 @@ fn locale_compare<H: Host>(
     if matches!(this.decode(), Some(Decoded::Undefined | Decoded::Null)) {
         return Err(type_error("String method called on null or undefined"));
     }
-    let this = machine.to_string_observable(this)?;
-    let other = machine.to_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let this = machine.coerce_string_observable(this)?;
+    let other =
+        machine.coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let result: i32 = match this.as_units().cmp(other.as_units()) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
@@ -835,7 +836,8 @@ pub(super) fn unescape<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let source = machine.to_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let source =
+        machine.coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let units = source.as_units();
     let mut output = EcmaStringBuilder::with_capacity(units.len());
     let mut offset = 0;

@@ -21,6 +21,7 @@ pub(super) fn install<H: Host>(
     let to_string_tag = symbol(heap, "Symbol.toStringTag");
     let dispose = symbol(heap, "Symbol.dispose");
     builtins.set_symbol_iterator(iterator);
+    builtins.set_symbol_async_iterator(async_iterator);
     builtins.set_symbol_to_string_tag(to_string_tag);
     builtins.set_symbol_prototype(prototype);
 

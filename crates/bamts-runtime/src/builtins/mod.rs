@@ -34,7 +34,9 @@ pub(crate) fn install<H: Host>(
         timers::install(heap, globals, builtins);
     }
     collections::install_iterator_prototype(heap, builtins);
+    collections::install_async_iterator_prototype(heap, builtins);
     collections::install_generator_prototype(heap, builtins);
+    collections::install_async_generator_prototype(heap, builtins);
     collections::install(heap, globals, builtins);
     date::install(heap, globals, builtins);
     object::install(heap, globals, builtins);

@@ -42,7 +42,7 @@ fn set_timeout<H: Host>(
         }));
     }
     let delay_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-    let delay_number = super::value_number(machine.to_number_observable(delay_arg)?);
+    let delay_number = super::value_number(machine.coerce_number_observable(delay_arg)?);
     let delay_ms = clamp_delay(delay_number);
     let forwarded = args.get(2..).unwrap_or(&[]).to_vec();
     let handle = machine.schedule_timeout(callback, delay_ms, forwarded)?;

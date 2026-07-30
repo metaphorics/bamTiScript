@@ -16,7 +16,10 @@
 //! The oracle never invokes package managers, project scripts, or transpilers:
 //! it runs `node <entrypoint>` and relies on the interpreter's own execution.
 //! The BamTS runner executes the same validated entrypoint through the public
-//! CLI driver in JIT mode or compiles, links, and spawns it in AOT mode.
+//! CLI driver in JIT mode, compiles, links, and spawns it in AOT mode, or — in
+//! Interpreter mode, without any shell-out — compiles it through the public
+//! `bamts` facade and executes it in-process via `bamts_runtime::run` against
+//! a Node host.
 
 use std::{
     collections::BTreeSet,
@@ -36,6 +39,7 @@ use bamts_cli::{
     args::{CliArgs, ExecutionTarget, Mode, parse_args},
     driver,
 };
+use bamts_runtime::Limits;
 
 use crate::{ErrorCode, Result, VerificationError};
 
@@ -579,15 +583,17 @@ impl NodeOracle {
 /// BamTS execution paths covered by the differential harness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionMode {
+    Interpreter,
     Jit,
     Aot,
 }
 
 impl ExecutionMode {
-    pub const ALL: [Self; 2] = [Self::Jit, Self::Aot];
+    pub const ALL: [Self; 3] = [Self::Interpreter, Self::Jit, Self::Aot];
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Interpreter => "interpreter",
             Self::Jit => "jit",
             Self::Aot => "aot",
         }
@@ -627,7 +633,7 @@ impl CorpusStage {
     }
 }
 
-/// A classified driver failure with bounded, directly-observed evidence.
+/// A classified execution failure with bounded, directly-observed evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CorpusFailure {
     pub stage: CorpusStage,
@@ -668,6 +674,24 @@ impl CorpusFailure {
         Self {
             stage,
             evidence: driver_error_evidence(error),
+        }
+    }
+
+    /// Classifies a facade failure observed by the in-process interpreter.
+    /// Compile and load failures keep their own stages; they are never
+    /// reported as evaluation failures.
+    #[must_use]
+    pub fn from_facade_error(error: &bamts::Error) -> Self {
+        let stage = match error {
+            bamts::Error::ReadConfig { .. } | bamts::Error::ProgramLoad(_) => CorpusStage::Load,
+            bamts::Error::ProjectConfig { .. } => CorpusStage::Resolve,
+            bamts::Error::Diagnostics { .. } => CorpusStage::Check,
+            bamts::Error::Lower(error) => program_lower_stage(error),
+            bamts::Error::Runtime(_) => CorpusStage::Evaluate,
+        };
+        Self {
+            stage,
+            evidence: facade_error_evidence(error),
         }
     }
 }
@@ -756,6 +780,27 @@ fn driver_error_evidence(error: &driver::DriverError) -> String {
     }
 }
 
+fn facade_error_evidence(error: &bamts::Error) -> String {
+    match error {
+        bamts::Error::Diagnostics { diagnostics } => match diagnostics.first() {
+            Some(first) => format!(
+                "diagnostic={}; {}",
+                first.code(),
+                bounded_text(&error.to_string())
+            ),
+            None => bounded_text(&error.to_string()),
+        },
+        bamts::Error::Runtime(error) => format!(
+            "runtime function={} pc={} opcode={:?}; error={}",
+            error.function.get(),
+            error.pc.get(),
+            error.source.instruction,
+            bounded_text(&error.to_string())
+        ),
+        _ => bounded_text(&error.to_string()),
+    }
+}
+
 fn first_diagnostic_code(rendered: &str) -> Option<&str> {
     let bytes = rendered.as_bytes();
     if bytes.len() < 10 {
@@ -807,15 +852,52 @@ impl BamtsRunner {
         self
     }
 
-    /// Runs one validated case through either JIT or AOT under the case bound.
+    /// Runs one validated case through Interpreter, JIT, or AOT under the
+    /// case bound.
     pub fn run_case(&self, spec: &CaseSpec, mode: ExecutionMode) -> Result<OracleOutcome> {
         let manifest = self.root.join(MANIFEST_PATH);
         require_clean_relative(&manifest, "entrypoint", &spec.entrypoint)
             .map_err(|error| corpus_stage_error(CorpusStage::Resolve, error))?;
         match mode {
+            ExecutionMode::Interpreter => self.run_interpreter(spec),
             ExecutionMode::Jit => self.run_jit(spec),
             ExecutionMode::Aot => self.run_aot(spec),
         }
+    }
+
+    /// Runs one validated case through the bytecode interpreter in-process:
+    /// the entrypoint compiles through the public `bamts` facade, which owns
+    /// the CLI's `bamts.toml`-first project discovery, and the executable runs
+    /// via `bamts_runtime::run` against a Node host with the classic script
+    /// compiler. No subprocess is spawned.
+    fn run_interpreter(&self, spec: &CaseSpec) -> Result<OracleOutcome> {
+        let entrypoint = self.root.join(&spec.entrypoint);
+        let started = Instant::now();
+        let executable = bamts::compile_source_file(&entrypoint)
+            .map_err(|error| facade_error(spec, ExecutionMode::Interpreter, &error))?;
+        let mut host = bamts_node::NodeHost::new();
+        host.set_script_compiler(Box::new(bamts_node::ScriptCompiler));
+        host.set_argv(["bamts".to_owned(), entrypoint.display().to_string()]);
+        let outcome = bamts_runtime::run(executable.wire(), &mut host, &Limits::default())
+            .map_err(|error| {
+                facade_error(spec, ExecutionMode::Interpreter, &bamts::Error::from(error))
+            })?;
+        let mut stdout = host.stdout().to_vec();
+        stdout.extend_from_slice(&outcome.stdout);
+        let exit_code = if host.exit_code() == 0 {
+            outcome.exit_code
+        } else {
+            host.exit_code()
+        };
+        Ok(driver_outcome(
+            driver::CommandOutcome {
+                stdout,
+                stderr: host.stderr().to_vec(),
+                exit_code,
+            },
+            started.elapsed() >= spec.timeout(),
+            self.max_output_bytes,
+        ))
     }
 
     fn run_jit(&self, spec: &CaseSpec) -> Result<OracleOutcome> {
@@ -965,7 +1047,14 @@ fn cli_error(
     mode: ExecutionMode,
     error: driver::DriverError,
 ) -> VerificationError {
-    let failure = CorpusFailure::from_driver_error(&error);
+    mode_failure(spec, mode, CorpusFailure::from_driver_error(&error))
+}
+
+fn facade_error(spec: &CaseSpec, mode: ExecutionMode, error: &bamts::Error) -> VerificationError {
+    mode_failure(spec, mode, CorpusFailure::from_facade_error(error))
+}
+
+fn mode_failure(spec: &CaseSpec, mode: ExecutionMode, failure: CorpusFailure) -> VerificationError {
     VerificationError::new(
         ErrorCode::ToolFailed,
         format!(
@@ -1503,6 +1592,25 @@ mod tests {
             &limits,
         )
         .expect("oracle run")
+    }
+
+    // ---- execution modes --------------------------------------------------
+
+    #[test]
+    fn execution_mode_all_covers_exactly_three_modes() {
+        assert_eq!(
+            ExecutionMode::ALL,
+            [
+                ExecutionMode::Interpreter,
+                ExecutionMode::Jit,
+                ExecutionMode::Aot
+            ]
+        );
+        let names: BTreeSet<&str> = ExecutionMode::ALL
+            .iter()
+            .map(|mode| mode.as_str())
+            .collect();
+        assert_eq!(names, BTreeSet::from(["interpreter", "jit", "aot"]));
     }
 
     // ---- manifest / spec parsing -----------------------------------------

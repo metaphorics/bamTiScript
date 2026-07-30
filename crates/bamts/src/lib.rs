@@ -145,15 +145,8 @@ pub fn compile_source_file(
     path: impl AsRef<Path>,
 ) -> Result<bamts_compiler::program::ExecutableProgram> {
     let path = canonical_entrypoint(path.as_ref())?;
-    let config_path = path
-        .ancestors()
-        .skip(1)
-        .map(|directory| directory.join("tsconfig.json"))
-        .find(|candidate| candidate.is_file());
-    let root_path = config_path
-        .as_deref()
-        .and_then(Path::parent)
-        .or_else(|| path.parent())
+    let root_path = discover_project_root(&path)
+        .or_else(|| path.parent().map(Path::to_path_buf))
         .ok_or_else(|| {
             Error::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -168,7 +161,8 @@ pub fn compile_source_file(
             error,
         )))
     })?;
-    let config_path = config_path.unwrap_or_else(|| root_path.join("tsconfig.json"));
+    let config_path = project_config_path(&path, root.path())
+        .unwrap_or_else(|| root.path().join("tsconfig.json"));
     let config_source = if config_path.is_file() {
         fs::read_to_string(&config_path).map_err(|source| Error::ReadConfig {
             path: config_path.clone(),
@@ -290,6 +284,27 @@ fn canonical_entrypoint(path: &Path) -> Result<PathBuf> {
     })
 }
 
+/// Finds the project root with CLI semantics: the nearest ancestor containing
+/// a `bamts.toml`, else the nearest ancestor containing a `tsconfig.json`.
+fn discover_project_root(entrypoint: &Path) -> Option<PathBuf> {
+    let ancestors = || entrypoint.parent().into_iter().flat_map(Path::ancestors);
+    ancestors()
+        .find(|directory| directory.join("bamts.toml").is_file())
+        .or_else(|| ancestors().find(|directory| directory.join("tsconfig.json").is_file()))
+        .map(Path::to_path_buf)
+}
+
+/// Selects the project's `tsconfig.json`: the nearest one on the chain from
+/// the entrypoint's directory up to the root, else the root's own file.
+fn project_config_path(entrypoint: &Path, root: &Path) -> Option<PathBuf> {
+    entrypoint
+        .parent()?
+        .ancestors()
+        .take_while(|directory| directory.starts_with(root))
+        .map(|directory| directory.join("tsconfig.json"))
+        .find(|path| path.is_file())
+}
+
 #[cfg(test)]
 mod tests {
     use super::compile_source_file;
@@ -317,6 +332,72 @@ mod tests {
 
     fn remove_fixture(directory: &Path) -> Result<(), Box<dyn Error>> {
         std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    fn tree_fixture(name: &str) -> Result<PathBuf, Box<dyn Error>> {
+        let directory = std::env::temp_dir().join(format!(
+            "bamts-facade-discovery-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(directory.join("sub"))?;
+        Ok(directory)
+    }
+
+    #[test]
+    fn bamts_toml_root_wins_over_a_closer_tsconfig() -> Result<(), Box<dyn Error>> {
+        let directory = tree_fixture("toml-precedence")?;
+        std::fs::write(directory.join("bamts.toml"), "")?;
+        std::fs::write(directory.join("shared.ts"), "export let value = 1;")?;
+        std::fs::write(directory.join("sub/tsconfig.json"), "{}")?;
+        let entrypoint = directory.join("sub/main.ts");
+        std::fs::write(
+            &entrypoint,
+            "import { value } from '../shared.js'; let answer = value;",
+        )?;
+
+        // The root is the nearest bamts.toml directory, so the `..` import
+        // stays inside the project and compiles.
+        let executable = compile_source_file(&entrypoint)?;
+        assert_eq!(executable.wire().modules().len(), 2);
+
+        // Without bamts.toml the tsconfig.json directory becomes the root and
+        // the same import escapes it.
+        std::fs::remove_file(directory.join("bamts.toml"))?;
+        let error = compile_source_file(&entrypoint)
+            .expect_err("the import must escape the tsconfig-only root");
+        assert!(matches!(error, super::Error::ProgramLoad(_)));
+
+        remove_fixture(&directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn nearest_tsconfig_within_the_root_wins() -> Result<(), Box<dyn Error>> {
+        let directory = tree_fixture("tsconfig-chain")?;
+        std::fs::write(directory.join("bamts.toml"), "")?;
+        std::fs::write(directory.join("tsconfig.json"), "this is not json")?;
+        std::fs::write(directory.join("sub/tsconfig.json"), "{}")?;
+        let entrypoint = directory.join("sub/main.ts");
+        std::fs::write(&entrypoint, "let answer = 42;")?;
+
+        // The nearest tsconfig.json between the entrypoint and the root wins,
+        // so the malformed root-level file is never read.
+        compile_source_file(&entrypoint)?;
+
+        // With no closer tsconfig.json the root's own file becomes the project
+        // configuration and its parse failure names that exact path.
+        std::fs::remove_file(directory.join("sub/tsconfig.json"))?;
+        let error =
+            compile_source_file(&entrypoint).expect_err("the root tsconfig.json must be parsed");
+        let expected = std::fs::canonicalize(directory.join("tsconfig.json"))?;
+        assert!(matches!(
+            error,
+            super::Error::ProjectConfig { ref path, .. } if *path == expected
+        ));
+
+        remove_fixture(&directory)?;
         Ok(())
     }
 

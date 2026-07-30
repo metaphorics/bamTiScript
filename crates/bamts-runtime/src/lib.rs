@@ -354,6 +354,9 @@ pub enum RuntimeErrorKind {
     InvalidRuntimeHeapReference {
         slot: u32,
     },
+    ModuleEvaluationStalled {
+        module: ModuleId,
+    },
 }
 
 impl fmt::Display for RuntimeError {
@@ -453,6 +456,11 @@ impl fmt::Display for RuntimeError {
             RuntimeErrorKind::InvalidRuntimeHeapReference { slot } => {
                 write!(formatter, "runtime heap slot {slot} does not exist")
             }
+            RuntimeErrorKind::ModuleEvaluationStalled { module } => write!(
+                formatter,
+                "module {} evaluation cannot complete: no pending microtask or live timer",
+                module.get()
+            ),
         }
     }
 }
@@ -671,6 +679,62 @@ pub(crate) enum GeneratorResume {
     },
 }
 
+/// One `.next()` request on an async generator: the value sent into the body
+/// plus the Promise handed back to the caller that the request settles.
+#[derive(Clone, Debug)]
+pub(crate) struct AsyncGeneratorRequest {
+    pub(crate) resume_value: Value,
+    pub(crate) capability: Value,
+}
+
+/// Lifecycle of a `HeapEntry::AsyncGenerator`. `AwaitingOperand` parks on an
+/// `Await` inside the body; `AwaitingYield` parks awaiting a `yield` operand.
+/// While `Executing` or in either `Awaiting*` state the body is owned by one
+/// in-flight request and further `.next()` calls only enqueue.
+#[derive(Clone, Debug)]
+pub(crate) enum AsyncGeneratorState {
+    SuspendedStart(GeneratorStart),
+    SuspendedYield(SuspendedActivation),
+    Executing,
+    AwaitingOperand(SuspendedActivation),
+    AwaitingYield(SuspendedActivation),
+    /// The body returned; its return value is being awaited before the front
+    /// request settles `done: true`. No activation is held.
+    AwaitingReturn,
+    Completed,
+}
+
+/// One step of driving an async-generator activation: it hit an `Await`, it
+/// reached a `yield`, it returned, or it threw an uncaught value. This is the
+/// union of `AsyncStep` and `GeneratorResume` produced by one drive call.
+#[derive(Clone, Debug)]
+pub(crate) enum AsyncGeneratorStep {
+    Await {
+        awaited: Value,
+        activation: SuspendedActivation,
+    },
+    Yield {
+        value: Value,
+        activation: SuspendedActivation,
+    },
+    Return(Value),
+    Throw {
+        value: Value,
+        origin: ThrowOrigin,
+    },
+}
+
+/// Collapses a drive helper's `EvalFailure` into the fatal channel of a
+/// Promise reaction job: runtime failures keep their kind; a throw-class
+/// failure here is an invariant violation, since settling paths only reject
+/// or resolve Promises rather than run user code.
+fn async_generator_kind(generator: Value, failure: EvalFailure) -> RuntimeErrorKind {
+    match failure {
+        EvalFailure::Runtime(kind) => kind,
+        _ => RuntimeErrorKind::InvalidValue { value: generator },
+    }
+}
+
 /// One step of driving a detached async-function activation: it awaited a
 /// value (and must suspend), it returned, or it threw an uncaught value.
 #[derive(Clone, Debug)]
@@ -679,11 +743,11 @@ enum AsyncStep {
         awaited: Value,
         activation: SuspendedActivation,
     },
-    Return(Value),
-    Throw {
+    Return {
         value: Value,
-        origin: ThrowOrigin,
+        execution: Option<Execution>,
     },
+    Throw(RuntimeError),
 }
 
 #[derive(Clone, Debug)]
@@ -733,6 +797,28 @@ pub(crate) enum PromiseReaction {
     /// the reaction value.
     AsyncReject {
         activation: Value,
+    },
+    /// Resumes a parked async generator on fulfillment of its awaited value.
+    /// Carries only the `HeapEntry::AsyncGenerator` handle; the parked
+    /// activation lives in the generator's own state.
+    AsyncGeneratorFulfill {
+        generator: Value,
+    },
+    /// Resumes a parked async generator on rejection of its awaited value.
+    AsyncGeneratorReject {
+        generator: Value,
+    },
+    /// Counts one fulfilled static dependency of an async-pending module.
+    /// The last fulfillment starts the parent entry inline inside the
+    /// reaction job.
+    ModuleDepFulfill {
+        parent: ModuleId,
+    },
+    /// Propagates one rejected static dependency into its async-pending
+    /// parent: the parent entry never runs and the parent settles with the
+    /// same uncaught throw.
+    ModuleDepReject {
+        parent: ModuleId,
     },
 }
 
@@ -884,6 +970,15 @@ enum HeapEntry {
         prototype: Option<Value>,
         extensible: bool,
     },
+    /// An `async function*` object: a FIFO of `.next()` requests plus a state
+    /// machine that lets exactly the front request drive the body at a time.
+    AsyncGenerator {
+        state: AsyncGeneratorState,
+        queue: VecDeque<AsyncGeneratorRequest>,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+        extensible: bool,
+    },
     ProcessEnv {
         prototype: Option<Value>,
         extensible: bool,
@@ -923,13 +1018,14 @@ enum HeapEntry {
         index: usize,
         called: bool,
     },
-    /// One suspended async-function activation together with the implicit
-    /// result Promise it settles. `activation` is taken on resume so a second
-    /// resume is a hard invalid-state error. This record is internal and never
-    /// escapes to user code.
+    /// One suspended async activation together with the implicit result Promise
+    /// it settles. Module entries also retain their terminal execution so
+    /// evaluation does not publish before top-level await completes.
     AsyncActivation {
         activation: Option<SuspendedActivation>,
         promise: Value,
+        module: Option<ModuleId>,
+        completion: Option<Result<Execution, RuntimeError>>,
     },
     NativeFunction {
         callable: NativeCallable,
@@ -986,6 +1082,29 @@ impl HeapEntry {
                     .saturating_add(1),
                 GeneratorState::Executing | GeneratorState::Completed => 1,
             },
+            Self::AsyncGenerator { state, queue, .. } => {
+                let queued = queue
+                    .len()
+                    .saturating_mul(std::mem::size_of::<AsyncGeneratorRequest>());
+                let state_bytes = match state {
+                    AsyncGeneratorState::SuspendedStart(start) => start
+                        .captures
+                        .len()
+                        .saturating_add(start.args.len())
+                        .saturating_add(1),
+                    AsyncGeneratorState::SuspendedYield(activation)
+                    | AsyncGeneratorState::AwaitingOperand(activation)
+                    | AsyncGeneratorState::AwaitingYield(activation) => activation
+                        .registers
+                        .len()
+                        .saturating_add(activation.args.len())
+                        .saturating_add(1),
+                    AsyncGeneratorState::Executing
+                    | AsyncGeneratorState::AwaitingReturn
+                    | AsyncGeneratorState::Completed => 1,
+                };
+                state_bytes.saturating_add(queued)
+            }
             Self::Object { properties, .. } | Self::Timeout { properties, .. } => {
                 properties.charge_bytes().saturating_add(1)
             }
@@ -1238,7 +1357,19 @@ struct ModuleInstance {
 #[derive(Clone, Debug)]
 enum ModuleState {
     Unevaluated,
+    /// On the current synchronous module-DFS stack; re-entering it is a
+    /// static cycle back-edge and never waits.
     Evaluating,
+    /// Awaiting asynchronous progress off-stack: one shared evaluation record
+    /// and Promise exist for the module's lifetime, and `pending_deps` counts
+    /// static dependencies whose attached reactions have not fired yet. The
+    /// record and Promise are allocated lazily, only when the entry suspends
+    /// or a static dependency is already pending.
+    EvaluatingAsync {
+        record: Value,
+        promise: Value,
+        pending_deps: usize,
+    },
     Evaluated(Result<(), RuntimeError>),
 }
 
@@ -1247,6 +1378,40 @@ pub(crate) enum ModuleEvaluation {
     Cycle,
     Evaluated(Result<(), RuntimeError>),
     Ready(Vec<ModuleId>),
+}
+
+/// The outcome of starting one module entry function.
+#[derive(Clone, Debug)]
+enum ModuleStart {
+    /// The entry settled synchronously (fully sync entry, or an async entry
+    /// whose first turn already reached Return/Throw).
+    Settled(Result<Execution, RuntimeError>),
+    /// The entry suspended (or its static dependencies are still pending);
+    /// completion arrives through the shared evaluation record.
+    Pending(ModulePending),
+    /// The module was already evaluated, or re-entered on the same DFS stack
+    /// (a static cycle back-edge); nothing ran and nothing is owed.
+    Cached,
+}
+
+/// One module's lazily created evaluation record and shared Promise. The
+/// record drives the activation; the Promise is handed to every pure dynamic
+/// import executed while the module is in flight, so concurrent importers
+/// observe the identical Promise object.
+#[derive(Clone, Copy, Debug)]
+struct ModulePending {
+    record: Value,
+    promise: Value,
+}
+
+/// The outcome of a pure dynamic `import()` edge: the raw namespace for a
+/// settled or same-stack cyclic target, the shared evaluation Promise for an
+/// in-flight async target, or the target's stored failure to rethrow at this
+/// import site.
+enum DynamicImport {
+    Ready(Value),
+    Pending(Value),
+    Failed(RuntimeError),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1419,27 +1584,99 @@ impl<'a, H: Host> Machine<'a, H> {
 
     /// Evaluates the program without draining queued microtasks.
     ///
-    /// The machine remains available for an explicit [`Self::drain_microtasks`]
-    /// checkpoint.
+    /// When the entry module suspends on top-level await, this drives the
+    /// automatic event loop — microtask checkpoints first, then one timer
+    /// turn at a time — only until the entry's evaluation Promise settles,
+    /// and returns the entry [`Execution`] before any unrelated later timer.
+    /// Timers still live at settlement stay queued for [`Self::run_to_quiescence`].
+    /// An entry whose awaited work enqueues nothing and leaves no live timer
+    /// fails with [`RuntimeErrorKind::ModuleEvaluationStalled`].
+    ///
+    /// Otherwise the machine remains available for an explicit
+    /// [`Self::drain_microtasks`] checkpoint.
     pub fn evaluate(&mut self) -> Result<Execution, RuntimeError> {
         if let Some(program) = self.program {
             let entry = program.entry();
             self.frames.clear();
             self.live_registers = 0;
             self.instantiate_modules()?;
-            return self.evaluate_module(entry)?.ok_or_else(|| {
-                self.program_error(
-                    entry,
-                    RuntimeErrorKind::InvalidVerifiedProgram {
-                        module: entry,
-                        instruction: Instruction::Halt,
-                    },
-                )
-            });
+            return self.evaluate_instantiated_module(entry);
         }
         Ok(self
             .run_loop(0)?
             .expect("the entry frame completes before the run loop stops"))
+    }
+
+    /// Evaluates one module of an already-instantiated program and returns
+    /// its entry [`Execution`]. Runs the module DFS (synchronous fast paths
+    /// stay synchronous) and, only when the entry suspends on top-level
+    /// await, drives the bounded outer loop until the entry's evaluation
+    /// Promise settles. Never calls `instantiate_modules` or
+    /// `run_to_quiescence`: the native backend delegates whole async static
+    /// graphs here, and `run` drains to quiescence afterwards.
+    pub(crate) fn evaluate_instantiated_module(
+        &mut self,
+        module: ModuleId,
+    ) -> Result<Execution, RuntimeError> {
+        match self.evaluate_module(module)? {
+            ModuleStart::Settled(result) => result,
+            ModuleStart::Pending(pending) => self.drive_entry_to_settlement(pending, module),
+            ModuleStart::Cached => Err(self.program_error(
+                module,
+                RuntimeErrorKind::InvalidVerifiedProgram {
+                    module,
+                    instruction: Instruction::Halt,
+                },
+            )),
+        }
+    }
+
+    /// Drives the outer event loop for one pending root entry: microtasks run
+    /// to emptiness, then one expired timer per turn, until the entry's
+    /// evaluation Promise settles. The settlement check runs after every full
+    /// microtask checkpoint and before any timer wait, so no wakeup is lost
+    /// and no timer beyond the settling turn fires here. A never-settling
+    /// entry with no live timer is a stall, not a hang.
+    fn drive_entry_to_settlement(
+        &mut self,
+        pending: ModulePending,
+        entry: ModuleId,
+    ) -> Result<Execution, RuntimeError> {
+        loop {
+            self.drain_microtasks_automatic()?;
+            if self
+                .promise_is_settled(pending.promise)
+                .map_err(|kind| self.program_error(entry, kind))?
+            {
+                break;
+            }
+            if !self.has_pending_timers() {
+                return Err(self.program_error(
+                    entry,
+                    RuntimeErrorKind::ModuleEvaluationStalled { module: entry },
+                ));
+            }
+            match self.wait_for_timer_expiry_state()? {
+                TimerWait::Ready => {}
+                TimerWait::Stale => continue,
+                TimerWait::Idle => {
+                    return Err(
+                        self.checkpoint_error(RuntimeErrorKind::TimerProviderFailure {
+                            message: "the timer provider lost a live machine timer".to_owned(),
+                        }),
+                    );
+                }
+            }
+            let run = self.run_one_expired_timer()?;
+            if let Some(exception) = run.uncaught.into_iter().next() {
+                return Err(self.checkpoint_error(RuntimeErrorKind::UncaughtThrow {
+                    value: exception.value,
+                    origin: exception.origin,
+                }));
+            }
+        }
+        self.take_async_module_completion(pending.record, entry)
+            .map_err(|kind| self.program_error(entry, kind))?
     }
 
     /// Runs at most one expired live timer callback.
@@ -1941,6 +2178,16 @@ impl<'a, H: Host> Machine<'a, H> {
             PromiseReaction::AsyncReject { activation } => {
                 self.resume_async(activation, value, Some(origin))
             }
+            PromiseReaction::AsyncGeneratorFulfill { generator } => {
+                self.resume_async_generator(generator, value, None)
+            }
+            PromiseReaction::AsyncGeneratorReject { generator } => {
+                self.resume_async_generator(generator, value, Some(origin))
+            }
+            PromiseReaction::ModuleDepFulfill { parent } => self.on_module_dep_fulfilled(parent),
+            PromiseReaction::ModuleDepReject { parent } => {
+                self.on_module_dep_rejected(parent, value, origin)
+            }
         }
     }
 
@@ -2027,6 +2274,164 @@ impl<'a, H: Host> Machine<'a, H> {
                     EvalFailure::Runtime(kind) => kind,
                     _ => RuntimeErrorKind::InvalidValue { value: cleanup },
                 }),
+        }
+    }
+
+    /// Counts down one fulfilled static dependency of an async-pending
+    /// module. At zero the parent entry starts inline inside this reaction
+    /// job; this is ordinary callback-shaped async execution (the same shape
+    /// `resume_async` uses), never a nested event-loop checkpoint. A
+    /// suspended entry keeps its shared pair in `state`; a settled entry
+    /// writes [`ModuleState::Evaluated`] (its pair's Promise was already
+    /// settled by `settle_async_step`); a fatal failure aborts the parent
+    /// back to [`ModuleState::Unevaluated`] and stays fatal.
+    fn on_module_dep_fulfilled(&mut self, parent: ModuleId) -> Result<(), RuntimeErrorKind> {
+        let Some(pair) = self.take_module_async_pending(parent)? else {
+            return Ok(());
+        };
+        match self.start_ready_entry(parent, Some(pair)) {
+            ModuleStart::Settled(result) => {
+                let step = match result {
+                    Ok(execution) => Ok(AsyncStep::Return {
+                        value: execution.value,
+                        execution: Some(execution),
+                    }),
+                    Err(error) if matches!(error.kind, RuntimeErrorKind::UncaughtThrow { .. }) => {
+                        Ok(AsyncStep::Throw(error))
+                    }
+                    Err(error) => {
+                        self.abort_module_evaluation(parent);
+                        return Err(error.kind);
+                    }
+                };
+                self.settle_async_step(pair.record, pair.promise, step)
+                    .map_err(|failure| self.module_eval_failure(parent, failure).kind)
+            }
+            ModuleStart::Pending(_) => Ok(()),
+            ModuleStart::Cached => unreachable!("a started entry is never cached"),
+        }
+    }
+
+    /// Fails the parent without running its entry: the identical dependency
+    /// throw is cached as the parent's stored failure, and the parent's
+    /// shared evaluation Promise rejects with the same value.
+    fn on_module_dep_rejected(
+        &mut self,
+        parent: ModuleId,
+        value: Value,
+        origin: ThrowOrigin,
+    ) -> Result<(), RuntimeErrorKind> {
+        let Some(pending) = self.take_module_async_pending(parent)? else {
+            return Ok(());
+        };
+        let error = self.program_error(parent, RuntimeErrorKind::UncaughtThrow { value, origin });
+        self.store_async_module_completion(pending.record, Some(Err(error.clone())))
+            .map_err(|failure| self.module_eval_failure(parent, failure).kind)?;
+        self.settle_module_evaluation(parent, Err(error));
+        self.reject_promise(pending.promise, value, origin)
+    }
+
+    /// Detaches an async-pending module's record/promise pair after
+    /// decrementing its dependency count; `None` means a dependency already
+    /// rejected the parent or its count has not reached zero.
+    fn take_module_async_pending(
+        &mut self,
+        parent: ModuleId,
+    ) -> Result<Option<ModulePending>, RuntimeErrorKind> {
+        let ModuleState::EvaluatingAsync {
+            record,
+            promise,
+            pending_deps,
+        } = &mut self.registry.modules[parent.get() as usize].state
+        else {
+            // A sibling rejection already settled or aborted the parent.
+            return Ok(None);
+        };
+        *pending_deps -= 1;
+        let (record, promise) = (*record, *promise);
+        if *pending_deps > 0 {
+            return Ok(None);
+        }
+        Ok(Some(ModulePending { record, promise }))
+    }
+
+    /// Attaches the module dependency fulfill/reject pair to a dependency's
+    /// evaluation Promise. Mirrors `await_promise`: an already-settled Promise
+    /// enqueues the reaction directly at exactly one microtask tick, and the
+    /// pending path charges and pushes without re-reading state, so no
+    /// check-then-attach window exists.
+    fn attach_module_reactions(
+        &mut self,
+        parent: ModuleId,
+        promise: Value,
+    ) -> Result<(), EvalFailure> {
+        let index = self
+            .runtime_slot(promise)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: promise,
+            }))?;
+        let settled = match &self.heap[index] {
+            HeapEntry::Promise {
+                state: PromiseState::Pending { .. },
+                ..
+            } => None,
+            HeapEntry::Promise {
+                state: PromiseState::Fulfilled { value },
+                ..
+            } => Some((true, *value, ThrowOrigin::Bytecode)),
+            HeapEntry::Promise {
+                state: PromiseState::Rejected { reason, origin },
+                ..
+            } => Some((false, *reason, *origin)),
+            _ => {
+                return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                    value: promise,
+                }));
+            }
+        };
+        if let Some((fulfilled, value, origin)) = settled {
+            self.ensure_microtask_capacity(1)
+                .map_err(EvalFailure::Runtime)?;
+            let reaction = if fulfilled {
+                PromiseReaction::ModuleDepFulfill { parent }
+            } else {
+                PromiseReaction::ModuleDepReject { parent }
+            };
+            self.microtasks.push_back(MicrotaskJob::Reaction {
+                reaction,
+                value,
+                origin,
+            });
+            return Ok(());
+        }
+        self.charge_promise_reactions(2)?;
+        let HeapEntry::Promise {
+            state:
+                PromiseState::Pending {
+                    fulfill_reactions,
+                    reject_reactions,
+                },
+            ..
+        } = &mut self.heap[index]
+        else {
+            unreachable!("pending Promise state was checked before reaction registration");
+        };
+        fulfill_reactions.push(PromiseReaction::ModuleDepFulfill { parent });
+        reject_reactions.push(PromiseReaction::ModuleDepReject { parent });
+        Ok(())
+    }
+
+    /// Reports whether a Promise reached a terminal state. Used by the root
+    /// drive loop after every full microtask checkpoint and before any timer
+    /// wait, so settlement is never observed late.
+    fn promise_is_settled(&self, promise: Value) -> Result<bool, RuntimeErrorKind> {
+        let index = self
+            .runtime_slot(promise)?
+            .ok_or(RuntimeErrorKind::InvalidValue { value: promise })?;
+        match &self.heap[index] {
+            HeapEntry::Promise { state, .. } => Ok(!matches!(state, PromiseState::Pending { .. })),
+            _ => Err(RuntimeErrorKind::InvalidValue { value: promise }),
         }
     }
 
@@ -3283,7 +3688,159 @@ impl<'a, H: Host> Machine<'a, H> {
         .map_err(|error| error.kind)
     }
 
-    fn run_import_entry(&mut self, module: ModuleId) -> Result<(), RuntimeError> {
+    pub(crate) fn module_entry_suspends(&self, module: ModuleId) -> bool {
+        let code = self.module_code(module);
+        code.functions()[code.entry().get() as usize]
+            .code()
+            .iter()
+            .any(|instruction| matches!(instruction, Instruction::Await { .. }))
+    }
+
+    /// Returns whether any module reachable from `module` through static
+    /// local edges has a top-level-await entry. The native backend uses this
+    /// to delegate whole async static graphs to the interpreter while keeping
+    /// fully synchronous graphs native.
+    pub(crate) fn module_graph_suspends(&self, module: ModuleId) -> bool {
+        let mut seen = Vec::new();
+        let mut stack = vec![module];
+        while let Some(next) = stack.pop() {
+            let index = next.get() as usize;
+            if index >= seen.len() {
+                seen.resize(index + 1, false);
+            }
+            if seen[index] {
+                continue;
+            }
+            seen[index] = true;
+            if self.module_entry_suspends(next) {
+                return true;
+            }
+            for edge in self.program_module(next).edges.iter() {
+                if !edge.kind.has_static() {
+                    continue;
+                }
+                if let EdgeTarget::Local(dependency) = edge.target {
+                    stack.push(dependency);
+                }
+            }
+        }
+        false
+    }
+
+    /// Runs a module entry whose static dependencies have all settled. A
+    /// fully synchronous entry completes inline; an async entry runs its
+    /// first turn and either settles (its terminal turn owns module-state
+    /// settlement through `settle_async_step`) or suspends into
+    /// [`ModuleState::EvaluatingAsync`]. Never drains the event loop:
+    /// driving belongs to the root `evaluate` machine.
+    fn start_ready_entry(&mut self, module: ModuleId, pair: Option<ModulePending>) -> ModuleStart {
+        if !self.module_entry_suspends(module) {
+            return ModuleStart::Settled(self.run_sync_module_entry(module));
+        }
+        let pair = match pair {
+            Some(pair) => pair,
+            None => match self.create_module_async_pair(module) {
+                Ok(pair) => pair,
+                Err(failure) => {
+                    return ModuleStart::Settled(Err(self.module_eval_failure(module, failure)));
+                }
+            },
+        };
+        let function = self.module_code(module).entry();
+        let stop_depth = self.frames.len();
+        if let Err(error) = self.push_frame(
+            RuntimeFunction { module, function },
+            &[],
+            Value::UNDEFINED,
+            Value::UNDEFINED,
+            &[],
+            None,
+        ) {
+            return ModuleStart::Settled(Err(error));
+        }
+        let step = self.drive_async_activation(stop_depth, None);
+        if let Err(failure) = self.settle_async_step(pair.record, pair.promise, step) {
+            let error = self.module_eval_failure(module, failure);
+            if !matches!(error.kind, RuntimeErrorKind::UncaughtThrow { .. }) {
+                // A fatal failure before settlement leaves the module
+                // retryable; throws are cached by the caller's settle.
+                self.abort_module_evaluation(module);
+            }
+            return ModuleStart::Settled(Err(error));
+        }
+        match self.finish_module_start(module, pair) {
+            Ok(start) => start,
+            Err(error) => ModuleStart::Settled(Err(error)),
+        }
+    }
+
+    /// Native-backend adapter: starts one module entry and, when it suspends,
+    /// drives the bounded outer loop until the entry settles. Callers settle
+    /// module state through `finish_module_evaluation`; only root evaluation
+    /// contexts may reach this (no checkpoint may be active).
+    pub(crate) fn run_module_entry(&mut self, module: ModuleId) -> Result<Execution, RuntimeError> {
+        match self.start_ready_entry(module, None) {
+            ModuleStart::Settled(result) => result,
+            ModuleStart::Pending(pair) => self.drive_entry_to_settlement(pair, module),
+            ModuleStart::Cached => unreachable!("a started entry is never cached"),
+        }
+    }
+
+    /// Reads the terminal effect of one async entry's first turn: a recorded
+    /// completion means the entry settled synchronously; otherwise it
+    /// suspended and the module becomes async-pending on the shared pair.
+    fn finish_module_start(
+        &mut self,
+        module: ModuleId,
+        pair: ModulePending,
+    ) -> Result<ModuleStart, RuntimeError> {
+        if self
+            .async_module_completion_stored(pair.record)
+            .map_err(|kind| self.program_error(module, kind))?
+        {
+            let completion = self
+                .take_async_module_completion(pair.record, module)
+                .map_err(|kind| self.program_error(module, kind))?;
+            return Ok(ModuleStart::Settled(completion));
+        }
+        self.registry.modules[module.get() as usize].state = ModuleState::EvaluatingAsync {
+            record: pair.record,
+            promise: pair.promise,
+            pending_deps: 0,
+        };
+        Ok(ModuleStart::Pending(pair))
+    }
+
+    /// Allocates the one shared evaluation record/promise pair for a module.
+    /// When the DFS tail already classified pending static dependencies, the
+    /// pair lives in `state` and this only clones it.
+    fn create_module_async_pair(&mut self, module: ModuleId) -> Result<ModulePending, EvalFailure> {
+        if let ModuleState::EvaluatingAsync {
+            record, promise, ..
+        } = &self.registry.modules[module.get() as usize].state
+        {
+            return Ok(ModulePending {
+                record: *record,
+                promise: *promise,
+            });
+        }
+        let promise = self.create_promise()?;
+        let record = self.create_async_activation(promise, Some(module))?;
+        Ok(ModulePending { record, promise })
+    }
+
+    /// Returns whether the entry's first turn already recorded a completion.
+    fn async_module_completion_stored(&self, record: Value) -> Result<bool, RuntimeErrorKind> {
+        let index = self
+            .runtime_slot(record)?
+            .ok_or(RuntimeErrorKind::InvalidValue { value: record })?;
+        let HeapEntry::AsyncActivation { completion, .. } = &self.heap[index] else {
+            return Err(RuntimeErrorKind::InvalidValue { value: record });
+        };
+        Ok(completion.is_some())
+    }
+
+    fn run_sync_module_entry(&mut self, module: ModuleId) -> Result<Execution, RuntimeError> {
         let function = self.module_code(module).entry();
         let stop_depth = self.frames.len();
         self.push_frame(
@@ -3295,7 +3852,7 @@ impl<'a, H: Host> Machine<'a, H> {
             None,
         )?;
         let result = self.run_loop(stop_depth).and_then(|execution| {
-            execution.map(|_| ()).ok_or_else(|| {
+            execution.ok_or_else(|| {
                 self.program_error(
                     module,
                     RuntimeErrorKind::InvalidVerifiedProgram {
@@ -3311,21 +3868,21 @@ impl<'a, H: Host> Machine<'a, H> {
         result
     }
 
-    fn evaluate_import(&mut self, module: ModuleId) -> Result<(), RuntimeError> {
-        let dependencies = match self.begin_module_evaluation(module)? {
-            ModuleEvaluation::Cycle => return Ok(()),
-            ModuleEvaluation::Evaluated(result) => return result,
-            ModuleEvaluation::Ready(dependencies) => dependencies,
-        };
-        for dependency in dependencies {
-            if let Err(error) = self.evaluate_import(dependency) {
-                self.settle_module_evaluation(module, Err(error.clone()));
-                return Err(error);
+    fn module_eval_failure(&mut self, module: ModuleId, failure: EvalFailure) -> RuntimeError {
+        match self.promise_rejection_value(failure) {
+            Ok((value, origin)) => {
+                self.program_error(module, RuntimeErrorKind::UncaughtThrow { value, origin })
             }
+            Err(EvalFailure::Runtime(kind)) => self.program_error(module, kind),
+            Err(_) => unreachable!("failure materialization only fails at a runtime boundary"),
         }
-        let result = self.run_import_entry(module);
-        self.settle_module_evaluation(module, result.clone());
-        result
+    }
+
+    fn evaluate_import(&mut self, module: ModuleId) -> Result<(), RuntimeError> {
+        // A pending dependency hands the raw (possibly partial) namespace to
+        // the executing entry; the shared evaluation Promise already carries
+        // completion to any pure dynamic importer.
+        self.evaluate_module(module).map(|_| ())
     }
 
     fn import_namespace(
@@ -3336,70 +3893,144 @@ impl<'a, H: Host> Machine<'a, H> {
         let target = self
             .resolve_import(requester, specifier)
             .map_err(EvalFailure::Runtime)?;
-        if let ImportTarget::Local(module) = target {
+        let ImportTarget::Local(module) = target else {
+            return self
+                .imported_namespace(requester, target)
+                .map_err(EvalFailure::Runtime);
+        };
+        if self.import_edge_has_static(requester, specifier) {
+            // A static (or coalesced static+dynamic) edge always yields the
+            // raw namespace: settled dependencies finished before this entry
+            // ran, pending ones hand over the partial cycle namespace, and
+            // stored failures rethrow at this site.
             self.evaluate_import(module)
                 .map_err(|error| import_failure(&error))?;
+            return self
+                .imported_namespace(requester, target)
+                .map_err(EvalFailure::Runtime);
         }
-        self.imported_namespace(requester, target)
-            .map_err(EvalFailure::Runtime)
+        match self.import_dynamic(requester, module)? {
+            DynamicImport::Ready(value) | DynamicImport::Pending(value) => Ok(value),
+            DynamicImport::Failed(error) => Err(import_failure(&error)),
+        }
     }
-    fn evaluate_module(&mut self, module: ModuleId) -> Result<Option<Execution>, RuntimeError> {
+
+    /// Pure dynamic import of a local module. Only an in-flight
+    /// [`ModuleState::EvaluatingAsync`] target hands out its shared
+    /// evaluation Promise, so every concurrent `import()` observes the
+    /// identical Promise object; every other state yields the raw namespace
+    /// or the stored failure.
+    fn import_dynamic(
+        &mut self,
+        requester: ModuleId,
+        target: ModuleId,
+    ) -> Result<DynamicImport, EvalFailure> {
+        match self.registry.modules[target.get() as usize].state.clone() {
+            ModuleState::EvaluatingAsync { promise, .. } => Ok(DynamicImport::Pending(promise)),
+            ModuleState::Evaluating | ModuleState::Evaluated(Ok(())) => self
+                .imported_namespace(requester, ImportTarget::Local(target))
+                .map(DynamicImport::Ready)
+                .map_err(EvalFailure::Runtime),
+            ModuleState::Evaluated(Err(error)) => Ok(DynamicImport::Failed(error)),
+            ModuleState::Unevaluated => match self.evaluate_module(target) {
+                Ok(ModuleStart::Settled(_)) | Ok(ModuleStart::Cached) => self
+                    .imported_namespace(requester, ImportTarget::Local(target))
+                    .map(DynamicImport::Ready)
+                    .map_err(EvalFailure::Runtime),
+                Ok(ModuleStart::Pending(pair)) => Ok(DynamicImport::Pending(pair.promise)),
+                Err(error) => Ok(DynamicImport::Failed(error)),
+            },
+        }
+    }
+
+    /// Reports whether the resolved dynamic edge also carries a static
+    /// component; coalesced edges follow static namespace semantics.
+    fn import_edge_has_static(&self, module: ModuleId, specifier: ConstantId) -> bool {
+        let name = self.constant_text(module, specifier);
+        self.program_module(module).edges.iter().any(|edge| {
+            edge.kind.has_dynamic()
+                && edge.kind.has_static()
+                && self.constant_text(module, edge.specifier) == name
+        })
+    }
+
+    /// Evaluates one module's static dependency graph and starts its entry.
+    /// The DFS never drains the event loop: a dependency already in flight
+    /// contributes one attached reaction per parent, and the module parks in
+    /// [`ModuleState::EvaluatingAsync`] until the last dependency fulfills.
+    /// Entry failures settle the module and propagate as `Err` exactly as
+    /// before; [`ModuleStart::Pending`] replaces the old blocking wait.
+    fn evaluate_module(&mut self, module: ModuleId) -> Result<ModuleStart, RuntimeError> {
+        if let ModuleState::EvaluatingAsync {
+            record, promise, ..
+        } = &self.registry.modules[module.get() as usize].state
+        {
+            return Ok(ModuleStart::Pending(ModulePending {
+                record: *record,
+                promise: *promise,
+            }));
+        }
         let dependencies = match self.begin_module_evaluation(module)? {
-            ModuleEvaluation::Cycle => return Ok(None),
-            ModuleEvaluation::Evaluated(result) => return result.map(|()| None),
+            ModuleEvaluation::Cycle => return Ok(ModuleStart::Cached),
+            ModuleEvaluation::Evaluated(result) => return result.map(|()| ModuleStart::Cached),
             ModuleEvaluation::Ready(dependencies) => dependencies,
         };
+        let mut pending_deps = 0usize;
+        let mut pending_pair: Option<ModulePending> = None;
         for dependency in dependencies {
-            if let Err(error) = self.evaluate_module(dependency) {
-                return self.finish_module_evaluation(module, Err(error)).map(Some);
+            match self.evaluate_module(dependency) {
+                Ok(ModuleStart::Settled(_)) | Ok(ModuleStart::Cached) => {}
+                Ok(ModuleStart::Pending(pair)) => {
+                    if pending_pair.is_none() {
+                        pending_pair = Some(match self.create_module_async_pair(module) {
+                            Ok(pair) => pair,
+                            Err(failure) => {
+                                return Err(self.module_alloc_failure(module, failure));
+                            }
+                        });
+                    }
+                    if let Err(failure) = self.attach_module_reactions(module, pair.promise) {
+                        return Err(self.module_alloc_failure(module, failure));
+                    }
+                    pending_deps += 1;
+                }
+                Err(error) => {
+                    // A dependency's failure becomes this module's stored
+                    // failure without running its entry.
+                    match self.finish_module_evaluation(module, Err(error)) {
+                        Err(error) => return Err(error),
+                        Ok(_) => unreachable!("a dependency failure stays an error"),
+                    }
+                }
             }
         }
+        if pending_deps > 0 {
+            let pair = pending_pair.expect("pending dependencies forced the shared pair");
+            self.registry.modules[module.get() as usize].state = ModuleState::EvaluatingAsync {
+                record: pair.record,
+                promise: pair.promise,
+                pending_deps,
+            };
+            return Ok(ModuleStart::Pending(pair));
+        }
+        let start = self.start_ready_entry(module, None);
+        if let ModuleStart::Settled(result) = &start {
+            // The async terminal turn already settled module state through
+            // `settle_async_step`; `finish_module_evaluation` remains the
+            // single state writer for synchronous entries.
+            self.finish_module_evaluation(module, result.clone())?;
+        }
+        Ok(start)
+    }
 
-        let code = self.module_code(module);
-        let function = code.entry().get() as usize;
-        let metadata = &code.functions()[function];
-        let register_count = metadata.register_count() as usize;
-        let result = if self.limits.max_call_depth < 1 {
-            Err(self.program_error(
-                module,
-                RuntimeErrorKind::CallDepthExceeded {
-                    limit: self.limits.max_call_depth,
-                },
-            ))
-        } else if register_count > self.limits.max_total_registers {
-            Err(self.program_error(
-                module,
-                RuntimeErrorKind::RegisterLimitExceeded {
-                    limit: self.limits.max_total_registers,
-                },
-            ))
-        } else {
-            self.frames.push(Frame::new(
-                RuntimeFunction {
-                    module,
-                    function: FunctionId::new(function as u32),
-                },
-                metadata,
-                &[],
-                Value::UNDEFINED,
-                Value::UNDEFINED,
-                &[],
-                None,
-            ));
-            self.live_registers = register_count;
-            self.run_loop(0).and_then(|execution| {
-                execution.ok_or_else(|| {
-                    self.program_error(
-                        module,
-                        RuntimeErrorKind::InvalidVerifiedProgram {
-                            module,
-                            instruction: Instruction::Halt,
-                        },
-                    )
-                })
-            })
-        };
-        self.finish_module_evaluation(module, result).map(Some)
+    /// Settles an allocation failure while starting or awaiting module
+    /// evaluation: fatal kinds abort back to retryable [`ModuleState::Unevaluated`].
+    fn module_alloc_failure(&mut self, module: ModuleId, failure: EvalFailure) -> RuntimeError {
+        let error = self.module_eval_failure(module, failure);
+        match self.finish_module_evaluation(module, Err(error)) {
+            Err(error) => error,
+            Ok(_) => unreachable!("an allocation failure stays an error"),
+        }
     }
 
     pub(crate) fn begin_module_evaluation(
@@ -3407,7 +4038,9 @@ impl<'a, H: Host> Machine<'a, H> {
         module: ModuleId,
     ) -> Result<ModuleEvaluation, RuntimeError> {
         match self.registry.modules[module.get() as usize].state.clone() {
-            ModuleState::Evaluating => return Ok(ModuleEvaluation::Cycle),
+            ModuleState::Evaluating | ModuleState::EvaluatingAsync { .. } => {
+                return Ok(ModuleEvaluation::Cycle);
+            }
             ModuleState::Evaluated(result) => return Ok(ModuleEvaluation::Evaluated(result)),
             ModuleState::Unevaluated => {}
         }
@@ -3451,10 +4084,6 @@ impl<'a, H: Host> Machine<'a, H> {
         module: ModuleId,
         result: Result<Execution, RuntimeError>,
     ) -> Result<Execution, RuntimeError> {
-        if result.is_err() {
-            self.frames.clear();
-            self.live_registers = 0;
-        }
         let stored = result.as_ref().map(|_| ()).map_err(Clone::clone);
         self.settle_module_evaluation(module, stored);
         result
@@ -3465,6 +4094,23 @@ impl<'a, H: Host> Machine<'a, H> {
         module: ModuleId,
         result: Result<(), RuntimeError>,
     ) {
+        // Settled exactly once: an async terminal turn writes the terminal
+        // state itself, and a later duplicate write (for example a native
+        // caller's `finish_module_evaluation` after `run_module_entry`)
+        // carries the identical stored result.
+        if matches!(
+            self.registry.modules[module.get() as usize].state,
+            ModuleState::Evaluated(_)
+        ) {
+            return;
+        }
+        debug_assert!(
+            matches!(
+                self.registry.modules[module.get() as usize].state,
+                ModuleState::Evaluating | ModuleState::EvaluatingAsync { .. }
+            ),
+            "only an in-flight module settles"
+        );
         match result {
             Ok(()) => {
                 self.registry.modules[module.get() as usize].state = ModuleState::Evaluated(Ok(()));
@@ -3480,7 +4126,7 @@ impl<'a, H: Host> Machine<'a, H> {
     pub(crate) fn abort_module_evaluation(&mut self, module: ModuleId) {
         if matches!(
             self.registry.modules[module.get() as usize].state,
-            ModuleState::Evaluating
+            ModuleState::Evaluating | ModuleState::EvaluatingAsync { .. }
         ) {
             self.registry.modules[module.get() as usize].state = ModuleState::Unevaluated;
         }
@@ -3904,6 +4550,31 @@ impl<'a, H: Host> Machine<'a, H> {
                         Err(failure) => self.resolve_failure(failure, pc)?,
                     }
                 }
+                Instruction::IteratorStep { dst, iterator } => {
+                    let iterator = self.read_register(frame_index, iterator.get());
+                    match self.iterator_step(iterator) {
+                        Ok(result) => {
+                            self.write_register(frame_index, dst.get(), result);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::IteratorResult {
+                    done,
+                    value,
+                    result,
+                } => {
+                    let result = self.read_register(frame_index, result.get());
+                    match self.iterator_result_parts(result) {
+                        Ok((is_done, produced)) => {
+                            self.write_register(frame_index, done.get(), Value::boolean(is_done));
+                            self.write_register(frame_index, value.get(), produced);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
                 Instruction::Jump { target } => {
                     self.frames[frame_index].pc = target.get() as usize;
                 }
@@ -3936,7 +4607,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     let value = self.read_register(frame_index, value.get());
                     self.throw(value, ThrowOrigin::Bytecode, pc)?;
                 }
-                Instruction::Suspend { src, .. }
+                Instruction::Await { src, .. }
                     if self
                         .async_boundaries
                         .last()
@@ -3991,6 +4662,9 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 Instruction::Suspend { .. } => {
                     self.throw_type("suspend outside an engine-owned event loop", pc)?;
+                }
+                Instruction::Await { .. } => {
+                    self.throw_type("await outside an engine-owned event loop", pc)?;
                 }
                 Instruction::Import { dst, specifier } => {
                     match self.import_namespace(module_id, specifier) {
@@ -4558,6 +5232,21 @@ impl<'a, H: Host> Machine<'a, H> {
                     let flags = self.module_code(target.module).functions()
                         [target.function.get() as usize]
                         .flags();
+                    if flags.is_async && flags.is_generator {
+                        let generator = self
+                            .create_async_generator(GeneratorStart {
+                                target,
+                                captures,
+                                this_value,
+                                new_target,
+                                args: arguments.as_ref().to_vec(),
+                            })
+                            .map_err(|kind| self.error_here_at(kind, call_pc))?;
+                        if let Some(register) = destination {
+                            self.write_register(self.frames.len() - 1, register, generator);
+                        }
+                        return Ok(());
+                    }
                     if flags.is_generator && !flags.is_async {
                         let generator = self
                             .create_generator(GeneratorStart {
@@ -4632,6 +5321,18 @@ impl<'a, H: Host> Machine<'a, H> {
                             }
                             Err(failure) => return self.resolve_failure(failure, call_pc),
                         },
+                        Ok(intrinsics::BuiltinOutcome::AsyncGeneratorNext {
+                            generator,
+                            resume_value,
+                        }) => match self.enqueue_async_generator_next(generator, resume_value) {
+                            Ok(value) => {
+                                if let Some(register) = destination {
+                                    self.write_register(self.frames.len() - 1, register, value);
+                                }
+                                return Ok(());
+                            }
+                            Err(failure) => return self.resolve_failure(failure, call_pc),
+                        },
                         Ok(intrinsics::BuiltinOutcome::ConstructCall { .. }) => {
                             return self.throw_type("call", call_pc);
                         }
@@ -4690,7 +5391,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 Ok(
                     intrinsics::BuiltinOutcome::Call { .. }
-                    | intrinsics::BuiltinOutcome::GeneratorNext { .. },
+                    | intrinsics::BuiltinOutcome::GeneratorNext { .. }
+                    | intrinsics::BuiltinOutcome::AsyncGeneratorNext { .. },
                 ) => self.throw_type("construct", call_pc),
                 Ok(intrinsics::BuiltinOutcome::ConstructCall {
                     callee: continuation,
@@ -4723,13 +5425,11 @@ impl<'a, H: Host> Machine<'a, H> {
         if let HeapEntry::Function {
             module, function, ..
         } = self.heap[index]
-        {
-            if self.module_code(module).functions()[function.get() as usize]
+            && self.module_code(module).functions()[function.get() as usize]
                 .flags()
                 .is_async
-            {
-                return self.throw_type("construct", call_pc);
-            }
+        {
+            return self.throw_type("construct", call_pc);
         }
         let object = self
             .allocate_constructed_receiver(callee)
@@ -5004,6 +5704,10 @@ impl<'a, H: Host> Machine<'a, H> {
                             generator,
                             resume_value,
                         } => return self.resume_generator(generator, resume_value),
+                        intrinsics::BuiltinOutcome::AsyncGeneratorNext {
+                            generator,
+                            resume_value,
+                        } => return self.enqueue_async_generator_next(generator, resume_value),
                         intrinsics::BuiltinOutcome::ConstructCall { .. } => {
                             return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                                 operation: "call",
@@ -5015,6 +5719,17 @@ impl<'a, H: Host> Machine<'a, H> {
                     let flags = self.module_code(target.module).functions()
                         [target.function.get() as usize]
                         .flags();
+                    if flags.is_async && flags.is_generator {
+                        return self
+                            .create_async_generator(GeneratorStart {
+                                target,
+                                captures,
+                                this_value,
+                                new_target: Value::UNDEFINED,
+                                args: arguments.as_ref().to_vec(),
+                            })
+                            .map_err(EvalFailure::Runtime);
+                    }
                     if flags.is_generator && !flags.is_async {
                         return self
                             .create_generator(GeneratorStart {
@@ -5441,6 +6156,7 @@ impl<'a, H: Host> Machine<'a, H> {
         match &self.heap[index] {
             HeapEntry::Object { properties, .. }
             | HeapEntry::Generator { properties, .. }
+            | HeapEntry::AsyncGenerator { properties, .. }
             | HeapEntry::Script { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
             | HeapEntry::Date { properties, .. }
@@ -5571,6 +6287,7 @@ impl<'a, H: Host> Machine<'a, H> {
         match &self.heap[index] {
             HeapEntry::Object { properties, .. }
             | HeapEntry::Generator { properties, .. }
+            | HeapEntry::AsyncGenerator { properties, .. }
             | HeapEntry::Script { properties, .. }
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
@@ -5756,6 +6473,7 @@ impl<'a, H: Host> Machine<'a, H> {
         let properties = match &self.heap[index] {
             HeapEntry::Object { properties, .. }
             | HeapEntry::Generator { properties, .. }
+            | HeapEntry::AsyncGenerator { properties, .. }
             | HeapEntry::Script { properties, .. }
             | HeapEntry::Array { properties, .. }
             | HeapEntry::Function { properties, .. }
@@ -5778,6 +6496,7 @@ impl<'a, H: Host> Machine<'a, H> {
         let prototype = match &self.heap[index] {
             HeapEntry::Object { prototype, .. }
             | HeapEntry::Generator { prototype, .. }
+            | HeapEntry::AsyncGenerator { prototype, .. }
             | HeapEntry::Script { prototype, .. }
             | HeapEntry::Array { prototype, .. }
             | HeapEntry::Function { prototype, .. }
@@ -5878,6 +6597,7 @@ impl<'a, H: Host> Machine<'a, H> {
             let accessor = match &self.heap[node] {
                 HeapEntry::Object { properties, .. }
                 | HeapEntry::Generator { properties, .. }
+                | HeapEntry::AsyncGenerator { properties, .. }
                 | HeapEntry::Script { properties, .. }
                 | HeapEntry::Array { properties, .. }
                 | HeapEntry::Function { properties, .. }
@@ -5991,6 +6711,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 extensible,
                 ..
             }
+            | HeapEntry::AsyncGenerator {
+                properties,
+                extensible,
+                ..
+            }
             | HeapEntry::Script {
                 properties,
                 extensible,
@@ -6070,6 +6795,7 @@ impl<'a, H: Host> Machine<'a, H> {
         let growth = match &self.heap[index] {
             HeapEntry::Object { properties, .. }
             | HeapEntry::Generator { properties, .. }
+            | HeapEntry::AsyncGenerator { properties, .. }
             | HeapEntry::Script { properties, .. }
             | HeapEntry::Function { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
@@ -6135,6 +6861,7 @@ impl<'a, H: Host> Machine<'a, H> {
         match &mut self.heap[index] {
             HeapEntry::Object { properties, .. }
             | HeapEntry::Generator { properties, .. }
+            | HeapEntry::AsyncGenerator { properties, .. }
             | HeapEntry::Script { properties, .. }
             | HeapEntry::Function { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
@@ -6226,6 +6953,11 @@ impl<'a, H: Host> Machine<'a, H> {
                         ..
                     }
                     | HeapEntry::Generator {
+                        properties,
+                        extensible,
+                        ..
+                    }
+                    | HeapEntry::AsyncGenerator {
                         properties,
                         extensible,
                         ..
@@ -6325,6 +7057,7 @@ impl<'a, H: Host> Machine<'a, H> {
             Some(index) => match &mut self.heap[index] {
                 HeapEntry::Object { properties, .. }
                 | HeapEntry::Generator { properties, .. }
+                | HeapEntry::AsyncGenerator { properties, .. }
                 | HeapEntry::Script { properties, .. }
                 | HeapEntry::Function { properties, .. }
                 | HeapEntry::NativeFunction { properties, .. }
@@ -6489,6 +7222,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     self.heap[index],
                     HeapEntry::Object { .. }
                         | HeapEntry::Generator { .. }
+                        | HeapEntry::AsyncGenerator { .. }
                         | HeapEntry::Script { .. }
                         | HeapEntry::Array { .. }
                         | HeapEntry::Promise { .. }
@@ -6532,6 +7266,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     prototype: slot, ..
                 }
                 | HeapEntry::Generator {
+                    prototype: slot, ..
+                }
+                | HeapEntry::AsyncGenerator {
                     prototype: slot, ..
                 }
                 | HeapEntry::Script {
@@ -6659,8 +7396,10 @@ impl<'a, H: Host> Machine<'a, H> {
         let instruction = self.module_code(activation.target.module).functions()
             [activation.target.function.get() as usize]
             .code()[suspend_pc];
-        let Instruction::Suspend { dst, resume, .. } = instruction else {
-            unreachable!("generator resume token names a suspend instruction");
+        let (Instruction::Suspend { dst, resume, .. } | Instruction::Await { dst, resume, .. }) =
+            instruction
+        else {
+            unreachable!("generator resume token names a suspension instruction");
         };
         let mut frame = Frame {
             module: activation.target.module,
@@ -6809,7 +7548,7 @@ impl<'a, H: Host> Machine<'a, H> {
         arguments: &[Value],
     ) -> Result<Value, EvalFailure> {
         let promise = self.create_promise()?;
-        let record = self.create_async_activation(promise)?;
+        let record = self.create_async_activation(promise, None)?;
         let stop_depth = self.frames.len();
         let return_to = self.frames.last().map(|frame| ReturnTo {
             destination: None,
@@ -6836,6 +7575,7 @@ impl<'a, H: Host> Machine<'a, H> {
         rejection: Option<ThrowOrigin>,
     ) -> Result<(), RuntimeErrorKind> {
         let promise = self.async_activation_promise(record)?;
+        let module_entry = self.async_activation_module(record)?.is_some();
         let activation = self.take_async_activation(record)?;
         let register_count = activation.registers.len();
         if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
@@ -6851,15 +7591,21 @@ impl<'a, H: Host> Machine<'a, H> {
         let instruction = self.module_code(activation.target.module).functions()
             [activation.target.function.get() as usize]
             .code()[suspend_pc];
-        let Instruction::Suspend { dst, resume, .. } = instruction else {
-            unreachable!("async resume token names a suspend instruction");
+        let (Instruction::Suspend { dst, resume, .. } | Instruction::Await { dst, resume, .. }) =
+            instruction
+        else {
+            unreachable!("async resume token names a suspension instruction");
         };
         let stop_depth = self.frames.len();
-        let return_to = self.frames.last().map(|frame| ReturnTo {
-            destination: None,
-            call_pc: frame.pc,
-            constructed: None,
-        });
+        let return_to = if module_entry {
+            None
+        } else {
+            self.frames.last().map(|frame| ReturnTo {
+                destination: None,
+                call_pc: frame.pc,
+                constructed: None,
+            })
+        };
         let mut frame = Frame {
             module: activation.target.module,
             function: activation.target.function.get() as usize,
@@ -6882,7 +7628,14 @@ impl<'a, H: Host> Machine<'a, H> {
         let step = self.drive_async_activation(stop_depth, inject);
         match self.settle_async_step(record, promise, step) {
             Ok(()) => Ok(()),
-            Err(EvalFailure::Runtime(kind)) => Err(kind),
+            Err(EvalFailure::Runtime(kind)) => {
+                // A fatal failure during a module entry's resume leaves the
+                // module retryable instead of stuck in flight.
+                if let Ok(Some(module)) = self.async_activation_module(record) {
+                    self.abort_module_evaluation(module);
+                }
+                Err(kind)
+            }
             Err(_) => Err(RuntimeErrorKind::InvalidValue { value: record }),
         }
     }
@@ -6915,7 +7668,10 @@ impl<'a, H: Host> Machine<'a, H> {
             .pop()
             .expect("async execution owns its unwind boundary");
         match result {
-            Ok(Some(execution)) => Ok(AsyncStep::Return(execution.value)),
+            Ok(Some(execution)) => Ok(AsyncStep::Return {
+                value: execution.value,
+                execution: Some(execution),
+            }),
             Ok(None) => {
                 if let Some((awaited, activation)) = self.pending_async_suspend.take() {
                     Ok(AsyncStep::Suspend {
@@ -6923,18 +7679,17 @@ impl<'a, H: Host> Machine<'a, H> {
                         activation,
                     })
                 } else {
-                    Ok(AsyncStep::Return(
-                        self.last_completion.take().unwrap_or(Value::UNDEFINED),
-                    ))
+                    Ok(AsyncStep::Return {
+                        value: self.last_completion.take().unwrap_or(Value::UNDEFINED),
+                        execution: None,
+                    })
                 }
             }
             Err(error) => {
                 self.unwind_frames_to(stop_depth);
-                match error.kind {
-                    RuntimeErrorKind::UncaughtThrow { value, origin } => {
-                        Ok(AsyncStep::Throw { value, origin })
-                    }
-                    kind => Err(EvalFailure::Runtime(kind)),
+                match &error.kind {
+                    RuntimeErrorKind::UncaughtThrow { .. } => Ok(AsyncStep::Throw(error)),
+                    _ => Err(EvalFailure::Runtime(error.kind)),
                 }
             }
         }
@@ -6964,14 +7719,600 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 result
             }
-            Ok(AsyncStep::Return(value)) => self
-                .resolve_promise(promise, value)
-                .map_err(EvalFailure::Runtime),
-            Ok(AsyncStep::Throw { value, origin }) => self
-                .reject_promise(promise, value, origin)
-                .map_err(EvalFailure::Runtime),
+            Ok(AsyncStep::Return { value, execution }) => {
+                self.store_async_module_completion(record, execution.map(Ok))?;
+                let module = self
+                    .async_activation_module(record)
+                    .map_err(EvalFailure::Runtime)?;
+                let Some(module) = module else {
+                    return self
+                        .resolve_promise(promise, value)
+                        .map_err(EvalFailure::Runtime);
+                };
+                // Module terminal settlement: the shared evaluation Promise
+                // fulfills with the namespace (so every in-flight dynamic
+                // importer unwraps it through `await`), and the module state
+                // stores the success — exactly once, before any reaction
+                // observing the settlement can run.
+                let namespace = self
+                    .module_namespace(module, module)
+                    .map_err(|error| EvalFailure::Runtime(error.kind))?;
+                self.fulfill_promise(promise, namespace)
+                    .map_err(EvalFailure::Runtime)?;
+                self.settle_module_evaluation(module, Ok(()));
+                Ok(())
+            }
+            Ok(AsyncStep::Throw(error)) => {
+                let RuntimeErrorKind::UncaughtThrow { value, origin } = error.kind.clone() else {
+                    unreachable!("async throws retain an uncaught-throw error");
+                };
+                self.store_async_module_completion(record, Some(Err(error.clone())))?;
+                let module = self
+                    .async_activation_module(record)
+                    .map_err(EvalFailure::Runtime)?;
+                if let Some(module) = module {
+                    // The identical uncaught throw is cached as the module's
+                    // stored failure and rejects the shared evaluation
+                    // Promise once.
+                    self.settle_module_evaluation(module, Err(error));
+                }
+                self.reject_promise(promise, value, origin)
+                    .map_err(EvalFailure::Runtime)
+            }
             Err(failure) => Err(failure),
         }
+    }
+
+    /// Creates a lazy `async function*` object. Calling the function runs no
+    /// body code; the first `.next()` starts the activation.
+    pub(crate) fn create_async_generator(
+        &mut self,
+        start: GeneratorStart,
+    ) -> Result<Value, RuntimeErrorKind> {
+        self.allocate(HeapEntry::AsyncGenerator {
+            state: AsyncGeneratorState::SuspendedStart(start),
+            queue: VecDeque::new(),
+            properties: PropertyMap::default(),
+            prototype: Some(self.intrinsics.builtins.async_generator_prototype()),
+            extensible: true,
+        })
+    }
+
+    /// `%AsyncGeneratorPrototype%.next`: never throws synchronously. An
+    /// incompatible receiver rejects the returned Promise; otherwise the
+    /// request joins the FIFO and the front request drives the body when the
+    /// generator is idle.
+    pub(crate) fn enqueue_async_generator_next(
+        &mut self,
+        generator: Value,
+        resume_value: Value,
+    ) -> Result<Value, EvalFailure> {
+        let capability = self.create_promise()?;
+        let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)? else {
+            self.reject_promise(
+                capability,
+                Value::UNDEFINED,
+                ThrowOrigin::TypeError {
+                    operation: "AsyncGenerator.prototype.next called on incompatible receiver",
+                },
+            )
+            .map_err(EvalFailure::Runtime)?;
+            return Ok(capability);
+        };
+        let HeapEntry::AsyncGenerator { state, queue, .. } = &mut self.heap[index] else {
+            self.reject_promise(
+                capability,
+                Value::UNDEFINED,
+                ThrowOrigin::TypeError {
+                    operation: "AsyncGenerator.prototype.next called on incompatible receiver",
+                },
+            )
+            .map_err(EvalFailure::Runtime)?;
+            return Ok(capability);
+        };
+        queue.push_back(AsyncGeneratorRequest {
+            resume_value,
+            capability,
+        });
+        let idle = !matches!(
+            state,
+            AsyncGeneratorState::Executing
+                | AsyncGeneratorState::AwaitingOperand(_)
+                | AsyncGeneratorState::AwaitingYield(_)
+                | AsyncGeneratorState::AwaitingReturn
+        );
+        if idle {
+            self.drive_async_generator(generator)?;
+        }
+        Ok(capability)
+    }
+
+    /// Iteratively serves the request queue. At most one request drives the
+    /// body at a time: a drive either parks the generator in `AwaitingOperand`
+    /// or `AwaitingYield` (returning until a Promise reaction resumes it), or
+    /// settles the front request and loops to serve the next one. A completed
+    /// generator drains every queued request with `{value: undefined,
+    /// done: true}`.
+    pub(crate) fn drive_async_generator(&mut self, generator: Value) -> Result<(), EvalFailure> {
+        loop {
+            let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)? else {
+                return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                    value: generator,
+                }));
+            };
+            let HeapEntry::AsyncGenerator { state, queue, .. } = &mut self.heap[index] else {
+                return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                    value: generator,
+                }));
+            };
+            if matches!(
+                state,
+                AsyncGeneratorState::Executing
+                    | AsyncGeneratorState::AwaitingOperand(_)
+                    | AsyncGeneratorState::AwaitingYield(_)
+                    | AsyncGeneratorState::AwaitingReturn
+            ) {
+                return Ok(());
+            }
+            if queue.is_empty() {
+                return Ok(());
+            }
+            if matches!(state, AsyncGeneratorState::Completed) {
+                let request = queue.pop_front().expect("queue emptiness checked");
+                let result = self.iterator_result(Value::UNDEFINED, true)?;
+                self.resolve_promise(request.capability, result)
+                    .map_err(EvalFailure::Runtime)?;
+                continue;
+            }
+            let resume_value = queue.front().expect("queue emptiness checked").resume_value;
+            let taken = std::mem::replace(state, AsyncGeneratorState::Executing);
+            let stop_depth = self.frames.len();
+            let return_to = self.frames.last().map(|frame| ReturnTo {
+                destination: None,
+                call_pc: frame.pc,
+                constructed: None,
+            });
+            let pushed = match taken {
+                AsyncGeneratorState::SuspendedStart(start) => self
+                    .push_frame(
+                        start.target,
+                        &start.captures,
+                        start.this_value,
+                        start.new_target,
+                        &start.args,
+                        return_to,
+                    )
+                    .map_err(|error| EvalFailure::Runtime(error.kind)),
+                AsyncGeneratorState::SuspendedYield(activation) => {
+                    self.push_resumed_generator_frame(activation, resume_value, return_to)
+                }
+                AsyncGeneratorState::Executing
+                | AsyncGeneratorState::AwaitingOperand(_)
+                | AsyncGeneratorState::AwaitingYield(_)
+                | AsyncGeneratorState::AwaitingReturn
+                | AsyncGeneratorState::Completed => unreachable!(),
+            };
+            let step = match pushed {
+                Ok(()) => self.drive_async_generator_activation(stop_depth, None),
+                Err(failure) => Err(failure),
+            };
+            self.settle_async_generator_step(generator, step)?;
+        }
+    }
+
+    /// Runs the body of an async generator from the current frame top under
+    /// callback, async, AND generator boundaries at one depth. The `Await`
+    /// opcode routes itself to the async suspension slot and `Suspend` (yield)
+    /// to the generator slot, so one frame can be driven by both stacks.
+    fn drive_async_generator_activation(
+        &mut self,
+        stop_depth: usize,
+        inject: Option<(Value, ThrowOrigin, usize)>,
+    ) -> Result<AsyncGeneratorStep, EvalFailure> {
+        self.last_completion = None;
+        self.pending_async_suspend = None;
+        self.pending_generator_resume = None;
+        self.callback_boundaries.push(stop_depth);
+        self.async_boundaries.push(stop_depth);
+        self.generator_boundaries.push(stop_depth);
+        let result = match inject {
+            None => self.run_loop(stop_depth),
+            Some((value, origin, faulting_pc)) => match self.throw(value, origin, faulting_pc) {
+                Ok(()) => self.run_loop(stop_depth),
+                Err(error) => Err(error),
+            },
+        };
+        self.generator_boundaries
+            .pop()
+            .expect("async generator execution owns its yield boundary");
+        self.async_boundaries
+            .pop()
+            .expect("async generator execution owns its await boundary");
+        self.callback_boundaries
+            .pop()
+            .expect("async generator execution owns its unwind boundary");
+        match result {
+            Ok(Some(execution)) => Ok(AsyncGeneratorStep::Return(execution.value)),
+            Ok(None) => {
+                if let Some((awaited, activation)) = self.pending_async_suspend.take() {
+                    return Ok(AsyncGeneratorStep::Await {
+                        awaited,
+                        activation,
+                    });
+                }
+                if let Some(GeneratorResume::Yield { value, activation }) =
+                    self.pending_generator_resume.take()
+                {
+                    return Ok(AsyncGeneratorStep::Yield { value, activation });
+                }
+                let value = self.last_completion.take().unwrap_or(Value::UNDEFINED);
+                Ok(AsyncGeneratorStep::Return(value))
+            }
+            Err(error) => {
+                self.unwind_frames_to(stop_depth);
+                match error.kind {
+                    RuntimeErrorKind::UncaughtThrow { value, origin } => {
+                        Ok(AsyncGeneratorStep::Throw { value, origin })
+                    }
+                    kind => Err(EvalFailure::Runtime(kind)),
+                }
+            }
+        }
+    }
+
+    /// Settles one drive step. `Await` and `Yield` park the generator and arm
+    /// Promise reactions without touching the queue; a return parks in
+    /// `AwaitingReturn` and awaits the return value before the front request
+    /// settles; a throw pops the front request, rejects it, and completes the
+    /// generator so the drive loop drains the remainder. Every failure path
+    /// releases the suspended registers and completes the generator.
+    fn settle_async_generator_step(
+        &mut self,
+        generator: Value,
+        step: Result<AsyncGeneratorStep, EvalFailure>,
+    ) -> Result<(), EvalFailure> {
+        match step {
+            Ok(AsyncGeneratorStep::Await {
+                awaited,
+                activation,
+            }) => {
+                let register_count = activation.registers.len();
+                let result = self
+                    .replace_async_generator_state(
+                        generator,
+                        AsyncGeneratorState::AwaitingOperand(activation),
+                    )
+                    .map_err(EvalFailure::Runtime)
+                    .and_then(|()| self.await_promise_for_generator(awaited, generator));
+                if result.is_err() {
+                    self.release_suspended_activation_registers(register_count);
+                    self.complete_async_generator(generator)?;
+                }
+                result
+            }
+            Ok(AsyncGeneratorStep::Yield { value, activation }) => {
+                let register_count = activation.registers.len();
+                let result = self
+                    .replace_async_generator_state(
+                        generator,
+                        AsyncGeneratorState::AwaitingYield(activation),
+                    )
+                    .map_err(EvalFailure::Runtime)
+                    .and_then(|()| self.await_promise_for_generator(value, generator));
+                if result.is_err() {
+                    self.release_suspended_activation_registers(register_count);
+                    self.complete_async_generator(generator)?;
+                }
+                result
+            }
+            Ok(AsyncGeneratorStep::Return(value)) => {
+                // AsyncGeneratorAwaitReturn: the return value is awaited
+                // before the front request settles `done: true`; the body is
+                // gone, so no activation registers stay charged. The queue is
+                // untouched until the awaited value settles the front request.
+                let result = self
+                    .replace_async_generator_state(generator, AsyncGeneratorState::AwaitingReturn)
+                    .map_err(EvalFailure::Runtime)
+                    .and_then(|()| self.await_promise_for_generator(value, generator));
+                if result.is_err() {
+                    self.complete_async_generator(generator)?;
+                }
+                result
+            }
+            Ok(AsyncGeneratorStep::Throw { value, origin }) => {
+                let request = self.pop_async_generator_front(generator)?;
+                self.complete_async_generator(generator)?;
+                self.reject_promise(request.capability, value, origin)
+                    .map_err(EvalFailure::Runtime)
+            }
+            Err(failure) => {
+                self.complete_async_generator(generator)?;
+                Err(failure)
+            }
+        }
+    }
+
+    /// Resolves the awaited (or yielded) value through Promise resolution and
+    /// attaches the two generator resume reactions. An already-settled Promise
+    /// costs exactly one microtask tick, mirroring `await_promise`.
+    fn await_promise_for_generator(
+        &mut self,
+        awaited: Value,
+        generator: Value,
+    ) -> Result<(), EvalFailure> {
+        let promise = self.promise_resolve(awaited)?;
+        let index = self
+            .runtime_slot(promise)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: promise,
+            }))?;
+        let settled = match &self.heap[index] {
+            HeapEntry::Promise {
+                state: PromiseState::Pending { .. },
+                ..
+            } => None,
+            HeapEntry::Promise {
+                state: PromiseState::Fulfilled { value },
+                ..
+            } => Some((true, *value, ThrowOrigin::Bytecode)),
+            HeapEntry::Promise {
+                state: PromiseState::Rejected { reason, origin },
+                ..
+            } => Some((false, *reason, *origin)),
+            _ => {
+                return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                    value: promise,
+                }));
+            }
+        };
+        if let Some((fulfilled, value, origin)) = settled {
+            self.ensure_microtask_capacity(1)
+                .map_err(EvalFailure::Runtime)?;
+            let reaction = if fulfilled {
+                PromiseReaction::AsyncGeneratorFulfill { generator }
+            } else {
+                PromiseReaction::AsyncGeneratorReject { generator }
+            };
+            self.microtasks.push_back(MicrotaskJob::Reaction {
+                reaction,
+                value,
+                origin,
+            });
+            return Ok(());
+        }
+        self.charge_promise_reactions(2)?;
+        let HeapEntry::Promise {
+            state:
+                PromiseState::Pending {
+                    fulfill_reactions,
+                    reject_reactions,
+                },
+            ..
+        } = &mut self.heap[index]
+        else {
+            unreachable!("pending Promise state was checked before reaction registration");
+        };
+        fulfill_reactions.push(PromiseReaction::AsyncGeneratorFulfill { generator });
+        reject_reactions.push(PromiseReaction::AsyncGeneratorReject { generator });
+        Ok(())
+    }
+
+    /// Resumes a parked async generator inside its Promise reaction job.
+    /// Fulfillment of an `Await` operand writes the value to `Await.dst`;
+    /// fulfillment of a `yield` operand settles the front request with
+    /// `{value, done: false}`; fulfillment of a returned value settles the
+    /// front request with `{value, done: true}` and drains the queue. Either
+    /// rejection injects the throw at the suspension pc so a covering
+    /// `try`/`catch` runs, except a rejected return value, which rejects the
+    /// front request and drains the queue. Any other state is a hard
+    /// invariant violation.
+    fn resume_async_generator(
+        &mut self,
+        generator: Value,
+        value: Value,
+        rejection: Option<ThrowOrigin>,
+    ) -> Result<(), RuntimeErrorKind> {
+        let state = self
+            .take_async_generator_state(generator)
+            .map_err(|failure| async_generator_kind(generator, failure))?;
+        match (state, rejection) {
+            (AsyncGeneratorState::AwaitingYield(activation), None) => {
+                let request = self
+                    .pop_async_generator_front(generator)
+                    .map_err(|failure| async_generator_kind(generator, failure))?;
+                let register_count = activation.registers.len();
+                match self.iterator_result(value, false) {
+                    Err(failure) => {
+                        self.release_suspended_activation_registers(register_count);
+                        self.complete_async_generator(generator)
+                            .map_err(|failure| async_generator_kind(generator, failure))?;
+                        self.reject_promise_failure(request.capability, failure)
+                            .map_err(|failure| async_generator_kind(generator, failure))
+                    }
+                    Ok(result) => {
+                        if let Err(kind) = self.replace_async_generator_state(
+                            generator,
+                            AsyncGeneratorState::SuspendedYield(activation),
+                        ) {
+                            self.release_suspended_activation_registers(register_count);
+                            return Err(kind);
+                        }
+                        self.resolve_promise(request.capability, result)?;
+                        self.drive_async_generator(generator)
+                            .map_err(|failure| async_generator_kind(generator, failure))
+                    }
+                }
+            }
+            (AsyncGeneratorState::AwaitingReturn, rejection) => {
+                let request = self
+                    .pop_async_generator_front(generator)
+                    .map_err(|failure| async_generator_kind(generator, failure))?;
+                self.complete_async_generator(generator)
+                    .map_err(|failure| async_generator_kind(generator, failure))?;
+                match rejection {
+                    Some(origin) => self.reject_promise(request.capability, value, origin)?,
+                    None => {
+                        let result = self
+                            .iterator_result(value, true)
+                            .map_err(|failure| async_generator_kind(generator, failure))?;
+                        self.resolve_promise(request.capability, result)?;
+                    }
+                }
+                self.drive_async_generator(generator)
+                    .map_err(|failure| async_generator_kind(generator, failure))
+            }
+            (AsyncGeneratorState::AwaitingOperand(activation), None) => {
+                self.drive_resumed_async_generator(generator, activation, value, None)
+            }
+            (AsyncGeneratorState::AwaitingOperand(activation), Some(origin))
+            | (AsyncGeneratorState::AwaitingYield(activation), Some(origin)) => {
+                let suspend_pc = activation
+                    .resume_token
+                    .checked_sub(1)
+                    .expect("suspended async generator token is nonzero")
+                    as usize;
+                self.drive_resumed_async_generator(
+                    generator,
+                    activation,
+                    Value::UNDEFINED,
+                    Some((value, origin, suspend_pc)),
+                )
+            }
+            (
+                state @ (AsyncGeneratorState::SuspendedStart(_)
+                | AsyncGeneratorState::SuspendedYield(_)
+                | AsyncGeneratorState::Completed),
+                _,
+            ) => {
+                let register_count = match &state {
+                    AsyncGeneratorState::SuspendedYield(activation) => activation.registers.len(),
+                    _ => 0,
+                };
+                self.release_suspended_activation_registers(register_count);
+                self.complete_async_generator(generator)
+                    .map_err(|failure| async_generator_kind(generator, failure))?;
+                Err(RuntimeErrorKind::InvalidValue { value: generator })
+            }
+            (AsyncGeneratorState::Executing, _) => {
+                unreachable!("take_async_generator_state rejects an executing generator")
+            }
+        }
+    }
+
+    /// Pushes a parked activation back on the frame stack and drives it under
+    /// the three-boundary activation runner, then settles the step against
+    /// the request queue. On fulfillment the awaited value lands in the
+    /// suspension's `dst`; on rejection the throw is injected at the
+    /// suspension pc and `dst` stays undefined, mirroring `resume_async`.
+    fn drive_resumed_async_generator(
+        &mut self,
+        generator: Value,
+        activation: SuspendedActivation,
+        resume_value: Value,
+        inject: Option<(Value, ThrowOrigin, usize)>,
+    ) -> Result<(), RuntimeErrorKind> {
+        let stop_depth = self.frames.len();
+        let return_to = self.frames.last().map(|frame| ReturnTo {
+            destination: None,
+            call_pc: frame.pc,
+            constructed: None,
+        });
+        let step = self
+            .push_resumed_generator_frame(activation, resume_value, return_to)
+            .and_then(|()| self.drive_async_generator_activation(stop_depth, inject));
+        match self.settle_async_generator_step(generator, step) {
+            // A completing step (throw) leaves the queue for the drain loop;
+            // a parking step makes the drain loop return immediately.
+            Ok(()) => self
+                .drive_async_generator(generator)
+                .map_err(|failure| async_generator_kind(generator, failure)),
+            Err(EvalFailure::Runtime(kind)) => Err(kind),
+            Err(_) => Err(RuntimeErrorKind::InvalidValue { value: generator }),
+        }
+    }
+
+    /// Takes the generator state out of an `Awaiting*` park (or any resumable
+    /// state), leaving `Executing` behind. A resume in a non-resumable state
+    /// is a hard invalid-state error, mirroring `take_async_activation`.
+    fn take_async_generator_state(
+        &mut self,
+        generator: Value,
+    ) -> Result<AsyncGeneratorState, EvalFailure> {
+        let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)? else {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: generator,
+            }));
+        };
+        let HeapEntry::AsyncGenerator { state, .. } = &mut self.heap[index] else {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: generator,
+            }));
+        };
+        match std::mem::replace(state, AsyncGeneratorState::Executing) {
+            AsyncGeneratorState::Executing => {
+                Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                    value: generator,
+                }))
+            }
+            taken => Ok(taken),
+        }
+    }
+
+    /// Pops the front `.next()` request, which the current drive settles
+    /// exactly once. The queue is never popped by await/yield parking.
+    fn pop_async_generator_front(
+        &mut self,
+        generator: Value,
+    ) -> Result<AsyncGeneratorRequest, EvalFailure> {
+        let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)? else {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: generator,
+            }));
+        };
+        let HeapEntry::AsyncGenerator { queue, .. } = &mut self.heap[index] else {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: generator,
+            }));
+        };
+        queue
+            .pop_front()
+            .ok_or(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: generator,
+            }))
+    }
+
+    fn replace_async_generator_state(
+        &mut self,
+        generator: Value,
+        next: AsyncGeneratorState,
+    ) -> Result<(), RuntimeErrorKind> {
+        let Some(index) = self.runtime_slot(generator)? else {
+            return Err(RuntimeErrorKind::InvalidValue { value: generator });
+        };
+        let HeapEntry::AsyncGenerator { state, .. } = &mut self.heap[index] else {
+            return Err(RuntimeErrorKind::InvalidValue { value: generator });
+        };
+        if !matches!(state, AsyncGeneratorState::Executing) {
+            return Err(RuntimeErrorKind::InvalidValue { value: generator });
+        }
+        *state = next;
+        Ok(())
+    }
+
+    fn complete_async_generator(&mut self, generator: Value) -> Result<(), EvalFailure> {
+        let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)? else {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: generator,
+            }));
+        };
+        let HeapEntry::AsyncGenerator { state, .. } = &mut self.heap[index] else {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: generator,
+            }));
+        };
+        *state = AsyncGeneratorState::Completed;
+        Ok(())
     }
 
     /// Resolves the awaited value through Promise resolution and attaches the
@@ -7036,12 +8377,52 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(())
     }
 
-    fn create_async_activation(&mut self, promise: Value) -> Result<Value, EvalFailure> {
+    fn create_async_activation(
+        &mut self,
+        promise: Value,
+        module: Option<ModuleId>,
+    ) -> Result<Value, EvalFailure> {
         self.allocate(HeapEntry::AsyncActivation {
             activation: None,
             promise,
+            module,
+            completion: None,
         })
         .map_err(EvalFailure::Runtime)
+    }
+
+    fn store_async_module_completion(
+        &mut self,
+        record: Value,
+        completed: Option<Result<Execution, RuntimeError>>,
+    ) -> Result<(), EvalFailure> {
+        let index = self
+            .runtime_slot(record)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: record,
+            }))?;
+        let HeapEntry::AsyncActivation {
+            module, completion, ..
+        } = &mut self.heap[index]
+        else {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: record,
+            }));
+        };
+        if module.is_none() {
+            return Ok(());
+        }
+        let completed = completed.ok_or(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+            value: record,
+        }))?;
+        if completion.is_some() {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: record,
+            }));
+        }
+        *completion = Some(completed);
+        Ok(())
     }
 
     fn store_async_activation(
@@ -7096,6 +8477,40 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(*promise)
     }
 
+    fn async_activation_module(&self, record: Value) -> Result<Option<ModuleId>, RuntimeErrorKind> {
+        let index = self
+            .runtime_slot(record)?
+            .ok_or(RuntimeErrorKind::InvalidValue { value: record })?;
+        let HeapEntry::AsyncActivation { module, .. } = &self.heap[index] else {
+            return Err(RuntimeErrorKind::InvalidValue { value: record });
+        };
+        Ok(*module)
+    }
+
+    fn take_async_module_completion(
+        &mut self,
+        record: Value,
+        module: ModuleId,
+    ) -> Result<Result<Execution, RuntimeError>, RuntimeErrorKind> {
+        let index = self
+            .runtime_slot(record)?
+            .ok_or(RuntimeErrorKind::InvalidValue { value: record })?;
+        let HeapEntry::AsyncActivation {
+            module: owner,
+            completion,
+            ..
+        } = &mut self.heap[index]
+        else {
+            return Err(RuntimeErrorKind::InvalidValue { value: record });
+        };
+        if *owner != Some(module) {
+            return Err(RuntimeErrorKind::InvalidValue { value: record });
+        }
+        completion
+            .take()
+            .ok_or(RuntimeErrorKind::InvalidValue { value: record })
+    }
+
     pub(crate) fn iterator_result(
         &mut self,
         value: Value,
@@ -7126,9 +8541,23 @@ impl<'a, H: Host> Machine<'a, H> {
                 .map_err(EvalFailure::Runtime);
         }
 
-        let iterator_symbol = self.intrinsics.builtins.symbol_iterator();
-        let iterator_key = self.to_property_key(iterator_symbol)?;
-        let method = self.get_property_key(src, &iterator_key)?;
+        let method = match kind {
+            IteratorKind::Async => {
+                let key = self.to_property_key(self.intrinsics.builtins.symbol_async_iterator())?;
+                let method = self.get_property_key(src, &key)?;
+                if matches!(method.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+                    let key = self.to_property_key(self.intrinsics.builtins.symbol_iterator())?;
+                    self.get_property_key(src, &key)?
+                } else {
+                    method
+                }
+            }
+            IteratorKind::Sync => {
+                let key = self.to_property_key(self.intrinsics.builtins.symbol_iterator())?;
+                self.get_property_key(src, &key)?
+            }
+            IteratorKind::Keys => unreachable!("key iteration returns before method lookup"),
+        };
         if !self.is_callable(method)? {
             return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                 operation: "value is not iterable",
@@ -7160,6 +8589,7 @@ impl<'a, H: Host> Machine<'a, H> {
             Some(index) => match &self.heap[index] {
                 HeapEntry::Object { properties, .. }
                 | HeapEntry::Generator { properties, .. }
+                | HeapEntry::AsyncGenerator { properties, .. }
                 | HeapEntry::Script { properties, .. }
                 | HeapEntry::Function { properties, .. }
                 | HeapEntry::NativeFunction { properties, .. }
@@ -7276,6 +8706,7 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             HeapEntry::Object { properties, .. }
             | HeapEntry::Generator { properties, .. }
+            | HeapEntry::AsyncGenerator { properties, .. }
             | HeapEntry::Script { properties, .. }
             | HeapEntry::Function { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
@@ -7305,15 +8736,34 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn iterator_next(&mut self, iterator: Value) -> Result<(bool, Value), EvalFailure> {
-        let (callee, this_value) = match self.prepare_iterator_next(iterator)? {
-            IteratorNextPrepared::Ready { done, value } => return Ok((done, value)),
-            IteratorNextPrepared::Call { callee, this_value } => (callee, this_value),
-        };
+        let result = self.iterator_step(iterator)?;
+        let (done, value) = self.iterator_result_parts(result)?;
+        Ok((done, value))
+    }
 
-        let result = self.call_value(callee, this_value, &[])?;
+    /// Spec `IteratorNext`: performs the `next()` call (or takes the recorded
+    /// key of a Keys iterator) and returns the raw result with NO object
+    /// check. `for await` needs the raw Promise before awaiting it.
+    pub(crate) fn iterator_step(&mut self, iterator: Value) -> Result<Value, EvalFailure> {
+        match self.prepare_iterator_next(iterator)? {
+            IteratorNextPrepared::Ready { done, value } => self.iterator_result(value, done),
+            IteratorNextPrepared::Call { callee, this_value } => {
+                self.call_value(callee, this_value, &[])
+            }
+        }
+    }
+
+    /// Spec `IteratorComplete` + `IteratorValue`: an iterator result that is
+    /// not an Object is a TypeError, otherwise reads `done` (truthiness) and
+    /// `value`. A done result carries `undefined` for the value, matching the
+    /// fused sync path's behaviour.
+    pub(crate) fn iterator_result_parts(
+        &mut self,
+        result: Value,
+    ) -> Result<(bool, Value), EvalFailure> {
         if !self.is_object(result) {
             return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "iterator next returned a non-object",
+                operation: "iterator result is not an object",
             }));
         }
         let done = self.get_named_property(result, "done")?;
@@ -7494,8 +8944,8 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn add(&mut self, left: Value, right: Value) -> Result<Value, EvalFailure> {
-        let left = self.to_primitive_default(left)?;
-        let right = self.to_primitive_default(right)?;
+        let left = self.coerce_primitive_default(left)?;
+        let right = self.coerce_primitive_default(right)?;
         let left_string = self.string_text(left).cloned();
         let right_string = self.string_text(right).cloned();
         if left_string.is_some() || right_string.is_some() {
@@ -7602,15 +9052,15 @@ impl<'a, H: Host> Machine<'a, H> {
         ))
     }
 
-    fn to_primitive_default(&mut self, value: Value) -> Result<Value, EvalFailure> {
+    fn coerce_primitive_default(&mut self, value: Value) -> Result<Value, EvalFailure> {
         let prefer_string = self
             .runtime_slot(value)
             .map_err(EvalFailure::Runtime)?
             .is_some_and(|index| matches!(self.heap[index], HeapEntry::Date { .. }));
-        self.to_primitive_observable(value, prefer_string)
+        self.coerce_primitive_observable(value, prefer_string)
     }
 
-    pub(crate) fn to_primitive_observable(
+    pub(crate) fn coerce_primitive_observable(
         &mut self,
         value: Value,
         prefer_string: bool,
@@ -7638,13 +9088,16 @@ impl<'a, H: Host> Machine<'a, H> {
         }))
     }
 
-    pub(crate) fn to_string_observable(&mut self, value: Value) -> Result<EcmaString, EvalFailure> {
-        let primitive = self.to_primitive_observable(value, true)?;
+    pub(crate) fn coerce_string_observable(
+        &mut self,
+        value: Value,
+    ) -> Result<EcmaString, EvalFailure> {
+        let primitive = self.coerce_primitive_observable(value, true)?;
         self.to_string(primitive)
     }
 
-    pub(crate) fn to_number_observable(&mut self, value: Value) -> Result<Value, EvalFailure> {
-        let primitive = self.to_primitive_observable(value, false)?;
+    pub(crate) fn coerce_number_observable(&mut self, value: Value) -> Result<Value, EvalFailure> {
+        let primitive = self.coerce_primitive_observable(value, false)?;
         self.to_number(primitive)
     }
 
@@ -7675,6 +9128,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         }
                         HeapEntry::Object { .. }
                         | HeapEntry::Generator { .. }
+                        | HeapEntry::AsyncGenerator { .. }
                         | HeapEntry::Script { .. }
                         | HeapEntry::Array { .. }
                         | HeapEntry::Function { .. }
@@ -7720,6 +9174,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     HeapEntry::BigInt(text) => text != "0",
                     HeapEntry::Object { .. }
                     | HeapEntry::Generator { .. }
+                    | HeapEntry::AsyncGenerator { .. }
                     | HeapEntry::Script { .. }
                     | HeapEntry::Array { .. }
                     | HeapEntry::Function { .. }
@@ -7764,6 +9219,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     HeapEntry::PrivateName { .. } => "object",
                     HeapEntry::Object { .. }
                     | HeapEntry::Generator { .. }
+                    | HeapEntry::AsyncGenerator { .. }
                     | HeapEntry::Script { .. }
                     | HeapEntry::Array { .. }
                     | HeapEntry::ModuleNamespace { .. }
@@ -7921,6 +9377,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         HeapEntry::BigInt(text) => Ok(EcmaString::from_utf8(text)),
                         HeapEntry::Object { .. }
                         | HeapEntry::Generator { .. }
+                        | HeapEntry::AsyncGenerator { .. }
                         | HeapEntry::Script { .. }
                         | HeapEntry::Date { .. }
                         | HeapEntry::BuiltinIterator { .. }
@@ -8519,6 +9976,26 @@ mod tests {
         )
     }
 
+    fn async_generator_function(
+        parameters: u32,
+        registers: u32,
+        code: Vec<Instruction>,
+        handlers: Vec<ExceptionHandler>,
+    ) -> Function {
+        Function::new(
+            None,
+            0,
+            parameters,
+            registers,
+            FunctionFlags {
+                is_async: true,
+                is_generator: true,
+            },
+            code,
+            handlers,
+        )
+    }
+
     /// A function with `captures` leading capture registers.
     fn closure_function(
         captures: u32,
@@ -8645,7 +10122,7 @@ mod tests {
                             dst: reg(0),
                             constant: cid(0),
                         },
-                        Instruction::Suspend {
+                        Instruction::Await {
                             dst: reg(1),
                             src: reg(0),
                             resume: pc(2),
@@ -9172,6 +10649,685 @@ mod tests {
             Some(vec![Value::int32(1), Value::int32(2)]),
         );
         assert_eq!(machine.live_registers, 0);
+    }
+
+    fn async_generator_next<H: Host>(
+        machine: &mut Machine<'_, H>,
+        generator: Value,
+        resume_value: Value,
+    ) -> Result<Value, EvalFailure> {
+        let next = machine.get_named_property(generator, "next")?;
+        machine.call_value(next, generator, &[resume_value])
+    }
+
+    fn settled_iterator_result<H: Host>(
+        machine: &mut Machine<'_, H>,
+        promise: Value,
+    ) -> (Value, bool) {
+        let index = machine.runtime_slot(promise).unwrap().unwrap();
+        let HeapEntry::Promise {
+            state: PromiseState::Fulfilled { value },
+            ..
+        } = &machine.heap[index]
+        else {
+            panic!("capability must be fulfilled");
+        };
+        let result = *value;
+        let done = machine.get_named_property(result, "done").unwrap();
+        let value = machine.get_named_property(result, "value").unwrap();
+        (value, machine.truthy(done))
+    }
+
+    fn rejected_reason<H: Host>(machine: &Machine<'_, H>, promise: Value) -> Value {
+        let index = machine.runtime_slot(promise).unwrap().unwrap();
+        let HeapEntry::Promise {
+            state: PromiseState::Rejected { reason, .. },
+            ..
+        } = &machine.heap[index]
+        else {
+            panic!("capability must be rejected");
+        };
+        *reason
+    }
+
+    fn pending_promise<H: Host>(machine: &Machine<'_, H>, promise: Value) -> bool {
+        let Some(index) = machine.runtime_slot(promise).unwrap() else {
+            return false;
+        };
+        matches!(
+            machine.heap[index],
+            HeapEntry::Promise {
+                state: PromiseState::Pending { .. },
+                ..
+            }
+        )
+    }
+
+    #[test]
+    fn async_generator_call_creates_object_without_running_body() {
+        let program = verified(
+            vec![
+                Constant::Int32(1),
+                Constant::String(EcmaString::from_utf8("started")),
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        assert_eq!(machine.live_registers, 0, "calling must not start the body");
+        assert_eq!(machine.globals.get(&EcmaString::from_utf8("started")), None);
+        let index = machine.runtime_slot(generator).unwrap().unwrap();
+        assert!(matches!(
+            machine.heap[index],
+            HeapEntry::AsyncGenerator {
+                state: AsyncGeneratorState::SuspendedStart(_),
+                ..
+            }
+        ));
+        assert!(
+            machine
+                .inherits_from_prototype(
+                    generator,
+                    machine.intrinsics.builtins.async_generator_prototype(),
+                )
+                .unwrap()
+        );
+
+        // The first next() starts the body and settles once it returns.
+        let capability = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        assert!(pending_promise(&machine, capability));
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            machine.globals.get(&EcmaString::from_utf8("started")),
+            Some(&Value::int32(1)),
+        );
+        assert_eq!(
+            settled_iterator_result(&mut machine, capability),
+            (Value::int32(1), true),
+        );
+        assert_eq!(machine.live_registers, 0);
+    }
+
+    #[test]
+    fn async_generator_next_returns_promise_settled_with_iterator_result() {
+        let program = verified(
+            vec![Constant::Int32(10)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(1),
+                            src: reg(0),
+                            resume: pc(2),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let first = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        let index = machine.runtime_slot(first).unwrap().unwrap();
+        assert!(matches!(machine.heap[index], HeapEntry::Promise { .. }));
+        assert!(pending_promise(&machine, first));
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            settled_iterator_result(&mut machine, first),
+            (Value::int32(10), false),
+        );
+
+        let second = async_generator_next(&mut machine, generator, Value::int32(5)).unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            settled_iterator_result(&mut machine, second),
+            (Value::int32(5), true),
+        );
+        assert_eq!(machine.live_registers, 0);
+    }
+
+    #[test]
+    fn async_generator_await_resumes_without_producing_an_item() {
+        let program = verified(
+            vec![
+                Constant::Int32(1),
+                Constant::String(EcmaString::from_utf8("p")),
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    4,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(1),
+                        },
+                        Instruction::Await {
+                            dst: reg(1),
+                            src: reg(0),
+                            resume: pc(2),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(2),
+                            constant: cid(0),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(3),
+                            src: reg(2),
+                            resume: pc(4),
+                        },
+                        Instruction::Return { value: reg(3) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let awaited = machine.create_promise().unwrap();
+        machine.resolve_promise(awaited, Value::int32(9)).unwrap();
+        machine.globals.insert(EcmaString::from_utf8("p"), awaited);
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let capability = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        machine.drain_microtasks().unwrap();
+        // The await must not settle the request: exactly one item is produced,
+        // by the yield after the await.
+        assert_eq!(
+            settled_iterator_result(&mut machine, capability),
+            (Value::int32(1), false),
+        );
+        let index = machine.runtime_slot(generator).unwrap().unwrap();
+        let HeapEntry::AsyncGenerator { state, queue, .. } = &machine.heap[index] else {
+            panic!("generator heap entry");
+        };
+        assert!(matches!(state, AsyncGeneratorState::SuspendedYield(_)));
+        assert!(queue.is_empty(), "await must not pop the request queue");
+    }
+
+    #[test]
+    fn async_generator_resume_call_depth_failure_releases_registers_once() {
+        let program = verified(
+            vec![Constant::String(EcmaString::from_utf8("p"))],
+            vec![
+                function(0, 0, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::Await {
+                            dst: reg(1),
+                            src: reg(0),
+                            resume: pc(2),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let awaited = machine.create_promise().unwrap();
+        machine.globals.insert(EcmaString::from_utf8("p"), awaited);
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        assert_eq!(machine.live_registers, 2);
+
+        machine.limits.max_call_depth = 0;
+        machine.resolve_promise(awaited, Value::int32(1)).unwrap();
+        let error = machine
+            .drain_microtasks()
+            .expect_err("resume exceeds the call-depth limit");
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::CallDepthExceeded { limit: 0 }
+        ));
+        assert_eq!(machine.live_registers, 0);
+    }
+
+    #[test]
+    fn async_generator_yield_awaits_its_operand() {
+        let program = verified(
+            vec![Constant::String(EcmaString::from_utf8("p"))],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(1),
+                            src: reg(0),
+                            resume: pc(2),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let yielded = machine.create_promise().unwrap();
+        machine.resolve_promise(yielded, Value::int32(41)).unwrap();
+        machine.globals.insert(EcmaString::from_utf8("p"), yielded);
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let capability = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        machine.drain_microtasks().unwrap();
+        // The consumer sees the unwrapped value, never the yielded Promise.
+        assert_eq!(
+            settled_iterator_result(&mut machine, capability),
+            (Value::int32(41), false),
+        );
+    }
+
+    #[test]
+    fn async_generator_queue_serves_concurrent_next_calls_in_order() {
+        let program = verified(
+            vec![Constant::Int32(1), Constant::Int32(2), Constant::Int32(3)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    5,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(4),
+                            src: reg(0),
+                            resume: pc(2),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(1),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(4),
+                            src: reg(1),
+                            resume: pc(4),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(2),
+                            constant: cid(2),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(4),
+                            src: reg(2),
+                            resume: pc(6),
+                        },
+                        Instruction::Return { value: reg(4) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let first = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        let second = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        let third = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        let fourth = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        assert!(pending_promise(&machine, first));
+        assert!(pending_promise(&machine, second));
+        assert!(pending_promise(&machine, third));
+        assert!(pending_promise(&machine, fourth));
+
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            settled_iterator_result(&mut machine, first),
+            (Value::int32(1), false),
+        );
+        assert_eq!(
+            settled_iterator_result(&mut machine, second),
+            (Value::int32(2), false),
+        );
+        assert_eq!(
+            settled_iterator_result(&mut machine, third),
+            (Value::int32(3), false),
+        );
+        assert_eq!(
+            settled_iterator_result(&mut machine, fourth),
+            (Value::UNDEFINED, true),
+        );
+        assert_eq!(machine.live_registers, 0);
+    }
+
+    #[test]
+    fn async_generator_return_settles_front_and_drains_queue() {
+        let program = verified(
+            vec![Constant::Int32(9)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let front = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        let later = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            settled_iterator_result(&mut machine, front),
+            (Value::int32(9), true),
+        );
+        assert_eq!(
+            settled_iterator_result(&mut machine, later),
+            (Value::UNDEFINED, true),
+        );
+        // A completed generator keeps answering done without re-entering.
+        let after = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            settled_iterator_result(&mut machine, after),
+            (Value::UNDEFINED, true),
+        );
+        assert_eq!(machine.live_registers, 0);
+    }
+
+    #[test]
+    fn async_generator_throw_rejects_front_and_drains_queue() {
+        let program = verified(
+            vec![Constant::Int32(7)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Throw { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let front = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        let later = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(rejected_reason(&machine, front), Value::int32(7));
+        assert_eq!(
+            settled_iterator_result(&mut machine, later),
+            (Value::UNDEFINED, true),
+        );
+        assert_eq!(machine.live_registers, 0);
+    }
+
+    #[test]
+    fn async_generator_return_awaits_a_returned_promise() {
+        let program = verified(
+            vec![Constant::String(EcmaString::from_utf8("p"))],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let returned = machine.create_promise().unwrap();
+        machine.resolve_promise(returned, Value::int32(1)).unwrap();
+        machine.globals.insert(EcmaString::from_utf8("p"), returned);
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let capability = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        machine.drain_microtasks().unwrap();
+        // `return Promise.resolve(1)` settles the consumer with the unwrapped
+        // value (Node 24: `{value: 1, done: true}`, not a Promise).
+        assert_eq!(
+            settled_iterator_result(&mut machine, capability),
+            (Value::int32(1), true),
+        );
+        assert_eq!(machine.live_registers, 0);
+    }
+
+    #[test]
+    fn async_generator_returned_promise_rejection_rejects_front() {
+        let program = verified(
+            vec![Constant::String(EcmaString::from_utf8("p"))],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let returned = machine.create_promise().unwrap();
+        machine
+            .reject_promise(returned, Value::int32(5), ThrowOrigin::Bytecode)
+            .unwrap();
+        machine.globals.insert(EcmaString::from_utf8("p"), returned);
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let front = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        let later = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(rejected_reason(&machine, front), Value::int32(5));
+        assert_eq!(
+            settled_iterator_result(&mut machine, later),
+            (Value::UNDEFINED, true),
+        );
+    }
+
+    #[test]
+    fn async_generator_next_on_incompatible_receiver_rejects_promise() {
+        let program = verified(
+            Vec::new(),
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(0, 0, vec![Instruction::Halt], Vec::new()),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        let next = machine.get_named_property(generator, "next").unwrap();
+        let receiver = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+
+        // AsyncGenerator.prototype.next never throws synchronously.
+        let capability = machine.call_value(next, receiver, &[]).unwrap();
+        assert!(matches!(
+            machine.runtime_slot(capability),
+            Ok(Some(index)) if matches!(machine.heap[index], HeapEntry::Promise { .. })
+        ));
+        assert!(rejected_reason(&machine, capability) == Value::UNDEFINED);
+    }
+
+    #[test]
+    fn iterator_result_rejects_non_object() {
+        let program = verified(
+            vec![Constant::Int32(42)],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::IteratorResult {
+                        done: reg(1),
+                        value: reg(2),
+                        result: reg(0),
+                    },
+                    Instruction::Return { value: reg(1) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        assert!(matches!(
+            machine.iterator_result_parts(Value::int32(42)),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+        let error = machine
+            .run()
+            .expect_err("IteratorResult on a primitive throws");
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::TypeError { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn iterator_step_and_result_execute_the_protocol() {
+        let program = verified(
+            Vec::new(),
+            vec![function(
+                0,
+                5,
+                vec![
+                    Instruction::CreateArray { dst: reg(0) },
+                    Instruction::GetIterator {
+                        dst: reg(1),
+                        src: reg(0),
+                        kind: IteratorKind::Sync,
+                    },
+                    Instruction::IteratorStep {
+                        dst: reg(2),
+                        iterator: reg(1),
+                    },
+                    Instruction::IteratorResult {
+                        done: reg(3),
+                        value: reg(4),
+                        result: reg(2),
+                    },
+                    Instruction::Return { value: reg(3) },
+                ],
+                Vec::new(),
+            )],
+        );
+        assert_eq!(run_ok(&program).value, Value::boolean(true));
     }
 
     #[test]
@@ -10540,6 +12696,61 @@ mod tests {
         let execution = run_ok(&module);
         assert_eq!(execution.value, Value::int32(8));
         assert_eq!(execution.entry_registers[3], Value::FALSE);
+    }
+
+    #[test]
+    fn async_iterator_prefers_symbol_async_iterator() {
+        let program = verified(
+            Vec::new(),
+            vec![
+                function(0, 0, vec![Instruction::Halt], Vec::new()),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadThis { dst: reg(0) },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let object = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        let method = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(1),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        let key = machine
+            .to_property_key(machine.intrinsics.builtins.symbol_async_iterator())
+            .unwrap();
+        machine.set_data_property_key(object, key, method).unwrap();
+
+        let iterator = machine
+            .create_iterator(object, IteratorKind::Async)
+            .expect("async iterator method is used");
+
+        let index = machine.runtime_slot(iterator).unwrap().unwrap();
+        assert!(matches!(
+            machine.heap[index],
+            HeapEntry::Iterator {
+                state: IteratorState::Protocol { iterator, .. }
+            } if iterator == object
+        ));
     }
 
     #[test]
@@ -12766,6 +14977,151 @@ mod tests {
                 Value::int32(1)
             );
         }
+    }
+
+    #[test]
+    fn dynamic_import_of_tla_module_from_microtask_does_not_reenter_checkpoint() {
+        let root = program_module(
+            "root",
+            vec![
+                Constant::String(EcmaString::from_utf8("./target")),
+                Constant::Undefined,
+                Constant::String(EcmaString::from_utf8("value")),
+            ],
+            vec![function(
+                0,
+                5,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(2),
+                    },
+                    Instruction::Await {
+                        dst: reg(1),
+                        src: reg(0),
+                        resume: pc(2),
+                    },
+                    Instruction::Import {
+                        dst: reg(2),
+                        specifier: cid(1),
+                    },
+                    Instruction::Await {
+                        dst: reg(3),
+                        src: reg(2),
+                        resume: pc(4),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(4),
+                        constant: cid(3),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(0),
+                        object: reg(3),
+                        key: reg(4),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::Local(ModuleId::new(1)),
+                kind: EdgeKind::Dynamic,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let target = program_module(
+            "target",
+            vec![
+                Constant::Int32(7),
+                Constant::String(EcmaString::from_utf8("value")),
+            ],
+            vec![function(
+                0,
+                2,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::Await {
+                        dst: reg(1),
+                        src: reg(0),
+                        resume: pc(2),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(2),
+                        value: reg(1),
+                    },
+                    Instruction::Return { value: reg(1) },
+                ],
+                Vec::new(),
+            )],
+            Vec::new(),
+            vec![Binding {
+                name: cid(2),
+                kind: BindingKind::Hoisted,
+            }],
+            vec![Export {
+                name: cid(2),
+                source: ExportSource::Local(BindingId::new(0)),
+            }],
+        );
+        let program = linked(vec![root, target], 0);
+        let mut host = TestHost;
+        let execution = Machine::new(&program, &mut host, Limits::default())
+            .run()
+            .expect("nested TLA import completes through the active checkpoint");
+        assert_eq!(execution.value, Value::int32(7));
+    }
+
+    #[test]
+    fn top_level_await_resumes_module_entry() {
+        let module = program_module(
+            "root",
+            vec![
+                Constant::String(EcmaString::from_utf8("after")),
+                Constant::Int32(7),
+            ],
+            vec![function(
+                0,
+                2,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(2),
+                    },
+                    Instruction::Await {
+                        dst: reg(1),
+                        src: reg(0),
+                        resume: pc(2),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(1),
+                        value: reg(1),
+                    },
+                    Instruction::Return { value: reg(1) },
+                ],
+                Vec::new(),
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let program = linked(vec![module], 0);
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+
+        let execution = machine.evaluate().expect("top-level await completes");
+        machine.run_to_quiescence().expect("event loop drains");
+
+        assert_eq!(execution.value, Value::int32(7));
+        assert_eq!(execution.entry_registers[1], Value::int32(7));
+        assert_eq!(
+            machine.globals.get(&EcmaString::from_utf8("after")),
+            Some(&Value::int32(7)),
+        );
     }
 
     #[test]

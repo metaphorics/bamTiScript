@@ -140,6 +140,22 @@ pub(super) fn install_iterator_prototype<H: Host>(
     builtins.set_iterator_prototype(prototype);
 }
 
+pub(super) fn install_async_iterator_prototype<H: Host>(
+    heap: &mut Vec<HeapEntry>,
+    builtins: &mut BuiltinTable<H>,
+) {
+    let prototype = ordinary(heap, Some(builtins.object_prototype()));
+    let identity = install_function(
+        heap,
+        builtins,
+        "[Symbol.asyncIterator]",
+        0,
+        iterator_identity::<H>,
+    );
+    define_symbol(heap, prototype, builtins.symbol_async_iterator(), identity);
+    builtins.set_async_iterator_prototype(prototype);
+}
+
 pub(super) fn install_generator_prototype<H: Host>(
     heap: &mut Vec<HeapEntry>,
     builtins: &mut BuiltinTable<H>,
@@ -148,6 +164,28 @@ pub(super) fn install_generator_prototype<H: Host>(
     let next = install_function(heap, builtins, "next", 1, generator_next::<H>);
     define_data(heap, prototype, "next", next);
     builtins.set_generator_prototype(prototype);
+}
+
+pub(super) fn install_async_generator_prototype<H: Host>(
+    heap: &mut Vec<HeapEntry>,
+    builtins: &mut BuiltinTable<H>,
+) {
+    let prototype = ordinary(heap, Some(builtins.async_iterator_prototype()));
+    let next = install_function(heap, builtins, "next", 1, async_generator_next::<H>);
+    define_data(heap, prototype, "next", next);
+    builtins.set_async_generator_prototype(prototype);
+}
+
+fn async_generator_next<H: Host>(
+    _machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    Ok(BuiltinOutcome::AsyncGeneratorNext {
+        generator: this,
+        resume_value: args.first().copied().unwrap_or(Value::UNDEFINED),
+    })
 }
 
 fn generator_next<H: Host>(
@@ -1208,6 +1246,52 @@ mod tests {
             "Symbol.iterator on %GeneratorPrototype% must be the same \
              function inherited from %IteratorPrototype%"
         );
+    }
+
+    #[test]
+    fn async_generator_prototype_has_the_async_iterator_contract() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let generator = machine.intrinsics.builtins.async_generator_prototype();
+        let iterator = machine.intrinsics.builtins.async_iterator_prototype();
+        assert!(
+            machine
+                .inherits_from_prototype(generator, iterator)
+                .unwrap(),
+            "%AsyncGeneratorPrototype% must inherit from %AsyncIteratorPrototype%"
+        );
+        assert_eq!(
+            machine.get_named_property(iterator, "next").unwrap(),
+            Value::UNDEFINED,
+            "%AsyncIteratorPrototype% must not define next"
+        );
+
+        let symbol = machine.intrinsics.builtins.symbol_async_iterator();
+        let key = machine.to_property_key(symbol).unwrap();
+        assert!(
+            !machine.has_own_property_key(generator, &key).unwrap(),
+            "the async iterator identity must be inherited"
+        );
+        let identity = machine.get_property_key(generator, &key).unwrap();
+        assert_eq!(
+            machine.call_value(identity, generator, &[]).unwrap(),
+            generator
+        );
+
+        let next = machine.get_named_property(generator, "next").unwrap();
+        let index = machine.runtime_slot(next).unwrap().unwrap();
+        let HeapEntry::NativeFunction {
+            callable: NativeCallable::Builtin(id),
+            ..
+        } = machine.heap[index]
+        else {
+            panic!("next must be a native function");
+        };
+        let def = machine.intrinsics.builtins.get(id);
+        assert_eq!(def.name, "next");
+        assert_eq!(def.length, 1);
     }
 
     #[test]

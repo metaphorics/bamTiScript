@@ -27,7 +27,7 @@
 //! * `frame` points at the register frame; `frame.handles` (offset 16) is the
 //!   `*mut Value` register array. `frame.bytecode_pc` (offset 8) records the
 //!   active instruction and carries the resume token after
-//!   [`Suspend`](#suspend-and-the-resume-helper).
+//!   [`Suspend`](#suspendawait-and-the-resume-helper).
 //! * `out` receives the completion value; the returned `u32` is a
 //!   `bamts_native::CompletionTag` discriminant (`Normal`/`Throw`/`Suspend`/
 //!   `FatalTrap`).
@@ -72,10 +72,11 @@
 //!
 //! * [`Helper::Truthy`] performs the total ToBoolean coercion and returns the
 //!   truth value directly as `0`/`1`; it never writes `out` and never throws.
-//! * [`Helper::IteratorNext`] writes **two** registers — it receives the `done`
-//!   and `value` register indices and, on `Normal`, writes both slots in the
-//!   frame directly (a single completion channel cannot carry two results);
-//!   `out.value` is used only to carry a thrown handle on `Throw`.
+//! * [`Helper::IteratorNext`] and [`Helper::IteratorResult`] write **two**
+//!   registers — they receive the `done` and `value` register indices and, on
+//!   `Normal`, write both slots in the frame directly (a single completion
+//!   channel cannot carry two results); `out.value` is used only to carry a
+//!   thrown handle on `Throw`.
 //!
 //! A subset of the completion helpers is **total** (`Normal` only, never
 //! `Throw`/`FatalTrap`): [`Helper::TypeOfGlobal`], [`Helper::LoadThis`],
@@ -116,6 +117,8 @@
 //! | `CreateRegExp`      | [`Helper::CreateRegExp`] (`pattern`, `flags`) → `dst`      |
 //! | `GetIterator`       | [`Helper::GetIterator`] (`src`, kind) → `dst`             |
 //! | `IteratorNext`      | [`Helper::IteratorNext`] (`iterator`) → `done` + `value`   |
+//! | `IteratorStep`      | [`Helper::IteratorStep`] (`iterator`) → `dst` (raw result) |
+//! | `IteratorResult`    | [`Helper::IteratorResult`] (`result`) → `done` + `value`   |
 //! | `Import`            | [`Helper::Import`] by string `specifier` → `dst`          |
 //! | `Export`            | [`Helper::Export`] (string `name`, `src`)                 |
 //! | `Jump`              | unconditional branch                                       |
@@ -125,6 +128,7 @@
 //! | `Throw`             | route to covering handler (bind `catch_register`) or       |
 //! |                     | `out.value` + return `Throw`                              |
 //! | `Suspend`           | yield path + resume path via [`Helper::ResumeValue`]      |
+//! | `Await`             | same suspension ABI as `Suspend` (await operand)         |
 //! | `Halt`              | `undefined` → `out.value`, return `Normal`               |
 //!
 //! No opcode is silently dropped and none is lowered to a placeholder no-op.
@@ -138,18 +142,20 @@
 //! `FatalTrap` bypasses handlers. When no handler covers the pc, the completion
 //! is returned to the caller.
 //!
-//! # Suspend and the resume helper
+//! # Suspend/Await and the resume helper
 //!
-//! `Suspend { dst, src, resume }` yields `src` and, when resumed, delivers the
-//! resumed value into `dst` before continuing at `resume`. The native entry ABI
+//! `Suspend { dst, src, resume }` (the `yield` form) and
+//! `Await { dst, src, resume }` (the `await` form) share one suspension ABI:
+//! yield `src` and, when resumed, deliver the resumed value into `dst` before
+//! continuing at `resume`. The native entry ABI
 //! carries no resume input (`out.value` is the *yielded* value, not an input),
 //! so the resumed value is obtained through an explicit runtime contract rather
 //! than invented:
 //!
-//! * **Yield path** — store this suspend's resume token into `frame.bytecode_pc`
-//!   (`0` is a fresh call; the suspend at bytecode pc `P` uses token `P + 1`, so
-//!   tokens never collide with a fresh entry or with each other), write `src`
-//!   into `out.value`, and return `Suspend`.
+//! * **Yield path** — store this suspension's resume token into `frame.bytecode_pc`
+//!   (`0` is a fresh call; the `Suspend`/`Await` at bytecode pc `P` uses token
+//!   `P + 1`, so tokens never collide with a fresh entry or with each other),
+//!   write `src` into `out.value`, and return `Suspend`.
 //! * **Resume path** — the dispatch prologue for token `P + 1` calls
 //!   [`Helper::ResumeValue`], which the runtime resolves to write the verified
 //!   resumed value for this frame into `out.value` (it may return `Throw` for
@@ -296,6 +302,8 @@ const _: () = {
 /// | 29  | `Export`            | `name: i32, src: i64`                        |
 /// | 30  | `ConsumeFuel`       | `amount: i32` (total except `FatalTrap`)     |
 /// | 31 | `CreateCell`        | —                                            |
+/// | 32 | `IteratorStep`      | `iterator: i64` (raw, possibly-promised result) |
+/// | 33 | `IteratorResult`    | `result: i64, done_reg: i32, value_reg: i32` (two-write) |
 ///
 /// Every helper except [`Helper::Truthy`] returns a
 /// `bamts_native::CompletionTag`. [`Helper::Truthy`] returns `0`/`1`.
@@ -399,6 +407,18 @@ pub enum Helper {
     /// instructions from the shared machine budget. Returns `FatalTrap` on
     /// exhaustion and never routes through a bytecode exception handler.
     ConsumeFuel,
+    /// `bamts_iterator_step(frame, iterator, out)`: advance `iterator`,
+    /// writing the raw iterator result object (possibly a promise for an
+    /// async iterator) into `out.value`. `for await` suspends on that result
+    /// before [`Helper::IteratorResult`] reads it.
+    IteratorStep,
+    /// `bamts_iterator_result(frame, result, done_reg, value_reg, out)`:
+    /// validate the iterator result object `result`, writing the done flag
+    /// into `handles[done_reg]` and the produced value into
+    /// `handles[value_reg]` directly (two writes), exactly like
+    /// [`Helper::IteratorNext`]. On `Throw`, the thrown handle is in
+    /// `out.value` and neither slot is written.
+    IteratorResult,
 }
 
 impl Helper {
@@ -435,6 +455,8 @@ impl Helper {
             Helper::CreateRegExp => "bamts_create_regexp",
             Helper::GetIterator => "bamts_get_iterator",
             Helper::IteratorNext => "bamts_iterator_next",
+            Helper::IteratorStep => "bamts_iterator_step",
+            Helper::IteratorResult => "bamts_iterator_result",
             Helper::Export => "bamts_export",
             Helper::ConsumeFuel => "bamts_consume_fuel",
             Helper::CreateCell => "bamts_create_cell",
@@ -478,6 +500,8 @@ impl Helper {
             Helper::Export => 29,
             Helper::ConsumeFuel => 30,
             Helper::CreateCell => 31,
+            Helper::IteratorStep => 32,
+            Helper::IteratorResult => 33,
         }
     }
 
@@ -518,6 +542,8 @@ impl Helper {
             29 => Some(Helper::Export),
             30 => Some(Helper::ConsumeFuel),
             31 => Some(Helper::CreateCell),
+            32 => Some(Helper::IteratorStep),
+            33 => Some(Helper::IteratorResult),
             _ => None,
         }
     }
@@ -581,8 +607,12 @@ impl Helper {
             Helper::CreateRegExp => &[types::I64, types::I32, types::I32, types::I64],
             // (frame, src, kind, out)
             Helper::GetIterator => &[types::I64, types::I64, types::I32, types::I64],
-            // (frame, iterator, done_reg, value_reg, out)
-            Helper::IteratorNext => &[types::I64, types::I64, types::I32, types::I32, types::I64],
+            // (frame, iterator, out)
+            Helper::IteratorStep => &[types::I64, types::I64, types::I64],
+            // (frame, iterator/result, done_reg, value_reg, out)
+            Helper::IteratorNext | Helper::IteratorResult => {
+                &[types::I64, types::I64, types::I32, types::I32, types::I64]
+            }
             // (frame, value)
             Helper::Truthy => &[types::I64, types::I64],
         }
@@ -1002,8 +1032,8 @@ struct Lowering<'a> {
     /// One block per reachable bytecode pc; `None` for unreachable pcs, which
     /// are never emitted (keeping every block dominated by the entry block).
     pc_blocks: Vec<Option<Block>>,
-    /// The resume prologue block for each reachable `Suspend`, keyed by the
-    /// suspend's bytecode pc.
+    /// The resume prologue block for each reachable `Suspend`/`Await`, keyed
+    /// by the suspension's bytecode pc.
     resume_blocks: BTreeMap<usize, Block>,
     handlers: &'a [ExceptionHandler],
     call_conv: CallConv,
@@ -1044,7 +1074,7 @@ impl<'a> Lowering<'a> {
             self.pc_blocks[pc] = Some(self.builder.create_block());
         }
         for &pc in reachable {
-            if let Instruction::Suspend { .. } = code[pc] {
+            if let Instruction::Suspend { .. } | Instruction::Await { .. } = code[pc] {
                 let block = self.builder.create_block();
                 self.resume_blocks.insert(pc, block);
             }
@@ -1054,8 +1084,12 @@ impl<'a> Lowering<'a> {
             self.emit_instruction(pc, code[pc]);
         }
         for &pc in reachable {
-            if let Instruction::Suspend { dst, resume, .. } = code[pc] {
-                self.emit_resume_prologue(pc, dst, resume);
+            match code[pc] {
+                Instruction::Suspend { dst, resume, .. }
+                | Instruction::Await { dst, resume, .. } => {
+                    self.emit_resume_prologue(pc, dst, resume);
+                }
+                _ => {}
             }
         }
         self.builder.seal_all_blocks();
@@ -1396,6 +1430,33 @@ impl<'a> Lowering<'a> {
                 );
                 self.route_completion(pc, tag, None);
             }
+            Instruction::IteratorStep { dst, iterator } => {
+                let handles = self.load_handles();
+                let iterator_value = self.load_register(handles, iterator);
+                let tag = self.call_helper(
+                    Helper::IteratorStep,
+                    &[self.frame, iterator_value, self.out],
+                );
+                self.route_completion(pc, tag, Some(dst));
+            }
+            Instruction::IteratorResult {
+                done,
+                value,
+                result,
+            } => {
+                let handles = self.load_handles();
+                let result_value = self.load_register(handles, result);
+                let done_reg = self.iconst32(i64::from(done.get()));
+                let value_reg = self.iconst32(i64::from(value.get()));
+                // Two-write, like IteratorNext: the helper writes both `done`
+                // and `value` slots directly from the frame on Normal, so no
+                // `dst` store here.
+                let tag = self.call_helper(
+                    Helper::IteratorResult,
+                    &[self.frame, result_value, done_reg, value_reg, self.out],
+                );
+                self.route_completion(pc, tag, None);
+            }
             Instruction::Import { dst, specifier } => {
                 let specifier_id = self.iconst32(i64::from(specifier.get()));
                 let tag = self.call_helper(Helper::Import, &[self.frame, specifier_id, self.out]);
@@ -1421,7 +1482,9 @@ impl<'a> Lowering<'a> {
             }
             Instruction::Return { value } => self.emit_return(value),
             Instruction::Throw { value } => self.emit_throw(pc, value),
-            Instruction::Suspend { src, .. } => self.emit_suspend(pc, src),
+            Instruction::Suspend { src, .. } | Instruction::Await { src, .. } => {
+                self.emit_suspend(pc, src);
+            }
             Instruction::Halt => self.emit_halt(),
         }
     }
@@ -1529,8 +1592,11 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// Emits the `Suspend` yield path: store this suspend's resume token into
-    /// `frame.bytecode_pc`, yield `src` in `out.value`, and return `Suspend`.
+    /// Emits the `Suspend`/`Await` suspension path: store this suspension's
+    /// resume token into `frame.bytecode_pc`, yield `src` in `out.value`, and
+    /// return `Suspend`. Both opcodes share this ABI; only the runtime driver
+    /// interprets the yielded value differently (generator item vs awaited
+    /// operand).
     fn emit_suspend(&mut self, pc: usize, src: Register) {
         let token = self.iconst32(i64::from(pc as u32 + 1));
         self.builder.ins().store(
@@ -1546,10 +1612,10 @@ impl<'a> Lowering<'a> {
         self.builder.ins().return_(&[tag]);
     }
 
-    /// Emits a `Suspend` resume prologue: obtain the resumed value from the
-    /// runtime via [`Helper::ResumeValue`], store it into `dst`, and continue at
-    /// `resume`. A `Throw` from the resume (e.g. `generator.throw`) routes to a
-    /// covering handler; `FatalTrap` propagates.
+    /// Emits a `Suspend`/`Await` resume prologue: obtain the resumed value
+    /// from the runtime via [`Helper::ResumeValue`], store it into `dst`, and
+    /// continue at `resume`. A `Throw` from the resume (e.g. `generator.throw`)
+    /// routes to a covering handler; `FatalTrap` propagates.
     fn emit_resume_prologue(&mut self, pc: usize, dst: Register, resume: Pc) {
         let block = self.resume_blocks[&pc];
         self.builder.switch_to_block(block);
@@ -1705,9 +1771,9 @@ fn register_offset(register: Register) -> i32 {
 // -- CFG analysis ------------------------------------------------------------
 
 /// The set of pcs reachable from a fresh call (pc 0) plus every resumable
-/// suspend point, following fallthrough, jumps, conditional targets, suspend
-/// resumes, and the handler edge of any instruction that can route a `Throw`
-/// completion into a covering handler.
+/// `Suspend`/`Await` point, following fallthrough, jumps, conditional targets,
+/// suspension resumes, and the handler edge of any instruction that can route
+/// a `Throw` completion into a covering handler.
 fn reachable_pcs(code: &[Instruction], handlers: &[ExceptionHandler]) -> BTreeSet<usize> {
     let mut reachable = BTreeSet::new();
     let mut worklist = Vec::new();
@@ -1763,9 +1829,12 @@ fn routes_to_handler(instruction: Instruction) -> bool {
         | Instruction::CreateRegExp { .. }
         | Instruction::GetIterator { .. }
         | Instruction::IteratorNext { .. }
+        | Instruction::IteratorStep { .. }
+        | Instruction::IteratorResult { .. }
         | Instruction::Import { .. }
         | Instruction::Export { .. }
         | Instruction::Suspend { .. }
+        | Instruction::Await { .. }
         | Instruction::Throw { .. } => true,
         Instruction::Move { .. }
         | Instruction::TypeOfGlobal { .. }
@@ -1793,7 +1862,8 @@ fn is_inline_instruction(instruction: Instruction) -> bool {
         | Instruction::Return { .. }
         | Instruction::Halt
         | Instruction::Throw { .. }
-        | Instruction::Suspend { .. } => true,
+        | Instruction::Suspend { .. }
+        | Instruction::Await { .. } => true,
         Instruction::LoadConst { .. }
         | Instruction::Unary { .. }
         | Instruction::Binary { .. }
@@ -1821,20 +1891,24 @@ fn is_inline_instruction(instruction: Instruction) -> bool {
         | Instruction::CreateRegExp { .. }
         | Instruction::GetIterator { .. }
         | Instruction::IteratorNext { .. }
+        | Instruction::IteratorStep { .. }
+        | Instruction::IteratorResult { .. }
         | Instruction::Import { .. }
         | Instruction::Export { .. } => false,
     }
 }
 
 /// The resume-dispatch tokens the entry accepts: `0` (fresh call) plus `P + 1`
-/// for each reachable `Suspend` at bytecode pc `P`, sorted and deduplicated.
+/// for each reachable `Suspend`/`Await` at bytecode pc `P`, sorted and
+/// deduplicated. One pc holds one instruction, so tokens are unique across
+/// both suspension opcodes by construction.
 fn resume_tokens(code: &[Instruction], reachable: &BTreeSet<usize>) -> Vec<u32> {
     let mut tokens = BTreeSet::new();
     if !code.is_empty() {
         tokens.insert(0u32);
     }
     for &pc in reachable {
-        if let Instruction::Suspend { .. } = code[pc] {
+        if let Instruction::Suspend { .. } | Instruction::Await { .. } = code[pc] {
             tokens.insert(pc as u32 + 1);
         }
     }
@@ -1880,9 +1954,11 @@ impl NormalSuccessors for Instruction {
                 visit(target.get() as usize);
                 visit(pc + 1);
             }
-            // A suspend returns now; its `resume` pc is entered by a later call
-            // through the resume prologue.
-            Instruction::Suspend { resume, .. } => visit(resume.get() as usize),
+            // A suspension returns now; its `resume` pc is entered by a later
+            // call through the resume prologue.
+            Instruction::Suspend { resume, .. } | Instruction::Await { resume, .. } => {
+                visit(resume.get() as usize);
+            }
             Instruction::Return { .. } | Instruction::Throw { .. } | Instruction::Halt => {}
             Instruction::LoadConst { .. }
             | Instruction::Move { .. }
@@ -1912,6 +1988,8 @@ impl NormalSuccessors for Instruction {
             | Instruction::CreateRegExp { .. }
             | Instruction::GetIterator { .. }
             | Instruction::IteratorNext { .. }
+            | Instruction::IteratorStep { .. }
+            | Instruction::IteratorResult { .. }
             | Instruction::Import { .. }
             | Instruction::Export { .. } => visit(pc + 1),
         }
@@ -2064,7 +2142,7 @@ mod tests {
     #[test]
     fn helper_index_table_is_a_stable_bijection() {
         // Every helper round-trips through its external index, and the table
-        // covers a dense 0..=31 range with unique symbols.
+        // covers a dense 0..=33 range with unique symbols.
         let helpers = [
             Helper::LoadConstant,
             Helper::Unary,
@@ -2098,6 +2176,8 @@ mod tests {
             Helper::Export,
             Helper::ConsumeFuel,
             Helper::CreateCell,
+            Helper::IteratorStep,
+            Helper::IteratorResult,
         ];
         let mut symbols = BTreeSet::new();
         for (expected_index, helper) in helpers.iter().copied().enumerate() {
@@ -2110,8 +2190,8 @@ mod tests {
             );
             assert!(symbols.insert(helper.symbol()), "unique symbol {helper:?}");
         }
-        assert_eq!(symbols.len(), 32);
-        assert_eq!(Helper::from_external_index(32), None);
+        assert_eq!(symbols.len(), 34);
+        assert_eq!(Helper::from_external_index(34), None);
     }
 
     #[test]
@@ -2778,6 +2858,66 @@ mod tests {
     }
 
     #[test]
+    fn iterator_step_routes_its_raw_result_through_the_step_helper() {
+        // r0 = iterator; IteratorStep dst=r1 iterator=r0.
+        let code = vec![
+            load_undef(reg(0)),
+            Instruction::IteratorStep {
+                dst: reg(1),
+                iterator: reg(0),
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(2, code, Vec::new()));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::IteratorStep));
+        assert_eq!(Helper::IteratorStep.external_index(), 32);
+        assert!(
+            clif.contains("u1:32"),
+            "iterator-step import missing:\n{clif}"
+        );
+        // (frame, iterator:i64, out) -> tag: one value operand, result via out.
+        assert!(
+            clif.contains("(i64, i64, i64) -> i32"),
+            "iterator-step helper sig wrong:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn iterator_result_writes_both_done_and_value_registers() {
+        // r0 = raw result; IteratorResult done=r1 value=r2 result=r0.
+        let code = vec![
+            load_undef(reg(0)),
+            Instruction::IteratorResult {
+                done: reg(1),
+                value: reg(2),
+                result: reg(0),
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(3, code, Vec::new()));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::IteratorResult));
+        assert_eq!(Helper::IteratorResult.external_index(), 33);
+        assert!(
+            clif.contains("u1:33"),
+            "iterator-result import missing:\n{clif}"
+        );
+        // (frame, result:i64, done_reg:i32, value_reg:i32, out) -> tag: the two
+        // destination register indices are passed so the helper writes both.
+        assert!(
+            clif.contains("(i64, i64, i32, i32, i64) -> i32"),
+            "iterator-result helper sig wrong:\n{clif}"
+        );
+        // Both destination register indices (r1 -> 1, r2 -> 2) are materialized
+        // as i32 constants and handed to the helper.
+        assert!(
+            clif.contains("iconst.i32 1") && clif.contains("iconst.i32 2"),
+            "both destination register indices must be passed:\n{clif}"
+        );
+    }
+
+    #[test]
     fn export_lowers_to_the_export_helper() {
         let code = vec![
             load_undef(reg(0)),
@@ -2832,6 +2972,45 @@ mod tests {
             clif.contains("store"),
             "resume token store missing:\n{clif}"
         );
+        assert!(
+            clif.contains("u1:13"),
+            "resume helper import missing:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn await_shares_the_suspend_abi_with_a_distinct_resume_token() {
+        // r0 = undef; suspend (yield r0) at pc 1 resuming at pc 2; await r0 at
+        // pc 2 resuming at pc 3; pc 3 halts. Both suspensions are reachable,
+        // each through the other's resume edge.
+        let code = vec![
+            load_undef(reg(0)),
+            Instruction::Suspend {
+                dst: reg(0),
+                src: reg(0),
+                resume: Pc::new(2),
+            },
+            Instruction::Await {
+                dst: reg(0),
+                src: reg(0),
+                resume: Pc::new(3),
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(1, code, Vec::new()));
+        let lowered = lower_code_module(ModuleId::new(0), &module, host_config()).expect("lowers");
+        let function = &lowered.functions[0];
+        // Fresh token 0, the suspend at pc 1 -> token 2, the await at pc 2 ->
+        // token 3: distinct tokens across both suspension opcodes.
+        assert_eq!(function.entry_points, vec![0, 2, 3]);
+        assert!(function.helpers.contains(&Helper::ResumeValue));
+        let clif = function.clif.display().to_string();
+        // Multi-token dispatch loads and compares the resume token.
+        assert!(
+            clif.contains("load.i32"),
+            "dispatch token load missing:\n{clif}"
+        );
+        assert!(clif.contains("icmp"), "dispatch compare missing:\n{clif}");
         assert!(
             clif.contains("u1:13"),
             "resume helper import missing:\n{clif}"

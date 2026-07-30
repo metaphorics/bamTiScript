@@ -118,6 +118,7 @@ name = "bamts-verification"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bamts",
  "bamts-bytecode",
  "bamts-cli",
  "bamts-codegen",

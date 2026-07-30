@@ -33,6 +33,10 @@ pub(crate) enum BuiltinOutcome {
         generator: Value,
         resume_value: Value,
     },
+    AsyncGeneratorNext {
+        generator: Value,
+        resume_value: Value,
+    },
 }
 
 pub(crate) type BuiltinHandler<H> = fn(
@@ -59,12 +63,15 @@ pub(crate) struct BuiltinTable<H: Host> {
     boolean_prototype: Value,
     error_prototypes: Vec<(BuiltinId, Value)>,
     symbol_iterator: Option<Value>,
+    symbol_async_iterator: Option<Value>,
     symbol_to_string_tag: Option<Value>,
     symbol_prototype: Option<Value>,
     object_to_string: Option<Value>,
     regexp_prototype: Option<Value>,
     iterator_prototype: Option<Value>,
+    async_iterator_prototype: Option<Value>,
     generator_prototype: Option<Value>,
+    async_generator_prototype: Option<Value>,
     promise_resolver_targets: Option<(Value, Value)>,
     promise_finally_targets: Option<(Value, Value)>,
     promise_all_targets: Option<(Value, Value)>,
@@ -91,12 +98,15 @@ impl<H: Host> BuiltinTable<H> {
             boolean_prototype,
             error_prototypes: Vec::new(),
             symbol_iterator: None,
+            symbol_async_iterator: None,
             symbol_to_string_tag: None,
             symbol_prototype: None,
             object_to_string: None,
             regexp_prototype: None,
             iterator_prototype: None,
+            async_iterator_prototype: None,
             generator_prototype: None,
+            async_generator_prototype: None,
             promise_resolver_targets: None,
             promise_finally_targets: None,
             promise_all_targets: None,
@@ -149,6 +159,15 @@ impl<H: Host> BuiltinTable<H> {
         self.symbol_iterator.expect("Symbol builtins install first")
     }
 
+    pub(crate) fn set_symbol_async_iterator(&mut self, iterator: Value) {
+        self.symbol_async_iterator = Some(iterator);
+    }
+
+    pub(crate) fn symbol_async_iterator(&self) -> Value {
+        self.symbol_async_iterator
+            .expect("Symbol builtins install first")
+    }
+
     pub(crate) fn set_symbol_to_string_tag(&mut self, symbol: Value) {
         self.symbol_to_string_tag = Some(symbol);
     }
@@ -193,6 +212,15 @@ impl<H: Host> BuiltinTable<H> {
             .expect("iterator builtins install their prototype")
     }
 
+    pub(crate) fn set_async_iterator_prototype(&mut self, prototype: Value) {
+        self.async_iterator_prototype = Some(prototype);
+    }
+
+    pub(crate) fn async_iterator_prototype(&self) -> Value {
+        self.async_iterator_prototype
+            .expect("async iterator builtins install their prototype")
+    }
+
     pub(crate) fn set_generator_prototype(&mut self, prototype: Value) {
         self.generator_prototype = Some(prototype);
     }
@@ -200,6 +228,15 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn generator_prototype(&self) -> Value {
         self.generator_prototype
             .expect("generator builtins install their prototype")
+    }
+
+    pub(crate) fn set_async_generator_prototype(&mut self, prototype: Value) {
+        self.async_generator_prototype = Some(prototype);
+    }
+
+    pub(crate) fn async_generator_prototype(&self) -> Value {
+        self.async_generator_prototype
+            .expect("async generator builtins install their prototype")
     }
 
     pub(crate) fn set_promise_prototype(&mut self, prototype: Value) {
@@ -534,17 +571,17 @@ impl<'a, H: Host> Machine<'a, H> {
         &mut self,
         value: Value,
     ) -> Result<EcmaString, EvalFailure> {
-        if let Some(index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
-            if let HeapEntry::Symbol { description } = &self.heap[index] {
-                let mut text =
-                    EcmaStringBuilder::with_capacity(description.len_units().saturating_add(8));
-                text.push_utf8("Symbol(");
-                for &unit in description.as_units() {
-                    text.push_unit(unit);
-                }
-                text.push_unit(u16::from(b')'));
-                return Ok(text.finish());
+        if let Some(index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)?
+            && let HeapEntry::Symbol { description } = &self.heap[index]
+        {
+            let mut text =
+                EcmaStringBuilder::with_capacity(description.len_units().saturating_add(8));
+            text.push_utf8("Symbol(");
+            for &unit in description.as_units() {
+                text.push_unit(unit);
             }
+            text.push_unit(u16::from(b')'));
+            return Ok(text.finish());
         }
 
         if !self.is_object(value) {

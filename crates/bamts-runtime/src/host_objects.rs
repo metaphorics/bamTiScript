@@ -340,6 +340,7 @@ impl<H: Host> Machine<'_, H> {
                     | HeapEntry::BuiltinIterator { properties, .. }
                     | HeapEntry::Collection { properties, .. }
                     | HeapEntry::Generator { properties, .. }
+                    | HeapEntry::AsyncGenerator { properties, .. }
                     | HeapEntry::Promise { properties, .. }
                     | HeapEntry::Timeout { properties, .. } => {
                         if depth >= 2 {

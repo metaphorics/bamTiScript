@@ -417,22 +417,26 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     /// it reuses the machine's own loop driver directly.
     pub fn run(self) -> Result<Execution, RuntimeError> {
         self.machine.borrow_mut().instantiate_modules()?;
-        let execution = self
-            .evaluate_reference_module(self.program.entry())?
-            .ok_or_else(|| {
-                let module = self.program.entry();
-                let function = self.module(module).entry().get() as usize;
+        let entry = self.program.entry();
+        let execution = if self.machine.borrow().module_graph_suspends(entry) {
+            self.machine
+                .borrow_mut()
+                .evaluate_instantiated_module(entry)?
+        } else {
+            self.evaluate_reference_module(entry)?.ok_or_else(|| {
+                let function = self.module(entry).entry().get() as usize;
                 self.error_at(
-                    module,
+                    entry,
                     RuntimeErrorKind::InvalidVerifiedProgram {
-                        module,
+                        module: entry,
                         instruction: Instruction::Halt,
                     },
                     function,
                     0,
                 )
-            })?;
-        // After successful synchronous evaluation, drain microtasks and timers
+            })?
+        };
+        // After successful evaluation, drain microtasks and timers
         // to quiescence on the single borrowed machine. The guard spans only this
         // statement: the loop runs through the machine's own &mut methods, so no
         // nested RefCell borrow is taken and no native callback overlaps it.
@@ -724,7 +728,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     })?;
                     return Ok(FrameCompletion::Suspend(frame.register(src.get()), token));
                 }
-                Instruction::Suspend { .. } => {
+                Instruction::Suspend { .. } | Instruction::Await { .. } => {
                     match self.raise(
                         &mut frame,
                         code,
@@ -948,6 +952,24 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 },
                 None,
             ),
+            Instruction::IteratorStep { dst, iterator } => (
+                HelperCall::IteratorStep {
+                    iterator: register(iterator),
+                },
+                Some(dst.get()),
+            ),
+            Instruction::IteratorResult {
+                done,
+                value,
+                result,
+            } => (
+                HelperCall::IteratorResult {
+                    result: register(result),
+                    done_reg: done.get(),
+                    value_reg: value.get(),
+                },
+                None,
+            ),
             Instruction::Import { dst, specifier } => (
                 HelperCall::Import {
                     specifier: specifier.get(),
@@ -969,6 +991,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             | Instruction::Return { .. }
             | Instruction::Throw { .. }
             | Instruction::Suspend { .. }
+            | Instruction::Await { .. }
             | Instruction::Halt => {
                 unreachable!("control-flow opcode is not lowered to a helper call")
             }
@@ -1106,6 +1129,19 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         }) => {
                             return self.resume_generator(generator, resume_value);
                         }
+                        Ok(BuiltinOutcome::AsyncGeneratorNext {
+                            generator,
+                            resume_value,
+                        }) => {
+                            let outcome = self
+                                .machine
+                                .borrow_mut()
+                                .enqueue_async_generator_next(generator, resume_value);
+                            return match outcome {
+                                Ok(promise) => InvokeOutcome::Value(promise),
+                                Err(failure) => self.failure_outcome(failure),
+                            };
+                        }
                         Err(EvalFailure::Throw(origin)) => {
                             return InvokeOutcome::Threw(Value::UNDEFINED, origin);
                         }
@@ -1167,6 +1203,25 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         let index = target.function.get() as usize;
         let handle = self.code_ref(target.module);
         let flags = handle.code(target.module).functions()[index].flags();
+        if flags.is_async && flags.is_generator {
+            let created = self
+                .machine
+                .borrow_mut()
+                .create_async_generator(GeneratorStart {
+                    target,
+                    captures: captures.to_vec(),
+                    this_value: this,
+                    new_target,
+                    args: args.to_vec(),
+                });
+            return match created {
+                Ok(generator) => InvokeOutcome::Value(generator),
+                Err(kind) => {
+                    self.pending_fatal_kind.set(Some(kind));
+                    InvokeOutcome::Fatal
+                }
+            };
+        }
         if flags.is_generator && !flags.is_async {
             let created = self.machine.borrow_mut().create_generator(GeneratorStart {
                 target,
@@ -1355,19 +1410,41 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             let created = self.machine.borrow_mut().create_iterator(source, kind);
             return self.eval_outcome(created);
         }
-        let method = {
-            let mut machine = self.machine.borrow_mut();
-            let symbol = machine.intrinsics.builtins.symbol_iterator();
-            let key = match machine.to_property_key(symbol) {
-                Ok(key) => key,
-                Err(failure) => return self.failure_outcome(failure),
-            };
-            machine.resolve_get(source, &key)
+        let symbol = match kind {
+            bamts_bytecode::IteratorKind::Async => self
+                .machine
+                .borrow()
+                .intrinsics
+                .builtins
+                .symbol_async_iterator(),
+            bamts_bytecode::IteratorKind::Sync => {
+                self.machine.borrow().intrinsics.builtins.symbol_iterator()
+            }
+            bamts_bytecode::IteratorKind::Keys => unreachable!("keys handled above"),
         };
-        let method = match self.get_outcome(method, source) {
+        let key = match self.machine.borrow_mut().to_property_key(symbol) {
+            Ok(key) => key,
+            Err(failure) => return self.failure_outcome(failure),
+        };
+        let method = self.machine.borrow_mut().resolve_get(source, &key);
+        let mut method = match self.get_outcome(method, source) {
             InvokeOutcome::Value(method) => method,
             other => return other,
         };
+        if kind == bamts_bytecode::IteratorKind::Async
+            && matches!(method, Value::UNDEFINED | Value::NULL)
+        {
+            let symbol = self.machine.borrow().intrinsics.builtins.symbol_iterator();
+            let key = match self.machine.borrow_mut().to_property_key(symbol) {
+                Ok(key) => key,
+                Err(failure) => return self.failure_outcome(failure),
+            };
+            let fallback = self.machine.borrow_mut().resolve_get(source, &key);
+            method = match self.get_outcome(fallback, source) {
+                InvokeOutcome::Value(method) => method,
+                other => return other,
+            };
+        }
         match self.machine.borrow().is_callable(method) {
             Ok(true) => {}
             Ok(false) => {
@@ -1403,23 +1480,29 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         self.eval_outcome(created)
     }
 
-    fn iterator_next_active(&self, iterator: Value) -> Result<(bool, Value), InvokeOutcome> {
+    fn iterator_step_active(&self, iterator: Value) -> Result<Value, InvokeOutcome> {
         let prepared = self.machine.borrow_mut().prepare_iterator_next(iterator);
-        let result = match prepared {
-            Ok(IteratorNextPrepared::Ready { done, value }) => return Ok((done, value)),
+        match prepared {
+            Ok(IteratorNextPrepared::Ready { done, value }) => {
+                let result = self.machine.borrow_mut().iterator_result(value, done);
+                result.map_err(|failure| self.failure_outcome(failure))
+            }
             Ok(IteratorNextPrepared::Call { callee, this_value }) => {
                 match self.invoke_callee(callee, this_value, &[], Value::UNDEFINED) {
-                    InvokeOutcome::Value(result) => result,
-                    other => return Err(other),
+                    InvokeOutcome::Value(result) => Ok(result),
+                    other => Err(other),
                 }
             }
-            Err(failure) => return Err(self.failure_outcome(failure)),
-        };
+            Err(failure) => Err(self.failure_outcome(failure)),
+        }
+    }
+
+    fn iterator_result_active(&self, result: Value) -> Result<(bool, Value), InvokeOutcome> {
         if !self.machine.borrow().is_object(result) {
             return Err(InvokeOutcome::Threw(
                 Value::UNDEFINED,
                 ThrowOrigin::TypeError {
-                    operation: "iterator next returned a non-object",
+                    operation: "iterator result is not an object",
                 },
             ));
         }
@@ -1435,6 +1518,11 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             other => return Err(other),
         };
         Ok((false, value))
+    }
+
+    fn iterator_next_active(&self, iterator: Value) -> Result<(bool, Value), InvokeOutcome> {
+        let result = self.iterator_step_active(iterator)?;
+        self.iterator_result_active(result)
     }
 
     fn array_extend_active(&self, array: Value, iterable: Value) -> InvokeOutcome {
@@ -2035,7 +2123,11 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 );
                 match result {
                     Ok(BuiltinOutcome::Value(value)) => HelperResult::normal(value),
-                    Ok(BuiltinOutcome::Call { .. } | BuiltinOutcome::GeneratorNext { .. }) => {
+                    Ok(
+                        BuiltinOutcome::Call { .. }
+                        | BuiltinOutcome::GeneratorNext { .. }
+                        | BuiltinOutcome::AsyncGeneratorNext { .. },
+                    ) => {
                         self.pending_throw.set(Some(PendingThrow {
                             value: Value::UNDEFINED,
                             origin: ThrowOrigin::TypeError {
@@ -2128,18 +2220,25 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     fn run_linked(&mut self) -> Result<ExecutionOutcome, NativeError> {
         self.machine.borrow_mut().instantiate_modules()?;
         let module = self.program.entry();
-        let execution = self.evaluate_linked_module(module)?.ok_or_else(|| {
-            let function = self.module(module).entry().get() as usize;
-            NativeError::Runtime(self.error_at(
-                module,
-                RuntimeErrorKind::InvalidVerifiedProgram {
+        let execution = if self.machine.borrow().module_graph_suspends(module) {
+            self.machine
+                .borrow_mut()
+                .evaluate_instantiated_module(module)
+                .map_err(NativeError::Runtime)?
+        } else {
+            self.evaluate_linked_module(module)?.ok_or_else(|| {
+                let function = self.module(module).entry().get() as usize;
+                NativeError::Runtime(self.error_at(
                     module,
-                    instruction: Instruction::Halt,
-                },
-                function,
-                0,
-            ))
-        })?;
+                    RuntimeErrorKind::InvalidVerifiedProgram {
+                        module,
+                        instruction: Instruction::Halt,
+                    },
+                    function,
+                    0,
+                ))
+            })?
+        };
         // The linked backend shares the interpreter's automatic loop policy: it
         // drives the machine to quiescence after successful evaluation. Driver
         // failures are runtime failures, surfaced through `NativeError::Runtime`.
@@ -2179,7 +2278,16 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             }
         }
 
-        match self.invoke_linked_entry(module) {
+        let result = if self.machine.borrow().module_entry_suspends(module) {
+            self.machine
+                .borrow_mut()
+                .run_module_entry(module)
+                .map_err(NativeError::Runtime)
+        } else {
+            self.invoke_linked_entry(module)
+        };
+
+        match result {
             Ok(execution) => self
                 .machine
                 .borrow_mut()
@@ -2651,6 +2759,28 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 }
                 Err(outcome) => self.outcome_result(outcome),
             },
+            HelperCall::IteratorStep { iterator } => match self.iterator_step_active(iterator) {
+                Ok(result) => HelperResult::normal(result),
+                Err(outcome) => self.outcome_result(outcome),
+            },
+            HelperCall::IteratorResult {
+                result,
+                done_reg,
+                value_reg,
+            } => match self.iterator_result_active(result) {
+                Ok((done, value)) => {
+                    let wrote_done = frame.try_set_register(done_reg, Value::boolean(done));
+                    let wrote_value = frame.try_set_register(value_reg, value);
+                    if wrote_done && wrote_value {
+                        HelperResult::normal(Value::UNDEFINED)
+                    } else {
+                        self.fatal(RuntimeErrorKind::InvalidValue {
+                            value: Value::UNDEFINED,
+                        })
+                    }
+                }
+                Err(outcome) => self.outcome_result(outcome),
+            },
             HelperCall::Export { .. } => self.fail(EvalFailure::Throw(ThrowOrigin::TypeError {
                 operation: "export outside an engine-owned module registry",
             })),
@@ -2668,7 +2798,8 @@ fn is_inline_instruction(instruction: Instruction) -> bool {
         | Instruction::Return { .. }
         | Instruction::Halt
         | Instruction::Throw { .. }
-        | Instruction::Suspend { .. } => true,
+        | Instruction::Suspend { .. }
+        | Instruction::Await { .. } => true,
         Instruction::LoadConst { .. }
         | Instruction::Unary { .. }
         | Instruction::Binary { .. }
@@ -2696,6 +2827,8 @@ fn is_inline_instruction(instruction: Instruction) -> bool {
         | Instruction::CreateRegExp { .. }
         | Instruction::GetIterator { .. }
         | Instruction::IteratorNext { .. }
+        | Instruction::IteratorStep { .. }
+        | Instruction::IteratorResult { .. }
         | Instruction::Import { .. }
         | Instruction::Export { .. } => false,
     }
@@ -3377,7 +3510,7 @@ mod tests {
                                 dst: reg(0),
                                 constant: cid(2),
                             },
-                            Instruction::Suspend {
+                            Instruction::Await {
                                 dst: reg(1),
                                 src: reg(0),
                                 resume: pc(2),
@@ -4626,6 +4759,247 @@ mod tests {
     }
 
     #[test]
+    fn linked_top_level_await_uses_the_reference_entry() {
+        let module = program_module(
+            "root",
+            vec![
+                Constant::String(EcmaString::from_utf8("after")),
+                Constant::Int32(7),
+            ],
+            vec![entry_function(
+                2,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(2),
+                    },
+                    Instruction::Await {
+                        dst: reg(1),
+                        src: reg(0),
+                        resume: pc(2),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(1),
+                        value: reg(1),
+                    },
+                    Instruction::Return { value: reg(1) },
+                ],
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let program = linked(vec![module], 0);
+        let entries = ForeignEntries {
+            program_bytes: program.encode(),
+            invoked: Cell::new(false),
+        };
+        let mut host = SilentHost;
+        let mut engine = NativeEngine::build(
+            &program,
+            &entries,
+            &mut host,
+            Limits::default(),
+            Backend::Linked,
+        );
+
+        engine.run_linked().expect("top-level await completes");
+
+        assert!(!entries.invoked.get(), "linked entry must not run");
+        assert_eq!(
+            engine
+                .machine
+                .borrow()
+                .globals
+                .get(&EcmaString::from_utf8("after")),
+            Some(&Value::int32(7)),
+        );
+    }
+
+    #[test]
+    fn static_dependency_tla_delegates_the_whole_native_graph() {
+        let dependency = program_module(
+            "dependency",
+            vec![
+                Constant::String(EcmaString::from_utf8("after")),
+                Constant::Undefined,
+                Constant::Int32(7),
+            ],
+            vec![entry_function(
+                2,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(2),
+                    },
+                    Instruction::Await {
+                        dst: reg(0),
+                        src: reg(0),
+                        resume: pc(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(3),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(1),
+                        value: reg(1),
+                    },
+                    Instruction::Return { value: reg(1) },
+                ],
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let root = program_module(
+            "root",
+            vec![
+                Constant::String(EcmaString::from_utf8("after")),
+                Constant::String(EcmaString::from_utf8("dependency")),
+            ],
+            vec![entry_function(
+                1,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(1),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+            )],
+            vec![Edge {
+                specifier: cid(2),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let program = linked(vec![dependency, root], 1);
+
+        let mut reference_host = SilentHost;
+        let execution =
+            NativeEngine::new(&program, &NoEntries, &mut reference_host, Limits::default())
+                .run()
+                .expect("reference backend completes the async dependency");
+        assert_eq!(execution.value, Value::int32(7));
+
+        let entries = ForeignEntries {
+            program_bytes: program.encode(),
+            invoked: Cell::new(false),
+        };
+        let mut linked_host = SilentHost;
+        let mut engine = NativeEngine::build(
+            &program,
+            &entries,
+            &mut linked_host,
+            Limits::default(),
+            Backend::Linked,
+        );
+        engine
+            .run_linked()
+            .expect("linked backend completes the async dependency");
+        assert!(
+            !entries.invoked.get(),
+            "the linked graph must not mix native and interpreter entries"
+        );
+        assert_eq!(
+            engine
+                .machine
+                .borrow()
+                .globals
+                .get(&EcmaString::from_utf8("after")),
+            Some(&Value::int32(7)),
+        );
+    }
+
+    #[test]
+    fn static_dependency_tla_rejection_skips_the_native_graph() {
+        let dependency = program_module(
+            "dependency",
+            vec![Constant::Undefined, Constant::Int32(9)],
+            vec![entry_function(
+                2,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::Await {
+                        dst: reg(0),
+                        src: reg(0),
+                        resume: pc(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(2),
+                    },
+                    Instruction::Throw { value: reg(1) },
+                ],
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let root = program_module(
+            "root",
+            vec![Constant::String(EcmaString::from_utf8("dependency"))],
+            vec![entry_function(0, vec![Instruction::Halt])],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let program = linked(vec![dependency, root], 1);
+
+        let mut reference_host = SilentHost;
+        let error = NativeEngine::new(&program, &NoEntries, &mut reference_host, Limits::default())
+            .run()
+            .expect_err("reference backend propagates the async dependency rejection");
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                value,
+                ..
+            } if value == Value::int32(9)
+        ));
+
+        let entries = ForeignEntries {
+            program_bytes: program.encode(),
+            invoked: Cell::new(false),
+        };
+        let mut linked_host = SilentHost;
+        let mut engine = NativeEngine::build(
+            &program,
+            &entries,
+            &mut linked_host,
+            Limits::default(),
+            Backend::Linked,
+        );
+        let error = engine
+            .run_linked()
+            .expect_err("linked backend propagates the async dependency rejection");
+        assert!(matches!(
+            error,
+            NativeError::Runtime(RuntimeError {
+                kind: RuntimeErrorKind::UncaughtThrow {
+                    value,
+                    ..
+                },
+                ..
+            }) if value == Value::int32(9)
+        ));
+        assert!(
+            !entries.invoked.get(),
+            "the rejected async graph must not run a linked entry"
+        );
+    }
+
+    #[test]
     fn dynamic_import_cycle_matches_the_reference_backend() {
         let execution = assert_program_parity(&dynamic_cycle_program()).unwrap();
         assert_eq!(execution.value, Value::TRUE);
@@ -5616,8 +5990,10 @@ mod tests {
         let program = yielding_generator_program();
         let mut host = SilentHost;
         let entries = NoEntries;
-        let mut limits = Limits::default();
-        limits.max_total_registers = 3;
+        let limits = Limits {
+            max_total_registers: 3,
+            ..Limits::default()
+        };
         let engine = NativeEngine::new(&program, &entries, &mut host, limits);
         let first = invoke_test_generator(&engine);
         let second = invoke_test_generator(&engine);

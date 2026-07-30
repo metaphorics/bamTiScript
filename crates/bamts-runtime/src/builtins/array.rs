@@ -1048,7 +1048,9 @@ mod tests {
         // `backing` before installing the custom Symbol.iterator.
         let values = machine.get_named_property(source, "_values").unwrap();
         let next = machine.get_named_property(source, "_next").unwrap();
-        machine.set_data_property(backing, "_values", values).unwrap();
+        machine
+            .set_data_property(backing, "_values", values)
+            .unwrap();
         machine.set_data_property(backing, "_next", next).unwrap();
 
         let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();

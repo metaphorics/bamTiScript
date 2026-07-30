@@ -11,7 +11,7 @@ use crate::{
 /// `BMTPC\0\0\1`: the canonical whole-program container, distinct from module magic.
 pub const PROGRAM_MAGIC: [u8; 8] = [66, 77, 84, 80, 67, 0, 0, 1];
 /// The sole supported program-envelope version.
-pub const PROGRAM_VERSION: u8 = 3;
+pub const PROGRAM_VERSION: u8 = 4;
 
 index_type!(
     /// Index of a module within a program.
@@ -1703,6 +1703,19 @@ mod tests {
         assert_eq!(read_u32(&encoded, &mut offset), 0);
         assert_eq!(read_u32(&encoded, &mut offset) as usize, blob.len());
         assert_eq!(&encoded[offset..offset + blob.len()], blob);
+    }
+
+    #[test]
+    fn version_three_programs_are_rejected() {
+        let mut encoded = PROGRAM_MAGIC.to_vec();
+        encoded.push(3);
+        assert!(matches!(
+            decode_program(&encoded, &ProgramDecodeLimits::default()),
+            Err(ProgramDecodeError {
+                kind: ProgramDecodeErrorKind::UnsupportedVersion { version: 3 },
+                ..
+            })
+        ));
     }
 
     #[test]

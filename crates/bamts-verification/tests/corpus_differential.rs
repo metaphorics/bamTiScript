@@ -6,7 +6,7 @@ use bamts_verification::corpus::{
 };
 
 #[test]
-fn all_pinned_cases_match_node_in_jit_and_aot() {
+fn all_pinned_cases_match_node_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let corpus = load_corpus(&root).expect("the pinned corpus must parse and validate");
     let ids = corpus
@@ -39,7 +39,29 @@ fn all_pinned_cases_match_node_in_jit_and_aot() {
 }
 
 #[test]
-fn declaration_owned_self_captures_match_node_in_jit_and_aot() {
+fn p_map_matches_node_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let corpus = load_corpus(&root).expect("the pinned corpus must parse and validate");
+    let case = corpus.case("p-map").expect("p-map is pinned");
+    let oracle = NodeOracle::discover(&root).expect("the pinned Node oracle must be available");
+    let expected = oracle.run_case(case);
+    let bamts = BamtsRunner::new(&root);
+    let mut failures = Vec::new();
+
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(case, mode);
+        compare_case(&case.id, mode, &expected, &actual, &mut failures);
+    }
+
+    assert!(
+        failures.is_empty(),
+        "p-map differential failures:\n{}",
+        failures.join("\n\n")
+    );
+}
+
+#[test]
+fn declaration_owned_self_captures_match_node_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("task-106-self-captures-{}", process::id());
     let entrypoint = format!("target/{id}.js");
@@ -92,7 +114,7 @@ run();
 }
 
 #[test]
-fn local_lexical_tdz_matches_node_in_jit_and_aot() {
+fn local_lexical_tdz_matches_node_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("task-106-local-tdz-{}", process::id());
     let entrypoint = format!("target/{id}.js");
@@ -180,7 +202,7 @@ process.stdout.write([
 }
 
 #[test]
-fn task_106_sync_cases_match_node_in_jit_and_aot() {
+fn task_106_sync_cases_match_node_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let corpus = load_corpus(&root).expect("the pinned corpus must parse and validate");
     let ids = corpus
@@ -213,7 +235,7 @@ fn task_106_sync_cases_match_node_in_jit_and_aot() {
 }
 
 #[test]
-fn task_107_node_cases_match_node_in_jit_and_aot() {
+fn task_107_node_cases_match_node_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let corpus = load_corpus(&root).expect("the pinned corpus must parse and validate");
     let ids = corpus
@@ -246,7 +268,7 @@ fn task_107_node_cases_match_node_in_jit_and_aot() {
 }
 
 #[test]
-fn task_110_event_loop_drives_to_quiescence_in_jit_and_aot() {
+fn task_110_event_loop_drives_to_quiescence_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("task-110-event-loop-{}", process::id());
     let entrypoint = format!("target/{id}.js");
@@ -287,6 +309,80 @@ setTimeout(() => {
         failures.is_empty(),
         "Task 110 event-loop differential failures:\n{}",
         failures.join("\n\n")
+    );
+}
+
+#[test]
+fn interpreter_runtime_errors_classify_as_evaluate() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("task-113-interpreter-throw-{}", process::id());
+    let entrypoint = format!("target/{id}.js");
+    let path = root.join(&entrypoint);
+    fs::write(
+        &path,
+        "throw new Error('boom');
+",
+    )
+    .expect("write interpreter throw fixture");
+    let spec = CaseSpec {
+        id,
+        repository: "local".to_owned(),
+        commit: "0".repeat(40),
+        license: "UNLICENSED".to_owned(),
+        source_dir: "target".to_owned(),
+        entrypoint,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let result = bamts.run_case(&spec, ExecutionMode::Interpreter);
+    fs::remove_file(path).expect("remove interpreter throw fixture");
+    let error = result.expect_err("a top-level throw must fail in interpreter mode");
+    let text = error.to_string();
+    assert!(
+        text.contains("failed in interpreter mode"),
+        "failure must name interpreter mode: {text}"
+    );
+    assert!(
+        text.contains("stage=evaluate"),
+        "a runtime throw must classify as evaluate: {text}"
+    );
+}
+
+#[test]
+fn interpreter_failure_text_names_mode_stage_and_evidence() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("task-113-interpreter-missing-{}", process::id());
+    let spec = CaseSpec {
+        id: id.clone(),
+        repository: "local".to_owned(),
+        commit: "0".repeat(40),
+        license: "UNLICENSED".to_owned(),
+        source_dir: "target".to_owned(),
+        entrypoint: format!("target/{id}.js"),
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let error = bamts
+        .run_case(&spec, ExecutionMode::Interpreter)
+        .expect_err("a missing entrypoint must fail in interpreter mode");
+    let text = error.to_string();
+    assert!(
+        text.contains(&format!("case `{id}` failed in interpreter mode")),
+        "failure must name the case and interpreter mode: {text}"
+    );
+    assert!(
+        text.contains("stage=load"),
+        "a missing entrypoint must classify as load: {text}"
+    );
+    assert!(
+        text.contains("cannot read"),
+        "failure must carry the observed evidence: {text}"
     );
 }
 
@@ -348,10 +444,9 @@ fn compare_case(
 }
 
 fn bamts_outcome_stage(mode: ExecutionMode) -> CorpusStage {
-    if matches!(mode, ExecutionMode::Aot) {
-        CorpusStage::Spawn
-    } else {
-        CorpusStage::Evaluate
+    match mode {
+        ExecutionMode::Interpreter | ExecutionMode::Jit => CorpusStage::Evaluate,
+        ExecutionMode::Aot => CorpusStage::Spawn,
     }
 }
 

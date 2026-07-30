@@ -288,6 +288,8 @@ fn helper_address(helper: Helper) -> *const u8 {
         Helper::IteratorNext => bamts_native::bamts_iterator_next as *const u8,
         Helper::Export => bamts_native::bamts_export as *const u8,
         Helper::ConsumeFuel => bamts_native::bamts_consume_fuel as *const u8,
+        Helper::IteratorStep => bamts_native::bamts_iterator_step as *const u8,
+        Helper::IteratorResult => bamts_native::bamts_iterator_result as *const u8,
     }
 }
 

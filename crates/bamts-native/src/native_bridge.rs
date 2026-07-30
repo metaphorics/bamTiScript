@@ -1,4 +1,4 @@
-//! The native runtime bridge: the typed helper-call algebra, the exact 32
+//! The native runtime bridge: the typed helper-call algebra, the exact 34
 //! `bamts_*` C-ABI helper exports, the panic- and nesting-safe thread-local
 //! [`NativeOps`] dispatch seam, and the feature-gated JIT and AOT linkage
 //! surfaces.
@@ -37,10 +37,10 @@ use crate::{Completion, CompletionTag, ShadowFrame, Value};
 // -- The helper algebra ------------------------------------------------------
 
 /// The number of runtime helpers, `0..HELPER_COUNT`.
-pub const HELPER_COUNT: u32 = 32;
+pub const HELPER_COUNT: u32 = 34;
 
 /// A runtime helper, identified by its stable ABI index. The variant order is
-/// the canonical `external_index` order (0..31) and is byte-identical to
+/// the canonical `external_index` order (0..33) and is byte-identical to
 /// `bamts_codegen::Helper`; [`NativeHelper::symbol`] returns the exact linker
 /// symbol generated code resolves against.
 #[repr(u32)]
@@ -302,6 +302,22 @@ pub enum NativeHelper {
     /// handle range is disjoint from its header, and a live, aligned, writable
     /// `out`. Both remain valid and unaliased for the full call.
     CreateCell = 31,
+    /// # Safety
+    ///
+    /// The caller must provide a live, uniquely owned `frame` whose nonempty
+    /// handle range is disjoint from its header, and a live, aligned, writable
+    /// `out`. Both remain valid and unaliased for the full call.
+    ///
+    /// `bamts_iterator_step` — index 32 (raw, possibly-promised iterator result).
+    IteratorStep = 32,
+    /// # Safety
+    ///
+    /// The caller must provide a live, uniquely owned `frame` whose nonempty
+    /// handle range is disjoint from its header, and a live, aligned, writable
+    /// `out`. Both remain valid and unaliased for the full call.
+    ///
+    /// `bamts_iterator_result` — index 33 (writes two registers directly).
+    IteratorResult = 33,
 }
 
 impl NativeHelper {
@@ -348,6 +364,8 @@ impl NativeHelper {
             NativeHelper::Export => "bamts_export",
             NativeHelper::ConsumeFuel => "bamts_consume_fuel",
             NativeHelper::CreateCell => "bamts_create_cell",
+            NativeHelper::IteratorStep => "bamts_iterator_step",
+            NativeHelper::IteratorResult => "bamts_iterator_result",
         }
     }
 
@@ -394,6 +412,8 @@ impl NativeHelper {
             29 => Some(NativeHelper::Export),
             30 => Some(NativeHelper::ConsumeFuel),
             31 => Some(NativeHelper::CreateCell),
+            32 => Some(NativeHelper::IteratorStep),
+            33 => Some(NativeHelper::IteratorResult),
             _ => None,
         }
     }
@@ -495,6 +515,19 @@ pub enum HelperCall {
         done_reg: u32,
         value_reg: u32,
     },
+    /// Advance `iterator`, returning the raw iterator result object (possibly
+    /// a promise for an async iterator) as the completion value. `for await`
+    /// suspends on that result before [`HelperCall::IteratorResult`] reads it.
+    IteratorStep { iterator: Value },
+    /// Validate the iterator result object `result`, writing the done flag
+    /// into register `done_reg` and the produced value into register
+    /// `value_reg` (both via the frame). On `Throw`, the thrown handle is the
+    /// result value and neither register is written.
+    IteratorResult {
+        result: Value,
+        done_reg: u32,
+        value_reg: u32,
+    },
     /// Export local value `src` under string constant `name`.
     Export { name: u32, src: Value },
     /// Consume `amount` units from the shared instruction budget.
@@ -536,6 +569,8 @@ impl HelperCall {
             HelperCall::CreateRegExp { .. } => NativeHelper::CreateRegExp,
             HelperCall::GetIterator { .. } => NativeHelper::GetIterator,
             HelperCall::IteratorNext { .. } => NativeHelper::IteratorNext,
+            HelperCall::IteratorStep { .. } => NativeHelper::IteratorStep,
+            HelperCall::IteratorResult { .. } => NativeHelper::IteratorResult,
             HelperCall::Export { .. } => NativeHelper::Export,
             HelperCall::ConsumeFuel { .. } => NativeHelper::ConsumeFuel,
         }
@@ -899,7 +934,7 @@ fn dispatch_simple(frame: *mut ShadowFrame, out: *mut Completion, call: HelperCa
     })
 }
 
-// -- The exact 30 exported C-ABI helpers -------------------------------------
+// -- The exact 34 exported C-ABI helpers -------------------------------------
 //
 // Parameter order and widths mirror `bamts_codegen::Helper::param_types`
 // exactly: `frame` (pointer) first, `out` (pointer) last, runtime `Value`s as
@@ -1547,6 +1582,61 @@ pub unsafe extern "C" fn bamts_iterator_next(
 /// range is disjoint from its header, and a live, aligned, writable `out` when
 /// this helper has one. Both remain valid and unaliased for the full call.
 ///
+/// `bamts_iterator_step(frame, iterator, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_iterator_step(
+    frame: *mut ShadowFrame,
+    iterator: u64,
+    out: *mut Completion,
+) -> u32 {
+    dispatch_simple(
+        frame,
+        out,
+        HelperCall::IteratorStep {
+            iterator: Value::from_bits(iterator),
+        },
+    )
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out` when
+/// this helper has one. Both remain valid and unaliased for the full call.
+///
+/// `bamts_iterator_result(frame, result, done_reg, value_reg, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_iterator_result(
+    frame: *mut ShadowFrame,
+    result: u64,
+    done_reg: u32,
+    value_reg: u32,
+    out: *mut Completion,
+) -> u32 {
+    run_completion_helper(frame, out, |native_frame, ops| {
+        if done_reg >= native_frame.handle_len() || value_reg >= native_frame.handle_len() {
+            return HelperResult {
+                tag: CompletionTag::FatalTrap,
+                value: Value::int32(TRAP_INVALID_REGISTER),
+            };
+        }
+        ops.dispatch(
+            native_frame,
+            HelperCall::IteratorResult {
+                result: Value::from_bits(result),
+                done_reg,
+                value_reg,
+            },
+        )
+    })
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out` when
+/// this helper has one. Both remain valid and unaliased for the full call.
+///
 /// `bamts_export(frame, name, src, out)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bamts_export(
@@ -1616,6 +1706,10 @@ const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u32, u32, *mut Completion) 
     bamts_iterator_next; // 28
 const _: unsafe extern "C" fn(*mut ShadowFrame, u32, u64, *mut Completion) -> u32 = bamts_export; // 29
 const _: unsafe extern "C" fn(*mut ShadowFrame, u32, *mut Completion) -> u32 = bamts_consume_fuel; // 30
+const _: unsafe extern "C" fn(*mut ShadowFrame, *mut Completion) -> u32 = bamts_create_cell; // 31
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, *mut Completion) -> u32 = bamts_iterator_step; // 32
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u32, u32, *mut Completion) -> u32 =
+    bamts_iterator_result; // 33
 
 // -- Native entry invocation seam --------------------------------------------
 
@@ -2164,6 +2258,18 @@ mod tests {
     ) -> u32 {
         unsafe { super::bamts_iterator_next(f, i, d, v, o) }
     }
+    fn test_bamts_iterator_step(f: *mut ShadowFrame, i: u64, o: *mut Completion) -> u32 {
+        unsafe { super::bamts_iterator_step(f, i, o) }
+    }
+    fn test_bamts_iterator_result(
+        f: *mut ShadowFrame,
+        r: u64,
+        d: u32,
+        v: u32,
+        o: *mut Completion,
+    ) -> u32 {
+        unsafe { super::bamts_iterator_result(f, r, d, v, o) }
+    }
     fn test_bamts_create_object(f: *mut ShadowFrame, o: *mut Completion) -> u32 {
         unsafe { super::bamts_create_object(f, o) }
     }
@@ -2187,7 +2293,7 @@ mod tests {
     /// this helper has one. Both remain valid and unaliased for the full call.
     ///
     /// `bamts_codegen::Helper::{external_index, symbol}`.
-    const CODEGEN_HELPERS: [(u32, &str); 32] = [
+    const CODEGEN_HELPERS: [(u32, &str); 34] = [
         (0, "bamts_load_constant"),
         (1, "bamts_unary"),
         (2, "bamts_binary"),
@@ -2220,6 +2326,8 @@ mod tests {
         (29, "bamts_export"),
         (30, "bamts_consume_fuel"),
         (31, "bamts_create_cell"),
+        (32, "bamts_iterator_step"),
+        (33, "bamts_iterator_result"),
     ];
 
     /// A recording dispatcher: captures the last call and returns a fixed
@@ -2252,6 +2360,11 @@ mod tests {
         fn dispatch(&self, frame: &mut NativeFrame<'_>, call: HelperCall) -> HelperResult {
             self.last.set(Some(call));
             if let HelperCall::IteratorNext {
+                done_reg,
+                value_reg,
+                ..
+            }
+            | HelperCall::IteratorResult {
                 done_reg,
                 value_reg,
                 ..
@@ -2392,6 +2505,22 @@ mod tests {
             NativeHelper::ConsumeFuel
         );
         assert_eq!(HelperCall::CreateCell.helper(), NativeHelper::CreateCell);
+        assert_eq!(
+            HelperCall::IteratorStep {
+                iterator: Value::NULL,
+            }
+            .helper(),
+            NativeHelper::IteratorStep
+        );
+        assert_eq!(
+            HelperCall::IteratorResult {
+                result: Value::NULL,
+                done_reg: 0,
+                value_reg: 1,
+            }
+            .helper(),
+            NativeHelper::IteratorResult
+        );
     }
 
     #[test]
@@ -2809,6 +2938,62 @@ mod tests {
             test_bamts_load_global(&mut frame, 0, core::ptr::null_mut())
         });
         assert_eq!(tag, CompletionTag::FatalTrap.as_u32());
+    }
+
+    #[test]
+    fn iterator_step_wrapper_dispatches_the_raw_result_call() {
+        let mut regs = [Value::UNINITIALIZED; 1];
+        let mut frame = frame_with(&mut regs);
+        let mut completion = Completion::new(Value::UNDEFINED);
+        let mut ops = Recorder::normal(Value::int32(7));
+        let tag = with_native_ops(&mut ops, || {
+            test_bamts_iterator_step(&mut frame, Value::NULL.to_bits(), &mut completion)
+        });
+        assert_eq!(tag, CompletionTag::Normal.as_u32());
+        assert_eq!(completion.value.as_int32(), Some(7));
+        assert_eq!(
+            ops.last.get(),
+            Some(HelperCall::IteratorStep {
+                iterator: Value::NULL,
+            })
+        );
+    }
+
+    #[test]
+    fn iterator_result_writes_both_registers() {
+        let mut regs = [Value::UNINITIALIZED; 2];
+        let mut frame = frame_with(&mut regs);
+        let mut completion = Completion::new(Value::UNDEFINED);
+        let mut ops = Recorder::normal(Value::UNDEFINED);
+        let tag = with_native_ops(&mut ops, || {
+            test_bamts_iterator_result(&mut frame, Value::NULL.to_bits(), 0, 1, &mut completion)
+        });
+        assert_eq!(tag, CompletionTag::Normal.as_u32());
+        assert_eq!(regs[0], Value::TRUE);
+        assert_eq!(regs[1], Value::int32(9));
+        assert_eq!(
+            ops.last.get(),
+            Some(HelperCall::IteratorResult {
+                result: Value::NULL,
+                done_reg: 0,
+                value_reg: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn iterator_result_out_of_range_register_is_fatal_trap() {
+        let mut regs = [Value::UNINITIALIZED; 1];
+        let mut frame = frame_with(&mut regs);
+        let mut completion = Completion::new(Value::UNDEFINED);
+        let mut ops = Recorder::normal(Value::UNDEFINED);
+        let tag = with_native_ops(&mut ops, || {
+            test_bamts_iterator_result(&mut frame, Value::NULL.to_bits(), 99, 0, &mut completion)
+        });
+        assert_eq!(tag, CompletionTag::FatalTrap.as_u32());
+        assert_eq!(completion.value.as_int32(), Some(TRAP_INVALID_REGISTER));
+        // The dispatcher was never reached, so no register was mutated.
+        assert_eq!(regs[0], Value::UNINITIALIZED);
     }
 
     #[test]

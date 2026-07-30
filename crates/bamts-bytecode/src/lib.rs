@@ -49,8 +49,12 @@
 //!   class prototype chains incrementally.
 //! * **Iteration protocol.** [`Instruction::GetIterator`] (with a closed
 //!   [`IteratorKind`]) and the two-write [`Instruction::IteratorNext`] model
-//!   `for`/`of`, `for`/`await`/`of`, `for`/`in`, destructuring, and array/call
-//!   spread against the ECMAScript iterator protocol.
+//!   `for`/`of`, `for`/`in`, destructuring, and array/call spread against the
+//!   ECMAScript iterator protocol. `for`/`await`/`of` splits the step across
+//!   [`Instruction::IteratorStep`] (acquire the raw, possibly-promised
+//!   iterator result), [`Instruction::Await`] (suspend until it settles), and
+//!   the two-write [`Instruction::IteratorResult`] (validate the settled
+//!   object and read `done`/`value`).
 //! * **Environment access.** [`Instruction::LoadGlobal`],
 //!   [`Instruction::StoreGlobal`], [`Instruction::TypeOfGlobal`] (the last
 //!   models `typeof g` without throwing on an undeclared global),
@@ -65,20 +69,23 @@
 //!
 //! ## Resume contract (async / generators)
 //!
-//! [`Instruction::Suspend`] `{ dst, src, resume }` is the single suspension
-//! primitive; [`FunctionFlags::is_async`] and [`FunctionFlags::is_generator`]
-//! select *how* a suspension is driven, but the wire form is identical:
+//! Two suspension primitives share one wire and CFG shape
+//! (`{ dst, src, resume }`): [`Instruction::Suspend`] is the `yield` form
+//! (including delegated `yield*`) and [`Instruction::Await`] is the `await`
+//! form, so an async-generator body can tell its two suspension kinds apart.
+//! [`FunctionFlags::is_async`] and [`FunctionFlags::is_generator`] select *how*
+//! a suspension is driven, but the contract is identical for both opcodes:
 //!
 //! 1. The activation yields the value in `src` (a produced item for a
-//!    generator; an awaited operand for an async function) to its driver.
+//!    generator `yield`; an awaited operand for `await`) to its driver.
 //! 2. When the driver resumes the activation, control continues at `resume`
 //!    with the resumed value written to `dst` (the argument of `.next(v)` for a
 //!    generator; the settled result of the awaited value for `await`).
-//! 3. `resume` is a normal CFG successor and the only successor of `Suspend`, so
-//!    the definite-initialization witness treats every register live across a
-//!    suspension as it would across any join: `dst` is initialized on the
-//!    resume edge, and registers not provably initialized before the suspension
-//!    are not assumed initialized after it.
+//! 3. `resume` is a normal CFG successor and the only successor of either
+//!    suspension opcode, so the definite-initialization witness treats every
+//!    register live across a suspension as it would across any join: `dst` is
+//!    initialized on the resume edge, and registers not provably initialized
+//!    before the suspension are not assumed initialized after it.
 //!
 //! A generator's completion is an ordinary [`Instruction::Return`]; an uncaught
 //! throw during drive routes to an enclosing [`ExceptionHandler`] exactly as in
@@ -103,7 +110,7 @@ use std::marker::PhantomData;
 /// `BMTBC\0\0\1`, matching `Bamti.Bytecode.magicBytes`.
 pub const MAGIC: [u8; 8] = [66, 77, 84, 66, 67, 0, 0, 1];
 /// The sole supported wire version.
-pub const FORMAT_VERSION: u8 = 3;
+pub const FORMAT_VERSION: u8 = 4;
 
 /// Structural verify-time ceiling on a function's register count. Generous
 /// enough for real code yet bounds definite-initialization bitset allocation.
@@ -587,6 +594,20 @@ pub enum Instruction {
         value: Register,
         iterator: Register,
     },
+    /// Advance `iterator` one step, writing the raw iterator result -- the
+    /// object its `next` method returns, possibly a promise for an async
+    /// iterator -- to `dst`. `for await` splits the step this way so it can
+    /// suspend on the raw result with [`Instruction::Await`] before reading
+    /// `done`/`value` via [`Instruction::IteratorResult`].
+    IteratorStep { dst: Register, iterator: Register },
+    /// Validate the iterator result object in `result`: write whether
+    /// iteration is done to `done` and the produced value to `value` (two
+    /// writes), exactly as [`Instruction::IteratorNext`] reports them.
+    IteratorResult {
+        done: Register,
+        value: Register,
+        result: Register,
+    },
     /// Unconditional control transfer (identical to the formal `Jump`).
     Jump { target: Pc },
     /// Branch to `target` when `condition` is truthy, else fall through.
@@ -597,9 +618,20 @@ pub enum Instruction {
     Return { value: Register },
     /// Throw `value` (terminator; caught by an enclosing handler if any).
     Throw { value: Register },
-    /// Yield `src` and resume at `resume`, receiving the resumed value in `dst`
-    /// (refines the formal `Suspend`). See the module-level resume contract.
+    /// Yield `src` (the `yield` form, including delegated `yield*`) and resume
+    /// at `resume`, receiving the resumed value in `dst` (refines the formal
+    /// `Suspend`). See the module-level resume contract.
     Suspend {
+        dst: Register,
+        src: Register,
+        resume: Pc,
+    },
+    /// Await the operand in `src` and resume at `resume`, receiving the
+    /// settled value in `dst`. Identical register and CFG shape to
+    /// [`Instruction::Suspend`], which remains the `yield` form; keeping the
+    /// opcodes distinct lets an async-generator body tell `await` from
+    /// `yield`. See the module-level resume contract.
+    Await {
         dst: Register,
         src: Register,
         resume: Pc,
@@ -679,14 +711,17 @@ impl Instruction {
                 visit(prototype);
             }
             Self::GetIterator { src, .. } => visit(src),
-            Self::IteratorNext { iterator, .. } => visit(iterator),
+            Self::IteratorNext { iterator, .. } | Self::IteratorStep { iterator, .. } => {
+                visit(iterator);
+            }
+            Self::IteratorResult { result, .. } => visit(result),
             Self::JumpIfTrue { condition, .. } | Self::JumpIfFalse { condition, .. } => {
                 visit(condition);
             }
             Self::Return { value } | Self::Throw { value } | Self::Export { src: value, .. } => {
                 visit(value);
             }
-            Self::Suspend { src, .. } => visit(src),
+            Self::Suspend { src, .. } | Self::Await { src, .. } => visit(src),
             Self::LoadConst { .. }
             | Self::CreateObject { .. }
             | Self::CreateArray { .. }
@@ -705,7 +740,8 @@ impl Instruction {
     }
 
     /// Visits each register this instruction defines: zero, one, or two.
-    /// [`Instruction::IteratorNext`] is the sole two-write opcode.
+    /// [`Instruction::IteratorNext`] and [`Instruction::IteratorResult`] are
+    /// the two-write opcodes.
     fn visit_writes(self, mut visit: impl FnMut(Register)) {
         match self {
             Self::LoadConst { dst, .. }
@@ -728,9 +764,11 @@ impl Instruction {
             | Self::CreatePrivateName { dst, .. }
             | Self::CreateRegExp { dst, .. }
             | Self::GetIterator { dst, .. }
+            | Self::IteratorStep { dst, .. }
             | Self::Suspend { dst, .. }
+            | Self::Await { dst, .. }
             | Self::Import { dst, .. } => visit(dst),
-            Self::IteratorNext { done, value, .. } => {
+            Self::IteratorNext { done, value, .. } | Self::IteratorResult { done, value, .. } => {
                 visit(done);
                 visit(value);
             }
@@ -761,7 +799,7 @@ impl Instruction {
                 visit(target);
                 visit(Pc::new(pc + 1));
             }
-            Self::Suspend { resume, .. } => visit(resume),
+            Self::Suspend { resume, .. } | Self::Await { resume, .. } => visit(resume),
             Self::Return { .. } | Self::Throw { .. } | Self::Halt => {}
             Self::LoadConst { .. }
             | Self::Move { .. }
@@ -791,6 +829,8 @@ impl Instruction {
             | Self::CreateRegExp { .. }
             | Self::GetIterator { .. }
             | Self::IteratorNext { .. }
+            | Self::IteratorStep { .. }
+            | Self::IteratorResult { .. }
             | Self::Import { .. }
             | Self::Export { .. } => visit(Pc::new(pc + 1)),
         }
@@ -1793,6 +1833,19 @@ fn verify_instruction(
             check_register(value)?;
             check_register(iterator)?;
         }
+        Instruction::IteratorStep { dst, iterator } => {
+            check_register(dst)?;
+            check_register(iterator)?;
+        }
+        Instruction::IteratorResult {
+            done,
+            value,
+            result,
+        } => {
+            check_register(done)?;
+            check_register(value)?;
+            check_register(result)?;
+        }
         Instruction::Jump { target } => verify_target(function_index, pc, target, code_len)?,
         Instruction::JumpIfTrue { condition, target }
         | Instruction::JumpIfFalse { condition, target } => {
@@ -1800,7 +1853,7 @@ fn verify_instruction(
             verify_target(function_index, pc, target, code_len)?;
         }
         Instruction::Return { value } | Instruction::Throw { value } => check_register(value)?,
-        Instruction::Suspend { dst, src, resume } => {
+        Instruction::Suspend { dst, src, resume } | Instruction::Await { dst, src, resume } => {
             check_register(dst)?;
             check_register(src)?;
             verify_target(function_index, pc, resume, code_len)?;
@@ -2435,6 +2488,20 @@ impl<'a> Decoder<'a> {
             36 => Ok(Instruction::CreateCell {
                 dst: Register::new(self.leb128()?),
             }),
+            37 => Ok(Instruction::Await {
+                dst: Register::new(self.leb128()?),
+                src: Register::new(self.leb128()?),
+                resume: Pc::new(self.leb128()?),
+            }),
+            38 => Ok(Instruction::IteratorStep {
+                dst: Register::new(self.leb128()?),
+                iterator: Register::new(self.leb128()?),
+            }),
+            39 => Ok(Instruction::IteratorResult {
+                done: Register::new(self.leb128()?),
+                value: Register::new(self.leb128()?),
+                result: Register::new(self.leb128()?),
+            }),
             opcode => Err(self.error(opcode_at, DecodeErrorKind::InvalidOpcode { opcode })),
         }
     }
@@ -2842,6 +2909,27 @@ fn encode_instruction(instruction: Instruction, output: &mut Vec<u8>) {
             output.push(36);
             write_u32(dst.get(), output);
         }
+        Instruction::Await { dst, src, resume } => {
+            output.push(37);
+            write_u32(dst.get(), output);
+            write_u32(src.get(), output);
+            write_u32(resume.get(), output);
+        }
+        Instruction::IteratorStep { dst, iterator } => {
+            output.push(38);
+            write_u32(dst.get(), output);
+            write_u32(iterator.get(), output);
+        }
+        Instruction::IteratorResult {
+            done,
+            value,
+            result,
+        } => {
+            output.push(39);
+            write_u32(done.get(), output);
+            write_u32(value.get(), output);
+            write_u32(result.get(), output);
+        }
     }
 }
 
@@ -3076,7 +3164,7 @@ mod tests {
 
     /// Every opcode variant survives an encode -> decode round-trip at the
     /// instruction level, independent of CFG/reference validity. This pins the
-    /// wire tag and field order for all 37 opcodes.
+    /// wire tag and field order for all 40 opcodes.
     #[test]
     fn every_opcode_round_trips_on_the_wire() {
         let instructions = [
@@ -3232,8 +3320,22 @@ mod tests {
             Instruction::CreateCell {
                 dst: Register::new(75),
             },
+            Instruction::Await {
+                dst: Register::new(76),
+                src: Register::new(77),
+                resume: Pc::new(78),
+            },
+            Instruction::IteratorStep {
+                dst: Register::new(79),
+                iterator: Register::new(80),
+            },
+            Instruction::IteratorResult {
+                done: Register::new(81),
+                value: Register::new(82),
+                result: Register::new(83),
+            },
         ];
-        assert_eq!(instructions.len(), 37, "one case per opcode");
+        assert_eq!(instructions.len(), 40, "one case per opcode");
         let limits = DecodeLimits::default();
         for (opcode, instruction) in instructions.into_iter().enumerate() {
             let mut bytes = Vec::new();
@@ -3474,12 +3576,12 @@ mod tests {
             })
         );
         let mut bad_version = MAGIC.to_vec();
-        bad_version.push(1);
+        bad_version.push(3);
         assert_eq!(
             decode(&bad_version, &DecodeLimits::default()),
             Err(DecodeError {
                 offset: 8,
-                kind: DecodeErrorKind::UnsupportedVersion { version: 1 },
+                kind: DecodeErrorKind::UnsupportedVersion { version: 3 },
             })
         );
     }
@@ -4370,6 +4472,148 @@ mod tests {
         );
         assert_eq!(
             certificate.initialized_before(Pc::new(3), Register::new(3)),
+            Some(true)
+        );
+    }
+
+    /// `Await` shares `Suspend`'s CFG and definite-initialization shape:
+    /// `resume` is its only successor, `dst` is initialized on the resume
+    /// edge, and no other register gains initialization across the suspension.
+    #[test]
+    fn await_has_the_suspend_cfg_and_dataflow_shape() {
+        let module = Module::new(
+            vec![Constant::Int32(0)],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                3,
+                flags(),
+                vec![
+                    Instruction::LoadConst {
+                        dst: Register::new(0),
+                        constant: ConstantId::new(0),
+                    },
+                    Instruction::Await {
+                        dst: Register::new(1),
+                        src: Register::new(0),
+                        resume: Pc::new(2),
+                    },
+                    Instruction::Return {
+                        value: Register::new(1),
+                    },
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        let verified = module.verify().expect("await verifies like suspend");
+        let certificate = verified.certificate(FunctionId::new(0)).unwrap();
+        assert_eq!(
+            certificate.initialized_before(Pc::new(1), Register::new(1)),
+            Some(false),
+            "dst is not initialized before the await"
+        );
+        assert_eq!(
+            certificate.initialized_before(Pc::new(2), Register::new(1)),
+            Some(true),
+            "dst is initialized on the resume edge"
+        );
+        assert_eq!(
+            certificate.initialized_before(Pc::new(2), Register::new(2)),
+            Some(false),
+            "no other register gains initialization across the await"
+        );
+    }
+
+    /// An awaited operand must itself be definitely initialized: reading an
+    /// unwritten register as `src` is a read-before-write error.
+    #[test]
+    fn await_rejects_an_uninitialized_operand() {
+        let module = Module::new(
+            vec![],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                2,
+                flags(),
+                vec![
+                    Instruction::Await {
+                        dst: Register::new(1),
+                        src: Register::new(0),
+                        resume: Pc::new(1),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        assert!(module.verify().is_err());
+    }
+
+    /// The split async-iteration pair: `IteratorStep` initializes its raw
+    /// result register, and `IteratorResult` initializes both `done` and
+    /// `value`, so the settled object can be read between the two.
+    #[test]
+    fn iterator_step_and_result_initialize_their_writes() {
+        let module = Module::new(
+            vec![Constant::Int32(0)],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                6,
+                flags(),
+                vec![
+                    Instruction::LoadConst {
+                        dst: Register::new(0),
+                        constant: ConstantId::new(0),
+                    },
+                    Instruction::GetIterator {
+                        dst: Register::new(1),
+                        src: Register::new(0),
+                        kind: IteratorKind::Async,
+                    },
+                    Instruction::IteratorStep {
+                        dst: Register::new(2),
+                        iterator: Register::new(1),
+                    },
+                    Instruction::IteratorResult {
+                        done: Register::new(3),
+                        value: Register::new(4),
+                        result: Register::new(2),
+                    },
+                    // Read BOTH results: sound only because IteratorResult
+                    // defines two registers.
+                    Instruction::Binary {
+                        dst: Register::new(5),
+                        op: BinaryOp::StrictEqual,
+                        left: Register::new(3),
+                        right: Register::new(4),
+                    },
+                    Instruction::Return {
+                        value: Register::new(5),
+                    },
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        let verified = module.verify().expect("split-step dataflow verifies");
+        let certificate = verified.certificate(FunctionId::new(0)).unwrap();
+        assert_eq!(
+            certificate.initialized_before(Pc::new(3), Register::new(2)),
+            Some(true),
+            "the raw result is initialized before IteratorResult reads it"
+        );
+        assert_eq!(
+            certificate.initialized_before(Pc::new(4), Register::new(3)),
+            Some(true)
+        );
+        assert_eq!(
+            certificate.initialized_before(Pc::new(4), Register::new(4)),
             Some(true)
         );
     }

@@ -12,8 +12,9 @@
 //! property access, non-empty arrays and spread, iteration (`for`/`of`,
 //! `for`/`in`, `for await`), destructuring, template literals, regular
 //! expressions, globals, closures, classes with prototypes/accessors/private
-//! names, `this`/`arguments`/`new.target`, generators and async via
-//! [`Instruction::Suspend`], and module exports.
+//! names, `this`/`arguments`/`new.target`, generators via
+//! [`Instruction::Suspend`], async via [`Instruction::Await`], and module
+//! exports.
 //!
 //! No runtime construct that the instruction set can model is silently
 //! approximated. The handful of forms that remain genuinely inexpressible in
@@ -1663,7 +1664,10 @@ impl<'a> FunctionContext<'a> {
     }
 
     /// Shared iterator-driven loop for `for`/`of`, `for`/`in`, and
-    /// `for await`/`of`.
+    /// `for await`/`of`. Async iteration splits each step into
+    /// [`Instruction::IteratorStep`] → [`Instruction::Await`] →
+    /// [`Instruction::IteratorResult`]; sync loops keep the fused
+    /// [`Instruction::IteratorNext`].
     fn lower_iteration(
         &mut self,
         builder: &mut ModuleBuilder,
@@ -1698,14 +1702,39 @@ impl<'a> FunctionContext<'a> {
         let done = self.alloc_register(range)?;
         let value = self.alloc_register(range)?;
         let head = self.next_pc();
-        self.emit(
-            range,
-            Instruction::IteratorNext {
-                done,
-                value,
-                iterator,
-            },
-        )?;
+        if kind == IteratorKind::Async {
+            // `for await`: step the async iterator to its raw (thenable)
+            // result, suspend until it settles, then read `done`/`value` from
+            // the settled iterator result object. The awaited register is
+            // defined by `Await` on the resume edge, which is exactly the
+            // fall-through pc `IteratorResult` executes at.
+            let step = self.alloc_register(range)?;
+            self.emit(
+                range,
+                Instruction::IteratorStep {
+                    dst: step,
+                    iterator,
+                },
+            )?;
+            let settled = self.emit_await(range, step)?;
+            self.emit(
+                range,
+                Instruction::IteratorResult {
+                    done,
+                    value,
+                    result: settled,
+                },
+            )?;
+        } else {
+            self.emit(
+                range,
+                Instruction::IteratorNext {
+                    done,
+                    value,
+                    iterator,
+                },
+            )?;
+        }
         let exit_jump = self.emit(
             range,
             Instruction::JumpIfTrue {
@@ -2317,10 +2346,10 @@ impl<'a> FunctionContext<'a> {
                 self.read_name(builder, &name, range)
             }
             Expression::This => self.this_value(range),
+            // Derived constructors lower their direct `super(...)` call with
+            // the captured parent and existing receiver.
             Expression::Super => {
-                // Derived constructors handle their one supported `super(...)`
-                // call directly so it uses the captured parent and existing receiver.
-                return Err(self.unsupported(range, UnsupportedConstruct::DerivedConstructorShape));
+                Err(self.unsupported(range, UnsupportedConstruct::DerivedConstructorShape))
             }
             Expression::Literal(literal) => self.lower_literal(builder, range, literal),
             Expression::Template(template) => self.lower_template(builder, range, template),
@@ -2862,7 +2891,9 @@ impl<'a> FunctionContext<'a> {
         }
     }
 
-    /// `await x` suspends on `x` and resumes with the settled value in `dst`.
+    /// `await x` suspends on `x` ([`Instruction::Await`], distinct from the
+    /// `yield` form's [`Instruction::Suspend`]) and resumes with the settled
+    /// value in `dst`.
     fn lower_await(
         &mut self,
         builder: &mut ModuleBuilder,
@@ -2870,7 +2901,7 @@ impl<'a> FunctionContext<'a> {
         await_expression: &AwaitExpression,
     ) -> Result<Register, LowerError> {
         let src = self.lower_expression(builder, &await_expression.argument)?;
-        self.emit_suspend(range, src)
+        self.emit_await(range, src)
     }
 
     /// `yield x` yields `x` and resumes with the `.next(v)` value in `dst`;
@@ -2943,12 +2974,22 @@ impl<'a> FunctionContext<'a> {
         Ok(result)
     }
 
-    /// Emits a suspension yielding `src`, returning the register that receives
-    /// the resumed value.
+    /// Emits a `yield` suspension producing `src`, returning the register that
+    /// receives the resumed value.
     fn emit_suspend(&mut self, range: TextRange, src: Register) -> Result<Register, LowerError> {
         let dst = self.alloc_register(range)?;
         let resume = Pc::new(self.code.len() as u32 + 1);
         self.emit(range, Instruction::Suspend { dst, src, resume })?;
+        Ok(dst)
+    }
+
+    /// Emits an `await` suspension on `src`, returning the register that
+    /// receives the settled value. Distinct from [`Self::emit_suspend`] so an
+    /// async-generator body keeps `await` and `yield` apart.
+    fn emit_await(&mut self, range: TextRange, src: Register) -> Result<Register, LowerError> {
+        let dst = self.alloc_register(range)?;
+        let resume = Pc::new(self.code.len() as u32 + 1);
+        self.emit(range, Instruction::Await { dst, src, resume })?;
         Ok(dst)
     }
 
@@ -5066,13 +5107,12 @@ impl<'a> FunctionContext<'a> {
                 && let Expression::Call(call) = expression.expression.data()
                 && !call.optional
                 && matches!(call.callee.data(), Expression::Super)
+                && direct.replace(index).is_some()
             {
-                if direct.replace(index).is_some() {
-                    return Err(self.unsupported(
-                        statement.range(),
-                        UnsupportedConstruct::DerivedConstructorShape,
-                    ));
-                }
+                return Err(self.unsupported(
+                    statement.range(),
+                    UnsupportedConstruct::DerivedConstructorShape,
+                ));
             }
         }
         let Some(index) = direct else {
@@ -7922,10 +7962,14 @@ mod tests {
             i,
             Instruction::Suspend { .. }
         )));
+        assert!(
+            !any_instruction(&module, |i| matches!(i, Instruction::Await { .. })),
+            "yield never emits the await opcode"
+        );
     }
 
     #[test]
-    fn async_await_suspends() {
+    fn async_await_uses_the_await_opcode() {
         let module = lower_js("async function f(p: any) { return await p; }");
         assert!(
             module
@@ -7935,8 +7979,55 @@ mod tests {
         );
         assert!(any_instruction(&module, |i| matches!(
             i,
-            Instruction::Suspend { .. }
+            Instruction::Await { .. }
         )));
+        assert!(
+            !any_instruction(&module, |i| matches!(i, Instruction::Suspend { .. })),
+            "await never emits the yield opcode"
+        );
+        assert_round_trips(&module);
+    }
+
+    #[test]
+    fn async_generator_distinguishes_await_from_yield() {
+        let module = lower_js("async function* g(p: any) { const v = await p; yield v; }");
+        assert!(
+            module
+                .functions()
+                .iter()
+                .any(|function| function.flags().is_async && function.flags().is_generator)
+        );
+        assert!(
+            any_instruction(&module, |i| matches!(i, Instruction::Await { .. })),
+            "the await operand suspends with Await"
+        );
+        assert!(
+            any_instruction(&module, |i| matches!(i, Instruction::Suspend { .. })),
+            "the produced item yields with Suspend"
+        );
+        assert_round_trips(&module);
+    }
+
+    #[test]
+    fn for_await_splits_step_await_result() {
+        let module = lower_js("async function f(xs: any) { for await (const v of xs) { v; } }");
+        assert!(
+            any_instruction(&module, |i| matches!(i, Instruction::IteratorStep { .. })),
+            "the async iterator is stepped for its raw result"
+        );
+        assert!(
+            any_instruction(&module, |i| matches!(i, Instruction::Await { .. })),
+            "the raw iterator result is awaited"
+        );
+        assert!(
+            any_instruction(&module, |i| matches!(i, Instruction::IteratorResult { .. })),
+            "the settled iterator result yields done/value"
+        );
+        assert!(
+            !any_instruction(&module, |i| matches!(i, Instruction::IteratorNext { .. })),
+            "async loops never use the fused sync step"
+        );
+        assert_round_trips(&module);
     }
 
     #[test]

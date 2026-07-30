@@ -496,7 +496,10 @@ mod tests {
         ] {
             let regexp = construct_regexp(&mut machine, pattern, "");
             let source_value = machine.get_named_property(regexp, "source").unwrap();
-            assert_eq!(machine.to_string(source_value).unwrap(), EcmaString::from_utf8(source));
+            assert_eq!(
+                machine.to_string(source_value).unwrap(),
+                EcmaString::from_utf8(source)
+            );
 
             let BuiltinOutcome::Value(string_value) =
                 to_string(&mut machine, regexp, &[], false).unwrap()
