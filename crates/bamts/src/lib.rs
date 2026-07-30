@@ -353,6 +353,43 @@ mod tests {
         Ok((stdout, drain))
     }
 
+    #[cfg(feature = "node-host")]
+    struct TimerCheckpoint {
+        stdout: Vec<u8>,
+        waited: bool,
+        timer: bamts_runtime::TimerRun,
+        before_timer: bamts_runtime::MicrotaskDrain,
+        after_timer: bamts_runtime::MicrotaskDrain,
+    }
+
+    #[cfg(feature = "node-host")]
+    fn run_timer_checkpoint(name: &str, source: &str) -> Result<TimerCheckpoint, Box<dyn Error>> {
+        let (directory, entrypoint) = script_fixture(name, source)?;
+        let executable = compile_source_file(&entrypoint)?;
+        let mut host = bamts_node::NodeHost::new();
+        host.set_script_compiler(Box::new(super::ScriptCompiler));
+        let mut machine = bamts_runtime::Machine::new(
+            executable.wire(),
+            &mut host,
+            bamts_runtime::Limits::default(),
+        );
+        machine.evaluate()?;
+        let before_timer = machine.drain_microtasks()?;
+        let waited = machine.wait_for_timer_expiry()?;
+        let timer = machine.run_one_expired_timer()?;
+        let after_timer = machine.drain_microtasks()?;
+        drop(machine);
+        let stdout = host.stdout().to_vec();
+        remove_fixture(&directory)?;
+        Ok(TimerCheckpoint {
+            stdout,
+            waited,
+            timer,
+            before_timer,
+            after_timer,
+        })
+    }
+
     #[test]
     fn compiles_complete_program_with_module_local_function_ids() -> Result<(), Box<dyn Error>> {
         let (directory, entrypoint) = fixture("compile")?;
@@ -725,6 +762,108 @@ mod tests {
         );
         assert_eq!(output.exit_code, 0);
         remove_fixture(&directory)
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn async_await_resumes_in_node_microtask_order() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            const seen: string[] = [];
+            async function run() {
+                seen.push("start");
+                await Promise.resolve();
+                seen.push("A");
+            }
+            run();
+            Promise.resolve()
+                .then(() => { seen.push("B1"); })
+                .then(() => { seen.push("B2"); })
+                .then(() => { process.stdout.write(seen.join(",") + "\n"); });
+        "#;
+        let (stdout, drain) = run_microtask_checkpoint("async-order", source)?;
+        assert!(drain.executed >= 4);
+        assert!(drain.uncaught.is_empty());
+        assert_eq!(stdout, b"start,A,B1,B2\n");
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn async_function_awaits_a_timeout_at_explicit_checkpoints() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            async function run() {
+                const value = await new Promise(resolve => {
+                    const handle = setTimeout(function (value) {
+                        process.stdout.write(String(this === handle) + "|");
+                        resolve(value);
+                    }, 1, 42);
+                });
+                process.stdout.write(String(value) + "\n");
+            }
+            run();
+        "#;
+        let checkpoint = run_timer_checkpoint("async-timeout", source)?;
+        assert!(checkpoint.waited);
+        assert_eq!(checkpoint.timer.executed, 1);
+        assert!(checkpoint.timer.uncaught.is_empty());
+        assert!(checkpoint.before_timer.uncaught.is_empty());
+        assert!(checkpoint.after_timer.executed > 0);
+        assert!(checkpoint.after_timer.uncaught.is_empty());
+        assert_eq!(checkpoint.stdout, b"true|42\n");
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn clear_timeout_suppresses_only_its_own_callback() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            const canceled = setTimeout(() => {
+                process.stdout.write("canceled\n");
+            }, 1);
+            clearTimeout(canceled);
+            setTimeout(() => {
+                process.stdout.write("kept\n");
+            }, 1);
+        "#;
+        let checkpoint = run_timer_checkpoint("clear-timeout", source)?;
+        assert!(checkpoint.waited);
+        assert_eq!(checkpoint.timer.executed, 1);
+        assert!(checkpoint.timer.uncaught.is_empty());
+        assert!(checkpoint.before_timer.uncaught.is_empty());
+        assert!(checkpoint.after_timer.uncaught.is_empty());
+        assert_eq!(checkpoint.stdout, b"kept\n");
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn rejected_await_enters_its_catch_and_preserves_later_resumes() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            async function caught() {
+                try {
+                    await Promise.reject(7);
+                    process.stdout.write("missed\n");
+                } catch (reason) {
+                    process.stdout.write("caught:" + reason + "\n");
+                }
+                let total = 1 + await Promise.resolve(2);
+                return total + await Promise.resolve(3);
+            }
+            async function uncaught() {
+                await Promise.reject(8);
+            }
+            caught().then(value => {
+                process.stdout.write("return:" + value + "\n");
+            });
+            uncaught().catch(reason => {
+                process.stdout.write("uncaught:" + reason + "\n");
+            });
+        "#;
+        let (stdout, drain) = run_microtask_checkpoint("async-rejection", source)?;
+        assert!(drain.executed >= 6);
+        assert!(drain.uncaught.is_empty());
+        assert_eq!(stdout, b"caught:7\nuncaught:8\nreturn:6\n");
+        Ok(())
     }
 
     #[cfg(feature = "aot")]

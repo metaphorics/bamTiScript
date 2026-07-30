@@ -340,7 +340,8 @@ impl<H: Host> Machine<'_, H> {
                     | HeapEntry::BuiltinIterator { properties, .. }
                     | HeapEntry::Collection { properties, .. }
                     | HeapEntry::Generator { properties, .. }
-                    | HeapEntry::Promise { properties, .. } => {
+                    | HeapEntry::Promise { properties, .. }
+                    | HeapEntry::Timeout { properties, .. } => {
                         if depth >= 2 {
                             return Ok("[Object]".to_owned());
                         }
@@ -381,6 +382,7 @@ impl<H: Host> Machine<'_, H> {
                     | HeapEntry::PromiseResolver { .. }
                     | HeapEntry::PromiseFinally { .. }
                     | HeapEntry::PromiseAll { .. }
+                    | HeapEntry::AsyncActivation { .. }
                     | HeapEntry::PromiseAllElement { .. } => Ok("{}".to_owned()),
                 }
             }

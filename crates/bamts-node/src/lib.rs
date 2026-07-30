@@ -2,6 +2,8 @@
 
 #![deny(unsafe_code)]
 
+mod timers;
+
 use std::collections::BTreeMap;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -77,6 +79,7 @@ pub struct NodeHost {
     started: Instant,
     random_state: u64,
     compiler: Option<Box<dyn bamts_runtime::CompileProvider>>,
+    timers: timers::NodeTimers,
 }
 
 impl Default for NodeHost {
@@ -97,6 +100,7 @@ impl NodeHost {
             started: Instant::now(),
             random_state: 0x6a09_e667_f3bc_c909,
             compiler: None,
+            timers: timers::NodeTimers::new(),
         }
     }
 
@@ -199,6 +203,10 @@ impl Host for NodeHost {
 
     fn script_compiler(&mut self) -> Option<&mut (dyn bamts_runtime::CompileProvider + 'static)> {
         self.compiler.as_deref_mut()
+    }
+
+    fn timers(&mut self) -> Option<&mut (dyn bamts_runtime::TimerProvider + 'static)> {
+        Some(&mut self.timers)
     }
 
     fn hash(&mut self, algorithm: &str, data: &[u8]) -> Option<Vec<u8>> {
@@ -839,5 +847,134 @@ mod tests {
         assert_eq!(error, AotProcessContextError::EnvironmentValue);
         assert!(host.argv().is_empty());
         assert_eq!(host.env("SAFE"), None);
+    }
+}
+
+#[cfg(test)]
+mod timer_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn real_timers_expire_in_deadline_order_through_one_delay_queue() {
+        let mut host = NodeHost::new();
+        let timers = Host::timers(&mut host).expect("timer capability is always present");
+
+        // The later-deadline timer is scheduled first to prove ordering comes
+        // from the deadline, not insertion order.
+        let late = timers.schedule(1, 12).expect("schedule id 1");
+        let early = timers.schedule(2, 4).expect("schedule id 2");
+        assert!(early <= late, "smaller delay yields an earlier deadline");
+        assert!(timers.has_pending());
+
+        let first = timers.wait_expired().expect("wait").expect("a wakeup");
+        let second = timers.wait_expired().expect("wait").expect("a wakeup");
+        assert_eq!(first.id, 2, "the earlier deadline fires first");
+        assert_eq!(second.id, 1);
+        assert_eq!(first.deadline_ms, early);
+        assert_eq!(second.deadline_ms, late);
+
+        assert!(!timers.has_pending());
+        assert!(
+            timers.wait_expired().expect("wait").is_none(),
+            "an empty pending set never blocks"
+        );
+    }
+
+    #[test]
+    fn cancellation_removes_exactly_the_target_id() {
+        let mut host = NodeHost::new();
+        let timers = Host::timers(&mut host).unwrap();
+
+        timers.schedule(10, 20).expect("schedule id 10");
+        timers.schedule(11, 4).expect("schedule id 11");
+
+        assert!(timers.cancel(10).expect("cancel"), "an armed timer cancels");
+        assert!(
+            !timers.cancel(10).expect("cancel"),
+            "a second cancel of the same id is false"
+        );
+        assert!(
+            !timers.cancel(999).expect("cancel"),
+            "an unknown id cancels to false"
+        );
+
+        let wakeup = timers.wait_expired().expect("wait").expect("a wakeup");
+        assert_eq!(wakeup.id, 11, "only the surviving timer fires");
+        assert!(!timers.has_pending());
+        assert!(timers.wait_expired().expect("wait").is_none());
+    }
+
+    #[test]
+    fn expiry_that_races_a_cancel_is_dropped_as_stale() {
+        let mut host = NodeHost::new();
+        let timers = Host::timers(&mut host).unwrap();
+
+        timers.schedule(7, 1).expect("schedule id 7");
+        // Let the worker fire and queue the wakeup while the caller has not yet
+        // polled it, then cancel: the caller-side pending set is authoritative.
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            timers.cancel(7).expect("cancel"),
+            "still pending from the caller's view until polled"
+        );
+
+        let mut output = Vec::new();
+        timers.poll_expired(&mut output).expect("poll");
+        assert!(output.is_empty(), "a cancelled id is never delivered");
+        assert!(!timers.has_pending());
+        assert!(timers.wait_expired().expect("wait").is_none());
+    }
+
+    #[test]
+    fn worker_is_lazy_and_shuts_down_cleanly_on_drop() {
+        let mut host = NodeHost::new();
+        assert!(
+            !host.timers.worker_active(),
+            "no worker thread before the first schedule"
+        );
+
+        // Merely returning the capability must not spawn the worker.
+        let _ = Host::timers(&mut host);
+        assert!(
+            !host.timers.worker_active(),
+            "returning the capability is not a schedule"
+        );
+
+        Host::timers(&mut host)
+            .unwrap()
+            .schedule(1, 1)
+            .expect("schedule id 1");
+        assert!(
+            host.timers.worker_active(),
+            "the worker starts lazily on first schedule"
+        );
+
+        // Dropping the host drops the worker handle, which closes the command
+        // channel and joins the thread even with a still-armed timer. A hang or
+        // panic here fails the test.
+        drop(host);
+    }
+
+    #[test]
+    fn constructs_and_runs_inside_an_ambient_tokio_runtime_without_panic() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("ambient runtime builds");
+        let _guard = runtime.enter();
+
+        // With an ambient Tokio runtime on this thread, the provider must still
+        // spawn its own dedicated worker thread/runtime and never `block_on`
+        // here, so none of these operations panic.
+        let mut host = NodeHost::new();
+        let timers = Host::timers(&mut host).unwrap();
+        let deadline = timers
+            .schedule(1, 2)
+            .expect("schedule under ambient runtime");
+        assert!(deadline >= 2);
+        let wakeup = timers.wait_expired().expect("wait").expect("a wakeup");
+        assert_eq!(wakeup.id, 1);
+        assert!(!timers.has_pending());
     }
 }

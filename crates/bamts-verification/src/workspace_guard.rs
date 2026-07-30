@@ -416,13 +416,12 @@ fn validate_codegen_features(manifest: &Value, context: &str) -> Result<()> {
     )
 }
 
-/// `bamts-node` keeps the `node-host` and `aot-image` capabilities of
-/// `bamts-native` behind its own features so a default dependency on the Node
-/// host never pulls the AOT image reader and its external descriptor symbol.
+/// `bamts-node` keeps compiler and native capabilities behind explicit
+/// features so its default host does not pull the frontend or AOT image reader.
 fn validate_node_features(manifest: &Value, context: &str) -> Result<()> {
     let root = root_table(manifest, context)?;
     let features = required_table(root, "features", context)?;
-    let expected_keys: BTreeSet<String> = ["default", "node-host", "aot-main"]
+    let expected_keys: BTreeSet<String> = ["default", "node-host", "script-compiler", "aot-main"]
         .into_iter()
         .map(str::to_owned)
         .collect();
@@ -436,6 +435,12 @@ fn validate_node_features(manifest: &Value, context: &str) -> Result<()> {
 
     require_feature_set(features, "default", &["node-host"], context)?;
     require_feature_set(features, "node-host", &["bamts-native/node-host"], context)?;
+    require_feature_set(
+        features,
+        "script-compiler",
+        &["dep:bamts-compiler", "dep:bamts-bytecode"],
+        context,
+    )?;
     require_feature_set(
         features,
         "aot-main",
@@ -504,7 +509,11 @@ fn validate_facade_manifest_features(manifest: &Value, context: &str) -> Result<
     require_feature_set(
         features,
         "node-host",
-        &["dep:bamts-node", "bamts-node/node-host"],
+        &[
+            "dep:bamts-node",
+            "bamts-node/node-host",
+            "bamts-node/script-compiler",
+        ],
         context,
     )
 }
@@ -881,6 +890,7 @@ fn expected_internal_graph() -> InternalGraph {
         "bamts-node".to_owned(),
         BTreeMap::from([
             ("bamts-runtime".to_owned(), internal_dependency(false, &[])),
+            ("bamts-compiler".to_owned(), internal_dependency(true, &[])),
             ("bamts-native".to_owned(), internal_dependency(false, &[])),
             // Enabled only by `aot-main`, which decodes the canonical bytecode
             // embedded in a linked AOT image before handing it to the engine.
@@ -911,6 +921,10 @@ fn expected_internal_graph() -> InternalGraph {
     graph.insert(
         "bamts-cli".to_owned(),
         BTreeMap::from([
+            (
+                "bamts".to_owned(),
+                internal_dependency(false, &["node-host"]),
+            ),
             ("bamts-compiler".to_owned(), internal_dependency(false, &[])),
             ("bamts-runtime".to_owned(), internal_dependency(false, &[])),
             (
@@ -919,7 +933,7 @@ fn expected_internal_graph() -> InternalGraph {
             ),
             (
                 "bamts-node".to_owned(),
-                internal_dependency(false, &["aot-main"]),
+                internal_dependency(false, &["aot-main", "script-compiler"]),
             ),
         ]),
     );

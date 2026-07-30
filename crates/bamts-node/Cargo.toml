@@ -25,6 +25,8 @@ bamts-bytecode = { path = "../bamts-bytecode", optional = true }
 bamts-compiler = { path = "../bamts-compiler", optional = true }
 bamts-native = { path = "../bamts-native" }
 bamts-runtime = { path = "../bamts-runtime" }
+tokio = { version = "=1.53.1", features = ["rt", "sync", "time"] }
+tokio-util = { version = "=0.7.19", features = ["time"] }
 
 [lints.rust]
 # `unsafe_code` is downgraded from the workspace `forbid` to `deny` so that a

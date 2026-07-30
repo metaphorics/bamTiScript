@@ -64,9 +64,9 @@ use bamts_native::{
 
 use crate::intrinsics::BuiltinOutcome;
 use crate::{
-    CalleeKind, EvalFailure, Execution, ExecutionOutcome, GeneratorActivation, GeneratorResume,
-    GeneratorStart, GeneratorState, GetOutcome, HeapEntry, Host, IteratorNextPrepared, Limits,
-    Machine, PropertyMap, RuntimeError, RuntimeErrorKind, SetOutcome, ThrowOrigin,
+    CalleeKind, EvalFailure, Execution, ExecutionOutcome, GeneratorResume, GeneratorStart,
+    GeneratorState, GetOutcome, HeapEntry, Host, IteratorNextPrepared, Limits, Machine,
+    PropertyMap, RuntimeError, RuntimeErrorKind, SetOutcome, SuspendedActivation, ThrowOrigin,
     accessor_from_selector, binary_from_selector, iterator_kind_from_selector, unary_from_selector,
 };
 
@@ -1175,6 +1175,20 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 }
             };
         }
+        if flags.is_async && !flags.is_generator {
+            // Async calls route through the shared reference Machine state
+            // machine, which drives the body on the interpreter to its first
+            // await or completion and returns the implicit Promise. No
+            // bytecode, codegen, or ABI change is involved.
+            let outcome = self
+                .machine
+                .borrow_mut()
+                .start_async_call(target, captures, this, new_target, args);
+            return match outcome {
+                Ok(promise) => InvokeOutcome::Value(promise),
+                Err(failure) => self.failure_outcome(failure),
+            };
+        }
         if self.backend == Backend::Reference || self.is_dynamic_module(target.module) {
             return match self.execute(
                 target.module,
@@ -1445,7 +1459,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         if let Err(kind) = self
             .machine
             .borrow_mut()
-            .reserve_suspended_generator_registers(register_count)
+            .reserve_suspended_activation_registers(register_count)
         {
             self.pending_fatal_kind.set(Some(kind));
             return None;
@@ -1453,7 +1467,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         if let Err(kind) = self.machine.borrow_mut().enter_native_generator() {
             self.machine
                 .borrow_mut()
-                .release_suspended_generator_registers(register_count);
+                .release_suspended_activation_registers(register_count);
             self.pending_fatal_kind.set(Some(kind));
             return None;
         }
@@ -1482,7 +1496,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
 
     fn resume_reference_generator(
         &self,
-        mut suspended: GeneratorActivation,
+        mut suspended: SuspendedActivation,
         sent: Value,
     ) -> Option<GeneratorResume> {
         let target = suspended.target;
@@ -1493,7 +1507,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         if let Err(kind) = self.machine.borrow_mut().enter_native_generator() {
             self.machine
                 .borrow_mut()
-                .release_suspended_generator_registers(register_count);
+                .release_suspended_activation_registers(register_count);
             self.pending_fatal_kind.set(Some(kind));
             return None;
         }
@@ -1534,7 +1548,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         match completion {
             Ok(FrameCompletion::Suspend(value, resume_token)) => Some(GeneratorResume::Yield {
                 value,
-                activation: GeneratorActivation {
+                activation: SuspendedActivation {
                     target,
                     registers,
                     this_value: activation.this_value,
@@ -1547,19 +1561,19 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             Ok(FrameCompletion::Normal(value)) => {
                 self.machine
                     .borrow_mut()
-                    .release_suspended_generator_registers(register_count);
+                    .release_suspended_activation_registers(register_count);
                 Some(GeneratorResume::Return(value))
             }
             Ok(FrameCompletion::Unwind(value, origin, _)) => {
                 self.machine
                     .borrow_mut()
-                    .release_suspended_generator_registers(register_count);
+                    .release_suspended_activation_registers(register_count);
                 Some(GeneratorResume::Throw { value, origin })
             }
             Err(error) => {
                 self.machine
                     .borrow_mut()
-                    .release_suspended_generator_registers(register_count);
+                    .release_suspended_activation_registers(register_count);
                 self.pending_error.set(Some(error));
                 None
             }
@@ -1574,13 +1588,13 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         if let Err(kind) = self
             .machine
             .borrow_mut()
-            .reserve_suspended_generator_registers(registers.len())
+            .reserve_suspended_activation_registers(registers.len())
         {
             self.pending_fatal_kind.set(Some(kind));
             return None;
         }
         self.drive_linked_generator(
-            GeneratorActivation {
+            SuspendedActivation {
                 target: start.target,
                 registers,
                 this_value: start.this_value,
@@ -1595,7 +1609,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
 
     fn resume_linked_generator(
         &self,
-        activation: GeneratorActivation,
+        activation: SuspendedActivation,
         sent: Value,
     ) -> Option<GeneratorResume> {
         self.drive_linked_generator(activation, Some(sent))
@@ -1603,14 +1617,14 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
 
     fn drive_linked_generator(
         &self,
-        mut suspended: GeneratorActivation,
+        mut suspended: SuspendedActivation,
         pending_resume: Option<Value>,
     ) -> Option<GeneratorResume> {
         let register_count = suspended.registers.len();
         if let Err(kind) = self.machine.borrow_mut().enter_native_generator() {
             self.machine
                 .borrow_mut()
-                .release_suspended_generator_registers(register_count);
+                .release_suspended_activation_registers(register_count);
             self.pending_fatal_kind.set(Some(kind));
             return None;
         }
@@ -1620,7 +1634,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 self.machine.borrow_mut().leave_native_generator();
                 self.machine
                     .borrow_mut()
-                    .release_suspended_generator_registers(register_count);
+                    .release_suspended_activation_registers(register_count);
                 self.pending_fatal_kind
                     .set(Some(RuntimeErrorKind::RegisterLimitExceeded {
                         limit: self.max_total_registers(),
@@ -1673,26 +1687,26 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 self.pending_throw.take();
                 self.machine
                     .borrow_mut()
-                    .release_suspended_generator_registers(register_count);
+                    .release_suspended_activation_registers(register_count);
                 Some(GeneratorResume::Return(out.value))
             }
             Ok(CompletionTag::Throw) => {
                 self.machine
                     .borrow_mut()
-                    .release_suspended_generator_registers(register_count);
+                    .release_suspended_activation_registers(register_count);
                 let (value, origin) = self.take_matching_throw(out.value);
                 Some(GeneratorResume::Throw { value, origin })
             }
             Ok(CompletionTag::Suspend | CompletionTag::FatalTrap) => {
                 self.machine
                     .borrow_mut()
-                    .release_suspended_generator_registers(register_count);
+                    .release_suspended_activation_registers(register_count);
                 None
             }
             Err(error) => {
                 self.machine
                     .borrow_mut()
-                    .release_suspended_generator_registers(register_count);
+                    .release_suspended_activation_registers(register_count);
                 self.pending_abi_error.set(Some(error));
                 None
             }
@@ -2054,6 +2068,19 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 }
             }
             Ok(CalleeKind::Runtime { target, captures }) => {
+                let flags = {
+                    let handle = self.code_ref(target.module);
+                    handle.code(target.module).functions()[target.function.get() as usize].flags()
+                };
+                if flags.is_async && !flags.is_generator {
+                    self.pending_throw.set(Some(PendingThrow {
+                        value: Value::UNDEFINED,
+                        origin: ThrowOrigin::TypeError {
+                            operation: "construct",
+                        },
+                    }));
+                    return HelperResult::throw(Value::UNDEFINED);
+                }
                 let instance = {
                     let allocated = self
                         .machine
@@ -2996,6 +3023,187 @@ mod tests {
         assert_eq!(interpreter_drain, native_drain);
         assert_eq!(interpreter_value, Some(Value::int32(7)));
         assert_eq!(native_value, interpreter_value);
+    }
+
+    fn async_module_function(registers: u32, code: Vec<Instruction>) -> Function {
+        Function::new(
+            None,
+            0,
+            0,
+            registers,
+            FunctionFlags {
+                is_async: true,
+                is_generator: false,
+            },
+            code,
+            Vec::new(),
+        )
+    }
+
+    /// An ordinary async call routed through the native reference engine must
+    /// produce the same Promise settlement, globals, and drain counts as the
+    /// interpreter, because native async execution reuses the shared Machine
+    /// reference state machine.
+    #[test]
+    fn async_call_matches_interpreter_and_native_engine() {
+        let program = linked(
+            vec![program_module(
+                "root",
+                vec![
+                    Constant::String(EcmaString::from_utf8("observed")),
+                    Constant::Int32(7),
+                    Constant::Undefined,
+                ],
+                vec![
+                    entry_function(
+                        5,
+                        vec![
+                            Instruction::CreateArray { dst: reg(0) },
+                            Instruction::CreateClosure {
+                                dst: reg(1),
+                                function: FunctionId::new(1),
+                                captures: reg(0),
+                            },
+                            Instruction::CreateArray { dst: reg(2) },
+                            Instruction::LoadConst {
+                                dst: reg(3),
+                                constant: cid(3),
+                            },
+                            Instruction::Call {
+                                dst: reg(4),
+                                callee: reg(1),
+                                this_value: reg(3),
+                                arguments: reg(2),
+                            },
+                            Instruction::Return { value: reg(3) },
+                        ],
+                    ),
+                    async_module_function(
+                        2,
+                        vec![
+                            Instruction::LoadConst {
+                                dst: reg(0),
+                                constant: cid(2),
+                            },
+                            Instruction::Suspend {
+                                dst: reg(1),
+                                src: reg(0),
+                                resume: pc(2),
+                            },
+                            Instruction::StoreGlobal {
+                                name: cid(1),
+                                value: reg(1),
+                            },
+                            Instruction::Return { value: reg(1) },
+                        ],
+                    ),
+                ],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )],
+            0,
+        );
+        let observed = EcmaString::from_utf8("observed");
+
+        let mut interpreter_host = SilentHost;
+        let mut interpreter = Machine::new(&program, &mut interpreter_host, Limits::default());
+        interpreter.evaluate().unwrap();
+        assert!(!interpreter.globals.contains_key(&observed));
+        let interpreter_drain = interpreter.drain_microtasks().unwrap();
+        let interpreter_value = interpreter.globals.get(&observed).copied();
+
+        let mut native_host = SilentHost;
+        let engine = NativeEngine::new(&program, &NoEntries, &mut native_host, Limits::default());
+        engine.machine.borrow_mut().instantiate_modules().unwrap();
+        engine
+            .evaluate_reference_module(program.entry())
+            .unwrap()
+            .expect("native entry completes");
+        assert!(!engine.machine.borrow().globals.contains_key(&observed));
+        let native_drain = engine.machine.borrow_mut().drain_microtasks().unwrap();
+        let native_value = engine.machine.borrow().globals.get(&observed).copied();
+
+        let mut linked_host = SilentHost;
+        let linked = NativeEngine::build(
+            &program,
+            &NoEntries,
+            &mut linked_host,
+            Limits::default(),
+            Backend::Linked,
+        );
+        linked.machine.borrow_mut().instantiate_modules().unwrap();
+        assert!(matches!(
+            linked.invoke_runtime(
+                crate::RuntimeFunction {
+                    module: ModuleId::new(0),
+                    function: FunctionId::new(1),
+                },
+                &[],
+                Value::UNDEFINED,
+                Value::UNDEFINED,
+                &[],
+            ),
+            InvokeOutcome::Value(_)
+        ));
+        assert!(!linked.machine.borrow().globals.contains_key(&observed));
+        let linked_drain = linked.machine.borrow_mut().drain_microtasks().unwrap();
+        let linked_value = linked.machine.borrow().globals.get(&observed).copied();
+
+        assert_eq!(interpreter_drain, native_drain);
+        assert_eq!(interpreter_value, Some(Value::int32(7)));
+        assert_eq!(native_value, interpreter_value);
+        assert_eq!(linked_drain, interpreter_drain);
+        assert_eq!(linked_value, interpreter_value);
+    }
+
+    /// Constructing an async function through the native engine is a TypeError,
+    /// matching the interpreter's construct guard, with no bytecode/ABI change.
+    #[test]
+    fn native_construct_of_async_function_is_a_type_error() {
+        let program = linked(
+            vec![program_module(
+                "root",
+                Vec::new(),
+                vec![
+                    entry_function(
+                        4,
+                        vec![
+                            Instruction::CreateArray { dst: reg(0) },
+                            Instruction::CreateClosure {
+                                dst: reg(1),
+                                function: FunctionId::new(1),
+                                captures: reg(0),
+                            },
+                            Instruction::CreateArray { dst: reg(2) },
+                            Instruction::Construct {
+                                dst: reg(3),
+                                callee: reg(1),
+                                arguments: reg(2),
+                            },
+                            Instruction::Return { value: reg(3) },
+                        ],
+                    ),
+                    async_module_function(1, vec![Instruction::Halt]),
+                ],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )],
+            0,
+        );
+        let mut host = SilentHost;
+        let result = NativeEngine::new(&program, &NoEntries, &mut host, Limits::default()).run();
+        assert!(matches!(
+            result,
+            Err(RuntimeError {
+                kind: RuntimeErrorKind::UncaughtThrow {
+                    origin: ThrowOrigin::TypeError { .. },
+                    ..
+                },
+                ..
+            })
+        ));
     }
 
     #[derive(Default)]

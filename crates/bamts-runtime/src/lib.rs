@@ -22,6 +22,7 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
@@ -80,6 +81,8 @@ pub struct Limits {
     pub max_dynamic_modules: usize,
     /// Ceiling on queued microtasks.
     pub max_microtasks: usize,
+    /// Ceiling on live timers armed at once.
+    pub max_timers: usize,
 }
 
 impl Default for Limits {
@@ -94,6 +97,7 @@ impl Default for Limits {
             max_module_cells: 1 << 20,
             max_dynamic_modules: 1 << 10,
             max_microtasks: 1 << 20,
+            max_timers: 1 << 20,
         }
     }
 }
@@ -186,6 +190,77 @@ pub trait Host {
     fn script_compiler(&mut self) -> Option<&mut (dyn CompileProvider + 'static)> {
         None
     }
+
+    /// This host's timer scheduler, or `None` when it provides none.
+    ///
+    /// Presence MUST remain stable for the lifetime of one machine because it
+    /// determines whether `setTimeout`/`clearTimeout` are installed during
+    /// construction.
+    fn timers(&mut self) -> Option<&mut (dyn TimerProvider + 'static)> {
+        None
+    }
+}
+
+/// A single expired timer reported by a [`TimerProvider`].
+///
+/// `id` echoes the machine-owned JavaScript identifier passed to
+/// [`TimerProvider::schedule`]; `deadline_ms` is the provider's monotonic
+/// absolute-millisecond deadline used as the promotion watermark.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TimerWakeup {
+    pub id: u64,
+    pub deadline_ms: u64,
+}
+
+/// An owned failure message produced by a [`TimerProvider`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimerError {
+    message: String,
+}
+
+impl TimerError {
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for TimerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for TimerError {}
+
+/// A host capability that schedules real time without observing machine state.
+///
+/// The provider owns only opaque `u64` identifiers and monotonic millisecond
+/// deadlines; it never stores a JavaScript `Value`. The machine owns visible
+/// ordering and every callback identity.
+pub trait TimerProvider {
+    /// Arms a timer for `id` after at least `delay_ms` milliseconds, returning
+    /// the provider-monotonic absolute-millisecond deadline.
+    fn schedule(&mut self, id: u64, delay_ms: u32) -> Result<u64, TimerError>;
+
+    /// Cancels the armed timer for `id`, returning whether one was removed.
+    fn cancel(&mut self, id: u64) -> Result<bool, TimerError>;
+
+    /// Drains every currently expired timer into `output` without blocking.
+    fn poll_expired(&mut self, output: &mut Vec<TimerWakeup>) -> Result<(), TimerError>;
+
+    /// Blocks until the next timer expires, or returns `None` when none pend.
+    fn wait_expired(&mut self) -> Result<Option<TimerWakeup>, TimerError>;
+
+    /// Reports whether the provider has any armed timer.
+    fn has_pending(&self) -> bool;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -247,6 +322,13 @@ pub enum RuntimeErrorKind {
         limit: usize,
     },
     MicrotaskDrainReentry,
+    TimerProviderFailure {
+        message: String,
+    },
+    TimerCapacityExceeded {
+        limit: usize,
+    },
+    TimerCheckpointReentry,
     InvalidDynamicScript {
         reason: &'static str,
     },
@@ -322,6 +404,15 @@ impl fmt::Display for RuntimeError {
             }
             RuntimeErrorKind::MicrotaskDrainReentry => {
                 write!(formatter, "microtask drain is already active")
+            }
+            RuntimeErrorKind::TimerProviderFailure { message } => {
+                write!(formatter, "timer provider failure: {message}")
+            }
+            RuntimeErrorKind::TimerCapacityExceeded { limit } => {
+                write!(formatter, "timer capacity {limit} exceeded")
+            }
+            RuntimeErrorKind::TimerCheckpointReentry => {
+                write!(formatter, "timer checkpoint is already active")
             }
             RuntimeErrorKind::InvalidDynamicScript { reason } => {
                 write!(formatter, "invalid dynamic script: {reason}")
@@ -549,7 +640,7 @@ pub(crate) struct GeneratorStart {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct GeneratorActivation {
+pub(crate) struct SuspendedActivation {
     pub(crate) target: RuntimeFunction,
     pub(crate) registers: Vec<Value>,
     pub(crate) this_value: Value,
@@ -563,7 +654,7 @@ pub(crate) struct GeneratorActivation {
 pub(crate) enum GeneratorState {
     SuspendedStart(GeneratorStart),
     Executing,
-    Suspended(GeneratorActivation),
+    Suspended(SuspendedActivation),
     Completed,
 }
 
@@ -571,7 +662,22 @@ pub(crate) enum GeneratorState {
 pub(crate) enum GeneratorResume {
     Yield {
         value: Value,
-        activation: GeneratorActivation,
+        activation: SuspendedActivation,
+    },
+    Return(Value),
+    Throw {
+        value: Value,
+        origin: ThrowOrigin,
+    },
+}
+
+/// One step of driving a detached async-function activation: it awaited a
+/// value (and must suspend), it returned, or it threw an uncaught value.
+#[derive(Clone, Debug)]
+enum AsyncStep {
+    Suspend {
+        awaited: Value,
+        activation: SuspendedActivation,
     },
     Return(Value),
     Throw {
@@ -616,6 +722,18 @@ pub(crate) enum PromiseReaction {
         derived: Value,
         completion: PromiseCompletion,
     },
+    /// Resumes a suspended async activation on fulfillment. Carries only the
+    /// heap `AsyncActivation` record handle; the awaited value arrives as the
+    /// reaction value.
+    AsyncFulfill {
+        activation: Value,
+    },
+    /// Resumes a suspended async activation on rejection. Carries only the
+    /// heap `AsyncActivation` record handle; the rejection reason arrives as
+    /// the reaction value.
+    AsyncReject {
+        activation: Value,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -635,9 +753,9 @@ pub(crate) enum MicrotaskJob {
     },
 }
 
-/// An exception reported by a `queueMicrotask` callback.
+/// An exception reported by a microtask or timer callback.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MicrotaskException {
+pub struct CallbackException {
     /// The value thrown by the callback.
     pub value: Value,
     /// The operation that produced the throw.
@@ -650,7 +768,16 @@ pub struct MicrotaskDrain {
     /// The number of jobs removed from the queue and run.
     pub executed: usize,
     /// Callback exceptions, in FIFO execution order.
-    pub uncaught: Vec<MicrotaskException>,
+    pub uncaught: Vec<CallbackException>,
+}
+
+/// The result of one explicit timer checkpoint. At most one callback runs.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TimerRun {
+    /// The number of timer callbacks run: `0` or `1`.
+    pub executed: usize,
+    /// Callback exceptions from the run callback, if it threw.
+    pub uncaught: Vec<CallbackException>,
 }
 
 #[derive(Clone, Debug)]
@@ -754,6 +881,14 @@ enum HeapEntry {
         prototype: Option<Value>,
         extensible: bool,
     },
+    /// A Node-compatible `Timeout` handle carrying its monotonic timer id and
+    /// ordinary object property/prototype fields.
+    Timeout {
+        id: u64,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+        extensible: bool,
+    },
     PromiseResolver {
         promise: Value,
         used: bool,
@@ -774,6 +909,14 @@ enum HeapEntry {
         aggregate: Value,
         index: usize,
         called: bool,
+    },
+    /// One suspended async-function activation together with the implicit
+    /// result Promise it settles. `activation` is taken on resume so a second
+    /// resume is a hard invalid-state error. This record is internal and never
+    /// escapes to user code.
+    AsyncActivation {
+        activation: Option<SuspendedActivation>,
+        promise: Value,
     },
     NativeFunction {
         callable: NativeCallable,
@@ -830,7 +973,9 @@ impl HeapEntry {
                     .saturating_add(1),
                 GeneratorState::Executing | GeneratorState::Completed => 1,
             },
-            Self::Object { properties, .. } => properties.charge_bytes().saturating_add(1),
+            Self::Object { properties, .. } | Self::Timeout { properties, .. } => {
+                properties.charge_bytes().saturating_add(1)
+            }
             Self::Array { .. }
             | Self::Function { .. }
             | Self::Script { .. }
@@ -844,6 +989,7 @@ impl HeapEntry {
             | Self::PromiseResolver { .. }
             | Self::PromiseFinally { .. }
             | Self::PromiseAll { .. }
+            | Self::AsyncActivation { .. }
             | Self::PromiseAllElement { .. } => 1,
         }
     }
@@ -992,6 +1138,15 @@ enum CalleeKind {
     NotCallable,
 }
 
+#[derive(Clone, Debug)]
+struct TimerRecord {
+    callback: Value,
+    arguments: Vec<Value>,
+    handle: Value,
+    deadline_ms: u64,
+    sequence: u64,
+}
+
 /// The production bytecode interpreter.
 pub struct Machine<'a, H: Host> {
     program: Option<&'a Program<Verified>>,
@@ -1013,8 +1168,16 @@ pub struct Machine<'a, H: Host> {
     callback_boundaries: Vec<usize>,
     generator_boundaries: Vec<usize>,
     pending_generator_resume: Option<GeneratorResume>,
+    async_boundaries: Vec<usize>,
+    pending_async_suspend: Option<(Value, SuspendedActivation)>,
     microtasks: VecDeque<MicrotaskJob>,
     microtask_drain_active: bool,
+    next_timer_id: Option<u64>,
+    next_timer_sequence: Option<u64>,
+    timers: BTreeMap<u64, TimerRecord>,
+    ready_timers: BTreeSet<(u64, u64)>,
+    timer_watermark: Option<u64>,
+    timer_checkpoint_active: bool,
     intrinsics: intrinsics::Intrinsics<H>,
     current_builtin_id: Option<intrinsics::BuiltinId>,
     registry: ModuleRegistry,
@@ -1129,7 +1292,8 @@ impl<'a, H: Host> Machine<'a, H> {
         );
         let live_registers = frame.registers.len();
         let mut heap = Vec::new();
-        let mut intrinsics = intrinsics::Intrinsics::<H>::initialize(&mut heap);
+        let timers_available = host.timers().is_some();
+        let mut intrinsics = intrinsics::Intrinsics::<H>::initialize(&mut heap, timers_available);
         let script_compiler = host.script_compiler().is_some();
         let installed_external = external_modules::install(
             &mut heap,
@@ -1183,8 +1347,16 @@ impl<'a, H: Host> Machine<'a, H> {
             callback_boundaries: Vec::new(),
             generator_boundaries: Vec::new(),
             pending_generator_resume: None,
+            async_boundaries: Vec::new(),
+            pending_async_suspend: None,
             microtasks: VecDeque::new(),
             microtask_drain_active: false,
+            next_timer_id: Some(1),
+            next_timer_sequence: Some(0),
+            timers: BTreeMap::new(),
+            ready_timers: BTreeSet::new(),
+            timer_watermark: None,
+            timer_checkpoint_active: false,
             globals: BTreeMap::new(),
             registry: ModuleRegistry {
                 external: installed_external
@@ -1250,6 +1422,250 @@ impl<'a, H: Host> Machine<'a, H> {
             .expect("the entry frame completes before the run loop stops"))
     }
 
+    /// Runs at most one expired live timer callback.
+    ///
+    /// This explicit checkpoint never drains microtasks. Expiry reports only
+    /// advance a monotonic watermark; visible delivery is ordered by the
+    /// machine-owned `(deadline, sequence)` key.
+    pub fn run_one_expired_timer(&mut self) -> Result<TimerRun, RuntimeError> {
+        if self.timer_checkpoint_active {
+            return Err(self.checkpoint_error(RuntimeErrorKind::TimerCheckpointReentry));
+        }
+        self.timer_checkpoint_active = true;
+        let result = (|| {
+            self.poll_timer_expiries()
+                .map_err(|kind| self.checkpoint_error(kind))?;
+            let Some(order) = self.ready_timers.first().copied() else {
+                return Ok(TimerRun::default());
+            };
+            let Some(id) = self.timers.iter().find_map(|(id, timer)| {
+                ((timer.deadline_ms, timer.sequence) == order).then_some(*id)
+            }) else {
+                return Err(self.checkpoint_error(RuntimeErrorKind::InvalidValue {
+                    value: Value::UNDEFINED,
+                }));
+            };
+            // Preserve both the ready key and live record when fuel is empty.
+            self.consume_fuel(1)
+                .map_err(|kind| self.checkpoint_error(kind))?;
+            self.ready_timers.remove(&order);
+            let timer = self
+                .timers
+                .remove(&id)
+                .expect("ready timer remains live until after fuel charging");
+            let mut report = TimerRun {
+                executed: 1,
+                uncaught: Vec::new(),
+            };
+            match self.call_value(timer.callback, timer.handle, &timer.arguments) {
+                Ok(_) => {}
+                Err(EvalFailure::Runtime(kind)) => {
+                    return Err(self.checkpoint_error(kind));
+                }
+                Err(failure) => {
+                    let (value, origin) =
+                        self.promise_rejection_value(failure)
+                            .map_err(|failure| match failure {
+                                EvalFailure::Runtime(kind) => self.checkpoint_error(kind),
+                                _ => self.checkpoint_error(RuntimeErrorKind::InvalidValue {
+                                    value: timer.callback,
+                                }),
+                            })?;
+                    report.uncaught.try_reserve(1).map_err(|_| {
+                        self.checkpoint_error(RuntimeErrorKind::HeapByteLimitExceeded {
+                            limit: self.limits.max_heap_bytes,
+                        })
+                    })?;
+                    report.uncaught.push(CallbackException { value, origin });
+                }
+            }
+            Ok(report)
+        })();
+        self.timer_checkpoint_active = false;
+        result
+    }
+
+    /// Blocks in the host provider until an expiry report is available.
+    /// Returns whether at least one live timer became ready.
+    pub fn wait_for_timer_expiry(&mut self) -> Result<bool, RuntimeError> {
+        if self.timer_checkpoint_active {
+            return Err(self.checkpoint_error(RuntimeErrorKind::TimerCheckpointReentry));
+        }
+        if !self.ready_timers.is_empty() {
+            return Ok(true);
+        }
+        self.timer_checkpoint_active = true;
+        let result = (|| {
+            let wakeup = match self.host.timers() {
+                Some(provider) => provider.wait_expired(),
+                None => return Ok(false),
+            }
+            .map_err(|error| {
+                self.checkpoint_error(RuntimeErrorKind::TimerProviderFailure {
+                    message: error.to_string(),
+                })
+            })?;
+            if let Some(wakeup) = wakeup {
+                self.promote_timer_wakeup(wakeup);
+            }
+            Ok(!self.ready_timers.is_empty())
+        })();
+        self.timer_checkpoint_active = false;
+        result
+    }
+
+    /// Returns whether any machine-owned live timer remains.
+    #[must_use]
+    pub fn has_pending_timers(&self) -> bool {
+        !self.timers.is_empty()
+    }
+
+    pub(crate) fn schedule_timeout(
+        &mut self,
+        callback: Value,
+        delay_ms: u32,
+        arguments: Vec<Value>,
+    ) -> Result<Value, EvalFailure> {
+        if self.timers.len() >= self.limits.max_timers {
+            return Err(EvalFailure::Runtime(
+                RuntimeErrorKind::TimerCapacityExceeded {
+                    limit: self.limits.max_timers,
+                },
+            ));
+        }
+        let id = self.next_timer_id.take().ok_or(EvalFailure::Runtime(
+            RuntimeErrorKind::TimerCapacityExceeded {
+                limit: self.limits.max_timers,
+            },
+        ))?;
+        self.next_timer_id = id.checked_add(1);
+        let sequence = self.next_timer_sequence.take().ok_or(EvalFailure::Runtime(
+            RuntimeErrorKind::TimerCapacityExceeded {
+                limit: self.limits.max_timers,
+            },
+        ))?;
+        self.next_timer_sequence = sequence.checked_add(1);
+        let deadline_ms = self
+            .host
+            .timers()
+            .ok_or(EvalFailure::Runtime(
+                RuntimeErrorKind::TimerProviderFailure {
+                    message: "timer capability is unavailable".to_owned(),
+                },
+            ))?
+            .schedule(id, delay_ms)
+            .map_err(|error| {
+                EvalFailure::Runtime(RuntimeErrorKind::TimerProviderFailure {
+                    message: error.to_string(),
+                })
+            })?;
+        let handle = match self.allocate(HeapEntry::Timeout {
+            id,
+            properties: PropertyMap::default(),
+            prototype: Some(self.intrinsics.object_prototype),
+            extensible: true,
+        }) {
+            Ok(handle) => handle,
+            Err(kind) => {
+                if let Some(provider) = self.host.timers() {
+                    let _ = provider.cancel(id);
+                }
+                return Err(EvalFailure::Runtime(kind));
+            }
+        };
+        self.timers.insert(
+            id,
+            TimerRecord {
+                callback,
+                arguments,
+                handle,
+                deadline_ms,
+                sequence,
+            },
+        );
+        Ok(handle)
+    }
+
+    pub(crate) fn clear_timeout(&mut self, handle: Value) -> Result<(), EvalFailure> {
+        let id = match handle.decode() {
+            Some(Decoded::Int32(raw)) if (raw as i32) > 0 => Some(u64::from(raw)),
+            Some(Decoded::Number(number))
+                if number.is_finite()
+                    && number > 0.0
+                    && number.fract() == 0.0
+                    && number < u64::MAX as f64 =>
+            {
+                Some(number as u64)
+            }
+            Some(Decoded::HeapRef(_)) => {
+                self.runtime_slot(handle)
+                    .ok()
+                    .flatten()
+                    .and_then(|index| match &self.heap[index] {
+                        HeapEntry::Timeout { id, .. } => Some(*id),
+                        _ => None,
+                    })
+            }
+            _ => None,
+        };
+        let Some(id) = id else {
+            return Ok(());
+        };
+        let Some(timer) = self.timers.remove(&id) else {
+            return Ok(());
+        };
+        self.ready_timers
+            .remove(&(timer.deadline_ms, timer.sequence));
+        if let Some(provider) = self.host.timers() {
+            provider.cancel(id).map_err(|error| {
+                EvalFailure::Runtime(RuntimeErrorKind::TimerProviderFailure {
+                    message: error.to_string(),
+                })
+            })?;
+        }
+        Ok(())
+    }
+
+    fn poll_timer_expiries(&mut self) -> Result<(), RuntimeErrorKind> {
+        let mut wakeups = Vec::new();
+        let Some(provider) = self.host.timers() else {
+            return Ok(());
+        };
+        provider.poll_expired(&mut wakeups).map_err(|error| {
+            RuntimeErrorKind::TimerProviderFailure {
+                message: error.to_string(),
+            }
+        })?;
+        // One live report authorizes every earlier deadline. Collapse a host
+        // batch to one watermark instead of rescanning all live timers per report.
+        if let Some(wakeup) = wakeups
+            .into_iter()
+            .filter(|wakeup| self.timers.contains_key(&wakeup.id))
+            .max_by_key(|wakeup| wakeup.deadline_ms)
+        {
+            self.promote_timer_wakeup(wakeup);
+        }
+        Ok(())
+    }
+
+    fn promote_timer_wakeup(&mut self, wakeup: TimerWakeup) {
+        // Unknown IDs are stale cancellation races and carry no authority to
+        // advance the watermark.
+        if !self.timers.contains_key(&wakeup.id) {
+            return;
+        }
+        let watermark = self.timer_watermark.map_or(wakeup.deadline_ms, |current| {
+            current.max(wakeup.deadline_ms)
+        });
+        self.timer_watermark = Some(watermark);
+        for timer in self.timers.values() {
+            if timer.deadline_ms <= watermark {
+                self.ready_timers
+                    .insert((timer.deadline_ms, timer.sequence));
+            }
+        }
+    }
+
     /// Runs queued microtasks in FIFO order until the queue is empty.
     ///
     /// Jobs queued by another job run in the same checkpoint. Promise callback
@@ -1257,21 +1673,21 @@ impl<'a, H: Host> Machine<'a, H> {
     /// callbacks are returned in [`MicrotaskDrain::uncaught`].
     pub fn drain_microtasks(&mut self) -> Result<MicrotaskDrain, RuntimeError> {
         if self.microtask_drain_active {
-            return Err(self.microtask_error(RuntimeErrorKind::MicrotaskDrainReentry));
+            return Err(self.checkpoint_error(RuntimeErrorKind::MicrotaskDrainReentry));
         }
         self.microtask_drain_active = true;
         let result = (|| {
             let mut report = MicrotaskDrain::default();
             while self.microtasks.front().is_some() {
                 self.consume_fuel(1)
-                    .map_err(|kind| self.microtask_error(kind))?;
+                    .map_err(|kind| self.checkpoint_error(kind))?;
                 let job = self
                     .microtasks
                     .pop_front()
                     .expect("the queued microtask remains present after fuel charging");
                 report.executed = report.executed.saturating_add(1);
                 self.execute_microtask_job(job, &mut report)
-                    .map_err(|kind| self.microtask_error(kind))?;
+                    .map_err(|kind| self.checkpoint_error(kind))?;
             }
             Ok(report)
         })();
@@ -1279,7 +1695,7 @@ impl<'a, H: Host> Machine<'a, H> {
         result
     }
 
-    fn microtask_error(&self, kind: RuntimeErrorKind) -> RuntimeError {
+    fn checkpoint_error(&self, kind: RuntimeErrorKind) -> RuntimeError {
         let function = self.module.entry();
         let instruction = self.module.functions()[function.get() as usize]
             .code()
@@ -1339,7 +1755,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         limit: self.limits.max_heap_bytes,
                     }
                 })?;
-                report.uncaught.push(MicrotaskException { value, origin });
+                report.uncaught.push(CallbackException { value, origin });
                 Ok(())
             }
         }
@@ -1408,6 +1824,12 @@ impl<'a, H: Host> Machine<'a, H> {
                 derived,
                 completion,
             } => self.execute_promise_finally(handler, derived, value, origin, completion),
+            PromiseReaction::AsyncFulfill { activation } => {
+                self.resume_async(activation, value, None)
+            }
+            PromiseReaction::AsyncReject { activation } => {
+                self.resume_async(activation, value, Some(origin))
+            }
         }
     }
 
@@ -3405,6 +3827,31 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 Instruction::Suspend { src, .. }
                     if self
+                        .async_boundaries
+                        .last()
+                        .is_some_and(|boundary| *boundary == frame_index) =>
+                {
+                    let awaited = self.read_register(frame_index, src.get());
+                    let frame = self.frames.pop().expect("async activation is executing");
+                    self.pending_async_suspend = Some((
+                        awaited,
+                        SuspendedActivation {
+                            target: RuntimeFunction {
+                                module: frame.module,
+                                function: FunctionId::new(frame.function as u32),
+                            },
+                            registers: frame.registers,
+                            this_value: frame.this_value,
+                            new_target: frame.new_target,
+                            args: frame.args,
+                            arguments_object: frame.arguments_object,
+                            resume_token: pc as u32 + 1,
+                        },
+                    ));
+                    return Ok(None);
+                }
+                Instruction::Suspend { src, .. }
+                    if self
                         .generator_boundaries
                         .last()
                         .is_some_and(|boundary| *boundary == frame_index) =>
@@ -3416,7 +3863,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         .expect("generator activation is executing");
                     self.pending_generator_resume = Some(GeneratorResume::Yield {
                         value,
-                        activation: GeneratorActivation {
+                        activation: SuspendedActivation {
                             target: RuntimeFunction {
                                 module: frame.module,
                                 function: FunctionId::new(frame.function as u32),
@@ -3950,7 +4397,7 @@ impl<'a, H: Host> Machine<'a, H> {
         self.live_registers -= register_count;
     }
 
-    pub(crate) fn reserve_suspended_generator_registers(
+    pub(crate) fn reserve_suspended_activation_registers(
         &mut self,
         register_count: usize,
     ) -> Result<(), RuntimeErrorKind> {
@@ -3963,7 +4410,7 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(())
     }
 
-    pub(crate) fn release_suspended_generator_registers(&mut self, register_count: usize) {
+    pub(crate) fn release_suspended_activation_registers(&mut self, register_count: usize) {
         self.live_registers -= register_count;
     }
 
@@ -4014,6 +4461,23 @@ impl<'a, H: Host> Machine<'a, H> {
                             self.write_register(self.frames.len() - 1, register, generator);
                         }
                         return Ok(());
+                    }
+                    if flags.is_async && !flags.is_generator {
+                        return match self.start_async_call(
+                            target,
+                            &captures,
+                            this_value,
+                            new_target,
+                            arguments.as_ref(),
+                        ) {
+                            Ok(promise) => {
+                                if let Some(register) = destination {
+                                    self.write_register(self.frames.len() - 1, register, promise);
+                                }
+                                Ok(())
+                            }
+                            Err(failure) => self.resolve_failure(failure, call_pc),
+                        };
                     }
                     return self.push_frame(
                         target,
@@ -4144,6 +4608,17 @@ impl<'a, H: Host> Machine<'a, H> {
             HeapEntry::Function { .. } | HeapEntry::NativeFunction { .. }
         ) {
             return self.throw_type("construct", call_pc);
+        }
+        if let HeapEntry::Function {
+            module, function, ..
+        } = self.heap[index]
+        {
+            if self.module_code(module).functions()[function.get() as usize]
+                .flags()
+                .is_async
+            {
+                return self.throw_type("construct", call_pc);
+            }
         }
         let object = self
             .allocate_constructed_receiver(callee)
@@ -4439,6 +4914,15 @@ impl<'a, H: Host> Machine<'a, H> {
                                 args: arguments.as_ref().to_vec(),
                             })
                             .map_err(EvalFailure::Runtime);
+                    }
+                    if flags.is_async && !flags.is_generator {
+                        return self.start_async_call(
+                            target,
+                            &captures,
+                            this_value,
+                            Value::UNDEFINED,
+                            arguments.as_ref(),
+                        );
                     }
                     let stop_depth = self.frames.len();
                     let return_to = self.frames.last().map(|frame| ReturnTo {
@@ -4851,7 +5335,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
-            | HeapEntry::Promise { properties, .. } => property_lookup_ascii(properties, name),
+            | HeapEntry::Promise { properties, .. }
+            | HeapEntry::Timeout { properties, .. } => property_lookup_ascii(properties, name),
             HeapEntry::Array {
                 elements,
                 properties,
@@ -4958,6 +5443,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::PromiseResolver { .. }
             | HeapEntry::PromiseFinally { .. }
             | HeapEntry::PromiseAll { .. }
+            | HeapEntry::AsyncActivation { .. }
             | HeapEntry::PromiseAllElement { .. } => None,
         }
     }
@@ -4978,7 +5464,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
-            | HeapEntry::Promise { properties, .. } => property_lookup(properties, key),
+            | HeapEntry::Promise { properties, .. }
+            | HeapEntry::Timeout { properties, .. } => property_lookup(properties, key),
             HeapEntry::Array {
                 elements,
                 properties,
@@ -5112,6 +5599,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::PromiseResolver { .. }
             | HeapEntry::PromiseFinally { .. }
             | HeapEntry::PromiseAll { .. }
+            | HeapEntry::AsyncActivation { .. }
             | HeapEntry::PromiseAllElement { .. } => None,
         }
     }
@@ -5165,7 +5653,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
-            | HeapEntry::Promise { properties, .. } => properties,
+            | HeapEntry::Promise { properties, .. }
+            | HeapEntry::Timeout { properties, .. } => properties,
             _ => return None,
         };
         match properties.get_ascii(name) {
@@ -5186,6 +5675,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::BuiltinIterator { prototype, .. }
             | HeapEntry::Collection { prototype, .. }
             | HeapEntry::Promise { prototype, .. }
+            | HeapEntry::Timeout { prototype, .. }
             | HeapEntry::ProcessEnv { prototype, .. } => *prototype,
             HeapEntry::NativeFunction { .. } => Some(self.intrinsics.function_prototype),
             _ => None,
@@ -5285,7 +5775,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::Date { properties, .. }
                 | HeapEntry::BuiltinIterator { properties, .. }
                 | HeapEntry::Collection { properties, .. }
-                | HeapEntry::Promise { properties, .. } => match properties.get(key) {
+                | HeapEntry::Promise { properties, .. }
+                | HeapEntry::Timeout { properties, .. } => match properties.get(key) {
                     Some(Property::Accessor { setter, .. }) => Some(Some(*setter)),
                     Some(Property::Data { .. }) => Some(None),
                     None => None,
@@ -5475,7 +5966,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
-            | HeapEntry::Promise { properties, .. } => {
+            | HeapEntry::Promise { properties, .. }
+            | HeapEntry::Timeout { properties, .. } => {
                 usize::from(!properties.contains_key(&key)) * key.charge_bytes()
             }
             HeapEntry::Array {
@@ -5506,6 +5998,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::PromiseResolver { .. }
             | HeapEntry::PromiseFinally { .. }
             | HeapEntry::PromiseAll { .. }
+            | HeapEntry::AsyncActivation { .. }
             | HeapEntry::PromiseAllElement { .. } => {
                 return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                     operation: "set property on non-object",
@@ -5538,7 +6031,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
-            | HeapEntry::Promise { properties, .. } => {
+            | HeapEntry::Promise { properties, .. }
+            | HeapEntry::Timeout { properties, .. } => {
                 properties.insert(
                     key,
                     Property::Data {
@@ -5727,7 +6221,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::Date { properties, .. }
                 | HeapEntry::BuiltinIterator { properties, .. }
                 | HeapEntry::Collection { properties, .. }
-                | HeapEntry::Promise { properties, .. } => {
+                | HeapEntry::Promise { properties, .. }
+                | HeapEntry::Timeout { properties, .. } => {
                     if properties
                         .get(key)
                         .is_some_and(|property| !property.configurable())
@@ -5780,6 +6275,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::PromiseResolver { .. }
                 | HeapEntry::PromiseFinally { .. }
                 | HeapEntry::PromiseAll { .. }
+                | HeapEntry::AsyncActivation { .. }
                 | HeapEntry::PromiseAllElement { .. }
                 | HeapEntry::HashState { .. } => Ok(true),
                 HeapEntry::ModuleNamespace { .. } | HeapEntry::ExternalModuleNamespace { .. } => {
@@ -6035,12 +6531,12 @@ impl<'a, H: Host> Machine<'a, H> {
 
     fn push_resumed_generator_frame(
         &mut self,
-        activation: GeneratorActivation,
+        activation: SuspendedActivation,
         resume_value: Value,
         return_to: Option<ReturnTo>,
     ) -> Result<(), EvalFailure> {
         if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
-            self.release_suspended_generator_registers(activation.registers.len());
+            self.release_suspended_activation_registers(activation.registers.len());
             return Err(EvalFailure::Runtime(RuntimeErrorKind::CallDepthExceeded {
                 limit: self.limits.max_call_depth,
             }));
@@ -6138,13 +6634,13 @@ impl<'a, H: Host> Machine<'a, H> {
         &mut self,
         generator: Value,
         value: Value,
-        activation: GeneratorActivation,
+        activation: SuspendedActivation,
     ) -> Result<Value, EvalFailure> {
         let register_count = activation.registers.len();
         let result = match self.iterator_result(value, false) {
             Ok(result) => result,
             Err(failure) => {
-                self.release_suspended_generator_registers(register_count);
+                self.release_suspended_activation_registers(register_count);
                 self.replace_executing_generator(generator, GeneratorState::Completed)?;
                 return Err(failure);
             }
@@ -6152,7 +6648,7 @@ impl<'a, H: Host> Machine<'a, H> {
         if let Err(failure) =
             self.replace_executing_generator(generator, GeneratorState::Suspended(activation))
         {
-            self.release_suspended_generator_registers(register_count);
+            self.release_suspended_activation_registers(register_count);
             return Err(failure);
         }
         Ok(result)
@@ -6187,6 +6683,306 @@ impl<'a, H: Host> Machine<'a, H> {
         }
         *state = next;
         Ok(())
+    }
+
+    /// Starts an ordinary async function: creates the implicit result Promise,
+    /// drives the body synchronously to its first `await` or completion under a
+    /// detached suspend boundary, and returns the Promise. A `return` resolves
+    /// it and an escaping throw rejects it; a runtime limit failure stays fatal.
+    pub(crate) fn start_async_call(
+        &mut self,
+        target: RuntimeFunction,
+        captures: &[Value],
+        this_value: Value,
+        new_target: Value,
+        arguments: &[Value],
+    ) -> Result<Value, EvalFailure> {
+        let promise = self.create_promise()?;
+        let record = self.create_async_activation(promise)?;
+        let stop_depth = self.frames.len();
+        let return_to = self.frames.last().map(|frame| ReturnTo {
+            destination: None,
+            call_pc: frame.pc,
+            constructed: None,
+        });
+        self.push_frame(
+            target, captures, this_value, new_target, arguments, return_to,
+        )
+        .map_err(|error| EvalFailure::Runtime(error.kind))?;
+        let step = self.drive_async_activation(stop_depth, None);
+        self.settle_async_step(record, promise, step)?;
+        Ok(promise)
+    }
+
+    /// Resumes a suspended async activation inside its Promise reaction job. On
+    /// fulfillment the awaited value is written to `Suspend.dst`; on rejection
+    /// the reason is thrown at the `Suspend` pc so a covering `try`/`catch`
+    /// runs. The activation is one-shot; a second resume is a hard error.
+    fn resume_async(
+        &mut self,
+        record: Value,
+        value: Value,
+        rejection: Option<ThrowOrigin>,
+    ) -> Result<(), RuntimeErrorKind> {
+        let promise = self.async_activation_promise(record)?;
+        let activation = self.take_async_activation(record)?;
+        let register_count = activation.registers.len();
+        if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
+            self.release_suspended_activation_registers(register_count);
+            return Err(RuntimeErrorKind::CallDepthExceeded {
+                limit: self.limits.max_call_depth,
+            });
+        }
+        let suspend_pc = activation
+            .resume_token
+            .checked_sub(1)
+            .expect("suspended async token is nonzero") as usize;
+        let instruction = self.module_code(activation.target.module).functions()
+            [activation.target.function.get() as usize]
+            .code()[suspend_pc];
+        let Instruction::Suspend { dst, resume, .. } = instruction else {
+            unreachable!("async resume token names a suspend instruction");
+        };
+        let stop_depth = self.frames.len();
+        let return_to = self.frames.last().map(|frame| ReturnTo {
+            destination: None,
+            call_pc: frame.pc,
+            constructed: None,
+        });
+        let mut frame = Frame {
+            module: activation.target.module,
+            function: activation.target.function.get() as usize,
+            pc: resume.get() as usize,
+            registers: activation.registers,
+            return_to,
+            this_value: activation.this_value,
+            new_target: activation.new_target,
+            args: activation.args,
+            arguments_object: activation.arguments_object,
+        };
+        let inject = match rejection {
+            None => {
+                frame.registers[dst.get() as usize] = value;
+                None
+            }
+            Some(origin) => Some((value, origin, suspend_pc)),
+        };
+        self.frames.push(frame);
+        let step = self.drive_async_activation(stop_depth, inject);
+        match self.settle_async_step(record, promise, step) {
+            Ok(()) => Ok(()),
+            Err(EvalFailure::Runtime(kind)) => Err(kind),
+            Err(_) => Err(RuntimeErrorKind::InvalidValue { value: record }),
+        }
+    }
+
+    /// Runs the interpreter loop for a detached async activation under one
+    /// suspend and one unwind boundary, optionally injecting a rejection at the
+    /// resumed `Suspend` pc first. It reports the awaited value on suspension,
+    /// the returned value on completion, or an uncaught throw; runtime limit
+    /// failures propagate as fatal `EvalFailure::Runtime`.
+    fn drive_async_activation(
+        &mut self,
+        stop_depth: usize,
+        inject: Option<(Value, ThrowOrigin, usize)>,
+    ) -> Result<AsyncStep, EvalFailure> {
+        self.last_completion = None;
+        self.pending_async_suspend = None;
+        self.callback_boundaries.push(stop_depth);
+        self.async_boundaries.push(stop_depth);
+        let result = match inject {
+            None => self.run_loop(stop_depth),
+            Some((value, origin, faulting_pc)) => match self.throw(value, origin, faulting_pc) {
+                Ok(()) => self.run_loop(stop_depth),
+                Err(error) => Err(error),
+            },
+        };
+        self.async_boundaries
+            .pop()
+            .expect("async execution owns its suspend boundary");
+        self.callback_boundaries
+            .pop()
+            .expect("async execution owns its unwind boundary");
+        match result {
+            Ok(Some(execution)) => Ok(AsyncStep::Return(execution.value)),
+            Ok(None) => {
+                if let Some((awaited, activation)) = self.pending_async_suspend.take() {
+                    Ok(AsyncStep::Suspend {
+                        awaited,
+                        activation,
+                    })
+                } else {
+                    Ok(AsyncStep::Return(
+                        self.last_completion.take().unwrap_or(Value::UNDEFINED),
+                    ))
+                }
+            }
+            Err(error) => {
+                self.unwind_frames_to(stop_depth);
+                match error.kind {
+                    RuntimeErrorKind::UncaughtThrow { value, origin } => {
+                        Ok(AsyncStep::Throw { value, origin })
+                    }
+                    kind => Err(EvalFailure::Runtime(kind)),
+                }
+            }
+        }
+    }
+
+    /// Settles the result Promise (or arms the next await) for one async step.
+    fn settle_async_step(
+        &mut self,
+        record: Value,
+        promise: Value,
+        step: Result<AsyncStep, EvalFailure>,
+    ) -> Result<(), EvalFailure> {
+        match step {
+            Ok(AsyncStep::Suspend {
+                awaited,
+                activation,
+            }) => {
+                let register_count = activation.registers.len();
+                let result = self
+                    .store_async_activation(record, activation)
+                    .and_then(|()| self.await_promise(awaited, record));
+                if result.is_err() {
+                    let released = self
+                        .take_async_activation(record)
+                        .map_or(register_count, |stored| stored.registers.len());
+                    self.release_suspended_activation_registers(released);
+                }
+                result
+            }
+            Ok(AsyncStep::Return(value)) => self
+                .resolve_promise(promise, value)
+                .map_err(EvalFailure::Runtime),
+            Ok(AsyncStep::Throw { value, origin }) => self
+                .reject_promise(promise, value, origin)
+                .map_err(EvalFailure::Runtime),
+            Err(failure) => Err(failure),
+        }
+    }
+
+    /// Resolves the awaited value through Promise resolution and attaches the
+    /// two direct resume reactions that point only at the activation record. An
+    /// already-settled Promise costs exactly one microtask tick.
+    fn await_promise(&mut self, awaited: Value, record: Value) -> Result<(), EvalFailure> {
+        let promise = self.promise_resolve(awaited)?;
+        let index = self
+            .runtime_slot(promise)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: promise,
+            }))?;
+        let settled = match &self.heap[index] {
+            HeapEntry::Promise {
+                state: PromiseState::Pending { .. },
+                ..
+            } => None,
+            HeapEntry::Promise {
+                state: PromiseState::Fulfilled { value },
+                ..
+            } => Some((true, *value, ThrowOrigin::Bytecode)),
+            HeapEntry::Promise {
+                state: PromiseState::Rejected { reason, origin },
+                ..
+            } => Some((false, *reason, *origin)),
+            _ => {
+                return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                    value: promise,
+                }));
+            }
+        };
+        if let Some((fulfilled, value, origin)) = settled {
+            self.ensure_microtask_capacity(1)
+                .map_err(EvalFailure::Runtime)?;
+            let reaction = if fulfilled {
+                PromiseReaction::AsyncFulfill { activation: record }
+            } else {
+                PromiseReaction::AsyncReject { activation: record }
+            };
+            self.microtasks.push_back(MicrotaskJob::Reaction {
+                reaction,
+                value,
+                origin,
+            });
+            return Ok(());
+        }
+        self.charge_promise_reactions(2)?;
+        let HeapEntry::Promise {
+            state:
+                PromiseState::Pending {
+                    fulfill_reactions,
+                    reject_reactions,
+                },
+            ..
+        } = &mut self.heap[index]
+        else {
+            unreachable!("pending Promise state was checked before reaction registration");
+        };
+        fulfill_reactions.push(PromiseReaction::AsyncFulfill { activation: record });
+        reject_reactions.push(PromiseReaction::AsyncReject { activation: record });
+        Ok(())
+    }
+
+    fn create_async_activation(&mut self, promise: Value) -> Result<Value, EvalFailure> {
+        self.allocate(HeapEntry::AsyncActivation {
+            activation: None,
+            promise,
+        })
+        .map_err(EvalFailure::Runtime)
+    }
+
+    fn store_async_activation(
+        &mut self,
+        record: Value,
+        activation: SuspendedActivation,
+    ) -> Result<(), EvalFailure> {
+        let index = self
+            .runtime_slot(record)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: record,
+            }))?;
+        let HeapEntry::AsyncActivation {
+            activation: slot, ..
+        } = &mut self.heap[index]
+        else {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: record,
+            }));
+        };
+        *slot = Some(activation);
+        Ok(())
+    }
+
+    /// Takes the one suspended activation out of the record, making resume
+    /// one-shot. A second take (a second resume) is a hard invalid-state error.
+    fn take_async_activation(
+        &mut self,
+        record: Value,
+    ) -> Result<SuspendedActivation, RuntimeErrorKind> {
+        let index = self
+            .runtime_slot(record)?
+            .ok_or(RuntimeErrorKind::InvalidValue { value: record })?;
+        let HeapEntry::AsyncActivation {
+            activation: slot, ..
+        } = &mut self.heap[index]
+        else {
+            return Err(RuntimeErrorKind::InvalidValue { value: record });
+        };
+        slot.take()
+            .ok_or(RuntimeErrorKind::InvalidValue { value: record })
+    }
+
+    fn async_activation_promise(&self, record: Value) -> Result<Value, RuntimeErrorKind> {
+        let index = self
+            .runtime_slot(record)?
+            .ok_or(RuntimeErrorKind::InvalidValue { value: record })?;
+        let HeapEntry::AsyncActivation { promise, .. } = &self.heap[index] else {
+            return Err(RuntimeErrorKind::InvalidValue { value: record });
+        };
+        Ok(*promise)
     }
 
     pub(crate) fn iterator_result(
@@ -6260,7 +7056,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::Date { properties, .. }
                 | HeapEntry::BuiltinIterator { properties, .. }
                 | HeapEntry::Collection { properties, .. }
-                | HeapEntry::Promise { properties, .. } => Ok(ordered_property_keys(properties)),
+                | HeapEntry::Promise { properties, .. }
+                | HeapEntry::Timeout { properties, .. } => Ok(ordered_property_keys(properties)),
                 HeapEntry::Array {
                     elements,
                     properties,
@@ -6328,6 +7125,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::PromiseResolver { .. }
                 | HeapEntry::PromiseFinally { .. }
                 | HeapEntry::PromiseAll { .. }
+                | HeapEntry::AsyncActivation { .. }
                 | HeapEntry::PromiseAllElement { .. } => Ok(Vec::new()),
             },
             None => Ok(Vec::new()),
@@ -6374,7 +7172,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
-            | HeapEntry::Promise { properties, .. } => {
+            | HeapEntry::Promise { properties, .. }
+            | HeapEntry::Timeout { properties, .. } => {
                 properties.get(key).is_some_and(Property::enumerable)
             }
             _ => false,
@@ -6780,9 +7579,11 @@ impl<'a, H: Host> Machine<'a, H> {
                         | HeapEntry::PromiseResolver { .. }
                         | HeapEntry::PromiseFinally { .. }
                         | HeapEntry::PromiseAll { .. }
+                        | HeapEntry::AsyncActivation { .. }
                         | HeapEntry::PromiseAllElement { .. }
                         | HeapEntry::ProcessEnv { .. }
-                        | HeapEntry::Iterator { .. } => Ok(Value::number(f64::NAN)),
+                        | HeapEntry::Iterator { .. }
+                        | HeapEntry::Timeout { .. } => Ok(Value::number(f64::NAN)),
                     },
                     None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                         operation: "coerce host object to number",
@@ -6825,9 +7626,11 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::PromiseResolver { .. }
                     | HeapEntry::PromiseFinally { .. }
                     | HeapEntry::PromiseAll { .. }
+                    | HeapEntry::AsyncActivation { .. }
                     | HeapEntry::PromiseAllElement { .. }
                     | HeapEntry::ProcessEnv { .. }
-                    | HeapEntry::Iterator { .. } => true,
+                    | HeapEntry::Iterator { .. }
+                    | HeapEntry::Timeout { .. } => true,
                 },
                 Ok(None) => true,
                 Err(_) => false,
@@ -6863,9 +7666,11 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::PromiseResolver { .. }
                     | HeapEntry::PromiseFinally { .. }
                     | HeapEntry::PromiseAll { .. }
+                    | HeapEntry::AsyncActivation { .. }
                     | HeapEntry::PromiseAllElement { .. }
                     | HeapEntry::ProcessEnv { .. }
-                    | HeapEntry::Iterator { .. } => "object",
+                    | HeapEntry::Iterator { .. }
+                    | HeapEntry::Timeout { .. } => "object",
                 },
                 _ => "object",
             },
@@ -7013,11 +7818,13 @@ impl<'a, H: Host> Machine<'a, H> {
                         | HeapEntry::PromiseResolver { .. }
                         | HeapEntry::PromiseFinally { .. }
                         | HeapEntry::PromiseAll { .. }
+                        | HeapEntry::AsyncActivation { .. }
                         | HeapEntry::PromiseAllElement { .. }
                         | HeapEntry::ModuleNamespace { .. }
                         | HeapEntry::ExternalModuleNamespace { .. }
                         | HeapEntry::ProcessEnv { .. }
                         | HeapEntry::Iterator { .. }
+                        | HeapEntry::Timeout { .. }
                         | HeapEntry::HashState { .. } => {
                             Ok(EcmaString::from_utf8("[object Object]"))
                         }
@@ -7122,6 +7929,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::PromiseResolver { .. }
                     | HeapEntry::PromiseFinally { .. }
                     | HeapEntry::PromiseAll { .. }
+                    | HeapEntry::AsyncActivation { .. }
                     | HeapEntry::PromiseAllElement { .. }
             ),
             Ok(None) => matches!(value.decode(), Some(Decoded::HeapRef(_))),
@@ -7580,6 +8388,26 @@ mod tests {
         )
     }
 
+    fn async_function(
+        parameters: u32,
+        registers: u32,
+        code: Vec<Instruction>,
+        handlers: Vec<ExceptionHandler>,
+    ) -> Function {
+        Function::new(
+            None,
+            0,
+            parameters,
+            registers,
+            FunctionFlags {
+                is_async: true,
+                is_generator: false,
+            },
+            code,
+            handlers,
+        )
+    }
+
     /// A function with `captures` leading capture registers.
     fn closure_function(
         captures: u32,
@@ -7691,6 +8519,50 @@ mod tests {
     #[derive(Default)]
     struct TestHost;
     impl Host for TestHost {}
+
+    #[test]
+    fn async_await_setup_failure_releases_suspended_registers() {
+        let program = verified(
+            vec![Constant::Undefined],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(1),
+                            src: reg(0),
+                            resume: pc(2),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let limits = Limits {
+            max_microtasks: 0,
+            ..Limits::default()
+        };
+        let mut machine = Machine::new(&program, &mut host, limits);
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+
+        assert!(matches!(
+            machine.call_value(callable, Value::UNDEFINED, &[]),
+            Err(EvalFailure::Runtime(
+                RuntimeErrorKind::MicrotaskQueueLimitExceeded { limit: 0 }
+            ))
+        ));
+        assert_eq!(machine.live_registers, 0);
+    }
 
     fn run_ok(program: &Program<Verified>) -> Execution {
         let mut host = TestHost;
@@ -13274,7 +14146,7 @@ mod tests {
         assert_eq!(drain.executed, 2);
         assert_eq!(
             drain.uncaught,
-            vec![MicrotaskException {
+            vec![CallbackException {
                 value: Value::int32(7),
                 origin: ThrowOrigin::Bytecode,
             }]
@@ -13368,5 +14240,666 @@ mod tests {
         let drain = machine.drain_microtasks().unwrap();
         assert_eq!(drain.executed, 1);
         assert!(machine.microtasks.is_empty());
+    }
+
+    // ---- timers -----------------------------------------------------------
+
+    #[derive(Default)]
+    struct ManualTimerState {
+        live: std::collections::BTreeMap<u64, u64>,
+        reports: std::collections::VecDeque<TimerWakeup>,
+        scheduled: Vec<(u64, u32)>,
+        cancelled: Vec<u64>,
+        fail_schedule: bool,
+        fail_poll: bool,
+    }
+
+    #[derive(Clone, Default)]
+    struct ManualTimerProvider {
+        state: std::rc::Rc<std::cell::RefCell<ManualTimerState>>,
+    }
+
+    impl TimerProvider for ManualTimerProvider {
+        fn schedule(&mut self, id: u64, delay_ms: u32) -> Result<u64, TimerError> {
+            let mut state = self.state.borrow_mut();
+            state.scheduled.push((id, delay_ms));
+            if state.fail_schedule {
+                return Err(TimerError::new("manual schedule failure"));
+            }
+            let deadline = u64::from(delay_ms);
+            state.live.insert(id, deadline);
+            Ok(deadline)
+        }
+
+        fn cancel(&mut self, id: u64) -> Result<bool, TimerError> {
+            let mut state = self.state.borrow_mut();
+            state.cancelled.push(id);
+            Ok(state.live.remove(&id).is_some())
+        }
+
+        fn poll_expired(&mut self, output: &mut Vec<TimerWakeup>) -> Result<(), TimerError> {
+            let mut state = self.state.borrow_mut();
+            if state.fail_poll {
+                return Err(TimerError::new("manual poll failure"));
+            }
+            output.extend(state.reports.drain(..));
+            Ok(())
+        }
+
+        fn wait_expired(&mut self) -> Result<Option<TimerWakeup>, TimerError> {
+            Ok(self.state.borrow_mut().reports.pop_front())
+        }
+
+        fn has_pending(&self) -> bool {
+            !self.state.borrow().live.is_empty()
+        }
+    }
+
+    #[derive(Default)]
+    struct TimerTestHost {
+        provider: ManualTimerProvider,
+    }
+
+    impl Host for TimerTestHost {
+        fn timers(&mut self) -> Option<&mut (dyn TimerProvider + 'static)> {
+            Some(&mut self.provider)
+        }
+    }
+
+    fn timer_program() -> Program<Verified> {
+        verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("a")),
+                Constant::String(EcmaString::from_utf8("b")),
+                Constant::String(EcmaString::from_utf8("this_seen")),
+                Constant::String(EcmaString::from_utf8("arg_seen")),
+                Constant::Int32(1),
+                Constant::Int32(7),
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(4),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(0),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(4),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    1,
+                    2,
+                    vec![
+                        Instruction::LoadThis { dst: reg(1) },
+                        Instruction::StoreGlobal {
+                            name: cid(2),
+                            value: reg(1),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(3),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(5),
+                        },
+                        Instruction::Throw { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        )
+    }
+
+    fn timer_fn(machine: &mut Machine<'_, TimerTestHost>, index: u32) -> Value {
+        machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(index),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap()
+    }
+
+    fn read_global(machine: &Machine<'_, TimerTestHost>, name: &str) -> Option<Value> {
+        machine.globals.get(&EcmaString::from_utf8(name)).copied()
+    }
+
+    fn set_timeout_global(machine: &Machine<'_, TimerTestHost>) -> Value {
+        machine
+            .intrinsics
+            .global("setTimeout")
+            .expect("setTimeout is installed")
+    }
+
+    fn schedule_nested_timer(
+        machine: &mut Machine<'_, TimerTestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let callback = machine
+            .globals
+            .get(&EcmaString::from_utf8("nestedCallback"))
+            .copied()
+            .expect("test installs nested callback");
+        let set_timeout = set_timeout_global(machine);
+        machine.call_value(set_timeout, Value::UNDEFINED, &[callback, Value::int32(1)])?;
+        Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+    }
+
+    fn timer_native(
+        machine: &mut Machine<'_, TimerTestHost>,
+        name: &'static str,
+        handler: crate::intrinsics::BuiltinHandler<TimerTestHost>,
+    ) -> Value {
+        let id = machine
+            .intrinsics
+            .builtins
+            .register(crate::intrinsics::BuiltinDef {
+                name,
+                length: 0,
+                handler,
+            });
+        crate::intrinsics::native_function(&mut machine.heap, id, name, 0)
+    }
+
+    #[test]
+    fn timers_are_absent_without_the_capability() {
+        let program = timer_program();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        assert!(machine.intrinsics.global("setTimeout").is_none());
+        assert!(machine.intrinsics.global("clearTimeout").is_none());
+        assert!(!machine.has_pending_timers());
+        assert_eq!(
+            machine.run_one_expired_timer().unwrap(),
+            TimerRun::default()
+        );
+        assert!(!machine.wait_for_timer_expiry().unwrap());
+    }
+
+    #[test]
+    fn set_timeout_rejects_a_non_callable_callback_before_coercion() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_timeout = set_timeout_global(&machine);
+        let failure = machine
+            .call_value(
+                set_timeout,
+                Value::UNDEFINED,
+                &[Value::int32(3), Value::int32(5)],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            failure,
+            EvalFailure::Throw(ThrowOrigin::TypeError { .. })
+        ));
+        // Nothing was armed, so no delay coercion or provider call happened.
+        assert!(shared.borrow().scheduled.is_empty());
+        assert!(!machine.has_pending_timers());
+    }
+
+    #[test]
+    fn set_timeout_clamps_and_truncates_like_node() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_timeout = set_timeout_global(&machine);
+        let callback = timer_fn(&mut machine, 1);
+        for delay in [
+            Value::int32(0),
+            Value::number(-5.0),
+            Value::number(f64::NAN),
+            Value::number(2_147_483_648.0),
+            Value::int32(2_147_483_647),
+            Value::number(3.9),
+        ] {
+            machine
+                .call_value(set_timeout, Value::UNDEFINED, &[callback, delay])
+                .unwrap();
+        }
+        let delays: Vec<u32> = shared.borrow().scheduled.iter().map(|(_, d)| *d).collect();
+        assert_eq!(delays, vec![1, 1, 1, 1, 2_147_483_647, 3]);
+        // Ids are minted monotonically from 1 and never reused.
+        let ids: Vec<u64> = shared
+            .borrow()
+            .scheduled
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn same_deadline_timers_run_in_registration_order_despite_reverse_reports() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_timeout = set_timeout_global(&machine);
+        let a = timer_fn(&mut machine, 1);
+        let b = timer_fn(&mut machine, 2);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(5)])
+            .unwrap();
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[b, Value::int32(5)])
+            .unwrap();
+        // Host reports the later registration first and in split batches.
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 2,
+            deadline_ms: 5,
+        });
+        let first = machine.run_one_expired_timer().unwrap();
+        assert_eq!(first.executed, 1);
+        assert_eq!(read_global(&machine, "a"), Some(Value::int32(1)));
+        assert_eq!(read_global(&machine, "b"), None);
+        let second = machine.run_one_expired_timer().unwrap();
+        assert_eq!(second.executed, 1);
+        assert_eq!(read_global(&machine, "b"), Some(Value::int32(1)));
+        assert!(!machine.has_pending_timers());
+    }
+
+    #[test]
+    fn a_shorter_deadline_beats_an_older_sequence() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_timeout = set_timeout_global(&machine);
+        let a = timer_fn(&mut machine, 1);
+        let b = timer_fn(&mut machine, 2);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(5)])
+            .unwrap();
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[b, Value::int32(3)])
+            .unwrap();
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 5,
+        });
+        machine.run_one_expired_timer().unwrap();
+        assert_eq!(read_global(&machine, "b"), Some(Value::int32(1)));
+        assert_eq!(read_global(&machine, "a"), None);
+    }
+
+    #[test]
+    fn clear_timeout_prevents_a_ready_timer_and_ignores_stale_ids() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_timeout = set_timeout_global(&machine);
+        let clear_timeout = machine.intrinsics.global("clearTimeout").unwrap();
+        let a = timer_fn(&mut machine, 1);
+        let b = timer_fn(&mut machine, 2);
+        let handle_a = machine
+            .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(3)])
+            .unwrap();
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[b, Value::int32(3)])
+            .unwrap();
+        // Clear the first timer even though the host already reported it.
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 3,
+        });
+        machine
+            .call_value(clear_timeout, Value::UNDEFINED, &[handle_a])
+            .unwrap();
+        assert!(shared.borrow().cancelled.contains(&1));
+        // A stale positive-integer id must not cancel the surviving timer.
+        machine
+            .call_value(clear_timeout, Value::UNDEFINED, &[Value::int32(1)])
+            .unwrap();
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 2,
+            deadline_ms: 3,
+        });
+        let run = machine.run_one_expired_timer().unwrap();
+        assert_eq!(run.executed, 1);
+        assert_eq!(read_global(&machine, "a"), None);
+        assert_eq!(read_global(&machine, "b"), Some(Value::int32(1)));
+    }
+
+    #[test]
+    fn clear_timeout_accepts_a_direct_positive_integer_id() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_timeout = set_timeout_global(&machine);
+        let clear_timeout = machine.intrinsics.global("clearTimeout").unwrap();
+        let a = timer_fn(&mut machine, 1);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(3)])
+            .unwrap();
+        machine
+            .call_value(clear_timeout, Value::UNDEFINED, &[Value::int32(1)])
+            .unwrap();
+        assert!(!machine.has_pending_timers());
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 3,
+        });
+        assert_eq!(machine.run_one_expired_timer().unwrap().executed, 0);
+
+        machine.next_timer_id = Some(u64::MAX);
+        let handle = machine
+            .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(3)])
+            .unwrap();
+        machine
+            .call_value(
+                clear_timeout,
+                Value::UNDEFINED,
+                &[Value::number(u64::MAX as f64)],
+            )
+            .unwrap();
+        assert!(machine.has_pending_timers());
+        machine
+            .call_value(clear_timeout, Value::UNDEFINED, &[handle])
+            .unwrap();
+        assert!(!machine.has_pending_timers());
+        // A no-op clear of an unrelated value never coerces or errors.
+        machine
+            .call_value(clear_timeout, Value::UNDEFINED, &[Value::UNDEFINED])
+            .unwrap();
+    }
+
+    #[test]
+    fn timer_callback_receives_trailing_args_and_the_handle_as_this() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_timeout = set_timeout_global(&machine);
+        let callback = timer_fn(&mut machine, 3);
+        let handle = machine
+            .call_value(
+                set_timeout,
+                Value::UNDEFINED,
+                &[callback, Value::int32(1), Value::int32(42)],
+            )
+            .unwrap();
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 1,
+        });
+        machine.run_one_expired_timer().unwrap();
+        assert_eq!(read_global(&machine, "this_seen"), Some(handle));
+        assert_eq!(read_global(&machine, "arg_seen"), Some(Value::int32(42)));
+    }
+
+    #[test]
+    fn a_callback_created_timer_waits_for_a_later_checkpoint() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_timeout = set_timeout_global(&machine);
+        let nested = timer_fn(&mut machine, 2);
+        machine
+            .globals
+            .insert(EcmaString::from_utf8("nestedCallback"), nested);
+        let creator = timer_native(&mut machine, "schedule nested", schedule_nested_timer);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[creator, Value::int32(1)])
+            .unwrap();
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 1,
+        });
+        assert_eq!(machine.run_one_expired_timer().unwrap().executed, 1);
+        assert_eq!(read_global(&machine, "b"), None);
+        assert!(machine.has_pending_timers());
+        // Even if the provider can report it immediately, it runs only in a
+        // later explicit timer checkpoint.
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 2,
+            deadline_ms: 1,
+        });
+        assert_eq!(machine.run_one_expired_timer().unwrap().executed, 1);
+        assert_eq!(read_global(&machine, "b"), Some(Value::int32(1)));
+    }
+
+    #[test]
+    fn timer_callback_throw_is_reported_and_a_runtime_failure_propagates() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_timeout = set_timeout_global(&machine);
+        let thrower = timer_fn(&mut machine, 4);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[thrower, Value::int32(1)])
+            .unwrap();
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 1,
+        });
+        let run = machine.run_one_expired_timer().unwrap();
+        assert_eq!(run.executed, 1);
+        assert_eq!(
+            run.uncaught,
+            vec![CallbackException {
+                value: Value::int32(7),
+                origin: ThrowOrigin::Bytecode
+            }]
+        );
+
+        // A runtime failure inside the callback stops the checkpoint.
+        let another = timer_fn(&mut machine, 1);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[another, Value::int32(1)])
+            .unwrap();
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 2,
+            deadline_ms: 1,
+        });
+        machine.fuel = 1;
+        let error = machine.run_one_expired_timer().unwrap_err();
+        assert!(matches!(error.kind, RuntimeErrorKind::FuelExhausted { .. }));
+    }
+
+    #[test]
+    fn a_timer_checkpoint_never_drains_microtasks() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_timeout = set_timeout_global(&machine);
+        let queue = machine.intrinsics.global("queueMicrotask").unwrap();
+        let a = timer_fn(&mut machine, 1);
+        let b = timer_fn(&mut machine, 2);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(1)])
+            .unwrap();
+        machine.call_value(queue, Value::UNDEFINED, &[b]).unwrap();
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 1,
+        });
+        let run = machine.run_one_expired_timer().unwrap();
+        assert_eq!(run.executed, 1);
+        assert_eq!(read_global(&machine, "a"), Some(Value::int32(1)));
+        assert_eq!(read_global(&machine, "b"), None);
+        assert_eq!(machine.microtasks.len(), 1);
+        machine.drain_microtasks().unwrap();
+        assert_eq!(read_global(&machine, "b"), Some(Value::int32(1)));
+    }
+
+    #[test]
+    fn timer_reentry_capacity_and_fuel_preserve_state() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(
+            &program,
+            &mut host,
+            Limits {
+                max_timers: 1,
+                ..Limits::default()
+            },
+        );
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_timeout = set_timeout_global(&machine);
+        let a = timer_fn(&mut machine, 1);
+        let b = timer_fn(&mut machine, 2);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(1)])
+            .unwrap();
+        // Capacity is enforced before any provider or table mutation.
+        let capacity = machine
+            .call_value(set_timeout, Value::UNDEFINED, &[b, Value::int32(1)])
+            .unwrap_err();
+        assert!(matches!(
+            capacity,
+            EvalFailure::Runtime(RuntimeErrorKind::TimerCapacityExceeded { limit: 1 })
+        ));
+        assert_eq!(shared.borrow().scheduled.len(), 1);
+
+        // Reentry fails without consuming fuel or touching the ready timer.
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 1,
+        });
+        machine.timer_checkpoint_active = true;
+        let fuel = machine.fuel;
+        let reentry = machine.run_one_expired_timer().unwrap_err();
+        assert!(matches!(
+            reentry.kind,
+            RuntimeErrorKind::TimerCheckpointReentry
+        ));
+        assert_eq!(machine.fuel, fuel);
+        machine.timer_checkpoint_active = false;
+
+        // Fuel is charged before the live record is removed.
+        machine.fuel = 0;
+        let exhausted = machine.run_one_expired_timer().unwrap_err();
+        assert!(matches!(
+            exhausted.kind,
+            RuntimeErrorKind::FuelExhausted { .. }
+        ));
+        assert!(machine.has_pending_timers());
+        machine.fuel = 100;
+        assert_eq!(machine.run_one_expired_timer().unwrap().executed, 1);
+        assert_eq!(read_global(&machine, "a"), Some(Value::int32(1)));
+    }
+
+    #[test]
+    fn a_failed_schedule_never_reuses_its_timer_id() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_timeout = set_timeout_global(&machine);
+        let a = timer_fn(&mut machine, 1);
+        shared.borrow_mut().fail_schedule = true;
+        let failure = machine
+            .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(1)])
+            .unwrap_err();
+        assert!(matches!(
+            failure,
+            EvalFailure::Runtime(RuntimeErrorKind::TimerProviderFailure { .. })
+        ));
+        shared.borrow_mut().fail_schedule = false;
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(1)])
+            .unwrap();
+        let ids: Vec<u64> = shared
+            .borrow()
+            .scheduled
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn wait_for_timer_expiry_promotes_a_reported_timer() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        assert!(!machine.wait_for_timer_expiry().unwrap());
+        let set_timeout = set_timeout_global(&machine);
+        let a = timer_fn(&mut machine, 1);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(1)])
+            .unwrap();
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 1,
+        });
+        assert!(machine.wait_for_timer_expiry().unwrap());
+        assert_eq!(machine.run_one_expired_timer().unwrap().executed, 1);
+        assert_eq!(read_global(&machine, "a"), Some(Value::int32(1)));
     }
 }

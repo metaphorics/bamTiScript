@@ -318,7 +318,7 @@ pub(crate) struct Intrinsics<H: Host> {
 }
 
 impl<H: Host> Intrinsics<H> {
-    pub(crate) fn initialize(heap: &mut Vec<HeapEntry>) -> Self {
+    pub(crate) fn initialize(heap: &mut Vec<HeapEntry>, timers_available: bool) -> Self {
         let object_prototype = push(
             heap,
             HeapEntry::Object {
@@ -351,7 +351,7 @@ impl<H: Host> Intrinsics<H> {
             number_prototype,
             boolean_prototype,
         );
-        builtins::install(heap, &mut globals, &mut builtins);
+        builtins::install(heap, &mut globals, &mut builtins, timers_available);
         crate::host_objects::install(heap, &mut globals, &mut builtins);
 
         Self {

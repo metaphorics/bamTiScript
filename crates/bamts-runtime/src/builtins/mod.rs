@@ -19,15 +19,20 @@ mod regexp;
 pub(crate) use regexp::canonical_source;
 mod string;
 mod symbol;
+mod timers;
 mod uint8array;
 
 pub(crate) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
+    timers_available: bool,
 ) {
     symbol::install(heap, globals, builtins);
     promise::install(heap, globals, builtins);
+    if timers_available {
+        timers::install(heap, globals, builtins);
+    }
     collections::install_iterator_prototype(heap, builtins);
     collections::install_generator_prototype(heap, builtins);
     collections::install(heap, globals, builtins);
@@ -775,6 +780,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 properties,
                 extensible,
                 ..
+            }
+            | HeapEntry::Timeout {
+                properties,
+                extensible,
+                ..
             } => (properties, extensible),
             HeapEntry::ProcessEnv { extensible, .. } => {
                 *extensible = false;
@@ -845,6 +855,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 ..
             }
             | HeapEntry::Collection {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::Timeout {
                 properties,
                 extensible,
                 ..
@@ -926,7 +941,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::RegExp { properties, .. }
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
-            | HeapEntry::Collection { properties, .. } => properties,
+            | HeapEntry::Collection { properties, .. }
+            | HeapEntry::Timeout { properties, .. } => properties,
             _ => return Ok(None),
         };
         Ok(properties.get(key).cloned())
@@ -1011,6 +1027,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 ..
             }
             | HeapEntry::Collection {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::Timeout {
                 properties,
                 extensible,
                 ..
