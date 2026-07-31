@@ -25,7 +25,7 @@ pub enum JitError {
     InvalidLoweredModule(String),
     /// Cranelift could not declare, compile, or finalize the module.
     Module(Box<ModuleError>),
-    /// Lowered IR named a runtime helper outside the pinned 30-entry table.
+    /// Lowered IR named a runtime helper not present in the runtime helper table.
     UnknownHelper { index: u32 },
 }
 
