@@ -47,9 +47,9 @@ use std::fmt;
 
 use bamts_bytecode::{
     AccessorKind, BigIntLiteral, BinaryOp, Constant, ConstantId, EcmaString, EcmaStringBuilder,
-    ExceptionHandler, Function, FunctionFlags, FunctionId, Instruction, IteratorKind,
-    MAX_BIGINT_BYTES, MAX_CONSTANTS, MAX_FUNCTIONS, MAX_INSTRUCTIONS, MAX_REGISTERS, Module,
-    NumberBits, Pc, Register, UnaryOp, Verified, VerifyError,
+    ExceptionHandler, Function, FunctionFlags, FunctionId, Instruction, IteratorCloseMode,
+    IteratorKind, MAX_BIGINT_BYTES, MAX_CONSTANTS, MAX_FUNCTIONS, MAX_INSTRUCTIONS, MAX_REGISTERS,
+    Module, NumberBits, Pc, Register, UnaryOp, Verified, VerifyError,
 };
 
 pub use crate::program::{
@@ -600,9 +600,21 @@ const COMPLETION_THROW: i32 = 2;
 const COMPLETION_BREAK: i32 = 3;
 const COMPLETION_CONTINUE: i32 = 4;
 
+/// What a live `finally_stack` frame protects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FinallyKind {
+    /// A user `try`/`finally` block.
+    Finalizer,
+    /// The iterator cleanup of the `for`/`of` loop whose control target is
+    /// `loop_target`. A `continue` naming that same loop resumes iteration
+    /// without closing, so it bypasses this frame.
+    IteratorCleanup { loop_target: usize },
+}
+
 /// A live `finally` block: the completion state registers and the pending
 /// jumps into the finally entry that must be patched once its PC is known.
 struct FinallyFrame {
+    kind: FinallyKind,
     kind_reg: Register,
     value_reg: Register,
     target_reg: Register,
@@ -1837,90 +1849,231 @@ impl<'a> FunctionContext<'a> {
             body,
             labels,
         } = lowering;
+        let cleanup = kind != IteratorKind::Keys;
+        let scope_depth = self.scopes.len();
+        let control_depth = self.control_targets.len();
+        let finally_depth = self.finally_stack.len();
         self.push_scope();
-        match binding {
-            ForBinding::Variable(declaration)
-                if matches!(
+
+        let result = (|| {
+            if let ForBinding::Variable(declaration) = binding
+                && matches!(
                     declaration.kind,
                     VariableKind::Using | VariableKind::AwaitUsing
-                ) =>
+                )
             {
-                self.pop_scope();
                 return Err(self.unsupported(range, UnsupportedConstruct::UsingDeclaration));
             }
-            _ => {}
-        }
-        let iterator = self.alloc_register(range)?;
-        self.emit(
-            range,
-            Instruction::GetIterator {
-                dst: iterator,
-                src: subject,
-                kind,
-            },
-        )?;
-        let done = self.alloc_register(range)?;
-        let value = self.alloc_register(range)?;
-        let head = self.next_pc();
-        if kind == IteratorKind::Async {
-            // `for await`: step the async iterator to its raw (thenable)
-            // result, suspend until it settles, then read `done`/`value` from
-            // the settled iterator result object. The awaited register is
-            // defined by `Await` on the resume edge, which is exactly the
-            // fall-through pc `IteratorResult` executes at.
-            let step = self.alloc_register(range)?;
+
+            let iterator = self.alloc_register(range)?;
             self.emit(
                 range,
-                Instruction::IteratorStep {
-                    dst: step,
-                    iterator,
+                Instruction::GetIterator {
+                    dst: iterator,
+                    src: subject,
+                    kind,
                 },
             )?;
-            let settled = self.emit_await(range, step)?;
-            self.emit(
+            let completion = if cleanup {
+                let kind_reg = self.alloc_register(range)?;
+                let value_reg = self.alloc_register(range)?;
+                let target_reg = self.alloc_register(range)?;
+                let normal =
+                    self.load_constant(builder, Constant::Int32(COMPLETION_NORMAL), range)?;
+                self.move_to(range, kind_reg, normal)?;
+                self.move_to(range, target_reg, normal)?;
+                let undefined = self.undefined(builder, range)?;
+                self.move_to(range, value_reg, undefined)?;
+                Some((kind_reg, value_reg, target_reg))
+            } else {
+                None
+            };
+
+            let done = self.alloc_register(range)?;
+            let value = self.alloc_register(range)?;
+            let head = self.next_pc();
+            if kind == IteratorKind::Async {
+                // `for await`: step the async iterator to its raw (thenable)
+                // result, suspend until it settles, then read `done`/`value` from
+                // the settled iterator result object. The awaited register is
+                // defined by `Await` on the resume edge, which is exactly the
+                // fall-through pc `IteratorResult` executes at.
+                let step = self.alloc_register(range)?;
+                self.emit(
+                    range,
+                    Instruction::IteratorStep {
+                        dst: step,
+                        iterator,
+                    },
+                )?;
+                let settled = self.emit_await(range, step)?;
+                self.emit(
+                    range,
+                    Instruction::IteratorResult {
+                        done,
+                        value,
+                        result: settled,
+                    },
+                )?;
+            } else {
+                self.emit(
+                    range,
+                    Instruction::IteratorNext {
+                        done,
+                        value,
+                        iterator,
+                    },
+                )?;
+            }
+            let exit_jump = self.emit(
                 range,
-                Instruction::IteratorResult {
-                    done,
-                    value,
-                    result: settled,
+                Instruction::JumpIfTrue {
+                    condition: done,
+                    target: Pc::new(0),
                 },
             )?;
-        } else {
-            self.emit(
-                range,
-                Instruction::IteratorNext {
-                    done,
-                    value,
-                    iterator,
-                },
-            )?;
-        }
-        let exit_jump = self.emit(
-            range,
-            Instruction::JumpIfTrue {
-                condition: done,
-                target: Pc::new(0),
-            },
-        )?;
-        self.push_control_target(range, ControlTargetKind::Iteration, labels)?;
-        // Fresh per-iteration scope for the loop binding.
-        self.push_scope();
-        self.bind_for_binding(builder, binding, value, range)?;
-        let body_result = self.lower_statement(builder, body);
-        self.pop_scope();
-        body_result?;
-        self.emit(range, Instruction::Jump { target: head })?;
-        let exit = self.next_pc();
-        self.patch_jump(exit_jump, exit);
-        let frame = self.control_targets.pop().expect("loop frame is balanced");
-        for jump in frame.breaks {
-            self.patch_jump(jump, exit);
-        }
-        for jump in frame.continues {
-            self.patch_jump(jump, head);
-        }
-        self.pop_scope();
-        Ok(())
+            self.push_control_target(range, ControlTargetKind::Iteration, labels)?;
+            let loop_target = self.control_targets.len() - 1;
+            if let Some((kind_reg, value_reg, target_reg)) = completion {
+                self.finally_stack.push(FinallyFrame {
+                    kind: FinallyKind::IteratorCleanup { loop_target },
+                    kind_reg,
+                    value_reg,
+                    target_reg,
+                    pending: Vec::new(),
+                    control_depth: self.control_targets.len(),
+                    targets: Vec::new(),
+                });
+            }
+
+            let body_start = self.next_pc();
+            // Fresh per-iteration scope for the loop binding.
+            self.push_scope();
+            let body_result = self
+                .bind_for_binding(builder, binding, value, range)
+                .and_then(|()| self.lower_statement(builder, body));
+            self.pop_scope();
+            body_result?;
+            self.emit(range, Instruction::Jump { target: head })?;
+            let body_end = self.next_pc();
+
+            if let Some((kind_reg, value_reg, target_reg)) = completion {
+                let handler = if body_end.get() != body_start.get() {
+                    let catch_register = self.alloc_register(range)?;
+                    let handler_pc = self.next_pc();
+                    self.push_finally_completion(
+                        builder,
+                        range,
+                        COMPLETION_THROW,
+                        Some(catch_register),
+                    )?;
+                    Some((handler_pc, catch_register))
+                } else {
+                    None
+                };
+
+                let frame = self
+                    .finally_stack
+                    .pop()
+                    .expect("iterator cleanup frame present");
+                let cleanup_pc = self.next_pc();
+                for jump in frame.pending {
+                    self.patch_jump(jump, cleanup_pc);
+                }
+                if let Some((handler_pc, catch_register)) = handler {
+                    self.handlers.push(ExceptionHandler {
+                        start: body_start,
+                        end: body_end,
+                        handler: handler_pc,
+                        catch_register,
+                    });
+                }
+
+                let propagate =
+                    self.emit_int32_guard(builder, range, kind_reg, COMPLETION_THROW)?;
+                let preserve_result = self.alloc_register(range)?;
+                let preserve_called = self.alloc_register(range)?;
+                self.emit(
+                    range,
+                    Instruction::IteratorClose {
+                        result: preserve_result,
+                        called: preserve_called,
+                        iterator,
+                        mode: IteratorCloseMode::PreserveAbrupt,
+                    },
+                )?;
+                let swallow = if kind == IteratorKind::Async {
+                    let await_pc = self.next_pc();
+                    self.emit_await(range, preserve_result)?;
+                    let catch_register = self.alloc_register(range)?;
+                    Some((await_pc, catch_register))
+                } else {
+                    None
+                };
+                let dispatch_jump = self.emit(range, Instruction::Jump { target: Pc::new(0) })?;
+
+                let propagate_pc = self.next_pc();
+                self.patch_jump(propagate, propagate_pc);
+                let propagate_result = self.alloc_register(range)?;
+                let propagate_called = self.alloc_register(range)?;
+                self.emit(
+                    range,
+                    Instruction::IteratorClose {
+                        result: propagate_result,
+                        called: propagate_called,
+                        iterator,
+                        mode: IteratorCloseMode::Propagate,
+                    },
+                )?;
+                let checked_result = if kind == IteratorKind::Async {
+                    self.emit_await(range, propagate_result)?
+                } else {
+                    propagate_result
+                };
+                self.emit(
+                    range,
+                    Instruction::RequireCloseResult {
+                        result: checked_result,
+                        called: propagate_called,
+                    },
+                )?;
+
+                let dispatch_pc = self.next_pc();
+                self.patch_jump(dispatch_jump, dispatch_pc);
+                if let Some((await_pc, catch_register)) = swallow {
+                    self.handlers.push(ExceptionHandler {
+                        start: await_pc,
+                        end: Pc::new(await_pc.get() + 1),
+                        handler: dispatch_pc,
+                        catch_register,
+                    });
+                }
+                self.emit_finally_dispatch(
+                    builder,
+                    range,
+                    kind_reg,
+                    value_reg,
+                    target_reg,
+                    &frame.targets,
+                )?;
+            }
+
+            let exit = self.next_pc();
+            self.patch_jump(exit_jump, exit);
+            let frame = self.control_targets.pop().expect("loop frame is balanced");
+            for jump in frame.breaks {
+                self.patch_jump(jump, exit);
+            }
+            for jump in frame.continues {
+                self.patch_jump(jump, head);
+            }
+            Ok(())
+        })();
+
+        self.scopes.truncate(scope_depth);
+        self.control_targets.truncate(control_depth);
+        self.finally_stack.truncate(finally_depth);
+        result
     }
 
     fn bind_for_binding(
@@ -1994,9 +2147,10 @@ impl<'a> FunctionContext<'a> {
         value: Option<Register>,
         target: Option<usize>,
     ) -> Result<bool, LowerError> {
-        let Some((kind_reg, value_reg, target_reg, depth)) =
+        let Some((frame_kind, kind_reg, value_reg, target_reg, depth)) =
             self.finally_stack.last().map(|frame| {
                 (
+                    frame.kind,
                     frame.kind_reg,
                     frame.value_reg,
                     frame.target_reg,
@@ -2006,6 +2160,12 @@ impl<'a> FunctionContext<'a> {
         else {
             return Ok(false);
         };
+        if let FinallyKind::IteratorCleanup { loop_target } = frame_kind
+            && kind == COMPLETION_CONTINUE
+            && target == Some(loop_target)
+        {
+            return Ok(false);
+        }
         if target.is_some_and(|target| target >= depth) {
             return Ok(false);
         }
@@ -2202,6 +2362,7 @@ impl<'a> FunctionContext<'a> {
         let undefined = self.undefined(builder, range)?;
         self.move_to(range, value_reg, undefined)?;
         self.finally_stack.push(FinallyFrame {
+            kind: FinallyKind::Finalizer,
             kind_reg,
             value_reg,
             target_reg,
@@ -7165,8 +7326,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        BigIntTextError, LowerError, LowerErrorKind, LowerOptions, UnsupportedConstruct,
-        canonical_bigint_text, cook_escapes, lower,
+        BigIntTextError, IteratorCloseMode, LowerError, LowerErrorKind, LowerOptions,
+        UnsupportedConstruct, canonical_bigint_text, cook_escapes, lower,
     };
     use crate::parser::parse;
     use crate::scanner::scan;
@@ -7307,7 +7468,8 @@ mod tests {
     }
 
     use bamts_bytecode::{
-        BinaryOp, Constant, DecodeLimits, Instruction, Module, Register, Verified, decode_verified,
+        BinaryOp, Constant, DecodeLimits, Instruction, Module, Pc, Register, Verified,
+        decode_verified,
     };
 
     fn lower_js_result(src: &str) -> Result<Module<Verified>, LowerError> {
@@ -8218,6 +8380,168 @@ mod tests {
             i,
             Instruction::IteratorNext { .. }
         )));
+    }
+
+    #[test]
+    fn for_of_emits_an_iterator_close_cleanup() {
+        let module = lower_js("for (const v of [1, 2]) { break; }");
+        let code = module.functions()[0].code();
+        assert!(any_instruction(&module, |instruction| matches!(
+            instruction,
+            Instruction::IteratorClose {
+                mode: IteratorCloseMode::PreserveAbrupt,
+                ..
+            }
+        )));
+        let preserve_called = code
+            .iter()
+            .find_map(|instruction| match instruction {
+                Instruction::IteratorClose {
+                    called,
+                    mode: IteratorCloseMode::PreserveAbrupt,
+                    ..
+                } => Some(called),
+                _ => None,
+            })
+            .expect("preserve close exists");
+        assert!(
+            !code.iter().any(|instruction| matches!(
+                instruction,
+                Instruction::RequireCloseResult { called, .. }
+                    if called == preserve_called
+            )),
+            "preserve close never validates the return result"
+        );
+        assert!(
+            code.windows(2).any(|window| {
+                matches!(
+                    (&window[0], &window[1]),
+                    (
+                        Instruction::IteratorClose {
+                            result,
+                            called,
+                            mode: IteratorCloseMode::Propagate,
+                            ..
+                        },
+                        Instruction::RequireCloseResult {
+                            result: checked,
+                            called: checked_called,
+                        }
+                    ) if result == checked && called == checked_called
+                )
+            }),
+            "sync propagate close validates its raw result immediately"
+        );
+        assert!(!code.windows(2).any(|window| {
+            matches!(
+                (&window[0], &window[1]),
+                (
+                    Instruction::IteratorClose {
+                        mode: IteratorCloseMode::PreserveAbrupt,
+                        ..
+                    },
+                    Instruction::RequireCloseResult { .. }
+                )
+            )
+        }));
+        assert_round_trips(&module);
+    }
+
+    #[test]
+    fn for_in_does_not_close_its_key_iterator() {
+        let module = lower_js("for (const k in obj) { break; }");
+        assert!(!any_instruction(&module, |instruction| matches!(
+            instruction,
+            Instruction::IteratorClose { .. }
+        )));
+        assert_round_trips(&module);
+    }
+
+    #[test]
+    fn for_await_awaits_the_close_result() {
+        let module = lower_js("async function f() { for await (const x of xs) { break; } }");
+        let function = module
+            .functions()
+            .iter()
+            .find(|function| {
+                function.code().iter().any(|instruction| {
+                    matches!(
+                        instruction,
+                        Instruction::IteratorClose {
+                            mode: IteratorCloseMode::PreserveAbrupt,
+                            ..
+                        }
+                    )
+                })
+            })
+            .expect("async loop function has iterator cleanup");
+        let code = function.code();
+        let (preserve_called, preserve_await_pc) = code
+            .windows(3)
+            .enumerate()
+            .find_map(|(pc, window)| match (&window[0], &window[1], &window[2]) {
+                (
+                    Instruction::IteratorClose {
+                        result,
+                        called,
+                        mode: IteratorCloseMode::PreserveAbrupt,
+                        ..
+                    },
+                    Instruction::Await { src, .. },
+                    after,
+                ) if result == src && !matches!(after, Instruction::RequireCloseResult { .. }) => {
+                    Some((called, Pc::new(pc as u32 + 1)))
+                }
+                _ => None,
+            })
+            .expect("preserve close awaits without validating");
+        assert!(
+            !code.iter().any(|instruction| matches!(
+                instruction,
+                Instruction::RequireCloseResult { called, .. }
+                    if called == preserve_called
+            )),
+            "preserve called flag is never consumed by close-result validation"
+        );
+
+        let propagate_close = code.windows(3).any(|window| {
+            matches!(
+                (&window[0], &window[1], &window[2]),
+                (
+                    Instruction::IteratorClose {
+                        result,
+                        called,
+                        mode: IteratorCloseMode::Propagate,
+                        ..
+                    },
+                    Instruction::Await { dst, src, .. },
+                    Instruction::RequireCloseResult {
+                        result: checked,
+                        called: checked_called,
+                    }
+                ) if result == src && dst == checked && called == checked_called
+            )
+        });
+        assert!(
+            propagate_close,
+            "async propagate validates the settled close result"
+        );
+        assert!(
+            function.handlers().iter().any(|handler| {
+                handler.start == preserve_await_pc
+                    && handler.end.get() == preserve_await_pc.get() + 1
+            }),
+            "preserve rejection handler covers exactly one Await"
+        );
+        assert_round_trips(&module);
+    }
+
+    #[test]
+    fn for_of_cleanup_round_trips() {
+        let module = lower_js(
+            "function f(xs: any, ys: any) { outer: for (const x of xs) { for (const y of ys) { if (y) continue outer; if (x) break outer; return y; } } }",
+        );
+        assert_round_trips(&module);
     }
 
     #[test]

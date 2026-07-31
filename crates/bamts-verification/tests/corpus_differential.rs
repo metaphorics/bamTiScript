@@ -226,6 +226,199 @@ fn for_await_sync_thenable_unwrap_and_iterator_result_not_assimilated() {
 }
 
 #[test]
+fn iterator_close_matches_node_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("iterator-close-{}", process::id());
+    let entrypoint = format!("target/{id}.js");
+    let path = root.join(&entrypoint);
+    fs::write(
+        &path,
+        r#"(async () => {
+  const trace = [];
+  function sync(tag, values, closeError, closeResult) {
+    let index = 0;
+    return {
+      [Symbol.iterator]() { return this; },
+      next() {
+        return index < values.length
+          ? { value: values[index++], done: false }
+          : { value: undefined, done: true };
+      },
+      return() {
+        trace.push(`${tag}:return`);
+        if (closeError !== undefined) throw closeError;
+        if (closeResult !== undefined) return closeResult;
+        return { value: undefined, done: true };
+      },
+    };
+  }
+
+  for (const value of sync("break", [1])) {
+    trace.push(`break:body:${value}`);
+    break;
+  }
+  for (const value of sync("normal", [1, 2])) {
+    trace.push(`normal:body:${value}`);
+  }
+  for (const value of sync("continue", [1, 2])) {
+    trace.push(`continue:body:${value}`);
+    continue;
+  }
+  for (const value of [1]) {
+    trace.push(`absent:body:${value}`);
+    break;
+  }
+  try {
+    for (const value of sync("primitive", [1], undefined, 1)) {
+      trace.push(`primitive:body:${value}`);
+      break;
+    }
+  } catch (_error) {
+    trace.push("primitive:catch");
+  }
+  function returnFromLoop() {
+    for (const value of sync("function", [1])) {
+      try {
+        trace.push(`function:body:${value}`);
+        return "returned";
+      } finally {
+        trace.push("function:finally");
+      }
+    }
+  }
+  trace.push(`function:result:${returnFromLoop()}`);
+  try {
+    const bindingValue = {
+      get value() {
+        trace.push("binding:get");
+        throw "binding-error";
+      },
+    };
+    for (const { value } of sync("binding", [bindingValue])) {
+      trace.push(`binding:body:${value}`);
+    }
+  } catch (_error) {
+    trace.push("binding:catch");
+  }
+  exit: {
+    for (const _value of sync("label-break", [1])) {
+      try {
+        trace.push("label-break:body");
+        break exit;
+      } finally {
+        trace.push("label-break:finally");
+      }
+    }
+  }
+  outer: for (let i = 0; i < 2; i++) {
+    for (const _value of sync(`label:${i}`, [i])) {
+      try {
+        trace.push(`label:body:${i}`);
+        continue outer;
+      } finally {
+        trace.push(`label:finally:${i}`);
+      }
+    }
+  }
+  try {
+    for (const _value of sync("throw", [1], "close-error")) {
+      try {
+        trace.push("throw:body");
+        throw "body-error";
+      } finally {
+        trace.push("throw:finally");
+      }
+    }
+  } catch (error) {
+    trace.push(`throw:catch:${error}`);
+  }
+  for await (const value of [1]) {
+    trace.push(`async-absent:body:${value}`);
+    break;
+  }
+  const asyncPrimitive = {
+    [Symbol.asyncIterator]() {
+      return {
+        next() { return Promise.resolve({ value: 1, done: false }); },
+        return() {
+          trace.push("async-primitive:return");
+          return Promise.resolve(1);
+        },
+      };
+    },
+  };
+  try {
+    for await (const value of asyncPrimitive) {
+      trace.push(`async-primitive:body:${value}`);
+      break;
+    }
+  } catch (_error) {
+    trace.push("async-primitive:catch");
+  }
+  const asyncIterable = {
+    [Symbol.asyncIterator]() {
+      let started = false;
+      return {
+        next() {
+          if (started) return Promise.resolve({ value: undefined, done: true });
+          started = true;
+          return Promise.resolve({ value: 1, done: false });
+        },
+        return() {
+          trace.push("async:return");
+          return Promise.resolve().then(() => {
+            trace.push("async:return-reject");
+            throw "async-close-error";
+          });
+        },
+      };
+    },
+  };
+  try {
+    for await (const value of asyncIterable) {
+      try {
+        trace.push(`async:body:${value}`);
+        throw "async-body-error";
+      } finally {
+        trace.push("async:finally");
+      }
+    }
+  } catch (error) {
+    trace.push(`async:catch:${error}`);
+  }
+  console.log(trace.join("\n"));
+})();"#,
+    )
+    .expect("write iterator-close fixture");
+    let spec = CaseSpec {
+        id,
+        repository: "local".to_owned(),
+        commit: "0".repeat(40),
+        license: "UNLICENSED".to_owned(),
+        source_dir: "target".to_owned(),
+        entrypoint,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+    };
+    let oracle = NodeOracle::discover(&root).expect("the pinned Node oracle must be available");
+    let bamts = BamtsRunner::new(&root);
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_file(path).expect("remove iterator-close fixture");
+    assert!(
+        failures.is_empty(),
+        "iterator-close differential failures:\n{}",
+        failures.join("\n\n")
+    );
+}
+
+#[test]
 fn declaration_owned_self_captures_match_node_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("task-106-self-captures-{}", process::id());

@@ -18,7 +18,7 @@ use crate::{
 
 const HELPER_COUNT: u32 = bamts_native::HELPER_COUNT;
 const AOT_MAGIC: u64 = u64::from_le_bytes(*b"BMTSAOT1");
-const AOT_ABI_VERSION: u32 = 3;
+const AOT_ABI_VERSION: u32 = 4;
 const UNIT_DESCRIPTOR_BYTES: usize = 16;
 const PROGRAM_DESCRIPTOR_BYTES: usize = 56;
 
@@ -563,7 +563,7 @@ mod tests {
         let (descriptor, descriptor_index) = symbol_bytes(&file, PROGRAM_DESCRIPTOR_SYMBOL);
         assert_eq!(descriptor.len(), PROGRAM_DESCRIPTOR_BYTES);
         assert_eq!(&descriptor[0..8], b"BMTSAOT1");
-        assert_eq!(u32::from_le_bytes(descriptor[8..12].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(descriptor[8..12].try_into().unwrap()), 4);
         assert_eq!(
             u64::from_le_bytes(descriptor[24..32].try_into().unwrap()),
             canonical.len() as u64

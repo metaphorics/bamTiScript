@@ -325,6 +325,8 @@ fn helper_address(helper: Helper) -> *const u8 {
         Helper::ConsumeFuel => bamts_native::bamts_consume_fuel as *const u8,
         Helper::IteratorStep => bamts_native::bamts_iterator_step as *const u8,
         Helper::IteratorResult => bamts_native::bamts_iterator_result as *const u8,
+        Helper::IteratorClose => bamts_native::bamts_iterator_close as *const u8,
+        Helper::RequireCloseResult => bamts_native::bamts_require_close_result as *const u8,
     }
 }
 

@@ -119,6 +119,8 @@
 //! | `IteratorNext`      | [`Helper::IteratorNext`] (`iterator`) → `done` + `value`   |
 //! | `IteratorStep`      | [`Helper::IteratorStep`] (`iterator`) → `dst` (raw result) |
 //! | `IteratorResult`    | [`Helper::IteratorResult`] (`result`) → `done` + `value`   |
+//! | `IteratorClose`     | [`Helper::IteratorClose`] (`iterator`, mode) → `result` + `called` |
+//! | `RequireCloseResult` | [`Helper::RequireCloseResult`] (`result`, `called`)               |
 //! | `Import`            | [`Helper::Import`] by string `specifier` → `dst`          |
 //! | `Export`            | [`Helper::Export`] (string `name`, `src`)                 |
 //! | `Jump`              | unconditional branch                                       |
@@ -186,8 +188,8 @@ use std::error::Error;
 use std::fmt;
 
 use bamts_bytecode::{
-    AccessorKind, BinaryOp, ExceptionHandler, FunctionId, Instruction, IteratorKind, Module,
-    ModuleId, Pc, Program, Register, UnaryOp, Verified,
+    AccessorKind, BinaryOp, ExceptionHandler, FunctionId, Instruction, IteratorCloseMode,
+    IteratorKind, Module, ModuleId, Pc, Program, Register, UnaryOp, Verified,
 };
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
@@ -304,6 +306,8 @@ const _: () = {
 /// | 31 | `CreateCell`        | —                                            |
 /// | 32 | `IteratorStep`      | `iterator: i64` (raw, possibly-promised result) |
 /// | 33 | `IteratorResult`    | `result: i64, done_reg: i32, value_reg: i32` (two-write) |
+/// | 34 | `IteratorClose`     | `iterator: i64, mode: i32, called_reg: i32`  |
+/// | 35 | `RequireCloseResult` | `result: i64, called: i64`                  |
 ///
 /// Every helper except [`Helper::Truthy`] returns a
 /// `bamts_native::CompletionTag`. [`Helper::Truthy`] returns `0`/`1`.
@@ -419,6 +423,15 @@ pub enum Helper {
     /// [`Helper::IteratorNext`]. On `Throw`, the thrown handle is in
     /// `out.value` and neither slot is written.
     IteratorResult,
+    /// `bamts_iterator_close(frame, iterator, mode, called_reg, out)`: close
+    /// `iterator`, writing whether callable `return` was invoked into
+    /// `handles[called_reg]` before invocation and the raw close result into
+    /// `out.value`; `mode` selects whether a user close throw propagates or
+    /// preserves an existing abrupt completion.
+    IteratorClose,
+    /// `bamts_require_close_result(frame, result, called, out)`: throw when
+    /// `called` is true and `result` is not an object.
+    RequireCloseResult,
 }
 
 impl Helper {
@@ -457,6 +470,8 @@ impl Helper {
             Helper::IteratorNext => "bamts_iterator_next",
             Helper::IteratorStep => "bamts_iterator_step",
             Helper::IteratorResult => "bamts_iterator_result",
+            Helper::IteratorClose => "bamts_iterator_close",
+            Helper::RequireCloseResult => "bamts_require_close_result",
             Helper::Export => "bamts_export",
             Helper::ConsumeFuel => "bamts_consume_fuel",
             Helper::CreateCell => "bamts_create_cell",
@@ -502,6 +517,8 @@ impl Helper {
             Helper::CreateCell => 31,
             Helper::IteratorStep => 32,
             Helper::IteratorResult => 33,
+            Helper::IteratorClose => 34,
+            Helper::RequireCloseResult => 35,
         }
     }
 
@@ -544,6 +561,8 @@ impl Helper {
             31 => Some(Helper::CreateCell),
             32 => Some(Helper::IteratorStep),
             33 => Some(Helper::IteratorResult),
+            34 => Some(Helper::IteratorClose),
+            35 => Some(Helper::RequireCloseResult),
             _ => None,
         }
     }
@@ -613,6 +632,10 @@ impl Helper {
             Helper::IteratorNext | Helper::IteratorResult => {
                 &[types::I64, types::I64, types::I32, types::I32, types::I64]
             }
+            // (frame, iterator, mode, called_reg, out)
+            Helper::IteratorClose => &[types::I64, types::I64, types::I32, types::I32, types::I64],
+            // (frame, result, called, out)
+            Helper::RequireCloseResult => &[types::I64, types::I64, types::I64, types::I64],
             // (frame, value)
             Helper::Truthy => &[types::I64, types::I64],
         }
@@ -680,6 +703,15 @@ const fn iterator_kind_selector(kind: IteratorKind) -> i64 {
         IteratorKind::Sync => 0,
         IteratorKind::Async => 1,
         IteratorKind::Keys => 2,
+    }
+}
+
+/// The ABI selector for iterator close behavior, passed as the `mode` argument
+/// to [`Helper::IteratorClose`]. This is the stable codegen-side encoding.
+const fn iterator_close_mode_selector(mode: IteratorCloseMode) -> i64 {
+    match mode {
+        IteratorCloseMode::Propagate => 0,
+        IteratorCloseMode::PreserveAbrupt => 1,
     }
 }
 
@@ -1457,6 +1489,32 @@ impl<'a> Lowering<'a> {
                 );
                 self.route_completion(pc, tag, None);
             }
+            Instruction::IteratorClose {
+                result,
+                called,
+                iterator,
+                mode,
+            } => {
+                let handles = self.load_handles();
+                let iterator_value = self.load_register(handles, iterator);
+                let selector = self.iconst32(iterator_close_mode_selector(mode));
+                let called_reg = self.iconst32(i64::from(called.get()));
+                let tag = self.call_helper(
+                    Helper::IteratorClose,
+                    &[self.frame, iterator_value, selector, called_reg, self.out],
+                );
+                self.route_completion(pc, tag, Some(result));
+            }
+            Instruction::RequireCloseResult { result, called } => {
+                let handles = self.load_handles();
+                let result_value = self.load_register(handles, result);
+                let called_value = self.load_register(handles, called);
+                let tag = self.call_helper(
+                    Helper::RequireCloseResult,
+                    &[self.frame, result_value, called_value, self.out],
+                );
+                self.route_completion(pc, tag, None);
+            }
             Instruction::Import { dst, specifier } => {
                 let specifier_id = self.iconst32(i64::from(specifier.get()));
                 let tag = self.call_helper(Helper::Import, &[self.frame, specifier_id, self.out]);
@@ -1831,6 +1889,8 @@ fn routes_to_handler(instruction: Instruction) -> bool {
         | Instruction::IteratorNext { .. }
         | Instruction::IteratorStep { .. }
         | Instruction::IteratorResult { .. }
+        | Instruction::IteratorClose { .. }
+        | Instruction::RequireCloseResult { .. }
         | Instruction::Import { .. }
         | Instruction::Export { .. }
         | Instruction::Suspend { .. }
@@ -1893,6 +1953,8 @@ fn is_inline_instruction(instruction: Instruction) -> bool {
         | Instruction::IteratorNext { .. }
         | Instruction::IteratorStep { .. }
         | Instruction::IteratorResult { .. }
+        | Instruction::IteratorClose { .. }
+        | Instruction::RequireCloseResult { .. }
         | Instruction::Import { .. }
         | Instruction::Export { .. } => false,
     }
@@ -1990,6 +2052,8 @@ impl NormalSuccessors for Instruction {
             | Instruction::IteratorNext { .. }
             | Instruction::IteratorStep { .. }
             | Instruction::IteratorResult { .. }
+            | Instruction::IteratorClose { .. }
+            | Instruction::RequireCloseResult { .. }
             | Instruction::Import { .. }
             | Instruction::Export { .. } => visit(pc + 1),
         }
@@ -2142,7 +2206,7 @@ mod tests {
     #[test]
     fn helper_index_table_is_a_stable_bijection() {
         // Every helper round-trips through its external index, and the table
-        // covers a dense 0..=33 range with unique symbols.
+        // covers a dense 0..=35 range with unique symbols.
         let helpers = [
             Helper::LoadConstant,
             Helper::Unary,
@@ -2178,6 +2242,8 @@ mod tests {
             Helper::CreateCell,
             Helper::IteratorStep,
             Helper::IteratorResult,
+            Helper::IteratorClose,
+            Helper::RequireCloseResult,
         ];
         let mut symbols = BTreeSet::new();
         for (expected_index, helper) in helpers.iter().copied().enumerate() {
@@ -2190,8 +2256,42 @@ mod tests {
             );
             assert!(symbols.insert(helper.symbol()), "unique symbol {helper:?}");
         }
-        assert_eq!(symbols.len(), 34);
-        assert_eq!(Helper::from_external_index(34), None);
+        assert_eq!(symbols.len(), 36);
+        assert_eq!(Helper::from_external_index(36), None);
+    }
+    #[test]
+    fn iterator_close_helpers_use_the_pinned_abis() {
+        let module = single(func(
+            3,
+            vec![
+                load_undef(reg(0)),
+                Instruction::IteratorClose {
+                    result: reg(1),
+                    called: reg(2),
+                    iterator: reg(0),
+                    mode: IteratorCloseMode::Propagate,
+                },
+                Instruction::RequireCloseResult {
+                    result: reg(1),
+                    called: reg(2),
+                },
+                Instruction::Halt,
+            ],
+            Vec::new(),
+        ));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::IteratorClose));
+        assert!(helpers.contains(&Helper::RequireCloseResult));
+        assert_eq!(Helper::IteratorClose.external_index(), 34);
+        assert_eq!(Helper::RequireCloseResult.external_index(), 35);
+        assert!(
+            clif.contains("(i64, i64, i32, i32, i64) -> i32"),
+            "iterator-close helper sig wrong:\n{clif}"
+        );
+        assert!(
+            clif.contains("(i64, i64, i64, i64) -> i32"),
+            "require-close-result helper sig wrong:\n{clif}"
+        );
     }
 
     #[test]

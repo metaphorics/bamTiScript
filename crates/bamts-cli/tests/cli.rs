@@ -279,6 +279,57 @@ continue-outer:1,crossed-inner:0,crossed-outer:0,switch\n";
 }
 
 #[test]
+fn aot_and_jit_close_iterators_after_finally_and_preserve_body_throw() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        r#"const trace: string[] = [];
+const iterable = {
+    [Symbol.iterator]() {
+        return {
+            next() { return { value: 1, done: false }; },
+            return() {
+                trace.push("return()");
+                throw "close-error";
+            },
+        };
+    },
+};
+try {
+    for (const value of iterable) {
+        try {
+            trace.push("body:" + value);
+            throw "body-error";
+        } finally {
+            trace.push("finally");
+        }
+    }
+} catch (error) {
+    trace.push("catch:" + error);
+}
+process.stdout.write(trace.join(",") + "\n");
+"#,
+    );
+
+    let expected = b"body:1,finally,return(),catch:body-error\n";
+    for target in ["jit", "aot"] {
+        let output = project
+            .command()
+            .args(["run", "--target", target, "main.ts"])
+            .current_dir(&project.path)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("bamts {target} iterator-close ordering program starts: {error}")
+            });
+        assert_success(
+            &output,
+            &format!("bamts {target} iterator-close ordering program"),
+        );
+        assert_eq!(output.stdout, expected, "{target}");
+    }
+}
+
+#[test]
 fn aot_and_jit_share_escaped_identifier_identity() {
     let project = ScratchDirectory::new();
     project.write("dependency.ts", "export const \\u0076alue = 41;\n");

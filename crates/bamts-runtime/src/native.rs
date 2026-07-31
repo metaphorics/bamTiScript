@@ -126,6 +126,14 @@ fn iterator_kind_to_selector(kind: bamts_bytecode::IteratorKind) -> u32 {
     }
 }
 
+fn iterator_close_mode_to_selector(mode: bamts_bytecode::IteratorCloseMode) -> u32 {
+    use bamts_bytecode::IteratorCloseMode;
+    match mode {
+        IteratorCloseMode::Propagate => 0,
+        IteratorCloseMode::PreserveAbrupt => 1,
+    }
+}
+
 fn accessor_to_selector(kind: bamts_bytecode::AccessorKind) -> u32 {
     use bamts_bytecode::AccessorKind;
     match kind {
@@ -1026,6 +1034,26 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 },
                 None,
             ),
+            Instruction::IteratorClose {
+                result,
+                called,
+                iterator,
+                mode,
+            } => (
+                HelperCall::IteratorClose {
+                    iterator: register(iterator),
+                    mode: iterator_close_mode_to_selector(mode),
+                    called_reg: called.get(),
+                },
+                Some(result.get()),
+            ),
+            Instruction::RequireCloseResult { result, called } => (
+                HelperCall::RequireCloseResult {
+                    result: register(result),
+                    called: register(called),
+                },
+                None,
+            ),
             Instruction::Import { dst, specifier } => (
                 HelperCall::Import {
                     specifier: specifier.get(),
@@ -1565,6 +1593,41 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             }
             Err(failure) => Err(self.failure_outcome(failure)),
         }
+    }
+
+    fn close_iterator_active(
+        &self,
+        frame: &mut NativeFrame<'_>,
+        iterator: Value,
+        mode: u32,
+        called_reg: u32,
+    ) -> Result<Value, InvokeOutcome> {
+        frame.set_register(called_reg, Value::FALSE);
+        let preserve_abrupt = mode == 1;
+        let map_outcome = |outcome| match outcome {
+            InvokeOutcome::Value(value) => Ok(value),
+            InvokeOutcome::Fatal => Err(InvokeOutcome::Fatal),
+            InvokeOutcome::Threw(_, _) if preserve_abrupt => Ok(Value::UNDEFINED),
+            InvokeOutcome::Threw(value, origin) => Err(InvokeOutcome::Threw(value, origin)),
+        };
+        let target = match self.machine.borrow_mut().iterator_close_target(iterator) {
+            Ok(Some(target)) => target,
+            Ok(None) => return Ok(Value::UNDEFINED),
+            Err(failure) => return map_outcome(self.failure_outcome(failure)),
+        };
+        let close = match self.get_ascii(target, "return") {
+            InvokeOutcome::Value(close) => close,
+            outcome => return map_outcome(outcome),
+        };
+        let callable = match self.machine.borrow().is_callable(close) {
+            Ok(callable) => callable,
+            Err(failure) => return map_outcome(self.failure_outcome(failure)),
+        };
+        if !callable {
+            return Ok(Value::UNDEFINED);
+        }
+        frame.set_register(called_reg, Value::TRUE);
+        map_outcome(self.invoke_callee(close, target, &[], Value::UNDEFINED))
     }
 
     fn iterator_result_active(&self, result: Value) -> Result<(bool, Value), InvokeOutcome> {
@@ -2851,6 +2914,23 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 }
                 Err(outcome) => self.outcome_result(outcome),
             },
+            HelperCall::IteratorClose {
+                iterator,
+                mode,
+                called_reg,
+            } => match self.close_iterator_active(frame, iterator, mode, called_reg) {
+                Ok(result) => HelperResult::normal(result),
+                Err(outcome) => self.outcome_result(outcome),
+            },
+            HelperCall::RequireCloseResult { result, called } => {
+                if called == Value::TRUE && !self.machine.borrow().is_object(result) {
+                    self.fail(EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "iterator.return() returned a non-object",
+                    }))
+                } else {
+                    HelperResult::normal(Value::UNDEFINED)
+                }
+            }
             HelperCall::Export { .. } => self.fail(EvalFailure::Throw(ThrowOrigin::TypeError {
                 operation: "export outside an engine-owned module registry",
             })),
@@ -2899,6 +2979,8 @@ fn is_inline_instruction(instruction: Instruction) -> bool {
         | Instruction::IteratorNext { .. }
         | Instruction::IteratorStep { .. }
         | Instruction::IteratorResult { .. }
+        | Instruction::IteratorClose { .. }
+        | Instruction::RequireCloseResult { .. }
         | Instruction::Import { .. }
         | Instruction::Export { .. } => false,
     }

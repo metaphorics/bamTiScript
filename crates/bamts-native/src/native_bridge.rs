@@ -1,4 +1,4 @@
-//! The native runtime bridge: the typed helper-call algebra, the exact 34
+//! The native runtime bridge: the typed helper-call algebra, the exact 35
 //! `bamts_*` C-ABI helper exports, the panic- and nesting-safe thread-local
 //! [`NativeOps`] dispatch seam, and the feature-gated JIT and AOT linkage
 //! surfaces.
@@ -37,10 +37,10 @@ use crate::{Completion, CompletionTag, ShadowFrame, Value};
 // -- The helper algebra ------------------------------------------------------
 
 /// The number of runtime helpers, `0..HELPER_COUNT`.
-pub const HELPER_COUNT: u32 = 34;
+pub const HELPER_COUNT: u32 = 36;
 
 /// A runtime helper, identified by its stable ABI index. The variant order is
-/// the canonical `external_index` order (0..33) and is byte-identical to
+/// the canonical `external_index` order (0..35) and is byte-identical to
 /// `bamts_codegen::Helper`; [`NativeHelper::symbol`] returns the exact linker
 /// symbol generated code resolves against.
 ///
@@ -120,6 +120,10 @@ pub enum NativeHelper {
     IteratorStep = 32,
     /// `bamts_iterator_result` — index 33 (writes two registers directly).
     IteratorResult = 33,
+    /// `bamts_iterator_close` — index 34 (raw close result; writes called flag).
+    IteratorClose = 34,
+    /// `bamts_require_close_result` — index 35 (validates an invoked close result).
+    RequireCloseResult = 35,
 }
 
 impl NativeHelper {
@@ -162,6 +166,8 @@ impl NativeHelper {
             NativeHelper::CreateCell => "bamts_create_cell",
             NativeHelper::IteratorStep => "bamts_iterator_step",
             NativeHelper::IteratorResult => "bamts_iterator_result",
+            NativeHelper::IteratorClose => "bamts_iterator_close",
+            NativeHelper::RequireCloseResult => "bamts_require_close_result",
         }
     }
 
@@ -210,6 +216,8 @@ impl NativeHelper {
             31 => Some(NativeHelper::CreateCell),
             32 => Some(NativeHelper::IteratorStep),
             33 => Some(NativeHelper::IteratorResult),
+            34 => Some(NativeHelper::IteratorClose),
+            35 => Some(NativeHelper::RequireCloseResult),
             _ => None,
         }
     }
@@ -324,6 +332,17 @@ pub enum HelperCall {
         done_reg: u32,
         value_reg: u32,
     },
+    /// Close `iterator`, writing whether a callable `return` was invoked into
+    /// register `called_reg` before that invocation and returning the raw close
+    /// result. `mode` selects whether a user close throw propagates (`0`) or
+    /// preserves an existing abrupt completion (`1`).
+    IteratorClose {
+        iterator: Value,
+        mode: u32,
+        called_reg: u32,
+    },
+    /// Require an object `result` only when `called` is true.
+    RequireCloseResult { result: Value, called: Value },
     /// Export local value `src` under string constant `name`.
     Export { name: u32, src: Value },
     /// Consume `amount` units from the shared instruction budget.
@@ -367,6 +386,8 @@ impl HelperCall {
             HelperCall::IteratorNext { .. } => NativeHelper::IteratorNext,
             HelperCall::IteratorStep { .. } => NativeHelper::IteratorStep,
             HelperCall::IteratorResult { .. } => NativeHelper::IteratorResult,
+            HelperCall::IteratorClose { .. } => NativeHelper::IteratorClose,
+            HelperCall::RequireCloseResult { .. } => NativeHelper::RequireCloseResult,
             HelperCall::Export { .. } => NativeHelper::Export,
             HelperCall::ConsumeFuel { .. } => NativeHelper::ConsumeFuel,
         }
@@ -730,7 +751,7 @@ fn dispatch_simple(frame: *mut ShadowFrame, out: *mut Completion, call: HelperCa
     })
 }
 
-// -- The exact 34 exported C-ABI helpers -------------------------------------
+// -- The exact 35 exported C-ABI helpers -------------------------------------
 //
 // Parameter order and widths mirror `bamts_codegen::Helper::param_types`
 // exactly: `frame` (pointer) first, `out` (pointer) last, runtime `Value`s as
@@ -1433,6 +1454,63 @@ pub unsafe extern "C" fn bamts_iterator_result(
 /// range is disjoint from its header, and a live, aligned, writable `out` when
 /// this helper has one. Both remain valid and unaliased for the full call.
 ///
+/// `bamts_iterator_close(frame, iterator, mode, called_reg, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_iterator_close(
+    frame: *mut ShadowFrame,
+    iterator: u64,
+    mode: u32,
+    called_reg: u32,
+    out: *mut Completion,
+) -> u32 {
+    run_completion_helper(frame, out, |native_frame, ops| {
+        if called_reg >= native_frame.handle_len() {
+            return HelperResult {
+                tag: CompletionTag::FatalTrap,
+                value: Value::int32(TRAP_INVALID_REGISTER),
+            };
+        }
+        ops.dispatch(
+            native_frame,
+            HelperCall::IteratorClose {
+                iterator: Value::from_bits(iterator),
+                mode,
+                called_reg,
+            },
+        )
+    })
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out`. Both
+/// remain valid and unaliased for the full call.
+///
+/// `bamts_require_close_result(frame, result, called, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_require_close_result(
+    frame: *mut ShadowFrame,
+    result: u64,
+    called: u64,
+    out: *mut Completion,
+) -> u32 {
+    dispatch_simple(
+        frame,
+        out,
+        HelperCall::RequireCloseResult {
+            result: Value::from_bits(result),
+            called: Value::from_bits(called),
+        },
+    )
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out` when
+/// this helper has one. Both remain valid and unaliased for the full call.
+///
 /// `bamts_export(frame, name, src, out)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bamts_export(
@@ -1506,6 +1584,10 @@ const _: unsafe extern "C" fn(*mut ShadowFrame, *mut Completion) -> u32 = bamts_
 const _: unsafe extern "C" fn(*mut ShadowFrame, u64, *mut Completion) -> u32 = bamts_iterator_step; // 32
 const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u32, u32, *mut Completion) -> u32 =
     bamts_iterator_result; // 33
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u32, u32, *mut Completion) -> u32 =
+    bamts_iterator_close; // 34
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 =
+    bamts_require_close_result; // 35
 
 // -- Native entry invocation seam --------------------------------------------
 
@@ -1568,7 +1650,7 @@ unsafe fn call_native_entry(
 /// The little-endian image magic, `b"BMTSAOT1"`.
 pub const AOT_MAGIC: u64 = u64::from_le_bytes(*b"BMTSAOT1");
 /// The supported AOT image ABI version.
-pub const AOT_ABI_VERSION: u32 = 3;
+pub const AOT_ABI_VERSION: u32 = 4;
 
 /// One compiled function in a linked AOT image.
 #[repr(C)]
@@ -2102,6 +2184,23 @@ mod tests {
     ) -> u32 {
         unsafe { super::bamts_iterator_result(f, r, d, v, o) }
     }
+    fn test_bamts_iterator_close(
+        f: *mut ShadowFrame,
+        i: u64,
+        m: u32,
+        c: u32,
+        o: *mut Completion,
+    ) -> u32 {
+        unsafe { super::bamts_iterator_close(f, i, m, c, o) }
+    }
+    fn test_bamts_require_close_result(
+        f: *mut ShadowFrame,
+        r: u64,
+        c: u64,
+        o: *mut Completion,
+    ) -> u32 {
+        unsafe { super::bamts_require_close_result(f, r, c, o) }
+    }
     fn test_bamts_create_object(f: *mut ShadowFrame, o: *mut Completion) -> u32 {
         unsafe { super::bamts_create_object(f, o) }
     }
@@ -2119,7 +2218,7 @@ mod tests {
     /// this crate under `host-jit`, so importing it would be a cycle), so this
     /// literal is the pinned contract; it must stay byte-identical to
     /// `bamts_codegen::Helper::{external_index, symbol}`.
-    const CODEGEN_HELPERS: [(u32, &str); 34] = [
+    const CODEGEN_HELPERS: [(u32, &str); 36] = [
         (0, "bamts_load_constant"),
         (1, "bamts_unary"),
         (2, "bamts_binary"),
@@ -2154,6 +2253,8 @@ mod tests {
         (31, "bamts_create_cell"),
         (32, "bamts_iterator_step"),
         (33, "bamts_iterator_result"),
+        (34, "bamts_iterator_close"),
+        (35, "bamts_require_close_result"),
     ];
 
     /// A recording dispatcher: captures the last call and returns a fixed
@@ -2346,6 +2447,23 @@ mod tests {
             }
             .helper(),
             NativeHelper::IteratorResult
+        );
+        assert_eq!(
+            HelperCall::IteratorClose {
+                iterator: Value::NULL,
+                mode: 1,
+                called_reg: 0,
+            }
+            .helper(),
+            NativeHelper::IteratorClose
+        );
+        assert_eq!(
+            HelperCall::RequireCloseResult {
+                result: Value::NULL,
+                called: Value::TRUE,
+            }
+            .helper(),
+            NativeHelper::RequireCloseResult
         );
     }
 
@@ -2833,6 +2951,43 @@ mod tests {
         assert_eq!(completion.value.as_int32(), Some(TRAP_INVALID_REGISTER));
         // The dispatcher was never reached, so no register was mutated.
         assert_eq!(regs[0], Value::UNINITIALIZED);
+    }
+
+    #[test]
+    fn close_result_wrappers_dispatch_exact_payloads() {
+        let mut regs = [Value::UNINITIALIZED; 1];
+        let mut frame = frame_with(&mut regs);
+        let mut completion = Completion::new(Value::UNDEFINED);
+        let mut ops = Recorder::normal(Value::int32(7));
+        let close_tag = with_native_ops(&mut ops, || {
+            test_bamts_iterator_close(&mut frame, Value::NULL.to_bits(), 1, 0, &mut completion)
+        });
+        assert_eq!(close_tag, CompletionTag::Normal.as_u32());
+        assert_eq!(
+            ops.last.get(),
+            Some(HelperCall::IteratorClose {
+                iterator: Value::NULL,
+                mode: 1,
+                called_reg: 0,
+            })
+        );
+
+        let require_tag = with_native_ops(&mut ops, || {
+            test_bamts_require_close_result(
+                &mut frame,
+                Value::int32(7).to_bits(),
+                Value::TRUE.to_bits(),
+                &mut completion,
+            )
+        });
+        assert_eq!(require_tag, CompletionTag::Normal.as_u32());
+        assert_eq!(
+            ops.last.get(),
+            Some(HelperCall::RequireCloseResult {
+                result: Value::int32(7),
+                called: Value::TRUE,
+            })
+        );
     }
 
     #[test]

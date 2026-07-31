@@ -50,11 +50,14 @@
 //! * **Iteration protocol.** [`Instruction::GetIterator`] (with a closed
 //!   [`IteratorKind`]) and the two-write [`Instruction::IteratorNext`] model
 //!   `for`/`of`, `for`/`in`, destructuring, and array/call spread against the
-//!   ECMAScript iterator protocol. `for`/`await`/`of` splits the step across
-//!   [`Instruction::IteratorStep`] (acquire the raw, possibly-promised
-//!   iterator result), [`Instruction::Await`] (suspend until it settles), and
-//!   the two-write [`Instruction::IteratorResult`] (validate the settled
-//!   object and read `done`/`value`).
+//!   ECMAScript iterator protocol. The two-write
+//!   [`Instruction::IteratorClose`] performs the abrupt-completion close step.
+//!   `for`/`await`/`of` splits each step across
+//!   [`Instruction::IteratorStep`] (acquire the raw, possibly-promised iterator
+//!   result), [`Instruction::Await`] (suspend until it settles), and the
+//!   two-write [`Instruction::IteratorResult`] (validate the settled object and
+//!   read `done`/`value`). [`Instruction::RequireCloseResult`] validates the
+//!   result of a callable `iterator.return` on non-throw exits.
 //! * **Environment access.** [`Instruction::LoadGlobal`],
 //!   [`Instruction::StoreGlobal`], [`Instruction::TypeOfGlobal`] (the last
 //!   models `typeof g` without throwing on an undeclared global),
@@ -442,6 +445,32 @@ impl IteratorKind {
     }
 }
 
+/// Error handling policy for [`Instruction::IteratorClose`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum IteratorCloseMode {
+    /// Surface a close failure as the current throw completion.
+    Propagate,
+    /// Preserve an existing abrupt completion over a user close failure.
+    PreserveAbrupt,
+}
+
+impl IteratorCloseMode {
+    const fn to_u8(self) -> u8 {
+        match self {
+            Self::Propagate => 0,
+            Self::PreserveAbrupt => 1,
+        }
+    }
+
+    const fn from_u8(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::Propagate),
+            1 => Some(Self::PreserveAbrupt),
+            _ => None,
+        }
+    }
+}
+
 /// Which half of an accessor descriptor [`Instruction::DefineAccessor`] installs.
 /// A property with both a getter and a setter is defined by two instructions on
 /// the same key.
@@ -468,7 +497,7 @@ impl AccessorKind {
     }
 }
 
-/// The production instruction algebra. Opcodes 0..=36 are stable wire tags.
+/// The production instruction algebra. Opcodes 0..=40 are stable wire tags.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Instruction {
     /// Load a constant into `dst` (refines the formal `Load`).
@@ -610,6 +639,24 @@ pub enum Instruction {
         value: Register,
         result: Register,
     },
+    /// Call `iterator.return`, writing its raw result to `result` and a boolean
+    /// to `called` that is true exactly when a callable return method was invoked.
+    ///
+    /// [`IteratorCloseMode::Propagate`] surfaces a close failure as a throw.
+    /// [`IteratorCloseMode::PreserveAbrupt`] swallows a user close throw and
+    /// writes `undefined`; engine failures remain fatal.
+    IteratorClose {
+        result: Register,
+        called: Register,
+        iterator: Register,
+        mode: IteratorCloseMode,
+    },
+    /// Require a callable `iterator.return` result to be an object.
+    ///
+    /// Falls through when the return method was absent or non-callable
+    /// (`called` is false), otherwise throws a `TypeError` with message
+    /// `iterator.return() returned a non-object` unless `result` is an object.
+    RequireCloseResult { result: Register, called: Register },
     /// Unconditional control transfer (identical to the formal `Jump`).
     Jump { target: Pc },
     /// Branch to `target` when `condition` is truthy, else fall through.
@@ -713,10 +760,14 @@ impl Instruction {
                 visit(prototype);
             }
             Self::GetIterator { src, .. } => visit(src),
-            Self::IteratorNext { iterator, .. } | Self::IteratorStep { iterator, .. } => {
-                visit(iterator);
-            }
+            Self::IteratorNext { iterator, .. }
+            | Self::IteratorStep { iterator, .. }
+            | Self::IteratorClose { iterator, .. } => visit(iterator),
             Self::IteratorResult { result, .. } => visit(result),
+            Self::RequireCloseResult { result, called } => {
+                visit(result);
+                visit(called);
+            }
             Self::JumpIfTrue { condition, .. } | Self::JumpIfFalse { condition, .. } => {
                 visit(condition);
             }
@@ -742,8 +793,8 @@ impl Instruction {
     }
 
     /// Visits each register this instruction defines: zero, one, or two.
-    /// [`Instruction::IteratorNext`] and [`Instruction::IteratorResult`] are
-    /// the two-write opcodes.
+    /// [`Instruction::IteratorNext`], [`Instruction::IteratorResult`], and
+    /// [`Instruction::IteratorClose`] are the two-write opcodes.
     fn visit_writes(self, mut visit: impl FnMut(Register)) {
         match self {
             Self::LoadConst { dst, .. }
@@ -774,6 +825,10 @@ impl Instruction {
                 visit(done);
                 visit(value);
             }
+            Self::IteratorClose { result, called, .. } => {
+                visit(result);
+                visit(called);
+            }
             Self::SetProperty { .. }
             | Self::DefineAccessor { .. }
             | Self::StoreGlobal { .. }
@@ -787,6 +842,7 @@ impl Instruction {
             | Self::JumpIfFalse { .. }
             | Self::Return { .. }
             | Self::Throw { .. }
+            | Self::RequireCloseResult { .. }
             | Self::Halt => {}
         }
     }
@@ -833,6 +889,8 @@ impl Instruction {
             | Self::IteratorNext { .. }
             | Self::IteratorStep { .. }
             | Self::IteratorResult { .. }
+            | Self::IteratorClose { .. }
+            | Self::RequireCloseResult { .. }
             | Self::Import { .. }
             | Self::Export { .. } => visit(Pc::new(pc + 1)),
         }
@@ -1214,6 +1272,9 @@ pub enum VerifyErrorKind {
         register: Register,
         register_count: u32,
     },
+    AliasedIteratorCloseOutputs {
+        register: Register,
+    },
     ConstantOutOfBounds {
         constant: ConstantId,
         constant_count: usize,
@@ -1328,6 +1389,11 @@ impl fmt::Display for VerifyError {
             } => write!(
                 formatter,
                 "register {} is outside register count {register_count}",
+                register.get()
+            ),
+            VerifyErrorKind::AliasedIteratorCloseOutputs { register } => write!(
+                formatter,
+                "iterator close result and called outputs alias register {}",
                 register.get()
             ),
             VerifyErrorKind::ConstantOutOfBounds {
@@ -1848,6 +1914,27 @@ fn verify_instruction(
             check_register(value)?;
             check_register(result)?;
         }
+        Instruction::IteratorClose {
+            result,
+            called,
+            iterator,
+            ..
+        } => {
+            check_register(result)?;
+            check_register(called)?;
+            check_register(iterator)?;
+            if result == called {
+                return Err(instruction_error(
+                    function_index,
+                    pc,
+                    VerifyErrorKind::AliasedIteratorCloseOutputs { register: result },
+                ));
+            }
+        }
+        Instruction::RequireCloseResult { result, called } => {
+            check_register(result)?;
+            check_register(called)?;
+        }
         Instruction::Jump { target } => verify_target(function_index, pc, target, code_len)?,
         Instruction::JumpIfTrue { condition, target }
         | Instruction::JumpIfFalse { condition, target } => {
@@ -2044,6 +2131,9 @@ pub enum DecodeErrorKind {
     InvalidIteratorKind {
         tag: u8,
     },
+    InvalidIteratorCloseMode {
+        tag: u8,
+    },
     InvalidAccessorKind {
         tag: u8,
     },
@@ -2103,6 +2193,9 @@ impl fmt::Display for DecodeError {
             }
             DecodeErrorKind::InvalidIteratorKind { tag } => {
                 write!(formatter, "invalid iterator kind {tag}")
+            }
+            DecodeErrorKind::InvalidIteratorCloseMode { tag } => {
+                write!(formatter, "invalid iterator close mode {tag}")
             }
             DecodeErrorKind::InvalidAccessorKind { tag } => {
                 write!(formatter, "invalid accessor kind {tag}")
@@ -2504,6 +2597,16 @@ impl<'a> Decoder<'a> {
                 value: Register::new(self.leb128()?),
                 result: Register::new(self.leb128()?),
             }),
+            40 => Ok(Instruction::IteratorClose {
+                result: Register::new(self.leb128()?),
+                called: Register::new(self.leb128()?),
+                iterator: Register::new(self.leb128()?),
+                mode: self.iterator_close_mode()?,
+            }),
+            41 => Ok(Instruction::RequireCloseResult {
+                result: Register::new(self.leb128()?),
+                called: Register::new(self.leb128()?),
+            }),
             opcode => Err(self.error(opcode_at, DecodeErrorKind::InvalidOpcode { opcode })),
         }
     }
@@ -2526,6 +2629,13 @@ impl<'a> Decoder<'a> {
         let tag = self.byte()?;
         IteratorKind::from_u8(tag)
             .ok_or_else(|| self.error(at, DecodeErrorKind::InvalidIteratorKind { tag }))
+    }
+
+    fn iterator_close_mode(&mut self) -> Result<IteratorCloseMode, DecodeError> {
+        let at = self.offset;
+        let tag = self.byte()?;
+        IteratorCloseMode::from_u8(tag)
+            .ok_or_else(|| self.error(at, DecodeErrorKind::InvalidIteratorCloseMode { tag }))
     }
 
     fn accessor_kind(&mut self) -> Result<AccessorKind, DecodeError> {
@@ -2932,6 +3042,23 @@ fn encode_instruction(instruction: Instruction, output: &mut Vec<u8>) {
             write_u32(value.get(), output);
             write_u32(result.get(), output);
         }
+        Instruction::IteratorClose {
+            result,
+            called,
+            iterator,
+            mode,
+        } => {
+            output.push(40);
+            write_u32(result.get(), output);
+            write_u32(called.get(), output);
+            write_u32(iterator.get(), output);
+            output.push(mode.to_u8());
+        }
+        Instruction::RequireCloseResult { result, called } => {
+            output.push(41);
+            write_u32(result.get(), output);
+            write_u32(called.get(), output);
+        }
     }
 }
 
@@ -3166,7 +3293,7 @@ mod tests {
 
     /// Every opcode variant survives an encode -> decode round-trip at the
     /// instruction level, independent of CFG/reference validity. This pins the
-    /// wire tag and field order for all 40 opcodes.
+    /// wire tag and field order for all 42 opcodes.
     #[test]
     fn every_opcode_round_trips_on_the_wire() {
         let instructions = [
@@ -3336,8 +3463,18 @@ mod tests {
                 value: Register::new(82),
                 result: Register::new(83),
             },
+            Instruction::IteratorClose {
+                result: Register::new(84),
+                called: Register::new(85),
+                iterator: Register::new(86),
+                mode: IteratorCloseMode::PreserveAbrupt,
+            },
+            Instruction::RequireCloseResult {
+                result: Register::new(87),
+                called: Register::new(88),
+            },
         ];
-        assert_eq!(instructions.len(), 40, "one case per opcode");
+        assert_eq!(instructions.len(), 42, "one case per opcode");
         let limits = DecodeLimits::default();
         for (opcode, instruction) in instructions.into_iter().enumerate() {
             let mut bytes = Vec::new();
@@ -3844,6 +3981,21 @@ mod tests {
                 ..
             })
         ));
+        // IteratorClose with a bad mode tag
+        // (opcode 40, result 0, called 0, iterator 0, mode 9).
+        assert!(matches!(
+            decode(
+                &one_function_bytes(&[40, 0, 0, 0, 9]),
+                &DecodeLimits::default()
+            ),
+            Err(DecodeError {
+                kind: DecodeErrorKind::InvalidIteratorCloseMode { tag: 9 },
+                ..
+            })
+        ));
+        // RequireCloseResult with a truncated called register is hostile input,
+        // not an implicit default.
+        assert!(decode(&one_function_bytes(&[41, 0]), &DecodeLimits::default()).is_err());
         // DefineAccessor with a bad kind tag (opcode 10, obj 0, key 0, acc 0, kind 9).
         assert!(matches!(
             decode(
@@ -5013,5 +5165,127 @@ mod tests {
         assert_eq!(std::mem::size_of::<Pc>(), 4);
         assert_eq!(std::mem::size_of::<NumberBits>(), 8);
         assert_eq!(std::mem::size_of::<FunctionFlags>(), 2);
+    }
+
+    #[test]
+    fn iterator_close_initializes_both_results_for_close_validation() {
+        let module = Module::new(
+            vec![Constant::Int32(0)],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                4,
+                flags(),
+                vec![
+                    Instruction::LoadConst {
+                        dst: Register::new(0),
+                        constant: ConstantId::new(0),
+                    },
+                    Instruction::GetIterator {
+                        dst: Register::new(1),
+                        src: Register::new(0),
+                        kind: IteratorKind::Sync,
+                    },
+                    Instruction::IteratorClose {
+                        result: Register::new(2),
+                        called: Register::new(3),
+                        iterator: Register::new(1),
+                        mode: IteratorCloseMode::Propagate,
+                    },
+                    Instruction::RequireCloseResult {
+                        result: Register::new(2),
+                        called: Register::new(3),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        let verified = module.verify().expect("close result dataflow verifies");
+        let certificate = verified.certificate(FunctionId::new(0)).unwrap();
+        assert_eq!(
+            certificate.initialized_before(Pc::new(3), Register::new(2)),
+            Some(true),
+            "IteratorClose initializes result"
+        );
+        assert_eq!(
+            certificate.initialized_before(Pc::new(3), Register::new(3)),
+            Some(true),
+            "IteratorClose initializes called"
+        );
+    }
+
+    #[test]
+    fn require_close_result_reads_both_operands() {
+        for instruction in [
+            Instruction::RequireCloseResult {
+                result: Register::new(0),
+                called: Register::new(1),
+            },
+            Instruction::RequireCloseResult {
+                result: Register::new(1),
+                called: Register::new(0),
+            },
+        ] {
+            let module = Module::new(
+                vec![Constant::Int32(0)],
+                vec![Function::new(
+                    None,
+                    0,
+                    0,
+                    2,
+                    flags(),
+                    vec![
+                        Instruction::LoadConst {
+                            dst: Register::new(0),
+                            constant: ConstantId::new(0),
+                        },
+                        instruction,
+                        Instruction::Halt,
+                    ],
+                    Vec::new(),
+                )],
+                FunctionId::new(0),
+            );
+            assert!(
+                module.verify().is_err(),
+                "both operands must be initialized"
+            );
+        }
+    }
+    #[test]
+    fn verifier_rejects_aliased_iterator_close_outputs() {
+        let register = Register::new(1);
+        let module = Module::new(
+            vec![],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                2,
+                flags(),
+                vec![
+                    Instruction::IteratorClose {
+                        result: register,
+                        called: register,
+                        iterator: Register::new(0),
+                        mode: IteratorCloseMode::Propagate,
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+
+        assert!(matches!(
+            module.verify(),
+            Err(VerifyError {
+                kind: VerifyErrorKind::AliasedIteratorCloseOutputs { register: found },
+                ..
+            }) if found == register
+        ));
     }
 }

@@ -30,8 +30,8 @@ use std::sync::Arc;
 
 use bamts_bytecode::{
     AccessorKind, BinaryOp, BindingId, BindingKind, Constant, ConstantId, EcmaString,
-    EcmaStringBuilder, EdgeId, EdgeTarget, Function, FunctionId, Instruction, IteratorKind, Module,
-    ModuleId, Pc, Program, ProgramModule, ResolvedExport, UnaryOp, Verified,
+    EcmaStringBuilder, EdgeId, EdgeTarget, Function, FunctionId, Instruction, IteratorCloseMode,
+    IteratorKind, Module, ModuleId, Pc, Program, ProgramModule, ResolvedExport, UnaryOp, Verified,
 };
 use bamts_native::{Decoded, SlotId, Value};
 
@@ -2987,19 +2987,46 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(promise)
     }
 
-    fn close_iterator(&mut self, iterator: Value) -> Result<(), EvalFailure> {
+    pub(crate) fn iterator_close_target(
+        &mut self,
+        iterator: Value,
+    ) -> Result<Option<Value>, EvalFailure> {
         let Some(index) = self.runtime_slot(iterator).map_err(EvalFailure::Runtime)? else {
-            return Ok(());
+            return Ok(None);
         };
-        let iterator = match &self.heap[index] {
+        match &self.heap[index] {
             HeapEntry::Iterator {
                 state:
                     IteratorState::Protocol { iterator, .. }
                     | IteratorState::AsyncFromSync { iterator, .. },
-            } => *iterator,
-            _ => return Ok(()),
+            } => Ok(Some(*iterator)),
+            _ => Ok(None),
+        }
+    }
+
+    pub(crate) fn close_iterator_raw(
+        &mut self,
+        iterator: Value,
+    ) -> (Result<Value, EvalFailure>, bool) {
+        let target = match self.iterator_close_target(iterator) {
+            Ok(Some(target)) => target,
+            Ok(None) => return (Ok(Value::UNDEFINED), false),
+            Err(failure) => return (Err(failure), false),
         };
-        self.close_protocol_iterator(iterator)
+        let close = match self.get_named_property(target, "return") {
+            Ok(close) => close,
+            Err(failure) => return (Err(failure), false),
+        };
+        match self.is_callable(close) {
+            Ok(true) => (self.call_value(close, target, &[]), true),
+            Ok(false) => (Ok(Value::UNDEFINED), false),
+            Err(failure) => (Err(failure), false),
+        }
+    }
+
+    fn close_iterator(&mut self, iterator: Value) -> Result<(), EvalFailure> {
+        let (result, _) = self.close_iterator_raw(iterator);
+        result.map(|_| ())
     }
 
     fn close_protocol_iterator(&mut self, iterator: Value) -> Result<(), EvalFailure> {
@@ -4758,6 +4785,55 @@ impl<'a, H: Host> Machine<'a, H> {
                             self.frames[frame_index].pc = pc + 1;
                         }
                         Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::IteratorClose {
+                    result,
+                    called,
+                    iterator,
+                    mode,
+                } => {
+                    let iterator = self.read_register(frame_index, iterator.get());
+                    let (close, was_called) = self.close_iterator_raw(iterator);
+                    match (close, mode) {
+                        (Ok(value), _) => {
+                            self.write_register(
+                                frame_index,
+                                called.get(),
+                                Value::boolean(was_called),
+                            );
+                            self.write_register(frame_index, result.get(), value);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        (Err(EvalFailure::Runtime(kind)), _) => {
+                            return Err(self.error_here_at(kind, pc));
+                        }
+                        (Err(failure), IteratorCloseMode::Propagate) => {
+                            self.resolve_failure(failure, pc)?;
+                        }
+                        (Err(_), IteratorCloseMode::PreserveAbrupt) => {
+                            self.write_register(
+                                frame_index,
+                                called.get(),
+                                Value::boolean(was_called),
+                            );
+                            self.write_register(frame_index, result.get(), Value::UNDEFINED);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                    }
+                }
+                Instruction::RequireCloseResult { result, called } => {
+                    let result = self.read_register(frame_index, result.get());
+                    let called = self.read_register(frame_index, called.get());
+                    if called == Value::TRUE && !self.is_object(result) {
+                        self.resolve_failure(
+                            EvalFailure::Throw(ThrowOrigin::TypeError {
+                                operation: "iterator.return() returned a non-object",
+                            }),
+                            pc,
+                        )?;
+                    } else {
+                        self.frames[frame_index].pc = pc + 1;
                     }
                 }
                 Instruction::Jump { target } => {
