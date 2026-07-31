@@ -43,291 +43,87 @@ pub const HELPER_COUNT: u32 = 34;
 /// the canonical `external_index` order (0..33) and is byte-identical to
 /// `bamts_codegen::Helper`; [`NativeHelper::symbol`] returns the exact linker
 /// symbol generated code resolves against.
+///
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out` when
+/// this helper has one. Both remain valid and unaliased for the full call.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum NativeHelper {
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_load_constant` — index 0.
     LoadConstant = 0,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_unary` — index 1.
     Unary = 1,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_binary` — index 2.
     Binary = 2,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_create_object` — index 3.
     CreateObject = 3,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_create_array` — index 4.
     CreateArray = 4,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_create_closure` — index 5.
     CreateClosure = 5,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_get_property` — index 6.
     GetProperty = 6,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_set_property` — index 7.
     SetProperty = 7,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_delete_property` — index 8.
     DeleteProperty = 8,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_call` — index 9.
     Call = 9,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_construct` — index 10.
     Construct = 10,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_import` — index 11.
     Import = 11,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_truthy` — index 12 (returns `0`/`1`, never writes `out`).
     Truthy = 12,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_resume_value` — index 13.
     ResumeValue = 13,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_define_accessor` — index 14.
     DefineAccessor = 14,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_load_global` — index 15.
     LoadGlobal = 15,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_store_global` — index 16.
     StoreGlobal = 16,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_typeof_global` — index 17.
     TypeOfGlobal = 17,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_load_this` — index 18.
     LoadThis = 18,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_load_arguments` — index 19.
     LoadArguments = 19,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_load_new_target` — index 20.
     LoadNewTarget = 20,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_array_push` — index 21.
     ArrayPush = 21,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_array_extend` — index 22.
     ArrayExtend = 22,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_object_spread` — index 23.
     ObjectSpread = 23,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_set_prototype` — index 24.
     SetPrototype = 24,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_create_private_name` — index 25.
     CreatePrivateName = 25,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_create_regexp` — index 26.
     CreateRegExp = 26,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_get_iterator` — index 27.
     GetIterator = 27,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_iterator_next` — index 28 (writes two registers directly).
     IteratorNext = 28,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_export` — index 29.
     Export = 29,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out`.
-    /// Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_consume_fuel` — index 30.
     ConsumeFuel = 30,
     /// `bamts_create_cell` — index 31.
-    ///
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty
-    /// handle range is disjoint from its header, and a live, aligned, writable
-    /// `out`. Both remain valid and unaliased for the full call.
     CreateCell = 31,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty
-    /// handle range is disjoint from its header, and a live, aligned, writable
-    /// `out`. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_iterator_step` — index 32 (raw, possibly-promised iterator result).
     IteratorStep = 32,
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty
-    /// handle range is disjoint from its header, and a live, aligned, writable
-    /// `out`. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_iterator_result` — index 33 (writes two registers directly).
     IteratorResult = 33,
 }
 
 impl NativeHelper {
     /// The C symbol generated code links against. Byte-identical to
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_codegen::Helper::symbol`.
     #[must_use]
     pub const fn symbol(self) -> &'static str {
@@ -2322,12 +2118,6 @@ mod tests {
     /// comparison to `bamts_codegen::Helper` is impossible (codegen depends on
     /// this crate under `host-jit`, so importing it would be a cycle), so this
     /// literal is the pinned contract; it must stay byte-identical to
-    /// # Safety
-    ///
-    /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-    /// range is disjoint from its header, and a live, aligned, writable `out` when
-    /// this helper has one. Both remain valid and unaliased for the full call.
-    ///
     /// `bamts_codegen::Helper::{external_index, symbol}`.
     const CODEGEN_HELPERS: [(u32, &str); 34] = [
         (0, "bamts_load_constant"),
