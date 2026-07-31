@@ -807,7 +807,7 @@ fn validate_registry_dependency(name: &str, dependency: &Value, context: &str) -
     }
 
     match dependency {
-        Value::String(version) => validate_exact_registry_version(name, version, context),
+        Value::String(version) => validate_registry_version(name, version, context),
         Value::Table(attributes) => {
             if attributes.contains_key("path") {
                 return Err(workspace_error(format!(
@@ -816,17 +816,17 @@ fn validate_registry_dependency(name: &str, dependency: &Value, context: &str) -
             }
             if attributes.contains_key("workspace") {
                 return Err(workspace_error(format!(
-                    "{context}: dependency `{name}` must declare an exact registry version directly"
+                    "{context}: dependency `{name}` must declare a registry version requirement directly"
                 )));
             }
             if attributes.contains_key("git") {
                 return Err(workspace_error(format!(
-                    "{context}: dependency `{name}` must use an exact registry version, not `git`"
+                    "{context}: dependency `{name}` must use a registry version requirement, not `git`"
                 )));
             }
 
             let version = required_string(attributes, "version", context)?;
-            validate_exact_registry_version(name, version, context)?;
+            validate_registry_version(name, version, context)?;
             optional_bool(attributes, "optional", context)?;
             optional_feature_set(attributes, "features", context)?;
             Ok(())
@@ -837,20 +837,37 @@ fn validate_registry_dependency(name: &str, dependency: &Value, context: &str) -
     }
 }
 
-fn validate_exact_registry_version(name: &str, version: &str, context: &str) -> Result<()> {
-    let Some(version) = version.strip_prefix('=') else {
+fn validate_registry_version(name: &str, version: &str, context: &str) -> Result<()> {
+    // Registry dependencies declare either a compatible caret requirement —
+    // the Cargo default, a bare `X.Y[.Z]` that accepts compatible upgrades —
+    // or an exact `=X.Y[.Z]` pin for private/tooling crates that must not
+    // float. Wildcards (`*`, `1.*`), tilde (`~`), comparator ranges (`>`,
+    // `<`, `>=`, `<=`), and multi-spec ranges (`,`) are unreviewed
+    // constraints and remain rejected.
+    let requirement = version.strip_prefix('=').unwrap_or(version);
+
+    if requirement.is_empty() || requirement.chars().any(char::is_whitespace) {
         return Err(workspace_error(format!(
-            "{context}: registry dependency `{name}` must use an exact `=` version, found `{version}`"
+            "{context}: registry dependency `{name}` must use a non-empty version requirement, found `{version}`"
         )));
-    };
-    if version.is_empty()
-        || version.chars().any(char::is_whitespace)
-        || version
-            .chars()
-            .any(|character| matches!(character, ',' | '<' | '>' | '^' | '~' | '*' | '='))
-    {
+    }
+
+    if requirement.contains('*') {
         return Err(workspace_error(format!(
-            "{context}: registry dependency `{name}` must use one exact `=` version"
+            "{context}: registry dependency `{name}` must not use a wildcard version requirement, found `{version}`"
+        )));
+    }
+
+    let component_count = requirement.bytes().filter(|byte| *byte == b'.').count() + 1;
+    let plain_semver = (2..=3).contains(&component_count)
+        && requirement.split('.').all(|component| {
+            !component.is_empty()
+                && (component == "0" || !component.starts_with('0'))
+                && component.parse::<u64>().is_ok()
+        });
+    if !plain_semver {
+        return Err(workspace_error(format!(
+            "{context}: registry dependency `{name}` must use a compatible caret requirement (`X.Y[.Z]`) or exact `=` pin, found `{version}`"
         )));
     }
 
@@ -1723,12 +1740,41 @@ unsafe_code = "forbid"
     }
 
     #[test]
-    fn rejects_inexact_registry_pin() {
-        assert_workspace_error(validate_registry_dependency(
-            "serde",
-            &Value::String("1.0.0".to_owned()),
-            "fixture",
-        ));
+    fn accepts_compatible_registry_requirement() {
+        // The Cargo default caret requirement `X.Y[.Z]` is the standard
+        // compatible minimum advertised by published registry dependencies.
+        validate_registry_version("tokio", "1.53", "fixture").expect("bare minor caret");
+        validate_registry_version("tokio-util", "0.7", "fixture").expect("minor-only caret");
+        validate_registry_version("serde", "1.0.0", "fixture").expect("full semver caret");
+    }
+
+    #[test]
+    fn accepts_exact_registry_pin() {
+        // Exact `=` pins remain allowed for private/tooling dependencies.
+        validate_registry_version("tokio", "=1.53.1", "fixture").expect("exact patch pin");
+        validate_registry_version("anyhow", "=1.0.104", "fixture").expect("exact pin");
+    }
+
+    #[test]
+    fn rejects_wildcard_registry_requirement() {
+        assert_workspace_error(validate_registry_version("serde", "*", "fixture"));
+        assert_workspace_error(validate_registry_version("serde", "1.*", "fixture"));
+    }
+
+    #[test]
+    fn rejects_malformed_registry_requirements() {
+        for requirement in [
+            "1..0",
+            "1.2.3.4",
+            "=.",
+            "1",
+            "=1.",
+            "01.2",
+            "=1.02.3",
+            "18446744073709551616.0",
+        ] {
+            assert_workspace_error(validate_registry_version("serde", requirement, "fixture"));
+        }
     }
 
     #[test]

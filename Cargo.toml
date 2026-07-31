@@ -27,7 +27,7 @@ bamts-codegen = { path = "crates/bamts-codegen", version = "0.1.0" }
 bamts-compiler = { path = "crates/bamts-compiler", version = "0.1.0" }
 bamts-native = { path = "crates/bamts-native", version = "0.1.0" }
 bamts-node = { path = "crates/bamts-node", version = "0.1.0" }
-bamts-runtime = { path = "crates/bamts-runtime", version = "0.1.2" }
+bamts-runtime = { path = "crates/bamts-runtime", version = "0.1.0" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
