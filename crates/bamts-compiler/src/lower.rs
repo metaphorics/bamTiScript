@@ -143,9 +143,9 @@ pub enum LowerErrorKind {
     Verify(VerifyError),
 }
 
-/// Runtime syntax this instruction set cannot express faithfully, or that
-/// carries no runtime semantics. Every variant names one rejected construct;
-/// there is no catch-all. None of these occur in the executable corpus.
+/// Runtime syntax this instruction set cannot express faithfully, plus
+/// source-goal early errors. Every variant names one rejected construct; there
+/// is no catch-all. None of these occur in the executable corpus.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnsupportedConstruct {
     /// `with` opens a dynamic scope the register model cannot represent.
@@ -156,8 +156,6 @@ pub enum UnsupportedConstruct {
     LabeledStatement,
     /// A labeled `break`/`continue`.
     LabeledJump,
-    /// `debugger` is a host breakpoint request with no bytecode.
-    DebuggerStatement,
     /// A runtime `enum` (const enums are type-only and already erased).
     EnumDeclaration,
     /// A runtime `namespace`/`module` block.
@@ -250,7 +248,6 @@ impl fmt::Display for UnsupportedConstruct {
             Self::UsingDeclaration => "`using` declaration",
             Self::LabeledStatement => "labeled statement",
             Self::LabeledJump => "labeled `break`/`continue`",
-            Self::DebuggerStatement => "`debugger` statement",
             Self::EnumDeclaration => "runtime `enum` declaration",
             Self::NamespaceDeclaration => "runtime `namespace` declaration",
             Self::RuntimeImportEquals => "runtime `import =` declaration",
@@ -1418,9 +1415,7 @@ impl<'a> FunctionContext<'a> {
                 self.emit(range, Instruction::Throw { value })?;
                 Ok(())
             }
-            Statement::Debugger => {
-                Err(self.unsupported(range, UnsupportedConstruct::DebuggerStatement))
-            }
+            Statement::Debugger => Ok(()),
             Statement::Missing(missing) => Err(self.missing(range, missing.expected())),
         }
     }
@@ -7156,6 +7151,12 @@ mod tests {
             },
         )
         .expect("snippet lowers to a verified module")
+    }
+
+    #[test]
+    fn debugger_statement_lowers_to_no_runtime_instruction() {
+        let module = lower_js("debugger;");
+        assert_eq!(module.functions()[0].code(), &[Instruction::Halt]);
     }
 
     #[test]
