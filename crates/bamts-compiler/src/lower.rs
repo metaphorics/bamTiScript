@@ -65,13 +65,14 @@ use crate::syntax::{
     ConditionalExpression, DoWhileStatement, ExportDeclaration, ExportDefaultValue,
     ExportNamedDeclaration, ExportSpecifierMode, Expr, Expression, ForBinding, ForInStatement,
     ForInitializer, ForOfMode, ForOfStatement, ForStatement, FunctionBody, FunctionLike,
-    IdentifierNode, IfStatement, ImportBinding, ImportDeclaration, ImportSpecifierMode, Literal,
-    LogicalExpression, LogicalOperator, MemberExpression, MemberProperty, MetaProperty,
-    ModuleExportName, NewExpression, NodeKind, NumericLiteralNode, ObjectLiteral, ObjectMember,
-    ParameterNode, Pattern, PrivateIdentifierNode, PropertyModifier, PropertyName,
-    RegexLiteralNode, SourceFile, Statement, Stmt, StringLiteralNode, SwitchStatement,
-    TemplateElementNode, TemplateLiteral, TokenKind, UnaryOperator, UpdateExpression,
-    UpdateOperator, VariableDeclaration, VariableKind, WhileStatement, YieldExpression,
+    IdentifierNode, IfStatement, ImportBinding, ImportDeclaration, ImportSpecifierMode,
+    LabeledStatement, Literal, LogicalExpression, LogicalOperator, MemberExpression,
+    MemberProperty, MetaProperty, ModuleExportName, NewExpression, NodeKind, NumericLiteralNode,
+    ObjectLiteral, ObjectMember, ParameterNode, Pattern, PrivateIdentifierNode, PropertyModifier,
+    PropertyName, RegexLiteralNode, SourceFile, Statement, Stmt, StringLiteralNode,
+    SwitchStatement, TemplateElementNode, TemplateLiteral, TokenKind, UnaryOperator,
+    UpdateExpression, UpdateOperator, VariableDeclaration, VariableKind, WhileStatement,
+    YieldExpression,
 };
 
 /// A degenerate range at the start of the document, used as the diagnostic
@@ -134,6 +135,8 @@ pub enum LowerErrorKind {
     InvalidRegexLiteral,
     /// A module linkage name contained an unpaired UTF-16 surrogate.
     IllFormedMetadataString,
+    /// A resolved jump target violated the statement control-flow contract.
+    InvalidControlFlow { operation: &'static str },
     /// A runtime construct the current instruction set cannot express.
     Unsupported(UnsupportedConstruct),
     /// A structural production capacity ran out.
@@ -152,10 +155,6 @@ pub enum UnsupportedConstruct {
     WithStatement,
     /// `using`/`await using` explicit resource management (no disposal opcode).
     UsingDeclaration,
-    /// A labeled statement (no labeled control-flow target model).
-    LabeledStatement,
-    /// A labeled `break`/`continue`.
-    LabeledJump,
     /// A runtime `enum` (const enums are type-only and already erased).
     EnumDeclaration,
     /// A runtime `namespace`/`module` block.
@@ -200,6 +199,7 @@ pub enum CapacityLimit {
     BigIntBytes,
     BigIntWork,
     Captures,
+    ControlTargets,
 }
 
 impl fmt::Display for LowerError {
@@ -232,6 +232,9 @@ impl fmt::Display for LowerErrorKind {
             Self::IllFormedMetadataString => {
                 f.write_str("module metadata string is not well-formed UTF-16")
             }
+            Self::InvalidControlFlow { operation } => {
+                write!(f, "invalid control flow: {operation}")
+            }
             Self::Unsupported(construct) => {
                 write!(f, "unsupported runtime semantics: {construct}")
             }
@@ -246,8 +249,6 @@ impl fmt::Display for UnsupportedConstruct {
         let text = match self {
             Self::WithStatement => "`with` statement",
             Self::UsingDeclaration => "`using` declaration",
-            Self::LabeledStatement => "labeled statement",
-            Self::LabeledJump => "labeled `break`/`continue`",
             Self::EnumDeclaration => "runtime `enum` declaration",
             Self::NamespaceDeclaration => "runtime `namespace` declaration",
             Self::RuntimeImportEquals => "runtime `import =` declaration",
@@ -281,6 +282,7 @@ impl fmt::Display for CapacityLimit {
             Self::BigIntBytes => "bigint constant exceeds the canonical decoder byte ceiling",
             Self::BigIntWork => "bigint radix conversion exceeds its deterministic work ceiling",
             Self::Captures => "too many captured variables in one closure",
+            Self::ControlTargets => "too many nested control-flow targets",
         };
         f.write_str(text)
     }
@@ -565,11 +567,28 @@ enum ArgumentsSource {
     None,
 }
 
-/// A live loop's break/continue placeholder jumps, patched when the loop ends.
-struct LoopFrame {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlTargetKind {
+    Iteration,
+    Switch,
+    Label,
+}
+
+/// A live statement target with pending break and continue jumps.
+struct ControlTarget {
     breaks: Vec<Pc>,
     continues: Vec<Pc>,
-    is_loop: bool,
+    kind: ControlTargetKind,
+    labels: Vec<String>,
+}
+
+struct IterationLowering<'a> {
+    range: TextRange,
+    subject: Register,
+    kind: IteratorKind,
+    binding: &'a ForBinding,
+    body: &'a Stmt,
+    labels: Vec<String>,
 }
 
 /// Completion kinds routed through a `finally` block.
@@ -584,10 +603,13 @@ const COMPLETION_CONTINUE: i32 = 4;
 struct FinallyFrame {
     kind_reg: Register,
     value_reg: Register,
+    target_reg: Register,
     pending: Vec<Pc>,
-    /// Loop-stack depth when this finally was entered; a `break`/`continue`
-    /// whose target loop predates the finally must route through it.
-    loop_depth: usize,
+    /// Control-target depth when this finally was entered. A jump whose target
+    /// predates the finally must route through it.
+    control_depth: usize,
+    /// Statically observed `(completion kind, target index)` pairs.
+    targets: Vec<(i32, usize)>,
 }
 
 /// Per-function lowering state: code, register allocator, and lexical scopes.
@@ -602,7 +624,7 @@ struct FunctionContext<'a> {
     /// indexed by the scanner's exact binding identity.
     predeclared_cells: HashMap<BindingIdentity, Register>,
     capture_plan: CapturePlan,
-    loops: Vec<LoopFrame>,
+    control_targets: Vec<ControlTarget>,
     handlers: Vec<ExceptionHandler>,
     finally_stack: Vec<FinallyFrame>,
     /// `true` for the module entry function, whose bindings are the module
@@ -637,7 +659,7 @@ impl<'a> FunctionContext<'a> {
             scopes: vec![HashMap::new()],
             predeclared_cells: HashMap::new(),
             capture_plan,
-            loops: Vec::new(),
+            control_targets: Vec::new(),
             handlers: Vec::new(),
             finally_stack: Vec::new(),
             top_level: true,
@@ -1355,32 +1377,32 @@ impl<'a> FunctionContext<'a> {
             }
             Statement::Switch(switch) => {
                 self.lower_normalizing_statement(builder, range, |this, builder| {
-                    this.lower_switch(builder, range, switch)
+                    this.lower_switch(builder, range, switch, Vec::new())
                 })
             }
             Statement::For(for_statement) => {
                 self.lower_normalizing_statement(builder, range, |this, builder| {
-                    this.lower_for(builder, for_statement)
+                    this.lower_for(builder, for_statement, Vec::new())
                 })
             }
             Statement::ForIn(for_in) => {
                 self.lower_normalizing_statement(builder, range, |this, builder| {
-                    this.lower_for_in(builder, range, for_in)
+                    this.lower_for_in(builder, range, for_in, Vec::new())
                 })
             }
             Statement::ForOf(for_of) => {
                 self.lower_normalizing_statement(builder, range, |this, builder| {
-                    this.lower_for_of(builder, range, for_of)
+                    this.lower_for_of(builder, range, for_of, Vec::new())
                 })
             }
             Statement::While(while_statement) => {
                 self.lower_normalizing_statement(builder, range, |this, builder| {
-                    this.lower_while(builder, while_statement)
+                    this.lower_while(builder, while_statement, Vec::new())
                 })
             }
             Statement::DoWhile(do_while) => {
                 self.lower_normalizing_statement(builder, range, |this, builder| {
-                    this.lower_do_while(builder, do_while)
+                    this.lower_do_while(builder, do_while, Vec::new())
                 })
             }
             Statement::Try(try_statement) => {
@@ -1389,11 +1411,27 @@ impl<'a> FunctionContext<'a> {
                 })
             }
             Statement::With(_) => Err(self.unsupported(range, UnsupportedConstruct::WithStatement)),
-            Statement::Labeled(_) => {
-                Err(self.unsupported(range, UnsupportedConstruct::LabeledStatement))
+            Statement::Labeled(labeled) => {
+                self.lower_normalizing_statement(builder, range, |this, builder| {
+                    this.lower_labeled(builder, range, labeled)
+                })
             }
-            Statement::Break(jump) => self.lower_break(builder, range, jump.label.is_some()),
-            Statement::Continue(jump) => self.lower_continue(builder, range, jump.label.is_some()),
+            Statement::Break(jump) => {
+                let label = jump
+                    .label
+                    .as_ref()
+                    .map(|label| self.identifier_text(label))
+                    .transpose()?;
+                self.lower_break(builder, range, label.as_deref())
+            }
+            Statement::Continue(jump) => {
+                let label = jump
+                    .label
+                    .as_ref()
+                    .map(|label| self.identifier_text(label))
+                    .transpose()?;
+                self.lower_continue(builder, range, label.as_deref())
+            }
             Statement::Return(return_statement) => {
                 if self.top_level {
                     return Err(
@@ -1404,7 +1442,13 @@ impl<'a> FunctionContext<'a> {
                     Some(expression) => self.lower_expression(builder, expression)?,
                     None => self.undefined(builder, range)?,
                 };
-                if self.route_through_finally(builder, range, COMPLETION_RETURN, Some(value))? {
+                if self.route_through_finally(
+                    builder,
+                    range,
+                    COMPLETION_RETURN,
+                    Some(value),
+                    None,
+                )? {
                     return Ok(());
                 }
                 self.emit(range, Instruction::Return { value })?;
@@ -1437,6 +1481,123 @@ impl<'a> FunctionContext<'a> {
         let result = self.lower_statement(builder, body);
         self.pop_scope();
         result
+    }
+
+    fn lower_labeled(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        labeled: &LabeledStatement,
+    ) -> Result<(), LowerError> {
+        let mut labels = vec![self.identifier_text(&labeled.label)?];
+        let mut body = labeled.body.as_ref();
+        while let Statement::Labeled(nested) = body.data() {
+            labels.push(self.identifier_text(&nested.label)?);
+            body = nested.body.as_ref();
+        }
+
+        match body.data() {
+            Statement::Switch(statement) => self.lower_switch(builder, range, statement, labels),
+            Statement::For(statement) => self.lower_for(builder, statement, labels),
+            Statement::ForIn(statement) => self.lower_for_in(builder, range, statement, labels),
+            Statement::ForOf(statement) => self.lower_for_of(builder, range, statement, labels),
+            Statement::While(statement) => self.lower_while(builder, statement, labels),
+            Statement::DoWhile(statement) => self.lower_do_while(builder, statement, labels),
+            _ => self.lower_label_target(builder, range, body, labels),
+        }
+    }
+
+    fn lower_label_target(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        body: &Stmt,
+        labels: Vec<String>,
+    ) -> Result<(), LowerError> {
+        self.push_control_target(range, ControlTargetKind::Label, labels)?;
+        let result = self.lower_statement(builder, body);
+        let target = self
+            .control_targets
+            .pop()
+            .expect("labeled statement target is balanced");
+        result?;
+        let exit = self.next_pc();
+        for jump in target.breaks {
+            self.patch_jump(jump, exit);
+        }
+        Ok(())
+    }
+
+    fn push_control_target(
+        &mut self,
+        range: TextRange,
+        kind: ControlTargetKind,
+        labels: Vec<String>,
+    ) -> Result<(), LowerError> {
+        i32::try_from(self.control_targets.len()).map_err(|_| {
+            self.error(
+                range,
+                LowerErrorKind::Capacity(CapacityLimit::ControlTargets),
+            )
+        })?;
+        self.control_targets.push(ControlTarget {
+            breaks: Vec::new(),
+            continues: Vec::new(),
+            kind,
+            labels,
+        });
+        Ok(())
+    }
+
+    fn break_target(&self, range: TextRange, label: Option<&str>) -> Result<usize, LowerError> {
+        let target = match label {
+            Some(label) => self
+                .control_targets
+                .iter()
+                .rposition(|target| target.labels.iter().any(|candidate| candidate == label)),
+            None => self
+                .control_targets
+                .iter()
+                .rposition(|target| target.kind != ControlTargetKind::Label),
+        };
+        target.ok_or_else(|| {
+            self.error(
+                range,
+                LowerErrorKind::InvalidControlFlow {
+                    operation: "break target is not live",
+                },
+            )
+        })
+    }
+
+    fn continue_target(&self, range: TextRange, label: Option<&str>) -> Result<usize, LowerError> {
+        let target = match label {
+            Some(label) => self
+                .control_targets
+                .iter()
+                .rposition(|target| target.labels.iter().any(|candidate| candidate == label)),
+            None => self
+                .control_targets
+                .iter()
+                .rposition(|target| target.kind == ControlTargetKind::Iteration),
+        }
+        .ok_or_else(|| {
+            self.error(
+                range,
+                LowerErrorKind::InvalidControlFlow {
+                    operation: "continue target is not live",
+                },
+            )
+        })?;
+        if self.control_targets[target].kind != ControlTargetKind::Iteration {
+            return Err(self.error(
+                range,
+                LowerErrorKind::InvalidControlFlow {
+                    operation: "continue target is not an iteration statement",
+                },
+            ));
+        }
+        Ok(target)
     }
 
     fn lower_if(
@@ -1475,6 +1636,7 @@ impl<'a> FunctionContext<'a> {
         &mut self,
         builder: &mut ModuleBuilder,
         while_statement: &WhileStatement,
+        labels: Vec<String>,
     ) -> Result<(), LowerError> {
         let range = while_statement.test.range();
         let head = self.next_pc();
@@ -1486,16 +1648,12 @@ impl<'a> FunctionContext<'a> {
                 target: Pc::new(0),
             },
         )?;
-        self.loops.push(LoopFrame {
-            breaks: Vec::new(),
-            continues: Vec::new(),
-            is_loop: true,
-        });
+        self.push_control_target(range, ControlTargetKind::Iteration, labels)?;
         self.lower_nested(builder, &while_statement.body)?;
         self.emit(range, Instruction::Jump { target: head })?;
         let exit = self.next_pc();
         self.patch_jump(exit_jump, exit);
-        let frame = self.loops.pop().expect("loop frame is balanced");
+        let frame = self.control_targets.pop().expect("loop frame is balanced");
         for jump in frame.breaks {
             self.patch_jump(jump, exit);
         }
@@ -1509,14 +1667,11 @@ impl<'a> FunctionContext<'a> {
         &mut self,
         builder: &mut ModuleBuilder,
         do_while: &DoWhileStatement,
+        labels: Vec<String>,
     ) -> Result<(), LowerError> {
         let range = do_while.test.range();
         let head = self.next_pc();
-        self.loops.push(LoopFrame {
-            breaks: Vec::new(),
-            continues: Vec::new(),
-            is_loop: true,
-        });
+        self.push_control_target(range, ControlTargetKind::Iteration, labels)?;
         self.lower_nested(builder, &do_while.body)?;
         let test_pc = self.next_pc();
         let condition = self.lower_expression(builder, &do_while.test)?;
@@ -1528,7 +1683,7 @@ impl<'a> FunctionContext<'a> {
             },
         )?;
         let exit = self.next_pc();
-        let frame = self.loops.pop().expect("loop frame is balanced");
+        let frame = self.control_targets.pop().expect("loop frame is balanced");
         for jump in frame.breaks {
             self.patch_jump(jump, exit);
         }
@@ -1542,9 +1697,10 @@ impl<'a> FunctionContext<'a> {
         &mut self,
         builder: &mut ModuleBuilder,
         for_statement: &ForStatement,
+        labels: Vec<String>,
     ) -> Result<(), LowerError> {
         self.push_scope();
-        let result = self.lower_for_inner(builder, for_statement);
+        let result = self.lower_for_inner(builder, for_statement, labels);
         self.pop_scope();
         result
     }
@@ -1553,6 +1709,7 @@ impl<'a> FunctionContext<'a> {
         &mut self,
         builder: &mut ModuleBuilder,
         for_statement: &ForStatement,
+        labels: Vec<String>,
     ) -> Result<(), LowerError> {
         let per_iteration_names = match &for_statement.initializer {
             Some(ForInitializer::Variable(declaration))
@@ -1590,11 +1747,11 @@ impl<'a> FunctionContext<'a> {
             }
             None => None,
         };
-        self.loops.push(LoopFrame {
-            breaks: Vec::new(),
-            continues: Vec::new(),
-            is_loop: true,
-        });
+        self.push_control_target(
+            head_range(for_statement),
+            ControlTargetKind::Iteration,
+            labels,
+        )?;
         self.lower_nested(builder, &for_statement.body)?;
         let update_pc = self.next_pc();
         self.rebind_iteration_cells(builder, &per_iteration_names, head_range(for_statement))?;
@@ -1609,7 +1766,7 @@ impl<'a> FunctionContext<'a> {
         if let Some(jump) = exit_jump {
             self.patch_jump(jump, exit);
         }
-        let frame = self.loops.pop().expect("loop frame is balanced");
+        let frame = self.control_targets.pop().expect("loop frame is balanced");
         for jump in frame.breaks {
             self.patch_jump(jump, exit);
         }
@@ -1625,15 +1782,19 @@ impl<'a> FunctionContext<'a> {
         builder: &mut ModuleBuilder,
         range: TextRange,
         for_in: &ForInStatement,
+        labels: Vec<String>,
     ) -> Result<(), LowerError> {
         let subject = self.lower_expression(builder, &for_in.object)?;
         self.lower_iteration(
             builder,
-            range,
-            subject,
-            IteratorKind::Keys,
-            &for_in.binding,
-            &for_in.body,
+            IterationLowering {
+                range,
+                subject,
+                kind: IteratorKind::Keys,
+                binding: &for_in.binding,
+                body: &for_in.body,
+                labels,
+            },
         )
     }
 
@@ -1643,13 +1804,24 @@ impl<'a> FunctionContext<'a> {
         builder: &mut ModuleBuilder,
         range: TextRange,
         for_of: &ForOfStatement,
+        labels: Vec<String>,
     ) -> Result<(), LowerError> {
         let subject = self.lower_expression(builder, &for_of.iterable)?;
         let kind = match for_of.mode {
             ForOfMode::Sync => IteratorKind::Sync,
             ForOfMode::Async => IteratorKind::Async,
         };
-        self.lower_iteration(builder, range, subject, kind, &for_of.binding, &for_of.body)
+        self.lower_iteration(
+            builder,
+            IterationLowering {
+                range,
+                subject,
+                kind,
+                binding: &for_of.binding,
+                body: &for_of.body,
+                labels,
+            },
+        )
     }
 
     /// Shared iterator-driven loop for `for`/`of`, `for`/`in`, and
@@ -1660,12 +1832,16 @@ impl<'a> FunctionContext<'a> {
     fn lower_iteration(
         &mut self,
         builder: &mut ModuleBuilder,
-        range: TextRange,
-        subject: Register,
-        kind: IteratorKind,
-        binding: &ForBinding,
-        body: &Stmt,
+        lowering: IterationLowering<'_>,
     ) -> Result<(), LowerError> {
+        let IterationLowering {
+            range,
+            subject,
+            kind,
+            binding,
+            body,
+            labels,
+        } = lowering;
         self.push_scope();
         match binding {
             ForBinding::Variable(declaration)
@@ -1731,11 +1907,7 @@ impl<'a> FunctionContext<'a> {
                 target: Pc::new(0),
             },
         )?;
-        self.loops.push(LoopFrame {
-            breaks: Vec::new(),
-            continues: Vec::new(),
-            is_loop: true,
-        });
+        self.push_control_target(range, ControlTargetKind::Iteration, labels)?;
         // Fresh per-iteration scope for the loop binding.
         self.push_scope();
         self.bind_for_binding(builder, binding, value, range)?;
@@ -1745,7 +1917,7 @@ impl<'a> FunctionContext<'a> {
         self.emit(range, Instruction::Jump { target: head })?;
         let exit = self.next_pc();
         self.patch_jump(exit_jump, exit);
-        let frame = self.loops.pop().expect("loop frame is balanced");
+        let frame = self.control_targets.pop().expect("loop frame is balanced");
         for jump in frame.breaks {
             self.patch_jump(jump, exit);
         }
@@ -1791,23 +1963,14 @@ impl<'a> FunctionContext<'a> {
         &mut self,
         builder: &mut ModuleBuilder,
         range: TextRange,
-        labeled: bool,
+        label: Option<&str>,
     ) -> Result<(), LowerError> {
-        if labeled {
-            return Err(self.unsupported(range, UnsupportedConstruct::LabeledJump));
-        }
-        if self.route_through_finally(builder, range, COMPLETION_BREAK, None)? {
+        let target = self.break_target(range, label)?;
+        if self.route_through_finally(builder, range, COMPLETION_BREAK, None, Some(target))? {
             return Ok(());
         }
         let jump = self.emit(range, Instruction::Jump { target: Pc::new(0) })?;
-        let frame = self.loops.last_mut().ok_or_else(|| LowerError {
-            source: self.file.source_id(),
-            range,
-            kind: LowerErrorKind::MissingSyntax {
-                expected: NodeKind::BreakStatement,
-            },
-        })?;
-        frame.breaks.push(jump);
+        self.control_targets[target].breaks.push(jump);
         Ok(())
     }
 
@@ -1815,81 +1978,71 @@ impl<'a> FunctionContext<'a> {
         &mut self,
         builder: &mut ModuleBuilder,
         range: TextRange,
-        labeled: bool,
+        label: Option<&str>,
     ) -> Result<(), LowerError> {
-        if labeled {
-            return Err(self.unsupported(range, UnsupportedConstruct::LabeledJump));
-        }
-        if self.route_through_finally(builder, range, COMPLETION_CONTINUE, None)? {
+        let target = self.continue_target(range, label)?;
+        if self.route_through_finally(builder, range, COMPLETION_CONTINUE, None, Some(target))? {
             return Ok(());
         }
         let jump = self.emit(range, Instruction::Jump { target: Pc::new(0) })?;
-        let index = self.nearest_loop_index().ok_or_else(|| LowerError {
-            source: self.file.source_id(),
-            range,
-            kind: LowerErrorKind::MissingSyntax {
-                expected: NodeKind::ContinueStatement,
-            },
-        })?;
-        self.loops[index].continues.push(jump);
+        self.control_targets[target].continues.push(jump);
         Ok(())
     }
 
-    /// Routes an abrupt completion (`return`/`break`/`continue`) through the
-    /// innermost enclosing `finally`, if one is live and the completion crosses
-    /// it. Returns `true` when the completion was routed.
+    /// Routes an abrupt completion through the innermost enclosing `finally`
+    /// when its resolved target predates that frame.
     fn route_through_finally(
         &mut self,
         builder: &mut ModuleBuilder,
         range: TextRange,
         kind: i32,
         value: Option<Register>,
+        target: Option<usize>,
     ) -> Result<bool, LowerError> {
-        let Some((kind_reg, value_reg, depth)) = self
-            .finally_stack
-            .last()
-            .map(|frame| (frame.kind_reg, frame.value_reg, frame.loop_depth))
+        let Some((kind_reg, value_reg, target_reg, depth)) =
+            self.finally_stack.last().map(|frame| {
+                (
+                    frame.kind_reg,
+                    frame.value_reg,
+                    frame.target_reg,
+                    frame.control_depth,
+                )
+            })
         else {
             return Ok(false);
         };
-        // Determine the frame this completion targets; if that frame predates
-        // the finally, the completion crosses it and routes through it.
-        let target = match kind {
-            COMPLETION_BREAK => {
-                if self.loops.is_empty() {
-                    return Ok(false);
-                }
-                Some(self.loops.len() - 1)
-            }
-            COMPLETION_CONTINUE => match self.nearest_loop_index() {
-                Some(index) => Some(index),
-                None => return Ok(false),
-            },
-            _ => None,
-        };
-        if let Some(target) = target
-            && target >= depth
-        {
+        if target.is_some_and(|target| target >= depth) {
             return Ok(false);
         }
+
         let marker = self.load_constant(builder, Constant::Int32(kind), range)?;
         self.move_to(range, kind_reg, marker)?;
         if let Some(value) = value {
             self.move_to(range, value_reg, value)?;
         }
+        if let Some(target) = target {
+            let target = i32::try_from(target).map_err(|_| {
+                self.error(
+                    range,
+                    LowerErrorKind::Capacity(CapacityLimit::ControlTargets),
+                )
+            })?;
+            let marker = self.load_constant(builder, Constant::Int32(target), range)?;
+            self.move_to(range, target_reg, marker)?;
+        }
         let jump = self.emit(range, Instruction::Jump { target: Pc::new(0) })?;
-        self.finally_stack
+        let frame = self
+            .finally_stack
             .last_mut()
-            .expect("finally frame present")
-            .pending
-            .push(jump);
+            .expect("finally frame present");
+        frame.pending.push(jump);
+        if let Some(target) = target {
+            let completion = (kind, target);
+            if !frame.targets.contains(&completion) {
+                frame.targets.push(completion);
+            }
+        }
         Ok(true)
-    }
-
-    /// The index of the innermost enclosing real loop (skipping `switch`
-    /// break-scopes), which is where a `continue` transfers.
-    fn nearest_loop_index(&self) -> Option<usize> {
-        self.loops.iter().rposition(|frame| frame.is_loop)
     }
 
     fn lower_switch(
@@ -1897,6 +2050,7 @@ impl<'a> FunctionContext<'a> {
         builder: &mut ModuleBuilder,
         range: TextRange,
         switch: &SwitchStatement,
+        labels: Vec<String>,
     ) -> Result<(), LowerError> {
         let discriminant = self.lower_expression(builder, &switch.discriminant)?;
         self.push_scope();
@@ -1906,11 +2060,7 @@ impl<'a> FunctionContext<'a> {
             .flat_map(|case| case.data().consequent.iter().cloned())
             .collect::<Vec<_>>();
         self.instantiate_declarations(builder, &switch_statements, true)?;
-        self.loops.push(LoopFrame {
-            breaks: Vec::new(),
-            continues: Vec::new(),
-            is_loop: false,
-        });
+        self.push_control_target(range, ControlTargetKind::Switch, labels)?;
         let mut case_jumps: Vec<Option<Pc>> = Vec::with_capacity(switch.cases.len());
         let mut default_index = None;
         for (index, case) in switch.cases.iter().enumerate() {
@@ -1961,7 +2111,10 @@ impl<'a> FunctionContext<'a> {
             Some(index) => self.patch_jump(no_match_jump, body_starts[index]),
             None => self.patch_jump(no_match_jump, exit),
         }
-        let frame = self.loops.pop().expect("switch break frame is balanced");
+        let frame = self
+            .control_targets
+            .pop()
+            .expect("switch break frame is balanced");
 
         for jump in frame.breaks {
             self.patch_jump(jump, exit);
@@ -2047,15 +2200,19 @@ impl<'a> FunctionContext<'a> {
             .expect("lower_try_finally is only called with a non-empty finalizer");
         let kind_reg = self.alloc_register(range)?;
         let value_reg = self.alloc_register(range)?;
+        let target_reg = self.alloc_register(range)?;
         let normal = self.load_constant(builder, Constant::Int32(COMPLETION_NORMAL), range)?;
         self.move_to(range, kind_reg, normal)?;
+        self.move_to(range, target_reg, normal)?;
         let undefined = self.undefined(builder, range)?;
         self.move_to(range, value_reg, undefined)?;
         self.finally_stack.push(FinallyFrame {
             kind_reg,
             value_reg,
+            target_reg,
             pending: Vec::new(),
-            loop_depth: self.loops.len(),
+            control_depth: self.control_targets.len(),
+            targets: Vec::new(),
         });
 
         let start = self.next_pc();
@@ -2133,7 +2290,14 @@ impl<'a> FunctionContext<'a> {
         });
         self.pop_scope();
         finally_result?;
-        self.emit_finally_dispatch(builder, range, kind_reg, value_reg)
+        self.emit_finally_dispatch(
+            builder,
+            range,
+            kind_reg,
+            value_reg,
+            target_reg,
+            &frame.targets,
+        )
     }
 
     /// Records a completion (sets the state registers) and jumps to the pending
@@ -2170,67 +2334,72 @@ impl<'a> FunctionContext<'a> {
         range: TextRange,
         kind_reg: Register,
         value_reg: Register,
+        target_reg: Register,
+        targets: &[(i32, usize)],
     ) -> Result<(), LowerError> {
         // return
-        let skip = self.emit_kind_guard(builder, range, kind_reg, COMPLETION_RETURN)?;
-        if !self.route_through_finally(builder, range, COMPLETION_RETURN, Some(value_reg))? {
+        let skip = self.emit_int32_guard(builder, range, kind_reg, COMPLETION_RETURN)?;
+        if !self.route_through_finally(builder, range, COMPLETION_RETURN, Some(value_reg), None)? {
             self.emit(range, Instruction::Return { value: value_reg })?;
         }
         let after = self.next_pc();
         self.patch_jump(skip, after);
-        // throw
-        let skip = self.emit_kind_guard(builder, range, kind_reg, COMPLETION_THROW)?;
+        // throw stays direct so an enclosing catch can observe it.
+        let skip = self.emit_int32_guard(builder, range, kind_reg, COMPLETION_THROW)?;
         self.emit(range, Instruction::Throw { value: value_reg })?;
         let after = self.next_pc();
         self.patch_jump(skip, after);
-        // break
-        let skip = self.emit_kind_guard(builder, range, kind_reg, COMPLETION_BREAK)?;
-        if !self.route_through_finally(builder, range, COMPLETION_BREAK, None)? {
-            let break_jump = self.emit(range, Instruction::Jump { target: Pc::new(0) })?;
-            match self.loops.last_mut() {
-                Some(frame) => frame.breaks.push(break_jump),
-                None => {
-                    let target = self.next_pc();
-                    self.patch_jump(break_jump, target);
+
+        for &(kind, target) in targets {
+            let kind_skip = self.emit_int32_guard(builder, range, kind_reg, kind)?;
+            let target_id = i32::try_from(target).map_err(|_| {
+                self.error(
+                    range,
+                    LowerErrorKind::Capacity(CapacityLimit::ControlTargets),
+                )
+            })?;
+            let target_skip = self.emit_int32_guard(builder, range, target_reg, target_id)?;
+            if !self.route_through_finally(builder, range, kind, None, Some(target))? {
+                let jump = self.emit(range, Instruction::Jump { target: Pc::new(0) })?;
+                if target >= self.control_targets.len() {
+                    return Err(self.error(
+                        range,
+                        LowerErrorKind::InvalidControlFlow {
+                            operation: "finally target is no longer live",
+                        },
+                    ));
+                }
+                let target = &mut self.control_targets[target];
+                match kind {
+                    COMPLETION_BREAK => target.breaks.push(jump),
+                    COMPLETION_CONTINUE => target.continues.push(jump),
+                    _ => unreachable!("only jump completions carry target ids"),
                 }
             }
+            let after = self.next_pc();
+            self.patch_jump(target_skip, after);
+            self.patch_jump(kind_skip, after);
         }
-        let after = self.next_pc();
-        self.patch_jump(skip, after);
-        // continue
-        let skip = self.emit_kind_guard(builder, range, kind_reg, COMPLETION_CONTINUE)?;
-        if !self.route_through_finally(builder, range, COMPLETION_CONTINUE, None)? {
-            let continue_jump = self.emit(range, Instruction::Jump { target: Pc::new(0) })?;
-            match self.nearest_loop_index() {
-                Some(index) => self.loops[index].continues.push(continue_jump),
-                None => {
-                    let target = self.next_pc();
-                    self.patch_jump(continue_jump, target);
-                }
-            }
-        }
-        let after = self.next_pc();
-        self.patch_jump(skip, after);
         Ok(())
     }
 
-    /// Emits `if kind_reg != kind { jump skip }`, returning the skip jump to
+    /// Emits `if register != value { jump skip }`, returning the skip jump to
     /// patch past the guarded completion.
-    fn emit_kind_guard(
+    fn emit_int32_guard(
         &mut self,
         builder: &mut ModuleBuilder,
         range: TextRange,
-        kind_reg: Register,
-        kind: i32,
+        register: Register,
+        value: i32,
     ) -> Result<Pc, LowerError> {
-        let marker = self.load_constant(builder, Constant::Int32(kind), range)?;
+        let marker = self.load_constant(builder, Constant::Int32(value), range)?;
         let matched = self.alloc_register(range)?;
         self.emit(
             range,
             Instruction::Binary {
                 dst: matched,
                 op: BinaryOp::StrictEqual,
-                left: kind_reg,
+                left: register,
                 right: marker,
             },
         )?;
@@ -4542,7 +4711,7 @@ impl<'a> FunctionContext<'a> {
             scopes: vec![HashMap::new()],
             predeclared_cells: HashMap::new(),
             capture_plan,
-            loops: Vec::new(),
+            control_targets: Vec::new(),
             handlers: Vec::new(),
             finally_stack: Vec::new(),
             top_level: false,
@@ -5279,7 +5448,7 @@ impl<'a> FunctionContext<'a> {
             scopes: vec![HashMap::new()],
             predeclared_cells: HashMap::new(),
             capture_plan,
-            loops: Vec::new(),
+            control_targets: Vec::new(),
             handlers: Vec::new(),
             finally_stack: Vec::new(),
             top_level: false,
@@ -7001,8 +7170,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        BigIntTextError, LowerErrorKind, LowerOptions, UnsupportedConstruct, canonical_bigint_text,
-        cook_escapes, lower,
+        BigIntTextError, LowerError, LowerErrorKind, LowerOptions, UnsupportedConstruct,
+        canonical_bigint_text, cook_escapes, lower,
     };
     use crate::parser::parse;
     use crate::scanner::scan;
@@ -7146,7 +7315,7 @@ mod tests {
         BinaryOp, Constant, DecodeLimits, Instruction, Module, Register, Verified, decode_verified,
     };
 
-    fn lower_js(src: &str) -> Module<Verified> {
+    fn lower_js_result(src: &str) -> Result<Module<Verified>, LowerError> {
         let source = Arc::new(SourceText::new(src.to_owned()));
         let scanned = scan(SourceId::new(0), ScriptKind::TypeScript, source);
         let parsed = parse(scanned);
@@ -7156,13 +7325,34 @@ mod tests {
                 javascript_compatibility: true,
             },
         )
-        .expect("snippet lowers to a verified module")
+    }
+
+    fn lower_js(src: &str) -> Module<Verified> {
+        lower_js_result(src).expect("snippet lowers to a verified module")
     }
 
     #[test]
     fn debugger_statement_lowers_to_no_runtime_instruction() {
         let module = lower_js("debugger;");
         assert_eq!(module.functions()[0].code(), &[Instruction::Halt]);
+    }
+
+    #[test]
+    fn invalid_labeled_jumps_fail_at_the_control_target_boundary() {
+        for (source, operation) in [
+            ("block: { break; }", "break target is not live"),
+            (
+                "block: { continue block; }",
+                "continue target is not an iteration statement",
+            ),
+        ] {
+            let error = lower_js_result(source).expect_err("invalid jump must not lower");
+            assert_eq!(
+                error.kind,
+                LowerErrorKind::InvalidControlFlow { operation },
+                "{source}"
+            );
+        }
     }
 
     #[test]

@@ -210,6 +210,75 @@ continue-body:1,continue-inner:1,continue-outer:1\n";
 }
 
 #[test]
+fn aot_and_jit_run_labeled_control_flow() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        r#"const trace: string[] = [];
+block: {
+    trace.push("block");
+    break block;
+    trace.push("bad-block");
+}
+trace.push("after-block");
+let visits = 0;
+first: second: for (let i = 0; i < 3; i++) {
+    visits++;
+    if (i < 2) continue first;
+    trace.push("loop:" + i);
+}
+trace.push("visits:" + visits);
+exit: {
+    try {
+        try { trace.push("break-body"); break exit; }
+        finally { trace.push("break-inner"); }
+    } finally {
+        trace.push("break-outer");
+    }
+    trace.push("bad-exit");
+}
+outer: for (let i = 0; i < 2; i++) {
+    try {
+        try { trace.push("continue-body:" + i); continue outer; }
+        finally { trace.push("continue-inner:" + i); }
+    } finally {
+        trace.push("continue-outer:" + i);
+    }
+}
+crossed: for (let i = 0; i < 2; i++) {
+    try {
+        for (let j = 0; j < 2; j++) {
+            try { break crossed; } finally { trace.push("crossed-inner:" + i); }
+        }
+        trace.push("bad-crossed:" + i);
+    } finally {
+        trace.push("crossed-outer:" + i);
+    }
+}
+choice: switch (1) {
+    case 1: trace.push("switch"); break choice;
+    default: trace.push("bad-switch");
+}
+process.stdout.write(trace.join(",") + "\n");
+"#,
+    );
+
+    let expected = b"block,after-block,loop:2,visits:3,break-body,break-inner,break-outer,\
+continue-body:0,continue-inner:0,continue-outer:0,continue-body:1,continue-inner:1,\
+continue-outer:1,crossed-inner:0,crossed-outer:0,switch\n";
+    for target in ["jit", "aot"] {
+        let output = project
+            .command()
+            .args(["run", "--target", target, "main.ts"])
+            .current_dir(&project.path)
+            .output()
+            .unwrap_or_else(|error| panic!("bamts {target} labeled program starts: {error}"));
+        assert_success(&output, &format!("bamts {target} labeled program"));
+        assert_eq!(output.stdout, expected, "{target}");
+    }
+}
+
+#[test]
 fn aot_fixture_matches_jit_stdout_and_exit_code() {
     let directory = ScratchDirectory::new();
     let executable = directory
