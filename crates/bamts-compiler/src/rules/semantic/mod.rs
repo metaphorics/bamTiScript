@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::{
     checker::{
         AnalysisFacts, HazardFact, ProgramSemanticModel, ResolvedModuleEdge, SemanticHazard,
-        SemanticModel, SymbolKind,
+        SemanticModel, SymbolKind, is_numeric_enum_initializer,
     },
     diagnostic::{Diagnostic, Recovered},
     lint::{LintTable, SourceDialect, rule_by_code},
@@ -114,7 +114,7 @@ pub(crate) fn collect_facts(source: &SourceFile, model: &SemanticModel) -> Analy
 #[derive(Clone)]
 struct ClassFacts {
     base: Option<String>,
-    accessors: HashMap<String, String>,
+    accessors: HashSet<String>,
     methods: HashSet<String>,
 }
 
@@ -161,17 +161,6 @@ impl<'a> AstFactCollector<'a> {
             range,
             note: None,
         });
-    }
-
-    fn text(&self, range: TextRange) -> &str {
-        let source = self.source.source_text();
-        let Ok(start) = source.utf16_to_byte(range.start()) else {
-            return "";
-        };
-        let Ok(end) = source.utf16_to_byte(range.end()) else {
-            return "";
-        };
-        source.as_str().get(start..end).unwrap_or("")
     }
 
     fn identifier(&self, identifier: &IdentifierNode) -> &str {
@@ -347,16 +336,7 @@ impl<'a> AstFactCollector<'a> {
                             .data()
                             .initializer
                             .as_deref()
-                            .is_none_or(|initializer| {
-                                matches!(
-                                    initializer.data(),
-                                    Expression::Literal(Literal::Number(_))
-                                        | Expression::Unary(UnaryExpression {
-                                            operator: UnaryOperator::Plus | UnaryOperator::Minus,
-                                            ..
-                                        })
-                                )
-                            })
+                            .is_none_or(is_numeric_enum_initializer)
                     }) {
                         self.numeric_enums
                             .insert(self.identifier(&enumeration.name).to_owned());
@@ -376,7 +356,7 @@ impl<'a> AstFactCollector<'a> {
                         };
                         Some(self.identifier(identifier).to_owned())
                     });
-                    let mut accessors = HashMap::new();
+                    let mut accessors = HashSet::new();
                     let mut methods = HashSet::new();
                     for member in &class.members {
                         if let ClassMember::Method(method) = member.data()
@@ -387,14 +367,7 @@ impl<'a> AstFactCollector<'a> {
                                 method.modifier,
                                 PropertyModifier::Get | PropertyModifier::Set
                             ) {
-                                let annotation = method
-                                    .function
-                                    .return_type
-                                    .as_ref()
-                                    .map_or_else(String::new, |annotation| {
-                                        self.text(annotation.range()).to_owned()
-                                    });
-                                accessors.insert(member_name, annotation);
+                                accessors.insert(member_name);
                             }
                         }
                     }
@@ -782,7 +755,7 @@ impl<'a> AstFactCollector<'a> {
             .and_then(|class| class.base.as_ref())
             .and_then(|base| self.classes.get(base))
             .cloned();
-        let mut accessor_types: HashMap<String, String> = HashMap::new();
+        let mut accessor_types = HashMap::new();
         for member in &class.members {
             match member.data() {
                 ClassMember::Constructor(constructor) => {
@@ -802,24 +775,19 @@ impl<'a> AstFactCollector<'a> {
                             method.modifier,
                             PropertyModifier::Get | PropertyModifier::Set
                         ) {
-                            let current = if method.modifier == PropertyModifier::Get {
-                                method
-                                    .function
-                                    .return_type
-                                    .as_ref()
-                                    .map_or_else(String::new, |annotation| {
-                                        self.text(annotation.range()).to_owned()
+                            let annotation =
+                                if method.modifier == PropertyModifier::Get {
+                                    method.function.return_type.as_ref()
+                                } else {
+                                    method.function.parameters.first().and_then(|parameter| {
+                                        parameter.data().type_annotation.as_ref()
                                     })
-                            } else {
-                                method
-                                    .function
-                                    .parameters
-                                    .first()
-                                    .and_then(|parameter| parameter.data().type_annotation.as_ref())
-                                    .map_or_else(String::new, |annotation| {
-                                        self.text(annotation.range()).to_owned()
-                                    })
-                            };
+                                };
+                            let current = annotation
+                                .and_then(|annotation| {
+                                    self.model.resolved_type(annotation.data().type_node.id())
+                                })
+                                .unwrap_or_else(|| self.model.types().any());
                             if let Some(previous) = accessor_types.get(&name)
                                 && previous != &current
                             {
@@ -837,7 +805,7 @@ impl<'a> AstFactCollector<'a> {
                     if let Some(name) = self.property_name(&property.name)
                         && base
                             .as_ref()
-                            .is_some_and(|base| base.accessors.contains_key(&name))
+                            .is_some_and(|base| base.accessors.contains(&name))
                         && !property.modifiers.is_declare
                     {
                         self.push(
@@ -1626,6 +1594,30 @@ mod tests {
             .expect("parameter starts on a UTF-8 boundary");
         assert_eq!(diagnostic.range().start(), expected_start);
         assert!(diagnostic.range().start() <= diagnostic.range().end());
+    }
+
+    #[test]
+    fn unary_non_number_enum_initializer_is_not_a_numeric_enum() {
+        let source = "enum E { A = -C } let e: E = E.A; let n: number = e;";
+        assert!(
+            !codes(source).contains(&"BAMTS-W045"),
+            "a nonnumeric enum initializer must not create a numeric-enum hazard"
+        );
+    }
+
+    #[test]
+    fn accessor_types_compare_by_canonical_checker_identity() {
+        let equivalent = "type Value = number|string; class C { get x(): Value { return 1; } set x(value: number | string) {} }";
+        assert!(
+            !codes(equivalent).contains(&"BAMTS-W011"),
+            "aliases and formatting must not make equivalent accessor types diverge"
+        );
+
+        let different = "class C { get x(): number { return 1; } set x(value: string) {} }";
+        assert!(
+            codes(different).contains(&"BAMTS-W011"),
+            "different accessor types must still diverge"
+        );
     }
 
     #[test]

@@ -763,6 +763,7 @@ pub struct SemanticModel {
     symbols: Vec<Symbol>,
     symbol_types: Vec<TypeId>,
     references: HashMap<NodeId, SymbolId>,
+    type_nodes: HashMap<NodeId, TypeId>,
     types: TypeTable,
     module_scope: ScopeId,
     facts: AnalysisFacts,
@@ -809,6 +810,12 @@ impl SemanticModel {
     #[must_use]
     pub const fn types(&self) -> &TypeTable {
         &self.types
+    }
+
+    /// Returns the checker's canonical identity for a resolved type node.
+    #[must_use]
+    pub(crate) fn resolved_type(&self, node: NodeId) -> Option<TypeId> {
+        self.type_nodes.get(&node).copied()
     }
 
     /// Returns the immutable semantic evidence consumed by lint rules.
@@ -1035,6 +1042,22 @@ enum TypeDef<'src> {
     },
 }
 
+/// Returns whether an enum initializer is a numeric literal expression.
+pub(crate) fn is_numeric_enum_initializer(expression: &Expr) -> bool {
+    match expression.data() {
+        Expression::Literal(Literal::Number(_)) => true,
+        Expression::Unary(unary)
+            if matches!(unary.operator, UnaryOperator::Plus | UnaryOperator::Minus) =>
+        {
+            matches!(
+                unary.argument.data(),
+                Expression::Literal(Literal::Number(_))
+            )
+        }
+        _ => false,
+    }
+}
+
 struct Checker<'src> {
     source: &'src SourceFile,
     intrinsics: GlobalEnvironment,
@@ -1044,6 +1067,7 @@ struct Checker<'src> {
     type_state: Vec<TypeState>,
     type_defs: HashMap<SymbolId, TypeDef<'src>>,
     references: HashMap<NodeId, SymbolId>,
+    type_nodes: HashMap<NodeId, TypeId>,
     diagnostics: Vec<Diagnostic>,
     types: TypeTable,
     module_scope: ScopeId,
@@ -1064,6 +1088,7 @@ impl<'src> Checker<'src> {
             type_state: Vec::new(),
             type_defs: HashMap::new(),
             references: HashMap::new(),
+            type_nodes: HashMap::new(),
             diagnostics: Vec::new(),
             types: TypeTable::new(),
             module_scope: ScopeId(0),
@@ -1114,6 +1139,7 @@ impl<'src> Checker<'src> {
             symbols: self.symbols,
             symbol_types: self.symbol_types,
             references: self.references,
+            type_nodes: self.type_nodes,
             types: self.types,
             module_scope: self.module_scope,
             facts: AnalysisFacts::default(),
@@ -1387,7 +1413,7 @@ impl<'src> Checker<'src> {
                                 .data()
                                 .initializer
                                 .as_deref()
-                                .is_none_or(Self::is_numeric_enum_initializer)
+                                .is_none_or(is_numeric_enum_initializer)
                         }),
                     },
                 );
@@ -1786,21 +1812,6 @@ impl<'src> Checker<'src> {
                     self.emit(TYPE_NOT_ASSIGNABLE, range, NOT_ASSIGNABLE_MESSAGE);
                 }
             }
-        }
-    }
-
-    fn is_numeric_enum_initializer(expression: &Expr) -> bool {
-        match expression.data() {
-            Expression::Literal(Literal::Number(_)) => true,
-            Expression::Unary(unary)
-                if matches!(unary.operator, UnaryOperator::Plus | UnaryOperator::Minus) =>
-            {
-                matches!(
-                    unary.argument.data(),
-                    Expression::Literal(Literal::Number(_))
-                )
-            }
-            _ => false,
         }
     }
 
@@ -2223,7 +2234,7 @@ impl<'src> Checker<'src> {
     // -- the named type algebra ------------------------------------------------
 
     fn resolve_type(&mut self, node: &'src Ty, scope: ScopeId) -> TypeId {
-        match node.data() {
+        let resolved = match node.data() {
             TypeNode::Keyword(keyword) => self.keyword_type(*keyword),
             TypeNode::Literal(literal) => self.literal_type(literal),
             TypeNode::Reference(reference) => {
@@ -2253,7 +2264,9 @@ impl<'src> Checker<'src> {
                 self.types.array(element)
             }
             _ => self.types.error_type(),
-        }
+        };
+        self.type_nodes.insert(node.id(), resolved);
+        resolved
     }
 
     fn keyword_type(&self, keyword: KeywordType) -> TypeId {
