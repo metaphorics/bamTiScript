@@ -1334,9 +1334,7 @@ impl<'src> Checker<'src> {
             }
             Statement::With(statement) => self.bind_hoisted_statement(&statement.body, scope),
             Statement::Labeled(statement) => self.bind_hoisted_statement(&statement.body, scope),
-            Statement::Namespace(namespace) => {
-                self.bind_hoisted_statements(&namespace.body.data().statements, scope);
-            }
+            Statement::Namespace(_) => {}
             Statement::Declare(inner) => self.bind_hoisted_statement(inner, scope),
             Statement::Export(crate::syntax::ExportDeclaration::Named(
                 crate::syntax::ExportNamedDeclaration::Declaration(inner),
@@ -1701,9 +1699,10 @@ impl<'src> Checker<'src> {
                 }
             }
             Statement::Namespace(namespace) => {
-                let child = self.new_scope(ScopeKind::Block, Some(scope));
+                let child = self.new_scope(ScopeKind::Function, Some(scope));
                 let body = &namespace.body;
                 self.bind_statements(&body.data().statements, child);
+                self.bind_hoisted_statements(&body.data().statements, child);
                 self.resolve_statements(&body.data().statements, child);
             }
             Statement::Declare(inner) => self.resolve_statement(inner, scope),
@@ -3627,5 +3626,14 @@ mod tests {
             model.lookup_value(model.module_scope(), "b").is_none(),
             "let stays block-scoped and never reaches the module scope"
         );
+    }
+
+    #[test]
+    fn namespace_vars_stay_inside_the_namespace_iife_scope() {
+        let result = check_text("namespace N { export var x = 1; x; } N.x; x;");
+        assert_eq!(checker_codes(&result), [CANNOT_FIND_NAME.as_str()]);
+        let model = result.product();
+        assert!(model.lookup_value(model.module_scope(), "N").is_some());
+        assert!(model.lookup_value(model.module_scope(), "x").is_none());
     }
 }
