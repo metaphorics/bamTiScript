@@ -123,6 +123,8 @@ pub const MAX_HANDLERS: u32 = 1 << 16;
 pub const MAX_CONSTANTS: u32 = 1 << 20;
 /// Structural verify-time ceiling on a module's function count.
 pub const MAX_FUNCTIONS: u32 = 1 << 20;
+/// Canonical decoder ceiling for one BigInt constant's decimal text.
+pub const MAX_BIGINT_BYTES: u32 = 1 << 20;
 
 /// Combined verify-time ceiling on the total definite-initialization fact
 /// storage a module may force the verifier to allocate, in 64-bit words. Each
@@ -1994,7 +1996,7 @@ impl Default for DecodeLimits {
             max_total_instructions: 1 << 24,
             max_handlers_per_function: MAX_HANDLERS,
             max_string_units: 1 << 20,
-            max_bigint_bytes: 1 << 20,
+            max_bigint_bytes: MAX_BIGINT_BYTES,
         }
     }
 }

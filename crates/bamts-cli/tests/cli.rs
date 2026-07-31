@@ -112,6 +112,45 @@ process.stdout.write(process.env.BAMTS_AOT_ENTRYPOINT === undefined ? "hidden\n"
 }
 
 #[test]
+fn aot_and_jit_execute_non_decimal_bigint_literals() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        r#"const hex = 0x100000000000000000000000000000001n;
+const octal = 0o20n;
+const binary = 0b1_0000n;
+if (
+    hex !== 340282366920938463463374607431768211457n ||
+    octal !== 16n ||
+    binary !== 16n
+) {
+    throw "non-decimal BigInt mismatch";
+}
+process.stdout.write("ok\n");
+"#,
+    );
+
+    let jit = project
+        .command()
+        .args(["run", "--target", "jit", "main.ts"])
+        .current_dir(&project.path)
+        .output()
+        .expect("bamts JIT BigInt program starts");
+    assert_success(&jit, "bamts JIT BigInt program");
+
+    let aot = project
+        .command()
+        .args(["run", "--target", "aot", "main.ts"])
+        .current_dir(&project.path)
+        .output()
+        .expect("bamts AOT BigInt program starts");
+    assert_success(&aot, "bamts AOT BigInt program");
+
+    assert_eq!(jit.stdout, b"ok\n");
+    assert_eq!(aot.stdout, jit.stdout);
+}
+
+#[test]
 fn aot_fixture_matches_jit_stdout_and_exit_code() {
     let directory = ScratchDirectory::new();
     let executable = directory

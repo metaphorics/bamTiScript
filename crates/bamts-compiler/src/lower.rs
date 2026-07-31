@@ -47,8 +47,8 @@ use std::fmt;
 use bamts_bytecode::{
     AccessorKind, BigIntLiteral, BinaryOp, Constant, ConstantId, EcmaString, EcmaStringBuilder,
     ExceptionHandler, Function, FunctionFlags, FunctionId, Instruction, IteratorKind,
-    MAX_CONSTANTS, MAX_FUNCTIONS, MAX_INSTRUCTIONS, MAX_REGISTERS, Module, NumberBits, Pc,
-    Register, UnaryOp, Verified, VerifyError,
+    MAX_BIGINT_BYTES, MAX_CONSTANTS, MAX_FUNCTIONS, MAX_INSTRUCTIONS, MAX_REGISTERS, Module,
+    NumberBits, Pc, Register, UnaryOp, Verified, VerifyError,
 };
 
 pub use crate::program::{
@@ -182,8 +182,6 @@ pub enum UnsupportedConstruct {
     ImportMeta,
     /// An identifier spelled with unicode escape sequences.
     EscapedIdentifier,
-    /// A non-decimal (`0x`/`0o`/`0b`) bigint literal.
-    NonDecimalBigInt,
     /// A `return` at module top level.
     ReturnOutsideFunction,
     /// A derived constructor that is not an implicit constructor or a single
@@ -201,6 +199,8 @@ pub enum CapacityLimit {
     Functions,
     Instructions,
     StringUnits,
+    BigIntBytes,
+    BigIntWork,
     Captures,
 }
 
@@ -263,7 +263,6 @@ impl fmt::Display for UnsupportedConstruct {
             Self::DynamicImportInScript => "dynamic `import()` in a classic script",
             Self::ImportMeta => "`import.meta` meta property",
             Self::EscapedIdentifier => "identifier containing escape sequences",
-            Self::NonDecimalBigInt => "non-decimal bigint literal",
             Self::ReturnOutsideFunction => "top-level `return`",
             Self::DerivedConstructorShape => {
                 "derived constructor without one direct `super(...)` call"
@@ -282,6 +281,8 @@ impl fmt::Display for CapacityLimit {
             Self::Functions => "too many functions",
             Self::Instructions => "too many instructions in one function",
             Self::StringUnits => "string constant exceeds the deterministic pool code-unit ceiling",
+            Self::BigIntBytes => "bigint constant exceeds the canonical decoder byte ceiling",
+            Self::BigIntWork => "bigint radix conversion exceeds its deterministic work ceiling",
             Self::Captures => "too many captured variables in one closure",
         };
         f.write_str(text)
@@ -3652,8 +3653,21 @@ impl<'a> FunctionContext<'a> {
             .file
             .token_text(token)
             .ok_or_else(|| self.error(range, LowerErrorKind::InvalidBigIntLiteral))?;
-        let canonical = canonical_bigint_text(lexeme)
-            .ok_or_else(|| self.unsupported(range, UnsupportedConstruct::NonDecimalBigInt))?;
+        let canonical = canonical_bigint_text(
+            lexeme,
+            MAX_BIGINT_BYTES as usize,
+            MAX_BIGINT_CONVERSION_LIMB_OPS,
+        )
+        .map_err(|error| {
+            self.error(
+                range,
+                match error {
+                    BigIntTextError::Invalid => LowerErrorKind::InvalidBigIntLiteral,
+                    BigIntTextError::Bytes => LowerErrorKind::Capacity(CapacityLimit::BigIntBytes),
+                    BigIntTextError::Work => LowerErrorKind::Capacity(CapacityLimit::BigIntWork),
+                },
+            )
+        })?;
         let value = BigIntLiteral::new(canonical)
             .ok_or_else(|| self.error(range, LowerErrorKind::InvalidBigIntLiteral))?;
         self.load_constant(builder, Constant::BigInt(value), range)
@@ -6781,29 +6795,152 @@ fn split_regex(lexeme: &str) -> Option<(String, String)> {
     let flags = &lexeme[last_slash + 1..];
     Some((pattern.to_owned(), flags.to_owned()))
 }
+const MAX_BIGINT_CONVERSION_LIMB_OPS: usize = 1 << 24;
 
-/// Canonicalizes a decimal bigint lexeme to canonical decimal text.
-fn canonical_bigint_text(lexeme: &str) -> Option<String> {
-    let digits = lexeme.strip_suffix('n')?;
+/// Failure while canonicalizing BigInt source text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BigIntTextError {
+    Invalid,
+    Bytes,
+    Work,
+}
+
+/// Canonicalizes a BigInt lexeme to bounded decimal text.
+fn canonical_bigint_text(
+    lexeme: &str,
+    max_bytes: usize,
+    max_limb_ops: usize,
+) -> Result<String, BigIntTextError> {
+    const LIMB_BASE: u64 = 1_000_000_000;
+    const DECIMAL_LIMB_DIGITS: usize = 9;
+    const LOG10_2_UPPER_NUMERATOR: usize = 30_103;
+    const LOG10_2_UPPER_DENOMINATOR: usize = 100_000;
+
+    let literal = lexeme.strip_suffix('n').ok_or(BigIntTextError::Invalid)?;
+    let (digits, radix) = literal
+        .strip_prefix("0x")
+        .or_else(|| literal.strip_prefix("0X"))
+        .map(|digits| (digits, 16))
+        .or_else(|| {
+            literal
+                .strip_prefix("0o")
+                .or_else(|| literal.strip_prefix("0O"))
+                .map(|digits| (digits, 8))
+        })
+        .or_else(|| {
+            literal
+                .strip_prefix("0b")
+                .or_else(|| literal.strip_prefix("0B"))
+                .map(|digits| (digits, 2))
+        })
+        .unwrap_or((literal, 10));
     if digits.is_empty() {
-        return None;
+        return Err(BigIntTextError::Invalid);
     }
-    if digits.len() >= 2 {
-        let prefix = &digits[..2];
-        if matches!(prefix, "0x" | "0X" | "0o" | "0O" | "0b" | "0B") {
-            return None;
+
+    let mut previous_was_digit = false;
+    let mut significant_digits = 0_usize;
+    let mut first_significant_bits = 0_usize;
+    for character in digits.chars() {
+        if character == '_' {
+            if !previous_was_digit {
+                return Err(BigIntTextError::Invalid);
+            }
+            previous_was_digit = false;
+            continue;
+        }
+        let digit = character.to_digit(radix).ok_or(BigIntTextError::Invalid)?;
+        previous_was_digit = true;
+        if first_significant_bits == 0 {
+            if digit == 0 {
+                continue;
+            }
+            first_significant_bits = (u32::BITS - digit.leading_zeros()) as usize;
+        }
+        significant_digits = significant_digits
+            .checked_add(1)
+            .ok_or(BigIntTextError::Work)?;
+    }
+    if !previous_was_digit {
+        return Err(BigIntTextError::Invalid);
+    }
+
+    if radix == 10 {
+        let output_bytes = significant_digits.max(1);
+        if output_bytes > max_bytes {
+            return Err(BigIntTextError::Bytes);
+        }
+        let mut output = String::with_capacity(output_bytes);
+        let mut significant = false;
+        for character in digits.chars().filter(|character| *character != '_') {
+            if character != '0' || significant {
+                significant = true;
+                output.push(character);
+            }
+        }
+        if output.is_empty() {
+            output.push('0');
+        }
+        return Ok(output);
+    }
+
+    let bit_length = significant_digits
+        .saturating_sub(1)
+        .checked_mul(radix.trailing_zeros() as usize)
+        .and_then(|remaining| remaining.checked_add(first_significant_bits))
+        .ok_or(BigIntTextError::Work)?;
+    let max_decimal_bytes = if bit_length == 0 {
+        1
+    } else {
+        bit_length
+            .checked_mul(LOG10_2_UPPER_NUMERATOR)
+            .and_then(|value| value.checked_add(LOG10_2_UPPER_DENOMINATOR - 1))
+            .map(|value| value / LOG10_2_UPPER_DENOMINATOR)
+            .ok_or(BigIntTextError::Work)?
+    };
+    if max_decimal_bytes > max_bytes {
+        return Err(BigIntTextError::Bytes);
+    }
+    let max_limb_count = max_decimal_bytes.div_ceil(DECIMAL_LIMB_DIGITS);
+    let worst_case_limb_ops = significant_digits
+        .checked_mul(max_limb_count)
+        .ok_or(BigIntTextError::Work)?;
+    if worst_case_limb_ops > max_limb_ops {
+        return Err(BigIntTextError::Work);
+    }
+
+    let mut limbs = vec![0_u32];
+    let mut significant = false;
+    for character in digits.chars().filter(|character| *character != '_') {
+        let digit = u64::from(
+            character
+                .to_digit(radix)
+                .expect("validated BigInt digit remains valid"),
+        );
+        if digit == 0 && !significant {
+            continue;
+        }
+        significant = true;
+        let mut carry = digit;
+        for limb in &mut limbs {
+            let value = u64::from(*limb) * u64::from(radix) + carry;
+            *limb = (value % LIMB_BASE) as u32;
+            carry = value / LIMB_BASE;
+        }
+        if carry != 0 {
+            limbs.push(carry as u32);
         }
     }
-    let cleaned: String = digits.chars().filter(|c| *c != '_').collect();
-    if cleaned.is_empty() || !cleaned.chars().all(|c| c.is_ascii_digit()) {
-        return None;
+
+    let mut output = limbs.pop().ok_or(BigIntTextError::Invalid)?.to_string();
+    for limb in limbs.iter().rev() {
+        use std::fmt::Write as _;
+        write!(output, "{limb:09}").expect("writing to String cannot fail");
     }
-    let trimmed = cleaned.trim_start_matches('0');
-    if trimmed.is_empty() {
-        Some("0".to_owned())
-    } else {
-        Some(trimmed.to_owned())
+    if output.len() > max_bytes {
+        return Err(BigIntTextError::Bytes);
     }
+    Ok(output)
 }
 
 /// Cooks a scanned numeric lexeme into its ECMAScript number value.
@@ -6862,7 +6999,10 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use super::{LowerErrorKind, LowerOptions, UnsupportedConstruct, cook_escapes, lower};
+    use super::{
+        BigIntTextError, LowerErrorKind, LowerOptions, UnsupportedConstruct, canonical_bigint_text,
+        cook_escapes, lower,
+    };
     use crate::parser::parse;
     use crate::scanner::scan;
     use crate::source::{ScriptKind, SourceId, SourceText};
@@ -7031,6 +7171,82 @@ mod tests {
             .collect();
         assert!(strings.iter().any(|units| *units == [0xD800]));
         assert!(strings.iter().any(|units| *units == [0xD83D, 0xDE03]));
+    }
+
+    #[test]
+    fn non_decimal_bigint_literals_lower_to_decimal_constants() {
+        let module = lower_js(
+            "const hex = 0x100000000000000000000000000000001n; \
+             const octal = 0o20n; \
+             const binary = 0b1_0000n;",
+        );
+        let bigints: Vec<_> = module
+            .constants()
+            .iter()
+            .filter_map(|constant| match constant {
+                Constant::BigInt(value) => Some(value.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(bigints.contains(&"340282366920938463463374607431768211457"));
+        assert!(bigints.contains(&"16"));
+    }
+
+    #[test]
+    fn malformed_non_decimal_bigint_separator_fails_lowering() {
+        let source = Arc::new(SourceText::new("const value = 0x1_n;".to_owned()));
+        let scanned = scan(SourceId::new(0), ScriptKind::TypeScript, source);
+        let parsed = parse(scanned);
+        let error = lower(
+            parsed.product(),
+            LowerOptions {
+                javascript_compatibility: true,
+            },
+        )
+        .expect_err("a trailing BigInt separator is invalid");
+        assert_eq!(error.kind, LowerErrorKind::InvalidBigIntLiteral);
+    }
+
+    #[test]
+    fn non_decimal_bigint_conversion_honors_output_limit() {
+        assert_eq!(
+            canonical_bigint_text("0xffn", 3, usize::MAX).as_deref(),
+            Ok("255")
+        );
+        assert_eq!(
+            canonical_bigint_text("0xffn", 2, usize::MAX),
+            Err(BigIntTextError::Bytes)
+        );
+    }
+
+    #[test]
+    fn non_decimal_bigint_conversion_honors_work_limit() {
+        assert_eq!(
+            canonical_bigint_text("0xffffn", 5, 4).as_deref(),
+            Ok("65535")
+        );
+        assert_eq!(
+            canonical_bigint_text("0xffffn", 5, 3),
+            Err(BigIntTextError::Work)
+        );
+    }
+
+    #[test]
+    fn non_decimal_bigint_conversion_matches_small_integer_values() {
+        for value in 0_u32..4096 {
+            let expected = value.to_string();
+            for lexeme in [
+                format!("0x{value:x}n"),
+                format!("0o{value:o}n"),
+                format!("0b{value:b}n"),
+            ] {
+                assert_eq!(
+                    canonical_bigint_text(&lexeme, 16, usize::MAX).as_deref(),
+                    Ok(expected.as_str()),
+                    "{lexeme}"
+                );
+            }
+        }
     }
 
     fn any_instruction(
