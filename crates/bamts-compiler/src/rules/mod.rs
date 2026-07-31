@@ -11,7 +11,8 @@ use crate::{
         ArrayElement, AssignmentArrayElement, AssignmentTarget, CallArgument, ClassDeclaration,
         ClassMember, ExportDeclaration, ExportDefaultValue, Expr, Expression, ForBinding,
         ForInitializer, FunctionBody, FunctionLike, InterfaceDeclaration, MemberProperty,
-        ObjectMember, PropertyName, SourceFile, Statement, Stmt, TokenKind, TypeMember, TypeNode,
+        ObjectMember, ParameterNode, PropertyName, SourceFile, Statement, Stmt, TokenKind,
+        TypeAnnotationNode, TypeMember, TypeNode, TypeParameterList,
     },
 };
 
@@ -1280,28 +1281,14 @@ fn visit_expression(
         ),
         Expression::Class(class) => visit_class(&class.class, script_kind, findings),
         Expression::Arrow(arrow) => {
-            flag_parameter_count(expression.range(), arrow.parameters.len(), findings);
-            for parameter in &arrow.parameters {
-                if is_javascript(script_kind) && parameter.data().type_annotation.is_some() {
-                    findings.push((
-                        "BAMTS-W085",
-                        parameter.range(),
-                        "TypeScript-only parameter type appears in JavaScript",
-                    ));
-                }
-                if let Some(initializer) = &parameter.data().initializer {
-                    visit_expression(initializer, script_kind, findings);
-                }
-            }
-            if is_javascript(script_kind)
-                && (arrow.return_type.is_some() || arrow.type_parameters.is_some())
-            {
-                findings.push((
-                    "BAMTS-W085",
-                    expression.range(),
-                    "TypeScript-only function type syntax appears in JavaScript",
-                ));
-            }
+            visit_callable_signature(
+                expression.range(),
+                &arrow.parameters,
+                arrow.return_type.as_ref(),
+                arrow.type_parameters.as_ref(),
+                script_kind,
+                findings,
+            );
             match &arrow.body {
                 FunctionBody::Block(block) => {
                     visit_statement_list(&block.data().statements, script_kind, findings)
@@ -1495,53 +1482,16 @@ fn visit_function(
     script_kind: ScriptKind,
     findings: &mut Vec<(&'static str, TextRange, &'static str)>,
 ) {
-    flag_parameter_count(range, function.parameters.len(), findings);
+    visit_callable_signature(
+        range,
+        &function.parameters,
+        function.return_type.as_ref(),
+        function.type_parameters.as_ref(),
+        script_kind,
+        findings,
+    );
     for decorator in &function.decorators {
         visit_expression(&decorator.data().expression, script_kind, findings);
-    }
-    for parameter in &function.parameters {
-        if parameter
-            .data()
-            .type_annotation
-            .as_ref()
-            .is_some_and(|annotation| {
-                matches!(annotation.data().type_node.data(), TypeNode::Array(_))
-            })
-        {
-            findings.push((
-                "BAMTS-W059",
-                parameter.range(),
-                "mutable array type crosses a callable boundary",
-            ));
-        }
-        if matches!(
-            script_kind,
-            ScriptKind::JavaScript | ScriptKind::JavaScriptReact
-        ) && parameter.data().type_annotation.is_some()
-        {
-            findings.push((
-                "BAMTS-W085",
-                parameter.range(),
-                "TypeScript-only parameter type appears in JavaScript",
-            ));
-        }
-        for decorator in &parameter.data().decorators {
-            visit_expression(&decorator.data().expression, script_kind, findings);
-        }
-        if let Some(initializer) = &parameter.data().initializer {
-            visit_expression(initializer, script_kind, findings);
-        }
-    }
-    if matches!(
-        script_kind,
-        ScriptKind::JavaScript | ScriptKind::JavaScriptReact
-    ) && (function.return_type.is_some() || function.type_parameters.is_some())
-    {
-        findings.push((
-            "BAMTS-W085",
-            range,
-            "TypeScript-only function type syntax appears in JavaScript",
-        ));
     }
     match &function.body {
         Some(FunctionBody::Block(block)) => {
@@ -1564,6 +1514,53 @@ fn visit_function(
             visit_expression(expression, script_kind, findings)
         }
         Some(FunctionBody::Missing(_)) | None => {}
+    }
+}
+
+/// Signature checks shared by function-like declarations and arrow functions:
+/// parameter count, mutable-array parameters, JavaScript-only type syntax,
+/// parameter decorators, and parameter initializers. Body traversal stays with
+/// each form so it owns its own control-flow handling.
+fn visit_callable_signature(
+    range: TextRange,
+    parameters: &[ParameterNode],
+    return_type: Option<&TypeAnnotationNode>,
+    type_parameters: Option<&TypeParameterList>,
+    script_kind: ScriptKind,
+    findings: &mut Vec<(&'static str, TextRange, &'static str)>,
+) {
+    flag_parameter_count(range, parameters.len(), findings);
+    for parameter in parameters {
+        let data = parameter.data();
+        if data.type_annotation.as_ref().is_some_and(|annotation| {
+            matches!(annotation.data().type_node.data(), TypeNode::Array(_))
+        }) {
+            findings.push((
+                "BAMTS-W059",
+                parameter.range(),
+                "mutable array type crosses a callable boundary",
+            ));
+        }
+        if is_javascript(script_kind) && data.type_annotation.is_some() {
+            findings.push((
+                "BAMTS-W085",
+                parameter.range(),
+                "TypeScript-only parameter type appears in JavaScript",
+            ));
+        }
+        for decorator in &data.decorators {
+            visit_expression(&decorator.data().expression, script_kind, findings);
+        }
+        if let Some(initializer) = &data.initializer {
+            visit_expression(initializer, script_kind, findings);
+        }
+    }
+    if is_javascript(script_kind) && (return_type.is_some() || type_parameters.is_some()) {
+        findings.push((
+            "BAMTS-W085",
+            range,
+            "TypeScript-only function type syntax appears in JavaScript",
+        ));
     }
 }
 
@@ -1917,5 +1914,28 @@ mod tests {
             .expect("const enum must be diagnosed");
         assert_eq!(runtime.severity(), DiagnosticSeverity::Error);
         assert_eq!(inlined.severity(), DiagnosticSeverity::Warning);
+    }
+
+    rule_test!(
+        w059_mutable_array_function,
+        "BAMTS-W059",
+        "function f(xs: number[]) { return xs; }",
+        "function f(value: number) { return value; }"
+    );
+
+    rule_test!(
+        w059_mutable_array_arrow,
+        "BAMTS-W059",
+        "const f = (xs: number[]) => xs;",
+        "const f = (value: number) => value;"
+    );
+
+    #[test]
+    fn arrow_signature_rejects_javascript_type_syntax() {
+        let diagnostics = codes("const f = (x: number) => x;", ScriptKind::JavaScript);
+        assert!(
+            diagnostics.contains(&"BAMTS-W085"),
+            "BAMTS-W085 must flag TypeScript-only parameter syntax on arrow functions in JavaScript"
+        );
     }
 }
