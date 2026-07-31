@@ -140,6 +140,13 @@ impl SourceEdgeNodeIndex {
             _ => Vec::new(),
         };
 
+        debug_assert!(
+            children
+                .windows(2)
+                .all(|pair| pair[0].range.end() <= pair[1].range.start()),
+            "edge node children must be source-ordered and non-overlapping"
+        );
+
         EdgeNode {
             id,
             range: statement.range(),
