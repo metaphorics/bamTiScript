@@ -17,11 +17,14 @@ use bamts_runtime::Host;
 /// Parent-to-AOT-child transport for the logical source entrypoint.
 ///
 /// `initialize_aot_process_context` consumes this before publishing
-/// `process.env`, so it is not observable to JavaScript.
+/// `process.env`, so it is not observable to JavaScript. It supplies the
+/// logical `argv[1]` slot only when the launch proof matches.
 pub const AOT_ENTRYPOINT_ENV: &str = "BAMTS_AOT_ENTRYPOINT";
-/// Parent-to-AOT-child launch proof paired with the first private argument.
+/// Parent-to-AOT-child launch proof paired with the private process argument.
 ///
-/// Both copies must match before `AOT_ENTRYPOINT_ENV` can replace `argv[0]`.
+/// `initialize_aot_process_context` compares the token against
+/// `process_args[1]`; the executable path otherwise fills the logical
+/// `argv[1]` slot.
 pub const AOT_LAUNCH_TOKEN_ENV: &str = "BAMTS_AOT_LAUNCH_TOKEN";
 
 /// Classic-script compiler capability for Node hosts.
@@ -584,12 +587,15 @@ enum AotProcessContextError {
 
 /// Populate an AOT host from an explicit process snapshot.
 ///
-/// The leading `bamts` mirrors the JIT driver's argv convention. A launched
-/// AOT child consumes `AOT_ENTRYPOINT_ENV` only when the private environment
-/// token matches its first argument. Direct AOT execution uses its executable
-/// path even when it inherits stale transport variables. Conversion
-/// is all-or-nothing so an invalid OS string cannot leave a partially populated
-/// host.
+/// The leading `bamts` mirrors the JIT driver's argv convention, so the
+/// executable always maps to logical `argv[1]`. A matching launch token
+/// (compared against the private `process_args[1]`) authenticates a
+/// parent-launched child: the token slot is skipped and `AOT_ENTRYPOINT_ENV`
+/// fills that `argv[1]` position, falling back to the executable path when no
+/// entrypoint was transported. Without a match, direct execution keeps the
+/// executable at `argv[1]` and drops any inherited transport variables.
+/// Conversion is all-or-nothing so an invalid OS string cannot leave a
+/// partially populated host.
 #[cfg(any(feature = "aot-main", test))]
 fn initialize_aot_process_context(
     host: &mut NodeHost,
@@ -616,17 +622,23 @@ fn initialize_aot_process_context(
         env.insert(name, value);
     }
 
-    let transported_entrypoint = match (
-        env.remove(AOT_ENTRYPOINT_ENV),
-        env.remove(AOT_LAUNCH_TOKEN_ENV),
-        process_args.get(1),
-    ) {
-        (Some(entrypoint), Some(token), Some(argument)) if argument == &token => Some(entrypoint),
-        _ => None,
+    let entrypoint_env = env.remove(AOT_ENTRYPOINT_ENV);
+    let launch_token_env = env.remove(AOT_LAUNCH_TOKEN_ENV);
+
+    // A matching launch token authenticates a parent-launched AOT child: the
+    // token is supplied both as `AOT_LAUNCH_TOKEN_ENV` and as the private
+    // `process_args[1]`. On a match the token slot is consumed so it never
+    // reaches JavaScript, regardless of whether an entrypoint was transported.
+    let launch_authenticated = match (launch_token_env.as_ref(), process_args.get(1)) {
+        (Some(token), Some(argument)) => argument == token,
+        _ => false,
     };
-    let (entrypoint, first_program_argument) = match transported_entrypoint {
-        Some(entrypoint) => (Some(entrypoint), 2),
-        None => (process_args.first().cloned(), 1),
+
+    let (entrypoint, first_program_argument) = if launch_authenticated {
+        let entrypoint = entrypoint_env.or_else(|| process_args.first().cloned());
+        (entrypoint, 2)
+    } else {
+        (process_args.first().cloned(), 1)
     };
     let mut argv = vec!["bamts".to_owned()];
     if let Some(entrypoint) = entrypoint {
@@ -836,6 +848,42 @@ mod tests {
         assert_eq!(host.argv(), ["bamts", "/tmp/direct-aot-image", "--flag"]);
         assert_eq!(host.env(AOT_ENTRYPOINT_ENV), None);
         assert_eq!(host.env(AOT_LAUNCH_TOKEN_ENV), None);
+    }
+
+    #[test]
+    fn aot_process_context_consumes_authenticated_token_without_entrypoint() {
+        let mut host = NodeHost::new();
+        initialize_aot_process_context(
+            &mut host,
+            [
+                std::ffi::OsString::from("/tmp/cache/aot-image"),
+                std::ffi::OsString::from("launch-7"),
+                std::ffi::OsString::from("--flag"),
+                std::ffi::OsString::from("extra.ts"),
+            ],
+            [
+                (
+                    std::ffi::OsString::from(AOT_LAUNCH_TOKEN_ENV),
+                    std::ffi::OsString::from("launch-7"),
+                ),
+                (
+                    std::ffi::OsString::from("VISIBLE"),
+                    std::ffi::OsString::from("value"),
+                ),
+            ],
+        )
+        .unwrap();
+
+        // A matching token still consumes the token slot (argv[1] stays the
+        // executable and the token never appears) even with no transported
+        // entrypoint; transport env keys remain hidden.
+        assert_eq!(
+            host.argv(),
+            ["bamts", "/tmp/cache/aot-image", "--flag", "extra.ts"]
+        );
+        assert_eq!(host.env(AOT_LAUNCH_TOKEN_ENV), None);
+        assert_eq!(host.env(AOT_ENTRYPOINT_ENV), None);
+        assert_eq!(host.env("VISIBLE"), Some("value"));
     }
 
     #[test]
