@@ -517,7 +517,7 @@ enum AotCompletion<'a> {
     Failure(AotMainFailure),
 }
 
-/// Emits buffered host stdout only on success and flushes both streams.
+/// Emits buffered host output for every completion and flushes both streams.
 #[cfg(any(feature = "aot-main", test))]
 fn write_aot_completion(
     host: &NodeHost,
@@ -525,11 +525,10 @@ fn write_aot_completion(
     stdout: &mut impl std::io::Write,
     stderr: &mut impl std::io::Write,
 ) -> std::io::Result<i32> {
+    stdout.write_all(host.stdout())?;
     let (exit_code, failure) = match completion {
         AotCompletion::Success(outcome) => {
-            stdout.write_all(host.stdout())?;
             stdout.write_all(&outcome.stdout)?;
-            stdout.flush()?;
             (
                 if host.exit_code() == 0 {
                     outcome.exit_code
@@ -541,6 +540,7 @@ fn write_aot_completion(
         }
         AotCompletion::Failure(error) => (1, Some(error)),
     };
+    stdout.flush()?;
     stderr.write_all(host.stderr())?;
     if let Some(error) = failure {
         writeln!(stderr, "bamts: {error}")?;
@@ -753,7 +753,11 @@ mod tests {
         let mut host = NodeHost::new();
         Host::write_stdout(&mut host, b"before failure");
         Host::write_stderr(&mut host, b"host diagnostic\n");
-        let mut stdout = Vec::new();
+        let mut stdout = FlushProbe {
+            bytes: Vec::new(),
+            flushes: 0,
+            flush_error: None,
+        };
         let mut stderr = Vec::new();
 
         let exit_code = write_aot_completion(
@@ -765,7 +769,8 @@ mod tests {
         .expect("completion writes");
 
         assert_eq!(exit_code, 1);
-        assert!(stdout.is_empty());
+        assert_eq!(stdout.bytes, b"before failure");
+        assert_eq!(stdout.flushes, 1);
         assert_eq!(stderr, b"host diagnostic\nbamts: aot runtime\n");
     }
 
