@@ -2173,7 +2173,9 @@ impl<'a> FunctionContext<'a> {
     ) -> Result<(), LowerError> {
         // return
         let skip = self.emit_kind_guard(builder, range, kind_reg, COMPLETION_RETURN)?;
-        self.emit(range, Instruction::Return { value: value_reg })?;
+        if !self.route_through_finally(builder, range, COMPLETION_RETURN, Some(value_reg))? {
+            self.emit(range, Instruction::Return { value: value_reg })?;
+        }
         let after = self.next_pc();
         self.patch_jump(skip, after);
         // throw
@@ -2183,24 +2185,28 @@ impl<'a> FunctionContext<'a> {
         self.patch_jump(skip, after);
         // break
         let skip = self.emit_kind_guard(builder, range, kind_reg, COMPLETION_BREAK)?;
-        let break_jump = self.emit(range, Instruction::Jump { target: Pc::new(0) })?;
-        match self.loops.last_mut() {
-            Some(frame) => frame.breaks.push(break_jump),
-            None => {
-                let target = self.next_pc();
-                self.patch_jump(break_jump, target);
+        if !self.route_through_finally(builder, range, COMPLETION_BREAK, None)? {
+            let break_jump = self.emit(range, Instruction::Jump { target: Pc::new(0) })?;
+            match self.loops.last_mut() {
+                Some(frame) => frame.breaks.push(break_jump),
+                None => {
+                    let target = self.next_pc();
+                    self.patch_jump(break_jump, target);
+                }
             }
         }
         let after = self.next_pc();
         self.patch_jump(skip, after);
         // continue
         let skip = self.emit_kind_guard(builder, range, kind_reg, COMPLETION_CONTINUE)?;
-        let continue_jump = self.emit(range, Instruction::Jump { target: Pc::new(0) })?;
-        match self.nearest_loop_index() {
-            Some(index) => self.loops[index].continues.push(continue_jump),
-            None => {
-                let target = self.next_pc();
-                self.patch_jump(continue_jump, target);
+        if !self.route_through_finally(builder, range, COMPLETION_CONTINUE, None)? {
+            let continue_jump = self.emit(range, Instruction::Jump { target: Pc::new(0) })?;
+            match self.nearest_loop_index() {
+                Some(index) => self.loops[index].continues.push(continue_jump),
+                None => {
+                    let target = self.next_pc();
+                    self.patch_jump(continue_jump, target);
+                }
             }
         }
         let after = self.next_pc();

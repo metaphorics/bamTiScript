@@ -151,6 +151,65 @@ process.stdout.write("ok\n");
 }
 
 #[test]
+fn aot_and_jit_run_all_nested_finally_completions() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        r#"const trace: string[] = [];
+function returnProbe(): number {
+    try {
+        try { return 7; } finally { trace.push("return-inner"); }
+    } finally {
+        trace.push("return-outer");
+    }
+}
+trace.push("return:" + returnProbe());
+try {
+    try {
+        try { throw "boom"; } finally { trace.push("throw-inner"); }
+    } finally {
+        trace.push("throw-outer");
+    }
+} catch (error) {
+    trace.push("catch:" + error);
+}
+for (;;) {
+    try {
+        try { trace.push("break-body"); break; } finally { trace.push("break-inner"); }
+    } finally {
+        trace.push("break-outer");
+    }
+}
+for (let i = 0; i < 2; i++) {
+    try {
+        try { trace.push("continue-body:" + i); continue; }
+        finally { trace.push("continue-inner:" + i); }
+    } finally {
+        trace.push("continue-outer:" + i);
+    }
+}
+process.stdout.write(trace.join(",") + "\n");
+"#,
+    );
+
+    let expected = b"return-inner,return-outer,return:7,throw-inner,throw-outer,catch:boom,\
+break-body,break-inner,break-outer,continue-body:0,continue-inner:0,continue-outer:0,\
+continue-body:1,continue-inner:1,continue-outer:1\n";
+    for target in ["jit", "aot"] {
+        let output = project
+            .command()
+            .args(["run", "--target", target, "main.ts"])
+            .current_dir(&project.path)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("bamts {target} nested-finally program starts: {error}")
+            });
+        assert_success(&output, &format!("bamts {target} nested-finally program"));
+        assert_eq!(output.stdout, expected, "{target}");
+    }
+}
+
+#[test]
 fn aot_fixture_matches_jit_stdout_and_exit_code() {
     let directory = ScratchDirectory::new();
     let executable = directory
