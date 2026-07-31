@@ -790,12 +790,13 @@ impl<'a> AstFactCollector<'a> {
                                     self.model.resolved_type(annotation.data().type_node.id())
                                 })
                                 .unwrap_or_else(|| self.model.types().any());
-                            if let Some(previous) = accessor_types.get(&name)
+                            let key = (method.modifiers.is_static, name);
+                            if let Some(previous) = accessor_types.get(&key)
                                 && previous != &current
                             {
                                 self.push(SemanticHazard::DivergentAccessor, member.range());
                             }
-                            accessor_types.insert(name, current);
+                            accessor_types.insert(key, current);
                         }
                         if implicit_override {
                             self.push(SemanticHazard::ImplicitOverride, member.range());
@@ -1631,6 +1632,23 @@ mod tests {
         assert!(
             codes(different).contains(&"BAMTS-W011"),
             "different accessor types must still diverge"
+        );
+    }
+
+    #[test]
+    fn static_and_instance_accessor_pairs_do_not_diverge() {
+        let static_get_instance_set =
+            "class C { static get x(): number { return 1; } set x(value: string) {} }";
+        assert!(
+            !codes(static_get_instance_set).contains(&"BAMTS-W011"),
+            "static and instance accessors are independent and must not be compared"
+        );
+
+        let static_get_static_set_divergent =
+            "class C { static get x(): number { return 1; } static set x(value: string) {} }";
+        assert!(
+            codes(static_get_static_set_divergent).contains(&"BAMTS-W011"),
+            "same-staticness divergent accessor pairs must still report divergence"
         );
     }
 
