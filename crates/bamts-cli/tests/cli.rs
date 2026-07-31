@@ -77,6 +77,41 @@ fn run_fixture_preserves_stdout_and_exit_code() {
 }
 
 #[test]
+fn aot_and_jit_share_process_argv_entrypoint_parity() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        r#"process.stdout.write(process.argv[0] + "\n");
+process.stdout.write(process.argv[1] + "\n");
+process.stdout.write(process.argv[2] + "\n");
+process.stdout.write(process.argv[3] + "\n");
+process.stdout.write(process.env.BAMTS_AOT_ENTRYPOINT === undefined ? "hidden\n" : "leaked\n");
+"#,
+    );
+
+    let jit = project
+        .command()
+        .env_remove("BAMTS_AOT_ENTRYPOINT")
+        .args(["run", "--target", "jit", "main.ts", "--", "first", "second"])
+        .current_dir(&project.path)
+        .output()
+        .expect("bamts JIT argv program starts");
+    assert_success(&jit, "bamts JIT argv program");
+
+    let aot = project
+        .command()
+        .env_remove("BAMTS_AOT_ENTRYPOINT")
+        .args(["run", "--target", "aot", "main.ts", "--", "first", "second"])
+        .current_dir(&project.path)
+        .output()
+        .expect("bamts AOT argv program starts");
+    assert_success(&aot, "bamts AOT argv program");
+
+    assert_eq!(jit.stdout, b"bamts\nmain.ts\nfirst\nsecond\nhidden\n");
+    assert_eq!(aot.stdout, jit.stdout);
+}
+
+#[test]
 fn aot_fixture_matches_jit_stdout_and_exit_code() {
     let directory = ScratchDirectory::new();
     let executable = directory

@@ -404,7 +404,7 @@ fn run(args: &CliArgs, frontend: &LoadedProgramFrontend) -> Result<CommandOutcom
         .map_err(DriverError::Lower)?;
     match args.target {
         ExecutionTarget::Jit => run_jit(args, entrypoint, warnings, &executable),
-        ExecutionTarget::Aot => run_aot(args, warnings, &executable),
+        ExecutionTarget::Aot => run_aot(args, entrypoint, warnings, &executable),
     }
 }
 
@@ -442,6 +442,7 @@ fn run_jit(
 
 fn run_aot(
     args: &CliArgs,
+    entrypoint: &Path,
     warnings: String,
     executable: &bamts_compiler::program::ExecutableProgram,
 ) -> Result<CommandOutcome, DriverError> {
@@ -460,7 +461,13 @@ fn run_aot(
         std::env::consts::EXE_SUFFIX
     ));
     link_executable(&object.bytes, &destination)?;
-    let output = Command::new(&destination).args(&args.program_args).output();
+    let launch_token = format!("{}-{id}", std::process::id());
+    let output = Command::new(&destination)
+        .env(bamts_node::AOT_ENTRYPOINT_ENV, entrypoint.as_os_str())
+        .env(bamts_node::AOT_LAUNCH_TOKEN_ENV, &launch_token)
+        .arg(launch_token)
+        .args(&args.program_args)
+        .output();
     let _ = fs::remove_file(&destination);
     let output = output.map_err(|source| DriverError::LinkStart {
         program: destination.into_os_string(),

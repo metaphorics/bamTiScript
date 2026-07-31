@@ -14,6 +14,16 @@ use std::sync::Arc;
 use bamts_bytecode::{Program, Verified};
 use bamts_runtime::Host;
 
+/// Parent-to-AOT-child transport for the logical source entrypoint.
+///
+/// `initialize_aot_process_context` consumes this before publishing
+/// `process.env`, so it is not observable to JavaScript.
+pub const AOT_ENTRYPOINT_ENV: &str = "BAMTS_AOT_ENTRYPOINT";
+/// Parent-to-AOT-child launch proof paired with the first private argument.
+///
+/// Both copies must match before `AOT_ENTRYPOINT_ENV` can replace `argv[0]`.
+pub const AOT_LAUNCH_TOKEN_ENV: &str = "BAMTS_AOT_LAUNCH_TOKEN";
+
 /// Classic-script compiler capability for Node hosts.
 #[cfg(feature = "script-compiler")]
 #[derive(Default)]
@@ -574,18 +584,21 @@ enum AotProcessContextError {
 
 /// Populate an AOT host from an explicit process snapshot.
 ///
-/// The leading `bamts` mirrors the JIT driver's argv convention; the AOT
-/// executable path occupies the entrypoint slot. Conversion is all-or-nothing
-/// so an invalid OS string cannot leave a partially populated host.
+/// The leading `bamts` mirrors the JIT driver's argv convention. A launched
+/// AOT child consumes `AOT_ENTRYPOINT_ENV` only when the private environment
+/// token matches its first argument. Direct AOT execution uses its executable
+/// path even when it inherits stale transport variables. Conversion
+/// is all-or-nothing so an invalid OS string cannot leave a partially populated
+/// host.
 #[cfg(any(feature = "aot-main", test))]
 fn initialize_aot_process_context(
     host: &mut NodeHost,
     args: impl IntoIterator<Item = std::ffi::OsString>,
     environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> Result<(), AotProcessContextError> {
-    let mut argv = vec!["bamts".to_owned()];
+    let mut process_args = Vec::new();
     for argument in args {
-        argv.push(
+        process_args.push(
             argument
                 .into_string()
                 .map_err(|_| AotProcessContextError::Argument)?,
@@ -602,6 +615,24 @@ fn initialize_aot_process_context(
             .map_err(|_| AotProcessContextError::EnvironmentValue)?;
         env.insert(name, value);
     }
+
+    let transported_entrypoint = match (
+        env.remove(AOT_ENTRYPOINT_ENV),
+        env.remove(AOT_LAUNCH_TOKEN_ENV),
+        process_args.get(1),
+    ) {
+        (Some(entrypoint), Some(token), Some(argument)) if argument == &token => Some(entrypoint),
+        _ => None,
+    };
+    let (entrypoint, first_program_argument) = match transported_entrypoint {
+        Some(entrypoint) => (Some(entrypoint), 2),
+        None => (process_args.first().cloned(), 1),
+    };
+    let mut argv = vec!["bamts".to_owned()];
+    if let Some(entrypoint) = entrypoint {
+        argv.push(entrypoint);
+    }
+    argv.extend(process_args.into_iter().skip(first_program_argument));
 
     host.argv = argv;
     host.env = env;
@@ -746,6 +777,65 @@ mod tests {
         assert_eq!(host.argv(), ["bamts", "/tmp/program", "--flag"]);
         assert_eq!(host.env("ALPHA"), Some("first"));
         assert_eq!(host.env("ZED"), Some("last"));
+    }
+
+    #[test]
+    fn aot_process_context_replaces_the_executable_with_a_private_entrypoint() {
+        let mut host = NodeHost::new();
+        initialize_aot_process_context(
+            &mut host,
+            [
+                std::ffi::OsString::from("/tmp/cache/aot-image"),
+                std::ffi::OsString::from("launch-7"),
+                std::ffi::OsString::from("--flag"),
+            ],
+            [
+                (
+                    std::ffi::OsString::from(AOT_ENTRYPOINT_ENV),
+                    std::ffi::OsString::from("src/main.ts"),
+                ),
+                (
+                    std::ffi::OsString::from(AOT_LAUNCH_TOKEN_ENV),
+                    std::ffi::OsString::from("launch-7"),
+                ),
+                (
+                    std::ffi::OsString::from("VISIBLE"),
+                    std::ffi::OsString::from("value"),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(host.argv(), ["bamts", "src/main.ts", "--flag"]);
+        assert_eq!(host.env("BAMTS_AOT_ENTRYPOINT"), None);
+        assert_eq!(host.env("VISIBLE"), Some("value"));
+    }
+
+    #[test]
+    fn aot_process_context_ignores_inherited_transport_without_launch_proof() {
+        let mut host = NodeHost::new();
+        initialize_aot_process_context(
+            &mut host,
+            [
+                std::ffi::OsString::from("/tmp/direct-aot-image"),
+                std::ffi::OsString::from("--flag"),
+            ],
+            [
+                (
+                    std::ffi::OsString::from(AOT_ENTRYPOINT_ENV),
+                    std::ffi::OsString::from("stale.ts"),
+                ),
+                (
+                    std::ffi::OsString::from(AOT_LAUNCH_TOKEN_ENV),
+                    std::ffi::OsString::from("stale-token"),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(host.argv(), ["bamts", "/tmp/direct-aot-image", "--flag"]);
+        assert_eq!(host.env(AOT_ENTRYPOINT_ENV), None);
+        assert_eq!(host.env(AOT_LAUNCH_TOKEN_ENV), None);
     }
 
     #[test]
