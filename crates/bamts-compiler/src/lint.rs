@@ -354,7 +354,7 @@ macro_rules! rule {
 }
 
 /// The single authoritative identity and default-level registry for all BamTS rules.
-pub static RULES: [RuleDefinition; 86] = [
+pub static RULES: [RuleDefinition; 88] = [
     rule!(
         "BAMTS-W001",
         "method-parameter-bivariance",
@@ -1401,6 +1401,24 @@ pub static RULES: [RuleDefinition; 86] = [
             ])
         )
     ),
+    rule!(
+        "BAMTS-W087",
+        "no-debugger",
+        Opinionated,
+        Allow,
+        "A debugger statement halts execution when developer tools are attached.",
+        "Remove the statement before shipping or use a deliberate diagnostic mechanism.",
+        examples!("debugger;", "void 0;")
+    ),
+    rule!(
+        "BAMTS-W088",
+        "no-with",
+        JavaScriptCompatibility,
+        Deny,
+        "A with statement changes name resolution based on dynamic scope.",
+        "Access the object explicitly instead of changing the scope chain.",
+        examples!(JavaScript, "with (obj) body;", "obj.body;")
+    ),
 ];
 
 /// Render the checked-in strictness reference directly from [`RULES`].
@@ -1868,7 +1886,7 @@ impl LintTable {
         if rule.code() == "BAMTS-W085" {
             return self.level(rule);
         }
-        let spec_footgun = matches!(
+        let javascript_rule = matches!(
             rule.code(),
             "BAMTS-W071"
                 | "BAMTS-W072"
@@ -1880,12 +1898,13 @@ impl LintTable {
                 | "BAMTS-W078"
                 | "BAMTS-W079"
                 | "BAMTS-W080"
+                | "BAMTS-W087"
         );
         let control_flow = RULES[rule_index(rule)].group() == RuleGroup::ControlFlow;
         let javascript_compatibility = RULES[rule_index(rule)].group()
             == RuleGroup::JavaScriptCompatibility
             && rule.code() != "BAMTS-W085";
-        if spec_footgun || control_flow || javascript_compatibility {
+        if javascript_rule || control_flow || javascript_compatibility {
             let effective = self.level(rule);
             return if effective == LintLevel::Allow {
                 LintLevel::Allow
@@ -2099,7 +2118,7 @@ mod tests {
 
     #[test]
     fn registry_is_complete_and_unique() {
-        assert_eq!(RULES.len(), 86);
+        assert_eq!(RULES.len(), 88);
         for (index, rule) in RULES.iter().enumerate() {
             assert!(rule.code().starts_with("BAMTS-W"));
             assert!(!rule.slug().is_empty());

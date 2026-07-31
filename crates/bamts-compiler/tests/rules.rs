@@ -11,7 +11,7 @@ use bamts_compiler::{
         RuleExampleSource, rule_reference,
     },
     parser, rules, scanner,
-    source::{SourceId, SourceText},
+    source::{ScriptKind, SourceId, SourceText},
     syntax::{SourceFile, Statement},
 };
 
@@ -19,7 +19,7 @@ const REFERENCE: &str = include_str!("../RULES.md");
 
 #[test]
 fn every_registered_rule_has_complete_metadata_and_current_reference() {
-    assert_eq!(RULES.len(), 86, "the adopted catalog has exactly 86 rules");
+    assert_eq!(RULES.len(), 88, "the adopted catalog has exactly 88 rules");
     assert_eq!(
         REFERENCE,
         rule_reference(),
@@ -122,6 +122,79 @@ fn every_registered_rule_triggers_and_has_a_clean_counterexample() {
         "rule contract failures:\n{}",
         failures.join("\n")
     );
+}
+
+#[test]
+fn debugger_is_reported_only_when_a_profile_or_override_enables_it() {
+    let default_codes = run(
+        RuleExampleCase::Source(RuleExampleSource::new(ScriptKind::TypeScript, "debugger;")),
+        &LintTable::new(LintProfile::Default),
+    );
+    assert!(
+        !default_codes.iter().any(|code| code == "BAMTS-W087"),
+        "default profile must leave no-debugger disabled: {default_codes:?}"
+    );
+
+    let pedantic_codes = run(
+        RuleExampleCase::Source(RuleExampleSource::new(ScriptKind::TypeScript, "debugger;")),
+        &LintTable::new(LintProfile::Pedantic),
+    );
+    assert!(
+        pedantic_codes.iter().any(|code| code == "BAMTS-W087"),
+        "pedantic profile must enable no-debugger: {pedantic_codes:?}"
+    );
+
+    let debugger = RULES
+        .iter()
+        .find(|rule| rule.code() == "BAMTS-W087")
+        .expect("W087 is registered");
+    let mut levels = LintTable::new(LintProfile::Default);
+    levels
+        .apply_cli([LintOverride::rule(
+            debugger.id(),
+            LintLevel::Warn,
+            "test override",
+        )])
+        .expect("a rule override can enable no-debugger");
+    let override_codes = run(
+        RuleExampleCase::Source(RuleExampleSource::new(ScriptKind::TypeScript, "debugger;")),
+        &levels,
+    );
+    assert!(
+        override_codes.iter().any(|code| code == "BAMTS-W087"),
+        "a rule override must enable no-debugger: {override_codes:?}"
+    );
+}
+
+#[test]
+fn with_reports_javascript_compatibility_and_visits_its_children() {
+    let debugger = RULES
+        .iter()
+        .find(|rule| rule.code() == "BAMTS-W087")
+        .expect("W087 is registered");
+    let mut levels = LintTable::new(LintProfile::Default);
+    levels
+        .apply_cli([LintOverride::rule(
+            debugger.id(),
+            LintLevel::Warn,
+            "test nested body traversal",
+        )])
+        .expect("a rule override can enable nested no-debugger");
+
+    let parsed = parse(
+        0,
+        RuleExampleSource::new(ScriptKind::JavaScript, "with (value) { debugger; }"),
+    );
+    let codes = rules::analyze(parsed.product(), &levels)
+        .iter()
+        .map(|diagnostic| diagnostic.code().as_str().to_owned())
+        .collect::<Vec<_>>();
+    for code in ["BAMTS-W087", "BAMTS-W088"] {
+        assert!(
+            codes.iter().any(|actual| actual == code),
+            "{code} must be reported from the with statement: {codes:?}"
+        );
+    }
 }
 
 #[test]

@@ -1142,9 +1142,14 @@ fn visit_statement(
                 visit_statement_list(&finalizer.data().statements, script_kind, findings);
             }
         }
-        Statement::With(statement) => {
-            visit_expression(&statement.object, script_kind, findings);
-            visit_statement(&statement.body, script_kind, findings);
+        Statement::With(with_statement) => {
+            findings.push((
+                "BAMTS-W088",
+                statement.range(),
+                "with statement changes name resolution based on dynamic scope",
+            ));
+            visit_expression(&with_statement.object, script_kind, findings);
+            visit_statement(&with_statement.body, script_kind, findings);
         }
         Statement::Labeled(statement) => visit_statement(&statement.body, script_kind, findings),
         Statement::Return(statement) => {
@@ -1152,6 +1157,11 @@ fn visit_statement(
                 visit_expression(argument, script_kind, findings);
             }
         }
+        Statement::Debugger => findings.push((
+            "BAMTS-W087",
+            statement.range(),
+            "debugger statement halts execution when developer tools are attached",
+        )),
         Statement::Throw(statement) => visit_expression(&statement.argument, script_kind, findings),
         Statement::Enum(declaration) => {
             if is_javascript(script_kind) {
