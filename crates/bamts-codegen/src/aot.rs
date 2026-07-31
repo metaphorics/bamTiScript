@@ -262,16 +262,37 @@ fn define_functions(
     units: &[DeclaredUnit],
     helper_ids: &[FuncId],
 ) -> Result<(), AotError> {
-    let mut unit_index = 0;
+    let mut declared_functions = std::collections::HashMap::with_capacity(units.len());
+    for unit in units {
+        if declared_functions
+            .insert((unit.module_id, unit.function_id), unit.function)
+            .is_some()
+        {
+            return Err(AotError::InvalidLoweredModule(format!(
+                "duplicate declaration for module {} function {}",
+                unit.module_id, unit.function_id
+            )));
+        }
+    }
+
     for module in &lowered.modules {
         for lowered_function in &module.functions {
+            let declared = declared_functions
+                .get(&(module.id.get(), lowered_function.id.get()))
+                .copied()
+                .ok_or_else(|| {
+                    AotError::InvalidLoweredModule(format!(
+                        "missing declaration for module {} function {}",
+                        module.id.get(),
+                        lowered_function.id.get()
+                    ))
+                })?;
             let mut function = lowered_function.clif.clone();
             remap_helper_names(&mut function, helper_ids)?;
             let mut context = Context::for_function(function);
             object
-                .define_function(units[unit_index].function, &mut context)
+                .define_function(declared, &mut context)
                 .map_err(|error| AotError::Module(error.to_string()))?;
-            unit_index += 1;
         }
     }
     Ok(())
@@ -601,6 +622,30 @@ mod tests {
         let first = compile_aot(&program, target()).expect("first AOT object emits");
         let second = compile_aot(&program, target()).expect("second AOT object emits");
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn define_functions_rejects_mismatched_declared_identity() {
+        let flags = Flags::new(settings::builder());
+        let isa = isa::lookup_by_name(target())
+            .expect("test target exists")
+            .finish(flags)
+            .expect("test target builds");
+        let call_conv = isa.frontend_config().default_call_conv;
+        let program = test_program();
+        let mut lowered = lower_program(&program, isa.frontend_config()).expect("program lowers");
+        let builder = ObjectBuilder::new(isa, "bamts-test", default_libcall_names())
+            .expect("object builder constructs");
+        let mut object = ObjectModule::new(builder);
+        let units = declare_functions(&mut object, &lowered).expect("functions declare");
+        let helpers = declare_helpers(&mut object, call_conv).expect("helpers declare");
+        lowered.modules[0].functions[0].id = FunctionId::new(1);
+
+        assert!(matches!(
+            define_functions(&mut object, &lowered, &units, &helpers),
+            Err(AotError::InvalidLoweredModule(message))
+                if message.contains("missing declaration for module 0 function 1")
+        ));
     }
 
     #[test]

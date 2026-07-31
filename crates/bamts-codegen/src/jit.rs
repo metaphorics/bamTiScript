@@ -21,6 +21,8 @@ use crate::{HELPER_NAMESPACE, Helper, LoweredProgram, ProgramLowerError, lower_p
 pub enum JitError {
     /// Backend-neutral program lowering failed.
     Lower(ProgramLowerError),
+    /// The lowered program violated the canonical module/function identity order.
+    InvalidLoweredModule(String),
     /// Cranelift could not declare, compile, or finalize the module.
     Module(Box<ModuleError>),
     /// Lowered IR named a runtime helper outside the pinned 30-entry table.
@@ -34,6 +36,9 @@ impl fmt::Display for JitError {
                 formatter,
                 "could not lower program for the host JIT: {error}"
             ),
+            JitError::InvalidLoweredModule(message) => {
+                write!(formatter, "invalid lowered module for host JIT: {message}")
+            }
             JitError::Module(error) => write!(formatter, "host JIT compilation failed: {error}"),
             JitError::UnknownHelper { index } => {
                 write!(
@@ -49,8 +54,8 @@ impl Error for JitError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             JitError::Lower(error) => Some(error),
+            JitError::InvalidLoweredModule(_) | JitError::UnknownHelper { .. } => None,
             JitError::Module(error) => Some(error.as_ref()),
-            JitError::UnknownHelper { .. } => None,
         }
     }
 }
@@ -172,16 +177,35 @@ fn compile_lowered(
         .map(|module| module.functions.len())
         .sum();
     let mut functions = Vec::with_capacity(function_count);
-    for lowered_module in &lowered.modules {
-        for function in &lowered_module.functions {
+    let mut declared_functions = std::collections::HashMap::with_capacity(function_count);
+    for (module_index, lowered_module) in lowered.modules.iter().enumerate() {
+        let module_id = lowered_module.id.get();
+        if module_id as usize != module_index {
+            return Err(JitError::InvalidLoweredModule(format!(
+                "module {module_id} appears at index {module_index}"
+            )));
+        }
+        for (function_index, function) in lowered_module.functions.iter().enumerate() {
+            let function_id = function.id.get();
+            if function_id as usize != function_index {
+                return Err(JitError::InvalidLoweredModule(format!(
+                    "module {module_id} function {function_id} appears at local index {function_index}"
+                )));
+            }
+            let declared =
+                module.declare_function(&function.symbol, Linkage::Local, &function.signature)?;
+            if declared_functions
+                .insert((module_id, function_id), declared)
+                .is_some()
+            {
+                return Err(JitError::InvalidLoweredModule(format!(
+                    "duplicate declaration for module {module_id} function {function_id}"
+                )));
+            }
             functions.push(JitUnit {
-                module_id: lowered_module.id.get(),
-                function_id: function.id.get(),
-                function: module.declare_function(
-                    &function.symbol,
-                    Linkage::Local,
-                    &function.signature,
-                )?,
+                module_id,
+                function_id,
+                function: declared,
             });
         }
     }
@@ -197,14 +221,22 @@ fn compile_lowered(
         )?);
     }
 
-    let mut unit_index = 0;
     for lowered_module in lowered.modules {
         for function in lowered_module.functions {
+            let declared = declared_functions
+                .get(&(lowered_module.id.get(), function.id.get()))
+                .copied()
+                .ok_or_else(|| {
+                    JitError::InvalidLoweredModule(format!(
+                        "missing declaration for module {} function {}",
+                        lowered_module.id.get(),
+                        function.id.get()
+                    ))
+                })?;
             let mut clif = function.clif;
             rebind_helper_imports(&mut clif, &helpers)?;
             let mut context = Context::for_function(clif);
-            module.define_function(functions[unit_index].function, &mut context)?;
-            unit_index += 1;
+            module.define_function(declared, &mut context)?;
         }
     }
     module.finalize_definitions()?;
@@ -951,5 +983,19 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn compile_lowered_rejects_out_of_order_function_identity() {
+        let bytecode = callback_reentry_program();
+        let (module, memory, program_bytes) = build_module(&bytecode).expect("module builds");
+        let mut lowered = lower_program(&bytecode, module.target_config()).expect("program lowers");
+        lowered.modules[0].functions.swap(0, 1);
+
+        assert!(matches!(
+            compile_lowered(module, memory, lowered, program_bytes),
+            Err(super::JitError::InvalidLoweredModule(message))
+                if message.contains("function 1 appears at local index 0")
+        ));
     }
 }

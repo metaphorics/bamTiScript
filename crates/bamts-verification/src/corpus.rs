@@ -736,9 +736,9 @@ fn lower_stage(error: &bamts_compiler::lower::LowerError) -> CorpusStage {
 fn jit_stage(error: &bamts_codegen::JitError) -> CorpusStage {
     match error {
         bamts_codegen::JitError::Lower(_) => CorpusStage::Lower,
-        bamts_codegen::JitError::Module(_) | bamts_codegen::JitError::UnknownHelper { .. } => {
-            CorpusStage::Instantiate
-        }
+        bamts_codegen::JitError::InvalidLoweredModule(_)
+        | bamts_codegen::JitError::Module(_)
+        | bamts_codegen::JitError::UnknownHelper { .. } => CorpusStage::Instantiate,
     }
 }
 
