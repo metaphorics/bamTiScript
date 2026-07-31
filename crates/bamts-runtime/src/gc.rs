@@ -6,6 +6,8 @@ pub(super) struct GcState {
     work: Vec<usize>,
     weak_collections: Vec<usize>,
     pending: bool,
+    byte_watermark: usize,
+    slot_watermark: usize,
 }
 
 impl<'a, H: Host> Machine<'a, H> {
@@ -19,6 +21,21 @@ impl<'a, H: Host> Machine<'a, H> {
         if self.gc.pending {
             self.collect_garbage();
         }
+    }
+
+    pub(crate) fn gc_pending(&self) -> bool {
+        self.gc.pending
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_gc_watermarks_for_test(&mut self, bytes: usize, slots: usize) {
+        self.gc.set_watermarks(bytes, slots);
+        self.request_garbage_collection();
+    }
+
+    #[cfg(test)]
+    pub(super) fn gc_watermarks_for_test(&self) -> (usize, usize) {
+        (self.gc.byte_watermark, self.gc.slot_watermark)
     }
 
     pub(crate) fn push_native_roots(&mut self, depth: usize, roots: &[Value]) {
@@ -51,6 +68,35 @@ impl<'a, H: Host> Machine<'a, H> {
 }
 
 impl GcState {
+    pub(super) fn new(limits: &Limits) -> Self {
+        Self {
+            byte_watermark: limits.max_heap_bytes / 2,
+            slot_watermark: limits.max_heap_slots / 2,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn request_collection(&mut self, heap_bytes: usize, live_slots: usize) {
+        self.pending |= heap_bytes >= self.byte_watermark || live_slots >= self.slot_watermark;
+    }
+
+    #[cfg(test)]
+    fn set_watermarks(&mut self, bytes: usize, slots: usize) {
+        self.byte_watermark = bytes;
+        self.slot_watermark = slots;
+    }
+
+    fn recompute_watermarks<H: Host>(&mut self, machine: &Machine<'_, H>) {
+        self.byte_watermark = machine
+            .heap_bytes
+            .saturating_mul(2)
+            .min(machine.limits.max_heap_bytes);
+        self.slot_watermark = machine
+            .live_runtime_slots()
+            .saturating_mul(2)
+            .min(machine.limits.max_heap_slots);
+    }
+
     fn collect<H: Host>(&mut self, machine: &mut Machine<'_, H>) {
         self.marks.resize(machine.heap.len(), false);
         self.marks.fill(false);
@@ -63,6 +109,7 @@ impl GcState {
         self.purge_weak_entries(machine);
         self.sweep(machine);
         self.pending = false;
+        self.recompute_watermarks(machine);
 
         debug_assert_eq!(machine.slot_bytes.len(), machine.heap.len());
         debug_assert_eq!(
@@ -91,6 +138,9 @@ impl GcState {
         for value in machine.globals.values().copied() {
             self.mark_value(&machine.heap, value);
         }
+        if let Some(value) = machine.context_global {
+            self.mark_value(&machine.heap, value);
+        }
         if let Some(value) = machine.last_completion {
             self.mark_value(&machine.heap, value);
         }
@@ -108,6 +158,9 @@ impl GcState {
             self.mark_value(&machine.heap, timer.callback);
             self.mark_values(&machine.heap, &timer.arguments);
             self.mark_value(&machine.heap, timer.handle);
+            if let Some(context) = timer.context {
+                self.mark_value(&machine.heap, context);
+            }
         }
         machine.intrinsics.for_each_value(|value| {
             mark_value(&machine.heap, &mut self.marks, &mut self.work, value);
@@ -184,7 +237,7 @@ impl GcState {
                 else {
                     continue;
                 };
-                for entry in entries {
+                for entry in entries.iter().filter(|entry| entry.live) {
                     if is_marked_value(&self.marks, entry.key) {
                         mark_value(heap, &mut self.marks, &mut self.work, entry.value);
                     }
@@ -202,19 +255,45 @@ impl GcState {
             if !self.marks[index] {
                 continue;
             }
-            let removed = match &mut machine.heap[index] {
+            let (replacement, removed) = match &machine.heap[index] {
                 HeapEntry::Collection {
                     kind: CollectionKind::WeakMap | CollectionKind::WeakSet,
                     entries,
+                    size,
                     ..
                 } => {
-                    let old_len = entries.len();
-                    entries.retain(|entry| is_marked_value(&self.marks, entry.key));
-                    old_len - entries.len()
+                    let retained_entries: Vec<_> = entries
+                        .iter()
+                        .copied()
+                        .filter(|entry| entry.live && is_marked_value(&self.marks, entry.key))
+                        .collect();
+                    let mut rebuilt = crate::CollectionIndex::default();
+                    for (entry_index, entry) in retained_entries.iter().enumerate() {
+                        rebuilt.insert(crate::collection_key_hash(machine, entry.key), entry_index);
+                    }
+                    let removed = *size - retained_entries.len();
+                    (Some((retained_entries, rebuilt)), removed)
                 }
-                _ => 0,
+                _ => (None, 0),
             };
-            machine.refund_slot(index, removed * CollectionEntry::BYTES);
+            if let Some((retained_entries, rebuilt)) = replacement {
+                let HeapEntry::Collection {
+                    entries,
+                    index: stored_index,
+                    size,
+                    ..
+                } = &mut machine.heap[index]
+                else {
+                    unreachable!("weak collection was checked")
+                };
+                *entries = retained_entries;
+                *stored_index = rebuilt;
+                *size -= removed;
+            }
+            machine.refund_slot(
+                index,
+                removed * (CollectionEntry::BYTES + crate::CollectionIndex::ENTRY_BYTES),
+            );
         }
     }
 
@@ -388,20 +467,21 @@ fn trace_promise_reaction(
     work: &mut Vec<usize>,
 ) {
     match reaction {
-        PromiseReaction::Fulfilled { handler, derived }
-        | PromiseReaction::Rejected { handler, derived }
-        | PromiseReaction::Finally {
+        PromiseReaction::Fulfilled {
+            handler, derived, ..
+        }
+        | PromiseReaction::Rejected {
             handler, derived, ..
         } => {
             mark_value(heap, marks, work, *handler);
             mark_value(heap, marks, work, *derived);
         }
-        PromiseReaction::AsyncFulfill { activation }
-        | PromiseReaction::AsyncReject { activation } => {
+        PromiseReaction::AsyncFulfill { activation, .. }
+        | PromiseReaction::AsyncReject { activation, .. } => {
             mark_value(heap, marks, work, *activation);
         }
-        PromiseReaction::AsyncGeneratorFulfill { generator }
-        | PromiseReaction::AsyncGeneratorReject { generator } => {
+        PromiseReaction::AsyncGeneratorFulfill { generator, .. }
+        | PromiseReaction::AsyncGeneratorReject { generator, .. } => {
             mark_value(heap, marks, work, *generator);
         }
         PromiseReaction::ModuleDepFulfill { .. } | PromiseReaction::ModuleDepReject { .. } => {}
@@ -416,6 +496,9 @@ fn trace_promise_reaction(
             mark_value(heap, marks, work, *derived);
             mark_value(heap, marks, work, *sync_iterator);
         }
+    }
+    if let Some(context) = reaction.context() {
+        mark_value(heap, marks, work, context);
     }
 }
 
@@ -456,12 +539,21 @@ fn trace_microtask(
             promise,
             thenable,
             then,
+            context,
         } => {
             mark_value(heap, marks, work, *promise);
             mark_value(heap, marks, work, *thenable);
             mark_value(heap, marks, work, *then);
+            if let Some(context) = context {
+                mark_value(heap, marks, work, *context);
+            }
         }
-        MicrotaskJob::Callback { callback } => mark_value(heap, marks, work, *callback),
+        MicrotaskJob::Callback { callback, context } => {
+            mark_value(heap, marks, work, *callback);
+            if let Some(context) = context {
+                mark_value(heap, marks, work, *context);
+            }
+        }
     }
 }
 
@@ -583,6 +675,11 @@ fn trace_entry(
             properties,
             prototype,
             ..
+        }
+        | HeapEntry::Uint8Array {
+            properties,
+            prototype,
+            ..
         } => trace_properties_and_prototype(properties, *prototype, heap, marks, work),
         HeapEntry::Collection {
             kind,
@@ -594,7 +691,7 @@ fn trace_entry(
             trace_properties_and_prototype(properties, *prototype, heap, marks, work);
             match kind {
                 CollectionKind::Map | CollectionKind::Set => {
-                    for entry in entries {
+                    for entry in entries.iter().filter(|entry| entry.live) {
                         mark_value(heap, marks, work, entry.key);
                         mark_value(heap, marks, work, entry.value);
                     }
@@ -660,10 +757,6 @@ fn trace_entry(
         }
         HeapEntry::PromiseResolver { promise, .. } => {
             mark_value(heap, marks, work, *promise);
-        }
-        HeapEntry::PromiseFinally { derived, value, .. } => {
-            mark_value(heap, marks, work, *derived);
-            mark_value(heap, marks, work, *value);
         }
         HeapEntry::PromiseAll {
             promise, values, ..

@@ -145,6 +145,7 @@ pub struct ResolvedProgram {
     entrypoint: SourceId,
     modules: Arc<[ResolvedModule]>,
     module_indices: HashMap<SourceId, usize>,
+    commonjs: bool,
 }
 
 impl ResolvedProgram {
@@ -174,6 +175,12 @@ impl ResolvedProgram {
         self.module_indices
             .get(&source_id)
             .map(|index| &self.modules[*index])
+    }
+
+    /// Whether compiler options select the CommonJS wrapper environment.
+    #[must_use]
+    pub const fn is_commonjs(&self) -> bool {
+        self.commonjs
     }
 
     /// Returns the eager runtime closure in the program's canonical order.
@@ -386,6 +393,10 @@ impl ProgramLoader {
             entrypoint,
             modules: Arc::from(state.modules),
             module_indices,
+            commonjs: self
+                .options
+                .module()
+                .is_some_and(|module| module.eq_ignore_ascii_case("commonjs")),
         })
     }
 
@@ -2351,8 +2362,13 @@ mod tests {
         }
 
         fn loader(&self) -> ProgramLoader {
+            self.loader_with_config("{}")
+        }
+
+        fn loader_with_config(&self, config_source: &str) -> ProgramLoader {
             let root = ProjectRoot::new(fs::canonicalize(&self.0).unwrap()).unwrap();
-            let config = ProjectConfig::parse(&root, self.0.join("tsconfig.json"), "{}").unwrap();
+            let config =
+                ProjectConfig::parse(&root, self.0.join("tsconfig.json"), config_source).unwrap();
             ProgramLoader::new(&root, config.options()).unwrap()
         }
     }
@@ -3155,5 +3171,37 @@ mod tests {
             .unwrap_or_else(|error| panic!("{entrypoint}: {error}"));
             assert_eq!(executable.wire().modules().len(), resolved.modules().len());
         }
+    }
+
+    #[test]
+    fn compiler_module_option_controls_commonjs_wrapper_bindings() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "main.ts",
+            "module; exports; require; __filename; __dirname;",
+        );
+
+        let commonjs = fixture
+            .loader_with_config(r#"{"compilerOptions": {"module": "CommonJS"}}"#)
+            .load("main.ts")
+            .unwrap();
+        assert!(commonjs.is_commonjs());
+        let commonjs_frontend = compile_program_frontend(&commonjs, FrontendMode::Check);
+        assert!(commonjs_frontend.modules().iter().all(|module| {
+            module
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.code().as_str() != "BAMTS-C002")
+        }));
+
+        let esm = fixture.loader().load("main.ts").unwrap();
+        assert!(!esm.is_commonjs());
+        let esm_frontend = compile_program_frontend(&esm, FrontendMode::Check);
+        assert!(esm_frontend.modules().iter().any(|module| {
+            module
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code().as_str() == "BAMTS-C002")
+        }));
     }
 }

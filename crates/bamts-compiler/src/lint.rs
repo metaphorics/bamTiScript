@@ -1391,12 +1391,12 @@ pub static RULES: [RuleDefinition; 86] = [
             RuleExampleCase::Program(&[
                 RuleExampleSource::new(
                     ScriptKind::TypeScript,
-                    "import { helper } from './legacy.js'; helper();"
+                    "import { helper, other, third } from './legacy.js'; helper(); void other; void third;"
                 )
                 .resolving_to(1),
                 RuleExampleSource::new(
                     ScriptKind::JavaScript,
-                    "function helper() {} module.exports = { helper };"
+                    "const other = 1; module.exports = { other, helper() { return 42; } }; module.exports.third = 3;"
                 )
             ])
         )
@@ -1865,6 +1865,9 @@ impl LintTable {
         if dialect == SourceDialect::TypeScript {
             return self.level(rule);
         }
+        if rule.code() == "BAMTS-W085" {
+            return self.level(rule);
+        }
         let spec_footgun = matches!(
             rule.code(),
             "BAMTS-W071"
@@ -1879,8 +1882,9 @@ impl LintTable {
                 | "BAMTS-W080"
         );
         let control_flow = RULES[rule_index(rule)].group() == RuleGroup::ControlFlow;
-        let javascript_compatibility =
-            RULES[rule_index(rule)].group() == RuleGroup::JavaScriptCompatibility;
+        let javascript_compatibility = RULES[rule_index(rule)].group()
+            == RuleGroup::JavaScriptCompatibility
+            && rule.code() != "BAMTS-W085";
         if spec_footgun || control_flow || javascript_compatibility {
             let effective = self.level(rule);
             return if effective == LintLevel::Allow {
@@ -2271,7 +2275,7 @@ mod tests {
     }
 
     #[test]
-    fn javascript_dialect_preserves_allow_and_clamps_enabled_rules_to_warning() {
+    fn javascript_dialect_preserves_syntax_rejection_and_clamps_runtime_footguns() {
         let table = LintTable::new(LintProfile::Pedantic);
         assert_eq!(
             table.level_for_source(
@@ -2293,7 +2297,7 @@ mod tests {
                 rule("javascript-syntax-rejection"),
                 SourceDialect::JavaScript
             ),
-            LintLevel::Warn
+            LintLevel::Deny
         );
         assert_eq!(
             LintTable::new(LintProfile::Default)

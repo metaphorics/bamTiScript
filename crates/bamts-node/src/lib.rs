@@ -517,7 +517,7 @@ enum AotCompletion<'a> {
     Failure(AotMainFailure),
 }
 
-/// Emits buffered host stdout only on success and always flushes host stderr.
+/// Emits buffered host stdout only on success and flushes both streams.
 #[cfg(any(feature = "aot-main", test))]
 fn write_aot_completion(
     host: &NodeHost,
@@ -529,6 +529,7 @@ fn write_aot_completion(
         AotCompletion::Success(outcome) => {
             stdout.write_all(host.stdout())?;
             stdout.write_all(&outcome.stdout)?;
+            stdout.flush()?;
             (
                 if host.exit_code() == 0 {
                     outcome.exit_code
@@ -610,6 +611,28 @@ fn initialize_aot_process_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FlushProbe {
+        bytes: Vec<u8>,
+        flushes: usize,
+        flush_error: Option<std::io::ErrorKind>,
+    }
+
+    impl std::io::Write for FlushProbe {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            match self.flush_error {
+                Some(kind) => Err(std::io::Error::from(kind)),
+                None => Ok(()),
+            }
+        }
+    }
+
     #[cfg(feature = "aot-main")]
     #[test]
     fn linked_descriptor_decodes_whole_program_and_tuple_entry() {
@@ -794,6 +817,60 @@ mod tests {
         assert_eq!(exit_code, 11);
         assert_eq!(stdout, b"host stdoutruntime stdout");
         assert_eq!(stderr, b"host stderr");
+    }
+
+    #[test]
+    fn aot_completion_flushes_trailing_stdout_without_a_newline() {
+        let mut host = NodeHost::new();
+        Host::write_stdout(&mut host, b"trailing host output");
+        let outcome = bamts_runtime::ExecutionOutcome {
+            stdout: b" and runtime output".to_vec(),
+            exit_code: 0,
+        };
+        let mut stdout = FlushProbe {
+            bytes: Vec::new(),
+            flushes: 0,
+            flush_error: None,
+        };
+        let mut stderr = Vec::new();
+
+        let exit_code = write_aot_completion(
+            &host,
+            AotCompletion::Success(&outcome),
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("completion writes");
+
+        assert_eq!(exit_code, 0);
+        assert_eq!(stdout.bytes, b"trailing host output and runtime output");
+        assert_eq!(stdout.flushes, 1);
+    }
+
+    #[test]
+    fn aot_completion_propagates_stdout_flush_failure() {
+        let host = NodeHost::new();
+        let outcome = bamts_runtime::ExecutionOutcome {
+            stdout: Vec::new(),
+            exit_code: 0,
+        };
+        let mut stdout = FlushProbe {
+            bytes: Vec::new(),
+            flushes: 0,
+            flush_error: Some(std::io::ErrorKind::BrokenPipe),
+        };
+        let mut stderr = Vec::new();
+
+        let error = write_aot_completion(
+            &host,
+            AotCompletion::Success(&outcome),
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect_err("stdout flush failure is reported");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(stdout.flushes, 1);
     }
 
     #[cfg(unix)]

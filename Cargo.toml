@@ -16,8 +16,18 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97.1"
-publish = true
 license = "MIT"
 repository = "https://github.com/metaphorics/bamTiScript"
+
+[workspace.dependencies]
+bamts = { path = "crates/bamts", version = "0.1.0" }
+bamts-bytecode = { path = "crates/bamts-bytecode", version = "0.1.0" }
+bamts-cli = { path = "crates/bamts-cli", version = "0.1.0" }
+bamts-codegen = { path = "crates/bamts-codegen", version = "0.1.0" }
+bamts-compiler = { path = "crates/bamts-compiler", version = "0.1.0" }
+bamts-native = { path = "crates/bamts-native", version = "0.1.0" }
+bamts-node = { path = "crates/bamts-node", version = "0.1.0" }
+bamts-runtime = { path = "crates/bamts-runtime", version = "0.1.2" }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"

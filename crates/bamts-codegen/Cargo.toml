@@ -3,14 +3,14 @@ name = "bamts-codegen"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-publish.workspace = true
+publish = true
 license.workspace = true
 repository.workspace = true
 description = "Code generation (JIT/AOT) backend for BamTS"
 
 [dependencies]
-bamts-bytecode = { path = "../bamts-bytecode", version = "0.1.0" }
-bamts-native = { path = "../bamts-native", version = "0.1.0", optional = true, features = ["jit-entry"] }
+bamts-bytecode.workspace = true
+bamts-native = { workspace = true, optional = true, features = ["jit-entry"] }
 cranelift-codegen = { version = "=0.134.2", default-features = false, features = ["std", "unwind", "all-native-arch"] }
 cranelift-frontend = "=0.134.2"
 cranelift-module = "=0.134.2"
@@ -23,7 +23,7 @@ wasmtime-internal-jit-icache-coherence = { version = "=47.0.2", optional = true 
 libc = { version = "=0.2.189", optional = true }
 
 [dev-dependencies]
-bamts-runtime = { path = "../bamts-runtime", version = "0.1.2" }
+bamts-runtime.workspace = true
 
 [features]
 default = []

@@ -66,6 +66,10 @@
     },
     {
       "file": "Bamti/Bytecode/Verify.lean",
+      "name": "Bamti.Bytecode.format_v4_createCell_tag"
+    },
+    {
+      "file": "Bamti/Bytecode/Verify.lean",
       "name": "Bamti.Bytecode.handlers_well_nested"
     },
     {
@@ -330,6 +334,6 @@
     }
   ],
   "schema": "bamti.lean-assumptions/v1",
-  "source_sha256": "0a7c857eee23cf063dea2be280555422f45e16ffb1deca3208b6fc3255f254a0",
+  "source_sha256": "41eaf14f0f359e4479793bd0af9c8754526d18a66b7405314b64f805f58f4d05",
   "user_axioms": []
 }

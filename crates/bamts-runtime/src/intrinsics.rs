@@ -23,12 +23,6 @@ pub(crate) enum BuiltinOutcome {
         this_value: Value,
         arguments: Vec<Value>,
     },
-    ConstructCall {
-        callee: Value,
-        this_value: Value,
-        arguments: Vec<Value>,
-        prototype: Value,
-    },
     GeneratorNext {
         generator: Value,
         resume_value: Value,
@@ -65,6 +59,7 @@ pub(crate) struct BuiltinTable<H: Host> {
     symbol_iterator: Option<Value>,
     symbol_async_iterator: Option<Value>,
     symbol_to_string_tag: Option<Value>,
+    symbol_species: Option<Value>,
     symbol_prototype: Option<Value>,
     object_to_string: Option<Value>,
     regexp_prototype: Option<Value>,
@@ -73,7 +68,6 @@ pub(crate) struct BuiltinTable<H: Host> {
     generator_prototype: Option<Value>,
     async_generator_prototype: Option<Value>,
     promise_resolver_targets: Option<(Value, Value)>,
-    promise_finally_targets: Option<(Value, Value)>,
     promise_all_targets: Option<(Value, Value)>,
     promise_prototype: Option<Value>,
     marker: PhantomData<fn() -> H>,
@@ -100,6 +94,7 @@ impl<H: Host> BuiltinTable<H> {
             symbol_iterator: None,
             symbol_async_iterator: None,
             symbol_to_string_tag: None,
+            symbol_species: None,
             symbol_prototype: None,
             object_to_string: None,
             regexp_prototype: None,
@@ -108,7 +103,6 @@ impl<H: Host> BuiltinTable<H> {
             generator_prototype: None,
             async_generator_prototype: None,
             promise_resolver_targets: None,
-            promise_finally_targets: None,
             promise_all_targets: None,
             promise_prototype: None,
             marker: PhantomData,
@@ -166,6 +160,14 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn symbol_async_iterator(&self) -> Value {
         self.symbol_async_iterator
             .expect("Symbol builtins install first")
+    }
+
+    pub(crate) fn set_symbol_species(&mut self, symbol: Value) {
+        self.symbol_species = Some(symbol);
+    }
+
+    pub(crate) fn symbol_species(&self) -> Value {
+        self.symbol_species.expect("Symbol builtins install first")
     }
 
     pub(crate) fn set_symbol_to_string_tag(&mut self, symbol: Value) {
@@ -257,15 +259,6 @@ impl<H: Host> BuiltinTable<H> {
             .expect("Promise builtins install resolver targets")
     }
 
-    pub(crate) fn set_promise_finally_targets(&mut self, fulfill: Value, reject: Value) {
-        self.promise_finally_targets = Some((fulfill, reject));
-    }
-
-    pub(crate) fn promise_finally_targets(&self) -> (Value, Value) {
-        self.promise_finally_targets
-            .expect("Promise builtins install finally targets")
-    }
-
     pub(crate) fn set_promise_all_targets(&mut self, fulfill: Value, reject: Value) {
         self.promise_all_targets = Some((fulfill, reject));
     }
@@ -354,6 +347,7 @@ impl<H: Host> BuiltinTable<H> {
             self.symbol_iterator,
             self.symbol_async_iterator,
             self.symbol_to_string_tag,
+            self.symbol_species,
             self.symbol_prototype,
             self.object_to_string,
             self.regexp_prototype,
@@ -368,13 +362,9 @@ impl<H: Host> BuiltinTable<H> {
         {
             visit(value);
         }
-        for (first, second) in [
-            self.promise_resolver_targets,
-            self.promise_finally_targets,
-            self.promise_all_targets,
-        ]
-        .into_iter()
-        .flatten()
+        for (first, second) in [self.promise_resolver_targets, self.promise_all_targets]
+            .into_iter()
+            .flatten()
         {
             visit(first);
             visit(second);
@@ -655,7 +645,6 @@ impl<'a, H: Host> Machine<'a, H> {
             operation: "cannot convert object to primitive without invoking user code",
         }))
     }
-
     pub(crate) fn to_boolean(&self, value: Value) -> bool {
         self.truthy(value)
     }
@@ -666,7 +655,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 a == b || (a.is_nan() && b.is_nan())
             }
             (Some(Decoded::Number(a)), Some(Decoded::Int32(b)))
-            | (Some(Decoded::Int32(b)), Some(Decoded::Number(a))) => a == f64::from(b),
+            | (Some(Decoded::Int32(b)), Some(Decoded::Number(a))) => a == f64::from(b as i32),
             _ => self.strict_equal(left, right),
         }
     }

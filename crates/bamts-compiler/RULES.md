@@ -860,4 +860,4 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Use the CommonJS default export or a declared named export.
 - Silence: `-A cjs-esm-named-export-mismatch`
 - Trigger: <code>TypeScript: import { helper } from './legacy.js'; helper();</code><br><code>JavaScript: exports.other = () =&gt; 1;</code>
-- Clean: <code>TypeScript: import { helper } from './legacy.js'; helper();</code><br><code>JavaScript: function helper() {} module.exports = { helper };</code>
+- Clean: <code>TypeScript: import { helper, other, third } from './legacy.js'; helper(); void other; void third;</code><br><code>JavaScript: const other = 1; module.exports = { other, helper() { return 42; } }; module.exports.third = 3;</code>

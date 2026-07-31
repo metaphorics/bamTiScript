@@ -145,15 +145,14 @@ pub fn compile_source_file(
     path: impl AsRef<Path>,
 ) -> Result<bamts_compiler::program::ExecutableProgram> {
     let path = canonical_entrypoint(path.as_ref())?;
-    let root_path = discover_project_root(&path)
-        .or_else(|| path.parent().map(Path::to_path_buf))
-        .ok_or_else(|| {
-            Error::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "entrypoint has no parent directory",
-            )))
-        })?;
-    let root_path = fs::canonicalize(root_path)
+    let fallback_root = path.parent().map(Path::to_path_buf).ok_or_else(|| {
+        Error::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "entrypoint has no parent directory",
+        )))
+    })?;
+    let project = discover_project(&path, fallback_root);
+    let root_path = fs::canonicalize(project.root())
         .map_err(|error| Error::ProgramLoad(ProgramLoadError::InvalidRoot(error)))?;
     let root = ProjectRoot::new(&root_path).map_err(|error| {
         Error::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(
@@ -161,8 +160,7 @@ pub fn compile_source_file(
             error,
         )))
     })?;
-    let config_path = project_config_path(&path, root.path())
-        .unwrap_or_else(|| root.path().join("tsconfig.json"));
+    let config_path = project.config().to_owned();
     let config_source = if config_path.is_file() {
         fs::read_to_string(&config_path).map_err(|source| Error::ReadConfig {
             path: config_path.clone(),
@@ -284,25 +282,45 @@ fn canonical_entrypoint(path: &Path) -> Result<PathBuf> {
     })
 }
 
-/// Finds the project root with CLI semantics: the nearest ancestor containing
-/// a `bamts.toml`, else the nearest ancestor containing a `tsconfig.json`.
-fn discover_project_root(entrypoint: &Path) -> Option<PathBuf> {
-    let ancestors = || entrypoint.parent().into_iter().flat_map(Path::ancestors);
-    ancestors()
-        .find(|directory| directory.join("bamts.toml").is_file())
-        .or_else(|| ancestors().find(|directory| directory.join("tsconfig.json").is_file()))
-        .map(Path::to_path_buf)
+/// The root and compiler configuration selected for a canonical entrypoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectDiscovery {
+    root: PathBuf,
+    config: PathBuf,
 }
 
-/// Selects the project's `tsconfig.json`: the nearest one on the chain from
-/// the entrypoint's directory up to the root, else the root's own file.
-fn project_config_path(entrypoint: &Path, root: &Path) -> Option<PathBuf> {
-    entrypoint
-        .parent()?
-        .ancestors()
-        .take_while(|directory| directory.starts_with(root))
+impl ProjectDiscovery {
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    #[must_use]
+    pub fn config(&self) -> &Path {
+        &self.config
+    }
+}
+
+/// Selects one project root and `tsconfig.json` for a canonical entrypoint.
+///
+/// A `bamts.toml` ancestor takes precedence over every `tsconfig.json`
+/// ancestor. When neither exists, `fallback_root` defines the project.
+#[must_use]
+pub fn discover_project(entrypoint: &Path, fallback_root: PathBuf) -> ProjectDiscovery {
+    let ancestors = || entrypoint.parent().into_iter().flat_map(Path::ancestors);
+    let root = ancestors()
+        .find(|directory| directory.join("bamts.toml").is_file())
+        .or_else(|| ancestors().find(|directory| directory.join("tsconfig.json").is_file()))
+        .map_or(fallback_root, Path::to_path_buf);
+    let config = entrypoint
+        .parent()
+        .into_iter()
+        .flat_map(Path::ancestors)
+        .take_while(|directory| directory.starts_with(&root))
         .map(|directory| directory.join("tsconfig.json"))
         .find(|path| path.is_file())
+        .unwrap_or_else(|| root.join("tsconfig.json"));
+    ProjectDiscovery { root, config }
 }
 
 #[cfg(test)]

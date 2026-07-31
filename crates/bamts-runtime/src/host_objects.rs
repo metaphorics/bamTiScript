@@ -84,11 +84,21 @@ pub(crate) fn install<H: Host>(
         } else if name.eq_ascii("NaN") {
             crate::intrinsics::builtins::define_frozen_data(heap, global_this, "NaN", *value);
         } else {
-            put_ecma(heap, global_this, name.clone(), *value);
+            define_global_data(heap, global_this, name.clone(), *value);
         }
     }
-    put(heap, global_this, "globalThis", global_this);
-    put(heap, global_this, "global", global_this);
+    define_global_data(
+        heap,
+        global_this,
+        EcmaString::from_utf8("globalThis"),
+        global_this,
+    );
+    define_global_data(
+        heap,
+        global_this,
+        EcmaString::from_utf8("global"),
+        global_this,
+    );
     globals.insert(EcmaString::from_utf8("global"), global_this);
     globals.insert(EcmaString::from_utf8("globalThis"), global_this);
 }
@@ -152,6 +162,24 @@ fn put_ecma(heap: &mut [HeapEntry], object: Value, name: EcmaString, value: Valu
             value,
             writable: true,
             enumerable: true,
+            configurable: true,
+        },
+    );
+}
+fn define_global_data(heap: &mut [HeapEntry], object: Value, name: EcmaString, value: Value) {
+    let index = heap_index(object);
+    let properties = match &mut heap[index] {
+        HeapEntry::Object { properties, .. }
+        | HeapEntry::Array { properties, .. }
+        | HeapEntry::NativeFunction { properties, .. } => properties,
+        _ => unreachable!("host object installation target owns properties"),
+    };
+    properties.insert(
+        PropertyKey::Named(name),
+        Property::Data {
+            value,
+            writable: true,
+            enumerable: false,
             configurable: true,
         },
     );
@@ -337,6 +365,17 @@ impl<H: Host> Machine<'_, H> {
                         }
                         Ok(format!("[ {} ]", parts.join(", ")))
                     }
+                    HeapEntry::Uint8Array { bytes, .. } => {
+                        if depth >= 2 {
+                            return Ok("[Uint8Array]".to_owned());
+                        }
+                        let elements = bytes.iter().map(u8::to_string).collect::<Vec<_>>();
+                        Ok(format!(
+                            "Uint8Array({}) [ {} ]",
+                            bytes.len(),
+                            elements.join(", ")
+                        ))
+                    }
                     HeapEntry::Object { properties, .. }
                     | HeapEntry::Script { properties, .. }
                     | HeapEntry::Date { properties, .. }
@@ -384,7 +423,6 @@ impl<H: Host> Machine<'_, H> {
                     | HeapEntry::ExternalModuleNamespace { .. }
                     | HeapEntry::HashState { .. }
                     | HeapEntry::PromiseResolver { .. }
-                    | HeapEntry::PromiseFinally { .. }
                     | HeapEntry::PromiseAll { .. }
                     | HeapEntry::AsyncActivation { .. }
                     | HeapEntry::PromiseAllElement { .. } => Ok("{}".to_owned()),

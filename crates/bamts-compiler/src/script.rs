@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use bamts_bytecode::{
-    ConstantId, EcmaString, ModuleId, Program, ProgramModule, ProgramVerifyError, Verified,
+    Constant, ConstantId, EcmaString, ModuleId, Program, ProgramModule, ProgramVerifyError,
+    Verified,
 };
 
 use crate::{
@@ -72,13 +73,19 @@ pub fn compile_classic_script(
     let options = LowerOptions {
         javascript_compatibility: true,
     };
-    let assembled = if module_name == DEFAULT_MODULE_NAME {
-        lower::assemble_classic_script(parsed.product(), options)
-    } else {
-        lower::assemble_classic_script_named(parsed.product(), options, module_name)
-    };
+    let assembled = lower::assemble_classic_script_named(parsed.product(), options, module_name)
+        .map_err(|error| map_lower_error(&source, error))?;
+    let encoded_name = EcmaString::from_utf8(module_name);
+    let name = assembled
+        .constants()
+        .iter()
+        .position(|constant| matches!(constant, Constant::String(value) if value == &encoded_name))
+        .and_then(|index| u32::try_from(index).ok())
+        .map(ConstantId::new)
+        .ok_or_else(|| ScriptCompileError::Capacity {
+            message: "classic-script module name is absent from the constant pool".to_owned(),
+        })?;
     let module = assembled
-        .map_err(|error| map_lower_error(&source, error))?
         .verify()
         .map_err(|error| ScriptCompileError::Capacity {
             message: error.to_string(),
@@ -86,7 +93,7 @@ pub fn compile_classic_script(
 
     Program::link(
         vec![ProgramModule {
-            name: ConstantId::new(0),
+            name,
             code: module,
             edges: Vec::new(),
             bindings: Vec::new(),
@@ -155,7 +162,7 @@ fn normalized_module_name(resource_name: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use bamts_bytecode::Instruction;
+    use bamts_bytecode::{Constant, Instruction};
 
     use super::{ScriptCompileError, compile_classic_script};
 
@@ -190,6 +197,11 @@ mod tests {
                     Instruction::Import { .. } | Instruction::Export { .. }
                 ))
         );
+        assert!(matches!(
+            &module.code().constants()[module.name().get() as usize],
+            Constant::String(name)
+                if name.to_utf8_strict().is_ok_and(|name| name == "script.js")
+        ));
     }
 
     #[test]

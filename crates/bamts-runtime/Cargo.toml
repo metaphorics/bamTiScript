@@ -3,7 +3,7 @@ name = "bamts-runtime"
 version = "0.1.2"
 edition.workspace = true
 rust-version.workspace = true
-publish.workspace = true
+publish = true
 license.workspace = true
 repository.workspace = true
 description = "Execution runtime and built-in intrinsics for BamTS"
@@ -20,8 +20,8 @@ default = []
 aot-main = []
 
 [dependencies]
-bamts-bytecode = { path = "../bamts-bytecode", version = "0.1.0" }
-bamts-native = { path = "../bamts-native", version = "0.1.0", features = ["gc"] }
+bamts-bytecode.workspace = true
+bamts-native = { workspace = true, features = ["gc"] }
 
 [lints]
 workspace = true

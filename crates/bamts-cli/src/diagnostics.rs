@@ -80,12 +80,14 @@ pub fn render_report(
     sources: &[DiagnosticSource<'_>],
     error_limit: usize,
 ) -> String {
-    let diagnostics = report
-        .diagnostics()
-        .iter()
+    // Apply the compiler's canonical total order to the complete report, then
+    // enforce the limit so the earliest canonical diagnostics are preserved
+    // regardless of the order the pipeline reported them in.
+    let diagnostics: Vec<Diagnostic> = ordered(report.diagnostics())
+        .into_iter()
         .take(error_limit)
         .cloned()
-        .collect::<Vec<_>>();
+        .collect();
     let mut rendered = render(format, &diagnostics, sources);
     if matches!(
         format,
@@ -938,5 +940,49 @@ mod tests {
         assert!(out.contains("first"));
         assert!(!out.contains("second"));
         assert!(out.contains("2 diagnostic(s); silence with `-A explicit-any`"));
+    }
+
+    #[test]
+    fn report_limit_preserves_earliest_canonical_diagnostics_across_modules() {
+        // Regression: the limit must be applied after canonical ordering of the
+        // full report, not to the raw pipeline order, so earlier diagnostics are
+        // never hidden behind later ones when aggregating across modules.
+        let text_a = SourceText::new("ab");
+        let text_b = SourceText::new("xy");
+        let src_a = SourceId::new(0);
+        let src_b = SourceId::new(1);
+        let catalog = vec![
+            DiagnosticSource {
+                id: src_a,
+                name: "a.ts",
+                text: &text_a,
+            },
+            DiagnosticSource {
+                id: src_b,
+                name: "b.ts",
+                text: &text_b,
+            },
+        ];
+        let diagnostics = [
+            Diagnostic::error(code("BTS0002"), src_b, range(0, 1), "b-first"),
+            Diagnostic::error(code("BTS0001"), src_a, range(1, 2), "a-second"),
+            Diagnostic::error(code("BTS0003"), src_b, range(1, 2), "b-last"),
+            Diagnostic::error(code("BTS0004"), src_a, range(0, 1), "a-earliest"),
+        ];
+        let report = DiagnosticReport::new(&diagnostics);
+        let out = render_report(DiagnosticsFormat::Text, &report, &catalog, 3);
+
+        let pos_earliest = out.find("a-earliest").expect("earliest A diagnostic");
+        let pos_second = out.find("a-second").expect("second A diagnostic");
+        let pos_b_first = out.find("b-first").expect("first B diagnostic");
+        assert!(pos_earliest < pos_second, "A diagnostics out of order");
+        assert!(
+            pos_second < pos_b_first,
+            "B diagnostic rendered before A diagnostics"
+        );
+        assert!(
+            !out.contains("b-last"),
+            "limit retained a later diagnostic over an earlier one"
+        );
     }
 }

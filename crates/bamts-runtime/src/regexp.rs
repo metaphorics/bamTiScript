@@ -181,7 +181,7 @@ impl Regex {
                 }
                 let (actual, width) = next_code_point(input, state.position, self.flags.unicode);
                 class
-                    .matches(actual, self.flags.ignore_case)
+                    .matches(actual, self.flags.ignore_case, self.flags.unicode)
                     .then(|| state.advanced(width))
                     .into_iter()
                     .collect()
@@ -202,14 +202,26 @@ impl Regex {
                 at_end.then_some(state).into_iter().collect()
             }
             Node::WordBoundary(positive) => {
-                let left = state
-                    .position
-                    .checked_sub(1)
-                    .and_then(|index| input.get(index))
-                    .is_some_and(|unit| is_word(u32::from(*unit)));
-                let right = input
-                    .get(state.position)
-                    .is_some_and(|unit| is_word(u32::from(*unit)));
+                let left = if state.position == 0 {
+                    false
+                } else {
+                    let low = input[state.position - 1];
+                    let value = if self.flags.unicode
+                        && (0xdc00..=0xdfff).contains(&low)
+                        && state.position >= 2
+                        && (0xd800..=0xdbff).contains(&input[state.position - 2])
+                    {
+                        combine_surrogates(input[state.position - 2], low)
+                    } else {
+                        u32::from(low)
+                    };
+                    is_word(value, self.flags.ignore_case, self.flags.unicode)
+                };
+                let right = (state.position < input.len())
+                    .then(|| next_code_point(input, state.position, self.flags.unicode).0)
+                    .is_some_and(|value| {
+                        is_word(value, self.flags.ignore_case, self.flags.unicode)
+                    });
                 ((left != right) == *positive)
                     .then_some(state)
                     .into_iter()
@@ -350,7 +362,10 @@ impl Regex {
     }
 
     fn code_point_eq(&self, left: u32, right: u32) -> bool {
-        left == right || (self.flags.ignore_case && fold(left) == fold(right))
+        left == right
+            || (self.flags.ignore_case
+                && canonicalize(left, self.flags.unicode)
+                    == canonicalize(right, self.flags.unicode))
     }
 }
 
@@ -417,11 +432,11 @@ struct CharacterClass {
 }
 
 impl CharacterClass {
-    fn matches(&self, value: u32, ignore_case: bool) -> bool {
+    fn matches(&self, value: u32, ignore_case: bool, unicode: bool) -> bool {
         let matched = self
             .items
             .iter()
-            .any(|item| item.matches(value, ignore_case));
+            .any(|item| item.matches(value, ignore_case, unicode));
         matched != self.negated
     }
 }
@@ -439,21 +454,21 @@ enum ClassItem {
 }
 
 impl ClassItem {
-    fn matches(&self, value: u32, ignore_case: bool) -> bool {
+    fn matches(&self, value: u32, ignore_case: bool, unicode: bool) -> bool {
         match self {
             Self::Character(expected) => {
-                value == *expected || (ignore_case && fold(value) == fold(*expected))
+                value == *expected
+                    || (ignore_case
+                        && canonicalize(value, unicode) == canonicalize(*expected, unicode))
             }
             Self::Range(start, end) => {
-                let candidate = if ignore_case { fold(value) } else { value };
-                let start = if ignore_case { fold(*start) } else { *start };
-                let end = if ignore_case { fold(*end) } else { *end };
-                (start..=end).contains(&candidate)
+                (*start..=*end).contains(&value)
+                    || (ignore_case && canonicalized_range_contains(*start, *end, value, unicode))
             }
             Self::Digit => value <= 0x7f && (value as u8).is_ascii_digit(),
             Self::NotDigit => !(value <= 0x7f && (value as u8).is_ascii_digit()),
-            Self::Word => is_word(value),
-            Self::NotWord => !is_word(value),
+            Self::Word => is_word(value, ignore_case, unicode),
+            Self::NotWord => !is_word(value, ignore_case, unicode),
             Self::Space => {
                 char::from_u32(value).is_some_and(char::is_whitespace) || value == 0xfeff
             }
@@ -464,19 +479,330 @@ impl ClassItem {
     }
 }
 
-fn fold(value: u32) -> u32 {
-    char::from_u32(value)
-        .and_then(|value| value.to_lowercase().next())
-        .map_or(value, u32::from)
+fn canonicalize(value: u32, unicode: bool) -> u32 {
+    if unicode {
+        return unicode_simple_fold(value);
+    }
+    let Some(character) = char::from_u32(value) else {
+        return value;
+    };
+    let mut uppercase = character.to_uppercase();
+    let Some(first) = uppercase.next() else {
+        return value;
+    };
+    if uppercase.next().is_some() {
+        return value;
+    }
+    let canonical = u32::from(first);
+    if value >= 0x80 && canonical < 0x80 {
+        value
+    } else {
+        canonical
+    }
 }
 
-fn is_word(value: u32) -> bool {
+fn canonicalized_range_contains(start: u32, end: u32, value: u32, unicode: bool) -> bool {
+    let canonical = canonicalize(value, unicode);
+    let folded = unicode_simple_fold(canonical);
+    if (start..=end).contains(&canonical) || (start..=end).contains(&folded) {
+        return true;
+    }
+    if UNICODE_SIMPLE_FOLD_RANGES
+        .iter()
+        .any(|(first, last, step, delta)| {
+            let source = offset_code_point(folded, -*delta);
+            source.is_some_and(|source| {
+                (*first..=*last).contains(&source)
+                    && (source - *first).is_multiple_of(*step)
+                    && (start..=end).contains(&source)
+                    && canonicalize(source, unicode) == canonical
+            })
+        })
+    {
+        return true;
+    }
+    UNICODE_SIMPLE_FOLD_SINGLETONS
+        .iter()
+        .any(|(source, target)| {
+            *target == folded
+                && (start..=end).contains(source)
+                && canonicalize(*source, unicode) == canonical
+        })
+}
+
+fn unicode_simple_fold(value: u32) -> u32 {
+    UNICODE_SIMPLE_FOLD_RANGES
+        .iter()
+        .find(|(start, end, step, _)| {
+            (*start..=*end).contains(&value) && (value - *start).is_multiple_of(*step)
+        })
+        .and_then(|(_, _, _, delta)| offset_code_point(value, *delta))
+        .or_else(|| {
+            UNICODE_SIMPLE_FOLD_SINGLETONS
+                .binary_search_by_key(&value, |(source, _)| *source)
+                .ok()
+                .map(|index| UNICODE_SIMPLE_FOLD_SINGLETONS[index].1)
+        })
+        .unwrap_or(value)
+}
+
+fn offset_code_point(value: u32, delta: i32) -> Option<u32> {
+    if delta < 0 {
+        value.checked_sub(delta.unsigned_abs())
+    } else {
+        value.checked_add(delta as u32)
+    }
+}
+
+fn is_word(value: u32, ignore_case: bool, unicode: bool) -> bool {
+    let value = if ignore_case && unicode {
+        unicode_simple_fold(value)
+    } else {
+        value
+    };
     value <= 0x7f && ((value as u8).is_ascii_alphanumeric() || value == u32::from(b'_'))
 }
 
 fn is_line_terminator(value: u32) -> bool {
     matches!(value, 0x0a | 0x0d | 0x2028 | 0x2029)
 }
+
+const UNICODE_SIMPLE_FOLD_RANGES: &[(u32, u32, u32, i32)] = &[
+    (0x41, 0x5a, 1, 32),
+    (0xc0, 0xd6, 1, 32),
+    (0xd8, 0xde, 1, 32),
+    (0x100, 0x12e, 2, 1),
+    (0x132, 0x136, 2, 1),
+    (0x139, 0x147, 2, 1),
+    (0x14a, 0x176, 2, 1),
+    (0x179, 0x17d, 2, 1),
+    (0x1a0, 0x1a4, 2, 1),
+    (0x1cb, 0x1db, 2, 1),
+    (0x1de, 0x1ee, 2, 1),
+    (0x1f8, 0x21e, 2, 1),
+    (0x222, 0x232, 2, 1),
+    (0x246, 0x24e, 2, 1),
+    (0x388, 0x38a, 1, 37),
+    (0x391, 0x3a1, 1, 32),
+    (0x3a3, 0x3ab, 1, 32),
+    (0x3d8, 0x3ee, 2, 1),
+    (0x3fd, 0x3ff, 1, -130),
+    (0x400, 0x40f, 1, 80),
+    (0x410, 0x42f, 1, 32),
+    (0x460, 0x480, 2, 1),
+    (0x48a, 0x4be, 2, 1),
+    (0x4c1, 0x4cd, 2, 1),
+    (0x4d0, 0x52e, 2, 1),
+    (0x531, 0x556, 1, 48),
+    (0x10a0, 0x10c5, 1, 7264),
+    (0x13f8, 0x13fd, 1, -8),
+    (0x1c90, 0x1cba, 1, -3008),
+    (0x1cbd, 0x1cbf, 1, -3008),
+    (0x1e00, 0x1e94, 2, 1),
+    (0x1ea0, 0x1efe, 2, 1),
+    (0x1f08, 0x1f0f, 1, -8),
+    (0x1f18, 0x1f1d, 1, -8),
+    (0x1f28, 0x1f2f, 1, -8),
+    (0x1f38, 0x1f3f, 1, -8),
+    (0x1f48, 0x1f4d, 1, -8),
+    (0x1f59, 0x1f5f, 2, -8),
+    (0x1f68, 0x1f6f, 1, -8),
+    (0x1f88, 0x1f8f, 1, -8),
+    (0x1f98, 0x1f9f, 1, -8),
+    (0x1fa8, 0x1faf, 1, -8),
+    (0x1fc8, 0x1fcb, 1, -86),
+    (0x2160, 0x216f, 1, 16),
+    (0x24b6, 0x24cf, 1, 26),
+    (0x2c00, 0x2c2f, 1, 48),
+    (0x2c67, 0x2c6b, 2, 1),
+    (0x2c80, 0x2ce2, 2, 1),
+    (0xa640, 0xa66c, 2, 1),
+    (0xa680, 0xa69a, 2, 1),
+    (0xa722, 0xa72e, 2, 1),
+    (0xa732, 0xa76e, 2, 1),
+    (0xa77e, 0xa786, 2, 1),
+    (0xa796, 0xa7a8, 2, 1),
+    (0xa7b4, 0xa7c2, 2, 1),
+    (0xa7cc, 0xa7da, 2, 1),
+    (0xab70, 0xabbf, 1, -38864),
+    (0xff21, 0xff3a, 1, 32),
+    (0x10400, 0x10427, 1, 40),
+    (0x104b0, 0x104d3, 1, 40),
+    (0x10570, 0x10594, 2, 39),
+    (0x10571, 0x10579, 2, 39),
+    (0x1057d, 0x10589, 2, 39),
+    (0x1058d, 0x10591, 2, 39),
+    (0x10c80, 0x10cb2, 1, 64),
+    (0x10d50, 0x10d65, 1, 32),
+    (0x118a0, 0x118bf, 1, 32),
+    (0x16e40, 0x16e5f, 1, 32),
+    (0x16ea0, 0x16eb8, 1, 27),
+    (0x1e900, 0x1e921, 1, 34),
+];
+
+const UNICODE_SIMPLE_FOLD_SINGLETONS: &[(u32, u32)] = &[
+    (0xb5, 0x3bc),
+    (0x178, 0xff),
+    (0x17f, 0x73),
+    (0x181, 0x253),
+    (0x182, 0x183),
+    (0x184, 0x185),
+    (0x186, 0x254),
+    (0x187, 0x188),
+    (0x189, 0x256),
+    (0x18a, 0x257),
+    (0x18b, 0x18c),
+    (0x18e, 0x1dd),
+    (0x18f, 0x259),
+    (0x190, 0x25b),
+    (0x191, 0x192),
+    (0x193, 0x260),
+    (0x194, 0x263),
+    (0x196, 0x269),
+    (0x197, 0x268),
+    (0x198, 0x199),
+    (0x19c, 0x26f),
+    (0x19d, 0x272),
+    (0x19f, 0x275),
+    (0x1a6, 0x280),
+    (0x1a7, 0x1a8),
+    (0x1a9, 0x283),
+    (0x1ac, 0x1ad),
+    (0x1ae, 0x288),
+    (0x1af, 0x1b0),
+    (0x1b1, 0x28a),
+    (0x1b2, 0x28b),
+    (0x1b3, 0x1b4),
+    (0x1b5, 0x1b6),
+    (0x1b7, 0x292),
+    (0x1b8, 0x1b9),
+    (0x1bc, 0x1bd),
+    (0x1c4, 0x1c6),
+    (0x1c5, 0x1c6),
+    (0x1c7, 0x1c9),
+    (0x1c8, 0x1c9),
+    (0x1ca, 0x1cc),
+    (0x1f1, 0x1f3),
+    (0x1f2, 0x1f3),
+    (0x1f4, 0x1f5),
+    (0x1f6, 0x195),
+    (0x1f7, 0x1bf),
+    (0x220, 0x19e),
+    (0x23a, 0x2c65),
+    (0x23b, 0x23c),
+    (0x23d, 0x19a),
+    (0x23e, 0x2c66),
+    (0x241, 0x242),
+    (0x243, 0x180),
+    (0x244, 0x289),
+    (0x245, 0x28c),
+    (0x345, 0x3b9),
+    (0x370, 0x371),
+    (0x372, 0x373),
+    (0x376, 0x377),
+    (0x37f, 0x3f3),
+    (0x386, 0x3ac),
+    (0x38c, 0x3cc),
+    (0x38e, 0x3cd),
+    (0x38f, 0x3ce),
+    (0x3c2, 0x3c3),
+    (0x3cf, 0x3d7),
+    (0x3d0, 0x3b2),
+    (0x3d1, 0x3b8),
+    (0x3d5, 0x3c6),
+    (0x3d6, 0x3c0),
+    (0x3f0, 0x3ba),
+    (0x3f1, 0x3c1),
+    (0x3f4, 0x3b8),
+    (0x3f5, 0x3b5),
+    (0x3f7, 0x3f8),
+    (0x3f9, 0x3f2),
+    (0x3fa, 0x3fb),
+    (0x4c0, 0x4cf),
+    (0x10c7, 0x2d27),
+    (0x10cd, 0x2d2d),
+    (0x1c80, 0x432),
+    (0x1c81, 0x434),
+    (0x1c82, 0x43e),
+    (0x1c83, 0x441),
+    (0x1c84, 0x442),
+    (0x1c85, 0x442),
+    (0x1c86, 0x44a),
+    (0x1c87, 0x463),
+    (0x1c88, 0xa64b),
+    (0x1c89, 0x1c8a),
+    (0x1e9b, 0x1e61),
+    (0x1e9e, 0xdf),
+    (0x1fb8, 0x1fb0),
+    (0x1fb9, 0x1fb1),
+    (0x1fba, 0x1f70),
+    (0x1fbb, 0x1f71),
+    (0x1fbc, 0x1fb3),
+    (0x1fbe, 0x3b9),
+    (0x1fcc, 0x1fc3),
+    (0x1fd3, 0x390),
+    (0x1fd8, 0x1fd0),
+    (0x1fd9, 0x1fd1),
+    (0x1fda, 0x1f76),
+    (0x1fdb, 0x1f77),
+    (0x1fe3, 0x3b0),
+    (0x1fe8, 0x1fe0),
+    (0x1fe9, 0x1fe1),
+    (0x1fea, 0x1f7a),
+    (0x1feb, 0x1f7b),
+    (0x1fec, 0x1fe5),
+    (0x1ff8, 0x1f78),
+    (0x1ff9, 0x1f79),
+    (0x1ffa, 0x1f7c),
+    (0x1ffb, 0x1f7d),
+    (0x1ffc, 0x1ff3),
+    (0x2126, 0x3c9),
+    (0x212a, 0x6b),
+    (0x212b, 0xe5),
+    (0x2132, 0x214e),
+    (0x2183, 0x2184),
+    (0x2c60, 0x2c61),
+    (0x2c62, 0x26b),
+    (0x2c63, 0x1d7d),
+    (0x2c64, 0x27d),
+    (0x2c6d, 0x251),
+    (0x2c6e, 0x271),
+    (0x2c6f, 0x250),
+    (0x2c70, 0x252),
+    (0x2c72, 0x2c73),
+    (0x2c75, 0x2c76),
+    (0x2c7e, 0x23f),
+    (0x2c7f, 0x240),
+    (0x2ceb, 0x2cec),
+    (0x2ced, 0x2cee),
+    (0x2cf2, 0x2cf3),
+    (0xa779, 0xa77a),
+    (0xa77b, 0xa77c),
+    (0xa77d, 0x1d79),
+    (0xa78b, 0xa78c),
+    (0xa78d, 0x265),
+    (0xa790, 0xa791),
+    (0xa792, 0xa793),
+    (0xa7aa, 0x266),
+    (0xa7ab, 0x25c),
+    (0xa7ac, 0x261),
+    (0xa7ad, 0x26c),
+    (0xa7ae, 0x26a),
+    (0xa7b0, 0x29e),
+    (0xa7b1, 0x287),
+    (0xa7b2, 0x29d),
+    (0xa7b3, 0xab53),
+    (0xa7c4, 0xa794),
+    (0xa7c5, 0x282),
+    (0xa7c6, 0x1d8e),
+    (0xa7c7, 0xa7c8),
+    (0xa7c9, 0xa7ca),
+    (0xa7cb, 0x264),
+    (0xa7dc, 0x19b),
+    (0xa7f5, 0xa7f6),
+    (0xfb05, 0xfb06),
+    (0x10595, 0x105bc),
+];
 
 struct Parser<'a> {
     units: &'a [u16],
@@ -649,7 +975,10 @@ impl<'a> Parser<'a> {
             0x57 => Ok(ClassItem::NotWord),
             0x73 => Ok(ClassItem::Space),
             0x53 => Ok(ClassItem::NotSpace),
-            _ => self.escape_character(escaped).map(ClassItem::Character),
+            0x62 => Ok(ClassItem::Character(0x08)),
+            _ => self
+                .escape_character(escaped, true)
+                .map(ClassItem::Character),
         }
     }
 
@@ -671,15 +1000,18 @@ impl<'a> Parser<'a> {
                 let mut number = (value - 0x30) as usize;
                 while let Some(digit) = self.peek().and_then(decimal_digit) {
                     self.position += 1;
-                    number = number * 10 + digit;
+                    number = number
+                        .checked_mul(10)
+                        .and_then(|number| number.checked_add(digit))
+                        .ok_or_else(|| self.error("backreference number is too large"))?;
                 }
                 Ok(Node::BackReference(number))
             }
-            value => self.escape_character(value).map(Node::Literal),
+            value => self.escape_character(value, false).map(Node::Literal),
         }
     }
 
-    fn escape_character(&mut self, escaped: u16) -> Result<u32, RegexError> {
+    fn escape_character(&mut self, escaped: u16, in_class: bool) -> Result<u32, RegexError> {
         match escaped {
             0x6e => Ok(0x0a),
             0x72 => Ok(0x0d),
@@ -688,7 +1020,7 @@ impl<'a> Parser<'a> {
             0x76 => Ok(0x0b),
             0x30 => Ok(0),
             0x78 => self.hex_escape(2),
-            0x75 if self.peek() == Some(0x7b) => {
+            0x75 if self.unicode && self.peek() == Some(0x7b) => {
                 self.position += 1;
                 let digits = self.take_until(0x7d)?;
                 u32::from_str_radix(&digits, 16)
@@ -697,7 +1029,11 @@ impl<'a> Parser<'a> {
                     .ok_or_else(|| self.error("invalid Unicode escape"))
             }
             0x75 => {
-                let first = self.hex_escape(4)?;
+                let first = match self.hex_escape(4) {
+                    Ok(first) => first,
+                    Err(_) if !self.unicode => return Ok(0x75),
+                    Err(error) => return Err(error),
+                };
                 if self.unicode && (0xd800..=0xdbff).contains(&first) {
                     let checkpoint = self.position;
                     if self.next() == Some(0x5c)
@@ -711,7 +1047,14 @@ impl<'a> Parser<'a> {
                 }
                 Ok(first)
             }
-            value => Ok(u32::from(value)),
+            value
+                if !self.unicode
+                    || is_syntax_character(value)
+                    || (in_class && value == u16::from(b'-')) =>
+            {
+                Ok(u32::from(value))
+            }
+            _ => Err(self.error("invalid identity escape in Unicode mode")),
         }
     }
 
@@ -840,6 +1183,26 @@ fn hex_digit(unit: u16) -> Option<u32> {
     (unit <= 0x7f)
         .then_some(unit as u8)
         .and_then(|byte| (byte as char).to_digit(16))
+}
+
+fn is_syntax_character(value: u16) -> bool {
+    matches!(
+        value,
+        0x5e | 0x24
+            | 0x5c
+            | 0x2e
+            | 0x2a
+            | 0x2b
+            | 0x3f
+            | 0x28
+            | 0x29
+            | 0x5b
+            | 0x5d
+            | 0x7b
+            | 0x7d
+            | 0x7c
+            | 0x2f
+    )
 }
 
 fn combine_surrogates(high: u16, low: u16) -> u32 {
@@ -1000,5 +1363,51 @@ mod tests {
             regex(r"\uD83D\uDE00", "").exec(&input, 0).unwrap().range,
             0..2
         );
+    }
+
+    #[test]
+    fn ignore_case_uses_legacy_and_unicode_canonicalization() {
+        assert!(regex("^k$", "i").exec(&text("K"), 0).is_some());
+        for (pattern, value) in [("^k$", "K"), ("^s$", "ſ")] {
+            assert!(regex(pattern, "iu").exec(&text(value), 0).is_some());
+            assert!(regex(pattern, "i").exec(&text(value), 0).is_none());
+        }
+        assert!(regex("^å$", "i").exec(&text("Å"), 0).is_some());
+        assert!(regex(r"^(K)\1$", "iu").exec(&text("Kk"), 0).is_some());
+    }
+
+    #[test]
+    fn ignore_case_ranges_keep_the_original_endpoints() {
+        assert!(regex(r"^[E-f]$", "i").exec(&text("["), 0).is_some());
+        assert!(regex(r"^[a-c]$", "iu").exec(&text("B"), 0).is_some());
+        assert!(regex(r"^[K-K]$", "i").exec(&text("K"), 0).is_some());
+        assert!(regex(r"^[K-K]$", "iu").exec(&text("K"), 0).is_some());
+        assert!(regex(r"^[K-K]$", "i").exec(&text("K"), 0).is_none());
+    }
+
+    #[test]
+    fn unicode_ignore_case_extends_word_characters_and_boundaries() {
+        assert!(regex(r"^\b\w\b$", "i").exec(&text("K"), 0).is_some());
+        for value in ["K", "ſ"] {
+            assert!(regex(r"^\b\w\b$", "iu").exec(&text(value), 0).is_some());
+            assert!(regex(r"^\b\w\b$", "i").exec(&text(value), 0).is_none());
+        }
+    }
+
+    #[test]
+    fn oversized_decimal_backreferences_are_rejected() {
+        let pattern = format!(r"\1{}", "0".repeat(usize::BITS as usize));
+        assert!(Regex::compile(&text(&pattern), &text("")).is_err());
+    }
+
+    #[test]
+    fn braced_and_identity_escapes_follow_unicode_mode() {
+        assert!(regex(r"^\u{61}$", "u").exec(&text("a"), 0).is_some());
+        assert!(regex(r"^\u{61}$", "").exec(&text("a"), 0).is_none());
+        assert!(regex(r"^\u{3}$", "").exec(&text("uuu"), 0).is_some());
+        assert!(regex(r"^\a$", "").exec(&text("a"), 0).is_some());
+        assert!(Regex::compile(&text(r"\a"), &text("u")).is_err());
+        assert!(Regex::compile(&text(r"[\a]"), &text("u")).is_err());
+        assert!(regex(r"^[\-]$", "u").exec(&text("-"), 0).is_some());
     }
 }

@@ -630,10 +630,90 @@ struct CollectionEntry {
     order: u64,
     key: Value,
     value: Value,
+    live: bool,
 }
 
 impl CollectionEntry {
     const BYTES: usize = std::mem::size_of::<Self>();
+}
+
+#[derive(Clone, Debug, Default)]
+struct CollectionIndex {
+    buckets: std::collections::HashMap<u64, Vec<usize>>,
+}
+
+impl CollectionIndex {
+    const ENTRY_BYTES: usize = std::mem::size_of::<usize>();
+
+    fn get<H: Host>(
+        &self,
+        machine: &Machine<'_, H>,
+        entries: &[CollectionEntry],
+        key: Value,
+    ) -> Option<usize> {
+        self.buckets
+            .get(&collection_key_hash(machine, key))?
+            .iter()
+            .copied()
+            .find(|&index| {
+                entries
+                    .get(index)
+                    .is_some_and(|entry| entry.live && machine.same_value_zero(entry.key, key))
+            })
+    }
+
+    fn insert(&mut self, hash: u64, index: usize) {
+        self.buckets.entry(hash).or_default().push(index);
+    }
+
+    fn clear(&mut self) {
+        self.buckets.clear();
+    }
+}
+
+fn collection_key_hash<H: Host>(machine: &Machine<'_, H>, key: Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match key.decode() {
+        Some(Decoded::Number(number)) => {
+            0_u8.hash(&mut hasher);
+            let normalized = if number.is_nan() {
+                Value::CANON_NAN
+            } else if number == 0.0 {
+                0
+            } else {
+                number.to_bits()
+            };
+            normalized.hash(&mut hasher);
+        }
+        Some(Decoded::Int32(raw)) => {
+            0_u8.hash(&mut hasher);
+            f64::from(raw as i32).to_bits().hash(&mut hasher);
+        }
+        Some(Decoded::HeapRef(_)) => {
+            if let Some(text) = machine.string_value(key) {
+                1_u8.hash(&mut hasher);
+                text.hash(&mut hasher);
+            } else if let Ok(Some(index)) = machine.runtime_slot(key) {
+                if let HeapEntry::BigInt(text) = &machine.heap[index] {
+                    2_u8.hash(&mut hasher);
+                    text.hash(&mut hasher);
+                } else {
+                    3_u8.hash(&mut hasher);
+                    key.to_bits().hash(&mut hasher);
+                }
+            } else {
+                3_u8.hash(&mut hasher);
+                key.to_bits().hash(&mut hasher);
+            }
+        }
+        _ => {
+            4_u8.hash(&mut hasher);
+            key.to_bits().hash(&mut hasher);
+        }
+    }
+    hasher.finish()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -812,49 +892,52 @@ pub(crate) enum PromiseReaction {
     Fulfilled {
         handler: Value,
         derived: Value,
+        context: Option<Value>,
     },
     Rejected {
         handler: Value,
         derived: Value,
-    },
-    Finally {
-        handler: Value,
-        derived: Value,
-        completion: PromiseCompletion,
+        context: Option<Value>,
     },
     /// Resumes a suspended async activation on fulfillment. Carries only the
     /// heap `AsyncActivation` record handle; the awaited value arrives as the
     /// reaction value.
     AsyncFulfill {
         activation: Value,
+        context: Option<Value>,
     },
     /// Resumes a suspended async activation on rejection. Carries only the
     /// heap `AsyncActivation` record handle; the rejection reason arrives as
     /// the reaction value.
     AsyncReject {
         activation: Value,
+        context: Option<Value>,
     },
     /// Resumes a parked async generator on fulfillment of its awaited value.
     /// Carries only the `HeapEntry::AsyncGenerator` handle; the parked
     /// activation lives in the generator's own state.
     AsyncGeneratorFulfill {
         generator: Value,
+        context: Option<Value>,
     },
     /// Resumes a parked async generator on rejection of its awaited value.
     AsyncGeneratorReject {
         generator: Value,
+        context: Option<Value>,
     },
     /// Counts one fulfilled static dependency of an async-pending module.
     /// The last fulfillment starts the parent entry inline inside the
     /// reaction job.
     ModuleDepFulfill {
         parent: ModuleId,
+        context: Option<Value>,
     },
     /// Propagates one rejected static dependency into its async-pending
     /// parent: the parent entry never runs and the parent settles with the
     /// same uncaught throw.
     ModuleDepReject {
         parent: ModuleId,
+        context: Option<Value>,
     },
     /// Rebuilds the iterator result of an async-from-sync step: the reaction
     /// value is the already-unwrapped `value`; `done` was read from the sync
@@ -862,6 +945,7 @@ pub(crate) enum PromiseReaction {
     AsyncFromSyncFulfill {
         derived: Value,
         done: bool,
+        context: Option<Value>,
     },
     /// Rejects the derived step promise of an async-from-sync step. Closes
     /// the underlying sync iterator first when the step was not done; a done
@@ -870,7 +954,25 @@ pub(crate) enum PromiseReaction {
         derived: Value,
         sync_iterator: Value,
         done: bool,
+        context: Option<Value>,
     },
+}
+
+impl PromiseReaction {
+    fn context(&self) -> Option<Value> {
+        match self {
+            Self::Fulfilled { context, .. }
+            | Self::Rejected { context, .. }
+            | Self::AsyncFulfill { context, .. }
+            | Self::AsyncReject { context, .. }
+            | Self::AsyncGeneratorFulfill { context, .. }
+            | Self::AsyncGeneratorReject { context, .. }
+            | Self::ModuleDepFulfill { context, .. }
+            | Self::ModuleDepReject { context, .. }
+            | Self::AsyncFromSyncFulfill { context, .. }
+            | Self::AsyncFromSyncReject { context, .. } => *context,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -884,9 +986,11 @@ pub(crate) enum MicrotaskJob {
         promise: Value,
         thenable: Value,
         then: Value,
+        context: Option<Value>,
     },
     Callback {
         callback: Value,
+        context: Option<Value>,
     },
 }
 
@@ -1018,13 +1122,21 @@ enum HeapEntry {
         prototype: Option<Value>,
         extensible: bool,
     },
-    /// Entries stay in insertion order. Iterators track order IDs, so deletion
-    /// can remove storage without moving an iterator's logical cursor.
-    /// Weak collections share this strong storage until the runtime has a collector.
+    /// Entries retain insertion positions. Deletion tombstones an entry so
+    /// live iterators keep a stable order cursor; the index retains only
+    /// integer positions and therefore introduces no GC roots.
     Collection {
         kind: CollectionKind,
         entries: Vec<CollectionEntry>,
+        index: CollectionIndex,
+        size: usize,
         next_order: u64,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+        extensible: bool,
+    },
+    Uint8Array {
+        bytes: Vec<u8>,
         properties: PropertyMap,
         prototype: Option<Value>,
         extensible: bool,
@@ -1076,12 +1188,6 @@ enum HeapEntry {
     PromiseResolver {
         promise: Value,
         used: bool,
-    },
-    PromiseFinally {
-        derived: Value,
-        value: Value,
-        origin: ThrowOrigin,
-        completion: PromiseCompletion,
     },
     PromiseAll {
         promise: Value,
@@ -1138,9 +1244,14 @@ impl HeapEntry {
             Self::HashState {
                 algorithm, data, ..
             } => algorithm.len() + data.len(),
-            Self::Collection { entries, .. } => entries
+            Self::Collection { size, .. } => size
+                .saturating_mul(CollectionEntry::BYTES.saturating_add(CollectionIndex::ENTRY_BYTES))
+                .saturating_add(1),
+            Self::Uint8Array {
+                bytes, properties, ..
+            } => bytes
                 .len()
-                .saturating_mul(CollectionEntry::BYTES)
+                .saturating_add(properties.charge_bytes())
                 .saturating_add(1),
             Self::NativeFunction { callable, .. } => match callable {
                 NativeCallable::Builtin(_) => 1,
@@ -1204,7 +1315,6 @@ impl HeapEntry {
             | Self::Iterator { .. }
             | Self::Promise { .. }
             | Self::PromiseResolver { .. }
-            | Self::PromiseFinally { .. }
             | Self::PromiseAll { .. }
             | Self::AsyncActivation { .. }
             | Self::PromiseAllElement { .. } => 1,
@@ -1360,6 +1470,7 @@ struct TimerRecord {
     callback: Value,
     arguments: Vec<Value>,
     handle: Value,
+    context: Option<Value>,
     deadline_ms: u64,
     sequence: u64,
 }
@@ -1383,6 +1494,8 @@ pub struct Machine<'a, H: Host> {
     native_depth: usize,
     fuel: u64,
     globals: BTreeMap<EcmaString, Value>,
+    /// The contextified global used only while executing `node:vm` code.
+    context_global: Option<Value>,
     last_completion: Option<Value>,
     /// Frame depths owned by native-to-runtime callback evaluations. A throw
     /// crossing this boundary returns to the native caller so the enclosing
@@ -1604,8 +1717,8 @@ impl<'a, H: Host> Machine<'a, H> {
             program,
             module,
             host,
+            gc: gc::GcState::new(&limits),
             limits,
-            gc: gc::GcState::default(),
             native_roots: Vec::new(),
             fuel,
             frames: vec![frame],
@@ -1632,6 +1745,7 @@ impl<'a, H: Host> Machine<'a, H> {
             timer_watermark: None,
             timer_checkpoint_active: false,
             globals: BTreeMap::new(),
+            context_global: None,
             registry: ModuleRegistry {
                 external: installed_external
                     .into_iter()
@@ -1801,6 +1915,7 @@ impl<'a, H: Host> Machine<'a, H> {
             // Preserve both the ready key and live record when fuel is empty.
             self.consume_fuel(1)
                 .map_err(|kind| self.checkpoint_error(kind))?;
+            self.collect_if_pending();
             self.ready_timers.remove(&order);
             let timer = self
                 .timers
@@ -1810,7 +1925,10 @@ impl<'a, H: Host> Machine<'a, H> {
                 executed: 1,
                 uncaught: Vec::new(),
             };
-            match self.call_value(timer.callback, timer.handle, &timer.arguments) {
+            let callback_result = self.with_active_context(timer.context, |machine| {
+                machine.call_value(timer.callback, timer.handle, &timer.arguments)
+            });
+            match callback_result {
                 Ok(_) => {}
                 Err(EvalFailure::Runtime(kind)) => {
                     return Err(self.checkpoint_error(kind));
@@ -1984,6 +2102,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 callback,
                 arguments,
                 handle,
+                context: self.context_global,
                 deadline_ms,
                 sequence,
             },
@@ -2114,6 +2233,7 @@ impl<'a, H: Host> Machine<'a, H> {
             while self.microtasks.front().is_some() {
                 self.consume_fuel(1)
                     .map_err(|kind| self.checkpoint_error(kind))?;
+                self.collect_if_pending();
                 let queued = self
                     .microtasks
                     .pop_front()
@@ -2173,18 +2293,39 @@ impl<'a, H: Host> Machine<'a, H> {
                 reaction,
                 value,
                 origin,
-            } => self
-                .execute_promise_reaction(reaction, value, origin)
-                .map(|()| None),
+            } => {
+                let context = reaction.context();
+                self.with_active_context(context, |machine| {
+                    machine.execute_promise_reaction(reaction, value, origin)
+                })
+                .map(|()| None)
+            }
             MicrotaskJob::Thenable {
                 promise,
                 thenable,
                 then,
+                context,
             } => self
-                .execute_thenable_job(promise, thenable, then)
+                .with_active_context(context, |machine| {
+                    machine.execute_thenable_job(promise, thenable, then)
+                })
                 .map(|()| None),
-            MicrotaskJob::Callback { callback } => self.execute_callback_microtask(callback),
+            MicrotaskJob::Callback { callback, context } => self
+                .with_active_context(context, |machine| {
+                    machine.execute_callback_microtask(callback)
+                }),
         }
+    }
+
+    fn with_active_context<T>(
+        &mut self,
+        context: Option<Value>,
+        operation: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let previous = std::mem::replace(&mut self.context_global, context);
+        let result = operation(self);
+        self.context_global = previous;
+        result
     }
 
     fn execute_callback_microtask(
@@ -2250,42 +2391,43 @@ impl<'a, H: Host> Machine<'a, H> {
         origin: ThrowOrigin,
     ) -> Result<(), RuntimeErrorKind> {
         match reaction {
-            PromiseReaction::Fulfilled { handler, derived } => self.execute_promise_handler(
+            PromiseReaction::Fulfilled {
+                handler, derived, ..
+            } => self.execute_promise_handler(
                 handler,
                 derived,
                 value,
                 origin,
                 PromiseCompletion::Fulfilled,
             ),
-            PromiseReaction::Rejected { handler, derived } => self.execute_promise_handler(
+            PromiseReaction::Rejected {
+                handler, derived, ..
+            } => self.execute_promise_handler(
                 handler,
                 derived,
                 value,
                 origin,
                 PromiseCompletion::Rejected,
             ),
-            PromiseReaction::Finally {
-                handler,
-                derived,
-                completion,
-            } => self.execute_promise_finally(handler, derived, value, origin, completion),
-            PromiseReaction::AsyncFulfill { activation } => {
+            PromiseReaction::AsyncFulfill { activation, .. } => {
                 self.resume_async(activation, value, None)
             }
-            PromiseReaction::AsyncReject { activation } => {
+            PromiseReaction::AsyncReject { activation, .. } => {
                 self.resume_async(activation, value, Some(origin))
             }
-            PromiseReaction::AsyncGeneratorFulfill { generator } => {
+            PromiseReaction::AsyncGeneratorFulfill { generator, .. } => {
                 self.resume_async_generator(generator, value, None)
             }
-            PromiseReaction::AsyncGeneratorReject { generator } => {
+            PromiseReaction::AsyncGeneratorReject { generator, .. } => {
                 self.resume_async_generator(generator, value, Some(origin))
             }
-            PromiseReaction::ModuleDepFulfill { parent } => self.on_module_dep_fulfilled(parent),
-            PromiseReaction::ModuleDepReject { parent } => {
+            PromiseReaction::ModuleDepFulfill { parent, .. } => {
+                self.on_module_dep_fulfilled(parent)
+            }
+            PromiseReaction::ModuleDepReject { parent, .. } => {
                 self.on_module_dep_rejected(parent, value, origin)
             }
-            PromiseReaction::AsyncFromSyncFulfill { derived, done } => {
+            PromiseReaction::AsyncFromSyncFulfill { derived, done, .. } => {
                 match self.iterator_result(value, done) {
                     Ok(result) => self.fulfill_promise(derived, result),
                     Err(EvalFailure::Runtime(kind)) => Err(kind),
@@ -2302,6 +2444,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 derived,
                 sync_iterator,
                 done,
+                ..
             } => {
                 if !done {
                     self.close_protocol_iterator_preserving_abrupt(sync_iterator)?;
@@ -2336,63 +2479,6 @@ impl<'a, H: Host> Machine<'a, H> {
                 .map_err(|failure| match failure {
                     EvalFailure::Runtime(kind) => kind,
                     _ => RuntimeErrorKind::InvalidValue { value: derived },
-                }),
-        }
-    }
-
-    fn execute_promise_finally(
-        &mut self,
-        handler: Value,
-        derived: Value,
-        value: Value,
-        origin: ThrowOrigin,
-        completion: PromiseCompletion,
-    ) -> Result<(), RuntimeErrorKind> {
-        if !self.is_callable(handler).map_err(|failure| match failure {
-            EvalFailure::Runtime(kind) => kind,
-            _ => RuntimeErrorKind::InvalidValue { value: handler },
-        })? {
-            return match completion {
-                PromiseCompletion::Fulfilled => self.resolve_promise(derived, value),
-                PromiseCompletion::Rejected => self.reject_promise(derived, value, origin),
-            };
-        }
-        let cleanup = self.create_promise().map_err(|failure| match failure {
-            EvalFailure::Runtime(kind) => kind,
-            _ => RuntimeErrorKind::InvalidValue { value: derived },
-        })?;
-        let record = self
-            .create_promise_finally(derived, value, origin, completion)
-            .map_err(|failure| match failure {
-                EvalFailure::Runtime(kind) => kind,
-                _ => RuntimeErrorKind::InvalidValue { value: derived },
-            })?;
-        let (on_fulfilled, on_rejected) = self.intrinsics.builtins.promise_finally_targets();
-        let on_fulfilled = self
-            .create_promise_resolver_function(on_fulfilled, record)
-            .map_err(|failure| match failure {
-                EvalFailure::Runtime(kind) => kind,
-                _ => RuntimeErrorKind::InvalidValue { value: record },
-            })?;
-        let on_rejected = self
-            .create_promise_resolver_function(on_rejected, record)
-            .map_err(|failure| match failure {
-                EvalFailure::Runtime(kind) => kind,
-                _ => RuntimeErrorKind::InvalidValue { value: record },
-            })?;
-        self.promise_then(cleanup, on_fulfilled, on_rejected)
-            .map_err(|failure| match failure {
-                EvalFailure::Runtime(kind) => kind,
-                _ => RuntimeErrorKind::InvalidValue { value: cleanup },
-            })?;
-        match self.call_value(handler, Value::UNDEFINED, &[]) {
-            Ok(result) => self.resolve_promise(cleanup, result),
-            Err(EvalFailure::Runtime(kind)) => Err(kind),
-            Err(failure) => self
-                .reject_promise_failure(cleanup, failure)
-                .map_err(|failure| match failure {
-                    EvalFailure::Runtime(kind) => kind,
-                    _ => RuntimeErrorKind::InvalidValue { value: cleanup },
                 }),
         }
     }
@@ -2521,9 +2607,15 @@ impl<'a, H: Host> Machine<'a, H> {
             self.ensure_microtask_capacity(1)
                 .map_err(EvalFailure::Runtime)?;
             let reaction = if fulfilled {
-                PromiseReaction::ModuleDepFulfill { parent }
+                PromiseReaction::ModuleDepFulfill {
+                    parent,
+                    context: self.context_global,
+                }
             } else {
-                PromiseReaction::ModuleDepReject { parent }
+                PromiseReaction::ModuleDepReject {
+                    parent,
+                    context: self.context_global,
+                }
             };
             self.microtasks
                 .push_back(QueuedMicrotask::uncharged(MicrotaskJob::Reaction {
@@ -2534,6 +2626,7 @@ impl<'a, H: Host> Machine<'a, H> {
             return Ok(());
         }
         self.charge_promise_reactions(index, 2)?;
+        let context = self.context_global;
         let HeapEntry::Promise {
             state:
                 PromiseState::Pending {
@@ -2545,8 +2638,8 @@ impl<'a, H: Host> Machine<'a, H> {
         else {
             unreachable!("pending Promise state was checked before reaction registration");
         };
-        fulfill_reactions.push(PromiseReaction::ModuleDepFulfill { parent });
-        reject_reactions.push(PromiseReaction::ModuleDepReject { parent });
+        fulfill_reactions.push(PromiseReaction::ModuleDepFulfill { parent, context });
+        reject_reactions.push(PromiseReaction::ModuleDepReject { parent, context });
         Ok(())
     }
 
@@ -2572,6 +2665,7 @@ impl<'a, H: Host> Machine<'a, H> {
         self.microtasks
             .push_back(QueuedMicrotask::uncharged(MicrotaskJob::Callback {
                 callback,
+                context: self.context_global,
             }));
         Ok(())
     }
@@ -2736,11 +2830,13 @@ impl<'a, H: Host> Machine<'a, H> {
                 PromiseReaction::Fulfilled {
                     handler: on_fulfilled,
                     derived,
+                    context: self.context_global,
                 }
             } else {
                 PromiseReaction::Rejected {
                     handler: on_rejected,
                     derived,
+                    context: self.context_global,
                 }
             };
             self.microtasks
@@ -2752,6 +2848,7 @@ impl<'a, H: Host> Machine<'a, H> {
             return Ok(derived);
         }
         self.charge_promise_reactions(index, 2)?;
+        let context = self.context_global;
         let HeapEntry::Promise {
             state:
                 PromiseState::Pending {
@@ -2766,142 +2863,14 @@ impl<'a, H: Host> Machine<'a, H> {
         fulfill_reactions.push(PromiseReaction::Fulfilled {
             handler: on_fulfilled,
             derived,
+            context,
         });
         reject_reactions.push(PromiseReaction::Rejected {
             handler: on_rejected,
             derived,
+            context,
         });
         Ok(derived)
-    }
-
-    pub(crate) fn promise_finally(
-        &mut self,
-        promise: Value,
-        handler: Value,
-    ) -> Result<Value, EvalFailure> {
-        let index = self
-            .runtime_slot(promise)
-            .map_err(EvalFailure::Runtime)?
-            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "Promise.prototype.finally",
-            }))?;
-        let settled = match &self.heap[index] {
-            HeapEntry::Promise {
-                state: PromiseState::Pending { .. },
-                ..
-            } => None,
-            HeapEntry::Promise {
-                state: PromiseState::Fulfilled { value },
-                ..
-            } => Some((true, *value, ThrowOrigin::Bytecode)),
-            HeapEntry::Promise {
-                state: PromiseState::Rejected { reason, origin },
-                ..
-            } => Some((false, *reason, *origin)),
-            _ => {
-                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                    operation: "Promise.prototype.finally",
-                }));
-            }
-        };
-        let derived = self.create_promise()?;
-        let reaction = |completion| PromiseReaction::Finally {
-            handler,
-            derived,
-            completion,
-        };
-        if let Some((fulfilled, value, origin)) = settled {
-            self.ensure_microtask_capacity(1)
-                .map_err(EvalFailure::Runtime)?;
-            self.microtasks
-                .push_back(QueuedMicrotask::uncharged(MicrotaskJob::Reaction {
-                    reaction: reaction(if fulfilled {
-                        PromiseCompletion::Fulfilled
-                    } else {
-                        PromiseCompletion::Rejected
-                    }),
-                    value,
-                    origin,
-                }));
-            return Ok(derived);
-        }
-        self.charge_promise_reactions(index, 2)?;
-        let HeapEntry::Promise {
-            state:
-                PromiseState::Pending {
-                    fulfill_reactions,
-                    reject_reactions,
-                },
-            ..
-        } = &mut self.heap[index]
-        else {
-            unreachable!("pending Promise state was checked before derived allocation");
-        };
-        fulfill_reactions.push(reaction(PromiseCompletion::Fulfilled));
-        reject_reactions.push(reaction(PromiseCompletion::Rejected));
-        Ok(derived)
-    }
-
-    pub(crate) fn create_promise_finally(
-        &mut self,
-        derived: Value,
-        value: Value,
-        origin: ThrowOrigin,
-        completion: PromiseCompletion,
-    ) -> Result<Value, EvalFailure> {
-        self.allocate(HeapEntry::PromiseFinally {
-            derived,
-            value,
-            origin,
-            completion,
-        })
-        .map_err(EvalFailure::Runtime)
-    }
-
-    pub(crate) fn fulfill_promise_finally(&mut self, record: Value) -> Result<(), EvalFailure> {
-        let (derived, value, origin, completion) = self.promise_finally_record(record)?;
-        match completion {
-            PromiseCompletion::Fulfilled => self
-                .resolve_promise(derived, value)
-                .map_err(EvalFailure::Runtime),
-            PromiseCompletion::Rejected => self
-                .reject_promise(derived, value, origin)
-                .map_err(EvalFailure::Runtime),
-        }
-    }
-
-    pub(crate) fn reject_promise_finally(
-        &mut self,
-        record: Value,
-        reason: Value,
-    ) -> Result<(), EvalFailure> {
-        let (derived, _, _, _) = self.promise_finally_record(record)?;
-        self.reject_promise(derived, reason, ThrowOrigin::Bytecode)
-            .map_err(EvalFailure::Runtime)
-    }
-
-    fn promise_finally_record(
-        &mut self,
-        record: Value,
-    ) -> Result<(Value, Value, ThrowOrigin, PromiseCompletion), EvalFailure> {
-        let index = self
-            .runtime_slot(record)
-            .map_err(EvalFailure::Runtime)?
-            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "Promise finally target",
-            }))?;
-        let HeapEntry::PromiseFinally {
-            derived,
-            value,
-            origin,
-            completion,
-        } = &self.heap[index]
-        else {
-            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "Promise finally target",
-            }));
-        };
-        Ok((*derived, *value, *origin, *completion))
     }
 
     pub(crate) fn promise_resolve(&mut self, value: Value) -> Result<Value, EvalFailure> {
@@ -2915,14 +2884,12 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(promise)
     }
 
-    pub(crate) fn promise_reject(&mut self, reason: Value) -> Result<Value, EvalFailure> {
-        let promise = self.create_promise()?;
-        self.reject_promise(promise, reason, ThrowOrigin::Bytecode)
-            .map_err(EvalFailure::Runtime)?;
-        Ok(promise)
-    }
-
-    pub(crate) fn promise_all(&mut self, iterable: Value) -> Result<Value, EvalFailure> {
+    pub(crate) fn promise_all_with_resolve(
+        &mut self,
+        iterable: Value,
+        resolve: Value,
+        receiver: Value,
+    ) -> Result<Value, EvalFailure> {
         let promise = self.create_promise()?;
         let aggregate = self
             .allocate(HeapEntry::PromiseAll {
@@ -2981,13 +2948,19 @@ impl<'a, H: Host> Machine<'a, H> {
                     return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
                 }
             };
-            let resolved = match self.promise_resolve(value) {
+            let resolved = match self.call_value(resolve, receiver, &[value]) {
                 Ok(resolved) => resolved,
                 Err(failure) => {
                     return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
                 }
             };
-            if let Err(failure) = self.promise_then(resolved, on_fulfilled, on_rejected) {
+            let then = match self.get_named_property(resolved, "then") {
+                Ok(then) => then,
+                Err(failure) => {
+                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                }
+            };
+            if let Err(failure) = self.call_value(then, resolved, &[on_fulfilled, on_rejected]) {
                 return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
             }
         }
@@ -3345,6 +3318,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 promise,
                 thenable: value,
                 then,
+                context: self.context_global,
             }));
         Ok(())
     }
@@ -4387,6 +4361,7 @@ impl<'a, H: Host> Machine<'a, H> {
             if let Err(kind) = self.consume_fuel(1) {
                 return Err(self.error_at(kind, function_index, pc));
             }
+            self.collect_if_pending();
             let instruction = self.module_code(module_id).functions()[function_index].code()[pc];
 
             match instruction {
@@ -4639,7 +4614,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         },
                         pc,
                     )?,
-                    Err(kind) => return Err(self.error_here_at(kind, pc)),
+                    Err(failure) => self.resolve_failure(failure, pc)?,
                 },
                 Instruction::StoreGlobal { name, value } => {
                     let value = self.read_register(frame_index, value.get());
@@ -4649,15 +4624,17 @@ impl<'a, H: Host> Machine<'a, H> {
                     }
                 }
                 Instruction::TypeOfGlobal { dst, name } => {
-                    let text = match self.load_global(module_id, name) {
-                        Ok(value) => value.map_or("undefined", |value| self.type_of(value)),
-                        Err(kind) => return Err(self.error_here_at(kind, pc)),
-                    };
-                    let value = self
-                        .allocate(HeapEntry::String(EcmaString::from_utf8(text)))
-                        .map_err(|kind| self.error_at(kind, function_index, pc))?;
-                    self.write_register(frame_index, dst.get(), value);
-                    self.frames[frame_index].pc = pc + 1;
+                    match self.load_global(module_id, name) {
+                        Ok(value) => {
+                            let text = value.map_or("undefined", |value| self.type_of(value));
+                            let value = self
+                                .allocate(HeapEntry::String(EcmaString::from_utf8(text)))
+                                .map_err(|kind| self.error_at(kind, function_index, pc))?;
+                            self.write_register(frame_index, dst.get(), value);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
                 }
                 Instruction::LoadThis { dst } => {
                     let value = self.frames[frame_index].this_value;
@@ -4936,7 +4913,17 @@ impl<'a, H: Host> Machine<'a, H> {
         self.heap_bytes += bytes;
         let id = SlotId::from_parts(RUNTIME_HEAP_SEGMENT, slot)
             .expect("runtime segment and one-based slot are nonzero");
+        self.request_garbage_collection();
         Ok(Value::heap_ref(id))
+    }
+
+    fn live_runtime_slots(&self) -> usize {
+        self.heap.len() - self.intrinsic_slots - self.vacant_count
+    }
+
+    fn request_garbage_collection(&mut self) {
+        self.gc
+            .request_collection(self.heap_bytes, self.live_runtime_slots());
     }
 
     fn ensure_allocation_capacity(
@@ -4944,7 +4931,7 @@ impl<'a, H: Host> Machine<'a, H> {
         additional_slots: usize,
         additional_bytes: usize,
     ) -> Result<(), RuntimeErrorKind> {
-        let used_slots = self.heap.len() - self.intrinsic_slots - self.vacant_count;
+        let used_slots = self.live_runtime_slots();
         let slots_fit_limit = used_slots
             .checked_add(additional_slots)
             .is_some_and(|total| total <= self.limits.max_heap_slots);
@@ -4991,6 +4978,7 @@ impl<'a, H: Host> Machine<'a, H> {
         self.ensure_allocation_capacity(0, bytes)?;
         self.slot_bytes[index] += bytes;
         self.heap_bytes += bytes;
+        self.request_garbage_collection();
         Ok(())
     }
 
@@ -5037,6 +5025,7 @@ impl<'a, H: Host> Machine<'a, H> {
         self.ensure_allocation_capacity(0, bytes)?;
         self.machine_bytes += bytes;
         self.heap_bytes += bytes;
+        self.request_garbage_collection();
         Ok(())
     }
 
@@ -5086,10 +5075,10 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     pub(crate) fn load_global(
-        &self,
+        &mut self,
         module: ModuleId,
         name: ConstantId,
-    ) -> Result<Option<Value>, RuntimeErrorKind> {
+    ) -> Result<Option<Value>, EvalFailure> {
         if let Some(cell) = self
             .registry
             .modules
@@ -5106,11 +5095,31 @@ impl<'a, H: Host> Machine<'a, H> {
                     .position(|candidate| *candidate == Some(cell))
                     .map(|index| BindingId::new(index as u32))
                     .expect("linked cell belongs to a binding");
-                return Err(RuntimeErrorKind::TemporalDeadZone { module, binding });
+                return Err(EvalFailure::Runtime(RuntimeErrorKind::TemporalDeadZone {
+                    module,
+                    binding,
+                }));
             }
             return Ok(Some(value));
         }
-        Ok(self.resolve_global_binding(self.constant_text(module, name)))
+        let name = self.constant_text(module, name).to_owned();
+        if let Some(context) = self.context_global {
+            if name.eq_ascii("globalThis") {
+                return Ok(Some(context));
+            }
+            let key = PropertyKey::Named(name.clone());
+            if self.own_descriptor(context, &key)?.is_some() {
+                return self.get_property_key(context, &key).map(Some);
+            }
+            return Ok(self
+                .intrinsics
+                .globals
+                .iter()
+                .find_map(|(candidate, value)| {
+                    (candidate == &name && !candidate.eq_ascii("globalThis")).then_some(*value)
+                }));
+        }
+        Ok(self.resolve_global_binding(&name))
     }
 
     pub(crate) fn store_global(
@@ -5143,6 +5152,10 @@ impl<'a, H: Host> Machine<'a, H> {
             self.registry.cells[cell.0].value = value;
         } else {
             let name = self.constant_text(module, name).to_owned();
+            if let Some(context) = self.context_global {
+                self.set_data_property_key(context, PropertyKey::Named(name), value)?;
+                return Ok(());
+            }
             if let Some(global_this) = self.intrinsics.global("globalThis") {
                 let key = PropertyKey::Named(name.clone());
                 if matches!(
@@ -5617,9 +5630,6 @@ impl<'a, H: Host> Machine<'a, H> {
                             }
                             Err(failure) => return self.resolve_failure(failure, call_pc),
                         },
-                        Ok(intrinsics::BuiltinOutcome::ConstructCall { .. }) => {
-                            return self.throw_type("call", call_pc);
-                        }
                         Err(failure) => return self.resolve_failure(failure, call_pc),
                     }
                 }
@@ -5678,25 +5688,6 @@ impl<'a, H: Host> Machine<'a, H> {
                     | intrinsics::BuiltinOutcome::GeneratorNext { .. }
                     | intrinsics::BuiltinOutcome::AsyncGeneratorNext { .. },
                 ) => self.throw_type("construct", call_pc),
-                Ok(intrinsics::BuiltinOutcome::ConstructCall {
-                    callee: continuation,
-                    this_value,
-                    arguments: continuation_arguments,
-                    prototype,
-                }) => {
-                    let object = self
-                        .allocate_constructed_receiver_with(prototype)
-                        .map_err(|kind| self.error_here_at(kind, call_pc))?;
-                    self.execute_call(CallRequest {
-                        callee: continuation,
-                        this_value,
-                        arguments: &continuation_arguments,
-                        destination: Some(destination),
-                        call_pc,
-                        constructed: Some(object),
-                        new_target: callee,
-                    })
-                }
                 Err(failure) => self.resolve_failure(failure, call_pc),
             };
         }
@@ -5784,15 +5775,32 @@ impl<'a, H: Host> Machine<'a, H> {
                 operation: "array method called on incompatible receiver",
             }));
         };
+        let old_length = match &self.heap[index] {
+            HeapEntry::Array { elements, .. } => elements.len(),
+            _ => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "array method called on incompatible receiver",
+                }));
+            }
+        };
+        let element_bytes = std::mem::size_of::<Value>();
+        let growth = elements
+            .len()
+            .saturating_sub(old_length)
+            .saturating_mul(element_bytes);
+        self.charge_slot(index, growth)
+            .map_err(EvalFailure::Runtime)?;
+        let released = old_length
+            .saturating_sub(elements.len())
+            .saturating_mul(element_bytes);
         let HeapEntry::Array {
             elements: current, ..
         } = &mut self.heap[index]
         else {
-            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "array method called on incompatible receiver",
-            }));
+            unreachable!("array brand was checked before its heap charge");
         };
         *current = elements;
+        self.refund_slot(index, released);
         Ok(())
     }
 
@@ -5961,6 +5969,73 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(self.own_get(index, key).is_some())
     }
 
+    pub(crate) fn construct_value(
+        &mut self,
+        callee: Value,
+        arguments: &[Value],
+    ) -> Result<Value, EvalFailure> {
+        match self.callee_kind(callee).map_err(EvalFailure::Runtime)? {
+            CalleeKind::Builtin { id } => {
+                match self.call_builtin(id, Value::UNDEFINED, arguments, true)? {
+                    intrinsics::BuiltinOutcome::Value(value) => Ok(value),
+                    _ => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "construct",
+                    })),
+                }
+            }
+            CalleeKind::Runtime { target, captures } => {
+                let flags = self.module_code(target.module).functions()
+                    [target.function.get() as usize]
+                    .flags();
+                if flags.is_async || flags.is_generator {
+                    return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "construct",
+                    }));
+                }
+                let object = self
+                    .allocate_constructed_receiver(callee)
+                    .map_err(EvalFailure::Runtime)?;
+                let stop_depth = self.frames.len();
+                let return_to = self.frames.last().map(|frame| ReturnTo {
+                    destination: None,
+                    call_pc: frame.pc,
+                    constructed: Some(object),
+                });
+                self.push_frame(target, &captures, object, callee, arguments, return_to)
+                    .map_err(|error| EvalFailure::Runtime(error.kind))?;
+                self.callback_boundaries.push(stop_depth);
+                let result = self.run_loop(stop_depth);
+                self.callback_boundaries
+                    .pop()
+                    .expect("nested constructor callback owns its unwind boundary");
+                match result {
+                    Ok(None) => self.last_completion.take().ok_or(EvalFailure::Runtime(
+                        RuntimeErrorKind::InvalidValue { value: object },
+                    )),
+                    Ok(Some(execution)) => Ok(execution.value),
+                    Err(error) => {
+                        self.unwind_frames_to(stop_depth);
+                        match error.kind {
+                            RuntimeErrorKind::UncaughtThrow { value, .. } => {
+                                Err(EvalFailure::ThrowValue(value))
+                            }
+                            kind => Err(EvalFailure::Runtime(kind)),
+                        }
+                    }
+                }
+            }
+            CalleeKind::Bound => {
+                let bound = self
+                    .flatten_bound(callee, Value::UNDEFINED, arguments)
+                    .map_err(EvalFailure::Runtime)?;
+                self.construct_value(bound.target, &bound.arguments)
+            }
+            CalleeKind::NotCallable => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "construct",
+            })),
+        }
+    }
+
     pub(crate) fn call_value(
         &mut self,
         callee: Value,
@@ -5992,11 +6067,6 @@ impl<'a, H: Host> Machine<'a, H> {
                             generator,
                             resume_value,
                         } => return self.enqueue_async_generator_next(generator, resume_value),
-                        intrinsics::BuiltinOutcome::ConstructCall { .. } => {
-                            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                                operation: "call",
-                            }));
-                        }
                     }
                 }
                 CalleeKind::Runtime { target, captures } => {
@@ -6464,6 +6534,17 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 property_lookup_ascii(properties, name)
             }
+            HeapEntry::Uint8Array {
+                bytes, properties, ..
+            } => {
+                if let Some(index) = uint8array_index_ascii(name) {
+                    let value = index
+                        .and_then(|offset| bytes.get(offset))
+                        .map_or(Value::UNDEFINED, |byte| Value::int32(u32::from(*byte)));
+                    return Some(Found::Value(value));
+                }
+                property_lookup_ascii(properties, name)
+            }
             HeapEntry::Function {
                 module,
                 function,
@@ -6552,7 +6633,6 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::PrivateName { .. }
             | HeapEntry::Iterator { .. }
             | HeapEntry::PromiseResolver { .. }
-            | HeapEntry::PromiseFinally { .. }
             | HeapEntry::PromiseAll { .. }
             | HeapEntry::AsyncActivation { .. }
             | HeapEntry::PromiseAllElement { .. } => None,
@@ -6594,6 +6674,19 @@ impl<'a, H: Host> Machine<'a, H> {
                     {
                         return Some(Found::Value(*element));
                     }
+                }
+                property_lookup(properties, key)
+            }
+            HeapEntry::Uint8Array {
+                bytes, properties, ..
+            } => {
+                if let PropertyKey::Named(name) = key
+                    && let Some(index) = uint8array_index(name)
+                {
+                    let value = index
+                        .and_then(|offset| bytes.get(offset))
+                        .map_or(Value::UNDEFINED, |byte| Value::int32(u32::from(*byte)));
+                    return Some(Found::Value(value));
                 }
                 property_lookup(properties, key)
             }
@@ -6710,7 +6803,6 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::PrivateName { .. }
             | HeapEntry::Iterator { .. }
             | HeapEntry::PromiseResolver { .. }
-            | HeapEntry::PromiseFinally { .. }
             | HeapEntry::PromiseAll { .. }
             | HeapEntry::AsyncActivation { .. }
             | HeapEntry::PromiseAllElement { .. } => None,
@@ -6768,6 +6860,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
+            | HeapEntry::Uint8Array { properties, .. }
             | HeapEntry::Promise { properties, .. }
             | HeapEntry::Timeout { properties, .. } => properties,
             _ => return None,
@@ -6790,6 +6883,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Date { prototype, .. }
             | HeapEntry::BuiltinIterator { prototype, .. }
             | HeapEntry::Collection { prototype, .. }
+            | HeapEntry::Uint8Array { prototype, .. }
             | HeapEntry::Promise { prototype, .. }
             | HeapEntry::Timeout { prototype, .. }
             | HeapEntry::ProcessEnv { prototype, .. } => *prototype,
@@ -6854,6 +6948,12 @@ impl<'a, H: Host> Machine<'a, H> {
                     self.host.set_env(&name, &text);
                     return Ok(SetOutcome::Done);
                 }
+                if matches!(self.heap[index], HeapEntry::Uint8Array { .. })
+                    && matches!(&key, PropertyKey::Named(name) if uint8array_index(name).is_some())
+                {
+                    self.set_own_data(index, key, value)?;
+                    return Ok(SetOutcome::Done);
+                }
                 if let Some(setter) = self.find_setter(index, &key)? {
                     return Ok(match setter {
                         Some(setter) => SetOutcome::Setter(setter),
@@ -6892,6 +6992,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::Date { properties, .. }
                 | HeapEntry::BuiltinIterator { properties, .. }
                 | HeapEntry::Collection { properties, .. }
+                | HeapEntry::Uint8Array { properties, .. }
                 | HeapEntry::Promise { properties, .. }
                 | HeapEntry::Timeout { properties, .. } => match properties.get(key) {
                     Some(Property::Accessor { setter, .. }) => Some(Some(*setter)),
@@ -6933,6 +7034,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 false
             }
+            HeapEntry::Uint8Array { bytes, .. } => key
+                .as_string()
+                .and_then(uint8array_index)
+                .flatten()
+                .is_some_and(|offset| offset < bytes.len()),
             HeapEntry::Function { .. } => {
                 (key.eq_ascii("length") || key.eq_ascii("name"))
                     && match key {
@@ -6953,6 +7059,27 @@ impl<'a, H: Host> Machine<'a, H> {
         key: PropertyKey,
         value: Value,
     ) -> Result<(), EvalFailure> {
+        if let PropertyKey::Named(name) = &key
+            && let Some(typed_index) = uint8array_index(name)
+            && matches!(self.heap[index], HeapEntry::Uint8Array { .. })
+        {
+            let Some(offset) = typed_index else {
+                return Ok(());
+            };
+            let in_bounds = matches!(
+                &self.heap[index],
+                HeapEntry::Uint8Array { bytes, .. } if offset < bytes.len()
+            );
+            if !in_bounds {
+                return Ok(());
+            }
+            let byte = crate::intrinsics::builtins::to_uint8(self, value)?;
+            let HeapEntry::Uint8Array { bytes, .. } = &mut self.heap[index] else {
+                unreachable!("Uint8Array brand was checked")
+            };
+            bytes[offset] = byte;
+            return Ok(());
+        }
         if matches!(&key, PropertyKey::Named(name) if name.eq_ascii("length"))
             && matches!(self.heap[index], HeapEntry::Array { .. })
         {
@@ -7069,6 +7196,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 extensible,
                 ..
             }
+            | HeapEntry::Uint8Array {
+                properties,
+                extensible,
+                ..
+            }
             | HeapEntry::Promise {
                 properties,
                 extensible,
@@ -7121,6 +7253,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
+            | HeapEntry::Uint8Array { properties, .. }
             | HeapEntry::Promise { properties, .. }
             | HeapEntry::Timeout { properties, .. } => {
                 usize::from(!properties.contains_key(&key)) * key.charge_bytes()
@@ -7153,7 +7286,6 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::PrivateName { .. }
             | HeapEntry::Iterator { .. }
             | HeapEntry::PromiseResolver { .. }
-            | HeapEntry::PromiseFinally { .. }
             | HeapEntry::PromiseAll { .. }
             | HeapEntry::AsyncActivation { .. }
             | HeapEntry::PromiseAllElement { .. } => {
@@ -7191,6 +7323,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
+            | HeapEntry::Uint8Array { properties, .. }
             | HeapEntry::Promise { properties, .. }
             | HeapEntry::Timeout { properties, .. } => {
                 properties.insert(
@@ -7266,6 +7399,14 @@ impl<'a, H: Host> Machine<'a, H> {
     ) -> Result<(), EvalFailure> {
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => {
+                if let PropertyKey::Named(name) = &key
+                    && uint8array_index(name).is_some()
+                    && matches!(self.heap[index], HeapEntry::Uint8Array { .. })
+                {
+                    return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "define accessor on typed array index",
+                    }));
+                }
                 let growth = match &self.heap[index] {
                     HeapEntry::Object {
                         properties,
@@ -7322,6 +7463,11 @@ impl<'a, H: Host> Machine<'a, H> {
                         extensible,
                         ..
                     }
+                    | HeapEntry::Uint8Array {
+                        properties,
+                        extensible,
+                        ..
+                    }
                     | HeapEntry::Promise {
                         properties,
                         extensible,
@@ -7363,6 +7509,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::Date { properties, .. }
                     | HeapEntry::BuiltinIterator { properties, .. }
                     | HeapEntry::Collection { properties, .. }
+                    | HeapEntry::Uint8Array { properties, .. }
                     | HeapEntry::Promise { properties, .. } => properties,
                     _ => unreachable!("validated object cannot change heap entry kind"),
                 };
@@ -7398,6 +7545,12 @@ impl<'a, H: Host> Machine<'a, H> {
     fn delete_property(&mut self, object: Value, key: &PropertyKey) -> Result<bool, EvalFailure> {
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => {
+                if let PropertyKey::Named(name) = key
+                    && let Some(typed_index) = uint8array_index(name)
+                    && let HeapEntry::Uint8Array { bytes, .. } = &self.heap[index]
+                {
+                    return Ok(typed_index.is_none_or(|offset| offset >= bytes.len()));
+                }
                 let released = match &mut self.heap[index] {
                     HeapEntry::Object { properties, .. }
                     | HeapEntry::Generator { properties, .. }
@@ -7409,6 +7562,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::Date { properties, .. }
                     | HeapEntry::BuiltinIterator { properties, .. }
                     | HeapEntry::Collection { properties, .. }
+                    | HeapEntry::Uint8Array { properties, .. }
                     | HeapEntry::Promise { properties, .. }
                     | HeapEntry::Timeout { properties, .. } => {
                         let Some(property) = properties.get(key) else {
@@ -7462,7 +7616,6 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::PrivateName { .. }
                     | HeapEntry::Iterator { .. }
                     | HeapEntry::PromiseResolver { .. }
-                    | HeapEntry::PromiseFinally { .. }
                     | HeapEntry::PromiseAll { .. }
                     | HeapEntry::AsyncActivation { .. }
                     | HeapEntry::PromiseAllElement { .. }
@@ -7651,6 +7804,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     prototype: slot, ..
                 }
                 | HeapEntry::Collection {
+                    prototype: slot, ..
+                }
+                | HeapEntry::Uint8Array {
                     prototype: slot, ..
                 }
                 | HeapEntry::Promise {
@@ -8431,9 +8587,15 @@ impl<'a, H: Host> Machine<'a, H> {
             self.ensure_microtask_capacity(1)
                 .map_err(EvalFailure::Runtime)?;
             let reaction = if fulfilled {
-                PromiseReaction::AsyncGeneratorFulfill { generator }
+                PromiseReaction::AsyncGeneratorFulfill {
+                    generator,
+                    context: self.context_global,
+                }
             } else {
-                PromiseReaction::AsyncGeneratorReject { generator }
+                PromiseReaction::AsyncGeneratorReject {
+                    generator,
+                    context: self.context_global,
+                }
             };
             self.microtasks
                 .push_back(QueuedMicrotask::uncharged(MicrotaskJob::Reaction {
@@ -8444,6 +8606,7 @@ impl<'a, H: Host> Machine<'a, H> {
             return Ok(());
         }
         self.charge_promise_reactions(index, 2)?;
+        let context = self.context_global;
         let HeapEntry::Promise {
             state:
                 PromiseState::Pending {
@@ -8455,8 +8618,8 @@ impl<'a, H: Host> Machine<'a, H> {
         else {
             unreachable!("pending Promise state was checked before reaction registration");
         };
-        fulfill_reactions.push(PromiseReaction::AsyncGeneratorFulfill { generator });
-        reject_reactions.push(PromiseReaction::AsyncGeneratorReject { generator });
+        fulfill_reactions.push(PromiseReaction::AsyncGeneratorFulfill { generator, context });
+        reject_reactions.push(PromiseReaction::AsyncGeneratorReject { generator, context });
         Ok(())
     }
 
@@ -8711,9 +8874,15 @@ impl<'a, H: Host> Machine<'a, H> {
             self.ensure_microtask_capacity(1)
                 .map_err(EvalFailure::Runtime)?;
             let reaction = if fulfilled {
-                PromiseReaction::AsyncFulfill { activation: record }
+                PromiseReaction::AsyncFulfill {
+                    activation: record,
+                    context: self.context_global,
+                }
             } else {
-                PromiseReaction::AsyncReject { activation: record }
+                PromiseReaction::AsyncReject {
+                    activation: record,
+                    context: self.context_global,
+                }
             };
             self.microtasks
                 .push_back(QueuedMicrotask::uncharged(MicrotaskJob::Reaction {
@@ -8724,6 +8893,7 @@ impl<'a, H: Host> Machine<'a, H> {
             return Ok(());
         }
         self.charge_promise_reactions(index, 2)?;
+        let context = self.context_global;
         let HeapEntry::Promise {
             state:
                 PromiseState::Pending {
@@ -8735,8 +8905,14 @@ impl<'a, H: Host> Machine<'a, H> {
         else {
             unreachable!("pending Promise state was checked before reaction registration");
         };
-        fulfill_reactions.push(PromiseReaction::AsyncFulfill { activation: record });
-        reject_reactions.push(PromiseReaction::AsyncReject { activation: record });
+        fulfill_reactions.push(PromiseReaction::AsyncFulfill {
+            activation: record,
+            context,
+        });
+        reject_reactions.push(PromiseReaction::AsyncReject {
+            activation: record,
+            context,
+        });
         Ok(())
     }
 
@@ -8967,6 +9143,15 @@ impl<'a, H: Host> Machine<'a, H> {
     fn own_property_keys(&self, src: Value) -> Result<Vec<PropertyKey>, EvalFailure> {
         match self.runtime_slot(src).map_err(EvalFailure::Runtime)? {
             Some(index) => match &self.heap[index] {
+                HeapEntry::Uint8Array {
+                    bytes, properties, ..
+                } => Ok((0..bytes.len())
+                    .map(|index| PropertyKey::Named(EcmaString::from_utf8(&index.to_string())))
+                    .chain(ordered_property_keys(properties).into_iter().filter(|key| {
+                        key.as_string()
+                            .is_none_or(|name| uint8array_index(name).is_none())
+                    }))
+                    .collect()),
                 HeapEntry::Object { properties, .. }
                 | HeapEntry::Generator { properties, .. }
                 | HeapEntry::AsyncGenerator { properties, .. }
@@ -9044,7 +9229,6 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::HashState { .. }
                 | HeapEntry::Iterator { .. }
                 | HeapEntry::PromiseResolver { .. }
-                | HeapEntry::PromiseFinally { .. }
                 | HeapEntry::PromiseAll { .. }
                 | HeapEntry::AsyncActivation { .. }
                 | HeapEntry::PromiseAllElement { .. } => Ok(Vec::new()),
@@ -9082,6 +9266,17 @@ impl<'a, H: Host> Machine<'a, H> {
             HeapEntry::String(text) => key.as_string().is_some_and(|name| {
                 array_index(name).is_some_and(|offset| (offset as usize) < text.len_units())
             }),
+            HeapEntry::Uint8Array {
+                bytes, properties, ..
+            } => properties.get(key).map_or_else(
+                || {
+                    key.as_string()
+                        .and_then(uint8array_index)
+                        .flatten()
+                        .is_some_and(|offset| offset < bytes.len())
+                },
+                Property::enumerable,
+            ),
             HeapEntry::ModuleNamespace { .. } | HeapEntry::ExternalModuleNamespace { .. } => {
                 matches!(key, PropertyKey::Named(_))
             }
@@ -9251,12 +9446,17 @@ impl<'a, H: Host> Machine<'a, H> {
             self.ensure_microtask_capacity(1)
                 .map_err(EvalFailure::Runtime)?;
             let reaction = if fulfilled {
-                PromiseReaction::AsyncFromSyncFulfill { derived, done }
+                PromiseReaction::AsyncFromSyncFulfill {
+                    derived,
+                    done,
+                    context: self.context_global,
+                }
             } else {
                 PromiseReaction::AsyncFromSyncReject {
                     derived,
                     sync_iterator,
                     done,
+                    context: self.context_global,
                 }
             };
             self.microtasks
@@ -9268,6 +9468,7 @@ impl<'a, H: Host> Machine<'a, H> {
             return Ok(());
         }
         self.charge_promise_reactions(index, 2)?;
+        let context = self.context_global;
         let HeapEntry::Promise {
             state:
                 PromiseState::Pending {
@@ -9279,11 +9480,16 @@ impl<'a, H: Host> Machine<'a, H> {
         else {
             unreachable!("pending Promise state was checked before reaction registration");
         };
-        fulfill_reactions.push(PromiseReaction::AsyncFromSyncFulfill { derived, done });
+        fulfill_reactions.push(PromiseReaction::AsyncFromSyncFulfill {
+            derived,
+            done,
+            context,
+        });
         reject_reactions.push(PromiseReaction::AsyncFromSyncReject {
             derived,
             sync_iterator,
             done,
+            context,
         });
         Ok(())
     }
@@ -9660,9 +9866,9 @@ impl<'a, H: Host> Machine<'a, H> {
                         | HeapEntry::Date { .. }
                         | HeapEntry::BuiltinIterator { .. }
                         | HeapEntry::Collection { .. }
+                        | HeapEntry::Uint8Array { .. }
                         | HeapEntry::Promise { .. }
                         | HeapEntry::PromiseResolver { .. }
-                        | HeapEntry::PromiseFinally { .. }
                         | HeapEntry::PromiseAll { .. }
                         | HeapEntry::AsyncActivation { .. }
                         | HeapEntry::PromiseAllElement { .. }
@@ -9709,9 +9915,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::Date { .. }
                     | HeapEntry::BuiltinIterator { .. }
                     | HeapEntry::Collection { .. }
+                    | HeapEntry::Uint8Array { .. }
                     | HeapEntry::Promise { .. }
                     | HeapEntry::PromiseResolver { .. }
-                    | HeapEntry::PromiseFinally { .. }
                     | HeapEntry::PromiseAll { .. }
                     | HeapEntry::AsyncActivation { .. }
                     | HeapEntry::PromiseAllElement { .. }
@@ -9751,9 +9957,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::Date { .. }
                     | HeapEntry::BuiltinIterator { .. }
                     | HeapEntry::Collection { .. }
+                    | HeapEntry::Uint8Array { .. }
                     | HeapEntry::Promise { .. }
                     | HeapEntry::PromiseResolver { .. }
-                    | HeapEntry::PromiseFinally { .. }
                     | HeapEntry::PromiseAll { .. }
                     | HeapEntry::AsyncActivation { .. }
                     | HeapEntry::PromiseAllElement { .. }
@@ -9905,9 +10111,9 @@ impl<'a, H: Host> Machine<'a, H> {
                         | HeapEntry::Date { .. }
                         | HeapEntry::BuiltinIterator { .. }
                         | HeapEntry::Collection { .. }
+                        | HeapEntry::Uint8Array { .. }
                         | HeapEntry::Promise { .. }
                         | HeapEntry::PromiseResolver { .. }
-                        | HeapEntry::PromiseFinally { .. }
                         | HeapEntry::PromiseAll { .. }
                         | HeapEntry::AsyncActivation { .. }
                         | HeapEntry::PromiseAllElement { .. }
@@ -10019,7 +10225,6 @@ impl<'a, H: Host> Machine<'a, H> {
                 HeapEntry::String(_)
                     | HeapEntry::BigInt(_)
                     | HeapEntry::PromiseResolver { .. }
-                    | HeapEntry::PromiseFinally { .. }
                     | HeapEntry::PromiseAll { .. }
                     | HeapEntry::AsyncActivation { .. }
                     | HeapEntry::PromiseAllElement { .. }
@@ -10232,6 +10437,55 @@ fn array_index(key: &EcmaString) -> Option<u32> {
             .checked_add(u32::from(unit - u16::from(b'0')))?;
     }
     (index != u32::MAX).then_some(index)
+}
+
+fn uint8array_index(key: &EcmaString) -> Option<Option<usize>> {
+    let Ok(key) = key.to_utf8_strict() else {
+        return None;
+    };
+    uint8array_index_ascii(&key)
+}
+
+fn uint8array_index_ascii(key: &str) -> Option<Option<usize>> {
+    if key == "-0" {
+        return Some(None);
+    }
+    if !key.is_empty()
+        && key.is_ascii()
+        && key.bytes().all(|byte| byte.is_ascii_digit())
+        && (key.len() == 1 || key.as_bytes()[0] != b'0')
+    {
+        let mut index = 0_usize;
+        let mut overflowed = false;
+        for byte in key.bytes() {
+            match index
+                .checked_mul(10)
+                .and_then(|index| index.checked_add(usize::from(byte - b'0')))
+            {
+                Some(next) => index = next,
+                None => {
+                    overflowed = true;
+                    break;
+                }
+            }
+        }
+        if !overflowed {
+            return Some(Some(index));
+        }
+    }
+    let number = match key {
+        "NaN" => f64::NAN,
+        "Infinity" => f64::INFINITY,
+        "-Infinity" => f64::NEG_INFINITY,
+        _ => key.parse::<f64>().ok()?,
+    };
+    if format_number(number) != key {
+        return None;
+    }
+    if !number.is_finite() || number < 0.0 || number.fract() != 0.0 || number >= usize::MAX as f64 {
+        return Some(None);
+    }
+    Some(Some(number as usize))
 }
 
 fn exact_array_length(value: Value) -> Option<usize> {
@@ -10643,6 +10897,64 @@ mod tests {
     }
 
     #[test]
+    fn uint8array_canonical_numeric_keys_never_become_ordinary_properties() {
+        assert!(uint8array_index_ascii("4294967295").is_some());
+        for key in ["-0", "NaN", "Infinity", "1.5"] {
+            assert_eq!(uint8array_index_ascii(key), Some(None), "{key}");
+        }
+        assert_eq!(uint8array_index_ascii("01"), None);
+
+        with_machine(Limits::default(), |machine| {
+            let typed = machine
+                .allocate(HeapEntry::Uint8Array {
+                    bytes: vec![0],
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    extensible: true,
+                })
+                .unwrap();
+            let index = machine.runtime_slot(typed).unwrap().unwrap();
+            for name in ["4294967295", "-0", "NaN", "Infinity", "1.5"] {
+                let key = PropertyKey::Named(EcmaString::from_utf8(name));
+                machine
+                    .set_own_data(index, key.clone(), Value::int32(7))
+                    .unwrap();
+                assert_eq!(
+                    machine.get_property_key(typed, &key).unwrap(),
+                    Value::UNDEFINED,
+                    "{name}"
+                );
+                assert!(machine.delete_property(typed, &key).unwrap(), "{name}");
+                assert!(
+                    machine
+                        .define_descriptor(
+                            typed,
+                            key,
+                            Property::Data {
+                                value: Value::int32(7),
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        )
+                        .is_err(),
+                    "{name}"
+                );
+            }
+
+            let ordinary = PropertyKey::Named(EcmaString::from_utf8("01"));
+            machine
+                .set_own_data(index, ordinary.clone(), Value::int32(7))
+                .unwrap();
+            assert_eq!(
+                machine.get_property_key(typed, &ordinary).unwrap(),
+                Value::int32(7)
+            );
+            assert!(machine.delete_property(typed, &ordinary).unwrap());
+        });
+    }
+
+    #[test]
     fn heap_ledger_tracks_slot_and_machine_charges() {
         with_machine(Limits::default(), |machine| {
             machine.assert_heap_ledger();
@@ -10657,6 +10969,182 @@ mod tests {
             assert_eq!(machine.machine_bytes, 5);
             machine.assert_heap_ledger();
         });
+    }
+
+    #[test]
+    fn gc_pending_arms_after_successful_mutations_without_preflight_side_effects() {
+        with_machine(Limits::default(), |machine| {
+            machine.set_gc_watermarks_for_test(usize::MAX, 1);
+            assert!(!machine.gc_pending());
+            machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .unwrap();
+            assert!(machine.gc_pending());
+
+            machine.collect_garbage();
+            machine.set_gc_watermarks_for_test(usize::MAX, usize::MAX);
+            let value = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .unwrap();
+            let index = machine.runtime_slot(value).unwrap().unwrap();
+            let bytes = machine.heap_bytes + 1;
+            machine.set_gc_watermarks_for_test(bytes, usize::MAX);
+            assert!(!machine.gc_pending());
+            machine.charge_slot(index, 1).unwrap();
+            assert!(machine.gc_pending());
+
+            machine.collect_garbage();
+            machine.set_gc_watermarks_for_test(usize::MAX, usize::MAX);
+            let bytes = machine.heap_bytes + 1;
+            machine.set_gc_watermarks_for_test(bytes, usize::MAX);
+            machine.charge_machine(1).unwrap();
+            assert!(machine.gc_pending());
+        });
+
+        with_machine(
+            Limits {
+                max_heap_bytes: 1,
+                ..Limits::default()
+            },
+            |machine| {
+                machine.set_gc_watermarks_for_test(usize::MAX, usize::MAX);
+                assert!(matches!(
+                    machine.allocate(HeapEntry::String(EcmaString::from_utf8("x"))),
+                    Err(RuntimeErrorKind::HeapByteLimitExceeded { limit: 1 })
+                ));
+                assert!(!machine.gc_pending());
+                machine.assert_heap_ledger();
+            },
+        );
+    }
+
+    #[test]
+    fn gc_recomputes_watermarks_from_live_usage() {
+        with_machine(Limits::default(), |machine| {
+            let value = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .unwrap();
+            machine.globals.insert(EcmaString::from_utf8("live"), value);
+
+            machine.collect_garbage();
+
+            assert_eq!(
+                machine.gc_watermarks_for_test(),
+                (
+                    machine
+                        .heap_bytes
+                        .saturating_mul(2)
+                        .min(machine.limits.max_heap_bytes),
+                    machine
+                        .live_runtime_slots()
+                        .saturating_mul(2)
+                        .min(machine.limits.max_heap_slots),
+                )
+            );
+        });
+    }
+
+    #[test]
+    fn interpreter_safe_point_reclaims_overwritten_values() {
+        let program = verified(
+            vec![Constant::Int32(7)],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.set_gc_watermarks_for_test(usize::MAX, 1);
+
+        let execution = machine.evaluate().unwrap();
+        machine.run_to_quiescence().unwrap();
+        assert_eq!(execution.value, Value::int32(7));
+        assert!(matches!(
+            machine.heap[machine.intrinsic_slots],
+            HeapEntry::Vacant
+        ));
+        assert!(machine.vacant_count >= 2);
+        machine.assert_heap_ledger();
+    }
+
+    #[test]
+    fn automatic_gc_repeats_deterministically() {
+        let program = verified(
+            vec![Constant::Int32(7)],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut outcomes = Vec::new();
+        for _ in 0..3 {
+            let mut host = TestHost;
+            let mut machine = Machine::new(&program, &mut host, Limits::default());
+            machine.set_gc_watermarks_for_test(usize::MAX, 1);
+            let execution = machine.evaluate().unwrap();
+            machine.run_to_quiescence().unwrap();
+            outcomes.push((execution.value, machine.heap_bytes, machine.vacant_count));
+        }
+
+        assert_eq!(outcomes, vec![(Value::int32(7), 1, 2); 3]);
+    }
+
+    #[test]
+    fn microtask_safe_point_keeps_queued_callback_rooted() {
+        let program = verified(
+            vec![],
+            vec![function(0, 0, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callback = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(0),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        machine
+            .microtasks
+            .push_back(QueuedMicrotask::uncharged(MicrotaskJob::Callback {
+                callback,
+                context: None,
+            }));
+        machine.set_gc_watermarks_for_test(0, 0);
+
+        assert_eq!(machine.drain_microtasks().unwrap().executed, 1);
+        assert!(matches!(
+            machine.heap[machine.runtime_slot(callback).unwrap().unwrap()],
+            HeapEntry::Function { .. }
+        ));
     }
 
     #[test]
@@ -10804,6 +11292,95 @@ mod tests {
                 panic!("array remains an array");
             };
             assert_eq!(*elements, vec![Value::int32(1)]);
+        });
+    }
+
+    #[test]
+    fn array_length_shrink_refunds_storage_charged_by_array_replacement() {
+        with_machine(Limits::default(), |machine| {
+            let indexed = PropertyKey::Named(EcmaString::from_utf8("1"));
+            let indexed_bytes = indexed.charge_bytes();
+            let mut properties = PropertyMap::default();
+            properties.insert(
+                indexed,
+                Property::Data {
+                    value: Value::int32(99),
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                },
+            );
+            let array = machine
+                .allocate(HeapEntry::Array {
+                    elements: Vec::new(),
+                    properties,
+                    prototype: Some(machine.intrinsics.array_prototype),
+                    extensible: true,
+                    length_writable: true,
+                })
+                .unwrap();
+            let index = machine.runtime_slot(array).unwrap().unwrap();
+            let base_charge = machine.slot_bytes[index];
+            let base_heap = machine.heap_bytes;
+            let element_bytes = std::mem::size_of::<Value>();
+
+            machine
+                .replace_array_elements(array, vec![Value::int32(1), Value::int32(2)])
+                .unwrap();
+            assert_eq!(machine.slot_bytes[index], base_charge + 2 * element_bytes);
+            assert_eq!(machine.heap_bytes, base_heap + 2 * element_bytes);
+
+            machine
+                .set_data_property(array, "length", Value::int32(1))
+                .unwrap();
+            assert_eq!(
+                machine.slot_bytes[index],
+                base_charge + element_bytes - indexed_bytes
+            );
+            assert_eq!(
+                machine.heap_bytes,
+                base_heap + element_bytes - indexed_bytes
+            );
+            let HeapEntry::Array {
+                elements,
+                properties,
+                length_writable,
+                ..
+            } = &machine.heap[index]
+            else {
+                panic!("array remains an array");
+            };
+            assert_eq!(*elements, vec![Value::int32(1)]);
+            assert!(properties.0.is_empty());
+            assert!(*length_writable);
+            machine.assert_heap_ledger();
+
+            let HeapEntry::Array {
+                length_writable, ..
+            } = &mut machine.heap[index]
+            else {
+                panic!("array remains an array");
+            };
+            *length_writable = false;
+            let failed_slot = machine.slot_bytes[index];
+            let failed_heap = machine.heap_bytes;
+            assert!(matches!(
+                machine.set_data_property(array, "length", Value::int32(0)),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+            assert_eq!(machine.slot_bytes[index], failed_slot);
+            assert_eq!(machine.heap_bytes, failed_heap);
+            let HeapEntry::Array {
+                elements,
+                properties,
+                ..
+            } = &machine.heap[index]
+            else {
+                panic!("array remains an array");
+            };
+            assert_eq!(*elements, vec![Value::int32(1)]);
+            assert!(properties.0.is_empty());
+            machine.assert_heap_ledger();
         });
     }
 
@@ -10958,10 +11535,12 @@ mod tests {
             fulfill_reactions.push(PromiseReaction::Fulfilled {
                 handler: Value::UNDEFINED,
                 derived: Value::int32(0),
+                context: None,
             });
             reject_reactions.push(PromiseReaction::Rejected {
                 handler: Value::UNDEFINED,
                 derived: Value::int32(0),
+                context: None,
             });
             machine
                 .fulfill_promise(failing_source, Value::int32(1))
@@ -12886,6 +13465,8 @@ mod tests {
         let set_prototype = machine
             .get_named_property(set_constructor, "prototype")
             .unwrap();
+        let mut set_index = CollectionIndex::default();
+        set_index.insert(collection_key_hash(&machine, Value::int32(7)), 0);
         let set = machine
             .allocate(HeapEntry::Collection {
                 kind: CollectionKind::Set,
@@ -12893,7 +13474,10 @@ mod tests {
                     order: 0,
                     key: Value::int32(7),
                     value: Value::int32(7),
+                    live: true,
                 }],
+                index: set_index,
+                size: 1,
                 next_order: 1,
                 properties: PropertyMap::default(),
                 prototype: Some(set_prototype),
@@ -16914,7 +17498,7 @@ mod tests {
             vec![Edge {
                 specifier: cid(2),
                 target: EdgeTarget::External,
-                kind: EdgeKind::Dynamic,
+                kind: EdgeKind::Static,
             }],
             Vec::new(),
             vec![Export {
@@ -17881,6 +18465,89 @@ mod tests {
             .intrinsics
             .global("setTimeout")
             .expect("setTimeout is installed")
+    }
+
+    fn test_context(machine: &mut Machine<'_, TimerTestHost>) -> Value {
+        machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn deferred_jobs_restore_their_captured_contexts() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let first = test_context(&mut machine);
+        let second = test_context(&mut machine);
+        let write_a = timer_fn(&mut machine, 1);
+        let write_b = timer_fn(&mut machine, 2);
+
+        machine.context_global = Some(first);
+        machine.enqueue_microtask_callback(write_a).unwrap();
+        let promise = machine.create_promise().unwrap();
+        machine
+            .promise_then(promise, write_b, Value::UNDEFINED)
+            .unwrap();
+
+        machine.context_global = Some(second);
+        machine.enqueue_microtask_callback(write_b).unwrap();
+        machine.schedule_timeout(write_a, 1, Vec::new()).unwrap();
+        machine.context_global = None;
+
+        machine.fulfill_promise(promise, Value::UNDEFINED).unwrap();
+        machine.drain_microtasks().unwrap();
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 1,
+        });
+        machine.run_one_expired_timer().unwrap();
+
+        assert_eq!(
+            machine.get_named_property(first, "a").unwrap(),
+            Value::int32(1)
+        );
+        assert_eq!(
+            machine.get_named_property(first, "b").unwrap(),
+            Value::int32(1)
+        );
+        assert_eq!(
+            machine.get_named_property(second, "a").unwrap(),
+            Value::int32(1)
+        );
+        assert_eq!(
+            machine.get_named_property(second, "b").unwrap(),
+            Value::int32(1)
+        );
+        assert_eq!(read_global(&machine, "a"), None);
+        assert_eq!(read_global(&machine, "b"), None);
+        assert_eq!(machine.context_global, None);
+    }
+
+    #[test]
+    fn timer_safe_point_keeps_callback_rooted() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let callback = timer_fn(&mut machine, 1);
+        machine.schedule_timeout(callback, 1, Vec::new()).unwrap();
+        machine.set_gc_watermarks_for_test(0, 0);
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 1,
+        });
+
+        assert_eq!(machine.run_one_expired_timer().unwrap().executed, 1);
+        assert_eq!(read_global(&machine, "a"), Some(Value::int32(1)));
     }
 
     fn schedule_nested_timer(

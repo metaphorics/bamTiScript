@@ -19,10 +19,12 @@ pub(super) fn install<H: Host>(
     let async_iterator = symbol(heap, "Symbol.asyncIterator");
     let has_instance = symbol(heap, "Symbol.hasInstance");
     let to_string_tag = symbol(heap, "Symbol.toStringTag");
+    let species = symbol(heap, "Symbol.species");
     let dispose = symbol(heap, "Symbol.dispose");
     builtins.set_symbol_iterator(iterator);
     builtins.set_symbol_async_iterator(async_iterator);
     builtins.set_symbol_to_string_tag(to_string_tag);
+    builtins.set_symbol_species(species);
     builtins.set_symbol_prototype(prototype);
 
     let constructor = install_function(heap, builtins, "Symbol", 0, constructor::<H>);
@@ -34,6 +36,7 @@ pub(super) fn install<H: Host>(
         ("asyncIterator", async_iterator),
         ("hasInstance", has_instance),
         ("toStringTag", to_string_tag),
+        ("species", species),
         ("dispose", dispose),
     ] {
         define_readonly_property(heap, constructor, name, value);
@@ -135,13 +138,32 @@ fn symbol_for<H: Host>(
     if let Some(existing) = machine.intrinsics.symbol_registry.get(&key).copied() {
         return Ok(BuiltinOutcome::Value(existing));
     }
+    let symbol_bytes = key
+        .len_units()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or(EvalFailure::Runtime(
+            crate::RuntimeErrorKind::HeapByteLimitExceeded {
+                limit: machine.limits.max_heap_bytes,
+            },
+        ))?;
+    let registry_bytes = PropertyKey::Named(key.clone()).charge_bytes();
+    let total_bytes = symbol_bytes
+        .checked_add(registry_bytes)
+        .ok_or(EvalFailure::Runtime(
+            crate::RuntimeErrorKind::HeapByteLimitExceeded {
+                limit: machine.limits.max_heap_bytes,
+            },
+        ))?;
+    machine
+        .ensure_allocation_capacity(1, total_bytes)
+        .map_err(EvalFailure::Runtime)?;
     let symbol = machine
         .allocate(HeapEntry::Symbol {
             description: key.clone(),
         })
         .map_err(EvalFailure::Runtime)?;
     machine
-        .charge_machine(PropertyKey::Named(key.clone()).charge_bytes())
+        .charge_machine(registry_bytes)
         .map_err(EvalFailure::Runtime)?;
     machine.intrinsics.symbol_registry.insert(key, symbol);
     Ok(BuiltinOutcome::Value(symbol))
@@ -205,51 +227,13 @@ fn value_of<H: Host>(
 
 #[cfg(test)]
 mod tests {
-    use bamts_bytecode::{
-        Constant, ConstantId, Function, FunctionFlags, FunctionId, Instruction, Module, ModuleId,
-        Program, ProgramModule, Verified,
-    };
-
+    use super::super::test_support::{TestHost, blank_program};
     use super::*;
     use crate::Limits;
 
-    #[derive(Default)]
-    struct TestHost;
-
-    impl Host for TestHost {}
-
-    fn module() -> Program<Verified> {
-        let code = Module::new(
-            vec![Constant::String(EcmaString::from_utf8("<test>"))],
-            vec![Function::new(
-                None,
-                0,
-                0,
-                1,
-                FunctionFlags::default(),
-                vec![Instruction::Halt],
-                Vec::new(),
-            )],
-            FunctionId::new(0),
-        )
-        .verify()
-        .expect("valid test module");
-        Program::link(
-            vec![ProgramModule {
-                name: ConstantId::new(0),
-                code,
-                edges: Vec::new(),
-                bindings: Vec::new(),
-                exports: Vec::new(),
-            }],
-            ModuleId::new(0),
-        )
-        .expect("valid test program")
-    }
-
     #[test]
     fn symbol_dispose_is_installed_on_constructor() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let symbol = machine
@@ -268,7 +252,7 @@ mod tests {
 
     #[test]
     fn symbol_dispose_descriptor_is_readonly_non_enumerable_non_configurable() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let machine = Machine::new(&module, &mut host, Limits::default());
         let symbol = machine
@@ -297,7 +281,7 @@ mod tests {
 
     #[test]
     fn symbol_dispose_identity_is_stable_across_reads() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let symbol = machine
@@ -313,6 +297,82 @@ mod tests {
         assert_eq!(
             first, second,
             "Symbol.dispose identity must be stable across reads"
+        );
+    }
+
+    #[test]
+    fn symbol_species_descriptor_and_identity_are_stable() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let symbol = machine
+            .intrinsics
+            .global("Symbol")
+            .expect("Symbol is installed");
+        let first = machine
+            .get_named_property(symbol, "species")
+            .expect("Symbol.species is readable");
+        let second = machine
+            .get_named_property(symbol, "species")
+            .expect("Symbol.species is readable twice");
+        assert_eq!(first, second);
+        assert_eq!(first, machine.intrinsics.builtins.symbol_species());
+        let descriptor = machine
+            .own_descriptor(
+                symbol,
+                &PropertyKey::Named(EcmaString::from_utf8("species")),
+            )
+            .expect("descriptor lookup succeeds")
+            .expect("Symbol.species is defined");
+        assert!(matches!(
+            descriptor,
+            Property::Data {
+                writable: false,
+                enumerable: false,
+                configurable: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn failed_symbol_for_preflight_leaves_heap_and_accounting_unchanged() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let symbol_constructor = machine
+            .intrinsics
+            .global("Symbol")
+            .expect("Symbol is installed");
+        let symbol_for = machine
+            .get_named_property(symbol_constructor, "for")
+            .expect("Symbol.for is installed");
+        let key = machine
+            .allocate(HeapEntry::String(EcmaString::from_utf8("key")))
+            .expect("registry key allocation succeeds");
+        let before = (
+            machine.heap.len(),
+            machine.heap_bytes,
+            machine.machine_bytes,
+            machine.intrinsics.symbol_registry.len(),
+        );
+        machine.limits.max_heap_bytes = machine.heap_bytes + 2 * 3;
+
+        assert!(matches!(
+            machine.call_value(symbol_for, symbol_constructor, &[key]),
+            Err(EvalFailure::Runtime(
+                crate::RuntimeErrorKind::HeapByteLimitExceeded { .. }
+            ))
+        ));
+        assert_eq!(
+            (
+                machine.heap.len(),
+                machine.heap_bytes,
+                machine.machine_bytes,
+                machine.intrinsics.symbol_registry.len(),
+            ),
+            before,
+            "a failed Symbol.for call must not allocate or charge before registry publication"
         );
     }
 }

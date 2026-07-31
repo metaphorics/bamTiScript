@@ -3,7 +3,7 @@ name = "bamts-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-publish.workspace = true
+publish = true
 license.workspace = true
 repository.workspace = true
 description = "BamTS compiler command-line driver"
@@ -13,14 +13,15 @@ name = "bamts"
 path = "src/main.rs"
 
 [dependencies]
-bamts = { path = "../bamts", version = "0.1.0", features = ["node-host"] }
-bamts-compiler = { path = "../bamts-compiler", version = "0.1.0" }
-bamts-runtime = { path = "../bamts-runtime", version = "0.1.2" }
-bamts-codegen = { path = "../bamts-codegen", version = "0.1.0", features = ["aot", "host-jit"] }
-bamts-node = { path = "../bamts-node", version = "0.1.0" }
+bamts = { workspace = true, features = ["node-host"] }
+bamts-compiler.workspace = true
+bamts-runtime.workspace = true
+bamts-codegen = { workspace = true, features = ["aot", "host-jit"] }
+bamts-node.workspace = true
 
 [build-dependencies]
-bamts-node = { path = "../bamts-node", version = "0.1.0", features = ["aot-main", "script-compiler"] }
+bamts-node = { workspace = true, features = ["aot-main", "script-compiler"] }
+serde_json = "=1.0.151"
 
 [lints]
 workspace = true

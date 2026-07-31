@@ -59,6 +59,7 @@ dependencies = [
  "bamts-compiler",
  "bamts-node",
  "bamts-runtime",
+ "serde_json",
 ]
 
 [[package]]

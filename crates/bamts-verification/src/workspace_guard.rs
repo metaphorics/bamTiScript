@@ -148,7 +148,6 @@ fn validate_root_manifest(manifest: &Value) -> Result<()> {
         "1.97.1",
         "root [workspace.package]",
     )?;
-    require_exact_bool(package, "publish", true, "root [workspace.package]")?;
 
     let lints = required_table(workspace, "lints", "root [workspace]")?;
     let rust = required_table(lints, "rust", "root [workspace.lints]")?;
@@ -211,9 +210,39 @@ fn validate_workspace_dependencies(manifest: &Value) -> Result<()> {
     })?;
 
     for (name, dependency) in sorted_table_entries(dependencies) {
-        validate_registry_dependency(name, dependency, "root [workspace.dependencies]")?;
+        if is_member_name(name) {
+            validate_workspace_internal_dependency(name, dependency)?;
+        } else {
+            validate_registry_dependency(name, dependency, "root [workspace.dependencies]")?;
+        }
     }
 
+    Ok(())
+}
+
+fn validate_workspace_internal_dependency(name: &str, dependency: &Value) -> Result<()> {
+    let context = format!("root [workspace.dependencies].{name}");
+    let attributes = dependency
+        .as_table()
+        .ok_or_else(|| workspace_error(format!("{context} must be a dependency table")))?;
+    for key in attributes.keys() {
+        if !matches!(key.as_str(), "path" | "version") {
+            return Err(workspace_error(format!(
+                "{context} may only declare `path` and `version`"
+            )));
+        }
+    }
+    let expected_path = MEMBERS
+        .iter()
+        .find_map(|(member, path)| (*member == name).then_some(*path))
+        .expect("member name was checked");
+    require_exact_string(attributes, "path", expected_path, &context)?;
+    let version = required_string(attributes, "version", &context)?;
+    if version.is_empty() || version.chars().any(char::is_whitespace) {
+        return Err(workspace_error(format!(
+            "{context}: `version` must be a non-empty version requirement"
+        )));
+    }
     Ok(())
 }
 
@@ -262,7 +291,12 @@ fn validate_member_manifest(expected_name: &str, manifest: &Value, path: &Path) 
 
     require_workspace_inheritance(package, "edition", path)?;
     require_workspace_inheritance(package, "rust-version", path)?;
-    require_workspace_inheritance(package, "publish", path)?;
+    require_exact_bool(
+        package,
+        "publish",
+        expected_name != "bamts-verification",
+        &format!("{} [package]", path.display()),
+    )?;
     validate_member_lints(expected_name, manifest, &path.display().to_string())?;
 
     if expected_name == "bamts-native" {
@@ -669,6 +703,8 @@ fn inspect_dependency_table(
 
         if table.contains_key("path") {
             inspect_internal_dependency(member, name, table, member_directories, edges)?;
+        } else if is_member_name(name) && table.contains_key("workspace") {
+            inspect_workspace_internal_dependency(member, name, table, edges)?;
         } else {
             validate_registry_dependency(
                 name,
@@ -729,6 +765,37 @@ fn inspect_internal_dependency(
         edges.insert(target.clone(), dependency);
     }
 
+    Ok(())
+}
+
+fn inspect_workspace_internal_dependency(
+    member: &MemberManifest,
+    dependency_name: &str,
+    attributes: &Table,
+    edges: &mut BTreeMap<String, InternalDependency>,
+) -> Result<()> {
+    let context = format!(
+        "{} dependency `{dependency_name}`",
+        member.manifest_path.display()
+    );
+    for key in attributes.keys() {
+        if !matches!(key.as_str(), "workspace" | "optional" | "features") {
+            return Err(workspace_error(format!(
+                "{context}: inherited internal dependencies may only declare `workspace`, `optional`, and `features`"
+            )));
+        }
+    }
+    require_exact_bool(attributes, "workspace", true, &context)?;
+    let dependency = InternalDependency {
+        optional: optional_bool(attributes, "optional", &context)?,
+        features: optional_feature_set(attributes, "features", &context)?,
+    };
+    if let Some(existing) = edges.get_mut(dependency_name) {
+        existing.optional &= dependency.optional;
+        existing.features.extend(dependency.features);
+    } else {
+        edges.insert(dependency_name.to_owned(), dependency);
+    }
     Ok(())
 }
 
@@ -1217,74 +1284,7 @@ fn cargo_metadata(root: &Path, feature: Option<&str>) -> Result<CargoMetadata> {
 }
 
 fn codegen_closure(metadata: &CargoMetadata) -> Result<ResolvedClosure> {
-    let resolve = metadata
-        .resolve
-        .as_ref()
-        .ok_or_else(|| workspace_error("cargo metadata did not include a resolve graph"))?;
-    let mut packages = BTreeMap::new();
-    let mut codegen = None;
-    for package in &metadata.packages {
-        if packages
-            .insert(package.id.as_str(), package.name.as_str())
-            .is_some()
-        {
-            return Err(workspace_error(format!(
-                "cargo metadata contains duplicate package id `{}`",
-                package.id
-            )));
-        }
-        if package.name == "bamts-codegen" && codegen.replace(package.id.as_str()).is_some() {
-            return Err(workspace_error(
-                "cargo metadata contains multiple bamts-codegen packages",
-            ));
-        }
-    }
-    let codegen =
-        codegen.ok_or_else(|| workspace_error("cargo metadata does not contain bamts-codegen"))?;
-
-    let mut nodes = BTreeMap::new();
-    for node in &resolve.nodes {
-        if nodes.insert(node.id.as_str(), node).is_some() {
-            return Err(workspace_error(format!(
-                "cargo metadata contains duplicate resolve node `{}`",
-                node.id
-            )));
-        }
-    }
-
-    let mut closure = ResolvedClosure::default();
-    let mut pending = vec![codegen];
-    let mut visited = BTreeSet::new();
-    while let Some(package_id) = pending.pop() {
-        if !visited.insert(package_id) {
-            continue;
-        }
-        let node = nodes.get(package_id).ok_or_else(|| {
-            workspace_error(format!(
-                "cargo metadata resolve graph lacks package `{package_id}`"
-            ))
-        })?;
-        let name = packages.get(package_id).ok_or_else(|| {
-            workspace_error(format!("cargo metadata package table lacks `{package_id}`"))
-        })?;
-        closure.package_names.insert((*name).to_owned());
-        let features = closure
-            .package_features
-            .entry((*name).to_owned())
-            .or_default();
-        features.extend(node.features.iter().cloned());
-        for dependency in &node.deps {
-            let contributes_to_artifact = dependency
-                .dep_kinds
-                .iter()
-                .any(|kind| kind.kind.as_deref() != Some("dev"));
-            if contributes_to_artifact {
-                pending.push(dependency.pkg.as_str());
-            }
-        }
-    }
-
-    Ok(closure)
+    resolve_closure_from(metadata, "bamts-codegen")
 }
 
 fn require_enabled_feature(closure: &ResolvedClosure, mode: &str, feature: &str) -> Result<()> {
@@ -1312,8 +1312,7 @@ fn require_present_package(closure: &ResolvedClosure, mode: &str, package: &str)
 }
 
 /// Resolve the package-closure from the given root, returning package names
-/// and their enabled features. Unlike [`codegen_closure`], this works for
-/// any root package, not just `bamts-codegen`.
+/// and their enabled features.
 fn resolve_closure_from(metadata: &CargoMetadata, root_name: &str) -> Result<ResolvedClosure> {
     let resolve = metadata
         .resolve
@@ -1687,7 +1686,6 @@ resolver = "3"
 [workspace.package]
 edition = "2024"
 rust-version = "1.97.1"
-publish = true
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use bamts::discover_project;
 use bamts_compiler::lower::LowerOptions;
 use bamts_compiler::pipeline::{
     FrontendMode, ProgramFrontendOutput, compile_program_frontend_with_lints,
@@ -287,7 +288,7 @@ pub fn execute(args: &CliArgs) -> Result<CommandOutcome, DriverError> {
     }
 }
 
-fn levels(args: &CliArgs) -> Result<LintTable, DriverError> {
+fn levels(args: &CliArgs, project_root: &Path) -> Result<LintTable, DriverError> {
     let profile = if args.pedantic {
         LintProfile::Pedantic
     } else if args.strict {
@@ -296,7 +297,8 @@ fn levels(args: &CliArgs) -> Result<LintTable, DriverError> {
         LintProfile::Default
     };
     let mut levels = LintTable::new(profile);
-    if let Some(path) = lint_config_path(args) {
+    let path = project_root.join("bamts.toml");
+    if path.is_file() {
         let source = fs::read_to_string(&path).map_err(|source| DriverError::ReadSource {
             path: path.clone(),
             source,
@@ -336,25 +338,10 @@ fn forbidden_lint_override(error: bamts_compiler::lint::ForbidOverrideError) -> 
     })
 }
 
-fn lint_config_path(args: &CliArgs) -> Option<PathBuf> {
-    let start = args.entrypoint.as_deref().map_or_else(
-        || std::env::current_dir().ok(),
-        |entrypoint| {
-            let path = Path::new(entrypoint);
-            let parent = path.parent().unwrap_or_else(|| Path::new("."));
-            if parent.is_absolute() {
-                Some(parent.to_path_buf())
-            } else {
-                std::env::current_dir()
-                    .ok()
-                    .map(|directory| directory.join(parent))
-            }
-        },
-    )?;
-    start
-        .ancestors()
-        .map(|directory| directory.join("bamts.toml"))
-        .find(|path| path.is_file())
+fn lower_options(args: &CliArgs) -> LowerOptions {
+    LowerOptions {
+        javascript_compatibility: args.js_compat.enabled,
+    }
 }
 
 fn check(args: &CliArgs, frontend: &LoadedProgramFrontend) -> Result<CommandOutcome, DriverError> {
@@ -392,14 +379,8 @@ fn compile(
 
     let entrypoint = required_entrypoint(args)?;
     let warnings = require_clean_frontend(args, frontend)?;
-    let executable = lower_program(
-        &frontend.program,
-        &frontend.output,
-        LowerOptions {
-            javascript_compatibility: true,
-        },
-    )
-    .map_err(DriverError::Lower)?;
+    let executable = lower_program(&frontend.program, &frontend.output, lower_options(args))
+        .map_err(DriverError::Lower)?;
     if BUILD_TARGET != HOST_TARGET {
         return Err(DriverError::CrossTargetLink {
             host: HOST_TARGET,
@@ -419,14 +400,20 @@ fn compile(
 fn run(args: &CliArgs, frontend: &LoadedProgramFrontend) -> Result<CommandOutcome, DriverError> {
     let entrypoint = required_entrypoint(args)?;
     let warnings = require_clean_frontend(args, frontend)?;
-    let executable = lower_program(
-        &frontend.program,
-        &frontend.output,
-        LowerOptions {
-            javascript_compatibility: true,
-        },
-    )
-    .map_err(DriverError::Lower)?;
+    let executable = lower_program(&frontend.program, &frontend.output, lower_options(args))
+        .map_err(DriverError::Lower)?;
+    match args.target {
+        ExecutionTarget::Jit => run_jit(args, entrypoint, warnings, &executable),
+        ExecutionTarget::Aot => run_aot(args, warnings, &executable),
+    }
+}
+
+fn run_jit(
+    args: &CliArgs,
+    entrypoint: &Path,
+    warnings: String,
+    executable: &bamts_compiler::program::ExecutableProgram,
+) -> Result<CommandOutcome, DriverError> {
     let program = bamts_codegen::compile_jit(executable.wire()).map_err(DriverError::Jit)?;
     let mut host = bamts_node::NodeHost::new();
     host.set_script_compiler(Box::new(bamts::ScriptCompiler));
@@ -450,6 +437,41 @@ fn run(args: &CliArgs, frontend: &LoadedProgramFrontend) -> Result<CommandOutcom
         stdout,
         stderr,
         exit_code,
+    })
+}
+
+fn run_aot(
+    args: &CliArgs,
+    warnings: String,
+    executable: &bamts_compiler::program::ExecutableProgram,
+) -> Result<CommandOutcome, DriverError> {
+    if BUILD_TARGET != HOST_TARGET {
+        return Err(DriverError::CrossTargetLink {
+            host: HOST_TARGET,
+            target: BUILD_TARGET,
+        });
+    }
+    let object =
+        bamts_codegen::compile_aot(executable.wire(), HOST_TARGET).map_err(DriverError::Aot)?;
+    let id = NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let destination = cache_root().join("run").join(format!(
+        "bamts-run-{}-{id}{}",
+        std::process::id(),
+        std::env::consts::EXE_SUFFIX
+    ));
+    link_executable(&object.bytes, &destination)?;
+    let output = Command::new(&destination).args(&args.program_args).output();
+    let _ = fs::remove_file(&destination);
+    let output = output.map_err(|source| DriverError::LinkStart {
+        program: destination.into_os_string(),
+        source,
+    })?;
+    let mut stderr = warnings.into_bytes();
+    stderr.extend_from_slice(&output.stderr);
+    Ok(CommandOutcome {
+        stdout: output.stdout,
+        stderr,
+        exit_code: output.status.code().unwrap_or(1),
     })
 }
 
@@ -716,17 +738,16 @@ fn load_program_frontend(args: &CliArgs) -> Result<LoadedProgramFrontend, Driver
             path: absolute_entrypoint,
             source,
         })?;
-    let root_path = discover_project_root(&absolute_entrypoint).unwrap_or_else(|| {
-        if absolute_entrypoint.starts_with(&current_directory) {
-            current_directory
-        } else {
-            absolute_entrypoint
-                .parent()
-                .unwrap_or_else(|| Path::new("/"))
-                .to_path_buf()
-        }
-    });
-    let canonical_root = fs::canonicalize(&root_path)
+    let fallback_root = if absolute_entrypoint.starts_with(&current_directory) {
+        current_directory
+    } else {
+        absolute_entrypoint
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .to_path_buf()
+    };
+    let project = discover_project(&absolute_entrypoint, fallback_root);
+    let canonical_root = fs::canonicalize(project.root())
         .map_err(|error| DriverError::ProgramLoad(ProgramLoadError::InvalidRoot(error)))?;
     let root = ProjectRoot::new(canonical_root).map_err(|error| {
         DriverError::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(
@@ -734,8 +755,7 @@ fn load_program_frontend(args: &CliArgs) -> Result<LoadedProgramFrontend, Driver
             error,
         )))
     })?;
-    let config_path = project_config_path(&absolute_entrypoint, root.path())
-        .unwrap_or_else(|| root.path().join("tsconfig.json"));
+    let config_path = project.config().to_owned();
     let config_source = if config_path.is_file() {
         fs::read_to_string(&config_path).map_err(|source| DriverError::ReadSource {
             path: config_path.clone(),
@@ -754,26 +774,9 @@ fn load_program_frontend(args: &CliArgs) -> Result<LoadedProgramFrontend, Driver
     let program = loader
         .load(&absolute_entrypoint)
         .map_err(DriverError::ProgramLoad)?;
-    let levels = levels(args)?;
+    let levels = levels(args, root.path())?;
     let output = compile_program_frontend_with_lints(&program, FrontendMode::Check, &levels);
     Ok(LoadedProgramFrontend { program, output })
-}
-
-fn discover_project_root(entrypoint: &Path) -> Option<PathBuf> {
-    let ancestors = || entrypoint.parent().into_iter().flat_map(Path::ancestors);
-    ancestors()
-        .find(|directory| directory.join("bamts.toml").is_file())
-        .or_else(|| ancestors().find(|directory| directory.join("tsconfig.json").is_file()))
-        .map(Path::to_path_buf)
-}
-
-fn project_config_path(entrypoint: &Path, root: &Path) -> Option<PathBuf> {
-    entrypoint
-        .parent()?
-        .ancestors()
-        .take_while(|directory| directory.starts_with(root))
-        .map(|directory| directory.join("tsconfig.json"))
-        .find(|path| path.is_file())
 }
 
 fn render_program_diagnostics(args: &CliArgs, frontend: &LoadedProgramFrontend) -> String {
@@ -827,11 +830,13 @@ fn require_clean_frontend(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use bamts_compiler::lint::{LintLevel, SourceDialect, rule_by_name};
 
     use crate::args::{ArgsError, parse_args};
 
-    use super::{DriverError, content_hash, levels, probe_toolchain};
+    use super::{DriverError, content_hash, levels, lower_options, probe_toolchain};
 
     #[test]
     fn content_hash_is_stable_and_sensitive() {
@@ -869,7 +874,8 @@ mod tests {
             "main.ts",
         ])
         .expect("arguments parse");
-        let table = levels(&args).expect("overrides resolve");
+        let table =
+            levels(&args, Path::new("/definitely/no/bamts/config")).expect("overrides resolve");
         let explicit_any = rule_by_name("explicit-any").expect("registered rule").id();
         let implicit_any = rule_by_name("implicit-any").expect("registered rule").id();
         assert_eq!(table.level(explicit_any), LintLevel::Allow);
@@ -888,15 +894,26 @@ mod tests {
         ])
         .expect("arguments parse");
         assert!(matches!(
-            levels(&args),
+            levels(&args, Path::new("/definitely/no/bamts/config")),
             Err(DriverError::Usage(ArgsError::ForbiddenLintOverride { .. }))
         ));
     }
 
     #[test]
+    fn lowering_options_follow_javascript_compatibility_selection() {
+        let disabled = parse_args(["compile", "main.ts"]).expect("arguments parse");
+        let enabled =
+            parse_args(["compile", "--compat", "strict", "main.ts"]).expect("arguments parse");
+
+        assert!(!lower_options(&disabled).javascript_compatibility);
+        assert!(lower_options(&enabled).javascript_compatibility);
+    }
+
+    #[test]
     fn strict_cli_profile_keeps_javascript_rules_nonfatal() {
         let args = parse_args(["check", "--strict", "vendored.js"]).expect("arguments parse");
-        let table = levels(&args).expect("profile resolves");
+        let table =
+            levels(&args, Path::new("/definitely/no/bamts/config")).expect("profile resolves");
         let footgun = rule_by_name("invalid-number-formatting-options")
             .expect("registered footgun")
             .id();
@@ -909,6 +926,33 @@ mod tests {
             table.level_for_source(typescript_only, SourceDialect::JavaScript),
             LintLevel::Allow
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_entrypoint_uses_one_canonical_config_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let directory =
+            std::env::temp_dir().join(format!("bamts-cli-symlink-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let real = directory.join("real");
+        let alias = directory.join("alias");
+        std::fs::create_dir_all(real.join("src"))?;
+        std::fs::create_dir_all(&alias)?;
+        std::fs::write(real.join("bamts.toml"), "")?;
+        std::fs::write(real.join("src/main.ts"), "let answer = 42;")?;
+        std::fs::write(alias.join("bamts.toml"), "this is not valid TOML = [")?;
+        symlink(real.join("src/main.ts"), alias.join("main.ts"))?;
+
+        let alias_entrypoint = alias.join("main.ts");
+        let args = parse_args(["check", alias_entrypoint.to_str().expect("UTF-8 temp path")])?;
+        let outcome = super::execute(&args)?;
+        assert_eq!(outcome.exit_code, 0);
+
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
     }
 
     #[test]

@@ -41,11 +41,9 @@ fn constructor<H: Host>(
     if !constructing {
         return Err(type_error("Uint8Array constructor requires 'new'"));
     }
-    let (length, values, preflighted) = match args.first().copied() {
-        None | Some(Value::UNDEFINED) => (0, None, false),
-        Some(source) if !machine.is_object(source) => {
-            (typed_array_length(machine, source)?, None, false)
-        }
+    let (length, values) = match args.first().copied() {
+        None | Some(Value::UNDEFINED) => (0, None),
+        Some(source) if !machine.is_object(source) => (typed_array_length(machine, source)?, None),
         Some(source) => {
             let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
             let iterator_key = machine.to_property_key(iterator_symbol)?;
@@ -53,50 +51,17 @@ fn constructor<H: Host>(
             match iterator_method.decode() {
                 Some(Decoded::Undefined | Decoded::Null) => {
                     let values = array_like_values(machine, source)?;
-                    (values.len(), Some(values), true)
+                    (values.len(), Some(values))
                 }
                 _ if machine.is_callable(iterator_method)? => {
                     let values = machine.iterable_values(source)?;
-                    (values.len(), Some(values), false)
+                    (values.len(), Some(values))
                 }
                 _ => return Err(type_error("value is not iterable")),
             }
         }
     };
-    if !preflighted {
-        machine
-            .ensure_object_property_capacity(uint8array_property_bytes(machine, length)?)
-            .map_err(EvalFailure::Runtime)?;
-    }
     let mut properties = PropertyMap::default();
-    match values {
-        Some(values) => {
-            for (index, value) in values.into_iter().enumerate() {
-                properties.insert(
-                    PropertyKey::Named(EcmaString::from_utf8(&index.to_string())),
-                    Property::Data {
-                        value: Value::int32(u32::from(to_uint8(machine, value)?)),
-                        writable: true,
-                        enumerable: true,
-                        configurable: true,
-                    },
-                );
-            }
-        }
-        None => {
-            for index in 0..length {
-                properties.insert(
-                    PropertyKey::Named(EcmaString::from_utf8(&index.to_string())),
-                    Property::Data {
-                        value: Value::int32(0),
-                        writable: true,
-                        enumerable: true,
-                        configurable: true,
-                    },
-                );
-            }
-        }
-    }
     properties.insert(
         PropertyKey::Named(EcmaString::from_utf8("length")),
         Property::Data {
@@ -106,13 +71,35 @@ fn constructor<H: Host>(
             configurable: false,
         },
     );
+    machine
+        .ensure_allocation_capacity(
+            1,
+            length
+                .saturating_add(properties.charge_bytes())
+                .saturating_add(1),
+        )
+        .map_err(EvalFailure::Runtime)?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(length).map_err(|_| {
+        EvalFailure::Runtime(crate::RuntimeErrorKind::HeapByteLimitExceeded {
+            limit: machine.limits.max_heap_bytes,
+        })
+    })?;
+    match values {
+        Some(values) => {
+            for value in values {
+                bytes.push(to_uint8(machine, value)?);
+            }
+        }
+        None => bytes.resize(length, 0),
+    }
     let prototype = constructor_prototype(machine)?;
     let value = machine
-        .allocate(HeapEntry::Object {
+        .allocate(HeapEntry::Uint8Array {
+            bytes,
             properties,
             prototype: Some(prototype),
             extensible: true,
-            boxed_primitive: None,
         })
         .map_err(EvalFailure::Runtime)?;
     Ok(BuiltinOutcome::Value(value))
@@ -138,7 +125,7 @@ fn array_like_values<H: Host>(
     let length_value = machine.get_named_property(source, "length")?;
     let length = array_like_length(machine, length_value)?;
     machine
-        .ensure_object_property_capacity(uint8array_property_bytes(machine, length)?)
+        .ensure_object_property_capacity(length)
         .map_err(EvalFailure::Runtime)?;
     let mut values = Vec::with_capacity(length);
     for index in 0..length {
@@ -164,40 +151,11 @@ fn array_like_length<H: Host>(
     }
     Ok(length as usize)
 }
-fn uint8array_property_bytes<H: Host>(
-    machine: &Machine<'_, H>,
-    length: usize,
-) -> Result<usize, EvalFailure> {
-    let failure = || {
-        EvalFailure::Runtime(crate::RuntimeErrorKind::HeapByteLimitExceeded {
-            limit: machine.limits.max_heap_bytes,
-        })
-    };
-    let mut bytes = 20usize;
-    let mut covered = 0usize;
-    let mut next = 10usize;
-    let mut units = 1usize;
-    while covered < length {
-        let end = length.min(next);
-        let count = end - covered;
-        let key_bytes = units
-            .checked_mul(2)
-            .and_then(|bytes| bytes.checked_add(8))
-            .ok_or_else(&failure)?;
-        bytes = bytes
-            .checked_add(count.checked_mul(key_bytes).ok_or_else(&failure)?)
-            .ok_or_else(&failure)?;
-        if end == length {
-            break;
-        }
-        covered = end;
-        next = next.saturating_mul(10);
-        units = units.checked_add(1).ok_or_else(&failure)?;
-    }
-    Ok(bytes)
-}
 
-fn to_uint8<H: Host>(machine: &mut Machine<'_, H>, value: Value) -> Result<u8, EvalFailure> {
+pub(crate) fn to_uint8<H: Host>(
+    machine: &mut Machine<'_, H>,
+    value: Value,
+) -> Result<u8, EvalFailure> {
     let number = match machine.coerce_number_observable(value)?.decode() {
         Some(Decoded::Int32(value)) => f64::from(value as i32),
         Some(Decoded::Number(value)) => value,
@@ -225,39 +183,31 @@ fn join<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let prototype = constructor_prototype(machine)?;
-    if !machine.inherits_from_prototype(this, prototype)? {
+    let Some(slot) = machine.runtime_slot(this).map_err(EvalFailure::Runtime)? else {
+        return Err(type_error(
+            "Uint8Array.prototype.join called on incompatible receiver",
+        ));
+    };
+    if !matches!(machine.heap[slot], HeapEntry::Uint8Array { .. }) {
         return Err(type_error(
             "Uint8Array.prototype.join called on incompatible receiver",
         ));
     }
-    let length = machine.get_named_property(this, "length")?;
-    let length = match length.decode() {
-        Some(Decoded::Int32(value)) => value as usize,
-        Some(Decoded::Number(value)) if value.is_finite() && value >= 0.0 => value as usize,
-        _ => {
-            return Err(type_error(
-                "Uint8Array.prototype.join called on incompatible receiver",
-            ));
-        }
-    };
     let separator = match args.first().copied() {
         None | Some(Value::UNDEFINED) => EcmaString::from_utf8(","),
         Some(value) => machine.coerce_string_observable(value)?,
     };
+    let HeapEntry::Uint8Array { bytes, .. } = &machine.heap[slot] else {
+        unreachable!("Uint8Array brand was checked")
+    };
     let mut output = EcmaStringBuilder::new();
-    for index in 0..length {
+    for (index, byte) in bytes.iter().copied().enumerate() {
         if index != 0 {
             for &unit in separator.as_units() {
                 output.push_unit(unit);
             }
         }
-        let value = machine.get_named_property(this, &index.to_string())?;
-        if !matches!(value.decode(), Some(Decoded::Undefined | Decoded::Null)) {
-            for &unit in machine.coerce_string_observable(value)?.as_units() {
-                output.push_unit(unit);
-            }
-        }
+        output.push_utf8(&byte.to_string());
     }
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
@@ -287,50 +237,13 @@ fn constructor_prototype<H: Host>(machine: &Machine<'_, H>) -> Result<Value, Eva
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use bamts_bytecode::{
-        Constant, ConstantId, Function, FunctionFlags, FunctionId, Instruction, Module, ModuleId,
-        Program, ProgramModule, Verified,
-    };
-
+    use super::super::test_support::{TestHost, blank_program, ordinary_object};
     use super::*;
     use crate::intrinsics::{BuiltinDef, native_function};
     use crate::{Limits, NativeCallable, PropertyMap, ThrowOrigin};
 
     static NEXT_CALLS: AtomicUsize = AtomicUsize::new(0);
     static ITERATION_COMPLETE: AtomicBool = AtomicBool::new(false);
-
-    #[derive(Default)]
-    struct TestHost;
-    impl Host for TestHost {}
-
-    fn module() -> Program<Verified> {
-        let code = Module::new(
-            vec![Constant::String(EcmaString::from_utf8("<test>"))],
-            vec![Function::new(
-                None,
-                0,
-                0,
-                1,
-                FunctionFlags::default(),
-                vec![Instruction::Halt],
-                Vec::new(),
-            )],
-            FunctionId::new(0),
-        )
-        .verify()
-        .expect("valid test module");
-        Program::link(
-            vec![ProgramModule {
-                name: ConstantId::new(0),
-                code,
-                edges: Vec::new(),
-                bindings: Vec::new(),
-                exports: Vec::new(),
-            }],
-            ModuleId::new(0),
-        )
-        .expect("valid test program")
-    }
 
     fn native(
         machine: &mut Machine<'_, TestHost>,
@@ -343,17 +256,6 @@ mod tests {
             handler,
         });
         native_function(&mut machine.heap, id, name, 0)
-    }
-
-    fn object(machine: &mut Machine<'_, TestHost>) -> Value {
-        machine
-            .allocate(HeapEntry::Object {
-                properties: PropertyMap::default(),
-                prototype: Some(machine.intrinsics.object_prototype),
-                extensible: true,
-                boxed_primitive: None,
-            })
-            .expect("object allocation succeeds")
     }
 
     fn iterator_method(
@@ -375,7 +277,7 @@ mod tests {
         if done {
             ITERATION_COMPLETE.store(true, Ordering::SeqCst);
         }
-        let result = object(machine);
+        let result = ordinary_object(machine);
         machine.set_data_property(result, "done", Value::boolean(done))?;
         if !done {
             machine.set_data_property(result, "value", this)?;
@@ -390,7 +292,7 @@ mod tests {
         _: bool,
     ) -> Result<BuiltinOutcome, EvalFailure> {
         let done = machine.get_named_property(this, "_done")?;
-        let result = object(machine);
+        let result = ordinary_object(machine);
         if machine.truthy(done) {
             machine.set_data_property(result, "done", Value::TRUE)?;
         } else {
@@ -443,10 +345,10 @@ mod tests {
     fn uint8array_collects_before_coercion_and_exposes_bounded_surface() {
         NEXT_CALLS.store(0, Ordering::SeqCst);
         ITERATION_COMPLETE.store(false, Ordering::SeqCst);
-        let program = module();
+        let program = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&program, &mut host, Limits::default());
-        let source = object(&mut machine);
+        let source = ordinary_object(&mut machine);
         let iterator = native(&mut machine, "[Symbol.iterator]", iterator_method);
         let next = native(&mut machine, "next", iterator_next);
         let value_of = native(&mut machine, "valueOf", value_of);
@@ -483,7 +385,7 @@ mod tests {
                 .is_some_and(|text| text.eq_ascii("1"))
         );
 
-        let element = object(&mut machine);
+        let element = ordinary_object(&mut machine);
         machine
             .set_data_property(element, "valueOf", value_of)
             .expect("valueOf install succeeds");
@@ -525,7 +427,7 @@ mod tests {
             machine.call_value(is_array, array, &[typed]).unwrap(),
             Value::FALSE
         );
-        let plain = object(&mut machine);
+        let plain = ordinary_object(&mut machine);
         machine
             .set_data_property(plain, "length", Value::int32(1))
             .unwrap();
@@ -582,7 +484,7 @@ mod tests {
     }
 
     fn with_machine(f: impl FnOnce(&mut Machine<'_, TestHost>)) {
-        let program = module();
+        let program = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&program, &mut host, Limits::default());
         f(&mut machine);
@@ -591,7 +493,7 @@ mod tests {
     #[test]
     fn uint8array_noniterable_objects_use_array_like_values() {
         with_machine(|machine| {
-            let plain = object(machine);
+            let plain = ordinary_object(machine);
             machine
                 .set_data_property(plain, "0", Value::int32(7))
                 .unwrap();
@@ -601,10 +503,10 @@ mod tests {
             let typed = construct(machine, plain);
             assert_eq!(int(machine, typed, "length"), 1);
             assert_eq!(int(machine, typed, "0"), 7);
-            let source = object(machine);
+            let source = ordinary_object(machine);
             let boxed_like = construct(machine, source);
             assert_eq!(int(machine, boxed_like, "length"), 0);
-            let nullish = object(machine);
+            let nullish = ordinary_object(machine);
             machine
                 .set_data_property(nullish, "0", Value::int32(8))
                 .unwrap();
@@ -624,7 +526,7 @@ mod tests {
     #[test]
     fn uint8array_iterators_take_precedence_and_noncallables_throw() {
         with_machine(|machine| {
-            let source = object(machine);
+            let source = ordinary_object(machine);
             machine
                 .set_data_property(source, "0", Value::int32(7))
                 .unwrap();
@@ -648,7 +550,7 @@ mod tests {
             machine.set_data_property(source, "next", next).unwrap();
             let typed = construct(machine, source);
             assert_eq!(int(machine, typed, "0"), 9);
-            let noncallable = object(machine);
+            let noncallable = ordinary_object(machine);
             let iterator_key = machine
                 .to_property_key(machine.intrinsics.builtins.symbol_iterator())
                 .unwrap();
@@ -662,19 +564,17 @@ mod tests {
         });
     }
     #[test]
-    fn uint8array_preflights_complete_property_storage() {
-        let program = module();
+    fn uint8array_preflights_dedicated_backing_storage() {
+        let program = blank_program("<test>");
         let mut host = TestHost;
-        let mut machine = Machine::new(
-            &program,
-            &mut host,
-            Limits {
-                max_heap_bytes: 30,
-                ..Limits::default()
-            },
-        );
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let initial_bytes = machine.heap_bytes;
+        try_construct(&mut machine, Value::int32(0)).unwrap();
+        let base_charge = machine.heap_bytes - initial_bytes;
         let slots = machine.heap.len();
         let bytes = machine.heap_bytes;
+
+        machine.limits.max_heap_bytes = bytes + base_charge;
         assert!(matches!(
             try_construct(&mut machine, Value::int32(1)),
             Err(EvalFailure::Runtime(
@@ -683,6 +583,10 @@ mod tests {
         ));
         assert_eq!(machine.heap.len(), slots);
         assert_eq!(machine.heap_bytes, bytes);
+
+        machine.limits.max_heap_bytes = bytes + base_charge + 1;
+        try_construct(&mut machine, Value::int32(1)).unwrap();
+        assert_eq!(machine.heap_bytes, bytes + base_charge + 1);
     }
     #[test]
     fn uint8array_length_construction_creates_zero_bytes() {

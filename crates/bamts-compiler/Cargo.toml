@@ -3,13 +3,13 @@ name = "bamts-compiler"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-publish.workspace = true
+publish = true
 license.workspace = true
 repository.workspace = true
 description = "TypeScript/JavaScript compiler frontend for BamTS"
 
 [dependencies]
-bamts-bytecode = { path = "../bamts-bytecode", version = "0.1.0" }
+bamts-bytecode.workspace = true
 
 [lints]
 workspace = true

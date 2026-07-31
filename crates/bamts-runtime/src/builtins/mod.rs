@@ -19,8 +19,13 @@ mod regexp;
 pub(crate) use regexp::canonical_source;
 mod string;
 mod symbol;
+#[cfg(test)]
+mod test_support;
 mod timers;
 mod uint8array;
+
+pub(crate) use collections::ordinary_runtime;
+pub(crate) use uint8array::to_uint8;
 
 pub(crate) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -783,6 +788,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 extensible,
                 ..
             }
+            | HeapEntry::Uint8Array {
+                properties,
+                extensible,
+                ..
+            }
             | HeapEntry::Timeout {
                 properties,
                 extensible,
@@ -857,6 +867,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 ..
             }
             | HeapEntry::Collection {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::Uint8Array {
                 properties,
                 extensible,
                 ..
@@ -936,6 +951,23 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 return Ok(None);
             }
+            HeapEntry::Uint8Array {
+                bytes, properties, ..
+            } => {
+                if let PropertyKey::Named(name) = key
+                    && let Some(typed_index) = crate::uint8array_index(name)
+                {
+                    return Ok(typed_index
+                        .and_then(|offset| bytes.get(offset))
+                        .map(|byte| Property::Data {
+                            value: Value::int32(u32::from(*byte)),
+                            writable: true,
+                            enumerable: true,
+                            configurable: true,
+                        }));
+                }
+                properties
+            }
             HeapEntry::Object { properties, .. }
             | HeapEntry::Function { properties, .. }
             | HeapEntry::Script { properties, .. }
@@ -959,6 +991,27 @@ impl<'a, H: Host> Machine<'a, H> {
         let Some(index) = self.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
             return Err(type_error("Object.defineProperty called on non-object"));
         };
+        if let PropertyKey::Named(name) = &key
+            && let Some(typed_index) = crate::uint8array_index(name)
+            && let HeapEntry::Uint8Array { bytes, .. } = &self.heap[index]
+        {
+            let Some(offset) = typed_index else {
+                return Err(type_error("Invalid typed array index descriptor"));
+            };
+            if offset >= bytes.len() {
+                return Err(type_error("Invalid typed array index descriptor"));
+            }
+            let Property::Data {
+                value,
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            } = descriptor
+            else {
+                return Err(type_error("Invalid typed array index descriptor"));
+            };
+            return self.set_data_property_key(object, key, value);
+        }
         if matches!(&key, PropertyKey::Named(name) if name.eq_ascii("length"))
             && matches!(self.heap[index], HeapEntry::Array { .. })
         {
@@ -1033,6 +1086,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 extensible,
                 ..
             }
+            | HeapEntry::Uint8Array {
+                properties,
+                extensible,
+                ..
+            }
             | HeapEntry::Timeout {
                 properties,
                 extensible,
@@ -1096,47 +1154,9 @@ impl<'a, H: Host> Machine<'a, H> {
 
 #[cfg(test)]
 mod tests {
-    use bamts_bytecode::{
-        Constant, ConstantId, Function, FunctionFlags, FunctionId, Instruction, Module, ModuleId,
-        Program, ProgramModule, Verified,
-    };
-
+    use super::test_support::{TestHost, blank_program};
     use super::*;
     use crate::Limits;
-
-    #[derive(Default)]
-    struct TestHost;
-
-    impl Host for TestHost {}
-
-    fn module() -> Program<Verified> {
-        let code = Module::new(
-            vec![Constant::String(EcmaString::from_utf8("<test>"))],
-            vec![Function::new(
-                None,
-                0,
-                0,
-                1,
-                FunctionFlags::default(),
-                vec![Instruction::Halt],
-                Vec::new(),
-            )],
-            FunctionId::new(0),
-        )
-        .verify()
-        .expect("valid test module");
-        Program::link(
-            vec![ProgramModule {
-                name: ConstantId::new(0),
-                code,
-                edges: Vec::new(),
-                bindings: Vec::new(),
-                exports: Vec::new(),
-            }],
-            ModuleId::new(0),
-        )
-        .expect("valid test program")
-    }
 
     fn inherited_message_getter<H: Host>(
         _machine: &mut Machine<'_, H>,
@@ -1151,7 +1171,7 @@ mod tests {
 
     #[test]
     fn valita_style_message_getter_does_not_run_before_private_issue_field() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let getter = install_function(
@@ -1250,7 +1270,7 @@ mod tests {
 
     #[test]
     fn global_infinity_descriptor_is_frozen_with_exact_value() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let machine = Machine::new(&module, &mut host, Limits::default());
         let global_this = machine
@@ -1283,7 +1303,7 @@ mod tests {
 
     #[test]
     fn global_nan_descriptor_is_frozen_with_exact_value() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let machine = Machine::new(&module, &mut host, Limits::default());
         let global_this = machine
@@ -1313,7 +1333,7 @@ mod tests {
 
     #[test]
     fn global_infinity_and_nan_are_stable_across_reads() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let global_this = machine
@@ -1341,7 +1361,7 @@ mod tests {
 
     #[test]
     fn atomics_is_an_object_with_correct_to_string_tag() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let atomics = machine
@@ -1362,7 +1382,7 @@ mod tests {
 
     #[test]
     fn atomics_to_string_tag_descriptor_matches_namespace_tag() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let machine = Machine::new(&module, &mut host, Limits::default());
         let atomics = machine
@@ -1399,7 +1419,7 @@ mod tests {
 
     #[test]
     fn atomics_global_binding_is_writable_and_configurable() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let machine = Machine::new(&module, &mut host, Limits::default());
         let global_this = machine
@@ -1419,10 +1439,7 @@ mod tests {
                 ..
             } => {
                 assert!(writable, "Atomics global binding must be writable");
-                assert!(
-                    enumerable,
-                    "Atomics global binding follows normal put_ecma semantics"
-                );
+                assert!(!enumerable, "Atomics global binding must be non-enumerable");
                 assert!(configurable, "Atomics global binding must be configurable");
             }
             Property::Accessor { .. } => panic!("Atomics global binding must be a data property"),
@@ -1431,7 +1448,7 @@ mod tests {
 
     #[test]
     fn atomics_claims_no_methods() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let machine = Machine::new(&module, &mut host, Limits::default());
         let atomics = machine
@@ -1449,5 +1466,33 @@ mod tests {
             method_keys.is_empty(),
             "Atomics must not claim any named methods"
         );
+    }
+
+    #[test]
+    fn copied_globals_are_non_enumerable_and_still_readable() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let global_this = machine
+            .intrinsics
+            .global("globalThis")
+            .expect("globalThis is installed");
+        assert!(
+            machine.enumerable_keys(global_this).unwrap().is_empty(),
+            "fresh globalThis must not expose any copied globals to Object.keys/for...in"
+        );
+        for name in [
+            "Atomics",
+            "console",
+            "process",
+            "Object",
+            "globalThis",
+            "global",
+        ] {
+            assert!(
+                machine.get_named_property(global_this, name).is_ok(),
+                "{name} must still be directly accessible on globalThis"
+            );
+        }
     }
 }

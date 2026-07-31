@@ -7,6 +7,16 @@ use super::{allocate_array, allocate_string, define_data, install_function, type
 use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyKey, PropertyMap};
 
+// JSON input and callbacks are untrusted; stop recursive Rust traversal well
+// before stack exhaustion.
+const MAX_JSON_DEPTH: usize = 256;
+
+fn json_depth_error() -> EvalFailure {
+    EvalFailure::Runtime(crate::RuntimeErrorKind::CallDepthExceeded {
+        limit: MAX_JSON_DEPTH,
+    })
+}
+
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -35,21 +45,24 @@ fn parse<H: Host>(
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let source = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-    let value = Parser::new(source.as_units())
-        .parse(machine)
-        .map_err(|message| {
+    let value = match Parser::new(source.as_units()).parse(machine) {
+        Ok(value) => value,
+        Err(ParseFailure::Runtime(error)) => return Err(error),
+        Err(ParseFailure::Syntax(message)) => {
             let id = machine
                 .intrinsics
                 .builtins
                 .id_named("SyntaxError")
                 .expect("SyntaxError installed");
-            machine.throw_error(id, message)
-        })?;
-    if let Some(reviver) = args
-        .get(1)
-        .copied()
-        .filter(|value| machine.is_callable(*value).unwrap_or(false))
-    {
+            return Err(machine.throw_error(id, message));
+        }
+    };
+    let reviver = if let Some(value) = args.get(1).copied() {
+        machine.is_callable(value)?.then_some(value)
+    } else {
+        None
+    };
+    if let Some(reviver) = reviver {
         let root = machine
             .allocate(HeapEntry::Object {
                 properties: PropertyMap::default(),
@@ -61,7 +74,7 @@ fn parse<H: Host>(
         let key = EcmaString::default();
         machine.set_data_property_key(root, PropertyKey::Named(key.clone()), value)?;
         return Ok(BuiltinOutcome::Value(walk_reviver(
-            machine, root, key, reviver,
+            machine, root, key, reviver, 0,
         )?));
     }
     Ok(BuiltinOutcome::Value(value))
@@ -72,13 +85,17 @@ fn walk_reviver<H: Host>(
     holder: Value,
     key: EcmaString,
     reviver: Value,
+    depth: usize,
 ) -> Result<Value, EvalFailure> {
     let property_key = PropertyKey::Named(key.clone());
     let value = machine.get_property_key(holder, &property_key)?;
     if let Some(elements) = machine.array_elements(value)? {
+        if depth >= MAX_JSON_DEPTH {
+            return Err(json_depth_error());
+        }
         for index in 0..elements.len() {
             let name = EcmaString::from_utf8(&index.to_string());
-            let child = walk_reviver(machine, value, name.clone(), reviver)?;
+            let child = walk_reviver(machine, value, name.clone(), reviver, depth + 1)?;
             let key = PropertyKey::Named(name);
             if child == Value::UNDEFINED {
                 machine.delete_property(value, &key)?;
@@ -87,8 +104,11 @@ fn walk_reviver<H: Host>(
             }
         }
     } else if machine.is_object(value) {
+        if depth >= MAX_JSON_DEPTH {
+            return Err(json_depth_error());
+        }
         for name in machine.enumerable_keys(value)? {
-            let child = walk_reviver(machine, value, name.clone(), reviver)?;
+            let child = walk_reviver(machine, value, name.clone(), reviver, depth + 1)?;
             let key = PropertyKey::Named(name);
             if child == Value::UNDEFINED {
                 machine.delete_property(value, &key)?;
@@ -123,28 +143,36 @@ fn stringify<H: Host>(
         Some(Decoded::HeapRef(_)) => {
             let text = machine.to_string(machine.unbox_primitive_or_self(space)?)?;
             text.slice_units(0..text.len_units().min(10))
+                .expect("range is bounded by the string length")
         }
         _ => EcmaString::default(),
     };
-    let property_list = if let Some(values) =
-        replacer.and_then(|value| machine.array_elements(value).ok().flatten())
-    {
-        let mut seen = BTreeSet::new();
-        Some(
-            values
-                .into_iter()
-                .filter_map(|value| match value.decode() {
-                    Some(Decoded::Int32(_) | Decoded::Number(_)) => machine.to_string(value).ok(),
+    let property_list = if let Some(replacer) = replacer {
+        if let Some(values) = machine.array_elements(replacer)? {
+            let mut seen = BTreeSet::new();
+            let mut keys = Vec::new();
+            for value in values {
+                let key = match value.decode() {
+                    Some(Decoded::Int32(_) | Decoded::Number(_)) => Some(machine.to_string(value)?),
                     Some(Decoded::HeapRef(_)) => machine.string_value(value),
                     _ => None,
-                })
-                .filter(|text| seen.insert(text.clone()))
-                .collect::<Vec<_>>(),
-        )
+                };
+                if let Some(key) = key.filter(|key| seen.insert(key.clone())) {
+                    keys.push(key);
+                }
+            }
+            Some(keys)
+        } else {
+            None
+        }
     } else {
         None
     };
-    let callable_replacer = replacer.filter(|value| machine.is_callable(*value).unwrap_or(false));
+    let callable_replacer = if let Some(value) = replacer {
+        machine.is_callable(value)?.then_some(value)
+    } else {
+        None
+    };
     let wrapper = machine
         .allocate(HeapEntry::Object {
             properties: PropertyMap::default(),
@@ -182,6 +210,9 @@ fn serialize_property<H: Host>(
     depth: usize,
     stack: &mut Vec<Value>,
 ) -> Result<Option<EcmaString>, EvalFailure> {
+    if depth >= MAX_JSON_DEPTH {
+        return Err(json_depth_error());
+    }
     let mut value = machine.get_property_key(holder, &PropertyKey::Named(key.clone()))?;
     if machine.is_object(value) {
         let to_json = machine.get_named_property(value, "toJSON")?;
@@ -381,17 +412,24 @@ struct Parser<'a> {
     pos: usize,
 }
 
+enum ParseFailure {
+    Syntax(String),
+    Runtime(EvalFailure),
+}
+
+type ParseResult<T> = Result<T, ParseFailure>;
+
 impl<'a> Parser<'a> {
     fn new(source: &'a [u16]) -> Self {
         Self { source, pos: 0 }
     }
 
-    fn parse<H: Host>(mut self, machine: &mut Machine<'_, H>) -> Result<Value, String> {
+    fn parse<H: Host>(mut self, machine: &mut Machine<'_, H>) -> ParseResult<Value> {
         self.ws();
-        let value = self.value(machine)?;
+        let value = self.value(machine, 0)?;
         self.ws();
         if self.pos != self.source.len() {
-            return Err(self.error_unexpected());
+            return Err(ParseFailure::Syntax(self.error_unexpected()));
         }
         Ok(value)
     }
@@ -409,7 +447,7 @@ impl<'a> Parser<'a> {
         self.source.get(self.pos).copied()
     }
 
-    fn value<H: Host>(&mut self, machine: &mut Machine<'_, H>) -> Result<Value, String> {
+    fn value<H: Host>(&mut self, machine: &mut Machine<'_, H>, depth: usize) -> ParseResult<Value> {
         self.ws();
         match self.peek() {
             Some(unit) if unit == u16::from(b'n') => {
@@ -426,21 +464,21 @@ impl<'a> Parser<'a> {
             }
             Some(unit) if unit == u16::from(b'"') => {
                 let string = self.string()?;
-                allocate_string(machine, string).map_err(|_| "Out of memory".to_owned())
+                allocate_string(machine, string).map_err(ParseFailure::Runtime)
             }
-            Some(unit) if unit == u16::from(b'[') => self.array(machine),
-            Some(unit) if unit == u16::from(b'{') => self.object(machine),
+            Some(unit) if unit == u16::from(b'[') => self.array(machine, depth),
+            Some(unit) if unit == u16::from(b'{') => self.object(machine, depth),
             Some(unit)
                 if unit == u16::from(b'-')
                     || (u16::from(b'0')..=u16::from(b'9')).contains(&unit) =>
             {
                 self.number()
             }
-            _ => Err(self.error_unexpected()),
+            _ => Err(ParseFailure::Syntax(self.error_unexpected())),
         }
     }
 
-    fn literal(&mut self, literal: &str) -> Result<(), String> {
+    fn literal(&mut self, literal: &str) -> ParseResult<()> {
         let matches = self.source[self.pos..]
             .iter()
             .zip(literal.bytes())
@@ -450,16 +488,16 @@ impl<'a> Parser<'a> {
             self.pos += literal.len();
             Ok(())
         } else {
-            Err(self.error_unexpected())
+            Err(ParseFailure::Syntax(self.error_unexpected()))
         }
     }
 
-    fn string(&mut self) -> Result<EcmaString, String> {
+    fn string(&mut self) -> ParseResult<EcmaString> {
         self.pos += 1;
         let mut output = EcmaStringBuilder::new();
         loop {
             let Some(unit) = self.peek() else {
-                return Err(self.at("Unterminated string in JSON"));
+                return Err(ParseFailure::Syntax(self.at("Unterminated string in JSON")));
             };
             self.pos += 1;
             if unit == u16::from(b'"') {
@@ -467,7 +505,7 @@ impl<'a> Parser<'a> {
             }
             if unit == u16::from(b'\\') {
                 let Some(escape) = self.peek() else {
-                    return Err(self.at("Unterminated string in JSON"));
+                    return Err(ParseFailure::Syntax(self.at("Unterminated string in JSON")));
                 };
                 self.pos += 1;
                 match escape {
@@ -480,19 +518,19 @@ impl<'a> Parser<'a> {
                     unit if unit == u16::from(b'r') => output.push_unit(0x000D),
                     unit if unit == u16::from(b't') => output.push_unit(0x0009),
                     unit if unit == u16::from(b'u') => output.push_unit(self.hex_unit()?),
-                    _ => return Err(self.error_unexpected()),
+                    _ => return Err(ParseFailure::Syntax(self.error_unexpected())),
                 }
             } else if unit <= 0x001F {
-                return Err(self.error_unexpected());
+                return Err(ParseFailure::Syntax(self.error_unexpected()));
             } else {
                 output.push_unit(unit);
             }
         }
     }
 
-    fn hex_unit(&mut self) -> Result<u16, String> {
+    fn hex_unit(&mut self) -> ParseResult<u16> {
         if self.pos + 4 > self.source.len() {
-            return Err(self.error_unexpected());
+            return Err(ParseFailure::Syntax(self.error_unexpected()));
         }
         let mut value = 0_u16;
         for &unit in &self.source[self.pos..self.pos + 4] {
@@ -506,7 +544,7 @@ impl<'a> Parser<'a> {
                 unit if (u16::from(b'A')..=u16::from(b'F')).contains(&unit) => {
                     unit - u16::from(b'A') + 10
                 }
-                _ => return Err(self.error_unexpected()),
+                _ => return Err(ParseFailure::Syntax(self.error_unexpected())),
             };
             value = value * 16 + digit;
         }
@@ -514,7 +552,7 @@ impl<'a> Parser<'a> {
         Ok(value)
     }
 
-    fn number(&mut self) -> Result<Value, String> {
+    fn number(&mut self) -> ParseResult<Value> {
         let start = self.pos;
         if self.peek() == Some(u16::from(b'-')) {
             self.pos += 1;
@@ -525,7 +563,7 @@ impl<'a> Parser<'a> {
                 .peek()
                 .is_some_and(|unit| (u16::from(b'0')..=u16::from(b'9')).contains(&unit))
             {
-                return Err(self.at("Unexpected number in JSON"));
+                return Err(ParseFailure::Syntax(self.at("Unexpected number in JSON")));
             }
         } else {
             self.digits()?;
@@ -554,11 +592,11 @@ impl<'a> Parser<'a> {
         let number = std::str::from_utf8(&bytes)
             .ok()
             .and_then(|text| text.parse::<f64>().ok())
-            .ok_or_else(|| self.error_unexpected())?;
+            .ok_or_else(|| ParseFailure::Syntax(self.error_unexpected()))?;
         Ok(crate::number_value(number))
     }
 
-    fn digits(&mut self) -> Result<(), String> {
+    fn digits(&mut self) -> ParseResult<()> {
         let start = self.pos;
         while self
             .peek()
@@ -568,19 +606,22 @@ impl<'a> Parser<'a> {
         }
         (self.pos != start)
             .then_some(())
-            .ok_or_else(|| self.error_unexpected())
+            .ok_or_else(|| ParseFailure::Syntax(self.error_unexpected()))
     }
 
-    fn array<H: Host>(&mut self, machine: &mut Machine<'_, H>) -> Result<Value, String> {
+    fn array<H: Host>(&mut self, machine: &mut Machine<'_, H>, depth: usize) -> ParseResult<Value> {
+        if depth >= MAX_JSON_DEPTH {
+            return Err(ParseFailure::Runtime(json_depth_error()));
+        }
         self.pos += 1;
         self.ws();
         let mut output = Vec::new();
         if self.peek() == Some(u16::from(b']')) {
             self.pos += 1;
-            return allocate_array(machine, output).map_err(|_| "Out of memory".to_owned());
+            return allocate_array(machine, output).map_err(ParseFailure::Runtime);
         }
         loop {
-            output.push(self.value(machine)?);
+            output.push(self.value(machine, depth + 1)?);
             self.ws();
             match self.peek() {
                 Some(unit) if unit == u16::from(b',') => {
@@ -591,13 +632,20 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     break;
                 }
-                _ => return Err(self.error_unexpected()),
+                _ => return Err(ParseFailure::Syntax(self.error_unexpected())),
             }
         }
-        allocate_array(machine, output).map_err(|_| "Out of memory".to_owned())
+        allocate_array(machine, output).map_err(ParseFailure::Runtime)
     }
 
-    fn object<H: Host>(&mut self, machine: &mut Machine<'_, H>) -> Result<Value, String> {
+    fn object<H: Host>(
+        &mut self,
+        machine: &mut Machine<'_, H>,
+        depth: usize,
+    ) -> ParseResult<Value> {
+        if depth >= MAX_JSON_DEPTH {
+            return Err(ParseFailure::Runtime(json_depth_error()));
+        }
         self.pos += 1;
         self.ws();
         let object = machine
@@ -607,25 +655,30 @@ impl<'a> Parser<'a> {
                 extensible: true,
                 boxed_primitive: None,
             })
-            .map_err(|_| "Out of memory".to_owned())?;
+            .map_err(EvalFailure::Runtime)
+            .map_err(ParseFailure::Runtime)?;
         if self.peek() == Some(u16::from(b'}')) {
             self.pos += 1;
             return Ok(object);
         }
         loop {
             if self.peek() != Some(u16::from(b'"')) {
-                return Err(self.at("Expected property name or '}' in JSON"));
+                return Err(ParseFailure::Syntax(
+                    self.at("Expected property name or '}' in JSON"),
+                ));
             }
             let key = self.string()?;
             self.ws();
             if self.peek() != Some(u16::from(b':')) {
-                return Err(self.at("Expected ':' after property name in JSON"));
+                return Err(ParseFailure::Syntax(
+                    self.at("Expected ':' after property name in JSON"),
+                ));
             }
             self.pos += 1;
-            let value = self.value(machine)?;
+            let value = self.value(machine, depth + 1)?;
             machine
                 .set_data_property_key(object, PropertyKey::Named(key), value)
-                .map_err(|_| "Out of memory".to_owned())?;
+                .map_err(ParseFailure::Runtime)?;
             self.ws();
             match self.peek() {
                 Some(unit) if unit == u16::from(b',') => {
@@ -636,7 +689,7 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     break;
                 }
-                _ => return Err(self.error_unexpected()),
+                _ => return Err(ParseFailure::Syntax(self.error_unexpected())),
             }
         }
         Ok(object)
@@ -673,47 +726,10 @@ impl<'a> Parser<'a> {
 
 #[cfg(test)]
 mod tests {
-    use bamts_bytecode::{
-        Constant, ConstantId, Function, FunctionFlags, FunctionId, Instruction, Module, ModuleId,
-        Program, ProgramModule, Verified,
-    };
-
+    use super::super::test_support::{TestHost, blank_program};
     use super::*;
-    use crate::Limits;
-
-    #[derive(Default)]
-    struct TestHost;
-
-    impl Host for TestHost {}
-
-    fn module() -> Program<Verified> {
-        let code = Module::new(
-            vec![Constant::String(EcmaString::from_utf8("<test>"))],
-            vec![Function::new(
-                None,
-                0,
-                0,
-                1,
-                FunctionFlags::default(),
-                vec![Instruction::Halt],
-                Vec::new(),
-            )],
-            FunctionId::new(0),
-        )
-        .verify()
-        .expect("valid test module");
-        Program::link(
-            vec![ProgramModule {
-                name: ConstantId::new(0),
-                code,
-                edges: Vec::new(),
-                bindings: Vec::new(),
-                exports: Vec::new(),
-            }],
-            ModuleId::new(0),
-        )
-        .expect("valid test program")
-    }
+    use crate::intrinsics::{BuiltinDef, BuiltinHandler, native_function};
+    use crate::{Limits, RuntimeErrorKind};
 
     fn call_json(machine: &mut Machine<'_, TestHost>, method: &str, source: EcmaString) -> Value {
         let json = machine.intrinsics.global("JSON").expect("JSON exists");
@@ -726,9 +742,41 @@ mod tests {
             .expect("JSON call succeeds")
     }
 
+    fn native(
+        machine: &mut Machine<'_, TestHost>,
+        name: &'static str,
+        handler: BuiltinHandler<TestHost>,
+    ) -> Value {
+        let id = machine.intrinsics.builtins.register(BuiltinDef {
+            name,
+            length: 2,
+            handler,
+        });
+        native_function(&mut machine.heap, id, name, 2)
+    }
+
+    fn identity_reviver(
+        _: &mut Machine<'_, TestHost>,
+        _: Value,
+        args: &[Value],
+        _: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Ok(BuiltinOutcome::Value(
+            args.get(1).copied().unwrap_or(Value::UNDEFINED),
+        ))
+    }
+
+    fn nested_array(machine: &mut Machine<'_, TestHost>, depth: usize) -> Value {
+        let mut value = Value::int32(0);
+        for _ in 0..depth {
+            value = allocate_array(machine, vec![value]).expect("array allocation succeeds");
+        }
+        value
+    }
+
     #[test]
     fn parse_ignores_non_callable_revivers() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let json = machine.intrinsics.global("JSON").expect("JSON exists");
@@ -756,7 +804,7 @@ mod tests {
 
     #[test]
     fn parse_preserves_utf16_surrogate_units() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let lone = call_json(&mut machine, "parse", EcmaString::from_utf8("\"\\uD83D\""));
@@ -773,8 +821,142 @@ mod tests {
     }
 
     #[test]
+    fn parse_uses_syntax_error_only_for_grammar_failures() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let json = machine.intrinsics.global("JSON").expect("JSON exists");
+        let parse = machine
+            .get_named_property(json, "parse")
+            .expect("JSON.parse exists");
+        let source = allocate_string(&mut machine, EcmaString::from_utf8("{]"))
+            .expect("string allocation succeeds");
+        let error = machine
+            .call_value(parse, json, &[source])
+            .expect_err("malformed JSON throws");
+        let EvalFailure::ThrowValue(value) = error else {
+            panic!("malformed JSON must throw a SyntaxError");
+        };
+        let syntax_error = machine
+            .intrinsics
+            .global("SyntaxError")
+            .expect("SyntaxError exists");
+        let prototype = machine
+            .get_named_property(syntax_error, "prototype")
+            .expect("SyntaxError.prototype exists");
+        assert!(
+            machine
+                .inherits_from_prototype(value, prototype)
+                .expect("error has a valid prototype chain")
+        );
+    }
+
+    #[test]
+    fn parse_preserves_allocation_failures_as_runtime_errors() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(
+            &module,
+            &mut host,
+            Limits {
+                max_heap_slots: 1,
+                ..Limits::default()
+            },
+        );
+        let json = machine.intrinsics.global("JSON").expect("JSON exists");
+        let parse = machine
+            .get_named_property(json, "parse")
+            .expect("JSON.parse exists");
+        let source = allocate_string(&mut machine, EcmaString::from_utf8("\"x\""))
+            .expect("input consumes the final slot");
+        assert!(matches!(
+            machine.call_value(parse, json, &[source]),
+            Err(EvalFailure::Runtime(
+                RuntimeErrorKind::HeapSlotLimitExceeded { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn nested_json_round_trips_within_the_depth_budget() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let source = format!("{}0{}", "[".repeat(16), "]".repeat(16));
+        let value = call_json(&mut machine, "parse", EcmaString::from_utf8(&source));
+        let json = machine.intrinsics.global("JSON").expect("JSON exists");
+        let stringify = machine
+            .get_named_property(json, "stringify")
+            .expect("JSON.stringify exists");
+        let output = machine
+            .call_value(stringify, json, &[value])
+            .expect("nested JSON stringifies");
+        assert!(
+            machine
+                .string_value(output)
+                .expect("string result")
+                .eq_ascii(&source)
+        );
+    }
+
+    #[test]
+    fn parser_reviver_and_stringify_bound_hostile_nesting() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let source = format!(
+            "{}0{}",
+            "[".repeat(MAX_JSON_DEPTH + 1),
+            "]".repeat(MAX_JSON_DEPTH + 1)
+        );
+        let json = machine.intrinsics.global("JSON").expect("JSON exists");
+        let parse = machine
+            .get_named_property(json, "parse")
+            .expect("JSON.parse exists");
+        let source = allocate_string(&mut machine, EcmaString::from_utf8(&source))
+            .expect("string allocation succeeds");
+        assert!(matches!(
+            machine.call_value(parse, json, &[source]),
+            Err(EvalFailure::Runtime(RuntimeErrorKind::CallDepthExceeded {
+                limit: MAX_JSON_DEPTH
+            }))
+        ));
+
+        let value = nested_array(&mut machine, MAX_JSON_DEPTH + 1);
+        let wrapper = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .expect("wrapper allocation succeeds");
+        let key = EcmaString::default();
+        machine
+            .set_data_property_key(wrapper, PropertyKey::Named(key.clone()), value)
+            .expect("wrapper property set succeeds");
+        let reviver = native(&mut machine, "identityReviver", identity_reviver);
+        assert!(matches!(
+            walk_reviver(&mut machine, wrapper, key, reviver, 0),
+            Err(EvalFailure::Runtime(RuntimeErrorKind::CallDepthExceeded {
+                limit: MAX_JSON_DEPTH
+            }))
+        ));
+
+        let stringify = machine
+            .get_named_property(json, "stringify")
+            .expect("JSON.stringify exists");
+        assert!(matches!(
+            machine.call_value(stringify, json, &[value]),
+            Err(EvalFailure::Runtime(RuntimeErrorKind::CallDepthExceeded {
+                limit: MAX_JSON_DEPTH
+            }))
+        ));
+    }
+
+    #[test]
     fn stringify_escapes_unpaired_surrogates() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let json = machine.intrinsics.global("JSON").expect("JSON exists");

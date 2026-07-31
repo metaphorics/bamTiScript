@@ -6,6 +6,7 @@ use std::fmt;
 use bamts_bytecode::{Program as BytecodeProgram, Verified};
 use bamts_native::{
     AbiError, Completion, CompletionTag, JitEntry, NativeEntryTable, NativeHelper, ShadowFrame,
+    require_frame_module_id,
 };
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::{ExternalName, Function, UserExternalName};
@@ -122,7 +123,9 @@ impl NativeEntryTable for JitProgram {
                 module_id,
                 function_id,
             })?;
-        Ok(JitEntry::new(&self.module, self.functions[index].function).invoke(frame, out))
+        let entry = &self.functions[index];
+        require_frame_module_id(frame, entry.module_id)?;
+        Ok(JitEntry::new(&self.module, entry.function).invoke(frame, out))
     }
 }
 
@@ -547,6 +550,18 @@ mod tests {
                 Ok(CompletionTag::FatalTrap)
             );
         }
+
+        let mut register = Value::UNINITIALIZED;
+        let mut mismatched_frame = ShadowFrame::new(core::ptr::null_mut(), 0, 1, &mut register, 1);
+        let mut mismatched_out = Completion::new(Value::int32(123));
+        assert_eq!(
+            program.invoke(0, 0, &mut mismatched_frame, &mut mismatched_out),
+            Err(AbiError::FrameModuleMismatch {
+                selected_module_id: 0,
+                frame_module_id: 1,
+            })
+        );
+        assert_eq!(mismatched_out.value.as_int32(), Some(123));
     }
 
     #[test]

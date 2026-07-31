@@ -11,15 +11,17 @@
 
 use std::sync::Arc;
 
-use crate::checker::{self, SemanticModel};
-use crate::diagnostic::Diagnostic;
+use crate::checker::{
+    self, ProgramCheckInput, ProgramCheckOptions, ResolvedModuleEdge, SemanticModel,
+};
+use crate::diagnostic::{Diagnostic, Recovered};
 use crate::emitter::{self, EmitOptions, EmitOutput};
 use crate::lint::{LintProfile, LintTable};
 use crate::parser;
-use crate::program::ResolvedProgram;
+use crate::program::{ModuleTarget, ResolvedProgram};
 use crate::scanner;
 use crate::source::{ScriptKind, SourceId, SourceText};
-use crate::syntax::SourceFile;
+use crate::syntax::{ExportDeclaration, ExportNamedDeclaration, SourceFile, Statement};
 
 /// The frontend product a caller wants produced for one source.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -171,25 +173,109 @@ pub fn compile_program_frontend_with_lints(
     mode: FrontendMode,
     levels: &LintTable,
 ) -> ProgramFrontendOutput {
-    let modules = program
+    let parsed = program
         .modules()
         .iter()
         .map(|module| {
-            compile_frontend_with_lints(
-                FrontendRequest {
-                    source_id: module.source_id(),
-                    script_kind: module.script_kind(),
-                    source: Arc::clone(module.source()),
-                    mode,
-                },
-                levels,
-            )
+            parser::parse(scanner::scan(
+                module.source_id(),
+                module.script_kind(),
+                Arc::clone(module.source()),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let edges = resolved_checker_edges(program, &parsed);
+    let checked = checker::check_program_with_options(
+        ProgramCheckInput {
+            files: &parsed,
+            edges: &edges,
+        },
+        levels,
+        if program.is_commonjs() {
+            ProgramCheckOptions::commonjs()
+        } else {
+            ProgramCheckOptions::standard()
+        },
+    );
+    let program_diagnostics = checked.diagnostics();
+    let modules = parsed
+        .into_iter()
+        .map(|parsed| {
+            let source_id = parsed.product().source_id();
+            let semantic_model = checked
+                .product()
+                .file(source_id)
+                .expect("whole-program checker returns every parsed module")
+                .clone();
+            let emit = mode
+                .emit_options()
+                .map(|options| emitter::emit(parsed.product(), options));
+            let (source_file, mut diagnostics) = parsed.into_parts();
+            diagnostics.extend(
+                program_diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.source_id() == source_id)
+                    .cloned(),
+            );
+            if let Some(output) = &emit {
+                diagnostics.extend(output.diagnostics.iter().cloned());
+            }
+            FrontendOutput {
+                mode,
+                source_file,
+                semantic_model,
+                emit,
+                diagnostics: canonicalize(diagnostics),
+            }
         })
         .collect();
     ProgramFrontendOutput {
         entrypoint: program.entrypoint_id(),
         modules,
     }
+}
+
+fn resolved_checker_edges(
+    program: &ResolvedProgram,
+    files: &[Recovered<SourceFile>],
+) -> Vec<ResolvedModuleEdge> {
+    program
+        .modules()
+        .iter()
+        .flat_map(|module| {
+            let source = files
+                .iter()
+                .find(|file| file.product().source_id() == module.source_id())
+                .expect("resolved module has one parsed source")
+                .product();
+            module.dependencies().iter().filter_map(move |edge| {
+                let ModuleTarget::Local(to) = edge.target() else {
+                    return None;
+                };
+                let specifier = source.statements().iter().find_map(|statement| {
+                    let source_range = match statement.data() {
+                        Statement::Import(import) => Some(import.source.range()),
+                        Statement::Export(ExportDeclaration::All(export)) => {
+                            Some(export.source.range())
+                        }
+                        Statement::Export(ExportDeclaration::Named(
+                            ExportNamedDeclaration::Specifiers {
+                                source: Some(source),
+                                ..
+                            },
+                        )) => Some(source.range()),
+                        _ => None,
+                    };
+                    (source_range == Some(edge.range())).then_some(statement.id())
+                })?;
+                Some(ResolvedModuleEdge {
+                    from: module.source_id(),
+                    specifier,
+                    to: *to,
+                })
+            })
+        })
+        .collect()
 }
 
 /// Runs the fixed frontend pipeline with settled default lint levels.

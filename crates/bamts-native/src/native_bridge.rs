@@ -1727,7 +1727,11 @@ pub trait NativeEntryTable {
     /// Callers must compare these bytes with the supplied program before any native entry runs.
     fn program_bytes(&self) -> &[u8];
 
-    /// Invokes the entry for `(module_id, function_id)`, returning its completion tag.
+    /// Invokes the entry for `(module_id, function_id)` with one completion.
+    ///
+    /// Implementations must reject `frame.module_id != module_id` before
+    /// entering native code so module-local constants and linkage use the
+    /// selected entry's identity.
     fn invoke(
         &self,
         module_id: u32,
@@ -1991,6 +1995,7 @@ impl NativeEntryTable for LinkedProgram<'_> {
                 module_id,
                 function_id,
             })?;
+        require_frame_module_id(frame, unit.module_id)?;
         // SAFETY: `unit.entry` is a finalized native entry installed by the AOT
         // image, upholding the native-entry ABI; its code stays mapped for the
         // program's lifetime.
@@ -2089,6 +2094,30 @@ pub enum AbiError {
         /// The requested function id.
         function_id: u32,
     },
+    /// The frame belongs to a different module than the selected native entry.
+    FrameModuleMismatch {
+        /// The module id attached to the selected native entry.
+        selected_module_id: u32,
+        /// The module id stored in the caller's shadow frame.
+        frame_module_id: u32,
+    },
+}
+
+/// Rejects a shadow frame that would make a selected native entry resolve
+/// constants or linkage against another module.
+#[inline]
+pub fn require_frame_module_id(
+    frame: &ShadowFrame,
+    selected_module_id: u32,
+) -> Result<(), AbiError> {
+    if frame.module_id == selected_module_id {
+        Ok(())
+    } else {
+        Err(AbiError::FrameModuleMismatch {
+            selected_module_id,
+            frame_module_id: frame.module_id,
+        })
+    }
 }
 
 impl fmt::Display for AbiError {
@@ -2140,6 +2169,13 @@ impl fmt::Display for AbiError {
             } => write!(
                 f,
                 "no native entry for function ({module_id}, {function_id})"
+            ),
+            AbiError::FrameModuleMismatch {
+                selected_module_id,
+                frame_module_id,
+            } => write!(
+                f,
+                "native entry module {selected_module_id} cannot execute frame for module {frame_module_id}"
             ),
         }
     }
@@ -2843,6 +2879,19 @@ mod tests {
             .expect("entry present");
         assert_eq!(tag, CompletionTag::Normal);
         assert_eq!(completion.value.as_int32(), Some(7));
+
+        let mut mismatched_frame =
+            ShadowFrame::new(core::ptr::null_mut(), 0, 2, regs.as_mut_ptr(), 0);
+        let mut mismatched_completion = Completion::new(Value::int32(123));
+        assert_eq!(
+            linked.invoke(3, 5, &mut mismatched_frame, &mut mismatched_completion),
+            Err(AbiError::FrameModuleMismatch {
+                selected_module_id: 3,
+                frame_module_id: 2,
+            })
+        );
+        assert_eq!(mismatched_completion.value.as_int32(), Some(123));
+
         assert_eq!(
             linked.invoke(4, 5, &mut frame, &mut completion).err(),
             Some(AbiError::UnknownFunction {

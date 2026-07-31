@@ -399,16 +399,48 @@ theorem provider_free_is_idempotent (p q : ProviderPhase)
   | freeIdempotent =>
       exact ⟨rfl, ProviderStep.freeIdempotent⟩
 
-theorem provider_never_writable_executable (p : ProviderPhase) :
-    ¬ (p = .Writable ∧ p = .Executable) := by
-  intro h
-  have he := h.2
-  rw [h.1] at he
-  exact ProviderPhase.noConfusion he
-
+/-- An executable provider can only remain executable or become freed along a
+reachable trace; once freed, it remains freed.  The second conjunct strengthens
+the induction enough to cover a `free` step from the executable phase. -/
 theorem provider_trace_exclusivity (s u : ProviderPhase)
-    (_ : ProviderTrace s u) :
-    ¬ (u = .Writable ∧ u = .Executable) := by
-  exact provider_never_writable_executable u
+    (trace : ProviderTrace s u) :
+    (s = .Executable → u = .Executable ∨ u = .Freed) ∧
+      (s = .Freed → u = .Freed) := by
+  induction trace with
+  | refl s =>
+      exact ⟨fun h => Or.inl h, fun h => h⟩
+  | step s u action result hs ht ih =>
+      cases hs with
+      | allocateAccepted =>
+          constructor <;> intro h <;> cases h
+      | finalizeAccepted =>
+          constructor <;> intro h <;> cases h
+      | finalizeFailed =>
+          constructor <;> intro h <;> cases h
+      | freeAccepted p hp =>
+          rcases hp with rfl | rfl
+          · constructor <;> intro h <;> cases h
+          · constructor
+            · intro _
+              exact Or.inr (ih.2 rfl)
+            · intro h
+              cases h
+      | freeIdempotent =>
+          constructor
+          · intro h
+            cases h
+          · intro _
+            exact ih.2 rfl
+
+/-- No phase reachable from an executable provider is writable. -/
+theorem provider_never_writable_executable (s u : ProviderPhase)
+    (trace : ProviderTrace s u) :
+    s = .Executable → u ≠ .Writable := by
+  intro hs hu
+  rcases (provider_trace_exclusivity s u trace).1 hs with he | hf
+  · rw [hu] at he
+    exact ProviderPhase.noConfusion he
+  · rw [hu] at hf
+    exact ProviderPhase.noConfusion hf
 
 end Bamti

@@ -13,7 +13,7 @@
 #[path = "checker/intrinsic_environment.rs"]
 mod intrinsic_environment;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
 use crate::lint::{LintProfile, LintTable};
@@ -23,8 +23,8 @@ use crate::syntax::{
     EntityName, Expr, Expression, ForBinding, ForInitializer, FunctionBody, FunctionLike,
     FunctionType, IdentifierNode, ImportBinding, InterfaceDeclaration, KeywordType, Literal,
     MemberProperty, NodeId, ObjectMember, PropertyName, SourceFile, Statement, Token, Ty,
-    TypeAliasDeclaration, TypeLiteral, TypeMember, TypeNode, TypeReference, VariableDeclaration,
-    VariableKind,
+    TypeAliasDeclaration, TypeLiteral, TypeMember, TypeNode, TypeReference, UnaryOperator,
+    VariableDeclaration, VariableKind,
 };
 use crate::warning::analyze_warnings;
 use intrinsic_environment::GlobalEnvironment;
@@ -606,7 +606,7 @@ impl TypeTable {
 
     fn contains_undefined(&self, type_id: TypeId) -> bool {
         match self.get(type_id) {
-            Type::Undefined => true,
+            Type::Any | Type::Unknown | Type::Undefined => true,
             Type::Union(members) => members
                 .iter()
                 .any(|member| self.contains_undefined(*member)),
@@ -734,6 +734,7 @@ pub struct HazardFact {
 #[derive(Clone, Debug, Default)]
 pub struct AnalysisFacts {
     hazards: Vec<HazardFact>,
+    index: HashSet<(SemanticHazard, TextRange)>,
 }
 
 impl AnalysisFacts {
@@ -743,12 +744,14 @@ impl AnalysisFacts {
     }
 
     pub(crate) fn push(&mut self, fact: HazardFact) {
-        if !self
-            .hazards
-            .iter()
-            .any(|existing| existing.hazard == fact.hazard && existing.range == fact.range)
-        {
+        if self.index.insert((fact.hazard, fact.range)) {
             self.hazards.push(fact);
+        }
+    }
+
+    pub(crate) fn extend(&mut self, facts: impl IntoIterator<Item = HazardFact>) {
+        for fact in facts {
+            self.push(fact);
         }
     }
 }
@@ -812,6 +815,10 @@ impl SemanticModel {
     #[must_use]
     pub const fn facts(&self) -> &AnalysisFacts {
         &self.facts
+    }
+
+    pub(crate) const fn facts_mut(&mut self) -> &mut AnalysisFacts {
+        &mut self.facts
     }
 
     pub(crate) fn replace_facts(&mut self, facts: AnalysisFacts) {
@@ -894,6 +901,32 @@ pub struct ProgramCheckInput<'a> {
     pub edges: &'a [ResolvedModuleEdge],
 }
 
+/// Checker environment selected by the project's module compiler option.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct ProgramCheckOptions {
+    commonjs: bool,
+}
+
+impl ProgramCheckOptions {
+    #[must_use]
+    pub const fn standard() -> Self {
+        Self { commonjs: false }
+    }
+
+    #[must_use]
+    pub const fn commonjs() -> Self {
+        Self { commonjs: true }
+    }
+
+    const fn environment(self) -> GlobalEnvironment {
+        if self.commonjs {
+            GlobalEnvironment::commonjs()
+        } else {
+            GlobalEnvironment::standard()
+        }
+    }
+}
+
 /// Immutable linked checker product.
 #[derive(Clone, Debug)]
 pub struct ProgramSemanticModel {
@@ -919,11 +952,22 @@ pub fn check_program(
     input: ProgramCheckInput<'_>,
     levels: &LintTable,
 ) -> Recovered<ProgramSemanticModel> {
+    check_program_with_options(input, levels, ProgramCheckOptions::standard())
+}
+
+/// Checks a set of loaded files using the environment selected by module options.
+#[must_use]
+pub fn check_program_with_options(
+    input: ProgramCheckInput<'_>,
+    levels: &LintTable,
+    options: ProgramCheckOptions,
+) -> Recovered<ProgramSemanticModel> {
     let mut files = BTreeMap::new();
     let mut diagnostics = Vec::new();
     for recovered in input.files {
         let source = recovered.product();
-        let (mut model, core_diagnostics) = check_core(source);
+        let (mut model, core_diagnostics) =
+            check_core_with_environment(source, options.environment());
         model.replace_facts(crate::rules::semantic::collect_facts(source, &model));
         diagnostics.extend(core_diagnostics);
         diagnostics.extend(analyze_warnings(recovered, levels));
@@ -955,6 +999,15 @@ fn check_core(source: &SourceFile) -> (SemanticModel, Vec<Diagnostic>) {
     checker.finish()
 }
 
+fn check_core_with_environment(
+    source: &SourceFile,
+    environment: GlobalEnvironment,
+) -> (SemanticModel, Vec<Diagnostic>) {
+    let mut checker = Checker::with_environment(source, environment);
+    checker.run();
+    checker.finish()
+}
+
 /// Lazy resolution state for a type-declaring symbol.
 #[derive(Clone, Copy)]
 enum TypeState {
@@ -977,6 +1030,9 @@ enum TypeDef<'src> {
         extends: &'src [TypeReference],
         members: &'src [crate::syntax::TypeMemberNode],
     },
+    Enum {
+        numeric: bool,
+    },
 }
 
 struct Checker<'src> {
@@ -995,9 +1051,13 @@ struct Checker<'src> {
 
 impl<'src> Checker<'src> {
     fn new(source: &'src SourceFile) -> Self {
+        Self::with_environment(source, GlobalEnvironment::standard())
+    }
+
+    fn with_environment(source: &'src SourceFile, intrinsics: GlobalEnvironment) -> Self {
         let mut checker = Self {
             source,
-            intrinsics: GlobalEnvironment::standard(),
+            intrinsics,
             scopes: Vec::new(),
             symbols: Vec::new(),
             symbol_types: Vec::new(),
@@ -1015,7 +1075,12 @@ impl<'src> Checker<'src> {
     }
 
     fn bind_intrinsic_environment(&mut self, scope: ScopeId) {
-        for name in self.intrinsics.values() {
+        for name in self
+            .intrinsics
+            .values()
+            .iter()
+            .chain(self.intrinsics.module_values())
+        {
             self.declare(
                 name,
                 SymbolKind::IntrinsicValue,
@@ -1309,12 +1374,24 @@ impl<'src> Checker<'src> {
             Statement::Interface(interface) => self.bind_interface(interface, scope, declaration),
             Statement::TypeAlias(alias) => self.bind_type_alias(alias, scope, declaration),
             Statement::Enum(declaration_node) => {
-                self.declare(
+                let id = self.declare(
                     self.identifier_text(&declaration_node.name),
                     SymbolKind::Enum,
                     scope,
                     declaration,
                     declaration_node.name.range(),
+                );
+                self.type_defs.insert(
+                    id,
+                    TypeDef::Enum {
+                        numeric: declaration_node.members.iter().all(|member| {
+                            member
+                                .data()
+                                .initializer
+                                .as_deref()
+                                .is_none_or(Self::is_numeric_enum_initializer)
+                        }),
+                    },
                 );
             }
             Statement::Namespace(namespace) => {
@@ -1713,10 +1790,28 @@ impl<'src> Checker<'src> {
         }
     }
 
-    fn resolve_function(&mut self, function: &'src FunctionLike, parent: ScopeId) {
-        let scope = self.new_scope(ScopeKind::Function, Some(parent));
+    fn is_numeric_enum_initializer(expression: &Expr) -> bool {
+        match expression.data() {
+            Expression::Literal(Literal::Number(_)) => true,
+            Expression::Unary(unary)
+                if matches!(unary.operator, UnaryOperator::Plus | UnaryOperator::Minus) =>
+            {
+                matches!(
+                    unary.argument.data(),
+                    Expression::Literal(Literal::Number(_))
+                )
+            }
+            _ => false,
+        }
+    }
+
+    fn bind_implicit_function_values(
+        &mut self,
+        parameters: &'src [crate::syntax::ParameterNode],
+        scope: ScopeId,
+    ) {
         for name in ["arguments", "this"] {
-            let explicitly_bound = function.parameters.iter().any(|parameter| {
+            let explicitly_bound = parameters.iter().any(|parameter| {
                 matches!(
                     parameter.data().binding.data(),
                     BindingPattern::Identifier(identifier)
@@ -1733,6 +1828,11 @@ impl<'src> Checker<'src> {
                 );
             }
         }
+    }
+
+    fn resolve_function(&mut self, function: &'src FunctionLike, parent: ScopeId) {
+        let scope = self.new_scope(ScopeKind::Function, Some(parent));
+        self.bind_implicit_function_values(&function.parameters, scope);
         if let Some(name) = &function.name {
             self.declare(
                 self.identifier_text(name),
@@ -1852,24 +1952,7 @@ impl<'src> Checker<'src> {
             }
             ClassMember::Constructor(constructor) => {
                 let child = self.new_scope(ScopeKind::Function, Some(scope));
-                for name in ["arguments", "this"] {
-                    let explicitly_bound = constructor.parameters.iter().any(|parameter| {
-                        matches!(
-                            parameter.data().binding.data(),
-                            BindingPattern::Identifier(identifier)
-                                if self.identifier_text(identifier) == name
-                        )
-                    });
-                    if !explicitly_bound {
-                        self.declare(
-                            name,
-                            SymbolKind::Parameter,
-                            child,
-                            NodeId::default(),
-                            NodeId::default_range(),
-                        );
-                    }
-                }
+                self.bind_implicit_function_values(&constructor.parameters, child);
                 for parameter in &constructor.parameters {
                     self.resolve_parameter(parameter, child);
                 }
@@ -2233,10 +2316,10 @@ impl<'src> Checker<'src> {
         let name = self.identifier_text(identifier);
         match self.lookup_type(scope, name) {
             Some(symbol) => match self.symbols[symbol.get() as usize].kind {
-                SymbolKind::Interface | SymbolKind::TypeAlias => self.resolve_type_symbol(symbol),
-                SymbolKind::Class | SymbolKind::Enum | SymbolKind::TypeParameter => {
-                    self.types.named(symbol)
+                SymbolKind::Interface | SymbolKind::TypeAlias | SymbolKind::Enum => {
+                    self.resolve_type_symbol(symbol)
                 }
+                SymbolKind::Class | SymbolKind::TypeParameter => self.types.named(symbol),
                 _ => self.types.error_type(),
             },
             None => {
@@ -2275,6 +2358,13 @@ impl<'src> Checker<'src> {
             } => {
                 self.resolve_type_parameter_bounds(type_parameters, scope);
                 self.resolve_interface_type(scope, extends, members)
+            }
+            TypeDef::Enum { numeric } => {
+                if numeric {
+                    self.types.numeric_enum(symbol)
+                } else {
+                    self.types.named(symbol)
+                }
             }
         };
         self.type_state[symbol.get() as usize] = TypeState::Done(resolved);
@@ -2487,7 +2577,7 @@ impl DefaultRange for NodeId {
 mod tests {
     use super::{
         CANNOT_FIND_NAME, CANNOT_FIND_TYPE, DUPLICATE_DECLARATION, PropertyType, ScopeKind,
-        SymbolKind, TYPE_NOT_ASSIGNABLE, TypeTable, check,
+        SymbolKind, TYPE_NOT_ASSIGNABLE, Type, TypeTable, check,
     };
     use crate::diagnostic::{DiagnosticSeverity, Recovered};
     use crate::source::{ScriptKind, SourceId, SourceText, TextRange, Utf16Pos};
@@ -2639,6 +2729,22 @@ mod tests {
                 .hazards()
                 .contains(&super::RelationHazard::NumericEnumNumber)
         );
+    }
+
+    #[test]
+    fn optional_any_and_unknown_already_contain_undefined() {
+        for value_type in [TypeTable::new().any(), TypeTable::new().unknown()] {
+            let mut table = TypeTable::new();
+            let source =
+                table.object_type(vec![PropertyType::new("x", false, table.undefined_type())]);
+            let target = table.object_type(vec![PropertyType::new("x", true, value_type)]);
+            assert!(
+                !table
+                    .relation(source, target)
+                    .hazards()
+                    .contains(&super::RelationHazard::ExplicitUndefinedForOptional)
+            );
+        }
     }
 
     // ---- checker behavior tests ----------------------------------------------
@@ -2904,6 +3010,31 @@ mod tests {
             result.diagnostics()
         );
         assert_eq!(result.product().resolved_reference_count(), names.len());
+    }
+
+    #[test]
+    fn primitive_wrapper_names_bind_in_type_position() {
+        let result = check_text(
+            "let a: Boolean; let b: Number; let c: String; let d: Symbol; let e: BigInt;",
+        );
+        assert!(
+            !checker_codes(&result).contains(&CANNOT_FIND_TYPE.as_str()),
+            "primitive wrappers must be checker-visible types: {:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn source_enum_references_construct_numeric_enum_types() {
+        let result = check_text("enum E { A } let e: E = E.A;");
+        let model = result.product();
+        let symbol = model
+            .lookup_value(model.module_scope(), "e")
+            .expect("enum-typed binding is present");
+        assert!(matches!(
+            model.types().get(model.symbol_type(symbol)),
+            Type::NumericEnum(_)
+        ));
     }
 
     #[test]
@@ -3186,14 +3317,14 @@ mod tests {
                 modifiers: crate::syntax::ParameterModifiers::default(),
                 binding,
                 optional: false,
-                type_annotation: None,
+                type_annotation: Some(keyword_annotation(84, KeywordType::Unknown, 14, 21)),
                 initializer: None,
             },
         );
-        let body = identifier_expr(90, "p", 17);
+        let body = identifier_expr(90, "p", 26);
         let arrow = Node::new(
             NodeId::new(80),
-            range(10, 18),
+            range(10, 27),
             Expression::Arrow(ArrowFunction {
                 is_async: false,
                 type_parameters: None,
@@ -3204,13 +3335,13 @@ mod tests {
         );
         let statements = vec![variable(
             10,
-            "const f = (p) => p;",
+            "const f = (p: unknown) => p;",
             "f",
             6,
             None,
             Some(Box::new(arrow)),
         )];
-        let result = check(&file("const f = (p) => p;", statements));
+        let result = check(&file("const f = (p: unknown) => p;", statements));
         assert!(semantic_codes(&result).is_empty());
         // Scope tree contains a function scope for the arrow.
         let model = result.product();

@@ -3,7 +3,51 @@ use std::{fs, path::Path, process};
 use bamts_verification::corpus::{
     BamtsRunner, CaseSpec, CorpusFailure, CorpusStage, ExecutionMode, NodeOracle, OracleOutcome,
     PINNED_CASE_IDS, TASK_106_SYNC_CASE_IDS, TASK_107_NODE_CASE_IDS, load_corpus,
+    run_corpus_worker_from_env,
 };
+
+#[test]
+#[ignore = "spawned by BamtsRunner as a killable JIT/AOT boundary"]
+fn corpus_differential_worker() {
+    if std::env::var_os("BAMTS_CORPUS_WORKER_REQUEST").is_none() {
+        return;
+    }
+    run_corpus_worker_from_env().expect("corpus worker completes");
+}
+
+#[test]
+fn every_execution_mode_enforces_the_case_timeout() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("corpus-timeout-{}", process::id());
+    let entrypoint = format!("target/{id}.ts");
+    let path = root.join(&entrypoint);
+    fs::write(&path, "while (true) {}\n").expect("write timeout fixture");
+    let spec = CaseSpec {
+        id,
+        repository: "local".to_owned(),
+        commit: "0".repeat(40),
+        license: "UNLICENSED".to_owned(),
+        source_dir: "target".to_owned(),
+        entrypoint,
+        node_args: Vec::new(),
+        expected_timeout_ms: 100,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    for mode in ExecutionMode::ALL {
+        let outcome = bamts
+            .run_case(&spec, mode)
+            .unwrap_or_else(|error| panic!("{} timeout run failed: {error}", mode.as_str()));
+        assert!(
+            outcome.timed_out,
+            "{} infinite loop escaped its case timeout: {}",
+            mode.as_str(),
+            evidence(&outcome)
+        );
+    }
+    fs::remove_file(path).expect("remove timeout fixture");
+}
 
 #[test]
 fn all_pinned_cases_match_node_in_every_execution_mode() {
@@ -493,29 +537,7 @@ fn first_tla_rejection_aborts_root_body_before_pending_dependency_completes() {
     }
     for mode in ExecutionMode::ALL {
         let actual = bamts.run_case(&spec, mode);
-        match mode {
-            ExecutionMode::Aot => {
-                compare_case(&spec.id, mode, &expected, &actual, &mut failures);
-            }
-            ExecutionMode::Interpreter | ExecutionMode::Jit => match actual {
-                Err(error) => {
-                    let text = error.to_string();
-                    if !text.contains("stage=evaluate") {
-                        failures.push(format!(
-                            "case `{}` / {}: rejection reached the wrong stage: {text}",
-                            spec.id,
-                            mode.as_str()
-                        ));
-                    }
-                }
-                Ok(outcome) => failures.push(format!(
-                    "case `{}` / {}: rejected graph completed successfully: {}",
-                    spec.id,
-                    mode.as_str(),
-                    evidence(&outcome)
-                )),
-            },
-        }
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
     }
     fs::remove_file(root_path).expect("remove root fixture");
     fs::remove_file(rejecting_path).expect("remove rejecting fixture");
@@ -528,17 +550,12 @@ fn first_tla_rejection_aborts_root_body_before_pending_dependency_completes() {
 }
 
 #[test]
-fn interpreter_runtime_errors_classify_as_evaluate() {
+fn top_level_throws_are_comparable_process_outcomes() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let id = format!("task-113-interpreter-throw-{}", process::id());
+    let id = format!("task-113-top-level-throw-{}", process::id());
     let entrypoint = format!("target/{id}.js");
     let path = root.join(&entrypoint);
-    fs::write(
-        &path,
-        "throw new Error('boom');
-",
-    )
-    .expect("write interpreter throw fixture");
+    fs::write(&path, "throw new Error('boom');\n").expect("write top-level throw fixture");
     let spec = CaseSpec {
         id,
         repository: "local".to_owned(),
@@ -551,18 +568,19 @@ fn interpreter_runtime_errors_classify_as_evaluate() {
         constructs: Vec::new(),
         source_files: Vec::new(),
     };
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
     let bamts = BamtsRunner::new(&root);
-    let result = bamts.run_case(&spec, ExecutionMode::Interpreter);
-    fs::remove_file(path).expect("remove interpreter throw fixture");
-    let error = result.expect_err("a top-level throw must fail in interpreter mode");
-    let text = error.to_string();
+    let mut failures = Vec::new();
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_file(path).expect("remove top-level throw fixture");
     assert!(
-        text.contains("failed in interpreter mode"),
-        "failure must name interpreter mode: {text}"
-    );
-    assert!(
-        text.contains("stage=evaluate"),
-        "a runtime throw must classify as evaluate: {text}"
+        failures.is_empty(),
+        "top-level throw differential failures:\n{}",
+        failures.join("\n\n")
     );
 }
 

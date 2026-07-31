@@ -991,6 +991,8 @@ fn clone_value<H: Host>(
                 .allocate(HeapEntry::Collection {
                     kind,
                     entries: Vec::new(),
+                    index: crate::CollectionIndex::default(),
+                    size: 0,
                     next_order: 0,
                     properties: PropertyMap::default(),
                     prototype,
@@ -999,10 +1001,40 @@ fn clone_value<H: Host>(
                 .map_err(EvalFailure::Runtime)?;
             seen.insert(index, clone);
             let clone_index = machine.runtime_slot(clone).unwrap().unwrap();
-            for entry in entries {
+            for entry in entries.into_iter().filter(|entry| entry.live) {
                 let key = clone_value(machine, entry.key, seen)?;
                 let value = clone_value(machine, entry.value, seen)?;
                 super::collections::append_collection_entry(machine, clone_index, key, value)?;
+            }
+            Ok(clone)
+        }
+        HeapEntry::Uint8Array {
+            bytes,
+            properties,
+            prototype,
+            extensible,
+        } => {
+            let clone = machine
+                .allocate(HeapEntry::Uint8Array {
+                    bytes,
+                    properties: PropertyMap::default(),
+                    prototype,
+                    extensible,
+                })
+                .map_err(EvalFailure::Runtime)?;
+            seen.insert(index, clone);
+            for (key, property) in properties.0 {
+                if key.eq_ascii("length")
+                    || key
+                        .as_string()
+                        .is_some_and(|name| crate::uint8array_index(name).is_some())
+                {
+                    continue;
+                }
+                if let Property::Data { value, .. } = property {
+                    let copied = clone_value(machine, value, seen)?;
+                    machine.set_data_property_key(clone, key, copied)?;
+                }
             }
             Ok(clone)
         }
@@ -1012,61 +1044,13 @@ fn clone_value<H: Host>(
 
 #[cfg(test)]
 mod tests {
-    use bamts_bytecode::{
-        Constant, ConstantId, Function, FunctionFlags, FunctionId, Instruction, Module, ModuleId,
-        Program, ProgramModule, Verified,
-    };
-
+    use super::super::test_support::{TestHost, blank_program, ordinary_object};
     use super::*;
     use crate::{Limits, ThrowOrigin};
-
-    #[derive(Default)]
-    struct TestHost;
-
-    impl Host for TestHost {}
-
-    fn module() -> Program<Verified> {
-        let code = Module::new(
-            vec![Constant::String(EcmaString::from_utf8("<test>"))],
-            vec![Function::new(
-                None,
-                0,
-                0,
-                1,
-                FunctionFlags::default(),
-                vec![Instruction::Halt],
-                Vec::new(),
-            )],
-            FunctionId::new(0),
-        )
-        .verify()
-        .expect("valid test module");
-        Program::link(
-            vec![ProgramModule {
-                name: ConstantId::new(0),
-                code,
-                edges: Vec::new(),
-                bindings: Vec::new(),
-                exports: Vec::new(),
-            }],
-            ModuleId::new(0),
-        )
-        .expect("valid test program")
-    }
-
-    fn object(machine: &mut Machine<'_, TestHost>) -> Value {
-        machine
-            .allocate(HeapEntry::Object {
-                properties: PropertyMap::default(),
-                prototype: Some(machine.intrinsics.object_prototype),
-                extensible: true,
-                boxed_primitive: None,
-            })
-            .unwrap()
-    }
+    use bamts_bytecode::{FunctionId, ModuleId};
 
     fn data_descriptor(machine: &mut Machine<'_, TestHost>, value: Value) -> Value {
-        let descriptor = object(machine);
+        let descriptor = ordinary_object(machine);
         machine
             .set_data_property(descriptor, "value", value)
             .unwrap();
@@ -1127,10 +1111,10 @@ mod tests {
 
     #[test]
     fn object_reflection_preserves_symbol_keys_and_filters_string_names() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
-        let target = object(&mut machine);
+        let target = ordinary_object(&mut machine);
         let key = symbol(&mut machine, "key");
         let descriptor = data_descriptor(&mut machine, Value::int32(42));
 
@@ -1141,7 +1125,7 @@ mod tests {
             machine.get_property_key(target, &property_key).unwrap(),
             Value::int32(42)
         );
-        let child = object(&mut machine);
+        let child = ordinary_object(&mut machine);
         machine.set_prototype_value(child, Some(target)).unwrap();
         assert!(machine.has_property(child, &property_key).unwrap());
         let names = call_object(&mut machine, "getOwnPropertyNames", &[target]).unwrap();
@@ -1165,11 +1149,11 @@ mod tests {
 
     #[test]
     fn assign_copies_enumerable_symbol_properties() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
-        let target = object(&mut machine);
-        let source = object(&mut machine);
+        let target = ordinary_object(&mut machine);
+        let source = ordinary_object(&mut machine);
         let symbol = symbol(&mut machine, "key");
         let key = symbol_key(&machine, symbol);
         machine
@@ -1196,7 +1180,7 @@ mod tests {
             Ok(BuiltinOutcome::Value(Value::int32(1)))
         }
 
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let getter_id = machine
@@ -1209,8 +1193,8 @@ mod tests {
             });
         let getter =
             crate::intrinsics::native_function(&mut machine.heap, getter_id, "delete next", 0);
-        let source = object(&mut machine);
-        let target = object(&mut machine);
+        let source = ordinary_object(&mut machine);
+        let target = ordinary_object(&mut machine);
         let first = PropertyKey::Named(EcmaString::from_utf8("first"));
         let next = PropertyKey::Named(EcmaString::from_utf8("next"));
         machine
@@ -1250,7 +1234,7 @@ mod tests {
             Ok(BuiltinOutcome::Value(Value::int32(1)))
         }
 
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let getter_id = machine
@@ -1282,7 +1266,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let target = object(&mut machine);
+        let target = ordinary_object(&mut machine);
         let later = PropertyKey::Named(EcmaString::from_utf8("10"));
 
         call_object(&mut machine, "assign", &[target, source]).unwrap();
@@ -1292,11 +1276,11 @@ mod tests {
 
     #[test]
     fn define_properties_collects_enumerable_symbol_descriptors() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
-        let target = object(&mut machine);
-        let descriptors = object(&mut machine);
+        let target = ordinary_object(&mut machine);
+        let descriptors = ordinary_object(&mut machine);
         let key = symbol(&mut machine, "definition");
         let descriptor = data_descriptor(&mut machine, Value::int32(7));
         let property_key = symbol_key(&machine, key);
@@ -1315,11 +1299,11 @@ mod tests {
 
     #[test]
     fn define_properties_ignores_language_private_descriptors() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
-        let target = object(&mut machine);
-        let descriptors = object(&mut machine);
+        let target = ordinary_object(&mut machine);
+        let descriptors = ordinary_object(&mut machine);
         let private = machine
             .allocate(HeapEntry::PrivateName {
                 description: EcmaString::from_utf8("private"),
@@ -1341,7 +1325,7 @@ mod tests {
 
     #[test]
     fn existing_namespaces_expose_standard_to_string_tags() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let object_to_string = machine.intrinsics.object_to_string();
@@ -1361,7 +1345,7 @@ mod tests {
 
     #[test]
     fn object_define_property_keeps_array_index_semantics() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let array = allocate_array(&mut machine, Vec::new()).unwrap();
@@ -1384,13 +1368,13 @@ mod tests {
 
     #[test]
     fn object_to_string_uses_string_tags_and_evaluates_tag_accessors() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let tag_key = symbol_key(&machine, machine.intrinsics.builtins.symbol_to_string_tag());
         let object_to_string = machine.intrinsics.object_to_string();
 
-        let non_string_tag = object(&mut machine);
+        let non_string_tag = ordinary_object(&mut machine);
         machine
             .set_data_property_key(non_string_tag, tag_key.clone(), Value::int32(1))
             .unwrap();
@@ -1403,7 +1387,7 @@ mod tests {
                 .is_some_and(|text| text.eq_ascii("[object Object]"))
         );
 
-        let accessor_tag = object(&mut machine);
+        let accessor_tag = ordinary_object(&mut machine);
         let object_constructor = machine.intrinsics.global("Object").unwrap();
         let throwing_getter = machine
             .get_named_property(object_constructor, "defineProperty")
@@ -1429,10 +1413,10 @@ mod tests {
 
     #[test]
     fn object_reflection_hides_language_private_keys() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
-        let target = object(&mut machine);
+        let target = ordinary_object(&mut machine);
         let symbol = symbol(&mut machine, "public");
         let private = machine
             .allocate(HeapEntry::PrivateName {
@@ -1461,7 +1445,7 @@ mod tests {
 
     #[test]
     fn array_length_is_exotic_and_locks_index_growth() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let array = allocate_array(&mut machine, vec![Value::int32(1), Value::int32(2)]).unwrap();
@@ -1504,13 +1488,13 @@ mod tests {
                 .is_err()
         );
 
-        let locked = object(&mut machine);
+        let locked = ordinary_object(&mut machine);
         machine
             .set_data_property(locked, "writable", Value::FALSE)
             .unwrap();
         let length_key = allocate_string(&mut machine, EcmaString::from_utf8("length")).unwrap();
         call_object(&mut machine, "defineProperty", &[array, length_key, locked]).unwrap();
-        let same_length = object(&mut machine);
+        let same_length = ordinary_object(&mut machine);
         machine
             .set_data_property(same_length, "value", Value::int32(3))
             .unwrap();
@@ -1539,7 +1523,7 @@ mod tests {
             )
             .is_err()
         );
-        let unlock = object(&mut machine);
+        let unlock = ordinary_object(&mut machine);
         machine
             .set_data_property(unlock, "writable", Value::TRUE)
             .unwrap();
@@ -1548,11 +1532,11 @@ mod tests {
 
     #[test]
     fn array_index_definitions_update_length_atomically() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let array = allocate_array(&mut machine, Vec::new()).unwrap();
-        let accessor = object(&mut machine);
+        let accessor = ordinary_object(&mut machine);
         let getter = machine.intrinsics.global("Object").unwrap();
         machine.set_data_property(accessor, "get", getter).unwrap();
 
@@ -1570,13 +1554,13 @@ mod tests {
             Some(Property::Accessor { .. })
         ));
 
-        let lock = object(&mut machine);
+        let lock = ordinary_object(&mut machine);
         machine
             .set_data_property(lock, "writable", Value::FALSE)
             .unwrap();
         let length_key = allocate_string(&mut machine, EcmaString::from_utf8("length")).unwrap();
         call_object(&mut machine, "defineProperty", &[array, length_key, lock]).unwrap();
-        let blocked_accessor = object(&mut machine);
+        let blocked_accessor = ordinary_object(&mut machine);
         machine
             .set_data_property(blocked_accessor, "get", getter)
             .unwrap();
@@ -1610,16 +1594,16 @@ mod tests {
 
     #[test]
     fn define_properties_rejects_later_invalid_getter_without_mutating_target() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
-        let target = object(&mut machine);
+        let target = ordinary_object(&mut machine);
         machine
             .set_data_property(target, "stable", Value::int32(9))
             .unwrap();
-        let descriptors = object(&mut machine);
+        let descriptors = ordinary_object(&mut machine);
         let first = data_descriptor(&mut machine, Value::int32(1));
-        let second = object(&mut machine);
+        let second = ordinary_object(&mut machine);
         machine
             .set_data_property(second, "get", Value::int32(0))
             .unwrap();
@@ -1637,16 +1621,16 @@ mod tests {
 
     #[test]
     fn define_properties_propagates_later_throwing_conversion_without_mutating_target() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
-        let target = object(&mut machine);
+        let target = ordinary_object(&mut machine);
         machine
             .set_data_property(target, "stable", Value::int32(9))
             .unwrap();
-        let descriptors = object(&mut machine);
+        let descriptors = ordinary_object(&mut machine);
         let first = data_descriptor(&mut machine, Value::int32(1));
-        let second = object(&mut machine);
+        let second = ordinary_object(&mut machine);
         let object_constructor = machine.intrinsics.global("Object").unwrap();
         let throwing_getter = machine
             .get_named_property(object_constructor, "defineProperty")
@@ -1677,11 +1661,11 @@ mod tests {
 
     #[test]
     fn define_properties_applies_collected_descriptors_in_enumeration_order() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
-        let target = object(&mut machine);
-        let descriptors = object(&mut machine);
+        let target = ordinary_object(&mut machine);
+        let descriptors = ordinary_object(&mut machine);
         let first = data_descriptor(&mut machine, Value::int32(1));
         let second = data_descriptor(&mut machine, Value::int32(2));
         machine
@@ -1715,7 +1699,7 @@ mod tests {
 
     #[test]
     fn array_length_descriptor_reads_inherited_fields() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let array = allocate_array(
@@ -1723,7 +1707,7 @@ mod tests {
             vec![Value::int32(1), Value::int32(2), Value::int32(3)],
         )
         .unwrap();
-        let prototype = object(&mut machine);
+        let prototype = ordinary_object(&mut machine);
         machine
             .set_data_property(prototype, "value", Value::int32(1))
             .unwrap();
@@ -1745,11 +1729,11 @@ mod tests {
 
     #[test]
     fn define_properties_converts_each_descriptor_once() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
-        let target = object(&mut machine);
-        let descriptors = object(&mut machine);
+        let target = ordinary_object(&mut machine);
+        let descriptors = ordinary_object(&mut machine);
         let descriptor =
             allocate_array(&mut machine, vec![Value::int32(1), Value::int32(2)]).unwrap();
         let array_prototype = machine.intrinsics.array_prototype;
@@ -1784,14 +1768,14 @@ mod tests {
 
     #[test]
     fn partial_redefinitions_preserve_omitted_fields() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
-        let target = object(&mut machine);
+        let target = ordinary_object(&mut machine);
         machine
             .set_data_property(target, "data", Value::int32(7))
             .unwrap();
-        let data_descriptor = object(&mut machine);
+        let data_descriptor = ordinary_object(&mut machine);
         machine
             .set_data_property(data_descriptor, "writable", Value::FALSE)
             .unwrap();
@@ -1830,7 +1814,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let accessor_descriptor = object(&mut machine);
+        let accessor_descriptor = ordinary_object(&mut machine);
         machine
             .set_data_property(accessor_descriptor, "set", Value::UNDEFINED)
             .unwrap();
@@ -1859,14 +1843,14 @@ mod tests {
 
     #[test]
     fn shrinking_array_length_processes_descriptor_indices() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let getter = machine.intrinsics.global("Object").unwrap();
         let length_key = allocate_string(&mut machine, EcmaString::from_utf8("length")).unwrap();
 
         let array = allocate_array(&mut machine, Vec::new()).unwrap();
-        let configurable_index = object(&mut machine);
+        let configurable_index = ordinary_object(&mut machine);
         machine
             .set_data_property(configurable_index, "get", getter)
             .unwrap();
@@ -1879,7 +1863,7 @@ mod tests {
             &[array, Value::int32(3), configurable_index],
         )
         .unwrap();
-        let shrink = object(&mut machine);
+        let shrink = ordinary_object(&mut machine);
         machine
             .set_data_property(shrink, "value", Value::int32(0))
             .unwrap();
@@ -1895,7 +1879,7 @@ mod tests {
         );
 
         let blocked = allocate_array(&mut machine, Vec::new()).unwrap();
-        let fixed_index = object(&mut machine);
+        let fixed_index = ordinary_object(&mut machine);
         machine
             .set_data_property(fixed_index, "get", getter)
             .unwrap();
@@ -1905,7 +1889,7 @@ mod tests {
             &[blocked, Value::int32(3), fixed_index],
         )
         .unwrap();
-        let blocked_shrink = object(&mut machine);
+        let blocked_shrink = ordinary_object(&mut machine);
         machine
             .set_data_property(blocked_shrink, "value", Value::int32(0))
             .unwrap();
@@ -1978,12 +1962,12 @@ mod tests {
 
     #[test]
     fn apply_forwards_array_like_arguments_and_receiver() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let target = probe(&mut machine, "probe", 2);
-        let receiver = object(&mut machine);
-        let arguments = object(&mut machine);
+        let receiver = ordinary_object(&mut machine);
+        let arguments = ordinary_object(&mut machine);
         machine
             .set_data_property(arguments, "length", Value::int32(2))
             .unwrap();
@@ -2083,12 +2067,12 @@ mod tests {
             Ok(BuiltinOutcome::Value(Value::int32(22)))
         }
 
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let target = probe(&mut machine, "probe", 2);
-        let receiver = object(&mut machine);
-        let arguments = object(&mut machine);
+        let receiver = ordinary_object(&mut machine);
+        let arguments = ordinary_object(&mut machine);
         machine
             .set_data_property(arguments, "reads", Value::int32(0))
             .unwrap();
@@ -2155,7 +2139,7 @@ mod tests {
             Ok(BuiltinOutcome::Value(Value::int32(0)))
         }
 
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let getter_id = machine
@@ -2168,7 +2152,7 @@ mod tests {
             });
         let getter =
             crate::intrinsics::native_function(&mut machine.heap, getter_id, "mark length", 0);
-        let arguments = object(&mut machine);
+        let arguments = ordinary_object(&mut machine);
         machine
             .define_descriptor(
                 arguments,
@@ -2181,7 +2165,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let invalid = object(&mut machine);
+        let invalid = ordinary_object(&mut machine);
         let apply = machine
             .get_named_property(machine.intrinsics.function_prototype, "apply")
             .unwrap();
@@ -2198,12 +2182,12 @@ mod tests {
 
     #[test]
     fn bind_pins_receiver_prepends_arguments_and_sets_metadata() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let target = probe(&mut machine, "probe", 2);
-        let receiver = object(&mut machine);
-        let ignored = object(&mut machine);
+        let receiver = ordinary_object(&mut machine);
+        let ignored = ordinary_object(&mut machine);
         let no_arguments = call_method(&mut machine, target, "bind", &[]).unwrap();
         assert_eq!(
             machine.get_named_property(no_arguments, "length").unwrap(),
@@ -2278,10 +2262,10 @@ mod tests {
 
     #[test]
     fn bound_constructor_uses_target_prototype_and_instanceof() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
-        let prototype = object(&mut machine);
+        let prototype = ordinary_object(&mut machine);
         let mut properties = PropertyMap::default();
         properties.insert(
             PropertyKey::Named(EcmaString::from_utf8("prototype")),
@@ -2302,7 +2286,7 @@ mod tests {
                 extensible: true,
             })
             .unwrap();
-        let bound_this = object(&mut machine);
+        let bound_this = ordinary_object(&mut machine);
         let bound =
             call_method(&mut machine, target, "bind", &[bound_this, Value::int32(1)]).unwrap();
         machine.execute_construct(bound, &[], 0, 0).unwrap();
@@ -2316,11 +2300,11 @@ mod tests {
     }
     #[test]
     fn function_prototype_methods_reject_invalid_receivers_and_construction() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let target = probe(&mut machine, "probe", 2);
-        let invalid = object(&mut machine);
+        let invalid = ordinary_object(&mut machine);
 
         for name in ["call", "apply", "bind"] {
             let method = machine
@@ -2347,7 +2331,7 @@ mod tests {
 
     #[test]
     fn bound_function_reports_callable_identity() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let target = probe(&mut machine, "probe", 2);
@@ -2375,7 +2359,7 @@ mod tests {
 
     #[test]
     fn function_prototype_methods_are_ordinary_own_properties() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let target = probe(&mut machine, "probe", 2);
@@ -2399,7 +2383,7 @@ mod tests {
 
     #[test]
     fn bound_and_applied_argument_lists_respect_the_limit() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(
             &module,
@@ -2410,7 +2394,7 @@ mod tests {
             },
         );
         let target = probe(&mut machine, "probe", 2);
-        let receiver = object(&mut machine);
+        let receiver = ordinary_object(&mut machine);
         let bound = call_method(
             &mut machine,
             target,
@@ -2448,7 +2432,7 @@ mod tests {
 
     #[test]
     fn deep_bound_call_chains_use_constant_native_stack() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let target = probe(&mut machine, "probe", 2);
@@ -2475,7 +2459,7 @@ mod tests {
             vec![Value::UNDEFINED]
         );
 
-        let receiver = object(&mut machine);
+        let receiver = ordinary_object(&mut machine);
         let mut arguments = Vec::with_capacity(machine.limits.max_argument_count as usize);
         arguments.push(target);
         arguments.push(receiver);
@@ -2568,7 +2552,7 @@ mod tests {
             "from entries iterator",
             0,
         );
-        let iterable = object(machine);
+        let iterable = ordinary_object(machine);
         let values_array = allocate_array(machine, values).unwrap();
         machine
             .set_data_property(iterable, "_values", values_array)
@@ -2585,7 +2569,7 @@ mod tests {
     }
 
     fn entry_pair(machine: &mut Machine<'_, TestHost>, key: &str, value: Value) -> Value {
-        let entry = object(machine);
+        let entry = ordinary_object(machine);
         let key_str = allocate_string(machine, EcmaString::from_utf8(key)).unwrap();
         machine.set_data_property(entry, "0", key_str).unwrap();
         machine.set_data_property(entry, "1", value).unwrap();
@@ -2594,7 +2578,7 @@ mod tests {
 
     #[test]
     fn from_entries_consumes_generic_iterable() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
 
@@ -2615,7 +2599,7 @@ mod tests {
 
     #[test]
     fn from_entries_accepts_object_shaped_entries() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
 
@@ -2637,7 +2621,7 @@ mod tests {
 
     #[test]
     fn from_entries_rejects_primitive_entries() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
 
@@ -2652,7 +2636,7 @@ mod tests {
 
     #[test]
     fn from_entries_consumes_array_through_protocol() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
 

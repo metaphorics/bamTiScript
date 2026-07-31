@@ -870,60 +870,12 @@ fn entries_iterator<H: Host>(
 
 #[cfg(test)]
 mod tests {
-    use bamts_bytecode::{
-        Constant, ConstantId, Function, FunctionFlags, FunctionId, Instruction, Module, ModuleId,
-        Program, ProgramModule, Verified,
-    };
     use bamts_native::Decoded;
 
+    use super::super::test_support::{TestHost, blank_program, custom_iterable, ordinary_object};
     use super::*;
+    use crate::Limits;
     use crate::intrinsics::BuiltinDef;
-    use crate::{Limits, PropertyMap};
-
-    #[derive(Default)]
-    struct TestHost;
-
-    impl Host for TestHost {}
-
-    fn module() -> Program<Verified> {
-        let code = Module::new(
-            vec![Constant::String(EcmaString::from_utf8("<test>"))],
-            vec![Function::new(
-                None,
-                0,
-                0,
-                1,
-                FunctionFlags::default(),
-                vec![Instruction::Halt],
-                Vec::new(),
-            )],
-            FunctionId::new(0),
-        )
-        .verify()
-        .expect("valid test module");
-        Program::link(
-            vec![ProgramModule {
-                name: ConstantId::new(0),
-                code,
-                edges: Vec::new(),
-                bindings: Vec::new(),
-                exports: Vec::new(),
-            }],
-            ModuleId::new(0),
-        )
-        .expect("valid test program")
-    }
-
-    fn object(machine: &mut Machine<'_, TestHost>) -> Value {
-        machine
-            .allocate(HeapEntry::Object {
-                properties: PropertyMap::default(),
-                prototype: Some(machine.intrinsics.object_prototype),
-                extensible: true,
-                boxed_primitive: None,
-            })
-            .unwrap()
-    }
 
     fn call_array(
         machine: &mut Machine<'_, TestHost>,
@@ -937,99 +889,14 @@ mod tests {
 
     // ---- custom iterable helpers -------------------------------------------
 
-    fn custom_iterator_next<H: Host>(
-        machine: &mut Machine<'_, H>,
-        this: Value,
-        _args: &[Value],
-        _constructing: bool,
-    ) -> Result<BuiltinOutcome, EvalFailure> {
-        let values = machine.get_named_property(this, "_values")?;
-        let index_val = machine.get_named_property(this, "_index")?;
-        let elements = machine.array_elements(values)?.unwrap_or_default();
-        let index = match index_val.decode() {
-            Some(Decoded::Int32(i)) => i as usize,
-            Some(Decoded::Number(n)) => n as usize,
-            _ => 0,
-        };
-        let result = machine
-            .allocate(HeapEntry::Object {
-                properties: PropertyMap::default(),
-                prototype: Some(machine.intrinsics.object_prototype),
-                extensible: true,
-                boxed_primitive: None,
-            })
-            .map_err(EvalFailure::Runtime)?;
-        if index >= elements.len() {
-            machine.set_data_property(result, "done", Value::TRUE)?;
-            machine.set_data_property(result, "value", Value::UNDEFINED)?;
-        } else {
-            machine.set_data_property(result, "done", Value::FALSE)?;
-            machine.set_data_property(result, "value", elements[index])?;
-            machine.set_data_property(this, "_index", Value::int32((index + 1) as u32))?;
-        }
-        Ok(BuiltinOutcome::Value(result))
-    }
-
-    fn custom_iterator_create<H: Host>(
-        machine: &mut Machine<'_, H>,
-        this: Value,
-        _args: &[Value],
-        _constructing: bool,
-    ) -> Result<BuiltinOutcome, EvalFailure> {
-        let iter = machine
-            .allocate(HeapEntry::Object {
-                properties: PropertyMap::default(),
-                prototype: Some(machine.intrinsics.object_prototype),
-                extensible: true,
-                boxed_primitive: None,
-            })
-            .map_err(EvalFailure::Runtime)?;
-        let values = machine.get_named_property(this, "_values")?;
-        let next = machine.get_named_property(this, "_next")?;
-        machine.set_data_property(iter, "_values", values)?;
-        machine.set_data_property(iter, "_index", Value::int32(0))?;
-        machine.set_data_property(iter, "next", next)?;
-        Ok(BuiltinOutcome::Value(iter))
-    }
-
     /// Builds an object with a custom `Symbol.iterator` that yields `values`
     /// in order, bypassing any structural shortcuts.
-    fn custom_iterable(machine: &mut Machine<'_, TestHost>, values: Vec<Value>) -> Value {
-        let next_id = machine.intrinsics.builtins.register(BuiltinDef {
-            name: "custom next",
-            length: 0,
-            handler: custom_iterator_next::<TestHost>,
-        });
-        let next_fn =
-            crate::intrinsics::native_function(&mut machine.heap, next_id, "custom next", 0);
-        let create_id = machine.intrinsics.builtins.register(BuiltinDef {
-            name: "custom iterator",
-            length: 0,
-            handler: custom_iterator_create::<TestHost>,
-        });
-        let create_fn =
-            crate::intrinsics::native_function(&mut machine.heap, create_id, "custom iterator", 0);
-        let iterable = object(machine);
-        let values_array = allocate_array(machine, values).unwrap();
-        machine
-            .set_data_property(iterable, "_values", values_array)
-            .unwrap();
-        machine
-            .set_data_property(iterable, "_next", next_fn)
-            .unwrap();
-        let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
-        let iterator_key = machine.to_property_key(iterator_symbol).unwrap();
-        machine
-            .set_data_property_key(iterable, iterator_key, create_fn)
-            .unwrap();
-        iterable
-    }
 
     // ---- tests -------------------------------------------------------------
 
     #[test]
     fn array_from_observes_custom_iterator_override() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
 
@@ -1094,7 +961,7 @@ mod tests {
             Ok(BuiltinOutcome::Value(Value::int32(e * 100 + i + o)))
         }
 
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
 
@@ -1109,7 +976,7 @@ mod tests {
         });
         let mapper_fn =
             crate::intrinsics::native_function(&mut machine.heap, mapper_id, "mapper", 1);
-        let this_arg = object(&mut machine);
+        let this_arg = ordinary_object(&mut machine);
         machine
             .set_data_property(this_arg, "offset", Value::int32(1000))
             .unwrap();
@@ -1129,7 +996,7 @@ mod tests {
 
     #[test]
     fn array_from_consumes_string_through_protocol() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
 
@@ -1156,11 +1023,11 @@ mod tests {
 
     #[test]
     fn array_from_rejects_non_iterable() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
 
-        let source = object(&mut machine); // no Symbol.iterator
+        let source = ordinary_object(&mut machine); // no Symbol.iterator
         let result = call_array(&mut machine, "from", &[source]);
         assert!(result.is_err());
     }

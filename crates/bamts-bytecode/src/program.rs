@@ -591,6 +591,10 @@ pub enum ProgramVerifyErrorKind {
         binding: BindingId,
         edge: EdgeId,
     },
+    IndirectExportRequiresStaticEdge {
+        export: u32,
+        edge: EdgeId,
+    },
     MissingImportedExport {
         binding: BindingId,
     },
@@ -1223,10 +1227,19 @@ fn verify_module_metadata(
                 }
             }
             ExportSource::Indirect { edge, name } => {
-                if edge.get() as usize >= module.edges.len() {
-                    return Err(module_error(
+                let dependency = module.edges.get(edge.get() as usize).ok_or_else(|| {
+                    module_error(
                         module_id,
                         ProgramVerifyErrorKind::ExportEdgeOutOfBounds {
+                            export: export_id,
+                            edge,
+                        },
+                    )
+                })?;
+                if !dependency.kind.has_static() {
+                    return Err(module_error(
+                        module_id,
+                        ProgramVerifyErrorKind::IndirectExportRequiresStaticEdge {
                             export: export_id,
                             edge,
                         },
@@ -2241,6 +2254,27 @@ mod tests {
                 .unwrap_err()
                 .kind,
             ProgramVerifyErrorKind::IndirectNameNotString { .. }
+        ));
+    }
+
+    #[test]
+    fn indirect_exports_require_static_edges() {
+        let mut module = program_module("main");
+        module.edges.push(Edge {
+            specifier: ConstantId::new(2),
+            target: EdgeTarget::External,
+            kind: EdgeKind::Dynamic,
+        });
+        module.exports[0].source = ExportSource::Indirect {
+            edge: EdgeId::new(0),
+            name: ConstantId::new(1),
+        };
+
+        assert!(matches!(
+            Program::link(vec![module], ModuleId::new(0))
+                .unwrap_err()
+                .kind,
+            ProgramVerifyErrorKind::IndirectExportRequiresStaticEdge { .. }
         ));
     }
 

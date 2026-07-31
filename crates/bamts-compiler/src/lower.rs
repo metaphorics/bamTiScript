@@ -334,13 +334,6 @@ pub(crate) fn assemble_program_module(
 }
 
 /// Assembles a classic script without the final verification pass.
-pub(crate) fn assemble_classic_script(
-    file: &SourceFile,
-    options: LowerOptions,
-) -> Result<Module<bamts_bytecode::Unverified>, LowerError> {
-    assemble_classic_script_named(file, options, "evalmachine.<anonymous>")
-}
-
 pub(crate) fn assemble_classic_script_named(
     file: &SourceFile,
     options: LowerOptions,

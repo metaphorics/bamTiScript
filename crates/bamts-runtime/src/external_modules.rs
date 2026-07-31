@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, mem};
 
 use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
@@ -397,7 +397,7 @@ fn parse_config<H: Host>(
 }
 
 fn object_properties<H: Host>(
-    machine: &Machine<'_, H>,
+    machine: &mut Machine<'_, H>,
     value: Value,
 ) -> Result<BTreeMap<String, Value>, EvalFailure> {
     let Some(index) = machine.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
@@ -406,18 +406,15 @@ fn object_properties<H: Host>(
     let HeapEntry::Object { properties, .. } = &machine.heap[index] else {
         return Err(type_error("parseArgs configuration must be an object"));
     };
+    let keys: Vec<PropertyKey> = properties.iter().map(|(key, _)| key.clone()).collect();
     let mut result = BTreeMap::new();
-    for (key, property) in properties {
-        let PropertyKey::Named(name) = key else {
+    for key in keys {
+        let PropertyKey::Named(name) = &key else {
             continue;
         };
-        let Property::Data { value, .. } = property else {
-            return Err(type_error("parseArgs accessors are unsupported"));
-        };
-        result.insert(
-            strict_host_text(name, "parseArgs option name must be well-formed UTF-16")?,
-            *value,
-        );
+        let name = strict_host_text(name, "parseArgs option name must be well-formed UTF-16")?;
+        let property_value = machine.get_property_key(value, &key)?;
+        result.insert(name, property_value);
     }
     Ok(result)
 }
@@ -522,6 +519,9 @@ fn store_option<H: Host>(
         .runtime_slot(array)
         .map_err(EvalFailure::Runtime)?
         .expect("allocated array is a runtime slot");
+    machine
+        .charge_slot(index, std::mem::size_of::<Value>())
+        .map_err(EvalFailure::Runtime)?;
     let HeapEntry::Array { elements, .. } = &mut machine.heap[index] else {
         unreachable!()
     };
@@ -722,8 +722,7 @@ fn hash_update<H: Host>(
     let Some(text) = args
         .first()
         .and_then(|value| machine.string_text(*value))
-        .map(|text| strict_host_text(text, "hash.update data must be well-formed UTF-16"))
-        .transpose()?
+        .map(EcmaString::to_utf8_lossy)
     else {
         return Err(type_error("hash.update data must be a string"));
     };
@@ -788,10 +787,11 @@ fn hash_digest<H: Host>(
                 return Err(type_error("hash already digested"));
             }
             *digested = true;
-            (algorithm.clone(), data.clone())
+            (algorithm.clone(), mem::take(data))
         }
         _ => return Err(type_error("invalid hash receiver")),
     };
+    machine.refund_slot(index, data.len());
     let digest = machine
         .host
         .hash(&algorithm, &data)
@@ -1180,6 +1180,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_reads_own_accessors_through_vm_get() {
+        let program = blank_program();
+        let mut host = EchoHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let config = config(&mut machine, &["positional"], &[], &[]);
+        let boolean = machine.intrinsics.global("Boolean").unwrap();
+        let index = machine.runtime_slot(config).unwrap().unwrap();
+        let HeapEntry::Object { properties, .. } = &mut machine.heap[index] else {
+            unreachable!()
+        };
+        properties.insert(
+            PropertyKey::Named(EcmaString::from_utf8("strict")),
+            Property::Accessor {
+                getter: Some(boolean),
+                setter: None,
+                enumerable: true,
+                configurable: true,
+            },
+        );
+
+        let result = call_parse_args(&mut machine, config).unwrap();
+        let positionals = array_values(&machine, machine_value(&machine, result, "positionals"));
+        assert_eq!(text(&machine, positionals[0]), "positional");
+    }
+
+    #[test]
     fn parse_args_defaults_strict_and_errors() {
         let program = blank_program();
         let mut host = EchoHost;
@@ -1348,6 +1374,35 @@ mod tests {
     }
 
     #[test]
+    fn repeated_parse_args_values_are_charged_before_retention() {
+        let program = blank_program();
+        let mut host = EchoHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let array = alloc_array(&mut machine, Vec::new()).unwrap();
+        let mut values = BTreeMap::from([("tag".to_owned(), array)]);
+        let spec = OptionSpec {
+            kind: OptionType::String,
+            multiple: true,
+            default: None,
+        };
+        machine.limits.max_heap_bytes = machine.heap_bytes;
+
+        assert!(matches!(
+            store_option(
+                &mut machine,
+                &mut values,
+                "tag",
+                Some(&spec),
+                Value::UNDEFINED,
+            ),
+            Err(EvalFailure::Runtime(
+                RuntimeErrorKind::HeapByteLimitExceeded { .. }
+            ))
+        ));
+        assert!(array_values(&machine, array).is_empty());
+    }
+
+    #[test]
     fn hash_update_digest_encodings_and_reuse_errors() {
         let program = blank_program();
         let mut host = EchoHost;
@@ -1403,6 +1458,42 @@ mod tests {
         assert!(matches!(
             hash_digest(&mut machine, fresh, &[bad_encoding], false),
             Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+    }
+
+    #[test]
+    fn hash_replaces_lone_surrogates_and_releases_digested_payload() {
+        let program = blank_program();
+        let mut host = EchoHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let algorithm = alloc_string(&mut machine, "echo").unwrap();
+        let BuiltinOutcome::Value(hash) =
+            create_hash(&mut machine, Value::UNDEFINED, &[algorithm], false).unwrap()
+        else {
+            unreachable!()
+        };
+        let index = machine.runtime_slot(hash).unwrap().unwrap();
+        let retained_before_update = machine.slot_bytes[index];
+        let lone_surrogate = machine
+            .allocate(HeapEntry::String(EcmaString::from_units(&[0xd800])))
+            .unwrap();
+        hash_update(&mut machine, hash, &[lone_surrogate], false).unwrap();
+        assert_eq!(
+            machine.slot_bytes[index],
+            retained_before_update + "\u{fffd}".len()
+        );
+
+        let output = alloc_string(&mut machine, "hex").unwrap();
+        let BuiltinOutcome::Value(digest) =
+            hash_digest(&mut machine, hash, &[output], false).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(text(&machine, digest), "efbfbd");
+        assert_eq!(machine.slot_bytes[index], retained_before_update);
+        assert!(matches!(
+            &machine.heap[index],
+            HeapEntry::HashState { data, .. } if data.is_empty()
         ));
     }
 

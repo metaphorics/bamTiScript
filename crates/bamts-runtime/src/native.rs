@@ -410,6 +410,60 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         module.get() as usize >= self.machine.borrow().dynamic_base
     }
 
+    /// Builds the root set for the current native activation. The registers are
+    /// driver-stack locals, so they must be copied into the Machine before GC.
+    fn native_root_snapshot(&self, registers: &[Value]) -> Vec<Value> {
+        let activations = self.activations.borrow();
+        let activation = activations
+            .last()
+            .expect("a native root snapshot requires an active activation");
+        let mut roots = Vec::with_capacity(
+            registers.len()
+                + activation.args.len()
+                + 2
+                + usize::from(activation.arguments_object.is_some())
+                + usize::from(activation.pending_resume.is_some())
+                + usize::from(self.pending_throw.get().is_some()),
+        );
+        roots.extend_from_slice(registers);
+        roots.push(activation.this_value);
+        roots.push(activation.new_target);
+        roots.extend_from_slice(&activation.args);
+        roots.extend(activation.arguments_object);
+        roots.extend(activation.pending_resume);
+        roots.extend(self.pending_throw.get().map(|pending| pending.value));
+        roots
+    }
+
+    fn push_native_roots(&self, registers: &[Value]) {
+        let depth = self.activations.borrow().len() - 1;
+        let roots = self.native_root_snapshot(registers);
+        self.machine.borrow_mut().push_native_roots(depth, &roots);
+    }
+
+    fn refresh_native_roots(&self, frame: &NativeFrame<'_>) {
+        let depth = self.activations.borrow().len() - 1;
+        let roots = self.native_root_snapshot(frame.registers());
+        self.machine
+            .borrow_mut()
+            .refresh_native_roots(depth, &roots);
+    }
+
+    fn pop_native_roots(&self) {
+        let depth = self.activations.borrow().len() - 1;
+        self.machine.borrow_mut().pop_native_roots(depth);
+    }
+
+    /// The only re-entrant native-helper boundary. Refresh first because the
+    /// helper may collect before it decodes operands or enters another engine.
+    fn prepare_native_helper(&self, frame: &NativeFrame<'_>) {
+        self.refresh_native_roots(frame);
+        let mut machine = self.machine.borrow_mut();
+        if machine.gc_pending() {
+            machine.collect_if_pending();
+        }
+    }
+
     // -- Reference backend: control-flow driver ------------------------------
 
     /// Executes the program entry with the reference driver, then drives the
@@ -579,8 +633,10 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             arguments_object: None,
             pending_resume: None,
         });
+        self.push_native_roots(&registers);
         let completion =
             self.run_frame(module, function, code, &mut registers, FrameDrive::Ordinary);
+        self.pop_native_roots();
         self.activations.borrow_mut().pop();
         self.machine
             .borrow_mut()
@@ -1117,12 +1173,6 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                             args = Cow::Owned(next_arguments);
                             new_target = Value::UNDEFINED;
                         }
-                        Ok(BuiltinOutcome::ConstructCall { .. }) => {
-                            return InvokeOutcome::Threw(
-                                Value::UNDEFINED,
-                                ThrowOrigin::TypeError { operation: "call" },
-                            );
-                        }
                         Ok(BuiltinOutcome::GeneratorNext {
                             generator,
                             resume_value,
@@ -1611,6 +1661,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             arguments_object: None,
             pending_resume: None,
         });
+        self.push_native_roots(&registers);
         let completion = self.run_frame(
             target.module,
             index,
@@ -1618,6 +1669,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             &mut registers,
             FrameDrive::GeneratorStart,
         );
+        self.pop_native_roots();
         let activation = self
             .activations
             .borrow_mut()
@@ -1651,6 +1703,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             arguments_object: suspended.arguments_object,
             pending_resume: None,
         });
+        self.push_native_roots(&suspended.registers);
         let completion = self.run_frame(
             target.module,
             index,
@@ -1661,6 +1714,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 sent,
             },
         );
+        self.pop_native_roots();
         let activation = self
             .activations
             .borrow_mut()
@@ -1782,6 +1836,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             arguments_object: suspended.arguments_object,
             pending_resume,
         });
+        self.push_native_roots(&suspended.registers);
         let handles = suspended.registers.as_mut_ptr();
         let (invoked, next_token, out) = {
             let mut shadow = ShadowFrame::new(
@@ -1800,6 +1855,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             );
             (invoked, shadow.bytecode_pc, out)
         };
+        self.pop_native_roots();
         let activation = self
             .activations
             .borrow_mut()
@@ -1886,6 +1942,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             arguments_object: None,
             pending_resume: None,
         });
+        self.push_native_roots(&registers);
         let handles = registers.as_mut_ptr();
         let (tag, out) = {
             let mut shadow = ShadowFrame::new(
@@ -1905,6 +1962,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             (tag, out)
         };
         drop(registers);
+        self.pop_native_roots();
         self.activations.borrow_mut().pop();
         self.machine
             .borrow_mut()
@@ -2173,34 +2231,6 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         }));
                         HelperResult::throw(Value::UNDEFINED)
                     }
-                    Ok(BuiltinOutcome::ConstructCall {
-                        callee: continuation,
-                        this_value,
-                        arguments: continuation_arguments,
-                        prototype,
-                    }) => {
-                        let instance = match self
-                            .machine
-                            .borrow_mut()
-                            .allocate_constructed_receiver_with(prototype)
-                        {
-                            Ok(value) => value,
-                            Err(kind) => return self.fatal(kind),
-                        };
-                        let outcome = self.invoke_callee(
-                            continuation,
-                            this_value,
-                            &continuation_arguments,
-                            callee,
-                        );
-                        match outcome {
-                            InvokeOutcome::Value(returned) => {
-                                let is_object = self.machine.borrow().is_object(returned);
-                                HelperResult::normal(if is_object { returned } else { instance })
-                            }
-                            other => self.outcome_result(other),
-                        }
-                    }
                     Err(failure) => self.fail(failure),
                 }
             }
@@ -2394,6 +2424,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             arguments_object: None,
             pending_resume: None,
         });
+        self.push_native_roots(&registers);
         let handles = registers.as_mut_ptr();
         let entries = self.entries;
         let (tag, out, fault_pc) = {
@@ -2405,6 +2436,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             });
             (tag, out, shadow.bytecode_pc as usize)
         };
+        self.pop_native_roots();
         self.activations.borrow_mut().pop();
         self.machine
             .borrow_mut()
@@ -2457,6 +2489,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
     }
 
     fn dispatch(&self, frame: &mut NativeFrame<'_>, call: HelperCall) -> HelperResult {
+        self.prepare_native_helper(frame);
         let module = ModuleId::new(frame.module_id());
         let amount = match call {
             HelperCall::ResumeValue => None,
@@ -2680,7 +2713,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
             HelperCall::LoadGlobal { name } => {
                 let resolved = self
                     .machine
-                    .borrow()
+                    .borrow_mut()
                     .load_global(module, ConstantId::new(name));
                 match resolved {
                     Ok(Some(value)) => self.validated(value),
@@ -2693,7 +2726,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                         }));
                         HelperResult::throw(Value::UNDEFINED)
                     }
-                    Err(kind) => self.fatal(kind),
+                    Err(failure) => self.fail(failure),
                 }
             }
             HelperCall::StoreGlobal { name, value } => {
@@ -2709,12 +2742,12 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
             HelperCall::TypeOfGlobal { name } => {
                 let resolved = self
                     .machine
-                    .borrow()
+                    .borrow_mut()
                     .load_global(module, ConstantId::new(name));
                 let text = match resolved {
                     Ok(Some(value)) => EcmaString::from_utf8(self.machine.borrow().type_of(value)),
                     Ok(None) => EcmaString::from_utf8("undefined"),
-                    Err(kind) => return self.fatal(kind),
+                    Err(failure) => return self.fail(failure),
                 };
                 self.allocated(HeapEntry::String(text))
             }
@@ -5208,6 +5241,14 @@ mod tests {
         ));
 
         let mut registers = [Value::UNINITIALIZED; 3];
+        engine.activations.borrow_mut().push(Activation {
+            this_value: Value::UNDEFINED,
+            new_target: Value::UNDEFINED,
+            args: Vec::new(),
+            arguments_object: None,
+            pending_resume: None,
+        });
+        engine.push_native_roots(&registers);
         let handles = registers.as_mut_ptr();
         let mut shadow =
             ShadowFrame::new(std::ptr::null_mut(), 0, 0, handles, registers.len() as u16);
@@ -5219,6 +5260,8 @@ mod tests {
         assert_eq!(second.tag, CompletionTag::Normal);
         assert_eq!(first.value, second.value);
         assert_eq!(entries.invoked.borrow().as_slice(), &[(1, 0)]);
+        engine.pop_native_roots();
+        engine.activations.borrow_mut().pop();
     }
 
     #[test]
@@ -6272,22 +6315,38 @@ mod tests {
             Limits::default(),
             Backend::Linked,
         );
+        let resumed_value = engine
+            .machine
+            .borrow_mut()
+            .allocate(HeapEntry::String(EcmaString::from_utf8("resume")))
+            .unwrap();
         engine.activations.borrow_mut().push(Activation {
             this_value: Value::UNDEFINED,
             new_target: Value::UNDEFINED,
             args: Vec::new(),
             arguments_object: None,
-            pending_resume: Some(Value::int32(77)),
+            pending_resume: Some(resumed_value),
         });
         let mut registers = vec![Value::UNINITIALIZED];
+        engine.push_native_roots(&registers);
+        engine.machine.borrow_mut().set_gc_watermarks_for_test(0, 0);
         let mut shadow = ShadowFrame::new(std::ptr::null_mut(), 2, 0, registers.as_mut_ptr(), 1);
         let mut frame = NativeFrame::new(&mut shadow, &mut registers).unwrap();
         let resumed = engine.dispatch(&mut frame, HelperCall::ResumeValue);
-        assert_eq!(resumed, HelperResult::normal(Value::int32(77)));
+        assert_eq!(resumed, HelperResult::normal(resumed_value));
+        assert!(
+            engine
+                .machine
+                .borrow()
+                .runtime_slot(resumed_value)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(
             engine.dispatch(&mut frame, HelperCall::ResumeValue).tag,
             CompletionTag::FatalTrap
         );
+        engine.pop_native_roots();
         engine.activations.borrow_mut().pop();
     }
 
@@ -6380,6 +6439,14 @@ mod tests {
             Backend::Reference,
         );
         let mut registers = vec![Value::UNINITIALIZED];
+        engine.activations.borrow_mut().push(Activation {
+            this_value: Value::UNDEFINED,
+            new_target: Value::UNDEFINED,
+            args: Vec::new(),
+            arguments_object: None,
+            pending_resume: None,
+        });
+        engine.push_native_roots(&registers);
         let mut shadow = ShadowFrame::new(std::ptr::null_mut(), 0, 0, registers.as_mut_ptr(), 1);
         let mut frame = NativeFrame::new(&mut shadow, &mut registers).unwrap();
         let created = engine.dispatch(&mut frame, HelperCall::CreateCell);
@@ -6399,5 +6466,75 @@ mod tests {
                 ..
             })
         ));
+        engine.pop_native_roots();
+        engine.activations.borrow_mut().pop();
+    }
+
+    #[test]
+    fn native_root_snapshot_retains_activation_values_through_collection() {
+        let program = trivial_program();
+        let entries = NoEntries;
+        let mut host = SilentHost;
+        let engine = NativeEngine::build(
+            &program,
+            &entries,
+            &mut host,
+            Limits::default(),
+            Backend::Linked,
+        );
+        let values = {
+            let mut machine = engine.machine.borrow_mut();
+            [
+                "register",
+                "this",
+                "new.target",
+                "argument",
+                "arguments",
+                "resume",
+                "throw",
+            ]
+            .map(|text| {
+                machine
+                    .allocate(HeapEntry::String(EcmaString::from_utf8(text)))
+                    .unwrap()
+            })
+        };
+        engine.activations.borrow_mut().push(Activation {
+            this_value: values[1],
+            new_target: values[2],
+            args: vec![values[3]],
+            arguments_object: Some(values[4]),
+            pending_resume: Some(values[5]),
+        });
+        engine.pending_throw.set(Some(PendingThrow {
+            value: values[6],
+            origin: ThrowOrigin::Bytecode,
+        }));
+        let mut registers = [values[0]];
+        engine.push_native_roots(&registers);
+        let mut shadow = ShadowFrame::new(
+            std::ptr::null_mut(),
+            0,
+            0,
+            registers.as_mut_ptr(),
+            registers.len() as u16,
+        );
+        let frame = NativeFrame::new(&mut shadow, &mut registers).unwrap();
+        engine.machine.borrow_mut().set_gc_watermarks_for_test(0, 0);
+        engine.prepare_native_helper(&frame);
+
+        for value in values {
+            assert!(
+                engine
+                    .machine
+                    .borrow()
+                    .runtime_slot(value)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        engine.pop_native_roots();
+        engine.activations.borrow_mut().pop();
+        assert!(engine.machine.borrow().native_roots.is_empty());
     }
 }

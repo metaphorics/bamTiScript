@@ -5,14 +5,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 const EXPECTED_STDOUT: &[u8] = b"hello from bamts\n";
 const UTF16_PROGRAM: &str = r#"const s = "\uD800";
-console.log(s.length);
-console.log(s.charCodeAt(0).toString(16));
-console.log(s.codePointAt(0).toString(16));
-console.log(/./gu.exec("\u{1F600}")[0].length);
-console.log("\u{10003}" < "\u{E000}");
+process.stdout.write(String(s.length) + "\n");
+process.stdout.write(s.charCodeAt(0).toString(16) + "\n");
+process.stdout.write(s.codePointAt(0).toString(16) + "\n");
+process.stdout.write(String(/./gu.exec("\u{1F600}")[0].length) + "\n");
+process.stdout.write(String("\u{10003}" < "\u{E000}") + "\n");
 const key = Object.keys({["\u{1F600}"]: 3})[0];
-console.log(key.length);
-console.log(key.codePointAt(0).toString(16));
+process.stdout.write(String(key.length) + "\n");
+process.stdout.write(key.codePointAt(0).toString(16) + "\n");
 "#;
 const UTF16_STDOUT: &[u8] = b"1\nd800\nd800\n2\ntrue\n2\n1f600\n";
 const CALLABLE_PROGRAM: &str = r#"function probe(a: unknown, b: unknown) {
@@ -65,7 +65,9 @@ static NEXT_DIRECTORY: AtomicU32 = AtomicU32::new(0);
 
 #[test]
 fn run_fixture_preserves_stdout_and_exit_code() {
-    let output = Command::new(bamts_binary())
+    let directory = ScratchDirectory::new();
+    let output = directory
+        .command()
         .args(["run", "--target", "jit"])
         .arg(fixture())
         .output()
@@ -80,11 +82,11 @@ fn aot_fixture_matches_jit_stdout_and_exit_code() {
     let executable = directory
         .path
         .join(format!("hello{}", std::env::consts::EXE_SUFFIX));
-    let compile = Command::new(bamts_binary())
+    let compile = directory
+        .command()
         .args(["compile", "--target", "aot", "--output"])
         .arg(&executable)
         .arg(fixture())
-        .env("BAMTS_CACHE_DIR", directory.path.join("cache"))
         .output()
         .expect("bamts compile starts");
     assert_success(&compile, "bamts compile --target aot");
@@ -105,7 +107,8 @@ fn jit_runs_two_module_program_with_live_imported_mutation() {
         "import { value } from './dependency.js'; console.log(value);\n",
     );
 
-    let output = Command::new(bamts_binary())
+    let output = project
+        .command()
         .args(["run", "--target", "jit", "main.ts"])
         .current_dir(&project.path)
         .output()
@@ -127,12 +130,12 @@ fn aot_runs_two_module_program_with_live_imported_mutation() {
         .path
         .join(format!("two-module{}", std::env::consts::EXE_SUFFIX));
 
-    let compile = Command::new(bamts_binary())
+    let compile = project
+        .command()
         .args(["compile", "--target", "aot", "--output"])
         .arg(&executable)
         .arg("main.ts")
         .current_dir(&project.path)
-        .env("BAMTS_CACHE_DIR", project.path.join("cache"))
         .output()
         .expect("bamts AOT compile starts");
     assert_success(&compile, "bamts compile two-module AOT");
@@ -149,7 +152,8 @@ fn jit_preserves_lone_surrogates_end_to_end() {
     let project = ScratchDirectory::new();
     project.write("main.ts", UTF16_PROGRAM);
 
-    let output = Command::new(bamts_binary())
+    let output = project
+        .command()
         .args(["run", "--target", "jit", "main.ts"])
         .current_dir(&project.path)
         .output()
@@ -167,12 +171,12 @@ fn aot_preserves_lone_surrogates_end_to_end() {
         .path
         .join(format!("utf16{}", std::env::consts::EXE_SUFFIX));
 
-    let compile = Command::new(bamts_binary())
+    let compile = project
+        .command()
         .args(["compile", "--target", "aot", "--output"])
         .arg(&executable)
         .arg("main.ts")
         .current_dir(&project.path)
-        .env("BAMTS_CACHE_DIR", project.path.join("cache"))
         .output()
         .expect("bamts AOT compile starts");
     assert_success(&compile, "bamts compile UTF-16 AOT");
@@ -189,7 +193,8 @@ fn jit_supports_apply_and_bound_callables() {
     let project = ScratchDirectory::new();
     project.write("main.ts", CALLABLE_PROGRAM);
 
-    let output = Command::new(bamts_binary())
+    let output = project
+        .command()
         .args(["run", "--target", "jit", "main.ts"])
         .current_dir(&project.path)
         .output()
@@ -207,12 +212,12 @@ fn aot_supports_apply_and_bound_callables() {
         .path
         .join(format!("callable{}", std::env::consts::EXE_SUFFIX));
 
-    let compile = Command::new(bamts_binary())
+    let compile = project
+        .command()
         .args(["compile", "--target", "aot", "--output"])
         .arg(&executable)
         .arg("main.ts")
         .current_dir(&project.path)
-        .env("BAMTS_CACHE_DIR", project.path.join("cache"))
         .output()
         .expect("bamts callable AOT compile starts");
     assert_success(&compile, "bamts compile callable AOT");
@@ -232,12 +237,12 @@ fn aot_runs_node_vm_in_new_context() {
         .path
         .join(format!("node-vm{}", std::env::consts::EXE_SUFFIX));
 
-    let compile = Command::new(bamts_binary())
+    let compile = project
+        .command()
         .args(["compile", "--target", "aot", "--output"])
         .arg(&executable)
         .arg("main.ts")
         .current_dir(&project.path)
-        .env("BAMTS_CACHE_DIR", project.path.join("cache"))
         .output()
         .expect("bamts node:vm AOT compile starts");
     assert_success(&compile, "bamts compile node:vm AOT");
@@ -385,8 +390,14 @@ impl ScratchDirectory {
         fs::write(path, source).expect("fixture source is written");
     }
 
+    fn command(&self) -> Command {
+        let mut command = Command::new(bamts_binary());
+        command.env("BAMTS_CACHE_DIR", self.path.join("cache"));
+        command
+    }
+
     fn check(&self, entrypoint: &str) -> Output {
-        Command::new(bamts_binary())
+        self.command()
             .args(["check", "--diagnostics-format", "text", entrypoint])
             .current_dir(&self.path)
             .output()
@@ -394,7 +405,7 @@ impl ScratchDirectory {
     }
 
     fn check_from(&self, directory: &str, entrypoint: &str) -> Output {
-        Command::new(bamts_binary())
+        self.command()
             .args(["check", "--diagnostics-format", "text", entrypoint])
             .current_dir(self.path.join(directory))
             .output()
