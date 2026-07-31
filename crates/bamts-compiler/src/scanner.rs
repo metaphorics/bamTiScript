@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
 use crate::source::{ScriptKind, SourceId, SourceText, TextRange, Utf16Pos};
-use crate::syntax::{Token, TokenKind};
+use crate::syntax::{Token, TokenKind, cook_identifier_text};
 
 /// Unterminated string literal.
 const UNTERMINATED_STRING: DiagnosticCode = DiagnosticCode::new("BAMTS-L001");
@@ -738,12 +738,19 @@ impl<'a> Scanner<'a> {
             }
         }
 
-        // Escaped identifiers are never keywords, matching the ECMAScript rule
-        // that a reserved word spelled with escapes is an ordinary identifier.
+        let word = &self.text[start_b..self.byte_pos];
         if had_escape {
+            let Some(cooked) = cook_identifier_text(word) else {
+                return TokenKind::Identifier;
+            };
+            if is_unconditional_reserved_word(&cooked) {
+                return TokenKind::EscapedReservedWord;
+            }
+            if matches!(cooked.as_ref(), "await" | "yield") {
+                return TokenKind::EscapedContextualKeyword;
+            }
             return TokenKind::Identifier;
         }
-        let word = &self.text[start_b..self.byte_pos];
         keyword_kind(word).unwrap_or(TokenKind::Identifier)
     }
 
@@ -1198,6 +1205,49 @@ fn is_id_continue(c: char) -> bool {
     c == '$' || c == '_' || c == '\u{200C}' || c == '\u{200D}' || c.is_alphanumeric()
 }
 
+/// Returns whether an escaped identifier spells an unconditional reserved word.
+fn is_unconditional_reserved_word(word: &str) -> bool {
+    matches!(
+        word,
+        "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "const"
+            | "continue"
+            | "debugger"
+            | "default"
+            | "delete"
+            | "do"
+            | "else"
+            | "enum"
+            | "export"
+            | "extends"
+            | "false"
+            | "finally"
+            | "for"
+            | "function"
+            | "if"
+            | "import"
+            | "in"
+            | "instanceof"
+            | "new"
+            | "null"
+            | "return"
+            | "super"
+            | "switch"
+            | "this"
+            | "throw"
+            | "true"
+            | "try"
+            | "typeof"
+            | "var"
+            | "void"
+            | "while"
+            | "with"
+    )
+}
+
 /// Maps a raw, escape-free identifier lexeme to its reserved or contextual
 /// keyword token, if any. The parser decides where contextual keywords are used
 /// as ordinary identifiers.
@@ -1359,6 +1409,28 @@ mod tests {
     }
 
     #[test]
+    fn escaped_reserved_word_keeps_identifier_name_context() {
+        let recovered = scan_text("\\u0069f");
+        assert!(recovered.diagnostics().is_empty());
+        assert_eq!(
+            recovered.product().tokens()[0].kind(),
+            TokenKind::EscapedReservedWord
+        );
+    }
+
+    #[test]
+    fn escaped_await_and_yield_retain_parser_context() {
+        assert_eq!(
+            kinds("aw\\u0061it"),
+            vec![TokenKind::EscapedContextualKeyword]
+        );
+        assert_eq!(
+            kinds("yi\\u0065ld"),
+            vec![TokenKind::EscapedContextualKeyword]
+        );
+    }
+
+    #[test]
     fn empty_source_has_only_eof() {
         let product = scan_text("").into_product();
         assert!(product.tokens().is_empty());
@@ -1417,11 +1489,10 @@ mod tests {
     }
 
     #[test]
-    fn escaped_keyword_is_an_identifier() {
-        // `\u{69}f` spells `if` but escapes disqualify it from being a keyword.
+    fn escaped_keyword_preserves_identifier_name_context() {
         let tokens = significant(r"\u{69}f");
         assert_eq!(tokens.len(), 1);
-        assert_eq!(tokens[0].0, TokenKind::Identifier);
+        assert_eq!(tokens[0].0, TokenKind::EscapedReservedWord);
     }
 
     #[test]

@@ -2264,9 +2264,9 @@ fn normalized_module_name(root: &ProjectRoot, path: &Path) -> Option<String> {
 }
 
 fn identifier(file: &SourceFile, node: &crate::syntax::IdentifierNode) -> String {
-    file.token_text(node.data().token())
+    file.identifier_text(node.data().token())
         .expect("parser identifier range belongs to its source")
-        .to_owned()
+        .into_owned()
 }
 
 fn metadata_string_literal(

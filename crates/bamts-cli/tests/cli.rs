@@ -279,6 +279,30 @@ continue-outer:1,crossed-inner:0,crossed-outer:0,switch\n";
 }
 
 #[test]
+fn aot_and_jit_share_escaped_identifier_identity() {
+    let project = ScratchDirectory::new();
+    project.write("dependency.ts", "export const \\u0076alue = 41;\n");
+    project.write(
+        "main.ts",
+        r#"import { value as \u0061lias } from "./dependency.ts";
+const increment = (\u{0000006e}: number) => n + 1;
+process.stdout.write(String(increment(alias)) + "\n");
+"#,
+    );
+
+    for target in ["jit", "aot"] {
+        let output = project
+            .command()
+            .args(["run", "--target", target, "main.ts"])
+            .current_dir(&project.path)
+            .output()
+            .unwrap_or_else(|error| panic!("bamts {target} escaped-name program starts: {error}"));
+        assert_success(&output, &format!("bamts {target} escaped-name program"));
+        assert_eq!(output.stdout, b"42\n", "{target}");
+    }
+}
+
+#[test]
 fn aot_fixture_matches_jit_stdout_and_exit_code() {
     let directory = ScratchDirectory::new();
     let executable = directory

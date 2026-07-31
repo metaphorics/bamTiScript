@@ -40,6 +40,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
@@ -177,8 +178,6 @@ pub enum UnsupportedConstruct {
     DynamicImportInScript,
     /// `import.meta` (no host meta-object primitive).
     ImportMeta,
-    /// An identifier spelled with unicode escape sequences.
-    EscapedIdentifier,
     /// A `return` at module top level.
     ReturnOutsideFunction,
     /// A derived constructor that is not an implicit constructor or a single
@@ -260,7 +259,6 @@ impl fmt::Display for UnsupportedConstruct {
             Self::ExportDeclarationInScript => "`export` declaration in a classic script",
             Self::DynamicImportInScript => "dynamic `import()` in a classic script",
             Self::ImportMeta => "`import.meta` meta property",
-            Self::EscapedIdentifier => "identifier containing escape sequences",
             Self::ReturnOutsideFunction => "top-level `return`",
             Self::DerivedConstructorShape => {
                 "derived constructor without one direct `super(...)` call"
@@ -856,15 +854,10 @@ impl<'a> FunctionContext<'a> {
         if token.is_missing() {
             return Err(self.missing(identifier.range(), NodeKind::Identifier));
         }
-        let Some(text) = self.file.token_text(token) else {
+        let Some(text) = self.file.identifier_text(token) else {
             return Err(self.missing(identifier.range(), NodeKind::Identifier));
         };
-        if text.contains('\\') {
-            return Err(
-                self.unsupported(identifier.range(), UnsupportedConstruct::EscapedIdentifier)
-            );
-        }
-        Ok(text.to_owned())
+        Ok(text.into_owned())
     }
 
     fn private_text(&self, private: &PrivateIdentifierNode) -> Result<String, LowerError> {
@@ -6726,13 +6719,13 @@ pub(crate) fn collect_pattern_names(file: &SourceFile, pattern: &Pattern, names:
     }
 }
 
-/// The raw text of an identifier node, or `None` for a missing token.
+/// The cooked identity of an identifier node, or `None` for a missing token.
 fn identifier_name(file: &SourceFile, identifier: &IdentifierNode) -> Option<String> {
     let token = identifier.data().token();
     if token.is_missing() {
         return None;
     }
-    file.token_text(token).map(str::to_owned)
+    file.identifier_text(token).map(Cow::into_owned)
 }
 
 /// The raw text of a private identifier (`#name`), or `None` for a missing

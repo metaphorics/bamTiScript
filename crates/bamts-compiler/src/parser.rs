@@ -80,7 +80,7 @@ use crate::syntax::{
     TypeParameterNode, TypePredicate, TypePropertySignature, TypeQuery, TypeReference,
     UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclaration,
     VariableDeclarator, VariableDeclaratorNode, VariableKind, Variance, WhileStatement,
-    WithStatement, YieldExpression,
+    WithStatement, YieldExpression, cook_identifier_text,
 };
 
 /// A token of one kind was required by the grammar but absent.
@@ -197,6 +197,12 @@ struct ParserCheckpoint {
     journal: usize,
 }
 
+#[derive(Clone, Copy, Default)]
+struct KeywordContext {
+    await_reserved: bool,
+    yield_reserved: bool,
+}
+
 struct Parser {
     source_id: SourceId,
     script_kind: ScriptKind,
@@ -211,6 +217,7 @@ struct Parser {
     next_node_id: u32,
     journal: Vec<RescanEdit>,
     depth: u32,
+    keyword_context: KeywordContext,
 }
 
 fn is_trivia(kind: TokenKind) -> bool {
@@ -244,6 +251,7 @@ fn is_identifier_like(kind: TokenKind) -> bool {
     matches!(
         kind,
         TokenKind::Identifier
+            | TokenKind::EscapedContextualKeyword
             | TokenKind::KwAbstract
             | TokenKind::KwAccessor
             | TokenKind::KwAny
@@ -291,6 +299,7 @@ fn is_identifier_like(kind: TokenKind) -> bool {
 /// object literal, or as a class member name. Every keyword qualifies.
 fn is_any_word(kind: TokenKind) -> bool {
     is_identifier_like(kind)
+        || kind == TokenKind::EscapedReservedWord
         || matches!(
             kind,
             TokenKind::KwBreak
@@ -352,6 +361,7 @@ impl Parser {
             next_node_id: 0,
             journal: Vec::new(),
             depth: 0,
+            keyword_context: KeywordContext::default(),
         };
         parser.cursor = parser.next_significant(0);
         parser
@@ -561,8 +571,46 @@ impl Parser {
         let range = token.range();
         self.node_at(range, Identifier::new(token))
     }
+    fn with_keyword_context<T>(
+        &mut self,
+        context: KeywordContext,
+        parse: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let previous = std::mem::replace(&mut self.keyword_context, context);
+        let result = parse(self);
+        self.keyword_context = previous;
+        result
+    }
+
+    fn escaped_identifier_is_reserved(&self, token: Token) -> bool {
+        match token.kind() {
+            TokenKind::EscapedReservedWord => true,
+            TokenKind::EscapedContextualKeyword => {
+                let cooked = cook_identifier_text(self.lexeme(token));
+                matches!(cooked.as_deref(), Some("await")) && self.keyword_context.await_reserved
+                    || matches!(cooked.as_deref(), Some("yield"))
+                        && self.keyword_context.yield_reserved
+            }
+            _ => false,
+        }
+    }
+
+    fn reject_reserved_identifier(&mut self, token: Token) {
+        if self.escaped_identifier_is_reserved(token) {
+            self.error_at(
+                EXPECTED_IDENTIFIER,
+                token.range(),
+                "an escaped reserved word cannot be used as an identifier",
+            );
+        }
+    }
 
     fn ident_from(&mut self, token: Token) -> IdentifierNode {
+        self.reject_reserved_identifier(token);
+        self.identifier_name_from(token)
+    }
+
+    fn identifier_name_from(&mut self, token: Token) -> IdentifierNode {
         let range = token.range();
         self.node_at(range, Identifier::new(token))
     }
@@ -1985,11 +2033,18 @@ impl Parser {
 
         // Method, getter, or setter.
         if self.at(TokenKind::LParen) || self.at_less_like() || is_generator {
+            let keyword_context = KeywordContext {
+                await_reserved: is_async,
+                yield_reserved: is_generator,
+            };
             let type_parameters = self.parse_optional_type_parameters();
-            let parameters = self.parse_parameter_list();
+            let parameters =
+                self.with_keyword_context(keyword_context, |this| this.parse_parameter_list());
             let return_type = self.parse_optional_type_annotation();
             let body = if self.at(TokenKind::LBrace) {
-                Some(FunctionBody::Block(self.parse_block()))
+                Some(FunctionBody::Block(
+                    self.with_keyword_context(keyword_context, Self::parse_block),
+                ))
             } else {
                 self.expect_semicolon();
                 None
@@ -2486,7 +2541,7 @@ impl Parser {
         }
         if is_any_word(self.kind()) {
             let token = self.bump();
-            return ModuleExportName::Identifier(self.ident_from(token));
+            return ModuleExportName::Identifier(self.identifier_name_from(token));
         }
         self.error_here(EXPECTED_IDENTIFIER, "expected a module export name");
         ModuleExportName::Missing(MissingNode::new(NodeKind::Identifier))
@@ -2775,6 +2830,13 @@ impl Parser {
         } else {
             (None, None)
         };
+        if source.is_none() {
+            for specifier in &specifiers {
+                if let ModuleExportName::Identifier(local) = &specifier.data().local {
+                    self.reject_reserved_identifier(*local.data().token());
+                }
+            }
+        }
         self.expect_semicolon();
         self.node(
             start,
@@ -3477,7 +3539,7 @@ impl Parser {
         }
         if is_any_word(self.kind()) {
             let token = self.bump();
-            return MemberProperty::Named(self.ident_from(token));
+            return MemberProperty::Named(self.identifier_name_from(token));
         }
         self.error_here(EXPECTED_IDENTIFIER, "expected a property name");
         MemberProperty::Named(self.missing_ident())
@@ -3788,11 +3850,18 @@ impl Parser {
 
         // Method.
         if self.at(TokenKind::LParen) || self.at_less_like() {
+            let keyword_context = KeywordContext {
+                await_reserved: is_async,
+                yield_reserved: is_generator,
+            };
             let type_parameters = self.parse_optional_type_parameters();
-            let parameters = self.parse_parameter_list();
+            let parameters =
+                self.with_keyword_context(keyword_context, |this| this.parse_parameter_list());
             let return_type = self.parse_optional_type_annotation();
             let body = if self.at(TokenKind::LBrace) {
-                Some(FunctionBody::Block(self.parse_block()))
+                Some(FunctionBody::Block(
+                    self.with_keyword_context(keyword_context, Self::parse_block),
+                ))
             } else {
                 self.error_here(EXPECTED_TOKEN, "expected a method body");
                 None
@@ -3906,7 +3975,7 @@ impl Parser {
             }
             kind if is_any_word(kind) => {
                 let token = self.bump();
-                PropertyName::Identifier(self.ident_from(token))
+                PropertyName::Identifier(self.identifier_name_from(token))
             }
             _ => {
                 self.error_here(EXPECTED_PROPERTY_NAME, "expected a property name");
@@ -4165,11 +4234,18 @@ impl Parser {
             }
             None
         };
+        let keyword_context = KeywordContext {
+            await_reserved: is_async,
+            yield_reserved: is_generator,
+        };
         let type_parameters = self.parse_optional_type_parameters();
-        let parameters = self.parse_parameter_list();
+        let parameters =
+            self.with_keyword_context(keyword_context, |this| this.parse_parameter_list());
         let return_type = self.parse_optional_type_annotation();
         let body = if self.at(TokenKind::LBrace) {
-            Some(FunctionBody::Block(self.parse_block()))
+            Some(FunctionBody::Block(
+                self.with_keyword_context(keyword_context, Self::parse_block),
+            ))
         } else {
             self.expect_semicolon();
             None
@@ -4381,9 +4457,13 @@ impl Parser {
     }
 
     fn parse_simple_arrow(&mut self, start: Utf16Pos, is_async: bool, no_in: bool) -> Expr {
+        let keyword_context = KeywordContext {
+            await_reserved: is_async,
+            yield_reserved: false,
+        };
         let param_start = self.cur_start();
         let token = self.bump();
-        let name = self.ident_from(token);
+        let name = self.with_keyword_context(keyword_context, |this| this.ident_from(token));
         let binding = self.node(param_start, BindingPattern::Identifier(name));
         let parameter = self.node(
             param_start,
@@ -4397,7 +4477,7 @@ impl Parser {
             },
         );
         self.expect(TokenKind::Arrow, "expected `=>`");
-        let body = self.parse_arrow_body(no_in);
+        let body = self.parse_arrow_body(no_in, keyword_context);
         self.node(
             start,
             Expression::Arrow(ArrowFunction {
@@ -4411,10 +4491,15 @@ impl Parser {
     }
 
     fn parse_paren_arrow(&mut self, start: Utf16Pos, is_async: bool, no_in: bool) -> Expr {
-        let parameters = self.parse_parameter_list();
+        let keyword_context = KeywordContext {
+            await_reserved: is_async,
+            yield_reserved: false,
+        };
+        let parameters =
+            self.with_keyword_context(keyword_context, |this| this.parse_parameter_list());
         let return_type = self.parse_optional_type_annotation();
         self.expect(TokenKind::Arrow, "expected `=>`");
-        let body = self.parse_arrow_body(no_in);
+        let body = self.parse_arrow_body(no_in, keyword_context);
         self.node(
             start,
             Expression::Arrow(ArrowFunction {
@@ -4427,12 +4512,14 @@ impl Parser {
         )
     }
 
-    fn parse_arrow_body(&mut self, no_in: bool) -> FunctionBody {
-        if self.at(TokenKind::LBrace) {
-            FunctionBody::Block(self.parse_block())
-        } else {
-            FunctionBody::Expression(Box::new(self.parse_assignment_expression(no_in)))
-        }
+    fn parse_arrow_body(&mut self, no_in: bool, keyword_context: KeywordContext) -> FunctionBody {
+        self.with_keyword_context(keyword_context, |this| {
+            if this.at(TokenKind::LBrace) {
+                FunctionBody::Block(this.parse_block())
+            } else {
+                FunctionBody::Expression(Box::new(this.parse_assignment_expression(no_in)))
+            }
+        })
     }
 
     fn speculate_paren_arrow(
@@ -4442,14 +4529,19 @@ impl Parser {
         no_in: bool,
     ) -> Option<Expr> {
         let checkpoint = self.checkpoint();
-        let parameters = self.parse_parameter_list();
+        let keyword_context = KeywordContext {
+            await_reserved: is_async,
+            yield_reserved: false,
+        };
+        let parameters =
+            self.with_keyword_context(keyword_context, |this| this.parse_parameter_list());
         let return_type = self.parse_optional_type_annotation();
         if !self.at(TokenKind::Arrow) || self.has_newline_before() {
             self.rollback(checkpoint);
             return None;
         }
         self.bump();
-        let body = self.parse_arrow_body(no_in);
+        let body = self.parse_arrow_body(no_in, keyword_context);
         Some(self.node(
             start,
             Expression::Arrow(ArrowFunction {
@@ -4465,14 +4557,19 @@ impl Parser {
     fn speculate_async_paren_arrow(&mut self, start: Utf16Pos, no_in: bool) -> Option<Expr> {
         let checkpoint = self.checkpoint();
         self.bump(); // `async`
-        let parameters = self.parse_parameter_list();
+        let keyword_context = KeywordContext {
+            await_reserved: true,
+            yield_reserved: false,
+        };
+        let parameters =
+            self.with_keyword_context(keyword_context, |this| this.parse_parameter_list());
         let return_type = self.parse_optional_type_annotation();
         if !self.at(TokenKind::Arrow) || self.has_newline_before() {
             self.rollback(checkpoint);
             return None;
         }
         self.bump();
-        let body = self.parse_arrow_body(no_in);
+        let body = self.parse_arrow_body(no_in, keyword_context);
         Some(self.node(
             start,
             Expression::Arrow(ArrowFunction {
@@ -4500,14 +4597,19 @@ impl Parser {
             self.rollback(checkpoint);
             return None;
         }
-        let parameters = self.parse_parameter_list();
+        let keyword_context = KeywordContext {
+            await_reserved: is_async,
+            yield_reserved: false,
+        };
+        let parameters =
+            self.with_keyword_context(keyword_context, |this| this.parse_parameter_list());
         let return_type = self.parse_optional_type_annotation();
         if !self.at(TokenKind::Arrow) || self.has_newline_before() {
             self.rollback(checkpoint);
             return None;
         }
         self.bump();
-        let body = self.parse_arrow_body(no_in);
+        let body = self.parse_arrow_body(no_in, keyword_context);
         Some(self.node(
             start,
             Expression::Arrow(ArrowFunction {
@@ -5805,6 +5907,23 @@ mod tests {
         let mut sorted = diagnostics.to_vec();
         sorted.sort();
         assert_eq!(sorted.as_slice(), diagnostics);
+    }
+
+    #[test]
+    fn escaped_keywords_obey_identifier_context() {
+        assert!(!errors(&parse_ts("const \\u0069f = 1;")).is_empty());
+        assert!(!errors(&parse_ts("\\u0069f (true) {}")).is_empty());
+        assert!(!errors(&parse_ts("function* g() { \\u0079ield; }")).is_empty());
+        assert!(!errors(&parse_ts("async function f() { \\u0061wait; }")).is_empty());
+        assert!(!errors(&parse_ts("const value = { \\u0069f };")).is_empty());
+        assert!(!errors(&parse_ts("import { \\u0069f } from 'm';")).is_empty());
+        assert!(!errors(&parse_ts("export { \\u0069f };")).is_empty());
+
+        assert!(errors(&parse_ts("const \\u0061wait = 1; const \\u0079ield = 2;")).is_empty());
+        assert!(errors(&parse_ts("const value = { \\u0069f: 1 }; value.\\u0069f;")).is_empty());
+        assert!(errors(&parse_ts("import { \\u0069f as value } from 'm';")).is_empty());
+        assert!(errors(&parse_ts("const value = 1; export { value as \\u0069f };")).is_empty());
+        assert!(errors(&parse_ts("export { \\u0069f } from 'm';")).is_empty());
     }
 
     #[test]

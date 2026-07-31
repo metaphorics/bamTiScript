@@ -13,6 +13,7 @@
 #[path = "checker/intrinsic_environment.rs"]
 mod intrinsic_environment;
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
@@ -1153,8 +1154,10 @@ impl<'src> Checker<'src> {
         self.source.token_text(token).unwrap_or("")
     }
 
-    fn identifier_text(&self, identifier: &IdentifierNode) -> &'src str {
-        self.text(identifier.data().token())
+    fn identifier_text(&self, identifier: &IdentifierNode) -> Cow<'src, str> {
+        self.source
+            .identifier_text(identifier.data().token())
+            .unwrap_or_default()
     }
 
     fn new_scope(&mut self, kind: ScopeKind, parent: Option<ScopeId>) -> ScopeId {
@@ -1301,7 +1304,7 @@ impl<'src> Checker<'src> {
             Statement::Function(function) => {
                 if let Some(name) = &function.function.name {
                     self.declare(
-                        self.identifier_text(name),
+                        &self.identifier_text(name),
                         SymbolKind::Function,
                         scope,
                         statement.id(),
@@ -1376,7 +1379,7 @@ impl<'src> Checker<'src> {
             Statement::Function(function) => {
                 if let Some(name) = &function.function.name {
                     self.declare(
-                        self.identifier_text(name),
+                        &self.identifier_text(name),
                         SymbolKind::Function,
                         scope,
                         declaration,
@@ -1387,7 +1390,7 @@ impl<'src> Checker<'src> {
             Statement::Class(class) => {
                 if let Some(name) = &class.name {
                     self.declare(
-                        self.identifier_text(name),
+                        &self.identifier_text(name),
                         SymbolKind::Class,
                         scope,
                         declaration,
@@ -1399,7 +1402,7 @@ impl<'src> Checker<'src> {
             Statement::TypeAlias(alias) => self.bind_type_alias(alias, scope, declaration),
             Statement::Enum(declaration_node) => {
                 let id = self.declare(
-                    self.identifier_text(&declaration_node.name),
+                    &self.identifier_text(&declaration_node.name),
                     SymbolKind::Enum,
                     scope,
                     declaration,
@@ -1420,7 +1423,7 @@ impl<'src> Checker<'src> {
             }
             Statement::Namespace(namespace) => {
                 self.declare(
-                    self.identifier_text(&namespace.name),
+                    &self.identifier_text(&namespace.name),
                     SymbolKind::Namespace,
                     scope,
                     declaration,
@@ -1430,7 +1433,7 @@ impl<'src> Checker<'src> {
             Statement::Import(import) => self.bind_import(import, scope, declaration),
             Statement::ImportEquals(import) => {
                 self.declare(
-                    self.identifier_text(&import.local),
+                    &self.identifier_text(&import.local),
                     SymbolKind::Import,
                     scope,
                     declaration,
@@ -1473,7 +1476,7 @@ impl<'src> Checker<'src> {
         match pattern.data() {
             BindingPattern::Identifier(name) => {
                 self.declare(
-                    self.identifier_text(name),
+                    &self.identifier_text(name),
                     SymbolKind::Variable(kind),
                     scope,
                     declaration,
@@ -1509,7 +1512,7 @@ impl<'src> Checker<'src> {
         declaration: NodeId,
     ) {
         let id = self.declare(
-            self.identifier_text(&interface.name),
+            &self.identifier_text(&interface.name),
             SymbolKind::Interface,
             scope,
             declaration,
@@ -1534,7 +1537,7 @@ impl<'src> Checker<'src> {
         declaration: NodeId,
     ) {
         let id = self.declare(
-            self.identifier_text(&alias.name),
+            &self.identifier_text(&alias.name),
             SymbolKind::TypeAlias,
             scope,
             declaration,
@@ -1563,7 +1566,7 @@ impl<'src> Checker<'src> {
         };
         if let Some(default) = &clause.default {
             self.declare(
-                self.identifier_text(default),
+                &self.identifier_text(default),
                 SymbolKind::Import,
                 scope,
                 declaration,
@@ -1573,7 +1576,7 @@ impl<'src> Checker<'src> {
         match &clause.binding {
             Some(ImportBinding::Namespace(name)) => {
                 self.declare(
-                    self.identifier_text(name),
+                    &self.identifier_text(name),
                     SymbolKind::Import,
                     scope,
                     declaration,
@@ -1584,7 +1587,7 @@ impl<'src> Checker<'src> {
                 for specifier in specifiers {
                     let local = &specifier.data().local;
                     self.declare(
-                        self.identifier_text(local),
+                        &self.identifier_text(local),
                         SymbolKind::Import,
                         scope,
                         declaration,
@@ -1612,7 +1615,7 @@ impl<'src> Checker<'src> {
             Statement::Interface(interface) => {
                 if let Some(id) = self.scopes[scope.0 as usize]
                     .types
-                    .get(self.identifier_text(&interface.name))
+                    .get(self.identifier_text(&interface.name).as_ref())
                     .copied()
                 {
                     let _ = self.resolve_type_symbol(id);
@@ -1621,7 +1624,7 @@ impl<'src> Checker<'src> {
             Statement::TypeAlias(alias) => {
                 if let Some(id) = self.scopes[scope.0 as usize]
                     .types
-                    .get(self.identifier_text(&alias.name))
+                    .get(self.identifier_text(&alias.name).as_ref())
                     .copied()
                 {
                     let _ = self.resolve_type_symbol(id);
@@ -1799,7 +1802,7 @@ impl<'src> Checker<'src> {
                 let declared = annotation
                     .or(initializer_type)
                     .unwrap_or_else(|| self.types.any());
-                if let Some(symbol) = self.lookup_value(scope, self.identifier_text(name)) {
+                if let Some(symbol) = self.lookup_value(scope, &self.identifier_text(name)) {
                     self.symbol_types[symbol.get() as usize] = declared;
                 }
                 if let (Some(target), Some(source)) = (annotation, initializer_type)
@@ -1845,7 +1848,7 @@ impl<'src> Checker<'src> {
         self.bind_implicit_function_values(&function.parameters, scope);
         if let Some(name) = &function.name {
             self.declare(
-                self.identifier_text(name),
+                &self.identifier_text(name),
                 SymbolKind::Function,
                 scope,
                 name.id(),
@@ -1890,7 +1893,7 @@ impl<'src> Checker<'src> {
         for parameter in &list.parameters {
             let data = parameter.data();
             self.declare(
-                self.identifier_text(&data.name),
+                &self.identifier_text(&data.name),
                 SymbolKind::TypeParameter,
                 scope,
                 parameter.id(),
@@ -1927,7 +1930,7 @@ impl<'src> Checker<'src> {
             let resolved = self.resolve_type(&annotation.data().type_node, scope);
             if let Some(symbol) = self.scopes[scope.0 as usize]
                 .values
-                .get(self.identifier_text(name))
+                .get(self.identifier_text(name).as_ref())
                 .copied()
             {
                 self.symbol_types[symbol.get() as usize] = resolved;
@@ -2196,7 +2199,7 @@ impl<'src> Checker<'src> {
         if name.is_empty() {
             return;
         }
-        if let Some(symbol) = self.lookup_value(scope, name) {
+        if let Some(symbol) = self.lookup_value(scope, &name) {
             self.references.insert(identifier.id(), symbol);
         } else {
             self.emit(
@@ -2326,7 +2329,7 @@ impl<'src> Checker<'src> {
             return self.types.error_type();
         };
         let name = self.identifier_text(identifier);
-        match self.lookup_type(scope, name) {
+        match self.lookup_type(scope, &name) {
             Some(symbol) => match self.symbols[symbol.get() as usize].kind {
                 SymbolKind::Interface | SymbolKind::TypeAlias | SymbolKind::Enum => {
                     self.resolve_type_symbol(symbol)
@@ -2458,7 +2461,7 @@ impl<'src> Checker<'src> {
     fn property_key(&self, name: &PropertyName) -> Option<String> {
         match name {
             PropertyName::Identifier(identifier) => {
-                Some(self.identifier_text(identifier).to_owned())
+                Some(self.identifier_text(identifier).into_owned())
             }
             PropertyName::String(string) => {
                 let text = self.text(string.data().token());

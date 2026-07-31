@@ -4,7 +4,7 @@
 //! There are deliberately no parent links or interior-mutable caches: a parsed
 //! [`SourceFile`] can be shared without changing the tree it describes.
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use crate::diagnostic::Diagnostic;
 use crate::source::{ScriptKind, SourceId, SourceText, TextRange};
@@ -33,6 +33,10 @@ pub enum TokenKind {
     BlockComment,
     Shebang,
     Identifier,
+    /// A reserved word spelled with escapes; valid only in IdentifierName contexts.
+    EscapedReservedWord,
+    /// An escaped `await` or `yield`, whose validity depends on parser context.
+    EscapedContextualKeyword,
     PrivateIdentifier,
     NumericLiteral,
     BigIntLiteral,
@@ -176,6 +180,56 @@ pub enum TokenKind {
     PipePipeEq,
     CaretEq,
     QuestionQuestionEq,
+}
+
+/// Returns the StringValue of an identifier token spelling.
+///
+/// The scanner validates identifier escapes before parser-owned tokens reach
+/// this layer. `None` keeps this helper total for synthetic tokens.
+pub(crate) fn cook_identifier_text(text: &str) -> Option<Cow<'_, str>> {
+    if !text.contains('\\') {
+        return Some(Cow::Borrowed(text));
+    }
+
+    let mut chars = text.chars();
+    let mut cooked = String::with_capacity(text.len());
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            cooked.push(character);
+            continue;
+        }
+        if chars.next()? != 'u' {
+            return None;
+        }
+
+        let first = chars.next()?;
+        let code_point = if first == '{' {
+            let mut value = 0_u32;
+            let mut has_digit = false;
+            loop {
+                let digit = chars.next()?;
+                if digit == '}' {
+                    break;
+                }
+                value = value.checked_mul(16)?.checked_add(digit.to_digit(16)?)?;
+                has_digit = true;
+            }
+            if !has_digit {
+                return None;
+            }
+            value
+        } else {
+            let mut value = first.to_digit(16)?;
+            for _ in 1..4 {
+                value = value
+                    .checked_mul(16)?
+                    .checked_add(chars.next()?.to_digit(16)?)?;
+            }
+            value
+        };
+        cooked.push(char::from_u32(code_point)?);
+    }
+    Some(Cow::Owned(cooked))
 }
 
 /// A grammar node kind. A value of this type can never name a token.
@@ -1963,6 +2017,11 @@ impl SourceFile {
         self.source.as_str().get(start..end)
     }
 
+    /// Returns the cooked identity of an identifier token.
+    pub fn identifier_text(&self, token: &Token) -> Option<Cow<'_, str>> {
+        cook_identifier_text(self.token_text(token)?)
+    }
+
     pub fn eof(&self) -> &Token {
         &self.eof
     }
@@ -1982,6 +2041,24 @@ mod tests {
 
     use super::*;
     use crate::source::Utf16Pos;
+
+    #[test]
+    fn identifier_text_borrows_plain_and_cooks_escaped_names() {
+        assert!(matches!(
+            cook_identifier_text("plain"),
+            Some(Cow::Borrowed("plain"))
+        ));
+        assert_eq!(
+            cook_identifier_text("\\u0061\\u{62}"),
+            Some(Cow::Owned("ab".to_owned()))
+        );
+        assert_eq!(
+            cook_identifier_text("\\u{00000061}"),
+            Some(Cow::Owned("a".to_owned()))
+        );
+        assert_eq!(cook_identifier_text("\\u{}"), None);
+        assert_eq!(cook_identifier_text("\\u{110000}"), None);
+    }
 
     fn range(start: usize, end: usize) -> TextRange {
         TextRange::new(Utf16Pos::new(start), Utf16Pos::new(end)).expect("ordered test range")

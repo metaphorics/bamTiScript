@@ -1,6 +1,9 @@
 pub mod semantic;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use crate::{
     checker::{ProgramSemanticModel, SemanticModel},
@@ -31,7 +34,9 @@ impl SyntaxToken<'_> {
     fn identifier(self) -> bool {
         matches!(
             self.kind,
-            TokenKind::Identifier | TokenKind::PrivateIdentifier
+            TokenKind::Identifier
+                | TokenKind::EscapedContextualKeyword
+                | TokenKind::PrivateIdentifier
         )
     }
 }
@@ -41,6 +46,23 @@ impl SyntaxToken<'_> {
 /// Rule identity and severity come exclusively from [`crate::lint::RULES`].
 #[must_use]
 pub fn analyze(source: &SourceFile, levels: &LintTable) -> Vec<Diagnostic> {
+    let cooked_identifiers = source
+        .tokens()
+        .iter()
+        .filter(|token| {
+            matches!(
+                token.kind(),
+                TokenKind::Identifier | TokenKind::EscapedContextualKeyword
+            )
+        })
+        .filter_map(|token| {
+            let Cow::Owned(text) = source.identifier_text(token)? else {
+                return None;
+            };
+            let range = token.range();
+            Some(((range.start().get(), range.end().get()), text))
+        })
+        .collect::<BTreeMap<_, _>>();
     let tokens = source
         .tokens()
         .iter()
@@ -53,7 +75,10 @@ pub fn analyze(source: &SourceFile, levels: &LintTable) -> Vec<Diagnostic> {
         .filter_map(|token| {
             Some(SyntaxToken {
                 kind: token.kind(),
-                text: source.token_text(token)?,
+                text: cooked_identifiers
+                    .get(&(token.range().start().get(), token.range().end().get()))
+                    .map(String::as_str)
+                    .or_else(|| source.token_text(token))?,
                 range: token.range(),
             })
         })

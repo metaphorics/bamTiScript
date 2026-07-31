@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::{
@@ -163,15 +164,15 @@ impl<'a> AstFactCollector<'a> {
         });
     }
 
-    fn identifier(&self, identifier: &IdentifierNode) -> &str {
+    fn identifier(&self, identifier: &IdentifierNode) -> Cow<'_, str> {
         self.source
-            .token_text(identifier.data().token())
-            .unwrap_or("")
+            .identifier_text(identifier.data().token())
+            .unwrap_or_default()
     }
 
     fn property_name(&self, name: &PropertyName) -> Option<String> {
         match name {
-            PropertyName::Identifier(identifier) => Some(self.identifier(identifier).to_owned()),
+            PropertyName::Identifier(identifier) => Some(self.identifier(identifier).into_owned()),
             PropertyName::Private(identifier) => self
                 .source
                 .token_text(identifier.data().token())
@@ -198,7 +199,7 @@ impl<'a> AstFactCollector<'a> {
         let EntityName::Identifier(identifier) = &reference.name else {
             return None;
         };
-        Some(self.identifier(identifier).to_owned())
+        Some(self.identifier(identifier).into_owned())
     }
 
     fn annotation_type_name(&self, annotation: &TypeAnnotationNode) -> Option<String> {
@@ -300,7 +301,7 @@ impl<'a> AstFactCollector<'a> {
 
     fn member_name(&self, member: &MemberExpression) -> Option<String> {
         match &member.property {
-            MemberProperty::Named(identifier) => Some(self.identifier(identifier).to_owned()),
+            MemberProperty::Named(identifier) => Some(self.identifier(identifier).into_owned()),
             _ => None,
         }
     }
@@ -321,13 +322,13 @@ impl<'a> AstFactCollector<'a> {
                         .any(|member| matches!(member.data(), TypeMember::Index(_)))
                     {
                         self.index_signature_types
-                            .insert(self.identifier(&interface.name).to_owned());
+                            .insert(self.identifier(&interface.name).into_owned());
                     }
                 }
                 Statement::TypeAlias(alias) => {
                     if let TypeNode::Union(members) = alias.type_node.data() {
                         self.union_variants
-                            .insert(self.identifier(&alias.name).to_owned(), members.len());
+                            .insert(self.identifier(&alias.name).into_owned(), members.len());
                     }
                 }
                 Statement::Enum(enumeration) => {
@@ -339,14 +340,14 @@ impl<'a> AstFactCollector<'a> {
                             .is_none_or(is_numeric_enum_initializer)
                     }) {
                         self.numeric_enums
-                            .insert(self.identifier(&enumeration.name).to_owned());
+                            .insert(self.identifier(&enumeration.name).into_owned());
                     }
                 }
                 Statement::Class(class) => {
                     let Some(name) = class
                         .name
                         .as_ref()
-                        .map(|name| self.identifier(name).to_owned())
+                        .map(|name| self.identifier(name).into_owned())
                     else {
                         continue;
                     };
@@ -354,7 +355,7 @@ impl<'a> AstFactCollector<'a> {
                         let Expression::Identifier(identifier) = heritage.expression.data() else {
                             return None;
                         };
-                        Some(self.identifier(identifier).to_owned())
+                        Some(self.identifier(identifier).into_owned())
                     });
                     let mut accessors = HashSet::new();
                     let mut methods = HashSet::new();
@@ -467,7 +468,7 @@ impl<'a> AstFactCollector<'a> {
             Expression::Call(call) => {
                 if let Expression::Identifier(identifier) = call.callee.data() {
                     self.called_names
-                        .insert(self.identifier(identifier).to_owned());
+                        .insert(self.identifier(identifier).into_owned());
                 }
                 if let Expression::Member(member) = call.callee.data()
                     && self.member_name(member).as_deref() == Some("sort")
@@ -625,7 +626,7 @@ impl<'a> AstFactCollector<'a> {
             let declaration = declaration.data();
             let binding_name = match declaration.binding.data() {
                 BindingPattern::Identifier(identifier) => {
-                    Some(self.identifier(identifier).to_owned())
+                    Some(self.identifier(identifier).into_owned())
                 }
                 _ => None,
             };
@@ -665,12 +666,13 @@ impl<'a> AstFactCollector<'a> {
                         })
                 {
                     self.readonly_aliases
-                        .insert(self.identifier(source).to_owned());
+                        .insert(self.identifier(source).into_owned());
                     self.readonly_aliases.insert(alias.clone());
                 }
                 if let (Some(target), Expression::Identifier(source)) =
                     (annotation_name.as_deref(), initializer.data())
-                    && let Some(source_type) = self.variable_types.get(self.identifier(source))
+                    && let Some(source_type) =
+                        self.variable_types.get(self.identifier(source).as_ref())
                     && ((target == "number" && self.numeric_enums.contains(source_type))
                         || (self.numeric_enums.contains(target) && source_type == "number"))
                 {
@@ -713,7 +715,7 @@ impl<'a> AstFactCollector<'a> {
                 parameter.data().type_annotation.as_ref(),
             ) && let Some(type_name) = self.reference_type_name(&annotation.data().type_node)
             {
-                let name = self.identifier(identifier).to_owned();
+                let name = self.identifier(identifier).into_owned();
                 shadowed_types.push((name.clone(), self.variable_types.insert(name, type_name)));
             }
             if parameter.data().type_annotation.is_none() {
@@ -751,7 +753,7 @@ impl<'a> AstFactCollector<'a> {
         let base = class
             .name
             .as_ref()
-            .and_then(|name| self.classes.get(self.identifier(name)))
+            .and_then(|name| self.classes.get(self.identifier(name).as_ref()))
             .and_then(|class| class.base.as_ref())
             .and_then(|base| self.classes.get(base))
             .cloned();
@@ -845,7 +847,7 @@ impl<'a> AstFactCollector<'a> {
         };
         let Some(type_name) = self
             .variable_types
-            .get(self.identifier(identifier))
+            .get(self.identifier(identifier).as_ref())
             .cloned()
         else {
             return;
@@ -899,7 +901,7 @@ impl<'a> AstFactCollector<'a> {
                         CallArgument::Missing(_) => continue,
                     };
                     if let Expression::Identifier(identifier) = argument.data() {
-                        let name = self.identifier(identifier).to_owned();
+                        let name = self.identifier(identifier).into_owned();
                         self.readonly_aliases.remove(name.as_str());
                     }
                     self.visit_expr(argument, in_constructor);
@@ -982,7 +984,9 @@ impl<'a> AstFactCollector<'a> {
             Expression::Assignment(assignment) => {
                 if let AssignmentTarget::Member(member) = assignment.left.data()
                     && let Expression::Identifier(identifier) = member.object.data()
-                    && self.readonly_aliases.contains(self.identifier(identifier))
+                    && self
+                        .readonly_aliases
+                        .contains(self.identifier(identifier).as_ref())
                 {
                     self.push(SemanticHazard::ReadonlyAliasMutation, expression.range());
                 }
@@ -1065,7 +1069,7 @@ impl<'a> AstFactCollector<'a> {
         let Expression::Identifier(object) = member.object.data() else {
             return;
         };
-        let object_name = self.identifier(object).to_owned();
+        let object_name = self.identifier(object).into_owned();
         if self
             .variable_types
             .get(&object_name)
@@ -1176,7 +1180,7 @@ impl<'a> AstFactCollector<'a> {
                 self.is_global_identifier(expression, "undefined")
                     || self
                         .variable_types
-                        .get(self.identifier(identifier))
+                        .get(self.identifier(identifier).as_ref())
                         .is_some_and(|ty| {
                             matches!(ty.as_str(), "bigint" | "BigInt" | "symbol" | "Symbol")
                         })
@@ -1300,7 +1304,7 @@ pub(crate) fn collect_program_facts(
                             };
                             if !import.type_only
                                 && specifier.data().mode == ImportSpecifierMode::Value
-                                && type_exports.contains(name)
+                                && type_exports.contains(name.as_ref())
                             {
                                 push_program_fact(
                                     &mut additions,
@@ -1310,7 +1314,7 @@ pub(crate) fn collect_program_facts(
                                     None,
                                 );
                             }
-                            if commonjs.is_commonjs && !commonjs.named.contains(name) {
+                            if commonjs.is_commonjs && !commonjs.named.contains(name.as_ref()) {
                                 push_program_fact(
                                     &mut additions,
                                     source_id,
@@ -1348,7 +1352,7 @@ pub(crate) fn collect_program_facts(
                         };
                         if !*type_only
                             && specifier.data().mode == ExportSpecifierMode::Value
-                            && type_exports.contains(name)
+                            && type_exports.contains(name.as_ref())
                         {
                             push_program_fact(
                                 &mut additions,
@@ -1409,7 +1413,7 @@ fn declaration_depends_on_inference(statement: &Stmt) -> bool {
     }
 }
 
-fn exported_type_names(source: &SourceFile) -> HashSet<&str> {
+fn exported_type_names<'a>(source: &'a SourceFile) -> HashSet<Cow<'a, str>> {
     source
         .statements()
         .iter()
@@ -1421,8 +1425,10 @@ fn exported_type_names(source: &SourceFile) -> HashSet<&str> {
                 return None;
             };
             match declaration.data() {
-                Statement::Interface(interface) => source.token_text(interface.name.data().token()),
-                Statement::TypeAlias(alias) => source.token_text(alias.name.data().token()),
+                Statement::Interface(interface) => {
+                    source.identifier_text(interface.name.data().token())
+                }
+                Statement::TypeAlias(alias) => source.identifier_text(alias.name.data().token()),
                 _ => None,
             }
         })
@@ -1452,7 +1458,9 @@ fn commonjs_exports(source: &SourceFile, model: &SemanticModel) -> CommonJsExpor
         let MemberProperty::Named(property) = &member.property else {
             continue;
         };
-        let property_name = source.token_text(property.data().token()).unwrap_or("");
+        let property_name = source
+            .identifier_text(property.data().token())
+            .unwrap_or_default();
         if let Expression::Member(namespace) = member.object.data() {
             let Expression::Identifier(module) = namespace.object.data() else {
                 continue;
@@ -1460,10 +1468,12 @@ fn commonjs_exports(source: &SourceFile, model: &SemanticModel) -> CommonJsExpor
             let MemberProperty::Named(namespace_property) = &namespace.property else {
                 continue;
             };
-            let module_name = source.token_text(module.data().token()).unwrap_or("");
+            let module_name = source
+                .identifier_text(module.data().token())
+                .unwrap_or_default();
             let namespace_name = source
-                .token_text(namespace_property.data().token())
-                .unwrap_or("");
+                .identifier_text(namespace_property.data().token())
+                .unwrap_or_default();
             if module_name == "module"
                 && namespace_name == "exports"
                 && !model
@@ -1471,21 +1481,23 @@ fn commonjs_exports(source: &SourceFile, model: &SemanticModel) -> CommonJsExpor
                     .is_some_and(|symbol| model.symbol(symbol).kind() != SymbolKind::IntrinsicValue)
             {
                 exports.is_commonjs = true;
-                exports.named.insert(property_name.to_owned());
+                exports.named.insert(property_name.into_owned());
             }
             continue;
         }
         let Expression::Identifier(object) = member.object.data() else {
             continue;
         };
-        let object_name = source.token_text(object.data().token()).unwrap_or("");
+        let object_name = source
+            .identifier_text(object.data().token())
+            .unwrap_or_default();
         if model.reference(object.id()).is_some_and(|symbol| {
             model.symbol(symbol).kind() != SymbolKind::IntrinsicValue
-                || !matches!(object_name, "module" | "exports")
+                || !matches!(object_name.as_ref(), "module" | "exports")
         }) {
             continue;
         }
-        match (object_name, property_name) {
+        match (object_name.as_ref(), property_name.as_ref()) {
             ("module", "exports") => {
                 exports.is_commonjs = true;
                 let Expression::Object(object) = assignment.right.data() else {
@@ -1499,15 +1511,15 @@ fn commonjs_exports(source: &SourceFile, model: &SemanticModel) -> CommonJsExpor
                     };
                     let name = match name {
                         PropertyName::Identifier(identifier) => {
-                            source.token_text(identifier.data().token())
+                            source.identifier_text(identifier.data().token())
                         }
                         PropertyName::String(string) => source
                             .token_text(string.data().token())
-                            .map(|name| name.trim_matches(['"', '\''])),
+                            .map(|name| Cow::Borrowed(name.trim_matches(['"', '\'']))),
                         _ => None,
                     };
                     if let Some(name) = name {
-                        exports.named.insert(name.to_owned());
+                        exports.named.insert(name.into_owned());
                     }
                 }
             }
@@ -1530,18 +1542,20 @@ fn has_esm_default_export(source: &SourceFile) -> bool {
     })
 }
 
-fn module_export_name<'a>(source: &'a SourceFile, name: &ModuleExportName) -> Option<&'a str> {
-    let range = match name {
-        ModuleExportName::Identifier(node) => node.range(),
-        ModuleExportName::String(node) => node.range(),
-        ModuleExportName::Missing(_) => return None,
-    };
-    let text = source.source_text();
-    let start = text.utf16_to_byte(range.start()).ok()?;
-    let end = text.utf16_to_byte(range.end()).ok()?;
-    text.as_str()
-        .get(start..end)
-        .map(|value| value.trim_matches(['"', '\'']))
+fn module_export_name<'a>(source: &'a SourceFile, name: &ModuleExportName) -> Option<Cow<'a, str>> {
+    match name {
+        ModuleExportName::Identifier(node) => source.identifier_text(node.data().token()),
+        ModuleExportName::String(node) => {
+            let text = source.source_text();
+            let range = node.range();
+            let start = text.utf16_to_byte(range.start()).ok()?;
+            let end = text.utf16_to_byte(range.end()).ok()?;
+            text.as_str()
+                .get(start..end)
+                .map(|value| Cow::Borrowed(value.trim_matches(['"', '\''])))
+        }
+        ModuleExportName::Missing(_) => None,
+    }
 }
 
 #[cfg(test)]
