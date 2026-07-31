@@ -136,6 +136,12 @@ pub enum LowerErrorKind {
     InvalidRegexLiteral,
     /// A module linkage name contained an unpaired UTF-16 surrogate.
     IllFormedMetadataString,
+    /// An import declaration is invalid in a classic script.
+    ImportDeclarationInScript,
+    /// An export declaration is invalid in a classic script.
+    ExportDeclarationInScript,
+    /// A `return` statement outside of a function.
+    ReturnOutsideFunction,
     /// A resolved jump target violated the statement control-flow contract.
     InvalidControlFlow { operation: &'static str },
     /// A runtime construct the current instruction set cannot express.
@@ -147,9 +153,9 @@ pub enum LowerErrorKind {
     Verify(VerifyError),
 }
 
-/// Runtime syntax this instruction set cannot express faithfully, plus
-/// source-goal early errors. Every variant names one rejected construct; there
-/// is no catch-all. None of these occur in the executable corpus.
+/// Runtime syntax this instruction set cannot express faithfully.
+/// Every variant names one rejected construct; there is no catch-all.
+/// None of these occur in the executable corpus.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnsupportedConstruct {
     /// `with` opens a dynamic scope the register model cannot represent.
@@ -170,16 +176,10 @@ pub enum UnsupportedConstruct {
     DecoratedDeclaration,
     /// A dynamic `import(expr)` whose specifier is not a string literal.
     DynamicImportExpression,
-    /// An import declaration is invalid in a classic script.
-    ImportDeclarationInScript,
-    /// An export declaration is invalid in a classic script.
-    ExportDeclarationInScript,
     /// A dynamic import expression is invalid in a classic script.
     DynamicImportInScript,
     /// `import.meta` (no host meta-object primitive).
     ImportMeta,
-    /// A `return` at module top level.
-    ReturnOutsideFunction,
     /// A derived constructor that is not an implicit constructor or a single
     /// direct top-level `super(...)` call.
     DerivedConstructorShape,
@@ -231,6 +231,13 @@ impl fmt::Display for LowerErrorKind {
             Self::IllFormedMetadataString => {
                 f.write_str("module metadata string is not well-formed UTF-16")
             }
+            Self::ImportDeclarationInScript => {
+                f.write_str("`import` declaration in a classic script")
+            }
+            Self::ExportDeclarationInScript => {
+                f.write_str("`export` declaration in a classic script")
+            }
+            Self::ReturnOutsideFunction => f.write_str("return statement outside of a function"),
             Self::InvalidControlFlow { operation } => {
                 write!(f, "invalid control flow: {operation}")
             }
@@ -255,11 +262,8 @@ impl fmt::Display for UnsupportedConstruct {
             Self::ExportAssignment => "`export =` assignment",
             Self::DecoratedDeclaration => "decorated declaration",
             Self::DynamicImportExpression => "dynamic `import()` with a non-literal specifier",
-            Self::ImportDeclarationInScript => "`import` declaration in a classic script",
-            Self::ExportDeclarationInScript => "`export` declaration in a classic script",
             Self::DynamicImportInScript => "dynamic `import()` in a classic script",
             Self::ImportMeta => "`import.meta` meta property",
-            Self::ReturnOutsideFunction => "top-level `return`",
             Self::DerivedConstructorShape => {
                 "derived constructor without one direct `super(...)` call"
             }
@@ -1330,7 +1334,7 @@ impl<'a> FunctionContext<'a> {
             Statement::Import(import) => self.lower_import(builder, range, import),
             Statement::ImportEquals(import) => {
                 if self.goal == LoweringGoal::ClassicScript {
-                    Err(self.unsupported(range, UnsupportedConstruct::ImportDeclarationInScript))
+                    Err(self.error(range, LowerErrorKind::ImportDeclarationInScript))
                 } else if import.is_type_only {
                     Ok(())
                 } else {
@@ -1427,9 +1431,7 @@ impl<'a> FunctionContext<'a> {
             }
             Statement::Return(return_statement) => {
                 if self.top_level {
-                    return Err(
-                        self.unsupported(range, UnsupportedConstruct::ReturnOutsideFunction)
-                    );
+                    return Err(self.error(range, LowerErrorKind::ReturnOutsideFunction));
                 }
                 let value = match &return_statement.argument {
                     Some(expression) => self.lower_expression(builder, expression)?,
@@ -3948,7 +3950,7 @@ impl<'a> FunctionContext<'a> {
         import: &ImportDeclaration,
     ) -> Result<(), LowerError> {
         if self.goal == LoweringGoal::ClassicScript {
-            return Err(self.unsupported(range, UnsupportedConstruct::ImportDeclarationInScript));
+            return Err(self.error(range, LowerErrorKind::ImportDeclarationInScript));
         }
         if import.type_only || self.goal == LoweringGoal::ProgramModule {
             return Ok(());
@@ -4100,7 +4102,7 @@ impl<'a> FunctionContext<'a> {
         export: &ExportDeclaration,
     ) -> Result<(), LowerError> {
         if self.goal == LoweringGoal::ClassicScript {
-            return Err(self.unsupported(range, UnsupportedConstruct::ExportDeclarationInScript));
+            return Err(self.error(range, LowerErrorKind::ExportDeclarationInScript));
         }
 
         match export {

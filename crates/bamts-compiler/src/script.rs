@@ -206,16 +206,26 @@ mod tests {
 
     #[test]
     fn classic_script_rejects_module_syntax_before_program_linking() {
-        for source in [
-            "import x from 'y'",
-            "export const a = 1",
-            "export default 1",
-            "import('y')",
+        for (source, is_syntax) in [
+            ("import x from 'y'", true),
+            ("export const a = 1", true),
+            ("export default 1", true),
+            ("return 1", true),
+            ("import('y')", false),
         ] {
-            assert!(matches!(
-                compile_classic_script(&source.encode_utf16().collect::<Vec<_>>(), "script.js"),
-                Err(ScriptCompileError::Unsupported { .. })
-            ));
+            let result =
+                compile_classic_script(&source.encode_utf16().collect::<Vec<_>>(), "script.js");
+            if is_syntax {
+                assert!(
+                    matches!(result, Err(ScriptCompileError::Syntax { .. })),
+                    "{source:?} should be a syntax error in a classic script: {result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(ScriptCompileError::Unsupported { .. })),
+                    "{source:?} should be unsupported in a classic script: {result:?}"
+                );
+            }
         }
     }
 
