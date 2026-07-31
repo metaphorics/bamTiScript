@@ -21,7 +21,149 @@ use crate::parser;
 use crate::program::{ModuleTarget, ResolvedProgram};
 use crate::scanner;
 use crate::source::{ScriptKind, SourceId, SourceText};
-use crate::syntax::{ExportDeclaration, ExportNamedDeclaration, SourceFile, Statement};
+use crate::syntax::{ExportDeclaration, ExportNamedDeclaration, SourceFile};
+
+struct EdgeNode {
+    id: crate::syntax::NodeId,
+    range: crate::source::TextRange,
+    children: Vec<Self>,
+}
+
+struct SourceEdgeNodeIndex {
+    exact: std::collections::HashMap<crate::source::TextRange, crate::syntax::NodeId>,
+    roots: Vec<EdgeNode>,
+}
+
+impl SourceEdgeNodeIndex {
+    fn new(source: &SourceFile) -> Self {
+        let mut exact = std::collections::HashMap::new();
+        let roots = Self::statements(source.statements(), &mut exact);
+        Self { exact, roots }
+    }
+
+    fn statements(
+        statements: &[crate::syntax::Stmt],
+        exact: &mut std::collections::HashMap<crate::source::TextRange, crate::syntax::NodeId>,
+    ) -> Vec<EdgeNode> {
+        statements
+            .iter()
+            .map(|statement| Self::statement(statement, exact))
+            .collect()
+    }
+
+    fn statement(
+        statement: &crate::syntax::Stmt,
+        exact: &mut std::collections::HashMap<crate::source::TextRange, crate::syntax::NodeId>,
+    ) -> EdgeNode {
+        use crate::syntax::{ExportDefaultValue, ExternalModuleReference, FunctionBody, Statement};
+
+        let id = statement.id();
+        match statement.data() {
+            Statement::Import(import) => {
+                exact.insert(import.source.range(), id);
+            }
+            Statement::ImportEquals(import) => {
+                if let ExternalModuleReference::Require(source) = &import.reference {
+                    exact.insert(source.range(), id);
+                }
+            }
+            Statement::Export(ExportDeclaration::All(export)) => {
+                exact.insert(export.source.range(), id);
+            }
+            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
+                source: Some(source),
+                ..
+            })) => {
+                exact.insert(source.range(), id);
+            }
+            _ => {}
+        }
+
+        let children = match statement.data() {
+            Statement::Function(function) => match &function.function.body {
+                Some(FunctionBody::Block(block)) => {
+                    Self::statements(&block.data().statements, exact)
+                }
+                _ => Vec::new(),
+            },
+            Statement::Namespace(namespace) => {
+                Self::statements(&namespace.body.data().statements, exact)
+            }
+            Statement::Declare(inner)
+            | Statement::Labeled(crate::syntax::LabeledStatement { body: inner, .. }) => {
+                vec![Self::statement(inner, exact)]
+            }
+            Statement::Block(block) => Self::statements(&block.data().statements, exact),
+            Statement::If(branch) => {
+                let mut children = vec![Self::statement(&branch.consequent, exact)];
+                if let Some(alternate) = &branch.alternate {
+                    children.push(Self::statement(alternate, exact));
+                }
+                children
+            }
+            Statement::Switch(switch) => switch
+                .cases
+                .iter()
+                .flat_map(|case| Self::statements(&case.data().consequent, exact))
+                .collect(),
+            Statement::For(statement) => vec![Self::statement(&statement.body, exact)],
+            Statement::ForIn(statement) => vec![Self::statement(&statement.body, exact)],
+            Statement::ForOf(statement) => vec![Self::statement(&statement.body, exact)],
+            Statement::While(statement) => vec![Self::statement(&statement.body, exact)],
+            Statement::DoWhile(statement) => vec![Self::statement(&statement.body, exact)],
+            Statement::Try(statement) => {
+                let mut children = Self::statements(&statement.block.data().statements, exact);
+                if let Some(handler) = &statement.handler {
+                    children.extend(Self::statements(
+                        &handler.data().body.data().statements,
+                        exact,
+                    ));
+                }
+                if let Some(finalizer) = &statement.finalizer {
+                    children.extend(Self::statements(&finalizer.data().statements, exact));
+                }
+                children
+            }
+            Statement::With(statement) => vec![Self::statement(&statement.body, exact)],
+            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
+                inner,
+            ))) => vec![Self::statement(inner, exact)],
+            Statement::Export(ExportDeclaration::Default(default)) => match &default.value {
+                ExportDefaultValue::Function(function) => match &function.body {
+                    Some(FunctionBody::Block(block)) => {
+                        Self::statements(&block.data().statements, exact)
+                    }
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+
+        EdgeNode {
+            id,
+            range: statement.range(),
+            children,
+        }
+    }
+
+    fn node_for(&self, range: crate::source::TextRange) -> Option<crate::syntax::NodeId> {
+        self.exact
+            .get(&range)
+            .copied()
+            .or_else(|| Self::smallest_containing(&self.roots, range))
+    }
+
+    fn smallest_containing(
+        nodes: &[EdgeNode],
+        range: crate::source::TextRange,
+    ) -> Option<crate::syntax::NodeId> {
+        let index = nodes.partition_point(|node| node.range.start() <= range.start());
+        let node = nodes.get(index.checked_sub(1)?)?;
+        (node.range.end() >= range.end())
+            .then(|| Self::smallest_containing(&node.children, range).unwrap_or(node.id))
+    }
+}
 
 /// The frontend product a caller wants produced for one source.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -248,29 +390,14 @@ fn resolved_checker_edges(
                 .find(|file| file.product().source_id() == module.source_id())
                 .expect("resolved module has one parsed source")
                 .product();
+            let nodes = SourceEdgeNodeIndex::new(source);
             module.dependencies().iter().filter_map(move |edge| {
                 let ModuleTarget::Local(to) = edge.target() else {
                     return None;
                 };
-                let specifier = source.statements().iter().find_map(|statement| {
-                    let source_range = match statement.data() {
-                        Statement::Import(import) => Some(import.source.range()),
-                        Statement::Export(ExportDeclaration::All(export)) => {
-                            Some(export.source.range())
-                        }
-                        Statement::Export(ExportDeclaration::Named(
-                            ExportNamedDeclaration::Specifiers {
-                                source: Some(source),
-                                ..
-                            },
-                        )) => Some(source.range()),
-                        _ => None,
-                    };
-                    (source_range == Some(edge.range())).then_some(statement.id())
-                })?;
                 Some(ResolvedModuleEdge {
                     from: module.source_id(),
-                    specifier,
+                    specifier: nodes.node_for(edge.range())?,
                     to: *to,
                 })
             })
@@ -483,5 +610,92 @@ mod tests {
             "try {} catch (e) { e.message }\nconst n: number = \"oops\";\nconst bad: number =";
         let output = compile_frontend(request(source, FrontendMode::JavaScript));
         assert!(is_sorted_unique(output.diagnostics()));
+    }
+
+    #[test]
+    fn resolved_edges_keep_static_and_find_import_equals_and_nested_dynamic_imports() {
+        use std::{
+            fs,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+
+        use crate::{
+            parser,
+            program::ProgramLoader,
+            project::{ProjectConfig, ProjectRoot},
+            scanner,
+            syntax::{Expression, FunctionBody, Statement},
+        };
+
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let root_path = std::env::temp_dir().join(format!(
+            "bamts-pipeline-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root_path).unwrap();
+        let write = |name: &str, source: &str| fs::write(root_path.join(name), source).unwrap();
+        write(
+            "main.ts",
+            "import value from \"./static\"; import equal = require(\"./equal\"); async function nested() { return import(\"./dynamic\"); }",
+        );
+        write("static.ts", "export default 1;");
+        write("equal.ts", "export = 1;");
+        write("dynamic.ts", "export default 1;");
+
+        let root = ProjectRoot::new(fs::canonicalize(&root_path).unwrap()).unwrap();
+        let config = ProjectConfig::parse(&root, root_path.join("tsconfig.json"), "{}").unwrap();
+        let program = ProgramLoader::new(&root, config.options())
+            .unwrap()
+            .load("main.ts")
+            .unwrap();
+        let files = program
+            .modules()
+            .iter()
+            .map(|module| {
+                parser::parse(scanner::scan(
+                    module.source_id(),
+                    module.script_kind(),
+                    Arc::clone(module.source()),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let edges = super::resolved_checker_edges(&program, &files);
+        let source = files
+            .iter()
+            .find(|file| file.product().source_id() == program.entrypoint_id())
+            .unwrap()
+            .product();
+        let statements = source.statements();
+        let Statement::Function(function) = statements[2].data() else {
+            panic!("expected nested function declaration");
+        };
+        let Some(FunctionBody::Block(body)) = &function.function.body else {
+            panic!("expected function block");
+        };
+        let Statement::Return(return_statement) = body.data().statements[0].data() else {
+            panic!("expected return statement");
+        };
+        let dynamic_import = return_statement.argument.as_ref().unwrap();
+        assert!(matches!(dynamic_import.data(), Expression::Import(_)));
+
+        assert_eq!(edges.len(), 3);
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.specifier == statements[0].id())
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.specifier == statements[1].id())
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.specifier == body.data().statements[0].id())
+        );
+
+        fs::remove_dir_all(root_path).unwrap();
     }
 }
