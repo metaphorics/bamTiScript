@@ -8199,13 +8199,20 @@ impl<'a> FunctionContext<'a> {
         context: Register,
         init_chain: Register,
     ) -> Result<(), LowerError> {
+        // Apply inner-to-outer, but TypeScript prepends each returned initializer, so
+        // the runtime chain must run outer-to-inner. Collect during application, then
+        // push onto `init_chain` in reverse collection order.
         let undefined = self.undefined(builder, range)?;
+        let mut collected_inits = Vec::new();
         for &decorator in decorators.iter().rev() {
             let returned =
                 self.call_with_registers(range, decorator, undefined, &[undefined, context])?;
             let collected = self.alloc_register(range)?;
             let accepted =
                 self.collect_optional_callable(builder, range, returned, collected)?;
+            collected_inits.push((accepted, collected));
+        }
+        for &(accepted, collected) in collected_inits.iter().rev() {
             let skip = self.emit(
                 range,
                 Instruction::JumpIfFalse {
@@ -8234,13 +8241,22 @@ impl<'a> FunctionContext<'a> {
         initial_set: Register,
         init_chain: Register,
     ) -> Result<(Register, Register), LowerError> {
+        // Same outer-then-inner init composition as fields: collect during
+        // inner-to-outer application, then append to the runtime chain in reverse.
         let current_get = self.alloc_register(range)?;
         self.move_to(range, current_get, initial_get)?;
         let current_set = self.alloc_register(range)?;
         self.move_to(range, current_set, initial_set)?;
         let undefined = self.undefined(builder, range)?;
         let object_type = self.string_reg(builder, EcmaString::from_utf8("object"), range)?;
+        let mut collected_inits = Vec::new();
         for &decorator in decorators.iter().rev() {
+            let collected = self.alloc_register(range)?;
+            let accepted_init = self.alloc_register(range)?;
+            self.move_to(range, collected, undefined)?;
+            let flag_false = self.load_constant(builder, Constant::Boolean(false), range)?;
+            self.move_to(range, accepted_init, flag_false)?;
+            collected_inits.push((accepted_init, collected));
             let pair = self.alloc_register(range)?;
             self.emit(range, Instruction::CreateObject { dst: pair })?;
             self.set_named_entry(builder, range, pair, "get", current_get)?;
@@ -8300,13 +8316,18 @@ impl<'a> FunctionContext<'a> {
             let new_set = self.get_named(builder, range, returned, "set")?;
             self.accept_replacement_callable(builder, range, new_set, current_set)?;
             let init = self.get_named(builder, range, returned, "init")?;
-            let collected = self.alloc_register(range)?;
-            let accepted_init =
+            let accepted =
                 self.collect_optional_callable(builder, range, init, collected)?;
+            self.move_to(range, accepted_init, accepted)?;
+            let after = self.next_pc();
+            self.patch_jump(keep, after);
+            self.patch_jump(errored, after);
+        }
+        for &(accepted, collected) in collected_inits.iter().rev() {
             let skip = self.emit(
                 range,
                 Instruction::JumpIfFalse {
-                    condition: accepted_init,
+                    condition: accepted,
                     target: Pc::new(0),
                 },
             )?;
@@ -8318,9 +8339,6 @@ impl<'a> FunctionContext<'a> {
                 },
             )?;
             self.patch_jump(skip, self.next_pc());
-            let after = self.next_pc();
-            self.patch_jump(keep, after);
-            self.patch_jump(errored, after);
         }
         Ok((current_get, current_set))
     }

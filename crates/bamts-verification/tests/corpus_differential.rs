@@ -2155,6 +2155,125 @@ console.log(trace.join('\n'));
 }
 
 #[test]
+fn stacked_field_accessor_initializers_match_tsc_oracle_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("stacked-field-accessor-initializers-{}", process::id());
+    let source_relative = format!("target/{id}.js");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("target/decorator-oracles/{id}.js");
+    let transpiled_path = root.join(&transpiled_relative);
+
+    // Non-commutative transforms: reversed/duplicated/skipped init order cannot
+    // accidentally produce the same final values or log timeline.
+    let source = r#"const trace = [];
+function log(value) { trace.push(value); }
+function field(label, op) {
+  log(`evaluate:${label}`);
+  return (_value, context) => {
+    log(`apply:${label}:${String(context.name)}:static=${context.static}`);
+    return (initial) => {
+      const next = op(initial);
+      log(`init:${label}:${initial}->${next}`);
+      return next;
+    };
+  };
+}
+function accessor(label, op) {
+  log(`evaluate:${label}`);
+  return (target, context) => {
+    log(`apply:${label}:${String(context.name)}`);
+    return {
+      init(initial) {
+        const next = op(initial);
+        log(`ainit:${label}:${initial}->${next}`);
+        return next;
+      },
+    };
+  };
+}
+class Fixture {
+  @field('outer', (v) => v + 'O')
+  @field('inner', (v) => v + 'I')
+  value = 'S';
+
+  @field('sOuter', (v) => v + 'SO')
+  @field('sInner', (v) => v + 'SI')
+  static sValue = 'SS';
+
+  @accessor('aOuter', (v) => v * 10)
+  @accessor('aInner', (v) => v + 1)
+  accessor acc = 1;
+}
+const instance = new Fixture();
+log(`value:${instance.value}`);
+log(`sValue:${Fixture.sValue}`);
+log(`acc:${instance.acc}`);
+console.log(trace.join('\n'));
+"#;
+    fs::write(&source_path, source).expect("write stacked field/accessor initializer fixture");
+    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+        .arg(&source_path)
+        .args([
+            "--target",
+            "es2022",
+            "--module",
+            "commonjs",
+            "--strict",
+            "false",
+            "--esModuleInterop",
+            "--skipLibCheck",
+            "--rootDir",
+            "target",
+            "--outDir",
+            "target/decorator-oracles",
+            "--allowJs",
+            "--checkJs",
+            "false",
+        ])
+        .current_dir(&root)
+        .status()
+        .expect("run TypeScript stacked field/accessor initializer oracle");
+    assert!(
+        status.success(),
+        "TypeScript stacked field/accessor initializer oracle failed with {status}"
+    );
+    let spec = CaseSpec {
+        id: id.clone(),
+        repository: "local".to_owned(),
+        commit: "0".repeat(40),
+        license: "UNLICENSED".to_owned(),
+        source_dir: "target".to_owned(),
+        entrypoint: transpiled_relative,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    let actual_spec = CaseSpec {
+        entrypoint: source_relative,
+        ..spec.clone()
+    };
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&actual_spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_file(source_path)
+        .expect("remove stacked field/accessor initializer source fixture");
+    fs::remove_file(transpiled_path)
+        .expect("remove stacked field/accessor initializer oracle fixture");
+    assert!(
+        failures.is_empty(),
+        "stacked field/accessor initializer differential failures:\n{}",
+        failures.join("\n\n")
+    );
+}
+
+#[test]
 fn undecorated_auto_accessor_matches_tsc_oracle_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("undecorated-auto-accessor-{}", process::id());
