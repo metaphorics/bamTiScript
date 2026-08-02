@@ -7050,7 +7050,8 @@ impl<'a> FunctionContext<'a> {
         }
         Ok(lowered)
     }
-    /// Computes the constructor's ordered instance-init list and the number of
+    /// Computes callable-extra prefix steps, source-order field/accessor steps,
+    /// and the class-element slot count reserved before constructor lowering.
     fn plan_instance_inits(
         &self,
         class: &ClassDeclaration,
@@ -7502,11 +7503,20 @@ impl<'a> FunctionContext<'a> {
             self.store_cell(builder, cell, final_class, range)?;
         }
         // Static writes target the raw constructor, while the evaluated class
-        // body sees the replacement as `this`.
+        // body sees the replacement as `this`. Callable MemberExtras run first
+        // on `final_class`, then the remaining static timeline.
         let previous_this = self.this_capture;
         self.this_capture = Some(final_class);
         let mut static_result = Ok(());
-        for step in &static_inits {
+        let static_order = static_inits
+            .iter()
+            .filter(|step| matches!(step, StaticInit::MemberExtras { .. }))
+            .chain(
+                static_inits
+                    .iter()
+                    .filter(|step| !matches!(step, StaticInit::MemberExtras { .. })),
+            );
+        for step in static_order {
             if let Err(error) = self.run_static_init(builder, range, ctor, final_class, step) {
                 static_result = Err(error);
                 break;
@@ -7762,7 +7772,15 @@ impl<'a> FunctionContext<'a> {
             return Ok(());
         }
         let table = self.class_elements;
-        for step in &steps {
+        // Method/getter/setter extras are Decorated { initializer: None }.
+        // Drain them as a prefix; field/auto-accessor steps keep source order.
+        let ordered = steps
+            .iter()
+            .filter(|step| matches!(step, InstanceInit::Decorated { initializer: None, .. }))
+            .chain(steps.iter().filter(|step| {
+                !matches!(step, InstanceInit::Decorated { initializer: None, .. })
+            }));
+        for step in ordered {
             match step {
                 InstanceInit::PlainField { slot, initializer } => {
                     let table =

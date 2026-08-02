@@ -1739,6 +1739,109 @@ console.log(trace.join('\n'));
 }
 
 #[test]
+fn callable_decorator_initializers_precede_fields_matches_tsc_oracle_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("callable-decorator-initializers-{}", process::id());
+    let source_relative = format!("target/{id}.js");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("target/decorator-oracles/{id}.js");
+    let transpiled_path = root.join(&transpiled_relative);
+
+    // Method extras are independent of source position: an instance field before a
+    // decorated method still sees FIFO extras first; a static field/block before a
+    // decorated static method still sees FIFO extras first on the final class.
+    let source = r#"const trace = [];
+function log(value) { trace.push(value); }
+function instanceMethod(_value, context) {
+  context.addInitializer(function () { log('instance:first'); });
+  context.addInitializer(function () { log('instance:second'); });
+}
+function staticMethod(_value, context) {
+  context.addInitializer(function () { log(`static:first:${this.name}`); });
+  context.addInitializer(function () { log(`static:second:${this.name}`); });
+}
+function replace(value, context) {
+  log(`replace:${context.name}:${value.name}`);
+  return class Replacement extends value {};
+}
+@replace
+class Fixture {
+  field = (log('field'), 1);
+  @instanceMethod
+  method() { return 'method'; }
+  static sField = (log('sField'), 2);
+  static { log(`sBlock:${this.name}`); }
+  @staticMethod
+  static sMethod() { return 'sMethod'; }
+  constructor() { log(`ctor:${this.constructor.name}`); }
+}
+const instance = new Fixture();
+log(`method:${instance.method()}`);
+log(`sMethod:${Fixture.sMethod()}`);
+console.log(trace.join('\n'));
+"#;
+    fs::write(&source_path, source).expect("write callable decorator initializer fixture");
+    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+        .arg(&source_path)
+        .args([
+            "--target",
+            "es2022",
+            "--module",
+            "commonjs",
+            "--strict",
+            "false",
+            "--esModuleInterop",
+            "--skipLibCheck",
+            "--rootDir",
+            "target",
+            "--outDir",
+            "target/decorator-oracles",
+            "--allowJs",
+            "--checkJs",
+            "false",
+        ])
+        .current_dir(&root)
+        .status()
+        .expect("run TypeScript callable decorator initializer oracle");
+    assert!(
+        status.success(),
+        "TypeScript callable decorator initializer oracle failed with {status}"
+    );
+    let spec = CaseSpec {
+        id: id.clone(),
+        repository: "local".to_owned(),
+        commit: "0".repeat(40),
+        license: "UNLICENSED".to_owned(),
+        source_dir: "target".to_owned(),
+        entrypoint: transpiled_relative,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    let actual_spec = CaseSpec {
+        entrypoint: source_relative,
+        ..spec.clone()
+    };
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&actual_spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_file(source_path).expect("remove callable decorator initializer source fixture");
+    fs::remove_file(transpiled_path).expect("remove callable decorator initializer oracle fixture");
+    assert!(
+        failures.is_empty(),
+        "callable decorator initializer differential failures:\n{}",
+        failures.join("\n\n")
+    );
+}
+
+#[test]
 fn member_decorator_application_stages_match_tsc_oracle_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("member-decorator-application-stages-{}", process::id());
