@@ -1282,6 +1282,99 @@ console.log(trace.join('\n'));
 }
 
 #[test]
+fn class_decorator_initializer_state_matches_tsc_oracle_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("class-decorator-state-{}", process::id());
+    let source_relative = format!("target/{id}.js");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("target/decorator-oracles/{id}.js");
+    let transpiled_path = root.join(&transpiled_relative);
+
+    // Open during decorator application: enqueue two callbacks. Closed after
+    // evaluation: escaped addInitializer throws TypeError and the rejected
+    // callback never runs. FIFO extras observe the final replacement as `this`.
+    let source = r#"const trace = [];
+function log(value) { trace.push(value); }
+let escaped;
+function replace(value, context) {
+  escaped = context.addInitializer;
+  context.addInitializer(function () { log(`extra:first:${this.name}`); });
+  context.addInitializer(function () { log(`extra:second:${this.name}`); });
+  return class Replacement extends value {};
+}
+@replace
+class C {}
+log(`finalName:${C.name}`);
+try {
+  escaped(function () { log('late'); });
+  log('late:accepted');
+} catch (error) {
+  log(`late:error:${error instanceof TypeError}`);
+}
+console.log(trace.join('\n'));
+"#;
+    fs::write(&source_path, source).expect("write class decorator state fixture");
+    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+        .arg(&source_path)
+        .args([
+            "--target",
+            "es2022",
+            "--module",
+            "commonjs",
+            "--strict",
+            "false",
+            "--esModuleInterop",
+            "--skipLibCheck",
+            "--rootDir",
+            "target",
+            "--outDir",
+            "target/decorator-oracles",
+            "--allowJs",
+            "--checkJs",
+            "false",
+        ])
+        .current_dir(&root)
+        .status()
+        .expect("run TypeScript decorator state oracle");
+    assert!(
+        status.success(),
+        "TypeScript decorator state oracle failed with {status}"
+    );
+    let spec = CaseSpec {
+        id: id.clone(),
+        repository: "local".to_owned(),
+        commit: "0".repeat(40),
+        license: "UNLICENSED".to_owned(),
+        source_dir: "target".to_owned(),
+        entrypoint: transpiled_relative,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    let actual_spec = CaseSpec {
+        entrypoint: source_relative,
+        ..spec.clone()
+    };
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&actual_spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_file(source_path).expect("remove class decorator state source fixture");
+    fs::remove_file(transpiled_path).expect("remove class decorator state oracle fixture");
+    assert!(
+        failures.is_empty(),
+        "class decorator state differential failures:\n{}",
+        failures.join("\n\n")
+    );
+}
+
+#[test]
 fn invalid_class_decorator_return_matches_tsc_oracle_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("class-decorator-invalid-{}", process::id());
