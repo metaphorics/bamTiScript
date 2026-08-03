@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -29,6 +30,44 @@ const NODE_STATICLIB: &[u8] = include_bytes!(env!("BAMTS_NODE_STATICLIB"));
 const HOST_TARGET: &str = env!("BAMTS_HOST_TARGET");
 const BUILD_TARGET: &str = env!("BAMTS_BUILD_TARGET");
 static NEXT_CACHE_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
+#[cfg(unix)]
+thread_local! {
+    static FALLBACK_CACHE: RefCell<FallbackCacheState> = const {
+        RefCell::new(FallbackCacheState {
+            depth: 0,
+            directory: None,
+        })
+    };
+}
+
+#[cfg(unix)]
+struct FallbackCacheState {
+    depth: usize,
+    directory: Option<tempfile::TempDir>,
+}
+
+#[cfg(unix)]
+struct FallbackCacheScope;
+
+#[cfg(unix)]
+impl FallbackCacheScope {
+    fn enter() -> Self {
+        FALLBACK_CACHE.with(|state| state.borrow_mut().depth += 1);
+        Self
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FallbackCacheScope {
+    fn drop(&mut self) {
+        let directory = FALLBACK_CACHE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.depth = state.depth.checked_sub(1).expect("fallback cache scope");
+            (state.depth == 0).then(|| state.directory.take()).flatten()
+        });
+        drop(directory);
+    }
+}
 
 /// Bytes and process status produced by one successful CLI command.
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -108,6 +147,9 @@ pub enum DriverError {
     CrossTargetLink {
         host: &'static str,
         target: &'static str,
+    },
+    UnsafeFallbackCacheRoot {
+        path: PathBuf,
     },
 }
 
@@ -226,6 +268,11 @@ impl fmt::Display for DriverError {
                 formatter,
                 "native linking for Cargo target `{target}` is unsupported from host `{host}`"
             ),
+            Self::UnsafeFallbackCacheRoot { path } => write!(
+                formatter,
+                "fallback cache root `{}` is not a private directory owned by the current user",
+                path.display()
+            ),
         }
     }
 }
@@ -257,13 +304,16 @@ impl Error for DriverError {
             | Self::ToolchainMissing { .. }
             | Self::ToolchainRejected { .. }
             | Self::LinkFailed { .. }
-            | Self::CrossTargetLink { .. } => None,
+            | Self::CrossTargetLink { .. }
+            | Self::UnsafeFallbackCacheRoot { .. } => None,
         }
     }
 }
 
 /// Executes one already-parsed CLI command.
 pub fn execute(args: &CliArgs) -> Result<CommandOutcome, DriverError> {
+    #[cfg(unix)]
+    let _fallback_cache = FallbackCacheScope::enter();
     match args.mode {
         Mode::Check | Mode::Compile | Mode::Run => {
             let frontend = load_program_frontend(args)?;
@@ -455,12 +505,15 @@ fn run_aot(
     let object =
         bamts_codegen::compile_aot(executable.wire(), HOST_TARGET).map_err(DriverError::Aot)?;
     let id = NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-    let destination = cache_root().join("run").join(format!(
+    let root = cache_root()?;
+    let destination = root.join("run").join(format!(
         "bamts-run-{}-{id}{}",
         std::process::id(),
         std::env::consts::EXE_SUFFIX
     ));
+    require_within_cache_root(&destination, &root)?;
     link_executable(&object.bytes, &destination)?;
+    require_within_cache_root(&destination, &root)?;
     let launch_token = format!("{}-{id}", std::process::id());
     let output = Command::new(&destination)
         .env(bamts_node::AOT_ENTRYPOINT_ENV, entrypoint.as_os_str())
@@ -568,7 +621,7 @@ fn probe_toolchain(program: OsString) -> Result<OsString, DriverError> {
 }
 
 fn cached_node_archive() -> Result<PathBuf, DriverError> {
-    let cache_dir = cache_root().join("runtime");
+    let cache_dir = cache_root()?.join("runtime");
     fs::create_dir_all(&cache_dir).map_err(|source| DriverError::CacheArchive {
         path: cache_dir.clone(),
         source,
@@ -624,17 +677,200 @@ fn write_cached_archive(file: &mut File, path: &Path) -> Result<(), DriverError>
         })
 }
 
-fn cache_root() -> PathBuf {
+fn cache_root() -> Result<PathBuf, DriverError> {
     if let Some(path) = std::env::var_os("BAMTS_CACHE_DIR") {
-        return PathBuf::from(path);
+        return Ok(PathBuf::from(path));
     }
     if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
-        return PathBuf::from(path).join("bamts");
+        return Ok(PathBuf::from(path).join("bamts"));
     }
     if let Some(path) = std::env::var_os("HOME") {
-        return PathBuf::from(path).join(".cache/bamts");
+        return Ok(PathBuf::from(path).join(".cache/bamts"));
     }
-    std::env::temp_dir().join("bamts-cache")
+    ensure_private_fallback_cache_root(fallback_cache_root_path()?)
+}
+
+#[cfg(unix)]
+fn fallback_cache_root_path() -> Result<PathBuf, DriverError> {
+    FALLBACK_CACHE.with(|state| {
+        let mut state = state.borrow_mut();
+        if state.directory.is_none() {
+            state.directory = Some(create_random_fallback_cache_root_in(&std::env::temp_dir())?);
+        }
+        Ok(state
+            .directory
+            .as_ref()
+            .expect("fallback cache root initialized")
+            .path()
+            .to_owned())
+    })
+}
+
+#[cfg(unix)]
+fn create_random_fallback_cache_root_in(parent: &Path) -> Result<tempfile::TempDir, DriverError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = validate_fallback_parent_chain(parent)?;
+    let prefix = format!("bamts-cache-{}-", fallback_cache_user_key()?);
+    let directory = tempfile::Builder::new()
+        .prefix(&prefix)
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in(&parent)
+        .map_err(|source| DriverError::CreateDirectory {
+            path: parent,
+            source,
+        })?;
+    validate_private_fallback_dir(directory.path())?;
+    Ok(directory)
+}
+
+#[cfg(not(unix))]
+fn fallback_cache_root_path() -> Result<PathBuf, DriverError> {
+    Ok(std::env::temp_dir().join(format!("bamts-cache-{}", fallback_cache_user_key()?)))
+}
+
+#[cfg(unix)]
+fn fallback_cache_user_key() -> Result<String, DriverError> {
+    Ok(effective_uid()?.to_string())
+}
+
+#[cfg(not(unix))]
+fn fallback_cache_user_key() -> Result<String, DriverError> {
+    Ok(std::env::var_os("USERNAME")
+        .or_else(|| std::env::var_os("USER"))
+        .map(|value| value.to_string_lossy().into_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "default".to_owned()))
+}
+
+fn ensure_private_fallback_cache_root(path: PathBuf) -> Result<PathBuf, DriverError> {
+    #[cfg(unix)]
+    let path = {
+        let parent = path
+            .parent()
+            .ok_or_else(|| DriverError::UnsafeFallbackCacheRoot { path: path.clone() })?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| DriverError::UnsafeFallbackCacheRoot { path: path.clone() })?;
+        validate_fallback_parent_chain(parent)?.join(name)
+    };
+    match create_private_fallback_dir(&path) {
+        Ok(()) => {}
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(source) => {
+            return Err(DriverError::CreateDirectory { path, source });
+        }
+    }
+    validate_private_fallback_dir(&path)?;
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn create_private_fallback_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_fallback_dir(path: &Path) -> io::Result<()> {
+    fs::create_dir(path)
+}
+
+#[cfg(unix)]
+fn validate_fallback_parent_chain(path: &Path) -> Result<PathBuf, DriverError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let canonical = fs::canonicalize(path).map_err(|source| DriverError::CreateDirectory {
+        path: path.to_owned(),
+        source,
+    })?;
+    let euid = effective_uid()?;
+    for ancestor in canonical.ancestors() {
+        let metadata =
+            fs::symlink_metadata(ancestor).map_err(|source| DriverError::CreateDirectory {
+                path: ancestor.to_owned(),
+                source,
+            })?;
+        let mode = metadata.permissions().mode();
+        let writable = mode & 0o022 != 0;
+        let owner = metadata.uid();
+        let protected_by_sticky_owner = mode & 0o1000 != 0 && (owner == 0 || owner == euid);
+        if !metadata.is_dir() || (writable && !protected_by_sticky_owner) {
+            return Err(DriverError::UnsafeFallbackCacheRoot {
+                path: ancestor.to_owned(),
+            });
+        }
+    }
+    Ok(canonical)
+}
+
+#[cfg(unix)]
+fn validate_private_fallback_dir(path: &Path) -> Result<(), DriverError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = fs::symlink_metadata(path).map_err(|source| DriverError::CreateDirectory {
+        path: path.to_owned(),
+        source,
+    })?;
+    let euid = effective_uid()?;
+    let permissions = metadata.permissions().mode() & 0o777;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != euid
+        || permissions & 0o077 != 0
+    {
+        return Err(DriverError::UnsafeFallbackCacheRoot {
+            path: path.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_private_fallback_dir(path: &Path) -> Result<(), DriverError> {
+    let metadata = fs::metadata(path).map_err(|source| DriverError::CreateDirectory {
+        path: path.to_owned(),
+        source,
+    })?;
+    if !metadata.is_dir() {
+        return Err(DriverError::UnsafeFallbackCacheRoot {
+            path: path.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Probe the effective user id without `unsafe` through an atomic random file.
+#[cfg(unix)]
+fn effective_uid() -> Result<u32, DriverError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let parent = std::env::temp_dir();
+    let probe = tempfile::Builder::new()
+        .prefix(".bamts-euid-")
+        .tempfile_in(&parent)
+        .map_err(|source| DriverError::CreateDirectory {
+            path: parent,
+            source,
+        })?;
+    probe
+        .as_file()
+        .metadata()
+        .map(|metadata| metadata.uid())
+        .map_err(|source| DriverError::CreateDirectory {
+            path: probe.path().to_owned(),
+            source,
+        })
+}
+
+fn require_within_cache_root(path: &Path, root: &Path) -> Result<(), DriverError> {
+    if path.starts_with(root) {
+        Ok(())
+    } else {
+        Err(DriverError::UnsafeFallbackCacheRoot {
+            path: path.to_owned(),
+        })
+    }
 }
 
 const fn content_hash(bytes: &[u8]) -> u64 {
@@ -947,6 +1183,107 @@ mod tests {
             table.level_for_source(typescript_only, SourceDialect::JavaScript),
             LintLevel::Allow
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_fallback_cache_root_creates_owner_only_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::Ordering;
+
+        let path = std::env::temp_dir().join(format!(
+            "bamts-cli-private-cache-create-{}-{}",
+            std::process::id(),
+            super::NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        let root = super::ensure_private_fallback_cache_root(path.clone())
+            .expect("private fallback root should be created");
+        let metadata = std::fs::symlink_metadata(&root).expect("metadata");
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_fallback_cache_root_rejects_group_or_other_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::Ordering;
+
+        let path = std::env::temp_dir().join(format!(
+            "bamts-cli-private-cache-unsafe-{}-{}",
+            std::process::id(),
+            super::NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir(&path).expect("create fixture root");
+        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o710);
+        std::fs::set_permissions(&path, permissions).expect("chmod");
+        let error = super::ensure_private_fallback_cache_root(path.clone())
+            .expect_err("group/other bits must be rejected");
+        assert!(matches!(error, DriverError::UnsafeFallbackCacheRoot { .. }));
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_fallback_cache_root_rejects_replaceable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::Ordering;
+
+        let parent = std::env::temp_dir().join(format!(
+            "bamts-cli-replaceable-parent-{}-{}",
+            std::process::id(),
+            super::NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::create_dir(&parent).expect("create fixture parent");
+        let mut permissions = std::fs::metadata(&parent).expect("metadata").permissions();
+        permissions.set_mode(0o777);
+        std::fs::set_permissions(&parent, permissions).expect("chmod");
+
+        let error = super::ensure_private_fallback_cache_root(parent.join("cache"))
+            .expect_err("replaceable parent must be rejected");
+
+        assert!(matches!(error, DriverError::UnsafeFallbackCacheRoot { .. }));
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn random_fallback_cache_root_uses_private_unpredictable_leaf() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::Ordering;
+
+        let parent = std::env::temp_dir().join(format!(
+            "bamts-cli-shared-sticky-parent-{}-{}",
+            std::process::id(),
+            super::NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::create_dir(&parent).expect("create fixture parent");
+        let mut permissions = std::fs::metadata(&parent).expect("metadata").permissions();
+        permissions.set_mode(0o1777);
+        std::fs::set_permissions(&parent, permissions).expect("chmod");
+
+        let root = super::create_random_fallback_cache_root_in(&parent)
+            .expect("sticky parent must support an atomic random private leaf");
+        let name = root
+            .path()
+            .file_name()
+            .expect("fallback leaf")
+            .to_string_lossy();
+        assert!(name.starts_with(&format!("bamts-cache-{}-", super::effective_uid().unwrap())));
+        assert!(name.len() > "bamts-cache-1000-".len());
+        assert_eq!(
+            std::fs::metadata(root.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        drop(root);
+        let _ = std::fs::remove_dir_all(&parent);
     }
 
     #[cfg(unix)]

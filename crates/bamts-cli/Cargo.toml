@@ -18,6 +18,7 @@ bamts-compiler.workspace = true
 bamts-runtime.workspace = true
 bamts-codegen = { workspace = true, features = ["aot", "host-jit"] }
 bamts-node.workspace = true
+tempfile = "=3.27.0"
 
 [build-dependencies]
 bamts-node = { workspace = true, features = ["aot-main", "script-compiler"] }

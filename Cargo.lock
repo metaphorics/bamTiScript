@@ -60,6 +60,7 @@ dependencies = [
  "bamts-node",
  "bamts-runtime",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

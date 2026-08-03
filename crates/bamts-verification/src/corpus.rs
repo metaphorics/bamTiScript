@@ -670,6 +670,7 @@ impl CorpusFailure {
             driver::DriverError::Native(error) => native_stage(error),
             driver::DriverError::Aot(error) => aot_stage(error),
             driver::DriverError::CreateDirectory { .. }
+            | driver::DriverError::UnsafeFallbackCacheRoot { .. }
             | driver::DriverError::CacheArchive { .. }
             | driver::DriverError::WriteObject { .. }
             | driver::DriverError::ToolchainMissing { .. }
