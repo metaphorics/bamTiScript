@@ -638,7 +638,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "Legacy decorators have semantics that differ from standard ECMAScript decorators.",
         "Use standard decorators or an explicit wrapper.",
-        examples!("@sealed class C {}", "const safe: number = 1;")
+        examples!("class C { m(@dec p: number) {} }", "class C { m(p: number) {} }")
     ),
     rule!(
         "BAMTS-W027",

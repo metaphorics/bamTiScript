@@ -991,6 +991,7 @@ pub struct ArrowFunction {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConstructorDeclaration {
+    pub decorators: Vec<DecoratorNode>,
     pub modifiers: DeclarationModifiers,
     pub parameters: Vec<ParameterNode>,
     pub body: BlockNode,
@@ -1007,6 +1008,7 @@ pub struct MethodDeclaration {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClassProperty {
+    pub decorators: Vec<DecoratorNode>,
     pub modifiers: DeclarationModifiers,
     pub name: PropertyName,
     pub optional: bool,
@@ -1017,6 +1019,7 @@ pub struct ClassProperty {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AutoAccessor {
+    pub decorators: Vec<DecoratorNode>,
     pub modifiers: DeclarationModifiers,
     pub name: PropertyName,
     pub type_annotation: Option<TypeAnnotationNode>,

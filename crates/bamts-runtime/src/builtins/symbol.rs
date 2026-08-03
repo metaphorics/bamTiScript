@@ -21,10 +21,15 @@ pub(super) fn install<H: Host>(
     let to_string_tag = symbol(heap, "Symbol.toStringTag");
     let species = symbol(heap, "Symbol.species");
     let dispose = symbol(heap, "Symbol.dispose");
+    let async_dispose = symbol(heap, "Symbol.asyncDispose");
+    let unscopables = symbol(heap, "Symbol.unscopables");
     builtins.set_symbol_iterator(iterator);
     builtins.set_symbol_async_iterator(async_iterator);
     builtins.set_symbol_to_string_tag(to_string_tag);
     builtins.set_symbol_species(species);
+    builtins.set_symbol_dispose(dispose);
+    builtins.set_symbol_async_dispose(async_dispose);
+    builtins.set_symbol_unscopables(unscopables);
     builtins.set_symbol_prototype(prototype);
 
     let constructor = install_function(heap, builtins, "Symbol", 0, constructor::<H>);
@@ -38,6 +43,8 @@ pub(super) fn install<H: Host>(
         ("toStringTag", to_string_tag),
         ("species", species),
         ("dispose", dispose),
+        ("asyncDispose", async_dispose),
+        ("unscopables", unscopables),
     ] {
         define_readonly_property(heap, constructor, name, value);
     }
@@ -301,6 +308,50 @@ mod tests {
     }
 
     #[test]
+    fn symbol_async_dispose_is_installed_readonly_and_stable() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let symbol = machine
+            .intrinsics
+            .global("Symbol")
+            .expect("Symbol is installed");
+        let first = machine
+            .get_named_property(symbol, "asyncDispose")
+            .expect("Symbol.asyncDispose is installed");
+        let second = machine
+            .get_named_property(symbol, "asyncDispose")
+            .expect("Symbol.asyncDispose is readable on second read");
+        let description = symbol_description(&machine, first).expect("asyncDispose is a symbol");
+        assert!(
+            description.eq_ascii("Symbol.asyncDispose"),
+            "Symbol.asyncDispose description must be 'Symbol.asyncDispose'"
+        );
+        assert_eq!(first, second, "Symbol.asyncDispose identity must be stable");
+        let key = PropertyKey::Named(EcmaString::from_utf8("asyncDispose"));
+        match machine
+            .own_descriptor(symbol, &key)
+            .expect("descriptor lookup succeeds")
+            .expect("Symbol.asyncDispose is defined")
+        {
+            Property::Data {
+                writable,
+                enumerable,
+                configurable,
+                ..
+            } => {
+                assert!(!writable, "Symbol.asyncDispose must be non-writable");
+                assert!(!enumerable, "Symbol.asyncDispose must be non-enumerable");
+                assert!(
+                    !configurable,
+                    "Symbol.asyncDispose must be non-configurable"
+                );
+            }
+            Property::Accessor { .. } => panic!("Symbol.asyncDispose must be a data property"),
+        }
+    }
+
+    #[test]
     fn symbol_species_descriptor_and_identity_are_stable() {
         let module = blank_program("<test>");
         let mut host = TestHost;
@@ -333,6 +384,48 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn symbol_unscopables_is_installed_readonly_and_stable() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let symbol = machine
+            .intrinsics
+            .global("Symbol")
+            .expect("Symbol is installed");
+        let first = machine
+            .get_named_property(symbol, "unscopables")
+            .expect("Symbol.unscopables is installed");
+        let second = machine
+            .get_named_property(symbol, "unscopables")
+            .expect("Symbol.unscopables is readable on second read");
+        let description = symbol_description(&machine, first).expect("unscopables is a symbol");
+        assert!(
+            description.eq_ascii("Symbol.unscopables"),
+            "Symbol.unscopables description must be 'Symbol.unscopables'"
+        );
+        assert_eq!(first, second, "Symbol.unscopables identity must be stable");
+        assert_eq!(first, machine.intrinsics.builtins.symbol_unscopables());
+        let key = PropertyKey::Named(EcmaString::from_utf8("unscopables"));
+        match machine
+            .own_descriptor(symbol, &key)
+            .expect("descriptor lookup succeeds")
+            .expect("Symbol.unscopables is defined")
+        {
+            Property::Data {
+                writable,
+                enumerable,
+                configurable,
+                ..
+            } => {
+                assert!(!writable, "Symbol.unscopables must be non-writable");
+                assert!(!enumerable, "Symbol.unscopables must be non-enumerable");
+                assert!(!configurable, "Symbol.unscopables must be non-configurable");
+            }
+            Property::Accessor { .. } => panic!("Symbol.unscopables must be a data property"),
+        }
     }
 
     #[test]

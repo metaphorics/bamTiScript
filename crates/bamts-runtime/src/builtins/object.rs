@@ -90,6 +90,25 @@ fn constructor<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let first = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let new_target = machine.current_new_target();
+    let object_constructor = machine
+        .intrinsics
+        .global("Object")
+        .expect("Object intrinsic");
+    // ECMA-262 §20.1.1.1: distinct NewTarget allocates a fresh ordinary object
+    // before any argument return / ToObject boxing path. Primitive NewTarget
+    // must propagate constructed_prototype's InvalidValue (no unwrap_or fallback);
+    // fallback to %Object.prototype% remains inside constructed_prototype for a
+    // valid constructor whose [["prototype"]] is missing or non-object.
+    if new_target != Value::UNDEFINED && new_target != object_constructor {
+        let prototype = machine
+            .constructed_prototype(new_target)
+            .map_err(EvalFailure::Runtime)?;
+        let value = machine
+            .allocate_constructed_receiver_with(prototype)
+            .map_err(EvalFailure::Runtime)?;
+        return Ok(BuiltinOutcome::Value(value));
+    }
     if machine.is_object(first) {
         return Ok(BuiltinOutcome::Value(first));
     }
@@ -1046,7 +1065,7 @@ fn clone_value<H: Host>(
 mod tests {
     use super::super::test_support::{TestHost, blank_program, ordinary_object};
     use super::*;
-    use crate::{Limits, ThrowOrigin};
+    use crate::{Limits, RuntimeErrorKind, ThrowOrigin};
     use bamts_bytecode::{FunctionId, ModuleId};
 
     fn data_descriptor(machine: &mut Machine<'_, TestHost>, value: Value) -> Value {
@@ -2289,7 +2308,7 @@ mod tests {
         let bound_this = ordinary_object(&mut machine);
         let bound =
             call_method(&mut machine, target, "bind", &[bound_this, Value::int32(1)]).unwrap();
-        machine.execute_construct(bound, &[], 0, 0).unwrap();
+        machine.execute_construct(bound, bound, &[], 0, 0).unwrap();
         assert_eq!(machine.frames.len(), 2);
         assert!(machine.run_loop(1).unwrap().is_none());
         let instance = machine.read_register(0, 0);
@@ -2298,6 +2317,335 @@ mod tests {
         assert!(machine.instance_of(instance, bound).unwrap());
         assert!(machine.instance_of(instance, target).unwrap());
     }
+
+    #[test]
+    fn object_constructor_distinct_new_target_ignores_value() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let object_constructor = machine.intrinsics.global("Object").unwrap();
+        let index = machine.runtime_slot(object_constructor).unwrap().unwrap();
+        let HeapEntry::NativeFunction {
+            callable: NativeCallable::Builtin(object_id),
+            ..
+        } = machine.heap[index]
+        else {
+            panic!("Object is a builtin");
+        };
+
+        let custom_prototype = ordinary_object(&mut machine);
+        machine
+            .set_data_property(custom_prototype, "marker", Value::int32(42))
+            .unwrap();
+        let mut properties = PropertyMap::default();
+        properties.insert(
+            PropertyKey::Named(EcmaString::from_utf8("prototype")),
+            Property::Data {
+                value: custom_prototype,
+                writable: true,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        let custom_new_target = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(0),
+                captures: Vec::new(),
+                properties,
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+
+        let existing = ordinary_object(&mut machine);
+        machine
+            .set_data_property(existing, "own", Value::int32(7))
+            .unwrap();
+        let BuiltinOutcome::Value(from_object) = machine
+            .call_builtin_with_new_target(
+                object_id,
+                Value::UNDEFINED,
+                &[existing],
+                true,
+                custom_new_target,
+            )
+            .unwrap()
+        else {
+            panic!("Object construct returns a value");
+        };
+        assert_ne!(from_object, existing);
+        assert_eq!(
+            machine.prototype_value(from_object).unwrap(),
+            Some(custom_prototype)
+        );
+        assert!(
+            !machine
+                .has_own_property_key(
+                    from_object,
+                    &PropertyKey::Named(EcmaString::from_utf8("own"))
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            machine.get_named_property(from_object, "marker").unwrap(),
+            Value::int32(42)
+        );
+
+        let BuiltinOutcome::Value(from_primitive) = machine
+            .call_builtin_with_new_target(
+                object_id,
+                Value::UNDEFINED,
+                &[Value::int32(99)],
+                true,
+                custom_new_target,
+            )
+            .unwrap()
+        else {
+            panic!("Object construct returns a value");
+        };
+        assert!(machine.is_object(from_primitive));
+        assert_eq!(
+            machine.prototype_value(from_primitive).unwrap(),
+            Some(custom_prototype)
+        );
+        // Fresh ordinary object — not a boxed Number.
+        let slot = machine.runtime_slot(from_primitive).unwrap().unwrap();
+        assert!(matches!(
+            &machine.heap[slot],
+            HeapEntry::Object {
+                boxed_primitive: None,
+                ..
+            }
+        ));
+
+        // Ordinary active-target / call paths keep argument return and boxing.
+        let BuiltinOutcome::Value(returned) = machine
+            .call_builtin_with_new_target(
+                object_id,
+                Value::UNDEFINED,
+                &[existing],
+                true,
+                object_constructor,
+            )
+            .unwrap()
+        else {
+            panic!("Object construct returns a value");
+        };
+        assert_eq!(returned, existing);
+
+        let BuiltinOutcome::Value(boxed) = machine
+            .call_builtin_with_new_target(
+                object_id,
+                Value::UNDEFINED,
+                &[Value::int32(99)],
+                true,
+                object_constructor,
+            )
+            .unwrap()
+        else {
+            panic!("Object construct returns a value");
+        };
+        assert_ne!(boxed, from_primitive);
+        let boxed_slot = machine.runtime_slot(boxed).unwrap().unwrap();
+        assert!(matches!(
+            &machine.heap[boxed_slot],
+            HeapEntry::Object {
+                boxed_primitive: Some(_),
+                ..
+            }
+        ));
+
+        let BuiltinOutcome::Value(called) = machine
+            .call_builtin(object_id, Value::UNDEFINED, &[existing], false)
+            .unwrap()
+        else {
+            panic!("Object call returns a value");
+        };
+        assert_eq!(called, existing);
+
+        // Distinct primitive NewTarget must reject (no Object.prototype fallback).
+        let before_new_target = machine.current_new_target();
+        let before_builtin_id = machine.current_builtin_id();
+        let primitive_nt = machine.call_builtin_with_new_target(
+            object_id,
+            Value::UNDEFINED,
+            &[existing],
+            true,
+            Value::int32(99),
+        );
+        assert!(matches!(
+            primitive_nt,
+            Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue { .. }))
+        ));
+        // Nested/error exit must restore ambient construct state.
+        assert_eq!(machine.current_new_target(), before_new_target);
+        assert_eq!(machine.current_builtin_id(), before_builtin_id);
+
+        // Non-object constructor prototype still falls back for a valid object NewTarget.
+        let mut bare_properties = PropertyMap::default();
+        bare_properties.insert(
+            PropertyKey::Named(EcmaString::from_utf8("prototype")),
+            Property::Data {
+                value: Value::int32(1),
+                writable: true,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        let bare_new_target = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(0),
+                captures: Vec::new(),
+                properties: bare_properties,
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        let BuiltinOutcome::Value(fallback) = machine
+            .call_builtin_with_new_target(
+                object_id,
+                Value::UNDEFINED,
+                &[existing],
+                true,
+                bare_new_target,
+            )
+            .unwrap()
+        else {
+            panic!("Object construct returns a value");
+        };
+        assert_ne!(fallback, existing);
+        assert_eq!(
+            machine.prototype_value(fallback).unwrap(),
+            Some(machine.intrinsics.object_prototype)
+        );
+    }
+
+    #[test]
+    fn bound_object_constructor_forwards_ordinary_and_distinct_new_target() {
+        // B2 -> B1 -> Object: ordinary construction preserves args; distinct NT ignores them.
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let object_constructor = machine.intrinsics.global("Object").unwrap();
+        let index = machine.runtime_slot(object_constructor).unwrap().unwrap();
+        let HeapEntry::NativeFunction {
+            callable: NativeCallable::Builtin(object_id),
+            ..
+        } = machine.heap[index]
+        else {
+            panic!("Object is a builtin");
+        };
+        let b1 = call_method(
+            &mut machine,
+            object_constructor,
+            "bind",
+            &[Value::UNDEFINED],
+        )
+        .unwrap();
+        let b2 = call_method(&mut machine, b1, "bind", &[Value::UNDEFINED]).unwrap();
+
+        let existing = ordinary_object(&mut machine);
+        machine
+            .set_data_property(existing, "own", Value::int32(7))
+            .unwrap();
+
+        // Ordinary Construct(B2, [existing]) keeps Object's argument-return path.
+        let returned = machine.construct_value(b2, &[existing]).unwrap();
+        assert_eq!(returned, existing);
+
+        // Ordinary Construct(B2, [99]) boxes the primitive.
+        let boxed = machine.construct_value(b2, &[Value::int32(99)]).unwrap();
+        assert!(machine.is_object(boxed));
+        let boxed_slot = machine.runtime_slot(boxed).unwrap().unwrap();
+        assert!(matches!(
+            &machine.heap[boxed_slot],
+            HeapEntry::Object {
+                boxed_primitive: Some(_),
+                ..
+            }
+        ));
+
+        let custom_prototype = ordinary_object(&mut machine);
+        machine
+            .set_data_property(custom_prototype, "marker", Value::int32(42))
+            .unwrap();
+        let mut properties = PropertyMap::default();
+        properties.insert(
+            PropertyKey::Named(EcmaString::from_utf8("prototype")),
+            Property::Data {
+                value: custom_prototype,
+                writable: true,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        let unrelated = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(0),
+                captures: Vec::new(),
+                properties,
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+
+        // Distinct unrelated NT through the bound chain ignores object/primitive args.
+        let flat_obj = machine
+            .flatten_bound(b2, Value::UNDEFINED, &[existing], unrelated)
+            .unwrap();
+        assert_eq!(flat_obj.target, object_constructor);
+        assert_eq!(flat_obj.new_target, unrelated);
+        let BuiltinOutcome::Value(fresh_obj) = machine
+            .call_builtin_with_new_target(
+                object_id,
+                Value::UNDEFINED,
+                &flat_obj.arguments,
+                true,
+                flat_obj.new_target,
+            )
+            .unwrap()
+        else {
+            panic!("Object construct returns a value");
+        };
+        assert_ne!(fresh_obj, existing);
+        assert_eq!(
+            machine.prototype_value(fresh_obj).unwrap(),
+            Some(custom_prototype)
+        );
+
+        let flat_prim = machine
+            .flatten_bound(b2, Value::UNDEFINED, &[Value::int32(99)], unrelated)
+            .unwrap();
+        let BuiltinOutcome::Value(fresh_prim) = machine
+            .call_builtin_with_new_target(
+                object_id,
+                Value::UNDEFINED,
+                &flat_prim.arguments,
+                true,
+                flat_prim.new_target,
+            )
+            .unwrap()
+        else {
+            panic!("Object construct returns a value");
+        };
+        assert_ne!(fresh_prim, boxed);
+        assert_eq!(
+            machine.prototype_value(fresh_prim).unwrap(),
+            Some(custom_prototype)
+        );
+        let fresh_slot = machine.runtime_slot(fresh_prim).unwrap().unwrap();
+        assert!(matches!(
+            &machine.heap[fresh_slot],
+            HeapEntry::Object {
+                boxed_primitive: None,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn function_prototype_methods_reject_invalid_receivers_and_construction() {
         let module = blank_program("<test>");

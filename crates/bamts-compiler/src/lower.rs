@@ -1,42 +1,41 @@
-
 #![allow(clippy::too_many_lines)]
-use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::error::Error;
-use std::fmt;
-use bamts_bytecode::{
-    AccessorKind, BigIntLiteral, BinaryOp, Constant, ConstantId, DescriptorSlot, DisposeHint,
-    EcmaString, ExceptionHandler, Function, FunctionFlags, FunctionId, Instruction,
-    IteratorCloseMode, IteratorKind, MAX_BIGINT_BYTES, MAX_CONSTANTS, MAX_FUNCTIONS,
-    MAX_INSTRUCTIONS, MAX_REGISTERS,
-    Module, NumberBits, Pc, Register, UnaryOp, Verified, VerifyError,
-};
+use crate::enum_plan::{EnumFacts, EnumMemberPlan, EnumScalar, EnumValue};
+use crate::literal::{cook_escapes, number_value, string_value};
+use crate::namespace_plan::{ContainerAcquisition, NamespaceFacts};
 pub use crate::program::{
     ExecutableModuleProvenance, ExecutableProgram, ProgramLowerError, ProgramLowerErrorKind,
     ProgramLowerPhase, lower_program,
 };
-use crate::enum_plan::{EnumFacts, EnumMemberPlan, EnumScalar, EnumValue};
-use crate::literal::{cook_escapes, number_value, string_value};
-use crate::namespace_plan::{ContainerAcquisition, NamespaceFacts};
 use crate::source::{ScriptKind, SourceId, TextRange, Utf16Pos};
 use crate::syntax::{
     ArrayBindingElement, ArrayElement, ArrowFunction, AssignmentArrayElement, AssignmentExpression,
     AssignmentMemberTarget, AssignmentObjectProperty, AssignmentOperator, AssignmentTarget,
     AssignmentTargetNode, AwaitExpression, BinaryExpression, BinaryOperator, BindingPattern, Block,
     BlockNode, BooleanLiteralNode, CallArgument, CallExpression, ClassDeclaration, ClassMember,
-    ConditionalExpression, DoWhileStatement, EnumDeclaration, ExportDeclaration,
+    ConditionalExpression, DecoratorNode, DoWhileStatement, EnumDeclaration, ExportDeclaration,
     ExportDefaultValue, ExportNamedDeclaration, ExportSpecifierMode, Expr, Expression, ForBinding,
     ForInStatement, ForInitializer, ForOfMode, ForOfStatement, ForStatement, FunctionBody,
     FunctionLike, IdentifierNode, IfStatement, ImportBinding, ImportDeclaration,
     ImportSpecifierMode, LabeledStatement, Literal, LogicalExpression, LogicalOperator,
     MemberExpression, MemberProperty, MetaProperty, ModuleExportName, NamespaceDeclaration,
-    DecoratorNode, NewExpression, NodeId, NodeKind, NumericLiteralNode, ObjectLiteral,
-    ObjectMember, ParameterNode, Pattern, PrivateIdentifierNode, PropertyModifier, PropertyName,
+    NewExpression, NodeId, NodeKind, NumericLiteralNode, ObjectLiteral, ObjectMember,
+    ParameterNode, Pattern, PrivateIdentifierNode, PropertyModifier, PropertyName,
     RegexLiteralNode, SourceFile, Statement, Stmt, StringLiteralNode, SwitchStatement,
     TemplateElementNode, TemplateLiteral, TokenKind, UnaryOperator, UpdateExpression,
     UpdateOperator, VariableDeclaration, VariableKind, WhileStatement, WithStatement,
     YieldExpression,
 };
+use bamts_bytecode::{
+    AccessorKind, BigIntLiteral, BinaryOp, Constant, ConstantId, DescriptorSlot, DisposeHint,
+    EcmaString, ExceptionHandler, Function, FunctionFlags, FunctionId, Instruction,
+    IteratorCloseMode, IteratorKind, MAX_BIGINT_BYTES, MAX_CONSTANTS, MAX_FUNCTIONS,
+    MAX_INSTRUCTIONS, MAX_REGISTERS, Module, NumberBits, Pc, Register, UnaryOp, Verified,
+    VerifyError,
+};
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::error::Error;
+use std::fmt;
 fn zero_range() -> TextRange {
     match TextRange::new(Utf16Pos::ZERO, Utf16Pos::ZERO) {
         Ok(range) => range,
@@ -63,9 +62,13 @@ pub struct LowerError {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LowerErrorKind {
-    JavaScriptSourceNeedsCompatibility { script_kind: ScriptKind },
+    JavaScriptSourceNeedsCompatibility {
+        script_kind: ScriptKind,
+    },
     JsonSourceNotExecutable,
-    MissingSyntax { expected: NodeKind },
+    MissingSyntax {
+        expected: NodeKind,
+    },
     InvalidNumericLiteral,
     InvalidBigIntLiteral,
     InvalidRegexLiteral,
@@ -74,10 +77,14 @@ pub enum LowerErrorKind {
     ExportDeclarationInScript,
     ImportMetaInScript,
     ReturnOutsideFunction,
-    InvalidControlFlow { operation: &'static str },
+    InvalidControlFlow {
+        operation: &'static str,
+    },
     /// A direct operation requires a runtime object, but its receiver is an
     /// elided `const enum`.
-    ConstEnumOperation { operation: ConstEnumOperation },
+    ConstEnumOperation {
+        operation: ConstEnumOperation,
+    },
     /// A runtime construct the current instruction set cannot express.
     Unsupported(UnsupportedConstruct),
     /// A structural production capacity ran out.
@@ -716,7 +723,9 @@ enum StaticInit {
         init_chain: Register,
         extra_inits: Register,
     },
-    MemberExtras { extra_inits: Register },
+    MemberExtras {
+        extra_inits: Register,
+    },
     Block(BlockNode),
 }
 struct FunctionContext<'a> {
@@ -847,10 +856,7 @@ impl<'a> FunctionContext<'a> {
         }
         Ok(())
     }
-    fn reject_parameter_decorators(
-        &self,
-        parameters: &[ParameterNode],
-    ) -> Result<(), LowerError> {
+    fn reject_parameter_decorators(&self, parameters: &[ParameterNode]) -> Result<(), LowerError> {
         for parameter in parameters {
             self.reject_decorators(
                 &parameter.data().decorators,
@@ -1288,12 +1294,7 @@ impl<'a> FunctionContext<'a> {
     /// Whether a live with region still precedes `name` given the binding floor.
     /// Captured names restored at scope 0 consult `captured_names` so nested
     /// closures preserve per-site precedence across further capture boundaries.
-    fn with_region_applies(
-        &self,
-        name: &str,
-        floor: Option<usize>,
-        region: &WithRegion,
-    ) -> bool {
+    fn with_region_applies(&self, name: &str, floor: Option<usize>, region: &WithRegion) -> bool {
         match floor {
             None => true,
             Some(index) if index < region.scope_depth => true,
@@ -1526,14 +1527,6 @@ impl<'a> FunctionContext<'a> {
             return self.with_write_to(builder, frozen, name, value, range);
         }
         self.assign_name_static(builder, name, value, range)
-    }
-    fn read_name_value(
-        &mut self,
-        builder: &mut ModuleBuilder,
-        name: &str,
-        range: TextRange,
-    ) -> Result<Register, LowerError> {
-        self.read_name(builder, name, range)
     }
     fn this_value(
         &mut self,
@@ -1834,7 +1827,13 @@ impl<'a> FunctionContext<'a> {
     ) -> Result<(), LowerError> {
         let value = self.lower_expression(builder, &statement.object)?;
         let object = self.alloc_register(range)?;
-        self.emit(range, Instruction::ToObject { dst: object, src: value })?;
+        self.emit(
+            range,
+            Instruction::ToObject {
+                dst: object,
+                src: value,
+            },
+        )?;
         self.push_scope();
         self.with_regions.push(WithRegion {
             site: binding_site(range),
@@ -2281,19 +2280,12 @@ impl<'a> FunctionContext<'a> {
                 if let ForBinding::Variable(declaration) = binding {
                     match declaration.kind {
                         VariableKind::Using => {
-                            context.capture_disposable(
-                                builder,
-                                range,
-                                value,
-                                DisposeHint::Sync,
-                            )?;
+                            context.capture_disposable(builder, range, value, DisposeHint::Sync)?;
                         }
                         VariableKind::AwaitUsing => {
                             if !context.can_await() {
-                                return Err(context.unsupported(
-                                    range,
-                                    UnsupportedConstruct::UsingDeclaration,
-                                ));
+                                return Err(context
+                                    .unsupported(range, UnsupportedConstruct::UsingDeclaration));
                             }
                             context.capture_disposable(
                                 builder,
@@ -3100,8 +3092,7 @@ impl<'a> FunctionContext<'a> {
     ) -> Result<(), LowerError> {
         let range = resource.range;
         if resource.hint == DisposeHint::Sync {
-            let skip_nullish =
-                self.emit_int32_skip_if(builder, range, resource.capture_kind, 0)?;
+            let skip_nullish = self.emit_int32_skip_if(builder, range, resource.capture_kind, 0)?;
             let dispose_start = self.next_pc();
             let arguments = self.alloc_register(range)?;
             self.emit(range, Instruction::CreateArray { dst: arguments })?;
@@ -3135,8 +3126,7 @@ impl<'a> FunctionContext<'a> {
         let undefined = self.undefined(builder, range)?;
         self.move_to(range, awaited, undefined)?;
         // kind == 0: skip the disposer call; awaited stays undefined.
-        let skip_call =
-            self.emit_int32_skip_if(builder, range, resource.capture_kind, 0)?;
+        let skip_call = self.emit_int32_skip_if(builder, range, resource.capture_kind, 0)?;
         let dispose_start = self.next_pc();
         let arguments = self.alloc_register(range)?;
         self.emit(range, Instruction::CreateArray { dst: arguments })?;
@@ -3152,8 +3142,7 @@ impl<'a> FunctionContext<'a> {
         )?;
         // kind == 2: call @@dispose but ignore its return; keep awaited undefined.
         // kind == 1: await the call result.
-        let skip_copy =
-            self.emit_int32_skip_if(builder, range, resource.capture_kind, 2)?;
+        let skip_copy = self.emit_int32_skip_if(builder, range, resource.capture_kind, 2)?;
         self.move_to(range, awaited, result)?;
         self.patch_jump(skip_copy, self.next_pc());
         // kind == 0 lands here with awaited == undefined, still under the handler.
@@ -3204,8 +3193,7 @@ impl<'a> FunctionContext<'a> {
         self.move_to(range, value_reg, catch_register)?;
         let set_pc = self.next_pc();
         self.patch_jump(to_set, set_pc);
-        let throw_kind =
-            self.load_constant(builder, Constant::Int32(COMPLETION_THROW), range)?;
+        let throw_kind = self.load_constant(builder, Constant::Int32(COMPLETION_THROW), range)?;
         self.move_to(range, kind_reg, throw_kind)?;
         let after = self.next_pc();
         if let Some(skip_nullish) = skip_nullish {
@@ -3808,7 +3796,13 @@ impl<'a> FunctionContext<'a> {
                     let id =
                         builder.intern(Constant::String(EcmaString::from_utf8(&name)), range)?;
                     let typed = self.alloc_register(range)?;
-                    self.emit(range, Instruction::TypeOfGlobal { dst: typed, name: id })?;
+                    self.emit(
+                        range,
+                        Instruction::TypeOfGlobal {
+                            dst: typed,
+                            name: id,
+                        },
+                    )?;
                     self.move_to(range, result, typed)?;
                 }
                 self.patch_jump(skip, self.next_pc());
@@ -4376,7 +4370,7 @@ impl<'a> FunctionContext<'a> {
             let value = self.lower_enum_scalar(builder, &scalar, range)?;
             return Ok((object, value));
         }
-        if let Some(_) = self.const_enum_symbol(&member.object)? {
+        if self.const_enum_symbol(&member.object)?.is_some() {
             let operation = if member.optional {
                 ConstEnumOperation::OptionalAccess
             } else {
@@ -4437,10 +4431,10 @@ impl<'a> FunctionContext<'a> {
         if matches!(call.callee.data(), Expression::Super) {
             return self.lower_derived_super(builder, range, call);
         }
-        if let Expression::Member(member) = call.callee.data() {
-            if member.optional {
-                return self.lower_optional_member_call(builder, range, call, member);
-            }
+        if let Expression::Member(member) = call.callee.data()
+            && member.optional
+        {
+            return self.lower_optional_member_call(builder, range, call, member);
         }
         if call.optional {
             return self.lower_optional_call(builder, range, call);
@@ -5251,6 +5245,10 @@ impl<'a> FunctionContext<'a> {
             )),
         }
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "member decoration context build shares class lowering registers and metadata"
+    )]
     fn build_member_context(
         &mut self,
         builder: &mut ModuleBuilder,
@@ -5653,9 +5651,7 @@ impl<'a> FunctionContext<'a> {
                 for specifier in specifiers {
                     let data = specifier.data();
                     if matches!(data.mode, ImportSpecifierMode::TypeOnly)
-                        || self
-                            .enum_facts
-                            .is_elided_import_specifier(specifier.id())
+                        || self.enum_facts.is_elided_import_specifier(specifier.id())
                     {
                         continue;
                     }
@@ -5793,10 +5789,7 @@ impl<'a> FunctionContext<'a> {
                 target: Pc::new(0),
             },
         )?;
-        self.emit(
-            statement.range(),
-            Instruction::CreateObject { dst: object },
-        )?;
+        self.emit(statement.range(), Instruction::CreateObject { dst: object })?;
         self.assign_name(builder, &name, object, statement.range())?;
         self.patch_jump(reuse, self.next_pc());
         Ok(())
@@ -7097,18 +7090,17 @@ impl<'a> FunctionContext<'a> {
                     slots += 1;
                 }
                 ClassMember::Method(method)
-                    if !method.modifiers.is_static && method.function.body.is_some() =>
+                    if !method.modifiers.is_static
+                        && method.function.body.is_some()
+                        && member_decorators
+                            .get(&member.id())
+                            .is_some_and(|d| !d.decorators.is_empty()) =>
                 {
-                    if member_decorators
-                        .get(&member.id())
-                        .is_some_and(|d| !d.decorators.is_empty())
-                    {
-                        steps.push(InstanceInit::Decorated {
-                            slot: slots,
-                            initializer: None,
-                        });
-                        slots += 1;
-                    }
+                    steps.push(InstanceInit::Decorated {
+                        slot: slots,
+                        initializer: None,
+                    });
+                    slots += 1;
                 }
                 _ => {}
             }
@@ -7235,8 +7227,7 @@ impl<'a> FunctionContext<'a> {
                 key: element_key,
             },
         )?;
-        let next_value =
-            self.call_with_registers(range, initializer, receiver, &[value])?;
+        let next_value = self.call_with_registers(range, initializer, receiver, &[value])?;
         self.move_to(range, value, next_value)?;
         let next = self.alloc_register(range)?;
         self.emit(
@@ -7386,7 +7377,12 @@ impl<'a> FunctionContext<'a> {
         let member_decorators = self.lower_member_decorator_inputs(builder, class)?;
         let (instance_steps, instance_slots) = self.plan_instance_inits(class, &member_decorators);
         let class_elements = self.alloc_register(range)?;
-        self.emit(range, Instruction::CreateArray { dst: class_elements })?;
+        self.emit(
+            range,
+            Instruction::CreateArray {
+                dst: class_elements,
+            },
+        )?;
         for _ in 0..instance_slots {
             let record = self.alloc_register(range)?;
             self.emit(range, Instruction::CreateArray { dst: record })?;
@@ -7551,6 +7547,10 @@ impl<'a> FunctionContext<'a> {
         self.pop_scope();
         Ok(final_class)
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "class decorator application shares the decoration queue and state cell"
+    )]
     fn apply_class_decorators(
         &mut self,
         builder: &mut ModuleBuilder,
@@ -7656,10 +7656,8 @@ impl<'a> FunctionContext<'a> {
         builder: &mut ModuleBuilder,
         range: TextRange,
     ) -> Result<Register, LowerError> {
-        let description = builder.intern(
-            Constant::String(EcmaString::from_utf8("#accessor")),
-            range,
-        )?;
+        let description =
+            builder.intern(Constant::String(EcmaString::from_utf8("#accessor")), range)?;
         let value = self.alloc_register(range)?;
         self.emit(
             range,
@@ -7670,6 +7668,10 @@ impl<'a> FunctionContext<'a> {
         )?;
         Ok(value)
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "constructor lowering needs parent/instance/element stage inputs"
+    )]
     fn build_constructor(
         &mut self,
         builder: &mut ModuleBuilder,
@@ -7778,15 +7780,28 @@ impl<'a> FunctionContext<'a> {
         // Drain them as a prefix; field/auto-accessor steps keep source order.
         let ordered = steps
             .iter()
-            .filter(|step| matches!(step, InstanceInit::Decorated { initializer: None, .. }))
+            .filter(|step| {
+                matches!(
+                    step,
+                    InstanceInit::Decorated {
+                        initializer: None,
+                        ..
+                    }
+                )
+            })
             .chain(steps.iter().filter(|step| {
-                !matches!(step, InstanceInit::Decorated { initializer: None, .. })
+                !matches!(
+                    step,
+                    InstanceInit::Decorated {
+                        initializer: None,
+                        ..
+                    }
+                )
             }));
         for step in ordered {
             match step {
                 InstanceInit::PlainField { slot, initializer } => {
-                    let table =
-                        table.expect("plain instance field requires the element table");
+                    let table = table.expect("plain instance field requires the element table");
                     let record = self.read_table_slot(builder, range, table, *slot)?;
                     let key = self.read_slot_entry(builder, range, record, 0)?;
                     let this_value = self.this_value(builder, range)?;
@@ -7815,13 +7830,8 @@ impl<'a> FunctionContext<'a> {
                             Some(expression) => self.lower_expression(builder, expression)?,
                             None => self.undefined(builder, range)?,
                         };
-                        let value = self.run_initializer_chain(
-                            builder,
-                            range,
-                            this_value,
-                            init_chain,
-                            raw,
-                        )?;
+                        let value = self
+                            .run_initializer_chain(builder, range, this_value, init_chain, raw)?;
                         self.emit(
                             range,
                             Instruction::SetProperty {
@@ -8115,10 +8125,7 @@ impl<'a> FunctionContext<'a> {
         let init_chain = self.alloc_register(range)?;
         self.emit(range, Instruction::CreateArray { dst: init_chain })?;
         let extra_inits = self.alloc_register(range)?;
-        self.emit(
-            range,
-            Instruction::CreateArray { dst: extra_inits },
-        )?;
+        self.emit(range, Instruction::CreateArray { dst: extra_inits })?;
         let state_cell = self.alloc_register(range)?;
         self.emit(range, Instruction::CreateCell { dst: state_cell })?;
         let open = self.load_constant(builder, Constant::Boolean(false), range)?;
@@ -8134,6 +8141,10 @@ impl<'a> FunctionContext<'a> {
         let closed = self.load_constant(builder, Constant::Boolean(true), range)?;
         self.store_cell(builder, state_cell, closed, range)
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "instance slot fill writes key and init chain registers into the table"
+    )]
     fn fill_instance_slot(
         &mut self,
         builder: &mut ModuleBuilder,
@@ -8156,6 +8167,10 @@ impl<'a> FunctionContext<'a> {
         }
         Ok(())
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "method decorator application shares target/key/slot/context registers"
+    )]
     fn apply_method_decorators(
         &mut self,
         builder: &mut ModuleBuilder,
@@ -8210,8 +8225,7 @@ impl<'a> FunctionContext<'a> {
             let returned =
                 self.call_with_registers(range, decorator, undefined, &[undefined, context])?;
             let collected = self.alloc_register(range)?;
-            let accepted =
-                self.collect_optional_callable(builder, range, returned, collected)?;
+            let accepted = self.collect_optional_callable(builder, range, returned, collected)?;
             collected_inits.push((accepted, collected));
         }
         for &(accepted, collected) in collected_inits.iter().rev() {
@@ -8233,6 +8247,10 @@ impl<'a> FunctionContext<'a> {
         }
         Ok(())
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "auto-accessor decorator application threads get/set/init-chain registers"
+    )]
     fn apply_auto_accessor_decorators(
         &mut self,
         builder: &mut ModuleBuilder,
@@ -8318,8 +8336,7 @@ impl<'a> FunctionContext<'a> {
             let new_set = self.get_named(builder, range, returned, "set")?;
             self.accept_replacement_callable(builder, range, new_set, current_set)?;
             let init = self.get_named(builder, range, returned, "init")?;
-            let accepted =
-                self.collect_optional_callable(builder, range, init, collected)?;
+            let accepted = self.collect_optional_callable(builder, range, init, collected)?;
             self.move_to(range, accepted_init, accepted)?;
             let after = self.next_pc();
             self.patch_jump(keep, after);
@@ -8400,7 +8417,13 @@ impl<'a> FunctionContext<'a> {
                 state_cell,
             } => {
                 self.apply_method_decorators(
-                    builder, range, target, key, slot, &decorators, context,
+                    builder,
+                    range,
+                    target,
+                    key,
+                    slot,
+                    &decorators,
+                    context,
                 )?;
                 self.close_decoration(builder, range, state_cell)
             }
@@ -8493,6 +8516,10 @@ impl<'a> FunctionContext<'a> {
         }
         Ok(())
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "class member lowering shares ctor/prototype/decoration stage state"
+    )]
     fn lower_class_member(
         &mut self,
         builder: &mut ModuleBuilder,
@@ -8589,8 +8616,7 @@ impl<'a> FunctionContext<'a> {
                     } else {
                         let slot = *next_instance_slot;
                         *next_instance_slot += 1;
-                        let record =
-                            self.read_table_slot(builder, range, class_elements, slot)?;
+                        let record = self.read_table_slot(builder, range, class_elements, slot)?;
                         self.emit(
                             range,
                             Instruction::ArrayPush {
@@ -10215,10 +10241,6 @@ fn number_constant(value: f64) -> Constant {
 }
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
     use super::{
         BigIntTextError, CaptureKey, ConstEnumOperation, ContainerKind, IteratorCloseMode,
         LowerError, LowerErrorKind, LowerOptions, UnsupportedConstruct, canonical_bigint_text,
@@ -10229,6 +10251,10 @@ mod tests {
     use crate::parser::parse;
     use crate::scanner::scan;
     use crate::source::{ScriptKind, SourceId, SourceText};
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     fn repository_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -10382,9 +10408,7 @@ mod tests {
             .iter()
             .enumerate()
             .filter_map(|(index, instruction)| match instruction {
-                Instruction::Call { callee, .. }
-                    if is_decorator_application_call(code, index) =>
-                {
+                Instruction::Call { callee, .. } if is_decorator_application_call(code, index) => {
                     Some((index, callee))
                 }
                 _ => None,
@@ -10436,26 +10460,21 @@ mod tests {
             error.kind,
             LowerErrorKind::Unsupported(UnsupportedConstruct::ParameterDecorator)
         );
-        let error = lower_js_result(
-            "function marker() {} function f(@marker x) { return x; }",
-        )
-        .expect_err("function parameter decorators must fail lowering");
+        let error = lower_js_result("function marker() {} function f(@marker x) { return x; }")
+            .expect_err("function parameter decorators must fail lowering");
         assert_eq!(
             error.kind,
             LowerErrorKind::Unsupported(UnsupportedConstruct::ParameterDecorator)
         );
-        let error = lower_js_result(
-            "function marker() {} class C { method(@marker x) { return x; } }",
-        )
-        .expect_err("method parameter decorators must fail lowering");
+        let error =
+            lower_js_result("function marker() {} class C { method(@marker x) { return x; } }")
+                .expect_err("method parameter decorators must fail lowering");
         assert_eq!(
             error.kind,
             LowerErrorKind::Unsupported(UnsupportedConstruct::ParameterDecorator)
         );
-        let error = lower_js_result(
-            "function marker() {} class C { @marker constructor() {} }",
-        )
-        .expect_err("constructor decorators must fail lowering");
+        let error = lower_js_result("function marker() {} class C { @marker constructor() {} }")
+            .expect_err("constructor decorators must fail lowering");
         assert_eq!(
             error.kind,
             LowerErrorKind::Unsupported(UnsupportedConstruct::ConstructorDecorator)
@@ -10510,11 +10529,7 @@ mod tests {
             })
             .map(|(index, _)| index)
             .collect();
-        assert_eq!(
-            key_calls.len(),
-            1,
-            "computed key expression evaluates once"
-        );
+        assert_eq!(key_calls.len(), 1, "computed key expression evaluates once");
         assert_eq!(
             apply_calls.len(),
             1,
@@ -10578,9 +10593,10 @@ mod tests {
             .enumerate()
             .find(|(index, function)| {
                 *index != entry_index
-                    && function.code().iter().any(|instruction| {
-                        matches!(instruction, Instruction::SetProperty { .. })
-                    })
+                    && function
+                        .code()
+                        .iter()
+                        .any(|instruction| matches!(instruction, Instruction::SetProperty { .. }))
             })
             .map(|(_, function)| function)
             .expect("instance field still initializes in the constructor");
@@ -10621,7 +10637,10 @@ mod tests {
             })
             .count();
         assert_eq!(key_calls, 1, "key expression evaluates once");
-        assert_eq!(apply_calls, 1, "auto-accessor decorator application occurs once");
+        assert_eq!(
+            apply_calls, 1,
+            "auto-accessor decorator application occurs once"
+        );
     }
     #[test]
     fn field_decorator_initializer_flag_is_definite_on_every_merge_path() {
@@ -10655,20 +10674,24 @@ mod tests {
             panic!("addInitializer ends with Return");
         };
         let return_reg = *value;
-        let seeded_before_branch = helper.code().iter().take_while(|instruction| {
-            !matches!(
-                instruction,
-                Instruction::JumpIfFalse { .. }
-                    | Instruction::JumpIfTrue { .. }
-                    | Instruction::Jump { .. }
-            )
-        }).any(|instruction| {
-            matches!(
-                instruction,
-                Instruction::LoadConst { dst, .. } | Instruction::Move { dst, .. }
-                    if *dst == return_reg
-            )
-        });
+        let seeded_before_branch = helper
+            .code()
+            .iter()
+            .take_while(|instruction| {
+                !matches!(
+                    instruction,
+                    Instruction::JumpIfFalse { .. }
+                        | Instruction::JumpIfTrue { .. }
+                        | Instruction::Jump { .. }
+                )
+            })
+            .any(|instruction| {
+                matches!(
+                    instruction,
+                    Instruction::LoadConst { dst, .. } | Instruction::Move { dst, .. }
+                        if *dst == return_reg
+                )
+            });
         assert!(
             seeded_before_branch,
             "addInitializer return register must be seeded before the open/closed split"
@@ -10743,7 +10766,10 @@ mod tests {
         let a = key_call("a");
         let b = key_call("b");
         let c = key_call("c");
-        assert!(a < b && b < c, "computed keys evaluate in source order: a < b < c");
+        assert!(
+            a < b && b < c,
+            "computed keys evaluate in source order: a < b < c"
+        );
         let apply = code
             .iter()
             .enumerate()
@@ -10753,7 +10779,10 @@ mod tests {
                     .filter(|&index| is_decorator_application_call(code, index))
             })
             .expect("decorated member applies once");
-        assert!(c < apply, "all key evaluations precede decorator application");
+        assert!(
+            c < apply,
+            "all key evaluations precede decorator application"
+        );
     }
     #[test]
     fn plain_computed_field_key_evaluated_once_at_class_definition() {
@@ -10770,7 +10799,10 @@ mod tests {
                     && call_loads_global(entry, constants, *index, "key")
             })
             .count();
-        assert_eq!(entry_key_calls, 1, "plain computed key evaluates once at class definition");
+        assert_eq!(
+            entry_key_calls, 1,
+            "plain computed key evaluates once at class definition"
+        );
         let constructor = module
             .functions()
             .iter()
@@ -10785,11 +10817,15 @@ mod tests {
             .map(|(_, function)| function)
             .expect("plain instance field initializes in the constructor");
         assert!(
-            !constructor.code().iter().enumerate().any(|(index, instruction)| {
-                matches!(instruction, Instruction::Call { .. })
-                    && call_arity(constructor.code(), index) == Some(0)
-                    && call_loads_global(constructor.code(), constants, index, "key")
-            }),
+            !constructor
+                .code()
+                .iter()
+                .enumerate()
+                .any(|(index, instruction)| {
+                    matches!(instruction, Instruction::Call { .. })
+                        && call_arity(constructor.code(), index) == Some(0)
+                        && call_loads_global(constructor.code(), constants, index, "key")
+                }),
             "constructor must reuse the staged key instead of re-evaluating it"
         );
         assert!(
@@ -10802,9 +10838,7 @@ mod tests {
     }
     #[test]
     fn constructor_captures_accessor_initializer_not_stored_key() {
-        let module = lower_js(
-            "function outer() { let x = 1; return class { accessor y = x; }; }",
-        );
+        let module = lower_js("function outer() { let x = 1; return class { accessor y = x; }; }");
         let constructor = module
             .functions()
             .iter()
@@ -10827,9 +10861,9 @@ mod tests {
             .position(|instruction| matches!(instruction, Instruction::SetProperty { .. }))
             .expect("accessor writes backing field");
         assert!(
-            constructor.code()[..set_property].iter().any(|instruction| {
-                matches!(instruction, Instruction::GetProperty { .. })
-            }),
+            constructor.code()[..set_property]
+                .iter()
+                .any(|instruction| { matches!(instruction, Instruction::GetProperty { .. }) }),
             "captured initializer loads through a cell before the backing-field write"
         );
     }
@@ -10842,11 +10876,7 @@ mod tests {
             Constant::String(value) if value.eq_ascii(expected)
         )
     }
-    fn global_load_call_index(
-        code: &[Instruction],
-        constants: &[Constant],
-        name: &str,
-    ) -> usize {
+    fn global_load_call_index(code: &[Instruction], constants: &[Constant], name: &str) -> usize {
         let load_pc = code
             .iter()
             .position(|instruction| match instruction {
@@ -10871,25 +10901,22 @@ mod tests {
     }
     fn is_empty_variadic_call(code: &[Instruction], call_index: usize) -> bool {
         let Some(Instruction::Call {
-            callee,
-            arguments,
-            ..
+            callee, arguments, ..
         }) = code.get(call_index)
         else {
             return false;
         };
-        let Some(Instruction::CreateArray { dst: arguments_reg }) = call_index
-            .checked_sub(1)
-            .and_then(|index| code.get(index))
+        let Some(Instruction::CreateArray { dst: arguments_reg }) =
+            call_index.checked_sub(1).and_then(|index| code.get(index))
         else {
             return false;
         };
         if arguments_reg != arguments {
             return false;
         }
-        let Some(Instruction::GetProperty { dst: callee_reg, .. }) = call_index
-            .checked_sub(2)
-            .and_then(|index| code.get(index))
+        let Some(Instruction::GetProperty {
+            dst: callee_reg, ..
+        }) = call_index.checked_sub(2).and_then(|index| code.get(index))
         else {
             return false;
         };
@@ -11018,15 +11045,14 @@ mod tests {
             "tag48 key register must evaluate to the string \"constructor\""
         );
         assert!(
-            code.iter().any(|instruction| match instruction {
-                Instruction::SetProperty { object, key, value }
-                    if *object == raw_ctor
-                        && *value == prototype
-                        && key_name(code, constants, *key) == "prototype" =>
-                {
-                    true
-                }
-                _ => false,
+            code.iter().any(|instruction| {
+                matches!(
+                    instruction,
+                    Instruction::SetProperty { object, key, value }
+                        if *object == raw_ctor
+                            && *value == prototype
+                            && key_name(code, constants, *key) == "prototype"
+                )
             }),
             "the same raw ctor installs `.prototype` pointing at that object"
         );
@@ -11045,9 +11071,7 @@ mod tests {
             })
             .expect("entry function contains tag48 prototype.constructor");
         let (prototype, constructor_key, raw_ctor) = match tag48 {
-            Instruction::DefineDataProperty { object, key, value } => {
-                (*object, *key, *value)
-            }
+            Instruction::DefineDataProperty { object, key, value } => (*object, *key, *value),
             _ => unreachable!("filter matched DefineDataProperty"),
         };
         assert_eq!(
@@ -11056,19 +11080,17 @@ mod tests {
             "resolved tag48 key constant is \"constructor\""
         );
         assert!(
-            !code.iter().any(|instruction| match instruction {
-                Instruction::SetProperty { object, key, .. }
-                    if *object == prototype
-                        && key_name(code, constants, *key) == "constructor" =>
-                {
-                    true
-                }
-                _ => false,
+            !code.iter().any(|instruction| {
+                matches!(
+                    instruction,
+                    Instruction::SetProperty { object, key, .. }
+                        if *object == prototype
+                            && key_name(code, constants, *key) == "constructor"
+                )
             }),
             "class prototype.constructor must not use ordinary SetProperty"
         );
-        let (discovered_raw, discovered_proto) =
-            class_raw_ctor_and_prototype(code, constants);
+        let (discovered_raw, discovered_proto) = class_raw_ctor_and_prototype(code, constants);
         assert_eq!(
             (discovered_raw, discovered_proto),
             (raw_ctor, prototype),
@@ -11141,9 +11163,8 @@ mod tests {
     }
     #[test]
     fn decorated_named_class_keeps_raw_constructor_name_metadata() {
-        let module = lower_js(
-            "function replace() { return class Replacement {} } @replace class Named {}",
-        );
+        let module =
+            lower_js("function replace() { return class Replacement {} } @replace class Named {}");
         assert!(
             module
                 .functions()
@@ -11152,10 +11173,11 @@ mod tests {
             "class decorators still see the non-empty raw constructor name"
         );
         assert!(
-            module
-                .functions()
-                .iter()
-                .any(|function| function_has_name(&module, function, "Replacement")),
+            module.functions().iter().any(|function| function_has_name(
+                &module,
+                function,
+                "Replacement"
+            )),
             "replacement constructors keep their own source names"
         );
     }
@@ -11424,12 +11446,14 @@ mod tests {
             .find(|function| {
                 function.capture_count() == 2
                     && function.parameter_count() == 1
-                    && function.code().iter().any(|instruction| {
-                        matches!(instruction, Instruction::ArrayPush { .. })
-                    })
-                    && function.code().iter().any(|instruction| {
-                        matches!(instruction, Instruction::JumpIfFalse { .. })
-                    })
+                    && function
+                        .code()
+                        .iter()
+                        .any(|instruction| matches!(instruction, Instruction::ArrayPush { .. }))
+                    && function
+                        .code()
+                        .iter()
+                        .any(|instruction| matches!(instruction, Instruction::JumpIfFalse { .. }))
             })
             .expect("class context emits an addInitializer helper");
         let code = helper.code();
@@ -11504,17 +11528,18 @@ mod tests {
                     });
                     let closed = entry.iter().any(|candidate| match candidate {
                         Instruction::SetProperty { object, value, .. } if object == dst => {
-                            entry.iter().any(|prior| match prior {
-                                Instruction::LoadConst { dst: load_dst, constant }
-                                    if load_dst == value
+                            entry.iter().any(|prior| {
+                                matches!(
+                                    prior,
+                                    Instruction::LoadConst {
+                                        dst: load_dst,
+                                        constant,
+                                    } if load_dst == value
                                         && matches!(
                                             &constants[constant.get() as usize],
                                             Constant::Boolean(true)
-                                        ) =>
-                                {
-                                    true
-                                }
-                                _ => false,
+                                        )
+                                )
                             })
                         }
                         _ => false,
@@ -11535,20 +11560,20 @@ mod tests {
             .enumerate()
             .rev()
             .find_map(|(index, instruction)| match instruction {
-                Instruction::SetProperty { object, value, .. } if *object == cell => {
-                    entry.iter().any(|prior| match prior {
-                        Instruction::LoadConst { dst, constant }
-                            if dst == value
-                                && matches!(
-                                    &constants[constant.get() as usize],
-                                    Constant::Boolean(true)
-                                ) =>
-                        {
-                            true
-                        }
-                        _ => false,
-                    }).then_some(index)
-                }
+                Instruction::SetProperty { object, value, .. } if *object == cell => entry
+                    .iter()
+                    .any(|prior| {
+                        matches!(
+                            prior,
+                            Instruction::LoadConst { dst, constant }
+                                if dst == value
+                                    && matches!(
+                                        &constants[constant.get() as usize],
+                                        Constant::Boolean(true)
+                                    )
+                        )
+                    })
+                    .then_some(index),
                 _ => None,
             })
             .expect("state cell is closed with true");
@@ -11686,15 +11711,14 @@ mod tests {
             .windows(2)
             .enumerate()
             .find_map(|(index, window)| match window {
-                [Instruction::Binary {
-                    op: BinaryOp::StrictEqual,
-                    left,
-                    ..
-                }, Instruction::JumpIfTrue { condition, target }]
-                    if left == &kind =>
-                {
-                    Some((index + 1, *condition, target.get() as usize))
-                }
+                [
+                    Instruction::Binary {
+                        op: BinaryOp::StrictEqual,
+                        left,
+                        ..
+                    },
+                    Instruction::JumpIfTrue { condition, target },
+                ] if left == &kind => Some((index + 1, *condition, target.get() as usize)),
                 _ => None,
             })
             .expect("nullish kind equality feeds a JumpIfTrue skip");
@@ -11776,7 +11800,8 @@ mod tests {
 
     #[test]
     fn await_using_in_async_function_captures_async_and_awaits_disposal() {
-        let module = lower_js("async function f() { await using value = acquire(); consume(value); }");
+        let module =
+            lower_js("async function f() { await using value = acquire(); consume(value); }");
         let function = module
             .functions()
             .iter()
@@ -11989,17 +12014,19 @@ mod tests {
             "formal pattern emits a single Await of the selected awaited register"
         );
         // Ensure kind==2 compare uses JumpIfTrue skip polarity (skip copy).
-        let skip_copy = code.windows(2).any(|window| matches!(
-            window,
-            [
-                Instruction::Binary {
-                    op: BinaryOp::StrictEqual,
-                    left,
-                    ..
-                },
-                Instruction::JumpIfTrue { .. }
-            ] if left == &kind
-        ));
+        let skip_copy = code.windows(2).any(|window| {
+            matches!(
+                window,
+                [
+                    Instruction::Binary {
+                        op: BinaryOp::StrictEqual,
+                        left,
+                        ..
+                    },
+                    Instruction::JumpIfTrue { .. }
+                ] if left == &kind
+            )
+        });
         assert!(skip_copy, "kind comparisons use JumpIfTrue skip polarity");
         assert_round_trips(&module);
     }
@@ -12066,14 +12093,15 @@ mod tests {
             .windows(2)
             .enumerate()
             .find_map(|(index, window)| match window {
-                [Instruction::Binary {
-                    op: BinaryOp::StrictEqual,
-                    dst,
-                    left,
-                    ..
-                }, Instruction::JumpIfTrue { condition, target }]
-                    if left == &kind && condition == dst =>
-                {
+                [
+                    Instruction::Binary {
+                        op: BinaryOp::StrictEqual,
+                        dst,
+                        left,
+                        ..
+                    },
+                    Instruction::JumpIfTrue { condition, target },
+                ] if left == &kind && condition == dst => {
                     Some((index, index + 1, target.get() as usize))
                 }
                 _ => None,
@@ -12141,20 +12169,18 @@ mod tests {
             catch_register, suppressed,
             "SuppressError keeps the prior completion distinct from the disposer error"
         );
-        let throw_guard = code[handler_pc..suppress_pc]
-            .windows(2)
-            .any(|window| {
-                matches!(
-                    window,
-                    [
-                        Instruction::Binary {
-                            op: BinaryOp::StrictEqual,
-                            ..
-                        },
-                        Instruction::JumpIfFalse { .. }
-                    ]
-                )
-            });
+        let throw_guard = code[handler_pc..suppress_pc].windows(2).any(|window| {
+            matches!(
+                window,
+                [
+                    Instruction::Binary {
+                        op: BinaryOp::StrictEqual,
+                        ..
+                    },
+                    Instruction::JumpIfFalse { .. }
+                ]
+            )
+        });
         assert!(
             throw_guard,
             "SuppressError is gated on the finally completion kind being THROW"
@@ -12655,8 +12681,7 @@ mod tests {
     }
     #[test]
     fn checked_lowering_retains_elided_const_enum_import_side_effect_without_binding() {
-        let enum_source =
-            "export let evaluated = 0; evaluated += 1; export const enum K { X = 1 }";
+        let enum_source = "export let evaluated = 0; evaluated += 1; export const enum K { X = 1 }";
         let importer_source =
             "import { K, evaluated } from './enum_dep.ts'; const observed = K.X + evaluated;";
         let enum_file = parse(scan(
@@ -12736,7 +12761,10 @@ mod tests {
             })
         };
         let reads_k = reads_named("K");
-        assert!(!reads_k, "elided const-enum specifier must not read a runtime export binding");
+        assert!(
+            !reads_k,
+            "elided const-enum specifier must not read a runtime export binding"
+        );
         assert!(
             reads_named("evaluated"),
             "ordinary import bindings are still materialized"
@@ -12751,7 +12779,10 @@ mod tests {
             })
         };
         let stores_k = stores_global("K");
-        assert!(!stores_k, "elided const-enum specifier leaves no runtime local binding");
+        assert!(
+            !stores_k,
+            "elided const-enum specifier leaves no runtime local binding"
+        );
         assert!(
             stores_global("evaluated"),
             "ordinary import bindings still install a runtime local"
@@ -12865,7 +12896,7 @@ mod tests {
             CaptureKey::WithObject((1, 4), Register::new(5)),
             CaptureKey::WithObject((2, 6), Register::new(5))
         );
-        let nested_function_captures = vec![
+        let nested_function_captures = [
             CaptureKey::Name(String::from("value"), Vec::new()),
             CaptureKey::Container(
                 crate::checker::SymbolId::new(1),
@@ -13783,7 +13814,9 @@ mod tests {
         .unwrap_or_else(|| panic!("derived field is initialized after super"))
     }
     fn plain_call_indices(code: &[Instruction]) -> Vec<usize> {
-        instruction_indices(code, |instruction| matches!(instruction, Instruction::Call { .. }))
+        instruction_indices(code, |instruction| {
+            matches!(instruction, Instruction::Call { .. })
+        })
     }
     fn expect_one_index(label: &str, indices: Vec<usize>) -> usize {
         match indices.as_slice() {
@@ -13813,9 +13846,9 @@ mod tests {
             |code| {
                 first_create_cell_index(code).is_some()
                     && super_construct_indices(code).len() == super_calls
-                    && !code.iter().any(|instruction| {
-                        matches!(instruction, Instruction::CreateClosure { .. })
-                    })
+                    && !code
+                        .iter()
+                        .any(|instruction| matches!(instruction, Instruction::CreateClosure { .. }))
             },
             label,
         )
@@ -13891,11 +13924,7 @@ mod tests {
         let field = instance_field_init_after_super(code, super_construct, this_cell);
         let after_call = first_call_after_index(code, field)
             .expect("after() remains a plain call after field initialization");
-        assert!(
-            before_call < super_construct
-                && super_construct < field
-                && field < after_call
-        );
+        assert!(before_call < super_construct && super_construct < field && field < after_call);
     }
     #[test]
     fn implicit_derived_constructor_forwards_arguments_before_fields() {
@@ -13904,9 +13933,9 @@ mod tests {
             &module,
             |code| {
                 super_construct_indices(code).len() == 1
-                    && code.iter().any(|instruction| {
-                        matches!(instruction, Instruction::ArrayExtend { .. })
-                    })
+                    && code
+                        .iter()
+                        .any(|instruction| matches!(instruction, Instruction::ArrayExtend { .. }))
             },
             "implicit derived constructor extends its arguments array",
         );
@@ -13967,8 +13996,8 @@ mod tests {
                 "derived constructor matches its ConstructWithNewTarget count",
             );
             let code = constructor.code();
-            let create_cell = first_create_cell_index(code)
-                .expect("derived constructor creates its this cell");
+            let create_cell =
+                first_create_cell_index(code).expect("derived constructor creates its this cell");
             let cell = this_cell_register(code);
             let super_calls = super_construct_indices(code);
             assert_eq!(super_calls.len(), case.calls, "{}", case.source);
@@ -14030,13 +14059,13 @@ mod tests {
             super_construct_indices(code),
         );
         assert_super_construct_operands(constructor, super_construct);
-        let cell_creation = first_create_cell_index(code)
-            .expect("this cell creation is present");
+        let cell_creation = first_create_cell_index(code).expect("this cell creation is present");
         let cell_capture = expect_one_index(
             "default initializer arrow captures the this cell",
-            instruction_indices(code, |instruction| {
-                matches!(instruction, Instruction::ArrayPush { value, .. } if *value == cell)
-            }),
+            instruction_indices(
+                code,
+                |instruction| matches!(instruction, Instruction::ArrayPush { value, .. } if *value == cell),
+            ),
         );
         let closure_creation = expect_one_index(
             "default initializer creates its arrow",
@@ -14050,7 +14079,8 @@ mod tests {
     }
     #[test]
     fn derived_constructor_super_store_and_guard_are_adjacent() {
-        let module = lower_js("class Base {} class Derived extends Base { constructor() { super(); } }");
+        let module =
+            lower_js("class Base {} class Derived extends Base { constructor() { super(); } }");
         let constructor = derived_constructor_with_super_count(
             &module,
             1,
@@ -14063,7 +14093,9 @@ mod tests {
             super_construct_indices(code),
         );
         assert_super_construct_operands(constructor, super_pc);
-        let Instruction::ConstructWithNewTarget { dst: construct_dst, .. } = &code[super_pc]
+        let Instruction::ConstructWithNewTarget {
+            dst: construct_dst, ..
+        } = &code[super_pc]
         else {
             panic!("instruction at {super_pc} is not ConstructWithNewTarget");
         };
@@ -14080,7 +14112,9 @@ mod tests {
             .filter(|index| *index > super_pc)
             .collect(),
         );
-        let Instruction::SetProperty { object: this_cell, .. } = &code[cell_store_pc]
+        let Instruction::SetProperty {
+            object: this_cell, ..
+        } = &code[cell_store_pc]
         else {
             panic!("instruction at {cell_store_pc} is not SetProperty");
         };
@@ -14098,8 +14132,7 @@ mod tests {
             .filter(|index| *index > cell_store_pc)
             .collect(),
         );
-        let Instruction::LoadConst { dst: true_src, .. } = &code[true_load_pc]
-        else {
+        let Instruction::LoadConst { dst: true_src, .. } = &code[true_load_pc] else {
             panic!("instruction at {true_load_pc} is not LoadConst");
         };
         let true_src = *true_src;
@@ -14552,21 +14585,28 @@ mod tests {
             CaptureKey::ClassElements(table),
         ];
         let closure = context
-            .build_synthetic_function(&mut builder, range, None, &captures, 2, |inner, _, parameters| {
-                assert_eq!(parameters, &[Register::new(2), Register::new(3)]);
-                assert_eq!(inner.class_elements, Some(Register::new(1)));
-                let sum = inner.alloc_register(range)?;
-                inner.emit(
-                    range,
-                    Instruction::Binary {
-                        dst: sum,
-                        op: BinaryOp::Add,
-                        left: parameters[0],
-                        right: parameters[1],
-                    },
-                )?;
-                Ok(sum)
-            })
+            .build_synthetic_function(
+                &mut builder,
+                range,
+                None,
+                &captures,
+                2,
+                |inner, _, parameters| {
+                    assert_eq!(parameters, &[Register::new(2), Register::new(3)]);
+                    assert_eq!(inner.class_elements, Some(Register::new(1)));
+                    let sum = inner.alloc_register(range)?;
+                    inner.emit(
+                        range,
+                        Instruction::Binary {
+                            dst: sum,
+                            op: BinaryOp::Add,
+                            left: parameters[0],
+                            right: parameters[1],
+                        },
+                    )?;
+                    Ok(sum)
+                },
+            )
             .expect("synthetic function lowers");
         let functions: Vec<_> = builder
             .functions
@@ -14625,7 +14665,11 @@ mod tests {
         let module = lower_js("with (o) { x; }");
         let code = entry_code(&module);
         let to_objects = to_object_indices(code);
-        assert_eq!(to_objects.len(), 1, "exactly one ToObject for the with object");
+        assert_eq!(
+            to_objects.len(),
+            1,
+            "exactly one ToObject for the with object"
+        );
         let membership = with_has_binding_indices(code);
         assert!(!membership.is_empty(), "free name consults with membership");
         assert!(
@@ -14667,9 +14711,10 @@ mod tests {
             .functions()
             .iter()
             .find(|function| {
-                function.code().iter().any(|instruction| {
-                    matches!(instruction, Instruction::ToObject { .. })
-                })
+                function
+                    .code()
+                    .iter()
+                    .any(|instruction| matches!(instruction, Instruction::ToObject { .. }))
             })
             .expect("function containing with");
         assert!(
@@ -14685,9 +14730,10 @@ mod tests {
             .functions()
             .iter()
             .find(|function| {
-                function.code().iter().any(|instruction| {
-                    matches!(instruction, Instruction::WithHasBinding { .. })
-                })
+                function
+                    .code()
+                    .iter()
+                    .any(|instruction| matches!(instruction, Instruction::WithHasBinding { .. }))
             })
             .expect("function body emits WithHasBinding for outer var");
         assert_eq!(
@@ -14729,10 +14775,7 @@ mod tests {
             membership[0], inner_object,
             "innermost WithHasBinding comes first"
         );
-        assert_eq!(
-            membership[1], outer_object,
-            "outer WithHasBinding follows"
-        );
+        assert_eq!(membership[1], outer_object, "outer WithHasBinding follows");
     }
     #[test]
     fn with_simple_assignment_resolves_put_value_after_rhs() {
@@ -14742,7 +14785,10 @@ mod tests {
         let to_object = expect_one_index("ToObject", to_object_indices(code));
         let membership = with_has_binding_indices(code);
         assert_eq!(membership.len(), 1, "PutValue alone probes membership");
-        assert!(to_object < membership[0], "object coercion precedes PutValue");
+        assert!(
+            to_object < membership[0],
+            "object coercion precedes PutValue"
+        );
         let write = instruction_indices(code, |instruction| {
             matches!(
                 instruction,
@@ -14851,11 +14897,10 @@ mod tests {
             )
         }));
         assert!(
-            instruction_indices(code, |instruction| {
+            !instruction_indices(code, |instruction| {
                 matches!(instruction, Instruction::GetProperty { .. })
             })
-            .len()
-                >= 1
+            .is_empty()
         );
     }
     #[test]
@@ -14906,20 +14951,22 @@ mod tests {
             .iter()
             .find(|function| {
                 let code = function.code();
-                code.iter().any(|instruction| {
-                    matches!(instruction, Instruction::WithHasBinding { .. })
-                }) && code.iter().any(|instruction| {
-                    matches!(instruction, Instruction::GetProperty { .. })
-                }) && code.iter().any(|instruction| {
-                    matches!(instruction, Instruction::Return { .. })
-                })
+                code.iter()
+                    .any(|instruction| matches!(instruction, Instruction::WithHasBinding { .. }))
+                    && code
+                        .iter()
+                        .any(|instruction| matches!(instruction, Instruction::GetProperty { .. }))
+                    && code
+                        .iter()
+                        .any(|instruction| matches!(instruction, Instruction::Return { .. }))
             })
             .expect("nested function consults captured with region");
         assert_eq!(with_has_binding_indices(inner.code()).len(), 1);
     }
     #[test]
     fn closure_captured_outer_binding_still_consults_with_region() {
-        let module = lower_js("function f(o) { var x = 1; with (o) { return function () { return x; }; } }");
+        let module =
+            lower_js("function f(o) { var x = 1; with (o) { return function () { return x; }; } }");
         let inner = module
             .functions()
             .iter()
@@ -14930,25 +14977,28 @@ mod tests {
                     })
             })
             .expect("closure over outer var inside with still emits WithHasBinding");
-        assert!(inner.code().iter().any(|instruction| {
-            matches!(instruction, Instruction::GetProperty { .. })
-        }));
+        assert!(
+            inner
+                .code()
+                .iter()
+                .any(|instruction| { matches!(instruction, Instruction::GetProperty { .. }) })
+        );
     }
     #[test]
     fn closure_with_body_lexical_capture_shadows_object_property() {
         // Lexical `x` declared inside the with body must win over a same-named
         // property on the with object once captured into a nested closure.
-        let module = lower_js(
-            "function f(o) { with (o) { let x = 1; return function () { return x; }; } }",
-        );
+        let module =
+            lower_js("function f(o) { with (o) { let x = 1; return function () { return x; }; } }");
         let inner = module
             .functions()
             .iter()
             .find(|function| {
                 function.parameter_count() == 0
-                    && function.code().iter().any(|instruction| {
-                        matches!(instruction, Instruction::Return { .. })
-                    })
+                    && function
+                        .code()
+                        .iter()
+                        .any(|instruction| matches!(instruction, Instruction::Return { .. }))
             })
             .expect("closure capturing with-body lexical");
         assert!(
@@ -14972,9 +15022,10 @@ mod tests {
                     && function.code().iter().any(|instruction| {
                         matches!(instruction, Instruction::WithHasBinding { .. })
                     })
-                    && function.code().iter().any(|instruction| {
-                        matches!(instruction, Instruction::GetProperty { .. })
-                    })
+                    && function
+                        .code()
+                        .iter()
+                        .any(|instruction| matches!(instruction, Instruction::GetProperty { .. }))
             })
             .expect("two-level nested closure must still consult captured with region");
         assert!(
@@ -14990,9 +15041,10 @@ mod tests {
             .iter()
             .find(|function| {
                 function.parameter_count() == 1
-                    && function.code().iter().any(|instruction| {
-                        matches!(instruction, Instruction::Return { .. })
-                    })
+                    && function
+                        .code()
+                        .iter()
+                        .any(|instruction| matches!(instruction, Instruction::Return { .. }))
             })
             .expect("nested function with parameter");
         assert!(
@@ -15030,9 +15082,6 @@ mod tests {
     #[test]
     fn with_body_error_still_pops_region() {
         let error = lower_js_result("with (o) { return; }").expect_err("top-level return");
-        assert!(matches!(
-            error.kind,
-            LowerErrorKind::ReturnOutsideFunction
-        ));
+        assert!(matches!(error.kind, LowerErrorKind::ReturnOutsideFunction));
     }
 }

@@ -61,6 +61,9 @@ const VM_PROGRAM: &str = r#"import { runInNewContext } from 'node:vm';
 console.log(runInNewContext('1 + 1'));
 console.log(typeof runInNewContext('({})'));
 "#;
+const CLASSIC_DYNAMIC_IMPORT_PROGRAM: &str = r#"import vm from 'node:vm';
+vm.runInThisContext("import('node:util').then(function(ns) { process.stdout.write(String(typeof ns.parseArgs) + '\\n'); })");
+"#;
 static NEXT_DIRECTORY: AtomicU32 = AtomicU32::new(0);
 
 #[test]
@@ -147,6 +150,31 @@ process.stdout.write("ok\n");
     assert_success(&aot, "bamts AOT BigInt program");
 
     assert_eq!(jit.stdout, b"ok\n");
+    assert_eq!(aot.stdout, jit.stdout);
+}
+
+#[test]
+fn aot_and_jit_execute_classic_script_dynamic_imports() {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", CLASSIC_DYNAMIC_IMPORT_PROGRAM);
+
+    let jit = project
+        .command()
+        .args(["run", "--target", "jit", "main.ts"])
+        .current_dir(&project.path)
+        .output()
+        .expect("bamts JIT classic dynamic import program starts");
+    assert_success(&jit, "bamts JIT classic dynamic import program");
+
+    let aot = project
+        .command()
+        .args(["run", "--target", "aot", "main.ts"])
+        .current_dir(&project.path)
+        .output()
+        .expect("bamts AOT classic dynamic import program starts");
+    assert_success(&aot, "bamts AOT classic dynamic import program");
+
+    assert_eq!(jit.stdout, b"function\n");
     assert_eq!(aot.stdout, jit.stdout);
 }
 
@@ -534,6 +562,49 @@ fn aot_runs_node_vm_in_new_context() {
         stderr(&output)
     );
     assert_eq!(output.stdout, b"2\nobject\n");
+}
+
+#[test]
+fn jit_runs_external_import_equals_with_one_binding() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        r#"import util = require('node:util');
+process.stdout.write(String(typeof util.parseArgs) + "\n");
+"#,
+    );
+
+    let output = project
+        .command()
+        .args(["run", "--target", "jit", "main.ts"])
+        .current_dir(&project.path)
+        .output()
+        .expect("bamts JIT import-equals run starts");
+
+    assert_success(&output, "bamts JIT import-equals run");
+    assert_eq!(output.stdout, b"function\n");
+}
+
+#[test]
+fn jit_runs_local_commonjs_style_import_equals_with_one_binding() {
+    let project = ScratchDirectory::new();
+    project.write("dependency.ts", "export const value = 41;\n");
+    project.write(
+        "main.ts",
+        r#"import dependency = require('./dependency.js');
+process.stdout.write(String(dependency.value + 1) + "\n");
+"#,
+    );
+
+    let output = project
+        .command()
+        .args(["run", "--target", "jit", "main.ts"])
+        .current_dir(&project.path)
+        .output()
+        .expect("bamts JIT local import-equals run starts");
+
+    assert_success(&output, "bamts JIT local import-equals run");
+    assert_eq!(output.stdout, b"42\n");
 }
 
 #[test]

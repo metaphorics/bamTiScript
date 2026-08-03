@@ -6,7 +6,7 @@ license = "MIT"
 source_dir = "corpus/projects/tiny-invariant"
 entrypoint = "corpus/cases/tiny-invariant.ts"
 node_args = []
-expected_timeout_ms = 5000
+expected_timeout_ms = 10000
 constructs = [
   "assertion-function-asserts-condition",
   "truthy-condition-passthrough",

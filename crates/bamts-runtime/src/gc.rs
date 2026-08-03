@@ -169,6 +169,9 @@ impl GcState {
             if let Some(value) = module.namespace {
                 self.mark_value(&machine.heap, value);
             }
+            if let Some(value) = module.import_meta {
+                self.mark_value(&machine.heap, value);
+            }
             match &module.state {
                 ModuleState::Unevaluated | ModuleState::Evaluating => {}
                 ModuleState::EvaluatingAsync {
@@ -495,6 +498,10 @@ fn trace_promise_reaction(
         } => {
             mark_value(heap, marks, work, *derived);
             mark_value(heap, marks, work, *sync_iterator);
+        }
+        PromiseReaction::DynamicImportFulfill { promise, .. }
+        | PromiseReaction::DynamicImportReject { promise, .. } => {
+            mark_value(heap, marks, work, *promise);
         }
     }
     if let Some(context) = reaction.context() {

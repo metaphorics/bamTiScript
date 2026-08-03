@@ -507,11 +507,131 @@ mod tests {
 
     #[cfg(feature = "node-host")]
     #[test]
+    fn runs_qualified_import_equals_namespace_alias() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            declare namespace A { export namespace B { export const value: number; } }
+            import X = A.B;
+            type Alias = X;
+            const erased: Alias | undefined = undefined;
+            process.stdout.write(String(erased === undefined) + "\n");
+        "#;
+        let (directory, entrypoint) = script_fixture("qualified-import-equals", source)?;
+        let output = run_program(&entrypoint)?;
+
+        assert_eq!(output.stdout, b"true\n");
+        assert_eq!(output.exit_code, 0);
+        remove_fixture(&directory)
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn runs_nested_ambient_qualified_import_equals_namespace_alias() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            declare namespace A {
+                export namespace B {
+                    export namespace C {
+                        export const value: number;
+                    }
+                }
+            }
+            import X = A.B.C;
+            type Alias = X;
+            const erased: Alias | undefined = undefined;
+            process.stdout.write(String(erased === undefined) + "\n");
+        "#;
+        let (directory, entrypoint) = script_fixture("nested-qualified-import-equals", source)?;
+        let output = run_program(&entrypoint)?;
+
+        assert_eq!(output.stdout, b"true\n");
+        assert_eq!(output.exit_code, 0);
+        remove_fixture(&directory)
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn runs_merged_export_namespace_value_export() -> Result<(), Box<dyn Error>> {
+        let directory = std::env::temp_dir().join(format!(
+            "bamts-facade-merged-export-namespace-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(
+            directory.join("ns.ts"),
+            r#"
+                export class C {}
+                export namespace C {
+                    export const tag = "ns";
+                }
+                export namespace N {
+                    export const x = 1;
+                }
+                export namespace N {
+                    export const y = 2;
+                }
+                export function F() {
+                    return "fn";
+                }
+                export namespace F {
+                    export const z = 3;
+                }
+            "#,
+        )?;
+        let entrypoint = directory.join("main.ts");
+        std::fs::write(
+            &entrypoint,
+            r#"
+                import { C, N, F } from "./ns.ts";
+                process.stdout.write(String(C.tag) + "\n");
+                process.stdout.write(String(N.x + N.y) + "\n");
+                process.stdout.write(String(F() + F.z) + "\n");
+            "#,
+        )?;
+        let output = run_program(&entrypoint)?;
+        assert_eq!(output.stdout, b"ns\n3\nfn3\n");
+        assert_eq!(output.exit_code, 0);
+        remove_fixture(&directory)
+    }
+
+    #[test]
     fn runs_two_module_program_with_live_imported_mutation() -> Result<(), Box<dyn Error>> {
         let (directory, entrypoint) = fixture("run")?;
         let output = run_program(&entrypoint)?;
 
         assert_eq!(output.stdout, b"2\n");
+        assert_eq!(output.exit_code, 0);
+        remove_fixture(&directory)
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn runs_commonjs_export_equals_import_require() -> Result<(), Box<dyn Error>> {
+        let directory = std::env::temp_dir().join(format!(
+            "bamts-facade-export-equals-require-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(
+            directory.join("dep.ts"),
+            r#"
+                function run() {
+                    process.stdout.write("executed\n");
+                }
+                export = run;
+            "#,
+        )?;
+        let entrypoint = directory.join("main.ts");
+        std::fs::write(
+            &entrypoint,
+            r#"
+                import run = require("./dep.js");
+                run();
+            "#,
+        )?;
+        let output = run_program(&entrypoint)?;
+
+        assert_eq!(output.stdout, b"executed\n");
         assert_eq!(output.exit_code, 0);
         remove_fixture(&directory)
     }
@@ -634,6 +754,34 @@ mod tests {
                 "import vm from 'node:vm'; process.stdout.write(String(vm.runInThisContext({script:?})) + '\\n');"
             );
             let (directory, entrypoint) = script_fixture(&format!("completion-{name}"), &source)?;
+            let output = run_program(&entrypoint)?;
+            assert_eq!(output.stdout, expected_stdout, "{name}");
+            assert_eq!(output.exit_code, 0, "{name}");
+            remove_fixture(&directory)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn classic_script_dynamic_import_resolves_external_namespaces() -> Result<(), Box<dyn Error>> {
+        let cases = [
+            (
+                "external-namespace",
+                "import('node:util').then(function(ns) { process.stdout.write(String(typeof ns.parseArgs) + '\\n'); })",
+                b"function\n".as_slice(),
+            ),
+            (
+                "computed-specifier",
+                "const name = 'node:util'; import(name).then(function(ns) { process.stdout.write(String(typeof ns.parseArgs) + '\\n'); })",
+                b"function\n".as_slice(),
+            ),
+        ];
+
+        for (name, script, expected_stdout) in cases {
+            let source = format!("import vm from 'node:vm'; vm.runInThisContext({script:?});");
+            let (directory, entrypoint) =
+                script_fixture(&format!("classic-import-{name}"), &source)?;
             let output = run_program(&entrypoint)?;
             assert_eq!(output.stdout, expected_stdout, "{name}");
             assert_eq!(output.exit_code, 0, "{name}");

@@ -835,6 +835,20 @@ fn require_clean_frontend(
     }
 }
 
+/// Compiles a source entrypoint through the same frontend, lint, and lowering
+/// pipeline as [`execute`], returning the lowered executable program without
+/// running or linking it.  This is the in-process interpreter seam used by the
+/// corpus differential harness so that CLI-supplied lint overrides and
+/// JavaScript-compatibility flags reach the lowering stage.
+pub fn compile_program(
+    args: &CliArgs,
+) -> Result<bamts_compiler::program::ExecutableProgram, DriverError> {
+    let frontend = load_program_frontend(args)?;
+    require_clean_frontend(args, &frontend)?;
+    lower_program(&frontend.program, &frontend.output, lower_options(args))
+        .map_err(DriverError::Lower)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;

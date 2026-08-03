@@ -846,9 +846,11 @@ console.log(typeof import.meta.url === 'string' && import.meta.url.length > 0);
         failures.is_empty(),
         "import-meta differential failures:
 {}",
-        failures.join("
+        failures.join(
+            "
 
-")
+"
+        )
     );
 }
 
@@ -1650,7 +1652,7 @@ fn interpreter_failure_text_names_mode_stage_and_evidence() {
         "a missing entrypoint must classify as load: {text}"
     );
     assert!(
-        text.contains("cannot read"),
+        text.contains("could not read"),
         "failure must carry the observed evidence: {text}"
     );
 }
@@ -2105,9 +2107,9 @@ fn member_decorator_application_stages_match_tsc_oracle_in_every_execution_mode(
     let transpiled_path = root.join(&transpiled_relative);
 
     // Static members first in source so evaluation order cannot be mistaken for the
-    // four application stages: static callable → instance callable →
-    // static field-like → instance field-like. evaluate:/key: stay on the evaluation
-    // timeline; apply: alone proves application-stage order.
+    // four application stages: static callable/accessor → instance callable/accessor →
+    // static field → instance field. evaluate:/key: stay on the evaluation timeline;
+    // apply: alone proves application-stage order.
     let source = r#"const trace = [];
 function log(value) { trace.push(value); }
 function dec(label) {
@@ -2121,11 +2123,17 @@ class Fixture {
   @dec('static-callable')
   static [key('sMethod')]() { return 's'; }
 
+  @dec('static-accessor-field-like')
+  static accessor [key('sAccessor')] = 3;
+
   @dec('static-field-like')
   static [key('sField')] = 1;
 
   @dec('instance-callable')
   [key('iMethod')]() { return 'i'; }
+
+  @dec('instance-accessor-field-like')
+  accessor [key('iAccessor')] = 4;
 
   @dec('instance-field-like')
   [key('iField')] = 2;
@@ -2184,8 +2192,7 @@ console.log(trace.join('\n'));
         let actual = bamts.run_case(&actual_spec, mode);
         compare_case(&spec.id, mode, &expected, &actual, &mut failures);
     }
-    fs::remove_file(source_path)
-        .expect("remove member decorator application-stage source fixture");
+    fs::remove_file(source_path).expect("remove member decorator application-stage source fixture");
     fs::remove_file(transpiled_path)
         .expect("remove member decorator application-stage oracle fixture");
     assert!(
@@ -2516,8 +2523,7 @@ console.log(trace.join('\n'));
         let actual = bamts.run_case(&actual_spec, mode);
         compare_case(&spec.id, mode, &expected, &actual, &mut failures);
     }
-    fs::remove_file(source_path)
-        .expect("remove stacked field/accessor initializer source fixture");
+    fs::remove_file(source_path).expect("remove stacked field/accessor initializer source fixture");
     fs::remove_file(transpiled_path)
         .expect("remove stacked field/accessor initializer oracle fixture");
     assert!(
@@ -2609,9 +2615,13 @@ console.log(trace.join('\n'));
 }
 
 #[test]
-fn class_decorator_replacement_static_field_and_auto_accessor_match_tsc_oracle_in_every_execution_mode() {
+fn class_decorator_replacement_static_field_and_auto_accessor_match_tsc_oracle_in_every_execution_mode()
+ {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let id = format!("class-decorator-replacement-static-accessor-{}", process::id());
+    let id = format!(
+        "class-decorator-replacement-static-accessor-{}",
+        process::id()
+    );
     let source_relative = format!("target/{id}.js");
     let source_path = root.join(&source_relative);
     let transpiled_relative = format!("target/decorator-oracles/{id}.js");
@@ -2806,7 +2816,8 @@ console.log(trace.join('\n'));
 }
 
 #[test]
-fn decorated_member_distinct_computed_keys_same_runtime_key_match_tsc_oracle_in_every_execution_mode() {
+fn decorated_member_distinct_computed_keys_same_runtime_key_match_tsc_oracle_in_every_execution_mode()
+ {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!(
         "decorated-member-distinct-computed-same-runtime-key-{}",
@@ -2904,8 +2915,8 @@ console.log(trace.join('\n'));
 }
 
 #[test]
-fn computed_member_source_order_key_once_and_accessor_init_match_tsc_oracle_in_every_execution_mode(
-) {
+fn computed_member_source_order_key_once_and_accessor_init_match_tsc_oracle_in_every_execution_mode()
+ {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!(
         "computed-member-source-order-key-once-accessor-init-{}",
@@ -3020,12 +3031,10 @@ console.log(trace.join('\n'));
         let actual = bamts.run_case(&actual_spec, mode);
         compare_case(&spec.id, mode, &expected, &actual, &mut failures);
     }
-    fs::remove_file(source_path).expect(
-        "remove computed member source-order/key-once/accessor-init source fixture",
-    );
-    fs::remove_file(transpiled_path).expect(
-        "remove computed member source-order/key-once/accessor-init oracle fixture",
-    );
+    fs::remove_file(source_path)
+        .expect("remove computed member source-order/key-once/accessor-init source fixture");
+    fs::remove_file(transpiled_path)
+        .expect("remove computed member source-order/key-once/accessor-init oracle fixture");
     assert!(
         failures.is_empty(),
         "computed member source-order/key-once/accessor-init differential failures:\n{}",
@@ -3279,7 +3288,10 @@ fn async_explicit_resource_management_matches_tsc_oracle_in_every_execution_mode
 #[test]
 fn sync_explicit_resource_management_suppression_matches_tsc_oracle_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let id = format!("sync-explicit-resource-management-suppression-{}", process::id());
+    let id = format!(
+        "sync-explicit-resource-management-suppression-{}",
+        process::id()
+    );
     let source_relative = format!("target/{id}.ts");
     let source_path = root.join(&source_relative);
     let transpiled_relative = format!("target/erm-oracles/{id}.js");
@@ -3309,7 +3321,8 @@ fn sync_explicit_resource_management_suppression_matches_tsc_oracle_in_every_exe
   console.log(out.join("\n"));
 })();
 "#;
-    fs::write(&source_path, source).expect("write sync explicit resource management suppression fixture");
+    fs::write(&source_path, source)
+        .expect("write sync explicit resource management suppression fixture");
     let status = process::Command::new(root.join("node_modules/.bin/tsc"))
         .arg(&source_path)
         .args([
@@ -3543,7 +3556,10 @@ fn resource_management_abrupt_completion_matches_tsc_oracle_in_every_execution_m
 #[test]
 fn async_explicit_resource_management_suppression_matches_tsc_oracle_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let id = format!("async-explicit-resource-management-suppression-{}", process::id());
+    let id = format!(
+        "async-explicit-resource-management-suppression-{}",
+        process::id()
+    );
     let source_relative = format!("target/{id}.ts");
     let source_path = root.join(&source_relative);
     let transpiled_relative = format!("target/erm-oracles/{id}.js");

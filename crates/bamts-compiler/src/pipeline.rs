@@ -358,7 +358,7 @@ pub fn compile_program_frontend_with_lints(
                 .clone();
             let emit = mode
                 .emit_options()
-                .map(|options| emitter::emit(parsed.product(), options));
+                .map(|options| emitter::emit_checked(parsed.product(), &semantic_model, options));
             let (source_file, mut diagnostics) = parsed.into_parts();
             diagnostics.extend(
                 program_diagnostics
@@ -439,10 +439,11 @@ pub fn compile_frontend_with_lints(request: FrontendRequest, levels: &LintTable)
     let parsed = parser::parse(scanned);
     let checked = checker::check_with_lints(&parsed, levels);
 
-    // Emit runs against the recovered tree; it never gates on prior diagnostics.
+    // Emit consumes the recovered tree and this pass's semantic model; it never
+    // gates on prior diagnostics.
     let emit = mode
         .emit_options()
-        .map(|options| emitter::emit(parsed.product(), options));
+        .map(|options| emitter::emit_checked(parsed.product(), checked.product(), options));
 
     let (source_file, parse_diagnostics) = parsed.into_parts();
     let (semantic_model, check_diagnostics) = checked.into_parts();

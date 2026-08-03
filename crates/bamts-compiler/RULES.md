@@ -259,8 +259,8 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Rationale: Legacy decorators have semantics that differ from standard ECMAScript decorators.
 - Sound alternative: Use standard decorators or an explicit wrapper.
 - Silence: `-A legacy-decorator-semantics`
-- Trigger: <code>TypeScript: @sealed class C {}</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Trigger: <code>TypeScript: class C { m(@dec p: number) {} }</code>
+- Clean: <code>TypeScript: class C { m(p: number) {} }</code>
 
 ## `BAMTS-W027`: `angle-bracket-assertion`
 

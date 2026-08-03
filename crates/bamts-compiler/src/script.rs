@@ -9,7 +9,9 @@ use bamts_bytecode::{
 
 use crate::{
     diagnostic::DiagnosticSeverity,
+    enum_plan::EnumFacts,
     lower::{self, LowerError, LowerErrorKind, LowerOptions},
+    namespace_plan::NamespaceFacts,
     parser, scanner,
     source::{ScriptKind, SourceId, SourceText, Utf16Pos},
 };
@@ -73,8 +75,16 @@ pub fn compile_classic_script(
     let options = LowerOptions {
         javascript_compatibility: true,
     };
-    let assembled = lower::assemble_classic_script_named(parsed.product(), options, module_name)
-        .map_err(|error| map_lower_error(&source, error))?;
+    let enum_facts = EnumFacts::unchecked();
+    let namespace_facts = NamespaceFacts::unchecked();
+    let assembled = lower::assemble_classic_script_named(
+        parsed.product(),
+        options,
+        module_name,
+        &enum_facts,
+        &namespace_facts,
+    )
+    .map_err(|error| map_lower_error(&source, error))?;
     let encoded_name = EcmaString::from_utf8(module_name);
     let name = assembled
         .constants()
@@ -162,7 +172,7 @@ fn normalized_module_name(resource_name: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use bamts_bytecode::{Constant, Instruction};
+    use bamts_bytecode::{Constant, Instruction, Verified};
 
     use super::{ScriptCompileError, compile_classic_script};
 
@@ -174,6 +184,32 @@ mod tests {
         )
         .expect("classic script compiles");
 
+        assert_classic_script_is_linkage_free(&program);
+    }
+
+    #[test]
+    fn classic_script_dynamic_import_lowers_without_static_linkage() {
+        let program = compile_classic_script(
+            "import(specifier)"
+                .encode_utf16()
+                .collect::<Vec<_>>()
+                .as_slice(),
+            "script.js",
+        )
+        .expect("classic script dynamic import compiles");
+
+        assert_classic_script_is_linkage_free(&program);
+        assert!(
+            program.modules()[0]
+                .code()
+                .functions()
+                .iter()
+                .flat_map(|function| function.code())
+                .any(|instruction| matches!(instruction, Instruction::ImportDynamic { .. }))
+        );
+    }
+
+    fn assert_classic_script_is_linkage_free(program: &bamts_bytecode::Program<Verified>) {
         assert_eq!(program.entry().get(), 0);
         assert_eq!(program.modules().len(), 1);
         let module = &program.modules()[0];
@@ -206,26 +242,31 @@ mod tests {
 
     #[test]
     fn classic_script_rejects_module_syntax_before_program_linking() {
-        for (source, is_syntax) in [
-            ("import x from 'y'", true),
-            ("export const a = 1", true),
-            ("export default 1", true),
-            ("return 1", true),
-            ("import('y')", false),
+        for (source, expected) in [
+            (
+                "import x from 'y'",
+                "`import` declaration in a classic script",
+            ),
+            (
+                "export const a = 1",
+                "`export` declaration in a classic script",
+            ),
+            (
+                "export default 1",
+                "`export` declaration in a classic script",
+            ),
+            ("return 1", "return statement outside of a function"),
+            ("import.meta", "`import.meta` in a classic script"),
         ] {
             let result =
                 compile_classic_script(&source.encode_utf16().collect::<Vec<_>>(), "script.js");
-            if is_syntax {
-                assert!(
-                    matches!(result, Err(ScriptCompileError::Syntax { .. })),
-                    "{source:?} should be a syntax error in a classic script: {result:?}"
-                );
-            } else {
-                assert!(
-                    matches!(result, Err(ScriptCompileError::Unsupported { .. })),
-                    "{source:?} should be unsupported in a classic script: {result:?}"
-                );
-            }
+            assert!(
+                matches!(
+                    result,
+                    Err(ScriptCompileError::Syntax { ref message, .. }) if message == expected
+                ),
+                "{source:?} should be a syntax error in a classic script: {result:?}"
+            );
         }
     }
 

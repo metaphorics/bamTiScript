@@ -29,10 +29,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use bamts_bytecode::{
-    AccessorKind, BinaryOp, BindingId, BindingKind, Constant, ConstantId, DescriptorSlot,
-    DisposeHint, EcmaString, EcmaStringBuilder, EdgeId, EdgeTarget, Function, FunctionId,
-    Instruction, IteratorCloseMode, IteratorKind, Module, ModuleId, Pc, Program, ProgramModule,
-    ResolvedExport, UnaryOp, Verified,
+    AccessorKind, BinaryOp, BindingId, BindingKind, Constant, ConstantId, DisposeHint, EcmaString,
+    EcmaStringBuilder, EdgeId, EdgeTarget, Function, FunctionId, Instruction, IteratorCloseMode,
+    IteratorKind, Module, ModuleId, Pc, Program, ProgramModule, ResolvedExport, UnaryOp, Verified,
 };
 use bamts_native::{Decoded, SlotId, Value};
 
@@ -1488,8 +1487,12 @@ fn resolve_relative_against_module_name(
         Some(index) => &units[..index],
         None => &[][..],
     };
-    let mut joined =
-        Vec::with_capacity(directory.len().saturating_add(1).saturating_add(specifier.len_units()));
+    let mut joined = Vec::with_capacity(
+        directory
+            .len()
+            .saturating_add(1)
+            .saturating_add(specifier.len_units()),
+    );
     if !directory.is_empty() {
         joined.extend_from_slice(directory);
         joined.push(u16::from(b'/'));
@@ -3174,7 +3177,6 @@ impl<'a, H: Host> Machine<'a, H> {
             }))
         }
     }
-
 
     /// Object Environment Record `HasBinding` for a `with` binding object.
     ///
@@ -4886,7 +4888,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 Instruction::ToObject { dst, src } => {
                     let source = self.read_register(frame_index, src.get());
-                    match self.to_object(source) {
+                    match self.value_to_object(source) {
                         Ok(value) => {
                             self.write_register(frame_index, dst.get(), value);
                             self.frames[frame_index].pc = pc + 1;
@@ -6584,7 +6586,7 @@ impl<'a, H: Host> Machine<'a, H> {
         .map_err(EvalFailure::Runtime)
     }
 
-    pub(crate) fn to_object(&mut self, value: Value) -> Result<Value, EvalFailure> {
+    pub(crate) fn value_to_object(&mut self, value: Value) -> Result<Value, EvalFailure> {
         if matches!(
             value.decode(),
             Some(Decoded::Undefined | Decoded::Null | Decoded::Hole | Decoded::Uninitialized)
@@ -6980,12 +6982,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 // non-Bytecode origin allocates an intrinsic error object.
                 let catch_value = if catch_value_needs_materialization(value, origin) {
                     self.materialize_engine_origin(origin).map_err(|kind| {
-                        self.error_at_in_module(
-                            kind,
-                            site_module,
-                            site_function,
-                            faulting_pc,
-                        )
+                        self.error_at_in_module(kind, site_module, site_function, faulting_pc)
                     })?
                 } else {
                     value
@@ -7251,12 +7248,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 if let Some(found) = property_lookup_ascii(properties, name) {
                     return Some(found);
                 }
-                if let Some(primitive) = boxed_primitive {
-                    if let Some(slot) = self.runtime_slot(*primitive).ok().flatten() {
-                        if let HeapEntry::String(text) = &self.heap[slot] {
-                            return string_own_get_ascii(text, name);
-                        }
-                    }
+                if let Some(primitive) = boxed_primitive
+                    && let Some(slot) = self.runtime_slot(*primitive).ok().flatten()
+                    && let HeapEntry::String(text) = &self.heap[slot]
+                {
+                    return string_own_get_ascii(text, name);
                 }
                 None
             }
@@ -7409,12 +7405,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 if let Some(found) = property_lookup(properties, key) {
                     return Some(found);
                 }
-                if let Some(primitive) = boxed_primitive {
-                    if let Some(slot) = self.runtime_slot(*primitive).ok().flatten() {
-                        if let HeapEntry::String(text) = &self.heap[slot] {
-                            return string_own_get(text, key);
-                        }
-                    }
+                if let Some(primitive) = boxed_primitive
+                    && let Some(slot) = self.runtime_slot(*primitive).ok().flatten()
+                    && let HeapEntry::String(text) = &self.heap[slot]
+                {
+                    return string_own_get(text, key);
                 }
                 None
             }
@@ -11485,8 +11480,8 @@ mod tests {
     use super::*;
     use crate::intrinsics::BuiltinOutcome;
     use bamts_bytecode::{
-        Binding, Edge, EdgeKind, ExceptionHandler, Export, ExportSource, FunctionFlags, NumberBits,
-        ProgramModule, Register,
+        Binding, DescriptorSlot, Edge, EdgeKind, ExceptionHandler, Export, ExportSource,
+        FunctionFlags, NumberBits, ProgramModule, Register,
     };
 
     fn reg(raw: u32) -> Register {
@@ -12653,12 +12648,7 @@ mod tests {
         let reason = *reason;
         let origin = *origin;
         assert_ne!(reason, Value::UNDEFINED);
-        assert_eq!(
-            origin,
-            ThrowOrigin::TypeError {
-                operation: "call",
-            }
-        );
+        assert_eq!(origin, ThrowOrigin::TypeError { operation: "call" });
         let name = machine.get_named_property(reason, "name").unwrap();
         assert!(
             machine
@@ -12684,12 +12674,7 @@ mod tests {
             Vec::new(),
             vec![
                 function(0, 1, vec![Instruction::Halt], Vec::new()),
-                async_function(
-                    1,
-                    1,
-                    vec![Instruction::Throw { value: reg(0) }],
-                    Vec::new(),
-                ),
+                async_function(1, 1, vec![Instruction::Throw { value: reg(0) }], Vec::new()),
             ],
         );
         let mut host = TestHost;
@@ -12729,7 +12714,10 @@ mod tests {
         // Direct sink contract: UNDEFINED + engine TypeError origin becomes one
         // intrinsic TypeError object; a second reject on a settled promise is a
         // no-op and must not allocate another reason.
-        let program = verified(Vec::new(), vec![function(0, 1, vec![Instruction::Halt], Vec::new())]);
+        let program = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
         let mut host = TestHost;
         let mut machine = Machine::new(&program, &mut host, Limits::default());
         let promise = machine.create_promise().unwrap();
@@ -12744,7 +12732,10 @@ mod tests {
             )
             .unwrap();
         let after_first = machine.heap.len();
-        assert!(after_first > before, "lazy rejection must allocate an error");
+        assert!(
+            after_first > before,
+            "lazy rejection must allocate an error"
+        );
         let index = machine.runtime_slot(promise).unwrap().unwrap();
         let HeapEntry::Promise {
             state: PromiseState::Rejected { reason, origin },
@@ -12786,12 +12777,17 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(machine.heap.len(), after_first, "settled reject must not rematerialize");
+        assert_eq!(
+            machine.heap.len(),
+            after_first,
+            "settled reject must not rematerialize"
+        );
         let HeapEntry::Promise {
-            state: PromiseState::Rejected {
-                reason: kept_reason,
-                origin: kept_origin,
-            },
+            state:
+                PromiseState::Rejected {
+                    reason: kept_reason,
+                    origin: kept_origin,
+                },
             ..
         } = &machine.heap[index]
         else {
@@ -12805,7 +12801,10 @@ mod tests {
     fn reject_promise_keeps_prematerialized_identity() {
         // Direct sink contract: an already-materialized reason and Bytecode
         // origin keep exact Value identity with no rematerialization.
-        let program = verified(Vec::new(), vec![function(0, 1, vec![Instruction::Halt], Vec::new())]);
+        let program = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
         let mut host = TestHost;
         let mut machine = Machine::new(&program, &mut host, Limits::default());
         let preallocated = machine
@@ -12821,7 +12820,11 @@ mod tests {
         machine
             .reject_promise(promise, preallocated, ThrowOrigin::Bytecode)
             .unwrap();
-        assert_eq!(machine.heap.len(), before, "prematerialized reject allocates no error");
+        assert_eq!(
+            machine.heap.len(),
+            before,
+            "prematerialized reject allocates no error"
+        );
         let index = machine.runtime_slot(promise).unwrap().unwrap();
         let HeapEntry::Promise {
             state: PromiseState::Rejected { reason, origin },
@@ -14020,12 +14023,7 @@ mod tests {
         let reason = *reason;
         let origin = *origin;
         assert_ne!(reason, Value::UNDEFINED);
-        assert_eq!(
-            origin,
-            ThrowOrigin::TypeError {
-                operation: "call",
-            }
-        );
+        assert_eq!(origin, ThrowOrigin::TypeError { operation: "call" });
         let name = machine.get_named_property(reason, "name").unwrap();
         assert!(
             machine
@@ -15437,7 +15435,6 @@ mod tests {
         ));
     }
 
-
     #[test]
     fn load_own_descriptor_slot_instruction_covers_absent_data_accessor_and_mismatch() {
         // Tag 49 LoadOwnDescriptorSlot is own-only and non-invoking.
@@ -15524,8 +15521,7 @@ mod tests {
             "data/getter mismatch yields undefined"
         );
         assert_eq!(
-            execution.entry_registers[7],
-            execution.entry_registers[4],
+            execution.entry_registers[7], execution.entry_registers[4],
             "accessor getter slot returns the installed getter"
         );
         assert_eq!(
@@ -15559,11 +15555,14 @@ mod tests {
 
         with_machine(Limits::default(), |machine| {
             LOG.with(|log| log.borrow_mut().clear());
-            let getter_id = machine.intrinsics.builtins.register(intrinsics::BuiltinDef {
-                name: "get @@unscopables",
-                length: 0,
-                handler: unscopables_getter::<TestHost>,
-            });
+            let getter_id = machine
+                .intrinsics
+                .builtins
+                .register(intrinsics::BuiltinDef {
+                    name: "get @@unscopables",
+                    length: 0,
+                    handler: unscopables_getter::<TestHost>,
+                });
             let getter =
                 intrinsics::native_function(&mut machine.heap, getter_id, "get @@unscopables", 0);
             let unscopables_key = machine
@@ -15590,7 +15589,7 @@ mod tests {
             let key = machine
                 .allocate(HeapEntry::String(EcmaString::from_utf8("missing")))
                 .unwrap();
-            assert_eq!(machine.with_has_binding(object, key).unwrap(), false);
+            assert!(!machine.with_has_binding(object, key).unwrap());
             LOG.with(|log| assert!(log.borrow().is_empty(), "absent binding must short-circuit"));
         });
     }
@@ -15658,8 +15657,8 @@ mod tests {
             };
             let allowed = make(machine, Value::FALSE);
             let blocked = make(machine, Value::TRUE);
-            assert_eq!(machine.with_has_binding(allowed, key).unwrap(), true);
-            assert_eq!(machine.with_has_binding(blocked, key).unwrap(), false);
+            assert!(machine.with_has_binding(allowed, key).unwrap());
+            assert!(!machine.with_has_binding(blocked, key).unwrap());
         });
     }
 
@@ -15750,9 +15749,8 @@ mod tests {
                 })
                 .unwrap();
             assert!(machine.has_property(object, &name).unwrap());
-            assert_eq!(
-                machine.with_has_binding(object, key).unwrap(),
-                false,
+            assert!(
+                !machine.with_has_binding(object, key).unwrap(),
                 "inherited unscopables entry must block the inherited candidate"
             );
 
@@ -15806,7 +15804,7 @@ mod tests {
                     extensible: true,
                 })
                 .unwrap();
-            assert_eq!(machine.with_has_binding(allowed, key).unwrap(), true);
+            assert!(machine.with_has_binding(allowed, key).unwrap());
         });
     }
 
@@ -15824,7 +15822,11 @@ mod tests {
             _args: &[Value],
             _constructing: bool,
         ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
-            assert_eq!(this.to_bits(), EXPECTED_BINDING.get(), "@@unscopables receiver");
+            assert_eq!(
+                this.to_bits(),
+                EXPECTED_BINDING.get(),
+                "@@unscopables receiver"
+            );
             LOG.with(|log| log.borrow_mut().push("unscopables"));
             Ok(intrinsics::BuiltinOutcome::Value(Value::from_bits(
                 EXPECTED_BLOCKLIST.get(),
@@ -15836,7 +15838,11 @@ mod tests {
             _args: &[Value],
             _constructing: bool,
         ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
-            assert_eq!(this.to_bits(), EXPECTED_BLOCKLIST.get(), "blocklist receiver");
+            assert_eq!(
+                this.to_bits(),
+                EXPECTED_BLOCKLIST.get(),
+                "blocklist receiver"
+            );
             LOG.with(|log| log.borrow_mut().push("block"));
             Ok(intrinsics::BuiltinOutcome::Value(Value::FALSE))
         }
@@ -15853,11 +15859,14 @@ mod tests {
         with_machine(Limits::default(), |machine| {
             LOG.with(|log| log.borrow_mut().clear());
             let mut install = |name, handler| {
-                let id = machine.intrinsics.builtins.register(intrinsics::BuiltinDef {
-                    name,
-                    length: 0,
-                    handler,
-                });
+                let id = machine
+                    .intrinsics
+                    .builtins
+                    .register(intrinsics::BuiltinDef {
+                        name,
+                        length: 0,
+                        handler,
+                    });
                 intrinsics::native_function(&mut machine.heap, id, name, 0)
             };
             let unscopables_get = install(
@@ -15924,7 +15933,7 @@ mod tests {
             let key = machine
                 .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
                 .unwrap();
-            assert_eq!(machine.with_has_binding(object, key).unwrap(), true);
+            assert!(machine.with_has_binding(object, key).unwrap());
             LOG.with(|log| assert_eq!(&*log.borrow(), &["unscopables", "block"]));
             assert_eq!(
                 machine.get_property_key(object, &name).unwrap(),
@@ -15947,7 +15956,9 @@ mod tests {
             _args: &[Value],
             _constructing: bool,
         ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
-            Err(EvalFailure::ThrowValue(Value::from_bits(SENTINEL_BITS.get())))
+            Err(EvalFailure::ThrowValue(Value::from_bits(
+                SENTINEL_BITS.get(),
+            )))
         }
 
         let module = verified(
@@ -15994,11 +16005,14 @@ mod tests {
             })
             .unwrap();
         SENTINEL_BITS.set(sentinel.to_bits());
-        let getter_id = machine.intrinsics.builtins.register(intrinsics::BuiltinDef {
-            name: "throw @@unscopables",
-            length: 0,
-            handler: throwing_unscopables::<TestHost>,
-        });
+        let getter_id = machine
+            .intrinsics
+            .builtins
+            .register(intrinsics::BuiltinDef {
+                name: "throw @@unscopables",
+                length: 0,
+                handler: throwing_unscopables::<TestHost>,
+            });
         let getter =
             intrinsics::native_function(&mut machine.heap, getter_id, "throw @@unscopables", 0);
         let unscopables_key = machine
@@ -16090,9 +16104,8 @@ mod tests {
             let key = machine
                 .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
                 .unwrap();
-            assert_eq!(
+            assert!(
                 machine.with_has_binding(object, key).unwrap(),
-                true,
                 "primitive @@unscopables must leave the binding visible"
             );
         });
@@ -16808,11 +16821,9 @@ mod tests {
                 .is_some_and(|text| text.eq_ascii("ReferenceError"))
         );
         let message = machine.get_named_property(error, "message").unwrap();
-        assert!(
-            machine.string_value(message).is_some_and(|text| {
-                text.eq_ascii("Cannot access lexical binding before initialization")
-            })
-        );
+        assert!(machine.string_value(message).is_some_and(|text| {
+            text.eq_ascii("Cannot access lexical binding before initialization")
+        }));
         let constructor = machine.intrinsics.global("ReferenceError").unwrap();
         assert!(machine.instance_of(error, constructor).unwrap());
         machine.run_to_quiescence().unwrap();
@@ -17017,9 +17028,7 @@ mod tests {
             error.kind,
             RuntimeErrorKind::UncaughtThrow {
                 value: Value::UNDEFINED,
-                origin: ThrowOrigin::TypeError {
-                    operation: "call",
-                },
+                origin: ThrowOrigin::TypeError { operation: "call" },
             }
         );
     }
@@ -23478,7 +23487,9 @@ mod tests {
 
         let mut host = TestHost;
         let mut machine = Machine::new(&program, &mut host, Limits::default());
-        let boxed = machine.to_object(Value::int32(7)).expect("primitive boxes");
+        let boxed = machine
+            .value_to_object(Value::int32(7))
+            .expect("primitive boxes");
         assert_eq!(
             machine
                 .unbox_primitive_or_self(boxed)
@@ -23486,7 +23497,7 @@ mod tests {
             Value::int32(7)
         );
         assert!(matches!(
-            machine.to_object(Value::NULL),
+            machine.value_to_object(Value::NULL),
             Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
         ));
     }
@@ -23533,7 +23544,7 @@ mod tests {
             let string = machine
                 .allocate(HeapEntry::String(EcmaString::from_utf8("ab")))
                 .unwrap();
-            let boxed = machine.to_object(string).unwrap();
+            let boxed = machine.value_to_object(string).unwrap();
             let length = PropertyKey::Named(EcmaString::from_utf8("length"));
             let zero = PropertyKey::Named(EcmaString::from_utf8("0"));
             let one = PropertyKey::Named(EcmaString::from_utf8("1"));
@@ -23944,7 +23955,10 @@ mod tests {
             Value::int32(41)
         );
         assert_eq!(
-            machine.registry.local_modules.get(&EcmaString::from_utf8("dependency.ts")),
+            machine
+                .registry
+                .local_modules
+                .get(&EcmaString::from_utf8("dependency.ts")),
             Some(&ModuleId::new(1))
         );
     }
@@ -24064,71 +24078,74 @@ mod tests {
     #[test]
     fn import_dynamic_expression_ignores_opaque_and_absolute_as_local_paths() {
         let program = linked(
-            vec![program_module(
-                "main.ts",
-                vec![
-                    Constant::String(EcmaString::from_utf8("dependency.ts")),
-                    Constant::String(EcmaString::from_utf8("/dependency.ts")),
-                ],
-                vec![function(
-                    0,
-                    3,
+            vec![
+                program_module(
+                    "main.ts",
                     vec![
-                        Instruction::LoadConst {
-                            dst: reg(0),
-                            constant: cid(1),
-                        },
-                        Instruction::ImportDynamic {
-                            dst: reg(1),
-                            specifier: reg(0),
-                        },
-                        Instruction::LoadConst {
-                            dst: reg(2),
-                            constant: cid(2),
-                        },
-                        Instruction::ImportDynamic {
-                            dst: reg(0),
-                            specifier: reg(2),
-                        },
-                        Instruction::Return { value: reg(1) },
+                        Constant::String(EcmaString::from_utf8("dependency.ts")),
+                        Constant::String(EcmaString::from_utf8("/dependency.ts")),
                     ],
+                    vec![function(
+                        0,
+                        3,
+                        vec![
+                            Instruction::LoadConst {
+                                dst: reg(0),
+                                constant: cid(1),
+                            },
+                            Instruction::ImportDynamic {
+                                dst: reg(1),
+                                specifier: reg(0),
+                            },
+                            Instruction::LoadConst {
+                                dst: reg(2),
+                                constant: cid(2),
+                            },
+                            Instruction::ImportDynamic {
+                                dst: reg(0),
+                                specifier: reg(2),
+                            },
+                            Instruction::Return { value: reg(1) },
+                        ],
+                        Vec::new(),
+                    )],
                     Vec::new(),
-                )],
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            ), program_module(
-                "dependency.ts",
-                vec![
-                    Constant::Int32(9),
-                    Constant::String(EcmaString::from_utf8("value")),
-                ],
-                vec![function(
-                    0,
-                    1,
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                program_module(
+                    "dependency.ts",
                     vec![
-                        Instruction::LoadConst {
-                            dst: reg(0),
-                            constant: cid(1),
-                        },
-                        Instruction::StoreGlobal {
-                            name: cid(2),
-                            value: reg(0),
-                        },
-                        Instruction::Halt,
+                        Constant::Int32(9),
+                        Constant::String(EcmaString::from_utf8("value")),
                     ],
+                    vec![function(
+                        0,
+                        1,
+                        vec![
+                            Instruction::LoadConst {
+                                dst: reg(0),
+                                constant: cid(1),
+                            },
+                            Instruction::StoreGlobal {
+                                name: cid(2),
+                                value: reg(0),
+                            },
+                            Instruction::Halt,
+                        ],
+                        Vec::new(),
+                    )],
                     Vec::new(),
-                )],
-                Vec::new(),
-                vec![Binding {
-                    name: cid(2),
-                    kind: BindingKind::Hoisted,
-                }],
-                vec![Export {
-                    name: cid(2),
-                    source: ExportSource::Local(BindingId::new(0)),
-                }],
-            )],
+                    vec![Binding {
+                        name: cid(2),
+                        kind: BindingKind::Hoisted,
+                    }],
+                    vec![Export {
+                        name: cid(2),
+                        source: ExportSource::Local(BindingId::new(0)),
+                    }],
+                ),
+            ],
             0,
         );
         let mut host = TestHost;

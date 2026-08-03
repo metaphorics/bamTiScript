@@ -2425,6 +2425,46 @@ mod tests {
     }
 
     #[test]
+    fn runtime_dynamic_import_needs_no_linkage_edge() {
+        let code = Module::new(
+            vec![Constant::String(EcmaString::from_utf8("main"))],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                2,
+                FunctionFlags::default(),
+                vec![
+                    Instruction::LoadConst {
+                        dst: Register::new(0),
+                        constant: ConstantId::new(0),
+                    },
+                    Instruction::ImportDynamic {
+                        dst: Register::new(1),
+                        specifier: Register::new(0),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("runtime dynamic-import instruction verifies");
+        Program::link(
+            vec![ProgramModule {
+                name: ConstantId::new(0),
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect("runtime dynamic import has no static-edge requirement");
+    }
+
+    #[test]
     fn static_bindings_require_static_capability() {
         for kind in [
             BindingKind::Imported {

@@ -149,6 +149,8 @@ pub struct CaseSpec {
     pub expected_timeout_ms: u64,
     pub constructs: Vec<String>,
     pub source_files: Vec<String>,
+    #[serde(default)]
+    pub compiler_args: Vec<String>,
 }
 
 impl CaseSpec {
@@ -211,6 +213,8 @@ struct RawSpec {
     expected_timeout_ms: u64,
     constructs: Vec<String>,
     source_files: Vec<String>,
+    #[serde(default)]
+    compiler_args: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +370,7 @@ fn validate_spec(path: &Path, raw: RawSpec, project: &ManifestProject) -> Result
         expected_timeout_ms: raw.expected_timeout_ms,
         constructs: raw.constructs,
         source_files: raw.source_files,
+        compiler_args: raw.compiler_args,
     })
 }
 
@@ -875,8 +880,16 @@ impl BamtsRunner {
     fn run_interpreter(&self, spec: &CaseSpec) -> Result<OracleOutcome> {
         let entrypoint = self.root.join(&spec.entrypoint);
         let started = Instant::now();
-        let executable = bamts::compile_source_file(&entrypoint)
-            .map_err(|error| facade_error(spec, ExecutionMode::Interpreter, &error))?;
+        let args = cli_args(
+            Mode::Run,
+            ExecutionTarget::Jit,
+            entrypoint.clone(),
+            None,
+            case_requires_javascript_compatibility(spec),
+            &spec.compiler_args,
+        )?;
+        let executable = driver::compile_program(&args)
+            .map_err(|error| driver_error(spec, ExecutionMode::Interpreter, &error))?;
         let remaining = spec.timeout().saturating_sub(started.elapsed());
         if remaining.is_zero() {
             return Ok(timeout_outcome(Vec::new(), self.max_output_bytes));
@@ -1079,6 +1092,7 @@ fn execute_worker_request(request: &WorkerRequest) -> Result<WorkerResponse> {
         request.root.join(&request.spec.entrypoint),
         output,
         case_requires_javascript_compatibility(&request.spec),
+        &request.spec.compiler_args,
     )?;
     match driver::execute(&args) {
         Ok(outcome) => match request.operation {
@@ -1260,6 +1274,7 @@ fn cli_args(
     entrypoint: PathBuf,
     output: Option<&Path>,
     javascript_compatibility: bool,
+    compiler_args: &[String],
 ) -> Result<CliArgs> {
     let mut raw = vec![
         mode.to_string(),
@@ -1274,6 +1289,7 @@ fn cli_args(
         raw.push("--output".to_owned());
         raw.push(path.to_string_lossy().into_owned());
     }
+    raw.extend(compiler_args.iter().cloned());
     parse_args(raw).map_err(|error| {
         VerificationError::new(
             ErrorCode::Usage,
@@ -1340,6 +1356,14 @@ impl Drop for ArtifactDirectory {
 
 fn facade_error(spec: &CaseSpec, mode: ExecutionMode, error: &bamts::Error) -> VerificationError {
     mode_failure(spec, mode, CorpusFailure::from_facade_error(error))
+}
+
+fn driver_error(
+    spec: &CaseSpec,
+    mode: ExecutionMode,
+    error: &driver::DriverError,
+) -> VerificationError {
+    mode_failure(spec, mode, CorpusFailure::from_driver_error(error))
 }
 
 fn mode_failure(spec: &CaseSpec, mode: ExecutionMode, failure: CorpusFailure) -> VerificationError {
@@ -1881,6 +1905,7 @@ mod tests {
             expected_timeout_ms,
             constructs: Vec::new(),
             source_files: Vec::new(),
+            compiler_args: Vec::new(),
         }
     }
 
@@ -1944,6 +1969,7 @@ mod tests {
             PathBuf::from("corpus/cases/javascript.js"),
             None,
             true,
+            &[],
         )
         .expect("JIT CLI args parse");
         assert!(jit.js_compat.enabled);
@@ -1955,17 +1981,18 @@ mod tests {
             PathBuf::from("corpus/cases/javascript.jsx"),
             Some(output),
             true,
+            &[],
         )
         .expect("AOT CLI args parse");
         assert!(aot.js_compat.enabled);
         assert_eq!(aot.output.file.as_deref(), output.to_str());
-
         let typescript = cli_args(
             Mode::Run,
             ExecutionTarget::Jit,
             PathBuf::from("corpus/cases/typescript.ts"),
             None,
             false,
+            &[],
         )
         .expect("TypeScript CLI args parse");
         assert!(!typescript.js_compat.enabled);
@@ -2236,6 +2263,7 @@ mod tests {
             expected_timeout_ms: 5000,
             constructs: vec!["one".into(), "two".into()],
             source_files: vec!["corpus/projects/sample/index.ts".into()],
+            compiler_args: vec![],
         }
     }
 

@@ -303,7 +303,17 @@ fn helper_address(helper: Helper) -> *const u8 {
         Helper::DeleteProperty => bamts_native::bamts_delete_property as *const u8,
         Helper::Call => bamts_native::bamts_call as *const u8,
         Helper::Construct => bamts_native::bamts_construct as *const u8,
+        Helper::ConstructWithNewTarget => {
+            bamts_native::bamts_construct_with_new_target as *const u8
+        }
+        Helper::DefineDataProperty => bamts_native::bamts_define_data_property as *const u8,
+        Helper::LoadOwnDescriptorSlot => bamts_native::bamts_load_own_descriptor_slot as *const u8,
+        Helper::DefineOwnDescriptorSlot => {
+            bamts_native::bamts_define_own_descriptor_slot as *const u8
+        }
+        Helper::WithHasBinding => bamts_native::bamts_with_has_binding as *const u8,
         Helper::Import => bamts_native::bamts_import as *const u8,
+        Helper::ImportDynamic => bamts_native::bamts_import_dynamic as *const u8,
         Helper::Truthy => bamts_native::bamts_truthy as *const u8,
         Helper::ResumeValue => bamts_native::bamts_resume_value as *const u8,
         Helper::DefineAccessor => bamts_native::bamts_define_accessor as *const u8,
@@ -327,6 +337,10 @@ fn helper_address(helper: Helper) -> *const u8 {
         Helper::IteratorResult => bamts_native::bamts_iterator_result as *const u8,
         Helper::IteratorClose => bamts_native::bamts_iterator_close as *const u8,
         Helper::RequireCloseResult => bamts_native::bamts_require_close_result as *const u8,
+        Helper::LoadImportMeta => bamts_native::bamts_load_import_meta as *const u8,
+        Helper::ToObject => bamts_native::bamts_to_object as *const u8,
+        Helper::DisposeCapture => bamts_native::bamts_dispose_capture as *const u8,
+        Helper::SuppressError => bamts_native::bamts_suppress_error as *const u8,
     }
 }
 
@@ -343,7 +357,8 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use bamts_bytecode::{
-        BinaryOp, Constant, ConstantId, EcmaString, ExceptionHandler, Function as BytecodeFunction,
+        BinaryOp, Binding, BindingKind, Constant, ConstantId, EcmaString, Edge, EdgeKind,
+        EdgeTarget, ExceptionHandler, Export, ExportSource, Function as BytecodeFunction,
         FunctionFlags, FunctionId, Instruction, Module, ModuleId, Pc, Program, ProgramModule,
         Register,
     };
@@ -352,7 +367,7 @@ mod tests {
         NativeFrame, NativeHelper, NativeOps, ShadowFrame, Value, with_native_ops,
     };
     use bamts_runtime::{
-        Host, Limits, NativeError, RuntimeError, RuntimeErrorKind, run_linked_program,
+        Host, Limits, Machine, NativeError, RuntimeError, RuntimeErrorKind, run_linked_program,
     };
     use cranelift_module::Module as _;
 
@@ -999,5 +1014,199 @@ mod tests {
             Err(super::JitError::InvalidLoweredModule(message))
                 if message.contains("function 1 appears at local index 0")
         ));
+    }
+
+    #[test]
+    fn jit_import_dynamic_instruction_matches_interpreter() {
+        let root = ProgramModule {
+            name: ConstantId::new(0),
+            code: Module::new(
+                vec![
+                    Constant::String(EcmaString::from_utf8("root")),
+                    Constant::String(EcmaString::from_utf8("./target")),
+                    Constant::String(EcmaString::from_utf8("then")),
+                    Constant::String(EcmaString::from_utf8("console")),
+                    Constant::String(EcmaString::from_utf8("log")),
+                    Constant::Int32(0),
+                    Constant::String(EcmaString::from_utf8("value")),
+                ],
+                vec![
+                    BytecodeFunction::new(
+                        None,
+                        0,
+                        0,
+                        8,
+                        FunctionFlags::default(),
+                        vec![
+                            Instruction::LoadConst {
+                                dst: Register::new(0),
+                                constant: ConstantId::new(1),
+                            },
+                            Instruction::ImportDynamic {
+                                dst: Register::new(1),
+                                specifier: Register::new(0),
+                            },
+                            Instruction::LoadConst {
+                                dst: Register::new(2),
+                                constant: ConstantId::new(2),
+                            },
+                            Instruction::GetProperty {
+                                dst: Register::new(3),
+                                object: Register::new(1),
+                                key: Register::new(2),
+                            },
+                            Instruction::CreateArray {
+                                dst: Register::new(4),
+                            },
+                            Instruction::CreateClosure {
+                                dst: Register::new(5),
+                                function: FunctionId::new(1),
+                                captures: Register::new(4),
+                            },
+                            Instruction::CreateArray {
+                                dst: Register::new(6),
+                            },
+                            Instruction::ArrayPush {
+                                array: Register::new(6),
+                                value: Register::new(5),
+                            },
+                            Instruction::Call {
+                                dst: Register::new(7),
+                                callee: Register::new(3),
+                                this_value: Register::new(1),
+                                arguments: Register::new(6),
+                            },
+                            Instruction::Halt,
+                        ],
+                        Vec::new(),
+                    ),
+                    BytecodeFunction::new(
+                        None,
+                        0,
+                        1,
+                        10,
+                        FunctionFlags::default(),
+                        vec![
+                            Instruction::LoadArguments {
+                                dst: Register::new(0),
+                            },
+                            Instruction::LoadConst {
+                                dst: Register::new(1),
+                                constant: ConstantId::new(5),
+                            },
+                            Instruction::GetProperty {
+                                dst: Register::new(2),
+                                object: Register::new(0),
+                                key: Register::new(1),
+                            },
+                            Instruction::LoadConst {
+                                dst: Register::new(3),
+                                constant: ConstantId::new(6),
+                            },
+                            Instruction::GetProperty {
+                                dst: Register::new(4),
+                                object: Register::new(2),
+                                key: Register::new(3),
+                            },
+                            Instruction::LoadGlobal {
+                                dst: Register::new(5),
+                                name: ConstantId::new(3),
+                            },
+                            Instruction::LoadConst {
+                                dst: Register::new(6),
+                                constant: ConstantId::new(4),
+                            },
+                            Instruction::GetProperty {
+                                dst: Register::new(7),
+                                object: Register::new(5),
+                                key: Register::new(6),
+                            },
+                            Instruction::CreateArray {
+                                dst: Register::new(8),
+                            },
+                            Instruction::ArrayPush {
+                                array: Register::new(8),
+                                value: Register::new(4),
+                            },
+                            Instruction::Call {
+                                dst: Register::new(9),
+                                callee: Register::new(7),
+                                this_value: Register::new(5),
+                                arguments: Register::new(8),
+                            },
+                            Instruction::Halt,
+                        ],
+                        Vec::new(),
+                    ),
+                ],
+                FunctionId::new(0),
+            )
+            .verify()
+            .expect("dynamic import root verifies"),
+            edges: vec![Edge {
+                specifier: ConstantId::new(1),
+                target: EdgeTarget::Local(ModuleId::new(1)),
+                kind: EdgeKind::Dynamic,
+            }],
+            bindings: Vec::new(),
+            exports: Vec::new(),
+        };
+        let target = ProgramModule {
+            name: ConstantId::new(0),
+            code: Module::new(
+                vec![
+                    Constant::String(EcmaString::from_utf8("target")),
+                    Constant::Int32(7),
+                    Constant::String(EcmaString::from_utf8("value")),
+                ],
+                vec![BytecodeFunction::new(
+                    None,
+                    0,
+                    0,
+                    1,
+                    FunctionFlags::default(),
+                    vec![
+                        Instruction::LoadConst {
+                            dst: Register::new(0),
+                            constant: ConstantId::new(1),
+                        },
+                        Instruction::StoreGlobal {
+                            name: ConstantId::new(2),
+                            value: Register::new(0),
+                        },
+                        Instruction::Halt,
+                    ],
+                    Vec::new(),
+                )],
+                FunctionId::new(0),
+            )
+            .verify()
+            .expect("dynamic import target verifies"),
+            edges: Vec::new(),
+            bindings: vec![Binding {
+                name: ConstantId::new(2),
+                kind: BindingKind::Hoisted,
+            }],
+            exports: vec![Export {
+                name: ConstantId::new(2),
+                source: ExportSource::Local(bamts_bytecode::BindingId::new(0)),
+            }],
+        };
+        let bytecode = Program::link(vec![root, target], ModuleId::new(0))
+            .expect("dynamic import fixture links");
+
+        let mut interpreter_host = RecordingHost::default();
+        let interpreter = Machine::new(&bytecode, &mut interpreter_host, Limits::default())
+            .run()
+            .expect("interpreter resolves local ImportDynamic");
+        assert_eq!(interpreter.outcome.exit_code, 0);
+        assert_eq!(interpreter_host.stdout, b"7\n");
+
+        let compiled = compile_jit(&bytecode).expect("JIT compiles ImportDynamic");
+        let mut jit_host = RecordingHost::default();
+        let outcome = run_linked_program(&bytecode, &compiled, &mut jit_host, &Limits::default())
+            .expect("JIT resolves local ImportDynamic");
+        assert_eq!(outcome.exit_code, interpreter.outcome.exit_code);
+        assert_eq!(jit_host.stdout, interpreter_host.stdout);
     }
 }

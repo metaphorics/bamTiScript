@@ -54,18 +54,19 @@ use std::fmt;
 use std::sync::Arc;
 
 use bamts_bytecode::{
-    ConstantId, EcmaString, FunctionId, Instruction, Module, ModuleId, Program, Verified,
+    ConstantId, DisposeHint, EcmaString, FunctionId, Instruction, Module, ModuleId, Program,
+    Verified,
 };
 pub use bamts_native::AbiError;
 use bamts_native::{
-    Completion, CompletionTag, HelperCall, HelperResult, NativeEntryTable, NativeFrame, NativeOps,
-    ShadowFrame, Value, with_native_ops,
+    Completion, CompletionTag, Decoded, HelperCall, HelperResult, NativeEntryTable, NativeFrame,
+    NativeOps, ShadowFrame, Value, with_native_ops,
 };
 
 use crate::intrinsics::BuiltinOutcome;
 use crate::{
     CalleeKind, EvalFailure, Execution, ExecutionOutcome, GeneratorResume, GeneratorStart,
-    GeneratorState, GetOutcome, HeapEntry, Host, IteratorNextPrepared, Limits, Machine,
+    GeneratorState, GetOutcome, HeapEntry, Host, IteratorNextPrepared, Limits, Machine, Property,
     PropertyMap, RuntimeError, RuntimeErrorKind, SetOutcome, SuspendedActivation, ThrowOrigin,
     accessor_from_selector, binary_from_selector, iterator_kind_from_selector, unary_from_selector,
 };
@@ -134,11 +135,37 @@ fn iterator_close_mode_to_selector(mode: bamts_bytecode::IteratorCloseMode) -> u
     }
 }
 
+fn dispose_hint_to_selector(hint: DisposeHint) -> u32 {
+    match hint {
+        DisposeHint::Sync => 0,
+        DisposeHint::Async => 1,
+    }
+}
+
 fn accessor_to_selector(kind: bamts_bytecode::AccessorKind) -> u32 {
     use bamts_bytecode::AccessorKind;
     match kind {
         AccessorKind::Getter => 0,
         AccessorKind::Setter => 1,
+    }
+}
+
+fn descriptor_slot_to_selector(slot: bamts_bytecode::DescriptorSlot) -> u32 {
+    use bamts_bytecode::DescriptorSlot;
+    match slot {
+        DescriptorSlot::Value => 0,
+        DescriptorSlot::Getter => 1,
+        DescriptorSlot::Setter => 2,
+    }
+}
+
+fn descriptor_slot_from_selector(selector: u32) -> Option<bamts_bytecode::DescriptorSlot> {
+    use bamts_bytecode::DescriptorSlot;
+    match selector {
+        0 => Some(DescriptorSlot::Value),
+        1 => Some(DescriptorSlot::Getter),
+        2 => Some(DescriptorSlot::Setter),
+        _ => None,
     }
 }
 
@@ -235,6 +262,10 @@ struct Activation {
     arguments_object: Option<Value>,
     /// The resumed value delivered to a pending `ResumeValue` (linked backend).
     pending_resume: Option<Value>,
+    /// The executing function; [`ShadowFrame`] carries only module and pc, so
+    /// the activation supplies the function id for sourced errors and handler
+    /// lookup at the helper boundary.
+    target: crate::RuntimeFunction,
 }
 
 /// A thrown value together with its origin, threaded out of `dispatch` through
@@ -307,6 +338,8 @@ pub struct NativeEngine<'m, 'h, H: Host> {
     exit_code: Cell<i32>,
     /// A throw's value+origin, set by `dispatch`, consumed by the driver.
     pending_throw: Cell<Option<PendingThrow>>,
+    /// The innermost uncaught throw site preserved across a nested call unwind.
+    pending_fault: Cell<Option<(crate::RuntimeFunction, usize)>>,
     /// A shallow fatal kind, set by `dispatch`; the driver attaches source.
     pending_fatal_kind: Cell<Option<RuntimeErrorKind>>,
     /// A fully-sourced error from a nested activation, propagated verbatim.
@@ -338,6 +371,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             stdout: RefCell::new(Vec::new()),
             exit_code: Cell::new(0),
             pending_throw: Cell::new(None),
+            pending_fault: Cell::new(None),
             pending_fatal_kind: Cell::new(None),
             pending_error: Cell::new(None),
             pending_abi_error: Cell::new(None),
@@ -378,6 +412,30 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
 
     fn max_total_registers(&self) -> usize {
         self.machine.borrow().limits.max_total_registers
+    }
+
+    fn uncaught_throw_at(
+        &self,
+        module: ModuleId,
+        function: usize,
+        pc: usize,
+        value: Value,
+        origin: ThrowOrigin,
+    ) -> RuntimeError {
+        if let Some((site, fault_pc)) = self.pending_fault.take() {
+            return self.error_at(
+                site.module,
+                RuntimeErrorKind::UncaughtThrow { value, origin },
+                site.function.get() as usize,
+                fault_pc,
+            );
+        }
+        self.error_at(
+            module,
+            RuntimeErrorKind::UncaughtThrow { value, origin },
+            function,
+            pc,
+        )
     }
 
     fn error_at(
@@ -565,12 +623,9 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     link: value,
                     entry_registers: registers,
                 }),
-                FrameCompletion::Unwind(value, origin, pc) => Err(self.error_at(
-                    module,
-                    RuntimeErrorKind::UncaughtThrow { value, origin },
-                    function,
-                    pc,
-                )),
+                FrameCompletion::Unwind(value, origin, pc) => {
+                    Err(self.uncaught_throw_at(module, function, pc, value, origin))
+                }
                 FrameCompletion::Suspend(value, _) => Err(self.error_at(
                     module,
                     RuntimeErrorKind::InvalidValue { value },
@@ -640,6 +695,10 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             args,
             arguments_object: None,
             pending_resume: None,
+            target: crate::RuntimeFunction {
+                module,
+                function: FunctionId::new(function as u32),
+            },
         });
         self.push_native_roots(&registers);
         let completion =
@@ -766,7 +825,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         pc,
                         thrown,
                         ThrowOrigin::Bytecode,
-                    ) {
+                    )? {
                         Flow::Next => pc += 1,
                         Flow::Goto(target) => pc = target,
                         Flow::Unwind(value, origin) => {
@@ -792,17 +851,20 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     })?;
                     return Ok(FrameCompletion::Suspend(frame.register(src.get()), token));
                 }
-                Instruction::Suspend { .. } | Instruction::Await { .. } => {
+                instruction @ (Instruction::Suspend { .. } | Instruction::Await { .. }) => {
+                    let operation = match instruction {
+                        Instruction::Suspend { .. } => "suspend outside an engine-owned event loop",
+                        Instruction::Await { .. } => "await outside an engine-owned event loop",
+                        _ => unreachable!(),
+                    };
                     match self.raise(
                         &mut frame,
                         code,
                         function,
                         pc,
                         Value::UNDEFINED,
-                        ThrowOrigin::TypeError {
-                            operation: "suspend outside an engine-owned event loop",
-                        },
-                    ) {
+                        ThrowOrigin::TypeError { operation },
+                    )? {
                         Flow::Next => pc += 1,
                         Flow::Goto(target) => pc = target,
                         Flow::Unwind(value, origin) => {
@@ -862,6 +924,12 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 Some(dst.get()),
             ),
             Instruction::CreateObject { dst } => (HelperCall::CreateObject, Some(dst.get())),
+            Instruction::ToObject { dst, src } => (
+                HelperCall::ToObject {
+                    value: register(src),
+                },
+                Some(dst.get()),
+            ),
             Instruction::CreateArray { dst } => (HelperCall::CreateArray, Some(dst.get())),
             Instruction::CreateCell { dst } => (HelperCall::CreateCell, Some(dst.get())),
             Instruction::CreateClosure {
@@ -911,6 +979,48 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 },
                 None,
             ),
+            Instruction::DefineDataProperty { object, key, value } => (
+                HelperCall::DefineDataProperty {
+                    object: register(object),
+                    key: register(key),
+                    value: register(value),
+                },
+                None,
+            ),
+            Instruction::LoadOwnDescriptorSlot {
+                dst,
+                object,
+                key,
+                slot,
+            } => (
+                HelperCall::LoadOwnDescriptorSlot {
+                    object: register(object),
+                    key: register(key),
+                    slot: descriptor_slot_to_selector(slot),
+                },
+                Some(dst.get()),
+            ),
+            Instruction::DefineOwnDescriptorSlot {
+                object,
+                key,
+                src,
+                slot,
+            } => (
+                HelperCall::DefineOwnDescriptorSlot {
+                    object: register(object),
+                    key: register(key),
+                    src: register(src),
+                    slot: descriptor_slot_to_selector(slot),
+                },
+                None,
+            ),
+            Instruction::WithHasBinding { dst, object, key } => (
+                HelperCall::WithHasBinding {
+                    object: register(object),
+                    key: register(key),
+                },
+                Some(dst.get()),
+            ),
             Instruction::Call {
                 dst,
                 callee,
@@ -931,6 +1041,19 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             } => (
                 HelperCall::Construct {
                     callee: register(callee),
+                    arguments: register(arguments),
+                },
+                Some(dst.get()),
+            ),
+            Instruction::ConstructWithNewTarget {
+                dst,
+                callee,
+                new_target,
+                arguments,
+            } => (
+                HelperCall::ConstructWithNewTarget {
+                    callee: register(callee),
+                    new_target: register(new_target),
                     arguments: register(arguments),
                 },
                 Some(dst.get()),
@@ -1054,9 +1177,40 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 },
                 None,
             ),
+            Instruction::DisposeCapture {
+                method,
+                kind,
+                src,
+                hint,
+            } => (
+                HelperCall::DisposeCapture {
+                    src: register(src),
+                    hint: dispose_hint_to_selector(hint),
+                    kind_reg: kind.get(),
+                },
+                Some(method.get()),
+            ),
+            Instruction::SuppressError {
+                dst,
+                error,
+                suppressed,
+            } => (
+                HelperCall::SuppressError {
+                    error: register(error),
+                    suppressed: register(suppressed),
+                },
+                Some(dst.get()),
+            ),
+            Instruction::LoadImportMeta { dst } => (HelperCall::LoadImportMeta, Some(dst.get())),
             Instruction::Import { dst, specifier } => (
                 HelperCall::Import {
                     specifier: specifier.get(),
+                },
+                Some(dst.get()),
+            ),
+            Instruction::ImportDynamic { dst, specifier } => (
+                HelperCall::ImportDynamic {
+                    specifier: register(specifier),
                 },
                 Some(dst.get()),
             ),
@@ -1104,6 +1258,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         match result.tag {
             CompletionTag::Normal => {
                 self.pending_throw.take();
+                self.pending_fault.take();
                 if let Some(register) = dst {
                     frame.set_register(register, result.value);
                 }
@@ -1111,7 +1266,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             }
             CompletionTag::Throw => {
                 let (value, origin) = self.take_matching_throw(result.value);
-                Ok(self.raise(frame, code, function, pc, value, origin))
+                self.raise(frame, code, function, pc, value, origin)
             }
             CompletionTag::Suspend => {
                 // The reference driver drives `Suspend` inline; a helper never
@@ -1141,6 +1296,10 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
 
     /// Searches the current function's handlers covering `pc`. Binds the thrown
     /// value into the handler's catch register and jumps, or signals an unwind.
+    ///
+    /// A caught, still-lazy engine throw (`value == UNDEFINED`, non-`Bytecode`
+    /// origin) is materialized into the realm-intrinsic error object here, so
+    /// the reference backend observes the same caught value as the linked one.
     fn raise(
         &self,
         frame: &mut NativeFrame<'_>,
@@ -1149,13 +1308,88 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         pc: usize,
         value: Value,
         origin: ThrowOrigin,
-    ) -> Flow {
+    ) -> Result<Flow, RuntimeError> {
         match crate::innermost_handler(&code.functions()[function], pc) {
             Some(handler) => {
-                frame.set_register(handler.catch_register.get(), value);
-                Flow::Goto(handler.handler.get() as usize)
+                self.pending_fault.take();
+                let target = crate::RuntimeFunction {
+                    module: ModuleId::new(frame.module_id()),
+                    function: FunctionId::new(function as u32),
+                };
+                let catch_value = self.materialize_catch_value(frame, target, pc, value, origin)?;
+                frame.set_register(handler.catch_register.get(), catch_value);
+                Ok(Flow::Goto(handler.handler.get() as usize))
             }
-            None => Flow::Unwind(value, origin),
+            None => Ok(Flow::Unwind(value, origin)),
+        }
+    }
+
+    /// The shared catch-value decision: bytecode throws and supplied
+    /// (non-`UNDEFINED`) values keep their identity; a still-lazy engine origin
+    /// allocates the realm-intrinsic error object. The machine borrow is scoped
+    /// so `error_at` never reborrows the `RefCell` while the mutable guard is
+    /// live. `pc` is the faulting instruction: the reference driver passes its
+    /// live pc; the linked postprocessor passes the frame-recorded pc.
+    fn materialize_catch_value(
+        &self,
+        frame: &NativeFrame<'_>,
+        target: crate::RuntimeFunction,
+        pc: usize,
+        value: Value,
+        origin: ThrowOrigin,
+    ) -> Result<Value, RuntimeError> {
+        if !crate::catch_value_needs_materialization(value, origin) {
+            return Ok(value);
+        }
+        self.refresh_native_roots(frame);
+        let materialized = {
+            let mut machine = self.machine.borrow_mut();
+            machine.materialize_engine_origin(origin)
+        };
+        materialized
+            .map_err(|kind| self.error_at(target.module, kind, target.function.get() as usize, pc))
+    }
+
+    /// Handler-aware postprocessor for linked helper completions. Generated
+    /// code routes an abnormal completion into a covering handler by copying
+    /// the raw completion value into the catch register, so a caught, still-
+    /// lazy engine throw must be materialized here, before the generated code
+    /// sees it. A throw with no covering handler at the frame-recorded target
+    /// and pc is returned untouched — pending metadata and all — so the
+    /// uncaught path stays lazy.
+    ///
+    /// The pending throw is consumed before materialization, so a failed
+    /// allocation cannot later be misread as a throw; the exact sourced error
+    /// is stored in `pending_error` and surfaced as `FatalTrap`, bypassing
+    /// JavaScript handlers. `pending_fatal_kind` is never used for this case.
+    fn finish_helper_result(&self, frame: &NativeFrame<'_>, result: HelperResult) -> HelperResult {
+        if self.backend != Backend::Linked || result.tag != CompletionTag::Throw {
+            return result;
+        }
+        let (target, pc) = {
+            let activations = self.activations.borrow();
+            match activations.last() {
+                Some(activation) => (activation.target, frame.pc() as usize),
+                None => return result,
+            }
+        };
+        let handle = self.code_ref(target.module);
+        let code = handle.code(target.module);
+        let function = &code.functions()[target.function.get() as usize];
+        if crate::innermost_handler(function, pc).is_none() {
+            return result;
+        }
+        self.pending_fault.take();
+        let (value, origin) = self.take_matching_throw(result.value);
+        match self.materialize_catch_value(frame, target, pc, value, origin) {
+            Ok(catch_value) => HelperResult::throw(catch_value),
+            Err(error) => {
+                self.pending_error.set(Some(error));
+                HelperResult {
+                    tag: CompletionTag::FatalTrap,
+                    value: Value::UNDEFINED,
+                }
+            }
         }
     }
 
@@ -1236,10 +1470,12 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     }
                 }
                 Ok(CalleeKind::Bound) => {
-                    let bound = self
-                        .machine
-                        .borrow()
-                        .flatten_bound(callee, this, args.as_ref());
+                    let bound = self.machine.borrow().flatten_bound(
+                        callee,
+                        this,
+                        args.as_ref(),
+                        Value::UNDEFINED,
+                    );
                     match bound {
                         Ok(bound) => {
                             callee = bound.target;
@@ -1340,7 +1576,8 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 captures,
             ) {
                 Ok((FrameCompletion::Normal(value), _)) => InvokeOutcome::Value(value),
-                Ok((FrameCompletion::Unwind(value, origin, _), _)) => {
+                Ok((FrameCompletion::Unwind(value, origin, fault_pc), _)) => {
+                    self.pending_fault.set(Some((target, fault_pc)));
                     InvokeOutcome::Threw(value, origin)
                 }
                 Ok((FrameCompletion::Suspend(value, _), _)) => {
@@ -1477,6 +1714,95 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     fn get_ascii(&self, object: Value, name: &str) -> InvokeOutcome {
         let outcome = self.machine.borrow_mut().resolve_get_ascii(object, name);
         self.get_outcome(outcome, object)
+    }
+
+    fn dispose_capture_active(
+        &self,
+        source: Value,
+        hint: u32,
+    ) -> Result<(Value, u32), InvokeOutcome> {
+        if matches!(source.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+            return Ok((Value::UNDEFINED, 0));
+        }
+        if !self.machine.borrow().is_object(source) {
+            return Err(InvokeOutcome::Threw(
+                Value::UNDEFINED,
+                ThrowOrigin::TypeError {
+                    operation: "disposable resource is not an object",
+                },
+            ));
+        }
+
+        let async_hint = match hint {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(self.failure_outcome(EvalFailure::Runtime(
+                    RuntimeErrorKind::InvalidValue {
+                        value: Value::UNDEFINED,
+                    },
+                )));
+            }
+        };
+        let symbol = if async_hint {
+            self.machine
+                .borrow()
+                .intrinsics
+                .builtins
+                .symbol_async_dispose()
+        } else {
+            self.machine.borrow().intrinsics.builtins.symbol_dispose()
+        };
+        let key = match self.machine.borrow_mut().to_property_key(symbol) {
+            Ok(key) => key,
+            Err(failure) => return Err(self.failure_outcome(failure)),
+        };
+        let method =
+            match self.get_outcome(self.machine.borrow_mut().resolve_get(source, &key), source) {
+                InvokeOutcome::Value(method) => method,
+                outcome => return Err(outcome),
+            };
+        if !matches!(method.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+            let callable = match self.machine.borrow().is_callable(method) {
+                Ok(callable) => callable,
+                Err(failure) => return Err(self.failure_outcome(failure)),
+            };
+            return callable.then_some((method, 1)).ok_or(InvokeOutcome::Threw(
+                Value::UNDEFINED,
+                ThrowOrigin::TypeError {
+                    operation: "disposal method is not callable",
+                },
+            ));
+        }
+        if !async_hint {
+            return Err(InvokeOutcome::Threw(
+                Value::UNDEFINED,
+                ThrowOrigin::TypeError {
+                    operation: "disposal method is not callable",
+                },
+            ));
+        }
+
+        let symbol = self.machine.borrow().intrinsics.builtins.symbol_dispose();
+        let key = match self.machine.borrow_mut().to_property_key(symbol) {
+            Ok(key) => key,
+            Err(failure) => return Err(self.failure_outcome(failure)),
+        };
+        let method =
+            match self.get_outcome(self.machine.borrow_mut().resolve_get(source, &key), source) {
+                InvokeOutcome::Value(method) => method,
+                outcome => return Err(outcome),
+            };
+        let callable = match self.machine.borrow().is_callable(method) {
+            Ok(callable) => callable,
+            Err(failure) => return Err(self.failure_outcome(failure)),
+        };
+        callable.then_some((method, 2)).ok_or(InvokeOutcome::Threw(
+            Value::UNDEFINED,
+            ThrowOrigin::TypeError {
+                operation: "disposal method is not callable",
+            },
+        ))
     }
 
     fn get_iterator_active(
@@ -1723,6 +2049,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             args: start.args.clone(),
             arguments_object: None,
             pending_resume: None,
+            target,
         });
         self.push_native_roots(&registers);
         let completion = self.run_frame(
@@ -1765,6 +2092,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             args: suspended.args.clone(),
             arguments_object: suspended.arguments_object,
             pending_resume: None,
+            target,
         });
         self.push_native_roots(&suspended.registers);
         let completion = self.run_frame(
@@ -1898,6 +2226,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             args: suspended.args.clone(),
             arguments_object: suspended.arguments_object,
             pending_resume,
+            target: suspended.target,
         });
         self.push_native_roots(&suspended.registers);
         let handles = suspended.registers.as_mut_ptr();
@@ -1937,12 +2266,17 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             }
             Ok(CompletionTag::Normal) => {
                 self.pending_throw.take();
+                self.pending_fault.take();
                 self.machine
                     .borrow_mut()
                     .release_suspended_activation_registers(register_count);
                 Some(GeneratorResume::Return(out.value))
             }
             Ok(CompletionTag::Throw) => {
+                if self.pending_fault.get().is_none() {
+                    self.pending_fault
+                        .set(Some((suspended.target, next_token as usize)));
+                }
                 self.machine
                     .borrow_mut()
                     .release_suspended_activation_registers(register_count);
@@ -2004,10 +2338,11 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             args: args.to_vec(),
             arguments_object: None,
             pending_resume: None,
+            target,
         });
         self.push_native_roots(&registers);
         let handles = registers.as_mut_ptr();
-        let (tag, out) = {
+        let (tag, out, fault_pc) = {
             let mut shadow = ShadowFrame::new(
                 std::ptr::null_mut(),
                 0,
@@ -2022,7 +2357,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 &mut shadow,
                 &mut out,
             );
-            (tag, out)
+            (tag, out, shadow.bytecode_pc as usize)
         };
         drop(registers);
         self.pop_native_roots();
@@ -2033,9 +2368,13 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         match tag {
             Ok(CompletionTag::Normal) => {
                 self.pending_throw.take();
+                self.pending_fault.take();
                 InvokeOutcome::Value(out.value)
             }
             Ok(CompletionTag::Throw) => {
+                if self.pending_fault.get().is_none() {
+                    self.pending_fault.set(Some((target, fault_pc)));
+                }
                 let (value, origin) = self.take_matching_throw(out.value);
                 InvokeOutcome::Threw(value, origin)
             }
@@ -2248,22 +2587,30 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         HelperResult::normal(value)
     }
 
-    /// `Construct`: allocate the instance with the constructor's `prototype`,
-    /// invoke with `new.target`, and override a non-object return with the
-    /// instance — the shared construct semantics, over native activations.
-    fn construct(&self, callee: Value, arguments: &[Value]) -> HelperResult {
+    /// `Construct`/`ConstructWithNewTarget`: allocate the instance with
+    /// `new_target`'s `prototype`, invoke with `new.target`, and override a
+    /// non-object return with the instance — the shared construct semantics,
+    /// over native activations. The legacy tag-12 path passes `callee` as
+    /// `new_target`.
+    fn construct(&self, callee: Value, new_target: Value, arguments: &[Value]) -> HelperResult {
         let mut callee = callee;
+        let mut new_target = new_target;
         let mut arguments = Cow::Borrowed(arguments);
         if matches!(
             self.machine.borrow().callee_kind(callee),
             Ok(CalleeKind::Bound)
         ) {
-            let bound =
-                self.machine
-                    .borrow()
-                    .flatten_bound(callee, Value::UNDEFINED, arguments.as_ref());
+            let bound = self.machine.borrow().flatten_bound(
+                callee,
+                Value::UNDEFINED,
+                arguments.as_ref(),
+                new_target,
+            );
             match bound {
                 Ok(bound) => {
+                    // BoundFunction [[Construct]] forwards through each wrapper;
+                    // flatten_bound already applied the recursive newTarget rule.
+                    new_target = bound.new_target;
                     callee = bound.target;
                     arguments = Cow::Owned(bound.arguments);
                 }
@@ -2273,11 +2620,12 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         let kind = self.machine.borrow().callee_kind(callee);
         match kind {
             Ok(CalleeKind::Builtin { id }) => {
-                let result = self.machine.borrow_mut().call_builtin(
+                let result = self.machine.borrow_mut().call_builtin_with_new_target(
                     id,
                     Value::UNDEFINED,
                     arguments.as_ref(),
                     true,
+                    new_target,
                 );
                 match result {
                     Ok(BuiltinOutcome::Value(value)) => HelperResult::normal(value),
@@ -2315,14 +2663,19 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     let allocated = self
                         .machine
                         .borrow_mut()
-                        .allocate_constructed_receiver(callee);
+                        .allocate_constructed_receiver(new_target);
                     match allocated {
                         Ok(value) => value,
                         Err(kind) => return self.fatal(kind),
                     }
                 };
-                let outcome =
-                    self.invoke_runtime(target, &captures, instance, callee, arguments.as_ref());
+                let outcome = self.invoke_runtime(
+                    target,
+                    &captures,
+                    instance,
+                    new_target,
+                    arguments.as_ref(),
+                );
                 match outcome {
                     InvokeOutcome::Value(returned) => {
                         let is_object = self.machine.borrow().is_object(returned);
@@ -2486,6 +2839,10 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             args: Vec::new(),
             arguments_object: None,
             pending_resume: None,
+            target: crate::RuntimeFunction {
+                module,
+                function: function_id,
+            },
         });
         self.push_native_roots(&registers);
         let handles = registers.as_mut_ptr();
@@ -2507,6 +2864,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         match tag {
             Ok(CompletionTag::Normal) => {
                 self.pending_throw.take();
+                self.pending_fault.take();
                 Ok(Execution {
                     outcome: ExecutionOutcome {
                         stdout: self.stdout.borrow().clone(),
@@ -2519,11 +2877,8 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             }
             Ok(CompletionTag::Throw) => {
                 let (value, origin) = self.take_matching_throw(out.value);
-                Err(NativeError::Runtime(self.error_at(
-                    module,
-                    RuntimeErrorKind::UncaughtThrow { value, origin },
-                    function,
-                    fault_pc,
+                Err(NativeError::Runtime(self.uncaught_throw_at(
+                    module, function, fault_pc, value, origin,
                 )))
             }
             Ok(CompletionTag::Suspend | CompletionTag::FatalTrap) => {
@@ -2564,378 +2919,519 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
         {
             return self.fatal(kind);
         }
-        match call {
-            HelperCall::LoadConstant { const_id } => {
-                let result = self
-                    .machine
-                    .borrow_mut()
-                    .load_constant_value(module, ConstantId::new(const_id));
-                match result {
-                    Ok(value) => HelperResult::normal(value),
-                    Err(kind) => self.fatal(kind),
+        let result = 'result: {
+            match call {
+                HelperCall::LoadConstant { const_id } => {
+                    let result = self
+                        .machine
+                        .borrow_mut()
+                        .load_constant_value(module, ConstantId::new(const_id));
+                    match result {
+                        Ok(value) => HelperResult::normal(value),
+                        Err(kind) => self.fatal(kind),
+                    }
                 }
-            }
-            HelperCall::Unary { op, operand } => match unary_from_selector(op) {
-                Some(op) => {
-                    let result = self.machine.borrow_mut().eval_unary(op, operand);
-                    self.eval_result(result)
-                }
-                None => self.fatal(RuntimeErrorKind::InvalidValue {
-                    value: Value::UNDEFINED,
-                }),
-            },
-            HelperCall::Binary { op, left, right } => match binary_from_selector(op) {
-                Some(op) => {
-                    let result = self.machine.borrow_mut().eval_binary(op, left, right);
-                    self.eval_result(result)
-                }
-                None => self.fatal(RuntimeErrorKind::InvalidValue {
-                    value: Value::UNDEFINED,
-                }),
-            },
-            HelperCall::CreateObject => {
-                let prototype = self.machine.borrow().intrinsics.object_prototype;
-                self.allocated(HeapEntry::Object {
-                    properties: PropertyMap::default(),
-                    prototype: Some(prototype),
-                    boxed_primitive: None,
-                    extensible: true,
-                })
-            }
-            HelperCall::CreateArray => {
-                let prototype = self.machine.borrow().intrinsics.array_prototype;
-                self.allocated(HeapEntry::Array {
-                    elements: Vec::new(),
-                    properties: PropertyMap::default(),
-                    prototype: Some(prototype),
-                    extensible: true,
-                    length_writable: true,
-                })
-            }
-            HelperCall::CreateCell => {
-                let prototype = self.machine.borrow().intrinsics.array_prototype;
-                self.allocated(HeapEntry::Array {
-                    elements: vec![Value::UNINITIALIZED],
-                    properties: PropertyMap::default(),
-                    prototype: Some(prototype),
-                    extensible: true,
-                    length_writable: true,
-                })
-            }
-            HelperCall::CreateClosure {
-                function_id,
-                captures,
-            } => {
-                let function = FunctionId::new(function_id);
-                let materialized = self
-                    .machine
-                    .borrow()
-                    .captures_from_array(module, captures, function);
-                match materialized {
-                    Ok(captures) => {
-                        let prototype = self.machine.borrow().intrinsics.function_prototype;
-                        self.allocated(HeapEntry::Function {
-                            module,
-                            function,
-                            captures,
-                            properties: PropertyMap::default(),
-                            prototype: Some(prototype),
-                            extensible: true,
-                        })
+                HelperCall::Unary { op, operand } => match unary_from_selector(op) {
+                    Some(op) => {
+                        let result = self.machine.borrow_mut().eval_unary(op, operand);
+                        self.eval_result(result)
                     }
-                    Err(failure) => self.fail(failure),
-                }
-            }
-            HelperCall::GetProperty { object, key } => {
-                let key = {
-                    let coerced = self.machine.borrow().to_property_key(key);
-                    match coerced {
-                        Ok(key) => key,
-                        Err(failure) => return self.fail(failure),
-                    }
-                };
-                let outcome = self.machine.borrow_mut().resolve_get(object, &key);
-                match outcome {
-                    Ok(GetOutcome::Value(value)) => self.validated(value),
-                    Ok(GetOutcome::Text(text)) => self.allocated(HeapEntry::String(text)),
-                    Ok(GetOutcome::Getter(getter)) => {
-                        let outcome = self.invoke_callee(getter, object, &[], Value::UNDEFINED);
-                        self.outcome_result(outcome)
-                    }
-                    Err(failure) => self.fail(failure),
-                }
-            }
-            HelperCall::SetProperty { object, key, value } => {
-                let key = {
-                    let coerced = self.machine.borrow().to_property_key(key);
-                    match coerced {
-                        Ok(key) => key,
-                        Err(failure) => return self.fail(failure),
-                    }
-                };
-                let outcome = self.machine.borrow_mut().resolve_set(object, key, value);
-                match outcome {
-                    Ok(SetOutcome::Done) => HelperResult::normal(Value::UNDEFINED),
-                    Ok(SetOutcome::Setter(setter)) => {
-                        let outcome =
-                            self.invoke_callee(setter, object, &[value], Value::UNDEFINED);
-                        match outcome {
-                            InvokeOutcome::Value(_) => HelperResult::normal(Value::UNDEFINED),
-                            other => self.outcome_result(other),
-                        }
-                    }
-                    Err(failure) => self.fail(failure),
-                }
-            }
-            HelperCall::DeleteProperty { object, key } => {
-                let key = {
-                    let coerced = self.machine.borrow().to_property_key(key);
-                    match coerced {
-                        Ok(key) => key,
-                        Err(failure) => return self.fail(failure),
-                    }
-                };
-                let deleted = self.machine.borrow_mut().delete_property(object, &key);
-                match deleted {
-                    Ok(deleted) => HelperResult::normal(Value::boolean(deleted)),
-                    Err(failure) => self.fail(failure),
-                }
-            }
-            HelperCall::DefineAccessor {
-                object,
-                key,
-                accessor,
-                kind,
-            } => {
-                let kind = match accessor_from_selector(kind) {
-                    Some(kind) => kind,
-                    None => {
-                        return self.fatal(RuntimeErrorKind::InvalidValue {
-                            value: Value::UNDEFINED,
-                        });
-                    }
-                };
-                let key = {
-                    let coerced = self.machine.borrow().to_property_key(key);
-                    match coerced {
-                        Ok(key) => key,
-                        Err(failure) => return self.fail(failure),
-                    }
-                };
-                let defined = self
-                    .machine
-                    .borrow_mut()
-                    .define_accessor(object, key, accessor, kind);
-                match defined {
-                    Ok(()) => HelperResult::normal(Value::UNDEFINED),
-                    Err(failure) => self.fail(failure),
-                }
-            }
-            HelperCall::Call {
-                callee,
-                this_value,
-                arguments,
-            } => {
-                let arguments = {
-                    let read = self.machine.borrow().arguments_from_array(arguments);
-                    match read {
-                        Ok(arguments) => arguments,
-                        Err(failure) => return self.fail(failure),
-                    }
-                };
-                let outcome = self.invoke_callee(callee, this_value, &arguments, Value::UNDEFINED);
-                self.outcome_result(outcome)
-            }
-            HelperCall::Construct { callee, arguments } => {
-                let arguments = {
-                    let read = self.machine.borrow().arguments_from_array(arguments);
-                    match read {
-                        Ok(arguments) => arguments,
-                        Err(failure) => return self.fail(failure),
-                    }
-                };
-                self.construct(callee, &arguments)
-            }
-            HelperCall::Import { specifier } => self.import_namespace(module, specifier),
-            HelperCall::Truthy { value } => {
-                HelperResult::normal(Value::boolean(self.machine.borrow().truthy(value)))
-            }
-            HelperCall::ResumeValue => {
-                let resumed = self
-                    .activations
-                    .borrow_mut()
-                    .last_mut()
-                    .and_then(|activation| activation.pending_resume.take());
-                match resumed {
-                    Some(value) => self.validated(value),
                     None => self.fatal(RuntimeErrorKind::InvalidValue {
                         value: Value::UNDEFINED,
                     }),
-                }
-            }
-            HelperCall::LoadGlobal { name } => {
-                let resolved = self
-                    .machine
-                    .borrow_mut()
-                    .load_global(module, ConstantId::new(name));
-                match resolved {
-                    Ok(Some(value)) => self.validated(value),
-                    Ok(None) => {
-                        self.pending_throw.set(Some(PendingThrow {
-                            value: Value::UNDEFINED,
-                            origin: ThrowOrigin::ReferenceError {
-                                operation: "global is not defined",
-                            },
-                        }));
-                        HelperResult::throw(Value::UNDEFINED)
+                },
+                HelperCall::Binary { op, left, right } => match binary_from_selector(op) {
+                    Some(op) => {
+                        let result = self.machine.borrow_mut().eval_binary(op, left, right);
+                        self.eval_result(result)
                     }
-                    Err(failure) => self.fail(failure),
+                    None => self.fatal(RuntimeErrorKind::InvalidValue {
+                        value: Value::UNDEFINED,
+                    }),
+                },
+                HelperCall::CreateObject => {
+                    let prototype = self.machine.borrow().intrinsics.object_prototype;
+                    self.allocated(HeapEntry::Object {
+                        properties: PropertyMap::default(),
+                        prototype: Some(prototype),
+                        boxed_primitive: None,
+                        extensible: true,
+                    })
                 }
-            }
-            HelperCall::StoreGlobal { name, value } => {
-                let stored =
-                    self.machine
+                HelperCall::ToObject { value } => {
+                    let result = self.machine.borrow_mut().value_to_object(value);
+                    self.eval_result(result)
+                }
+                HelperCall::CreateArray => {
+                    let prototype = self.machine.borrow().intrinsics.array_prototype;
+                    self.allocated(HeapEntry::Array {
+                        elements: Vec::new(),
+                        properties: PropertyMap::default(),
+                        prototype: Some(prototype),
+                        extensible: true,
+                        length_writable: true,
+                    })
+                }
+                HelperCall::CreateCell => {
+                    let prototype = self.machine.borrow().intrinsics.array_prototype;
+                    self.allocated(HeapEntry::Array {
+                        elements: vec![Value::UNINITIALIZED],
+                        properties: PropertyMap::default(),
+                        prototype: Some(prototype),
+                        extensible: true,
+                        length_writable: true,
+                    })
+                }
+                HelperCall::CreateClosure {
+                    function_id,
+                    captures,
+                } => {
+                    let function = FunctionId::new(function_id);
+                    let materialized = self
+                        .machine
+                        .borrow()
+                        .captures_from_array(module, captures, function);
+                    match materialized {
+                        Ok(captures) => {
+                            let prototype = self.machine.borrow().intrinsics.function_prototype;
+                            self.allocated(HeapEntry::Function {
+                                module,
+                                function,
+                                captures,
+                                properties: PropertyMap::default(),
+                                prototype: Some(prototype),
+                                extensible: true,
+                            })
+                        }
+                        Err(failure) => self.fail(failure),
+                    }
+                }
+                HelperCall::GetProperty { object, key } => {
+                    let key = {
+                        let coerced = self.machine.borrow().to_property_key(key);
+                        match coerced {
+                            Ok(key) => key,
+                            Err(failure) => break 'result self.fail(failure),
+                        }
+                    };
+                    let outcome = self.machine.borrow_mut().resolve_get(object, &key);
+                    match outcome {
+                        Ok(GetOutcome::Value(value)) => self.validated(value),
+                        Ok(GetOutcome::Text(text)) => self.allocated(HeapEntry::String(text)),
+                        Ok(GetOutcome::Getter(getter)) => {
+                            let outcome = self.invoke_callee(getter, object, &[], Value::UNDEFINED);
+                            self.outcome_result(outcome)
+                        }
+                        Err(failure) => self.fail(failure),
+                    }
+                }
+                HelperCall::SetProperty { object, key, value } => {
+                    let key = {
+                        let coerced = self.machine.borrow().to_property_key(key);
+                        match coerced {
+                            Ok(key) => key,
+                            Err(failure) => break 'result self.fail(failure),
+                        }
+                    };
+                    let outcome = self.machine.borrow_mut().resolve_set(object, key, value);
+                    match outcome {
+                        Ok(SetOutcome::Done) => HelperResult::normal(Value::UNDEFINED),
+                        Ok(SetOutcome::Setter(setter)) => {
+                            let outcome =
+                                self.invoke_callee(setter, object, &[value], Value::UNDEFINED);
+                            match outcome {
+                                InvokeOutcome::Value(_) => HelperResult::normal(Value::UNDEFINED),
+                                other => self.outcome_result(other),
+                            }
+                        }
+                        Err(failure) => self.fail(failure),
+                    }
+                }
+                HelperCall::DeleteProperty { object, key } => {
+                    let key = {
+                        let coerced = self.machine.borrow().to_property_key(key);
+                        match coerced {
+                            Ok(key) => key,
+                            Err(failure) => break 'result self.fail(failure),
+                        }
+                    };
+                    let deleted = self.machine.borrow_mut().delete_property(object, &key);
+                    match deleted {
+                        Ok(deleted) => HelperResult::normal(Value::boolean(deleted)),
+                        Err(failure) => self.fail(failure),
+                    }
+                }
+                HelperCall::DefineAccessor {
+                    object,
+                    key,
+                    accessor,
+                    kind,
+                } => {
+                    let kind = match accessor_from_selector(kind) {
+                        Some(kind) => kind,
+                        None => {
+                            break 'result self.fatal(RuntimeErrorKind::InvalidValue {
+                                value: Value::UNDEFINED,
+                            });
+                        }
+                    };
+                    let key = {
+                        let coerced = self.machine.borrow().to_property_key(key);
+                        match coerced {
+                            Ok(key) => key,
+                            Err(failure) => break 'result self.fail(failure),
+                        }
+                    };
+                    let defined = self
+                        .machine
                         .borrow_mut()
-                        .store_global(module, ConstantId::new(name), value);
-                match stored {
-                    Ok(()) => HelperResult::normal(Value::UNDEFINED),
-                    Err(failure) => self.fail(failure),
-                }
-            }
-            HelperCall::TypeOfGlobal { name } => {
-                let resolved = self
-                    .machine
-                    .borrow_mut()
-                    .load_global(module, ConstantId::new(name));
-                let text = match resolved {
-                    Ok(Some(value)) => EcmaString::from_utf8(self.machine.borrow().type_of(value)),
-                    Ok(None) => EcmaString::from_utf8("undefined"),
-                    Err(failure) => return self.fail(failure),
-                };
-                self.allocated(HeapEntry::String(text))
-            }
-            HelperCall::LoadThis => HelperResult::normal(
-                self.activations
-                    .borrow()
-                    .last()
-                    .map_or(Value::UNDEFINED, |activation| activation.this_value),
-            ),
-            HelperCall::LoadArguments => self.load_arguments(),
-            HelperCall::LoadNewTarget => HelperResult::normal(
-                self.activations
-                    .borrow()
-                    .last()
-                    .map_or(Value::UNDEFINED, |activation| activation.new_target),
-            ),
-            HelperCall::ArrayPush { array, value } => {
-                let result = self.machine.borrow_mut().array_push(array, value);
-                match result {
-                    Ok(()) => HelperResult::normal(Value::UNDEFINED),
-                    Err(failure) => self.fail(failure),
-                }
-            }
-            HelperCall::ArrayExtend { array, iterable } => {
-                let outcome = self.array_extend_active(array, iterable);
-                self.outcome_result(outcome)
-            }
-            HelperCall::ObjectSpread { target, source } => {
-                let result = self.machine.borrow_mut().object_spread(target, source);
-                match result {
-                    Ok(()) => HelperResult::normal(Value::UNDEFINED),
-                    Err(failure) => self.fail(failure),
-                }
-            }
-            HelperCall::SetPrototype { object, prototype } => {
-                let result = self.machine.borrow_mut().set_prototype(object, prototype);
-                match result {
-                    Ok(()) => HelperResult::normal(Value::UNDEFINED),
-                    Err(failure) => self.fail(failure),
-                }
-            }
-            HelperCall::CreatePrivateName { description } => {
-                let description = self.constant_text(module, description);
-                self.allocated(HeapEntry::PrivateName { description })
-            }
-            HelperCall::CreateRegExp { pattern, flags } => {
-                let pattern = self.constant_text(module, pattern);
-                let flags = self.constant_text(module, flags);
-                let prototype = self.machine.borrow().intrinsics.regexp_prototype();
-                self.allocated(HeapEntry::RegExp {
-                    pattern,
-                    flags,
-                    properties: PropertyMap::default(),
-                    prototype: Some(prototype),
-                    extensible: true,
-                })
-            }
-            HelperCall::GetIterator { src, kind } => match iterator_kind_from_selector(kind) {
-                Some(kind) => self.outcome_result(self.get_iterator_active(src, kind)),
-                None => self.fatal(RuntimeErrorKind::InvalidValue {
-                    value: Value::UNDEFINED,
-                }),
-            },
-            HelperCall::IteratorNext {
-                iterator,
-                done_reg,
-                value_reg,
-            } => match self.iterator_next_active(iterator) {
-                Ok((done, value)) => {
-                    let wrote_done = frame.try_set_register(done_reg, Value::boolean(done));
-                    let wrote_value = frame.try_set_register(value_reg, value);
-                    if wrote_done && wrote_value {
-                        HelperResult::normal(Value::UNDEFINED)
-                    } else {
-                        self.fatal(RuntimeErrorKind::InvalidValue {
-                            value: Value::UNDEFINED,
-                        })
+                        .define_accessor(object, key, accessor, kind);
+                    match defined {
+                        Ok(()) => HelperResult::normal(Value::UNDEFINED),
+                        Err(failure) => self.fail(failure),
                     }
                 }
-                Err(outcome) => self.outcome_result(outcome),
-            },
-            HelperCall::IteratorStep { iterator } => match self.iterator_step_active(iterator) {
-                Ok(result) => HelperResult::normal(result),
-                Err(outcome) => self.outcome_result(outcome),
-            },
-            HelperCall::IteratorResult {
-                result,
-                done_reg,
-                value_reg,
-            } => match self.iterator_result_active(result) {
-                Ok((done, value)) => {
-                    let wrote_done = frame.try_set_register(done_reg, Value::boolean(done));
-                    let wrote_value = frame.try_set_register(value_reg, value);
-                    if wrote_done && wrote_value {
-                        HelperResult::normal(Value::UNDEFINED)
-                    } else {
-                        self.fatal(RuntimeErrorKind::InvalidValue {
-                            value: Value::UNDEFINED,
-                        })
+                HelperCall::DefineDataProperty { object, key, value } => {
+                    let key = {
+                        let coerced = self.machine.borrow().to_property_key(key);
+                        match coerced {
+                            Ok(key) => key,
+                            Err(failure) => break 'result self.fail(failure),
+                        }
+                    };
+                    let defined = self.machine.borrow_mut().define_descriptor(
+                        object,
+                        key,
+                        Property::Data {
+                            value,
+                            writable: true,
+                            enumerable: false,
+                            configurable: true,
+                        },
+                    );
+                    match defined {
+                        Ok(()) => HelperResult::normal(Value::UNDEFINED),
+                        Err(failure) => self.fail(failure),
                     }
                 }
-                Err(outcome) => self.outcome_result(outcome),
-            },
-            HelperCall::IteratorClose {
-                iterator,
-                mode,
-                called_reg,
-            } => match self.close_iterator_active(frame, iterator, mode, called_reg) {
-                Ok(result) => HelperResult::normal(result),
-                Err(outcome) => self.outcome_result(outcome),
-            },
-            HelperCall::RequireCloseResult { result, called } => {
-                if called == Value::TRUE && !self.machine.borrow().is_object(result) {
+                HelperCall::LoadOwnDescriptorSlot { object, key, slot } => {
+                    let slot = match descriptor_slot_from_selector(slot) {
+                        Some(slot) => slot,
+                        None => {
+                            break 'result self.fatal(RuntimeErrorKind::InvalidValue {
+                                value: Value::UNDEFINED,
+                            });
+                        }
+                    };
+                    let read = self
+                        .machine
+                        .borrow_mut()
+                        .load_own_descriptor_slot(object, key, slot);
+                    match read {
+                        Ok(value) => HelperResult::normal(value),
+                        Err(failure) => self.fail(failure),
+                    }
+                }
+                HelperCall::DefineOwnDescriptorSlot {
+                    object,
+                    key,
+                    src,
+                    slot,
+                } => {
+                    let slot = match descriptor_slot_from_selector(slot) {
+                        Some(slot) => slot,
+                        None => {
+                            break 'result self.fatal(RuntimeErrorKind::InvalidValue {
+                                value: Value::UNDEFINED,
+                            });
+                        }
+                    };
+                    let defined = self
+                        .machine
+                        .borrow_mut()
+                        .define_own_descriptor_slot(object, key, src, slot);
+                    match defined {
+                        Ok(()) => HelperResult::normal(Value::UNDEFINED),
+                        Err(failure) => self.fail(failure),
+                    }
+                }
+                HelperCall::WithHasBinding { object, key } => {
+                    // Shared Object Environment Record HasBinding. Machine owns the
+                    // getter path via call_value; scope the RefCell borrow to this
+                    // single call so no outer borrow spans getter re-entry.
+                    let found = self.machine.borrow_mut().with_has_binding(object, key);
+                    match found {
+                        Ok(found) => HelperResult::normal(Value::boolean(found)),
+                        Err(failure) => self.fail(failure),
+                    }
+                }
+                HelperCall::Call {
+                    callee,
+                    this_value,
+                    arguments,
+                } => {
+                    let arguments = {
+                        let read = self.machine.borrow().arguments_from_array(arguments);
+                        match read {
+                            Ok(arguments) => arguments,
+                            Err(failure) => break 'result self.fail(failure),
+                        }
+                    };
+                    let outcome =
+                        self.invoke_callee(callee, this_value, &arguments, Value::UNDEFINED);
+                    self.outcome_result(outcome)
+                }
+                HelperCall::Construct { callee, arguments } => {
+                    let arguments = {
+                        let read = self.machine.borrow().arguments_from_array(arguments);
+                        match read {
+                            Ok(arguments) => arguments,
+                            Err(failure) => break 'result self.fail(failure),
+                        }
+                    };
+                    // Tag 12 has no explicit `new.target`: the callee is it.
+                    self.construct(callee, callee, &arguments)
+                }
+                HelperCall::ConstructWithNewTarget {
+                    callee,
+                    new_target,
+                    arguments,
+                } => {
+                    let arguments = {
+                        let read = self.machine.borrow().arguments_from_array(arguments);
+                        match read {
+                            Ok(arguments) => arguments,
+                            Err(failure) => break 'result self.fail(failure),
+                        }
+                    };
+                    self.construct(callee, new_target, &arguments)
+                }
+                HelperCall::Import { specifier } => self.import_namespace(module, specifier),
+                HelperCall::LoadImportMeta => {
+                    let result = self.machine.borrow_mut().load_import_meta(module);
+                    match result {
+                        Ok(value) => HelperResult::normal(value),
+                        Err(kind) => self.fatal(kind),
+                    }
+                }
+                HelperCall::ImportDynamic { specifier } => {
+                    let result = self
+                        .machine
+                        .borrow_mut()
+                        .import_dynamic_expression(module, specifier);
+                    self.eval_result(result)
+                }
+                HelperCall::Truthy { value } => {
+                    HelperResult::normal(Value::boolean(self.machine.borrow().truthy(value)))
+                }
+                HelperCall::ResumeValue => {
+                    let resumed = self
+                        .activations
+                        .borrow_mut()
+                        .last_mut()
+                        .and_then(|activation| activation.pending_resume.take());
+                    match resumed {
+                        Some(value) => self.validated(value),
+                        None => self.fatal(RuntimeErrorKind::InvalidValue {
+                            value: Value::UNDEFINED,
+                        }),
+                    }
+                }
+                HelperCall::LoadGlobal { name } => {
+                    let resolved = self
+                        .machine
+                        .borrow_mut()
+                        .load_global(module, ConstantId::new(name));
+                    match resolved {
+                        Ok(Some(value)) => self.validated(value),
+                        Ok(None) => {
+                            self.pending_throw.set(Some(PendingThrow {
+                                value: Value::UNDEFINED,
+                                origin: ThrowOrigin::ReferenceError {
+                                    operation: "global is not defined",
+                                },
+                            }));
+                            HelperResult::throw(Value::UNDEFINED)
+                        }
+                        Err(failure) => self.fail(failure),
+                    }
+                }
+                HelperCall::StoreGlobal { name, value } => {
+                    let stored = self.machine.borrow_mut().store_global(
+                        module,
+                        ConstantId::new(name),
+                        value,
+                    );
+                    match stored {
+                        Ok(()) => HelperResult::normal(Value::UNDEFINED),
+                        Err(failure) => self.fail(failure),
+                    }
+                }
+                HelperCall::TypeOfGlobal { name } => {
+                    let resolved = self
+                        .machine
+                        .borrow_mut()
+                        .load_global(module, ConstantId::new(name));
+                    let text = match resolved {
+                        Ok(Some(value)) => {
+                            EcmaString::from_utf8(self.machine.borrow().type_of(value))
+                        }
+                        Ok(None) => EcmaString::from_utf8("undefined"),
+                        Err(failure) => break 'result self.fail(failure),
+                    };
+                    self.allocated(HeapEntry::String(text))
+                }
+                HelperCall::LoadThis => HelperResult::normal(
+                    self.activations
+                        .borrow()
+                        .last()
+                        .map_or(Value::UNDEFINED, |activation| activation.this_value),
+                ),
+                HelperCall::LoadArguments => self.load_arguments(),
+                HelperCall::LoadNewTarget => HelperResult::normal(
+                    self.activations
+                        .borrow()
+                        .last()
+                        .map_or(Value::UNDEFINED, |activation| activation.new_target),
+                ),
+                HelperCall::ArrayPush { array, value } => {
+                    let result = self.machine.borrow_mut().array_push(array, value);
+                    match result {
+                        Ok(()) => HelperResult::normal(Value::UNDEFINED),
+                        Err(failure) => self.fail(failure),
+                    }
+                }
+                HelperCall::ArrayExtend { array, iterable } => {
+                    let outcome = self.array_extend_active(array, iterable);
+                    self.outcome_result(outcome)
+                }
+                HelperCall::ObjectSpread { target, source } => {
+                    let result = self.machine.borrow_mut().object_spread(target, source);
+                    match result {
+                        Ok(()) => HelperResult::normal(Value::UNDEFINED),
+                        Err(failure) => self.fail(failure),
+                    }
+                }
+                HelperCall::SetPrototype { object, prototype } => {
+                    let result = self.machine.borrow_mut().set_prototype(object, prototype);
+                    match result {
+                        Ok(()) => HelperResult::normal(Value::UNDEFINED),
+                        Err(failure) => self.fail(failure),
+                    }
+                }
+                HelperCall::CreatePrivateName { description } => {
+                    let description = self.constant_text(module, description);
+                    self.allocated(HeapEntry::PrivateName { description })
+                }
+                HelperCall::CreateRegExp { pattern, flags } => {
+                    let pattern = self.constant_text(module, pattern);
+                    let flags = self.constant_text(module, flags);
+                    let prototype = self.machine.borrow().intrinsics.regexp_prototype();
+                    self.allocated(HeapEntry::RegExp {
+                        pattern,
+                        flags,
+                        properties: PropertyMap::default(),
+                        prototype: Some(prototype),
+                        extensible: true,
+                    })
+                }
+                HelperCall::GetIterator { src, kind } => match iterator_kind_from_selector(kind) {
+                    Some(kind) => self.outcome_result(self.get_iterator_active(src, kind)),
+                    None => self.fatal(RuntimeErrorKind::InvalidValue {
+                        value: Value::UNDEFINED,
+                    }),
+                },
+                HelperCall::IteratorNext {
+                    iterator,
+                    done_reg,
+                    value_reg,
+                } => match self.iterator_next_active(iterator) {
+                    Ok((done, value)) => {
+                        let wrote_done = frame.try_set_register(done_reg, Value::boolean(done));
+                        let wrote_value = frame.try_set_register(value_reg, value);
+                        if wrote_done && wrote_value {
+                            HelperResult::normal(Value::UNDEFINED)
+                        } else {
+                            self.fatal(RuntimeErrorKind::InvalidValue {
+                                value: Value::UNDEFINED,
+                            })
+                        }
+                    }
+                    Err(outcome) => self.outcome_result(outcome),
+                },
+                HelperCall::IteratorStep { iterator } => {
+                    match self.iterator_step_active(iterator) {
+                        Ok(result) => HelperResult::normal(result),
+                        Err(outcome) => self.outcome_result(outcome),
+                    }
+                }
+                HelperCall::IteratorResult {
+                    result,
+                    done_reg,
+                    value_reg,
+                } => match self.iterator_result_active(result) {
+                    Ok((done, value)) => {
+                        let wrote_done = frame.try_set_register(done_reg, Value::boolean(done));
+                        let wrote_value = frame.try_set_register(value_reg, value);
+                        if wrote_done && wrote_value {
+                            HelperResult::normal(Value::UNDEFINED)
+                        } else {
+                            self.fatal(RuntimeErrorKind::InvalidValue {
+                                value: Value::UNDEFINED,
+                            })
+                        }
+                    }
+                    Err(outcome) => self.outcome_result(outcome),
+                },
+                HelperCall::IteratorClose {
+                    iterator,
+                    mode,
+                    called_reg,
+                } => match self.close_iterator_active(frame, iterator, mode, called_reg) {
+                    Ok(result) => HelperResult::normal(result),
+                    Err(outcome) => self.outcome_result(outcome),
+                },
+                HelperCall::RequireCloseResult { result, called } => {
+                    if called == Value::TRUE && !self.machine.borrow().is_object(result) {
+                        self.fail(EvalFailure::Throw(ThrowOrigin::TypeError {
+                            operation: "iterator.return() returned a non-object",
+                        }))
+                    } else {
+                        HelperResult::normal(Value::UNDEFINED)
+                    }
+                }
+                HelperCall::DisposeCapture {
+                    src,
+                    hint,
+                    kind_reg,
+                } => match self.dispose_capture_active(src, hint) {
+                    Ok((method, kind)) if frame.try_set_register(kind_reg, Value::int32(kind)) => {
+                        HelperResult::normal(method)
+                    }
+                    Ok(_) => self.fatal(RuntimeErrorKind::InvalidValue {
+                        value: Value::UNDEFINED,
+                    }),
+                    Err(outcome) => self.outcome_result(outcome),
+                },
+                HelperCall::SuppressError { error, suppressed } => {
+                    let result = self
+                        .machine
+                        .borrow_mut()
+                        .make_suppressed_error(error, suppressed);
+                    match result {
+                        Ok(value) => self.validated(value),
+                        Err(failure) => self.fail(failure),
+                    }
+                }
+                HelperCall::Export { .. } => {
                     self.fail(EvalFailure::Throw(ThrowOrigin::TypeError {
-                        operation: "iterator.return() returned a non-object",
+                        operation: "export outside an engine-owned module registry",
                     }))
-                } else {
-                    HelperResult::normal(Value::UNDEFINED)
                 }
+                HelperCall::ConsumeFuel { .. } => HelperResult::normal(Value::UNDEFINED),
             }
-            HelperCall::Export { .. } => self.fail(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "export outside an engine-owned module registry",
-            })),
-            HelperCall::ConsumeFuel { .. } => HelperResult::normal(Value::UNDEFINED),
-        }
+        };
+        self.finish_helper_result(frame, result)
     }
 }
 
@@ -2961,14 +3457,20 @@ fn is_inline_instruction(instruction: Instruction) -> bool {
         | Instruction::SetProperty { .. }
         | Instruction::DeleteProperty { .. }
         | Instruction::DefineAccessor { .. }
+        | Instruction::DefineDataProperty { .. }
+        | Instruction::LoadOwnDescriptorSlot { .. }
+        | Instruction::DefineOwnDescriptorSlot { .. }
+        | Instruction::WithHasBinding { .. }
         | Instruction::Call { .. }
         | Instruction::Construct { .. }
+        | Instruction::ConstructWithNewTarget { .. }
         | Instruction::LoadGlobal { .. }
         | Instruction::StoreGlobal { .. }
         | Instruction::TypeOfGlobal { .. }
         | Instruction::LoadThis { .. }
         | Instruction::LoadArguments { .. }
         | Instruction::LoadNewTarget { .. }
+        | Instruction::LoadImportMeta { .. }
         | Instruction::ArrayPush { .. }
         | Instruction::ArrayExtend { .. }
         | Instruction::ObjectSpread { .. }
@@ -2981,7 +3483,11 @@ fn is_inline_instruction(instruction: Instruction) -> bool {
         | Instruction::IteratorResult { .. }
         | Instruction::IteratorClose { .. }
         | Instruction::RequireCloseResult { .. }
+        | Instruction::DisposeCapture { .. }
+        | Instruction::SuppressError { .. }
         | Instruction::Import { .. }
+        | Instruction::ToObject { .. }
+        | Instruction::ImportDynamic { .. }
         | Instruction::Export { .. } => false,
     }
 }
@@ -3015,19 +3521,19 @@ mod tests {
     use std::sync::Arc;
 
     use bamts_bytecode::{
-        BinaryOp, Binding, BindingId, BindingKind, Constant, ConstantId, Edge, EdgeId, EdgeKind,
-        EdgeTarget, ExceptionHandler, Export, ExportSource, Function, FunctionFlags, FunctionId,
-        Instruction, IteratorKind, Module, ModuleId, Pc, Program, ProgramModule, Register,
-        Verified,
+        AccessorKind, BinaryOp, Binding, BindingId, BindingKind, Constant, ConstantId,
+        DescriptorSlot, DisposeHint, Edge, EdgeId, EdgeKind, EdgeTarget, ExceptionHandler, Export,
+        ExportSource, Function, FunctionFlags, FunctionId, Instruction, IteratorKind, Module,
+        ModuleId, Pc, Program, ProgramModule, Register, Verified,
     };
     use bamts_native::{
         AbiError, Completion, CompletionTag, HelperCall, HelperResult, NativeEntryTable,
-        NativeFrame, NativeOps, ShadowFrame, Value,
+        NativeFrame, NativeHelper, NativeOps, ShadowFrame, Value,
     };
 
     use crate::{
-        GeneratorState, HeapEntry, Host, Limits, Machine, PropertyMap, RuntimeError,
-        RuntimeErrorKind, ThrowOrigin,
+        GeneratorState, HeapEntry, Host, Limits, Machine, Property, PropertyKey, PropertyMap,
+        RuntimeError, RuntimeErrorKind, ThrowOrigin,
     };
 
     use super::EcmaString;
@@ -3046,6 +3552,13 @@ mod tests {
 
     fn cid(raw: u32) -> bamts_bytecode::ConstantId {
         bamts_bytecode::ConstantId::new(raw)
+    }
+
+    fn test_target() -> crate::RuntimeFunction {
+        crate::RuntimeFunction {
+            module: ModuleId::new(0),
+            function: FunctionId::new(0),
+        }
     }
 
     fn entry_function(register_count: u32, code: Vec<Instruction>) -> Function {
@@ -3205,12 +3718,255 @@ mod tests {
     ) -> Result<crate::Execution, RuntimeError> {
         let limits = Limits::default();
         let mut interpreter_host = SilentHost;
-        let interpreter = Machine::new(program, &mut interpreter_host, limits.clone()).run();
+        let mut interpreter = Machine::new(program, &mut interpreter_host, limits.clone());
+        let interpreter = run_interpreter_to_quiescence(&mut interpreter)?;
         let mut native_host = SilentHost;
         let entries = NoEntries;
-        let native = NativeEngine::new(program, &entries, &mut native_host, limits).run();
+        let native = NativeEngine::new(program, &entries, &mut native_host, limits);
+        let native = run_reference_to_quiescence(&native)?;
         assert_eq!(interpreter, native);
-        native
+        Ok(native)
+    }
+
+    fn run_interpreter_to_quiescence<H: Host>(
+        machine: &mut Machine<'_, H>,
+    ) -> Result<crate::Execution, RuntimeError> {
+        let execution = machine.evaluate()?;
+        machine.run_to_quiescence()?;
+        Ok(execution)
+    }
+
+    fn run_reference_to_quiescence<H: Host>(
+        engine: &NativeEngine<'_, '_, H>,
+    ) -> Result<crate::Execution, RuntimeError> {
+        engine.machine.borrow_mut().instantiate_modules()?;
+        let entry = engine.program.entry();
+        let execution = if engine.machine.borrow().module_graph_suspends(entry) {
+            engine
+                .machine
+                .borrow_mut()
+                .evaluate_instantiated_module(entry)?
+        } else {
+            engine.evaluate_reference_module(entry)?.ok_or_else(|| {
+                let function = engine.module(entry).entry().get() as usize;
+                engine.error_at(
+                    entry,
+                    RuntimeErrorKind::InvalidVerifiedProgram {
+                        module: entry,
+                        instruction: Instruction::Halt,
+                    },
+                    function,
+                    0,
+                )
+            })?
+        };
+        engine.machine.borrow_mut().run_to_quiescence()?;
+        Ok(execution)
+    }
+
+    #[test]
+    fn suppress_error_matches_interpreter_and_native_engine() {
+        let program = linked(
+            vec![program_module(
+                "root",
+                vec![
+                    Constant::Int32(11),
+                    Constant::Int32(22),
+                    Constant::String(EcmaString::from_utf8("error")),
+                    Constant::String(EcmaString::from_utf8("suppressed")),
+                ],
+                vec![entry_function(
+                    7,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(1),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(2),
+                        },
+                        Instruction::SuppressError {
+                            dst: reg(2),
+                            error: reg(0),
+                            suppressed: reg(1),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(3),
+                            constant: cid(3),
+                        },
+                        Instruction::GetProperty {
+                            dst: reg(4),
+                            object: reg(2),
+                            key: reg(3),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(5),
+                            constant: cid(4),
+                        },
+                        Instruction::GetProperty {
+                            dst: reg(6),
+                            object: reg(2),
+                            key: reg(5),
+                        },
+                        Instruction::Binary {
+                            dst: reg(6),
+                            op: BinaryOp::Add,
+                            left: reg(4),
+                            right: reg(6),
+                        },
+                        Instruction::Return { value: reg(6) },
+                    ],
+                )],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )],
+            0,
+        );
+
+        assert_eq!(
+            assert_program_parity(&program)
+                .expect("suppression chain construction succeeds")
+                .value,
+            Value::int32(33),
+        );
+    }
+
+    #[test]
+    fn dispose_capture_matches_interpreter_and_native_engine() {
+        let resource = |hint, property| {
+            linked(
+                vec![program_module(
+                    "root",
+                    vec![
+                        Constant::String(EcmaString::from_utf8("Symbol")),
+                        Constant::String(EcmaString::from_utf8(property)),
+                        Constant::String(EcmaString::from_utf8("Array")),
+                    ],
+                    vec![entry_function(
+                        7,
+                        vec![
+                            Instruction::LoadGlobal {
+                                dst: reg(0),
+                                name: cid(1),
+                            },
+                            Instruction::LoadConst {
+                                dst: reg(1),
+                                constant: cid(2),
+                            },
+                            Instruction::GetProperty {
+                                dst: reg(2),
+                                object: reg(0),
+                                key: reg(1),
+                            },
+                            Instruction::CreateObject { dst: reg(3) },
+                            Instruction::LoadGlobal {
+                                dst: reg(4),
+                                name: cid(3),
+                            },
+                            Instruction::SetProperty {
+                                object: reg(3),
+                                key: reg(2),
+                                value: reg(4),
+                            },
+                            Instruction::DisposeCapture {
+                                method: reg(5),
+                                kind: reg(6),
+                                src: reg(3),
+                                hint,
+                            },
+                            Instruction::Return { value: reg(6) },
+                        ],
+                    )],
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )],
+                0,
+            )
+        };
+        let nullish = |hint| {
+            linked(
+                vec![program_module(
+                    "root",
+                    vec![Constant::Null],
+                    vec![entry_function(
+                        3,
+                        vec![
+                            Instruction::LoadConst {
+                                dst: reg(0),
+                                constant: cid(1),
+                            },
+                            Instruction::DisposeCapture {
+                                method: reg(1),
+                                kind: reg(2),
+                                src: reg(0),
+                                hint,
+                            },
+                            Instruction::Return { value: reg(2) },
+                        ],
+                    )],
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )],
+                0,
+            )
+        };
+        let invalid = linked(
+            vec![program_module(
+                "root",
+                vec![],
+                vec![entry_function(
+                    3,
+                    vec![
+                        Instruction::CreateObject { dst: reg(0) },
+                        Instruction::DisposeCapture {
+                            method: reg(1),
+                            kind: reg(2),
+                            src: reg(0),
+                            hint: DisposeHint::Sync,
+                        },
+                        Instruction::Return { value: reg(2) },
+                    ],
+                )],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )],
+            0,
+        );
+        assert_eq!(
+            assert_program_parity(&resource(DisposeHint::Sync, "dispose"))
+                .expect("sync disposer capture succeeds")
+                .value,
+            Value::int32(1),
+        );
+        assert_eq!(
+            assert_program_parity(&resource(DisposeHint::Async, "asyncDispose"))
+                .expect("async disposer capture succeeds")
+                .value,
+            Value::int32(1),
+        );
+        for hint in [DisposeHint::Sync, DisposeHint::Async] {
+            assert_eq!(
+                assert_program_parity(&nullish(hint))
+                    .expect("nullish capture succeeds")
+                    .value,
+                Value::int32(0),
+            );
+        }
+        assert!(matches!(
+            assert_program_parity(&invalid),
+            Err(RuntimeError {
+                kind: RuntimeErrorKind::UncaughtThrow {
+                    origin: ThrowOrigin::TypeError { .. },
+                    ..
+                },
+                ..
+            })
+        ));
     }
 
     /// A dummy entry table for the reference backend, which never invokes it.
@@ -3894,6 +4650,49 @@ mod tests {
         ) -> Result<CompletionTag, AbiError> {
             *out = Completion::new(Value::UNDEFINED);
             Ok(CompletionTag::Throw)
+        }
+    }
+
+    struct FaultSiteEntries {
+        entry_tag: Cell<CompletionTag>,
+        entry_pc: Cell<u32>,
+        child_pc: u32,
+    }
+
+    impl FaultSiteEntries {
+        fn throwing(entry_pc: u32, child_pc: u32) -> Self {
+            Self {
+                entry_tag: Cell::new(CompletionTag::Throw),
+                entry_pc: Cell::new(entry_pc),
+                child_pc,
+            }
+        }
+    }
+
+    impl NativeEntryTable for FaultSiteEntries {
+        fn program_bytes(&self) -> &[u8] {
+            &[]
+        }
+
+        fn invoke(
+            &self,
+            _module_id: u32,
+            function_id: u32,
+            frame: &mut ShadowFrame,
+            out: &mut Completion,
+        ) -> Result<CompletionTag, AbiError> {
+            *out = Completion::new(Value::UNDEFINED);
+            match function_id {
+                0 => {
+                    frame.bytecode_pc = self.entry_pc.get();
+                    Ok(self.entry_tag.get())
+                }
+                1 => {
+                    frame.bytecode_pc = self.child_pc;
+                    Ok(CompletionTag::Throw)
+                }
+                _ => unreachable!("fault-site fixture only exposes entry and child"),
+            }
         }
     }
 
@@ -5329,6 +6128,7 @@ mod tests {
             args: Vec::new(),
             arguments_object: None,
             pending_resume: None,
+            target: test_target(),
         });
         engine.push_native_roots(&registers);
         let handles = registers.as_mut_ptr();
@@ -5859,6 +6659,593 @@ mod tests {
         assert_eq!(assert_parity(&module, || SilentHost), Value::int32(1));
     }
 
+    /// Tag 47 lowers to the explicit-newTarget helper with operands read in
+    /// the pinned wire order (`callee`, `new_target`, `arguments`).
+    #[test]
+    fn construct_with_new_target_lowers_with_pinned_operand_order() {
+        let module = verified(Vec::new(), vec![entry_function(5, vec![Instruction::Halt])]);
+        let program = one_module_program(&module);
+        let mut host = SilentHost;
+        let entries = NoEntries;
+        let engine = NativeEngine::new(&program, &entries, &mut host, Limits::default());
+        let mut registers = [
+            Value::int32(11),
+            Value::int32(22),
+            Value::int32(33),
+            Value::int32(44),
+            Value::UNINITIALIZED,
+        ];
+        engine.activations.borrow_mut().push(Activation {
+            this_value: Value::UNDEFINED,
+            new_target: Value::UNDEFINED,
+            args: Vec::new(),
+            arguments_object: None,
+            pending_resume: None,
+            target: test_target(),
+        });
+        engine.push_native_roots(&registers);
+        let handles = registers.as_mut_ptr();
+        let mut shadow =
+            ShadowFrame::new(std::ptr::null_mut(), 0, 0, handles, registers.len() as u16);
+        let frame = NativeFrame::new(&mut shadow, &mut registers).unwrap();
+        let (call, dst) = engine.lower(
+            Instruction::ConstructWithNewTarget {
+                dst: reg(4),
+                callee: reg(1),
+                new_target: reg(2),
+                arguments: reg(3),
+            },
+            &frame,
+        );
+        assert_eq!(
+            call,
+            HelperCall::ConstructWithNewTarget {
+                callee: Value::int32(22),
+                new_target: Value::int32(33),
+                arguments: Value::int32(44),
+            }
+        );
+        assert_eq!(dst, Some(4));
+        engine.pop_native_roots();
+        engine.activations.borrow_mut().pop();
+    }
+
+    /// An explicit `new.target` distinct from the callee reaches the
+    /// constructed activation in both engines: the constructor returns
+    /// `new.target` (an object), so the construct result IS the explicit
+    /// target.
+    #[test]
+    fn construct_with_new_target_delivers_explicit_target_to_both_engines() {
+        let module = verified(
+            Vec::new(),
+            vec![
+                entry_function(
+                    6,
+                    vec![
+                        Instruction::CreateArray { dst: reg(0) },
+                        Instruction::CreateClosure {
+                            dst: reg(1),
+                            function: FunctionId::new(1),
+                            captures: reg(0),
+                        },
+                        Instruction::CreateClosure {
+                            dst: reg(2),
+                            function: FunctionId::new(2),
+                            captures: reg(0),
+                        },
+                        Instruction::ConstructWithNewTarget {
+                            dst: reg(3),
+                            callee: reg(1),
+                            new_target: reg(2),
+                            arguments: reg(0),
+                        },
+                        Instruction::Binary {
+                            dst: reg(4),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(3),
+                            right: reg(2),
+                        },
+                        Instruction::Return { value: reg(4) },
+                    ],
+                ),
+                // The constructed callee: return `new.target` (an object, so
+                // it overrides the allocated instance verbatim).
+                module_function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadNewTarget { dst: reg(0) },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                ),
+                // The explicit `new.target`: any object identity suffices.
+                Function::new(
+                    None,
+                    0,
+                    1,
+                    1,
+                    FunctionFlags::default(),
+                    vec![Instruction::Return { value: reg(0) }],
+                    Vec::new(),
+                ),
+            ],
+        );
+        assert_eq!(assert_parity(&module, || SilentHost), Value::TRUE);
+    }
+
+    /// Tag 47 over a bound callee keeps an explicit `new.target` distinct
+    /// from the wrapper: the constructor still observes the explicit target,
+    /// not the bound wrapper and not the flattened target.
+    #[test]
+    fn construct_with_new_target_preserves_explicit_target_through_bound_callee() {
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("bind")),
+                Constant::Undefined,
+            ],
+            vec![
+                entry_function(
+                    8,
+                    vec![
+                        Instruction::CreateArray { dst: reg(0) },
+                        Instruction::CreateClosure {
+                            dst: reg(1),
+                            function: FunctionId::new(1),
+                            captures: reg(0),
+                        },
+                        Instruction::CreateClosure {
+                            dst: reg(2),
+                            function: FunctionId::new(2),
+                            captures: reg(0),
+                        },
+                        // Bind the callee with a fixed receiver.
+                        Instruction::LoadConst {
+                            dst: reg(3),
+                            constant: cid(0),
+                        },
+                        Instruction::GetProperty {
+                            dst: reg(3),
+                            object: reg(1),
+                            key: reg(3),
+                        },
+                        Instruction::CreateArray { dst: reg(4) },
+                        Instruction::LoadConst {
+                            dst: reg(5),
+                            constant: cid(1),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(4),
+                            value: reg(5),
+                        },
+                        Instruction::Call {
+                            dst: reg(5),
+                            callee: reg(3),
+                            this_value: reg(1),
+                            arguments: reg(4),
+                        },
+                        // Construct the bound callee with an explicit
+                        // `new.target` distinct from the wrapper.
+                        Instruction::CreateArray { dst: reg(4) },
+                        Instruction::ConstructWithNewTarget {
+                            dst: reg(6),
+                            callee: reg(5),
+                            new_target: reg(2),
+                            arguments: reg(4),
+                        },
+                        Instruction::Binary {
+                            dst: reg(7),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(6),
+                            right: reg(2),
+                        },
+                        Instruction::Return { value: reg(7) },
+                    ],
+                ),
+                // The bound target: return `new.target` (an object).
+                module_function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadNewTarget { dst: reg(0) },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                ),
+                // The explicit `new.target`.
+                Function::new(
+                    None,
+                    0,
+                    1,
+                    1,
+                    FunctionFlags::default(),
+                    vec![Instruction::Return { value: reg(0) }],
+                    Vec::new(),
+                ),
+            ],
+        );
+        assert_eq!(assert_parity(&module, || SilentHost), Value::TRUE);
+    }
+
+    #[test]
+    fn construct_with_new_target_forwards_intermediate_bound_wrapper_in_both_engines() {
+        // B2 -> B1 -> Base newTarget matrix (interpreter/native parity):
+        //   ConstructWithNT(B2, B2|B1|Base) -> Base
+        //   ConstructWithNT(B2, Unrelated)  -> Unrelated
+        //   Construct(B2)                   -> Base
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("bind")),
+                Constant::Undefined,
+            ],
+            vec![
+                entry_function(
+                    14,
+                    vec![
+                        Instruction::CreateArray { dst: reg(0) },
+                        Instruction::CreateClosure {
+                            dst: reg(1),
+                            function: FunctionId::new(1),
+                            captures: reg(0),
+                        },
+                        Instruction::CreateArray { dst: reg(0) },
+                        Instruction::CreateClosure {
+                            dst: reg(11),
+                            function: FunctionId::new(2),
+                            captures: reg(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(2),
+                            constant: cid(0),
+                        },
+                        Instruction::GetProperty {
+                            dst: reg(2),
+                            object: reg(1),
+                            key: reg(2),
+                        },
+                        Instruction::CreateArray { dst: reg(3) },
+                        Instruction::LoadConst {
+                            dst: reg(4),
+                            constant: cid(1),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(3),
+                            value: reg(4),
+                        },
+                        Instruction::Call {
+                            dst: reg(5),
+                            callee: reg(2),
+                            this_value: reg(1),
+                            arguments: reg(3),
+                        },
+                        // B2 = B1.bind(undefined)
+                        Instruction::LoadConst {
+                            dst: reg(2),
+                            constant: cid(0),
+                        },
+                        Instruction::GetProperty {
+                            dst: reg(2),
+                            object: reg(5),
+                            key: reg(2),
+                        },
+                        Instruction::CreateArray { dst: reg(3) },
+                        Instruction::ArrayPush {
+                            array: reg(3),
+                            value: reg(4),
+                        },
+                        Instruction::Call {
+                            dst: reg(6),
+                            callee: reg(2),
+                            this_value: reg(5),
+                            arguments: reg(3),
+                        },
+                        // ConstructWithNT(B2, B2) -> Base
+                        Instruction::CreateArray { dst: reg(3) },
+                        Instruction::ConstructWithNewTarget {
+                            dst: reg(7),
+                            callee: reg(6),
+                            new_target: reg(6),
+                            arguments: reg(3),
+                        },
+                        Instruction::Binary {
+                            dst: reg(8),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(7),
+                            right: reg(1),
+                        },
+                        // ConstructWithNT(B2, B1) -> Base
+                        Instruction::CreateArray { dst: reg(3) },
+                        Instruction::ConstructWithNewTarget {
+                            dst: reg(7),
+                            callee: reg(6),
+                            new_target: reg(5),
+                            arguments: reg(3),
+                        },
+                        Instruction::Binary {
+                            dst: reg(9),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(7),
+                            right: reg(1),
+                        },
+                        Instruction::Binary {
+                            dst: reg(8),
+                            op: BinaryOp::BitAnd,
+                            left: reg(8),
+                            right: reg(9),
+                        },
+                        // ConstructWithNT(B2, Base) -> Base
+                        Instruction::CreateArray { dst: reg(3) },
+                        Instruction::ConstructWithNewTarget {
+                            dst: reg(7),
+                            callee: reg(6),
+                            new_target: reg(1),
+                            arguments: reg(3),
+                        },
+                        Instruction::Binary {
+                            dst: reg(9),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(7),
+                            right: reg(1),
+                        },
+                        Instruction::Binary {
+                            dst: reg(8),
+                            op: BinaryOp::BitAnd,
+                            left: reg(8),
+                            right: reg(9),
+                        },
+                        // ConstructWithNT(B2, Unrelated) -> Unrelated
+                        Instruction::CreateArray { dst: reg(3) },
+                        Instruction::ConstructWithNewTarget {
+                            dst: reg(7),
+                            callee: reg(6),
+                            new_target: reg(11),
+                            arguments: reg(3),
+                        },
+                        Instruction::Binary {
+                            dst: reg(9),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(7),
+                            right: reg(11),
+                        },
+                        Instruction::Binary {
+                            dst: reg(8),
+                            op: BinaryOp::BitAnd,
+                            left: reg(8),
+                            right: reg(9),
+                        },
+                        // ordinary Construct(B2) -> Base
+                        Instruction::CreateArray { dst: reg(3) },
+                        Instruction::Construct {
+                            dst: reg(7),
+                            callee: reg(6),
+                            arguments: reg(3),
+                        },
+                        Instruction::Binary {
+                            dst: reg(9),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(7),
+                            right: reg(1),
+                        },
+                        Instruction::Binary {
+                            dst: reg(8),
+                            op: BinaryOp::BitAnd,
+                            left: reg(8),
+                            right: reg(9),
+                        },
+                        Instruction::Return { value: reg(8) },
+                    ],
+                ),
+                module_function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadNewTarget { dst: reg(0) },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                ),
+                module_function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadNewTarget { dst: reg(0) },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                ),
+            ],
+        );
+        assert_eq!(assert_parity(&module, || SilentHost), Value::int32(1));
+    }
+
+    #[test]
+    fn object_constructor_distinct_new_target_ignores_arguments_in_both_engines() {
+        // Reflect-style Construct(Object, [value], customNewTarget) ignores value
+        // and allocates under customNewTarget.prototype in both engines.
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("Object")),
+                Constant::String(EcmaString::from_utf8("prototype")),
+                Constant::String(EcmaString::from_utf8("marker")),
+                Constant::Int32(42),
+                Constant::Int32(7),
+                Constant::String(EcmaString::from_utf8("own")),
+            ],
+            vec![
+                entry_function(
+                    12,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::CreateArray { dst: reg(1) },
+                        Instruction::CreateClosure {
+                            dst: reg(2),
+                            function: FunctionId::new(1),
+                            captures: reg(1),
+                        },
+                        // customNewTarget.prototype = { marker: 42 }
+                        Instruction::CreateObject { dst: reg(3) },
+                        Instruction::LoadConst {
+                            dst: reg(4),
+                            constant: cid(1),
+                        },
+                        Instruction::SetProperty {
+                            object: reg(2),
+                            key: reg(4),
+                            value: reg(3),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(4),
+                            constant: cid(2),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(5),
+                            constant: cid(3),
+                        },
+                        Instruction::SetProperty {
+                            object: reg(3),
+                            key: reg(4),
+                            value: reg(5),
+                        },
+                        // existing object argument with own: 7
+                        Instruction::CreateObject { dst: reg(6) },
+                        Instruction::LoadConst {
+                            dst: reg(4),
+                            constant: cid(5),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(5),
+                            constant: cid(4),
+                        },
+                        Instruction::SetProperty {
+                            object: reg(6),
+                            key: reg(4),
+                            value: reg(5),
+                        },
+                        Instruction::CreateArray { dst: reg(1) },
+                        Instruction::ArrayPush {
+                            array: reg(1),
+                            value: reg(6),
+                        },
+                        Instruction::ConstructWithNewTarget {
+                            dst: reg(7),
+                            callee: reg(0),
+                            new_target: reg(2),
+                            arguments: reg(1),
+                        },
+                        // result !== existing argument
+                        Instruction::Binary {
+                            dst: reg(8),
+                            op: BinaryOp::StrictNotEqual,
+                            left: reg(7),
+                            right: reg(6),
+                        },
+                        // result.marker === 42 via custom prototype
+                        Instruction::LoadConst {
+                            dst: reg(4),
+                            constant: cid(2),
+                        },
+                        Instruction::GetProperty {
+                            dst: reg(9),
+                            object: reg(7),
+                            key: reg(4),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(5),
+                            constant: cid(3),
+                        },
+                        Instruction::Binary {
+                            dst: reg(9),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(9),
+                            right: reg(5),
+                        },
+                        Instruction::Binary {
+                            dst: reg(8),
+                            op: BinaryOp::BitAnd,
+                            left: reg(8),
+                            right: reg(9),
+                        },
+                        // primitive argument path also ignores boxing
+                        Instruction::CreateArray { dst: reg(1) },
+                        Instruction::LoadConst {
+                            dst: reg(5),
+                            constant: cid(4),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(1),
+                            value: reg(5),
+                        },
+                        Instruction::ConstructWithNewTarget {
+                            dst: reg(7),
+                            callee: reg(0),
+                            new_target: reg(2),
+                            arguments: reg(1),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(4),
+                            constant: cid(2),
+                        },
+                        Instruction::GetProperty {
+                            dst: reg(9),
+                            object: reg(7),
+                            key: reg(4),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(5),
+                            constant: cid(3),
+                        },
+                        Instruction::Binary {
+                            dst: reg(9),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(9),
+                            right: reg(5),
+                        },
+                        Instruction::Binary {
+                            dst: reg(8),
+                            op: BinaryOp::BitAnd,
+                            left: reg(8),
+                            right: reg(9),
+                        },
+                        // legacy tag-12 / ordinary Object still returns the object arg
+                        Instruction::CreateArray { dst: reg(1) },
+                        Instruction::ArrayPush {
+                            array: reg(1),
+                            value: reg(6),
+                        },
+                        Instruction::Construct {
+                            dst: reg(7),
+                            callee: reg(0),
+                            arguments: reg(1),
+                        },
+                        Instruction::Binary {
+                            dst: reg(9),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(7),
+                            right: reg(6),
+                        },
+                        Instruction::Binary {
+                            dst: reg(8),
+                            op: BinaryOp::BitAnd,
+                            left: reg(8),
+                            right: reg(9),
+                        },
+                        Instruction::Return { value: reg(8) },
+                    ],
+                ),
+                // Placeholder explicit new_target body (never invoked).
+                Function::new(
+                    None,
+                    0,
+                    1,
+                    1,
+                    FunctionFlags::default(),
+                    vec![Instruction::Return { value: reg(0) }],
+                    Vec::new(),
+                ),
+            ],
+        );
+        assert_eq!(assert_parity(&module, || SilentHost), Value::int32(1));
+    }
+
     #[test]
     fn linked_entry_preserves_pending_throw_origin() {
         let program = trivial_program();
@@ -5889,6 +7276,155 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn linked_nested_engine_throw_reports_callee_site_at_entry() {
+        let module = verified(
+            Vec::new(),
+            vec![
+                entry_function(1, vec![Instruction::Halt, Instruction::Halt]),
+                entry_function(1, vec![Instruction::Halt, Instruction::Halt]),
+            ],
+        );
+        let program = one_module_program(&module);
+        let entries = FaultSiteEntries::throwing(0, 1);
+        let mut host = SilentHost;
+        let mut engine = NativeEngine::build(
+            &program,
+            &entries,
+            &mut host,
+            Limits::default(),
+            Backend::Linked,
+        );
+        let (callee, arguments) = {
+            let mut machine = engine.machine.borrow_mut();
+            let function_prototype = machine.intrinsics.function_prototype;
+            let callee = machine
+                .allocate(HeapEntry::Function {
+                    module: ModuleId::new(0),
+                    function: FunctionId::new(1),
+                    captures: Vec::new(),
+                    properties: PropertyMap::default(),
+                    prototype: Some(function_prototype),
+                    extensible: true,
+                })
+                .expect("callee allocates");
+            let array_prototype = machine.intrinsics.array_prototype;
+            let arguments = machine
+                .allocate(HeapEntry::Array {
+                    elements: Vec::new(),
+                    properties: PropertyMap::default(),
+                    prototype: Some(array_prototype),
+                    extensible: true,
+                    length_writable: true,
+                })
+                .expect("arguments array allocates");
+            (callee, arguments)
+        };
+        let mut registers = [Value::UNINITIALIZED; 1];
+        engine.activations.borrow_mut().push(Activation {
+            this_value: Value::UNDEFINED,
+            new_target: Value::UNDEFINED,
+            args: Vec::new(),
+            arguments_object: None,
+            pending_resume: None,
+            target: test_target(),
+        });
+        engine.push_native_roots(&registers);
+        let mut shadow = ShadowFrame::new(
+            std::ptr::null_mut(),
+            0,
+            0,
+            registers.as_mut_ptr(),
+            registers.len() as u16,
+        );
+        let mut frame = NativeFrame::new(&mut shadow, &mut registers).unwrap();
+        engine.pending_throw.set(Some(PendingThrow {
+            value: Value::UNDEFINED,
+            origin: ThrowOrigin::ReferenceError {
+                operation: "nested linked fixture",
+            },
+        }));
+        assert_eq!(
+            engine
+                .dispatch(
+                    &mut frame,
+                    HelperCall::Call {
+                        callee,
+                        this_value: Value::UNDEFINED,
+                        arguments,
+                    },
+                )
+                .tag,
+            CompletionTag::Throw
+        );
+        engine.pop_native_roots();
+        engine.activations.borrow_mut().pop();
+
+        let NativeError::Runtime(error) = engine.run_linked().unwrap_err() else {
+            panic!("linked entry must propagate the nested engine throw");
+        };
+        assert_eq!(error.function, FunctionId::new(1));
+        assert_eq!(error.pc, pc(1));
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::ReferenceError {
+                    operation: "nested linked fixture"
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn linked_normal_entry_clears_fault_before_later_throw() {
+        let module = verified(
+            Vec::new(),
+            vec![
+                entry_function(1, vec![Instruction::Halt, Instruction::Halt]),
+                entry_function(1, vec![Instruction::Halt, Instruction::Halt]),
+            ],
+        );
+        let program = one_module_program(&module);
+        let entries = FaultSiteEntries::throwing(0, 1);
+        entries.entry_tag.set(CompletionTag::Normal);
+        let mut host = SilentHost;
+        let mut engine = NativeEngine::build(
+            &program,
+            &entries,
+            &mut host,
+            Limits::default(),
+            Backend::Linked,
+        );
+        engine.pending_fault.set(Some((
+            crate::RuntimeFunction {
+                module: ModuleId::new(0),
+                function: FunctionId::new(1),
+            },
+            1,
+        )));
+
+        engine
+            .invoke_linked_entry(ModuleId::new(0))
+            .expect("normal entry completes");
+        assert!(engine.pending_fault.get().is_none());
+
+        entries.entry_tag.set(CompletionTag::Throw);
+        entries.entry_pc.set(1);
+        engine.pending_throw.set(Some(PendingThrow {
+            value: Value::UNDEFINED,
+            origin: ThrowOrigin::ReferenceError {
+                operation: "later entry fixture",
+            },
+        }));
+        let NativeError::Runtime(error) = engine.invoke_linked_entry(ModuleId::new(0)).unwrap_err()
+        else {
+            panic!("later entry must throw");
+        };
+        assert_eq!(error.function, FunctionId::new(0));
+        assert_eq!(error.pc, pc(1));
     }
 
     #[test]
@@ -6408,6 +7944,7 @@ mod tests {
             args: Vec::new(),
             arguments_object: None,
             pending_resume: Some(resumed_value),
+            target: test_target(),
         });
         let mut registers = vec![Value::UNINITIALIZED];
         engine.push_native_roots(&registers);
@@ -6527,6 +8064,7 @@ mod tests {
             args: Vec::new(),
             arguments_object: None,
             pending_resume: None,
+            target: test_target(),
         });
         engine.push_native_roots(&registers);
         let mut shadow = ShadowFrame::new(std::ptr::null_mut(), 0, 0, registers.as_mut_ptr(), 1);
@@ -6587,6 +8125,7 @@ mod tests {
             args: vec![values[3]],
             arguments_object: Some(values[4]),
             pending_resume: Some(values[5]),
+            target: test_target(),
         });
         engine.pending_throw.set(Some(PendingThrow {
             value: values[6],
@@ -6618,5 +8157,1757 @@ mod tests {
         engine.pop_native_roots();
         engine.activations.borrow_mut().pop();
         assert!(engine.machine.borrow().native_roots.is_empty());
+    }
+
+    #[derive(Default)]
+    struct ImportMetaHost {
+        seen: Vec<EcmaString>,
+    }
+
+    impl Host for ImportMetaHost {
+        fn import_meta_url(&mut self, module_name: &EcmaString) -> EcmaString {
+            self.seen.push(module_name.clone());
+            EcmaString::from_utf8("host://modules/entry.mjs")
+        }
+    }
+
+    #[test]
+    fn import_meta_matches_interpreter_with_stable_identity_and_host_url() {
+        let program = linked(
+            vec![program_module(
+                "entry",
+                vec![
+                    Constant::String(EcmaString::from_utf8("url")),
+                    Constant::String(EcmaString::from_utf8("host://modules/entry.mjs")),
+                ],
+                vec![entry_function(
+                    7,
+                    vec![
+                        Instruction::LoadImportMeta { dst: reg(0) },
+                        Instruction::LoadImportMeta { dst: reg(1) },
+                        Instruction::Binary {
+                            dst: reg(2),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(0),
+                            right: reg(1),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(3),
+                            constant: cid(1),
+                        },
+                        Instruction::GetProperty {
+                            dst: reg(4),
+                            object: reg(0),
+                            key: reg(3),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(5),
+                            constant: cid(2),
+                        },
+                        Instruction::Binary {
+                            dst: reg(6),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(4),
+                            right: reg(5),
+                        },
+                        Instruction::Return { value: reg(6) },
+                    ],
+                )],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )],
+            0,
+        );
+        assert!(program.modules()[0].edges.is_empty());
+        let limits = Limits::default();
+        let mut interpreter_host = ImportMetaHost::default();
+        let interpreter = Machine::new(&program, &mut interpreter_host, limits.clone())
+            .run()
+            .unwrap();
+        let mut native_host = ImportMetaHost::default();
+        let native = NativeEngine::new(&program, &NoEntries, &mut native_host, limits)
+            .run()
+            .unwrap();
+        assert_eq!(native, interpreter);
+        assert_eq!(native.entry_registers[0], native.entry_registers[1]);
+        assert_eq!(native.entry_registers[2], Value::TRUE);
+        assert_eq!(native.value, Value::TRUE);
+        assert_eq!(interpreter_host.seen, vec![EcmaString::from_utf8("entry")]);
+        assert_eq!(native_host.seen, vec![EcmaString::from_utf8("entry")]);
+    }
+
+    #[test]
+    fn native_matches_interpreter_on_to_object_and_nullish_throw() {
+        let module = verified(
+            vec![Constant::Int32(7)],
+            vec![entry_function(
+                5,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::ToObject {
+                        dst: reg(1),
+                        src: reg(0),
+                    },
+                    Instruction::CreateObject { dst: reg(2) },
+                    Instruction::ToObject {
+                        dst: reg(3),
+                        src: reg(2),
+                    },
+                    Instruction::Binary {
+                        dst: reg(4),
+                        op: BinaryOp::StrictEqual,
+                        left: reg(2),
+                        right: reg(3),
+                    },
+                    Instruction::Return { value: reg(4) },
+                ],
+            )],
+        );
+        assert_eq!(assert_parity(&module, || SilentHost), Value::TRUE);
+
+        let nullish = verified(
+            vec![Constant::Null],
+            vec![entry_function(
+                2,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::ToObject {
+                        dst: reg(1),
+                        src: reg(0),
+                    },
+                    Instruction::Halt,
+                ],
+            )],
+        );
+        let error = assert_program_parity(&one_module_program(&nullish))
+            .expect_err("nullish ToObject throws");
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::TypeError { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn import_dynamic_instruction_matches_interpreter_and_native_engine() {
+        let root = program_module(
+            "root",
+            vec![Constant::String(EcmaString::from_utf8("./target"))],
+            vec![entry_function(
+                2,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::ImportDynamic {
+                        dst: reg(1),
+                        specifier: reg(0),
+                    },
+                    Instruction::Return { value: reg(1) },
+                ],
+            )],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::Local(ModuleId::new(1)),
+                kind: EdgeKind::Dynamic,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let target = program_module(
+            "target",
+            Vec::new(),
+            vec![entry_function(1, vec![Instruction::Halt])],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let execution = assert_program_parity(&linked(vec![root, target], 0))
+            .expect("ImportDynamic matches the interpreter and native helper path");
+        assert_eq!(execution.value, execution.entry_registers[1]);
+        assert_ne!(execution.value, Value::UNDEFINED);
+    }
+
+    fn outside_engine_loop_module(instruction: Instruction) -> Module<Verified> {
+        let body = Function::new(
+            None,
+            0,
+            0,
+            1,
+            FunctionFlags::default(),
+            vec![
+                Instruction::LoadConst {
+                    dst: reg(0),
+                    constant: cid(0),
+                },
+                instruction,
+                Instruction::Return { value: reg(0) },
+            ],
+            Vec::new(),
+        );
+        verified(
+            vec![Constant::Undefined],
+            vec![
+                entry_function(
+                    3,
+                    vec![
+                        Instruction::CreateArray { dst: reg(0) },
+                        Instruction::CreateClosure {
+                            dst: reg(1),
+                            function: FunctionId::new(1),
+                            captures: reg(0),
+                        },
+                        Instruction::CreateArray { dst: reg(0) },
+                        Instruction::LoadConst {
+                            dst: reg(2),
+                            constant: cid(0),
+                        },
+                        Instruction::Call {
+                            dst: reg(0),
+                            callee: reg(1),
+                            this_value: reg(2),
+                            arguments: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                ),
+                body,
+            ],
+        )
+    }
+
+    #[test]
+    fn suspend_and_await_outside_engine_loop_preserve_origin_parity() {
+        for (instruction, operation) in [
+            (
+                Instruction::Suspend {
+                    dst: reg(0),
+                    src: reg(0),
+                    resume: pc(2),
+                },
+                "suspend outside an engine-owned event loop",
+            ),
+            (
+                Instruction::Await {
+                    dst: reg(0),
+                    src: reg(0),
+                    resume: pc(2),
+                },
+                "await outside an engine-owned event loop",
+            ),
+        ] {
+            let module = outside_engine_loop_module(instruction);
+            let program = one_module_program(&module);
+
+            let expected = |error: &RuntimeError, operation: &'static str| {
+                assert_eq!(error.function, FunctionId::new(1));
+                assert_eq!(error.pc, pc(1));
+                assert_eq!(
+                    error.kind,
+                    RuntimeErrorKind::UncaughtThrow {
+                        value: Value::UNDEFINED,
+                        origin: ThrowOrigin::TypeError { operation },
+                    }
+                );
+            };
+
+            let mut interpreter_host = SilentHost;
+            let interpreter_error =
+                Machine::new(&program, &mut interpreter_host, Limits::default())
+                    .run()
+                    .unwrap_err();
+            expected(&interpreter_error, operation);
+
+            let mut reference_host = SilentHost;
+            let reference_error =
+                NativeEngine::new(&program, &NoEntries, &mut reference_host, Limits::default())
+                    .run()
+                    .unwrap_err();
+            expected(&reference_error, operation);
+        }
+    }
+
+    // -- Caught engine-origin materialization --------------------------------
+
+    /// Asserts the value is a realm-intrinsic error object: prototype-supplied
+    /// `name` and an own `message`, never resolved through user globals.
+    fn assert_intrinsic_error<H: Host>(
+        machine: &mut Machine<'_, H>,
+        error: Value,
+        name: &str,
+        message: &str,
+    ) {
+        let name_value = machine.get_named_property(error, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name_value)
+                .is_some_and(|text| text.eq_ascii(name))
+        );
+        let message_value = machine.get_named_property(error, "message").unwrap();
+        assert!(
+            machine
+                .string_value(message_value)
+                .is_some_and(|text| text.eq_ascii(message))
+        );
+    }
+
+    /// Entry shadows the user global `ReferenceError`, loads a missing global
+    /// under a covering handler, and returns the caught value. Constants:
+    /// 0 = shadow payload, 1 = "ReferenceError", 2 = the missing global's name.
+    fn caught_missing_global_module() -> Module<Verified> {
+        verified(
+            vec![
+                Constant::Int32(7),
+                Constant::String(EcmaString::from_utf8("ReferenceError")),
+                Constant::String(EcmaString::from_utf8("missing_global")),
+            ],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                3,
+                FunctionFlags::default(),
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(1),
+                        value: reg(0),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(1),
+                        name: cid(2),
+                    },
+                    Instruction::Halt,
+                    Instruction::Return { value: reg(2) },
+                ],
+                vec![ExceptionHandler {
+                    start: pc(2),
+                    end: pc(3),
+                    handler: pc(4),
+                    catch_register: reg(2),
+                }],
+            )],
+        )
+    }
+
+    #[test]
+    fn caught_missing_global_materializes_intrinsic_reference_error() {
+        let module = caught_missing_global_module();
+        let program = one_module_program(&module);
+
+        // The interpreter is the caught-value oracle.
+        let mut interpreter_host = SilentHost;
+        let mut interpreter = Machine::new(&program, &mut interpreter_host, Limits::default());
+        let interpreter_execution =
+            run_interpreter_to_quiescence(&mut interpreter).expect("interpreter catches");
+        assert_intrinsic_error(
+            &mut interpreter,
+            interpreter_execution.value,
+            "ReferenceError",
+            "global is not defined",
+        );
+
+        // The reference native driver catches through `raise` and must agree,
+        // even though the user global `ReferenceError` is shadowed.
+        let mut reference_host = SilentHost;
+        let reference =
+            NativeEngine::new(&program, &NoEntries, &mut reference_host, Limits::default());
+        let reference_execution =
+            run_reference_to_quiescence(&reference).expect("reference native catches");
+        assert!(
+            reference_execution.value != Value::int32(7),
+            "the shadow user global is never consulted"
+        );
+        assert_intrinsic_error(
+            &mut reference.machine.borrow_mut(),
+            reference_execution.value,
+            "ReferenceError",
+            "global is not defined",
+        );
+
+        // The linked backend catches through the dispatch postprocessor. The
+        // recorded frame pc stands in for the pc generated code writes before
+        // each instruction; dispatch is the same seam the helpers call.
+        let mut linked_host = SilentHost;
+        let linked = NativeEngine::build(
+            &program,
+            &NoEntries,
+            &mut linked_host,
+            Limits::default(),
+            Backend::Linked,
+        );
+        let mut registers = vec![Value::UNINITIALIZED; 3];
+        linked.activations.borrow_mut().push(Activation {
+            this_value: Value::UNDEFINED,
+            new_target: Value::UNDEFINED,
+            args: Vec::new(),
+            arguments_object: None,
+            pending_resume: None,
+            target: test_target(),
+        });
+        linked.push_native_roots(&registers);
+        let handles = registers.as_mut_ptr();
+        let mut shadow = ShadowFrame::new(std::ptr::null_mut(), 2, 0, handles, 3);
+        let mut frame = NativeFrame::new(&mut shadow, &mut registers).unwrap();
+        let result = linked.dispatch(&mut frame, HelperCall::LoadGlobal { name: 2 });
+        assert_eq!(result.tag, CompletionTag::Throw);
+        assert_ne!(
+            result.value,
+            Value::UNDEFINED,
+            "a covered lazy engine throw is materialized before generated code binds it"
+        );
+        assert!(
+            linked.pending_throw.get().is_none(),
+            "a caught throw consumes its pending metadata"
+        );
+        assert_intrinsic_error(
+            &mut linked.machine.borrow_mut(),
+            result.value,
+            "ReferenceError",
+            "global is not defined",
+        );
+        linked.pop_native_roots();
+        linked.activations.borrow_mut().pop();
+    }
+
+    #[test]
+    fn materialize_catch_value_covers_every_origin_and_preserves_identity() {
+        let program = trivial_program();
+        let mut host = SilentHost;
+        let engine = NativeEngine::build(
+            &program,
+            &NoEntries,
+            &mut host,
+            Limits::default(),
+            Backend::Linked,
+        );
+        let mut registers = vec![Value::UNINITIALIZED];
+        engine.activations.borrow_mut().push(Activation {
+            this_value: Value::UNDEFINED,
+            new_target: Value::UNDEFINED,
+            args: Vec::new(),
+            arguments_object: None,
+            pending_resume: None,
+            target: test_target(),
+        });
+        engine.push_native_roots(&registers);
+        let mut shadow = ShadowFrame::new(std::ptr::null_mut(), 0, 0, registers.as_mut_ptr(), 1);
+        let frame = NativeFrame::new(&mut shadow, &mut registers).unwrap();
+
+        for (origin, name) in [
+            (ThrowOrigin::TypeError { operation: "op" }, "TypeError"),
+            (ThrowOrigin::RangeError { operation: "op" }, "RangeError"),
+            (
+                ThrowOrigin::ReferenceError { operation: "op" },
+                "ReferenceError",
+            ),
+            (ThrowOrigin::UriError { operation: "op" }, "URIError"),
+        ] {
+            let value = engine
+                .materialize_catch_value(&frame, test_target(), 0, Value::UNDEFINED, origin)
+                .expect("origin materializes");
+            assert_ne!(value, Value::UNDEFINED);
+            assert_intrinsic_error(&mut engine.machine.borrow_mut(), value, name, "op");
+        }
+
+        // Bytecode `undefined` stays exactly undefined.
+        assert_eq!(
+            engine
+                .materialize_catch_value(
+                    &frame,
+                    test_target(),
+                    0,
+                    Value::UNDEFINED,
+                    ThrowOrigin::Bytecode,
+                )
+                .unwrap(),
+            Value::UNDEFINED
+        );
+
+        // A supplied non-undefined engine-origin value keeps exact identity.
+        let supplied = engine
+            .machine
+            .borrow_mut()
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: None,
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        assert_eq!(
+            engine
+                .materialize_catch_value(
+                    &frame,
+                    test_target(),
+                    0,
+                    supplied,
+                    ThrowOrigin::TypeError { operation: "op" },
+                )
+                .unwrap(),
+            supplied
+        );
+
+        engine.pop_native_roots();
+        engine.activations.borrow_mut().pop();
+    }
+
+    /// Entry loads a missing global with no covering handler.
+    fn uncaught_missing_global_module() -> Module<Verified> {
+        verified(
+            vec![Constant::String(EcmaString::from_utf8("missing_global"))],
+            vec![entry_function(
+                1,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+            )],
+        )
+    }
+
+    #[test]
+    fn uncaught_engine_throw_stays_lazy_even_with_zero_heap_slots() {
+        let limits = || Limits {
+            max_heap_slots: 0,
+            ..Limits::default()
+        };
+        let expected = |error: &RuntimeError| {
+            assert_eq!(error.function, FunctionId::new(0));
+            assert_eq!(error.pc, pc(0));
+            assert_eq!(
+                error.kind,
+                RuntimeErrorKind::UncaughtThrow {
+                    value: Value::UNDEFINED,
+                    origin: ThrowOrigin::ReferenceError {
+                        operation: "global is not defined",
+                    },
+                }
+            );
+        };
+
+        let program = one_module_program(&uncaught_missing_global_module());
+
+        let mut interpreter_host = SilentHost;
+        let interpreter_error = Machine::new(&program, &mut interpreter_host, limits())
+            .run()
+            .unwrap_err();
+        expected(&interpreter_error);
+
+        // The reference native driver never materializes without a handler, so
+        // the zero slot budget is irrelevant on the uncaught path.
+        let mut reference_host = SilentHost;
+        let reference_error =
+            NativeEngine::new(&program, &NoEntries, &mut reference_host, limits())
+                .run()
+                .unwrap_err();
+        expected(&reference_error);
+
+        // The linked postprocessor likewise leaves an uncovered throw — value
+        // and pending metadata — untouched.
+        let mut linked_host = SilentHost;
+        let linked = NativeEngine::build(
+            &program,
+            &NoEntries,
+            &mut linked_host,
+            limits(),
+            Backend::Linked,
+        );
+        let mut registers = vec![Value::UNINITIALIZED; 1];
+        linked.activations.borrow_mut().push(Activation {
+            this_value: Value::UNDEFINED,
+            new_target: Value::UNDEFINED,
+            args: Vec::new(),
+            arguments_object: None,
+            pending_resume: None,
+            target: test_target(),
+        });
+        linked.push_native_roots(&registers);
+        let handles = registers.as_mut_ptr();
+        let mut shadow = ShadowFrame::new(std::ptr::null_mut(), 0, 0, handles, 1);
+        let mut frame = NativeFrame::new(&mut shadow, &mut registers).unwrap();
+        let result = linked.dispatch(&mut frame, HelperCall::LoadGlobal { name: 0 });
+        assert_eq!(result.tag, CompletionTag::Throw);
+        assert_eq!(result.value, Value::UNDEFINED);
+        assert!(matches!(
+            linked.pending_throw.get(),
+            Some(PendingThrow {
+                value: Value::UNDEFINED,
+                origin: ThrowOrigin::ReferenceError {
+                    operation: "global is not defined",
+                },
+            })
+        ));
+        linked.pop_native_roots();
+        linked.activations.borrow_mut().pop();
+    }
+
+    /// Entry faults on a covered missing-global load; the handler returns a
+    /// sentinel, so a returned value would prove the catch block ran.
+    fn caught_missing_global_sentinel_module() -> Module<Verified> {
+        verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("missing_global")),
+                Constant::Int32(99),
+            ],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                3,
+                FunctionFlags::default(),
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::Halt,
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(1),
+                    },
+                    Instruction::Return { value: reg(2) },
+                ],
+                vec![ExceptionHandler {
+                    start: pc(0),
+                    end: pc(1),
+                    handler: pc(2),
+                    catch_register: reg(1),
+                }],
+            )],
+        )
+    }
+
+    #[test]
+    fn failed_materialization_bypasses_the_catch_with_an_exact_sourced_fatal() {
+        let limits = || Limits {
+            max_heap_slots: 0,
+            ..Limits::default()
+        };
+        let expected = |error: &RuntimeError| {
+            assert_eq!(error.function, FunctionId::new(0));
+            assert_eq!(error.pc, pc(0));
+            assert_eq!(
+                error.kind,
+                RuntimeErrorKind::HeapSlotLimitExceeded { limit: 0 }
+            );
+        };
+
+        let program = one_module_program(&caught_missing_global_sentinel_module());
+
+        // Interpreter oracle: the catch never runs; the allocation failure is
+        // fatal and sourced at the faulting instruction.
+        let mut interpreter_host = SilentHost;
+        let interpreter_error = Machine::new(&program, &mut interpreter_host, limits())
+            .run()
+            .unwrap_err();
+        expected(&interpreter_error);
+
+        // Reference native: `raise` propagates the exact RuntimeError instead
+        // of binding undefined into the catch register.
+        let mut reference_host = SilentHost;
+        let reference_error =
+            NativeEngine::new(&program, &NoEntries, &mut reference_host, limits())
+                .run()
+                .unwrap_err();
+        expected(&reference_error);
+
+        // Linked native: the postprocessor stores the fully sourced error in
+        // `pending_error`, answers `FatalTrap`, and clears the pending throw,
+        // so generated code never enters the handler.
+        let mut linked_host = SilentHost;
+        let linked = NativeEngine::build(
+            &program,
+            &NoEntries,
+            &mut linked_host,
+            limits(),
+            Backend::Linked,
+        );
+        let mut registers = vec![Value::UNINITIALIZED; 3];
+        linked.activations.borrow_mut().push(Activation {
+            this_value: Value::UNDEFINED,
+            new_target: Value::UNDEFINED,
+            args: Vec::new(),
+            arguments_object: None,
+            pending_resume: None,
+            target: test_target(),
+        });
+        linked.push_native_roots(&registers);
+        let handles = registers.as_mut_ptr();
+        let mut shadow = ShadowFrame::new(std::ptr::null_mut(), 0, 0, handles, 3);
+        let mut frame = NativeFrame::new(&mut shadow, &mut registers).unwrap();
+        let result = linked.dispatch(&mut frame, HelperCall::LoadGlobal { name: 0 });
+        assert_eq!(result.tag, CompletionTag::FatalTrap);
+        assert_eq!(result.value, Value::UNDEFINED);
+        assert!(
+            linked.pending_throw.get().is_none(),
+            "the pending throw is cleared before materialization"
+        );
+        assert!(
+            linked.pending_fatal_kind.take().is_none(),
+            "materialization failures never use the shallow fatal kind"
+        );
+        let error = linked
+            .pending_error
+            .replace(None)
+            .expect("the exact sourced error is pending");
+        expected(&error);
+        linked.pop_native_roots();
+        linked.activations.borrow_mut().pop();
+    }
+
+    /// Entry calls a callee whose covered missing-global load faults, so the
+    /// materialization failure originates in the nested activation.
+    fn nested_caught_missing_global_module() -> Module<Verified> {
+        verified(
+            vec![Constant::String(EcmaString::from_utf8("missing_global"))],
+            vec![
+                Function::new(
+                    None,
+                    0,
+                    0,
+                    4,
+                    FunctionFlags::default(),
+                    vec![
+                        Instruction::CreateArray { dst: reg(0) },
+                        Instruction::CreateClosure {
+                            dst: reg(1),
+                            function: FunctionId::new(1),
+                            captures: reg(0),
+                        },
+                        Instruction::CreateArray { dst: reg(2) },
+                        Instruction::Call {
+                            dst: reg(3),
+                            callee: reg(1),
+                            this_value: reg(0),
+                            arguments: reg(2),
+                        },
+                        Instruction::Return { value: reg(3) },
+                    ],
+                    Vec::new(),
+                ),
+                Function::new(
+                    None,
+                    0,
+                    0,
+                    2,
+                    FunctionFlags::default(),
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::Halt,
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    vec![ExceptionHandler {
+                        start: pc(0),
+                        end: pc(1),
+                        handler: pc(2),
+                        catch_register: reg(1),
+                    }],
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn nested_materialization_failure_keeps_the_inner_fault_site() {
+        let program = one_module_program(&nested_caught_missing_global_module());
+        let limits = || Limits {
+            // Three slots cover the entry's array/closure/array setup; the
+            // callee's materialization then has no headroom.
+            max_heap_slots: 3,
+            ..Limits::default()
+        };
+        let expected = |error: &RuntimeError| {
+            assert_eq!(error.function, FunctionId::new(1));
+            assert_eq!(error.pc, pc(0));
+            assert!(matches!(
+                error.kind,
+                RuntimeErrorKind::HeapSlotLimitExceeded { .. }
+            ));
+            assert!(matches!(
+                error.source.instruction,
+                Instruction::LoadGlobal { .. }
+            ));
+        };
+
+        // Interpreter oracle for the nested fault site.
+        let mut interpreter_host = SilentHost;
+        let interpreter_error = Machine::new(&program, &mut interpreter_host, limits())
+            .run()
+            .unwrap_err();
+        expected(&interpreter_error);
+
+        // Reference native: the nested `execute` propagates the inner error
+        // through `pending_error`, retaining the inner module/function/pc.
+        let mut reference_host = SilentHost;
+        let reference_error =
+            NativeEngine::new(&program, &NoEntries, &mut reference_host, limits())
+                .run()
+                .unwrap_err();
+        expected(&reference_error);
+    }
+
+    #[test]
+    fn prematerialized_error_keeps_identity_through_catch() {
+        // CreateCell TDZ throws ThrowValueOrigin with a pre-built
+        // ReferenceError; both backends must bind that exact value.
+        let module = verified(
+            vec![Constant::Int32(0)],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                5,
+                FunctionFlags::default(),
+                vec![
+                    Instruction::CreateCell { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(2),
+                        object: reg(0),
+                        key: reg(1),
+                    },
+                    Instruction::Halt,
+                    Instruction::Throw { value: reg(3) },
+                    Instruction::Binary {
+                        dst: reg(4),
+                        op: BinaryOp::StrictEqual,
+                        left: reg(3),
+                        right: reg(0),
+                    },
+                    Instruction::Return { value: reg(4) },
+                ],
+                vec![
+                    ExceptionHandler {
+                        start: pc(2),
+                        end: pc(3),
+                        handler: pc(4),
+                        catch_register: reg(3),
+                    },
+                    ExceptionHandler {
+                        start: pc(4),
+                        end: pc(5),
+                        handler: pc(5),
+                        catch_register: reg(0),
+                    },
+                ],
+            )],
+        );
+        let program = one_module_program(&module);
+
+        // Reference native: two catches preserve the exact supplied value.
+        let mut reference_host = SilentHost;
+        let reference =
+            NativeEngine::new(&program, &NoEntries, &mut reference_host, Limits::default());
+        let execution =
+            run_reference_to_quiescence(&reference).expect("reference native catches twice");
+        assert_eq!(execution.value, Value::TRUE);
+        let caught = execution.entry_registers[3];
+        assert_eq!(caught, execution.entry_registers[0]);
+        assert_intrinsic_error(
+            &mut reference.machine.borrow_mut(),
+            caught,
+            "ReferenceError",
+            "Cannot access lexical binding before initialization",
+        );
+
+        // Linked native: the covered GetProperty dispatch yields the supplied
+        // value unchanged — identity, not a rematerialized copy.
+        let mut linked_host = SilentHost;
+        let linked = NativeEngine::build(
+            &program,
+            &NoEntries,
+            &mut linked_host,
+            Limits::default(),
+            Backend::Linked,
+        );
+        let mut registers = vec![Value::UNINITIALIZED; 5];
+        linked.activations.borrow_mut().push(Activation {
+            this_value: Value::UNDEFINED,
+            new_target: Value::UNDEFINED,
+            args: Vec::new(),
+            arguments_object: None,
+            pending_resume: None,
+            target: test_target(),
+        });
+        linked.push_native_roots(&registers);
+        let handles = registers.as_mut_ptr();
+        let mut shadow = ShadowFrame::new(std::ptr::null_mut(), 2, 0, handles, 5);
+        let mut frame = NativeFrame::new(&mut shadow, &mut registers).unwrap();
+        let created = linked.dispatch(&mut frame, HelperCall::CreateCell);
+        assert_eq!(created.tag, CompletionTag::Normal);
+        let read = linked.dispatch(
+            &mut frame,
+            HelperCall::GetProperty {
+                object: created.value,
+                key: Value::int32(0),
+            },
+        );
+        assert_eq!(read.tag, CompletionTag::Throw);
+        assert_ne!(read.value, Value::UNDEFINED);
+        // The message is the pre-built TDZ text, not the origin's operation
+        // string: rematerializing would allocate a different object whose
+        // message is "lexical binding is uninitialized".
+        assert_intrinsic_error(
+            &mut linked.machine.borrow_mut(),
+            read.value,
+            "ReferenceError",
+            "Cannot access lexical binding before initialization",
+        );
+        assert!(
+            linked.pending_throw.get().is_none(),
+            "a caught throw consumes its pending metadata"
+        );
+        linked.pop_native_roots();
+        linked.activations.borrow_mut().pop();
+    }
+
+    #[test]
+    fn define_data_property_helper_installs_own_data() {
+        let program = trivial_program();
+        let entries = NoEntries;
+        let mut host = SilentHost;
+        let engine = NativeEngine::build(
+            &program,
+            &entries,
+            &mut host,
+            Limits::default(),
+            Backend::Reference,
+        );
+        let key = engine
+            .machine
+            .borrow_mut()
+            .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+            .unwrap();
+        let mut registers = vec![Value::UNINITIALIZED];
+        engine.activations.borrow_mut().push(Activation {
+            this_value: Value::UNDEFINED,
+            new_target: Value::UNDEFINED,
+            args: Vec::new(),
+            arguments_object: None,
+            pending_resume: None,
+            target: test_target(),
+        });
+        engine.push_native_roots(&registers);
+        let mut shadow = ShadowFrame::new(std::ptr::null_mut(), 0, 0, registers.as_mut_ptr(), 1);
+        let mut frame = NativeFrame::new(&mut shadow, &mut registers).unwrap();
+        let object = engine.dispatch(&mut frame, HelperCall::CreateObject);
+        assert_eq!(object.tag, CompletionTag::Normal);
+        let defined = engine.dispatch(
+            &mut frame,
+            HelperCall::DefineDataProperty {
+                object: object.value,
+                key,
+                value: Value::int32(7),
+            },
+        );
+        assert_eq!(defined.tag, CompletionTag::Normal);
+        assert_eq!(defined.value, Value::UNDEFINED);
+        let read = engine.dispatch(
+            &mut frame,
+            HelperCall::GetProperty {
+                object: object.value,
+                key,
+            },
+        );
+        assert_eq!(read.tag, CompletionTag::Normal);
+        assert_eq!(read.value, Value::int32(7));
+        engine.pop_native_roots();
+        engine.activations.borrow_mut().pop();
+    }
+
+    #[test]
+    fn with_has_binding_is_helper_backed_and_not_inline() {
+        assert!(!super::is_inline_instruction(Instruction::WithHasBinding {
+            dst: reg(0),
+            object: reg(1),
+            key: reg(2),
+        }));
+        assert_eq!(
+            HelperCall::WithHasBinding {
+                object: Value::NULL,
+                key: Value::NULL,
+            }
+            .helper(),
+            NativeHelper::WithHasBinding
+        );
+        assert_eq!(NativeHelper::WithHasBinding.as_u32(), 45);
+        assert_eq!(
+            NativeHelper::WithHasBinding.symbol(),
+            "bamts_with_has_binding"
+        );
+        assert_eq!(
+            NativeHelper::from_u32(45),
+            Some(NativeHelper::WithHasBinding)
+        );
+        assert_eq!(bamts_native::HELPER_COUNT, 46);
+    }
+
+    #[test]
+    fn with_has_binding_helper_parity_covers_absent_allowed_blocked_and_primitive_unscopables() {
+        let program = trivial_program();
+        let entries = NoEntries;
+        let mut host = SilentHost;
+        let engine = NativeEngine::build(
+            &program,
+            &entries,
+            &mut host,
+            Limits::default(),
+            Backend::Reference,
+        );
+        let key_x = engine
+            .machine
+            .borrow_mut()
+            .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+            .unwrap();
+        let key_missing = engine
+            .machine
+            .borrow_mut()
+            .allocate(HeapEntry::String(EcmaString::from_utf8("missing")))
+            .unwrap();
+        let mut registers = vec![Value::UNINITIALIZED; 2];
+        engine.activations.borrow_mut().push(Activation {
+            this_value: Value::UNDEFINED,
+            new_target: Value::UNDEFINED,
+            args: Vec::new(),
+            arguments_object: None,
+            pending_resume: None,
+            target: test_target(),
+        });
+        engine.push_native_roots(&registers);
+        let mut shadow = ShadowFrame::new(std::ptr::null_mut(), 0, 0, registers.as_mut_ptr(), 2);
+        let mut frame = NativeFrame::new(&mut shadow, &mut registers).unwrap();
+
+        let object = engine.dispatch(&mut frame, HelperCall::CreateObject);
+        assert_eq!(object.tag, CompletionTag::Normal);
+        assert_eq!(
+            engine
+                .dispatch(
+                    &mut frame,
+                    HelperCall::DefineDataProperty {
+                        object: object.value,
+                        key: key_x,
+                        value: Value::int32(1),
+                    },
+                )
+                .tag,
+            CompletionTag::Normal
+        );
+
+        let absent = engine.dispatch(
+            &mut frame,
+            HelperCall::WithHasBinding {
+                object: object.value,
+                key: key_missing,
+            },
+        );
+        assert_eq!(absent.tag, CompletionTag::Normal);
+        assert_eq!(absent.value, Value::FALSE);
+
+        let allowed = engine.dispatch(
+            &mut frame,
+            HelperCall::WithHasBinding {
+                object: object.value,
+                key: key_x,
+            },
+        );
+        assert_eq!(allowed.tag, CompletionTag::Normal);
+        assert_eq!(allowed.value, Value::TRUE);
+
+        let blocklist = engine.dispatch(&mut frame, HelperCall::CreateObject);
+        assert_eq!(blocklist.tag, CompletionTag::Normal);
+        assert_eq!(
+            engine
+                .dispatch(
+                    &mut frame,
+                    HelperCall::DefineDataProperty {
+                        object: blocklist.value,
+                        key: key_x,
+                        value: Value::TRUE,
+                    },
+                )
+                .tag,
+            CompletionTag::Normal
+        );
+        let unscopables = engine
+            .machine
+            .borrow()
+            .intrinsics
+            .builtins
+            .symbol_unscopables();
+        assert_eq!(
+            engine
+                .dispatch(
+                    &mut frame,
+                    HelperCall::SetProperty {
+                        object: object.value,
+                        key: unscopables,
+                        value: blocklist.value,
+                    },
+                )
+                .tag,
+            CompletionTag::Normal
+        );
+        let blocked = engine.dispatch(
+            &mut frame,
+            HelperCall::WithHasBinding {
+                object: object.value,
+                key: key_x,
+            },
+        );
+        assert_eq!(blocked.tag, CompletionTag::Normal);
+        assert_eq!(blocked.value, Value::FALSE);
+
+        // Primitive @@unscopables must be ignored (binding remains visible).
+        let primitive = engine
+            .machine
+            .borrow_mut()
+            .allocate(HeapEntry::String(EcmaString::from_utf8("not-object")))
+            .unwrap();
+        assert_eq!(
+            engine
+                .dispatch(
+                    &mut frame,
+                    HelperCall::SetProperty {
+                        object: object.value,
+                        key: unscopables,
+                        value: primitive,
+                    },
+                )
+                .tag,
+            CompletionTag::Normal
+        );
+        let still_allowed = engine.dispatch(
+            &mut frame,
+            HelperCall::WithHasBinding {
+                object: object.value,
+                key: key_x,
+            },
+        );
+        assert_eq!(still_allowed.tag, CompletionTag::Normal);
+        assert_eq!(still_allowed.value, Value::TRUE);
+
+        engine.pop_native_roots();
+        engine.activations.borrow_mut().pop();
+    }
+
+    #[test]
+    fn with_has_binding_propagates_unscopables_getter_throw() {
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("<test>")),
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::Int32(1),
+            ],
+            vec![
+                entry_function(1, vec![Instruction::Halt]),
+                entry_function(
+                    2,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(2),
+                        },
+                        Instruction::Throw { value: reg(0) },
+                    ],
+                ),
+            ],
+        );
+        let program = one_module_program(&module);
+        let entries = NoEntries;
+        let mut host = SilentHost;
+        let engine = NativeEngine::build(
+            &program,
+            &entries,
+            &mut host,
+            Limits::default(),
+            Backend::Reference,
+        );
+        let key_x = engine
+            .machine
+            .borrow_mut()
+            .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+            .unwrap();
+        let mut registers = vec![Value::UNINITIALIZED; 2];
+        engine.activations.borrow_mut().push(Activation {
+            this_value: Value::UNDEFINED,
+            new_target: Value::UNDEFINED,
+            args: Vec::new(),
+            arguments_object: None,
+            pending_resume: None,
+            target: test_target(),
+        });
+        engine.push_native_roots(&registers);
+        let mut shadow = ShadowFrame::new(std::ptr::null_mut(), 0, 0, registers.as_mut_ptr(), 2);
+        let mut frame = NativeFrame::new(&mut shadow, &mut registers).unwrap();
+
+        let object = engine.dispatch(&mut frame, HelperCall::CreateObject);
+        assert_eq!(object.tag, CompletionTag::Normal);
+        assert_eq!(
+            engine
+                .dispatch(
+                    &mut frame,
+                    HelperCall::DefineDataProperty {
+                        object: object.value,
+                        key: key_x,
+                        value: Value::int32(1),
+                    },
+                )
+                .tag,
+            CompletionTag::Normal
+        );
+        let thrower = {
+            let prototype = engine.machine.borrow().intrinsics.function_prototype;
+            engine
+                .machine
+                .borrow_mut()
+                .allocate(HeapEntry::Function {
+                    module: ModuleId::new(0),
+                    function: FunctionId::new(1),
+                    captures: Vec::new(),
+                    properties: PropertyMap::default(),
+                    prototype: Some(prototype),
+                    extensible: true,
+                })
+                .unwrap()
+        };
+        let unscopables = engine
+            .machine
+            .borrow()
+            .intrinsics
+            .builtins
+            .symbol_unscopables();
+        assert_eq!(
+            engine
+                .dispatch(
+                    &mut frame,
+                    HelperCall::DefineAccessor {
+                        object: object.value,
+                        key: unscopables,
+                        accessor: thrower,
+                        kind: super::accessor_to_selector(AccessorKind::Getter),
+                    },
+                )
+                .tag,
+            CompletionTag::Normal
+        );
+        let threw = engine.dispatch(
+            &mut frame,
+            HelperCall::WithHasBinding {
+                object: object.value,
+                key: key_x,
+            },
+        );
+        assert_eq!(threw.tag, CompletionTag::Throw);
+        assert_eq!(threw.value, Value::int32(1));
+
+        engine.pop_native_roots();
+        engine.activations.borrow_mut().pop();
+    }
+
+    #[test]
+    fn descriptor_slot_selectors_are_exhaustive_round_trips() {
+        for (slot, selector) in [
+            (DescriptorSlot::Value, 0),
+            (DescriptorSlot::Getter, 1),
+            (DescriptorSlot::Setter, 2),
+        ] {
+            assert_eq!(super::descriptor_slot_to_selector(slot), selector);
+            assert_eq!(super::descriptor_slot_from_selector(selector), Some(slot));
+        }
+        assert_eq!(super::descriptor_slot_from_selector(3), None);
+        assert_eq!(super::descriptor_slot_from_selector(u32::MAX), None);
+        assert!(!super::is_inline_instruction(
+            Instruction::LoadOwnDescriptorSlot {
+                dst: reg(0),
+                object: reg(1),
+                key: reg(2),
+                slot: DescriptorSlot::Value,
+            }
+        ));
+        assert!(!super::is_inline_instruction(
+            Instruction::DefineOwnDescriptorSlot {
+                object: reg(0),
+                key: reg(1),
+                src: reg(2),
+                slot: DescriptorSlot::Setter,
+            }
+        ));
+    }
+
+    #[test]
+    fn load_own_descriptor_slot_parity_covers_absent_data_accessor_and_mismatch() {
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("data")),
+                Constant::Int32(7),
+                Constant::String(EcmaString::from_utf8("accessor")),
+                Constant::String(EcmaString::from_utf8("missing")),
+            ],
+            vec![entry_function(
+                10,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(1),
+                    },
+                    Instruction::DefineDataProperty {
+                        object: reg(0),
+                        key: reg(1),
+                        value: reg(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(3),
+                        constant: cid(2),
+                    },
+                    Instruction::CreateObject { dst: reg(4) },
+                    Instruction::DefineAccessor {
+                        object: reg(0),
+                        key: reg(3),
+                        accessor: reg(4),
+                        kind: AccessorKind::Getter,
+                    },
+                    Instruction::LoadOwnDescriptorSlot {
+                        dst: reg(5),
+                        object: reg(0),
+                        key: reg(1),
+                        slot: DescriptorSlot::Value,
+                    },
+                    Instruction::LoadOwnDescriptorSlot {
+                        dst: reg(6),
+                        object: reg(0),
+                        key: reg(1),
+                        slot: DescriptorSlot::Getter,
+                    },
+                    Instruction::LoadOwnDescriptorSlot {
+                        dst: reg(7),
+                        object: reg(0),
+                        key: reg(3),
+                        slot: DescriptorSlot::Getter,
+                    },
+                    Instruction::LoadOwnDescriptorSlot {
+                        dst: reg(8),
+                        object: reg(0),
+                        key: reg(3),
+                        slot: DescriptorSlot::Value,
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(9),
+                        constant: cid(3),
+                    },
+                    Instruction::LoadOwnDescriptorSlot {
+                        dst: reg(9),
+                        object: reg(0),
+                        key: reg(9),
+                        slot: DescriptorSlot::Value,
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+            )],
+        );
+        let value = assert_parity(&module, || SilentHost);
+        let program = one_module_program(&module);
+        let mut host = SilentHost;
+        let native = NativeEngine::new(&program, &NoEntries, &mut host, Limits::default())
+            .run()
+            .expect("reference native runs load slots");
+        assert_eq!(value, native.value);
+        assert_eq!(native.entry_registers[5], Value::int32(7));
+        assert_eq!(
+            native.entry_registers[6],
+            Value::UNDEFINED,
+            "data/getter mismatch yields undefined"
+        );
+        assert_eq!(
+            native.entry_registers[7], native.entry_registers[4],
+            "accessor getter slot returns the installed getter"
+        );
+        assert_eq!(
+            native.entry_registers[8],
+            Value::UNDEFINED,
+            "accessor/value mismatch yields undefined"
+        );
+        assert_eq!(
+            native.entry_registers[9],
+            Value::UNDEFINED,
+            "absent property yields undefined"
+        );
+    }
+
+    #[test]
+    fn define_own_descriptor_slot_parity_creates_absent_preserves_and_rejects_mismatch() {
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("created")),
+                Constant::Int32(9),
+                Constant::String(EcmaString::from_utf8("data")),
+                Constant::Int32(1),
+                Constant::Int32(8),
+                Constant::String(EcmaString::from_utf8("accessor")),
+            ],
+            vec![entry_function(
+                8,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(1),
+                    },
+                    Instruction::DefineOwnDescriptorSlot {
+                        object: reg(0),
+                        key: reg(1),
+                        src: reg(2),
+                        slot: DescriptorSlot::Value,
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(3),
+                        constant: cid(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(4),
+                        constant: cid(3),
+                    },
+                    Instruction::DefineDataProperty {
+                        object: reg(0),
+                        key: reg(3),
+                        value: reg(4),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(5),
+                        constant: cid(4),
+                    },
+                    Instruction::DefineOwnDescriptorSlot {
+                        object: reg(0),
+                        key: reg(3),
+                        src: reg(5),
+                        slot: DescriptorSlot::Value,
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(6),
+                        constant: cid(5),
+                    },
+                    Instruction::CreateObject { dst: reg(7) },
+                    Instruction::DefineAccessor {
+                        object: reg(0),
+                        key: reg(6),
+                        accessor: reg(7),
+                        kind: AccessorKind::Getter,
+                    },
+                    Instruction::CreateObject { dst: reg(1) },
+                    Instruction::DefineOwnDescriptorSlot {
+                        object: reg(0),
+                        key: reg(6),
+                        src: reg(1),
+                        slot: DescriptorSlot::Setter,
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+            )],
+        );
+        let program = one_module_program(&module);
+        let created = PropertyKey::Named(EcmaString::from_utf8("created"));
+        let data = PropertyKey::Named(EcmaString::from_utf8("data"));
+        let accessor = PropertyKey::Named(EcmaString::from_utf8("accessor"));
+
+        let mut interpreter_host = SilentHost;
+        let mut interpreter = Machine::new(&program, &mut interpreter_host, Limits::default());
+        let interpreter_execution =
+            run_interpreter_to_quiescence(&mut interpreter).expect("interpreter defines slots");
+        let interpreter_object = interpreter_execution.value;
+
+        let mut native_host = SilentHost;
+        let native = NativeEngine::new(&program, &NoEntries, &mut native_host, Limits::default());
+        let native_execution =
+            run_reference_to_quiescence(&native).expect("reference native defines slots");
+        let native_object = native_execution.value;
+
+        assert_eq!(
+            interpreter_execution.entry_registers,
+            native_execution.entry_registers
+        );
+        let assert_slots =
+            |machine: &Machine<'_, SilentHost>, object: Value, registers: &[Value]| {
+                assert!(matches!(
+                    machine.own_descriptor(object, &created).unwrap(),
+                    Some(Property::Data {
+                        value,
+                        writable: true,
+                        enumerable: false,
+                        configurable: true,
+                    }) if value == Value::int32(9)
+                ));
+                assert!(matches!(
+                    machine.own_descriptor(object, &data).unwrap(),
+                    Some(Property::Data {
+                        value,
+                        writable: true,
+                        enumerable: false,
+                        configurable: true,
+                    }) if value == Value::int32(8)
+                ));
+                match machine
+                    .own_descriptor(object, &accessor)
+                    .unwrap()
+                    .expect("accessor remains installed")
+                {
+                    Property::Accessor {
+                        getter: Some(getter),
+                        setter: Some(setter),
+                        enumerable: true,
+                        configurable: true,
+                    } => {
+                        assert_eq!(getter, registers[7]);
+                        assert_eq!(setter, registers[1]);
+                    }
+                    other => panic!("expected accessor with both halves, got {other:?}"),
+                }
+            };
+        assert_slots(
+            &interpreter,
+            interpreter_object,
+            &interpreter_execution.entry_registers,
+        );
+        assert_slots(
+            &native.machine.borrow(),
+            native_object,
+            &native_execution.entry_registers,
+        );
+
+        let mismatch = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("data")),
+                Constant::Int32(1),
+                Constant::Int32(2),
+            ],
+            vec![entry_function(
+                4,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(1),
+                    },
+                    Instruction::DefineDataProperty {
+                        object: reg(0),
+                        key: reg(1),
+                        value: reg(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(3),
+                        constant: cid(2),
+                    },
+                    Instruction::DefineOwnDescriptorSlot {
+                        object: reg(0),
+                        key: reg(1),
+                        src: reg(3),
+                        slot: DescriptorSlot::Getter,
+                    },
+                    Instruction::Halt,
+                ],
+            )],
+        );
+        let mismatch_program = one_module_program(&mismatch);
+        let mut interpreter_host = SilentHost;
+        let interpreter_error =
+            Machine::new(&mismatch_program, &mut interpreter_host, Limits::default())
+                .run()
+                .expect_err("interpreter rejects data/getter shape mismatch");
+        let mut native_host = SilentHost;
+        let native_error = NativeEngine::new(
+            &mismatch_program,
+            &NoEntries,
+            &mut native_host,
+            Limits::default(),
+        )
+        .run()
+        .expect_err("reference native rejects data/getter shape mismatch");
+        for error in [&interpreter_error, &native_error] {
+            assert!(matches!(
+                error.kind,
+                RuntimeErrorKind::UncaughtThrow {
+                    origin: ThrowOrigin::TypeError {
+                        operation: "decorator replacement changes descriptor shape"
+                    },
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn own_descriptor_slot_helpers_pass_raw_keys_and_reject_invalid_slots() {
+        for backend in [Backend::Reference, Backend::Linked] {
+            let program = trivial_program();
+            let entries = NoEntries;
+            let mut host = SilentHost;
+            let engine =
+                NativeEngine::build(&program, &entries, &mut host, Limits::default(), backend);
+            let mut registers = vec![Value::UNINITIALIZED; 2];
+            engine.activations.borrow_mut().push(Activation {
+                this_value: Value::UNDEFINED,
+                new_target: Value::UNDEFINED,
+                args: Vec::new(),
+                arguments_object: None,
+                pending_resume: None,
+                target: test_target(),
+            });
+            engine.push_native_roots(&registers);
+            let handles = registers.as_mut_ptr();
+            let mut shadow = ShadowFrame::new(std::ptr::null_mut(), 0, 0, handles, 2);
+            let mut frame = NativeFrame::new(&mut shadow, &mut registers).unwrap();
+
+            let object = engine.dispatch(&mut frame, HelperCall::CreateObject);
+            assert_eq!(object.tag, CompletionTag::Normal);
+
+            // Raw non-string keys must reach Machine unchanged; Machine coerces.
+            let defined = engine.dispatch(
+                &mut frame,
+                HelperCall::DefineOwnDescriptorSlot {
+                    object: object.value,
+                    key: Value::int32(7),
+                    src: Value::int32(42),
+                    slot: super::descriptor_slot_to_selector(DescriptorSlot::Value),
+                },
+            );
+            assert_eq!(defined.tag, CompletionTag::Normal);
+            assert_eq!(defined.value, Value::UNDEFINED);
+
+            let loaded = engine.dispatch(
+                &mut frame,
+                HelperCall::LoadOwnDescriptorSlot {
+                    object: object.value,
+                    key: Value::int32(7),
+                    slot: super::descriptor_slot_to_selector(DescriptorSlot::Value),
+                },
+            );
+            assert_eq!(loaded.tag, CompletionTag::Normal);
+            assert_eq!(loaded.value, Value::int32(42));
+
+            let getter = engine.dispatch(&mut frame, HelperCall::CreateObject);
+            assert_eq!(getter.tag, CompletionTag::Normal);
+            let accessor_key = engine
+                .machine
+                .borrow_mut()
+                .allocate(HeapEntry::String(EcmaString::from_utf8("acc")))
+                .unwrap();
+            let installed = engine.dispatch(
+                &mut frame,
+                HelperCall::DefineOwnDescriptorSlot {
+                    object: object.value,
+                    key: accessor_key,
+                    src: getter.value,
+                    slot: super::descriptor_slot_to_selector(DescriptorSlot::Getter),
+                },
+            );
+            assert_eq!(installed.tag, CompletionTag::Normal);
+            let setter = engine.dispatch(&mut frame, HelperCall::CreateObject);
+            assert_eq!(setter.tag, CompletionTag::Normal);
+            let set_half = engine.dispatch(
+                &mut frame,
+                HelperCall::DefineOwnDescriptorSlot {
+                    object: object.value,
+                    key: accessor_key,
+                    src: setter.value,
+                    slot: super::descriptor_slot_to_selector(DescriptorSlot::Setter),
+                },
+            );
+            assert_eq!(set_half.tag, CompletionTag::Normal);
+            let got_getter = engine.dispatch(
+                &mut frame,
+                HelperCall::LoadOwnDescriptorSlot {
+                    object: object.value,
+                    key: accessor_key,
+                    slot: super::descriptor_slot_to_selector(DescriptorSlot::Getter),
+                },
+            );
+            let got_setter = engine.dispatch(
+                &mut frame,
+                HelperCall::LoadOwnDescriptorSlot {
+                    object: object.value,
+                    key: accessor_key,
+                    slot: super::descriptor_slot_to_selector(DescriptorSlot::Setter),
+                },
+            );
+            assert_eq!(got_getter.tag, CompletionTag::Normal);
+            assert_eq!(got_getter.value, getter.value);
+            assert_eq!(got_setter.tag, CompletionTag::Normal);
+            assert_eq!(got_setter.value, setter.value);
+
+            for invalid_slot in [3_u32, 99, u32::MAX] {
+                let invalid_load = engine.dispatch(
+                    &mut frame,
+                    HelperCall::LoadOwnDescriptorSlot {
+                        object: object.value,
+                        key: Value::int32(7),
+                        slot: invalid_slot,
+                    },
+                );
+                assert_eq!(invalid_load.tag, CompletionTag::FatalTrap);
+                assert_eq!(invalid_load.value, Value::UNDEFINED);
+                assert_eq!(
+                    engine.pending_fatal_kind.take(),
+                    Some(RuntimeErrorKind::InvalidValue {
+                        value: Value::UNDEFINED
+                    })
+                );
+
+                let invalid_define = engine.dispatch(
+                    &mut frame,
+                    HelperCall::DefineOwnDescriptorSlot {
+                        object: object.value,
+                        key: Value::int32(7),
+                        src: Value::int32(1),
+                        slot: invalid_slot,
+                    },
+                );
+                assert_eq!(invalid_define.tag, CompletionTag::FatalTrap);
+                assert_eq!(invalid_define.value, Value::UNDEFINED);
+                assert_eq!(
+                    engine.pending_fatal_kind.take(),
+                    Some(RuntimeErrorKind::InvalidValue {
+                        value: Value::UNDEFINED
+                    })
+                );
+            }
+
+            engine.pop_native_roots();
+            engine.activations.borrow_mut().pop();
+        }
     }
 }

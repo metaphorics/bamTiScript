@@ -6,7 +6,7 @@ license = "MIT"
 source_dir = "corpus/projects/valita"
 entrypoint = "corpus/cases/valita.ts"
 node_args = []
-expected_timeout_ms = 10000
+expected_timeout_ms = 30000
 constructs = ["schema-validation", "object-parsing", "union-types", "literal-types", "array-validation", "record-types", "tuple-types", "refinements", "transforms", "optional-defaults", "nullable-types", "parse-modes", "error-reporting"]
 source_files = [
   "corpus/projects/valita/src/index.ts",

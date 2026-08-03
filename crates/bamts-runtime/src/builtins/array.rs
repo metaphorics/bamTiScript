@@ -9,7 +9,9 @@ use super::{
     type_error, value_number,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
-use crate::{EvalFailure, HeapEntry, Host, IterationKind, Machine, PropertyKey};
+use crate::{
+    EvalFailure, HeapEntry, Host, IterationKind, Machine, Property, PropertyKey, PropertyMap,
+};
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -66,12 +68,63 @@ pub(super) fn install<H: Host>(
     define_data(heap, prototype, "keys", keys);
     define_data(heap, prototype, "values", values);
     define_data(heap, prototype, "entries", entries);
+    let unscopables = super::super::push(
+        heap,
+        HeapEntry::Object {
+            properties: PropertyMap::default(),
+            prototype: None,
+            extensible: true,
+            boxed_primitive: None,
+        },
+    );
+    {
+        let HeapEntry::Object { properties, .. } = &mut heap[super::heap_index(unscopables)] else {
+            unreachable!()
+        };
+        for name in [
+            "at",
+            "copyWithin",
+            "entries",
+            "fill",
+            "find",
+            "findIndex",
+            "findLast",
+            "findLastIndex",
+            "flat",
+            "flatMap",
+            "includes",
+            "keys",
+            "toReversed",
+            "toSorted",
+            "toSpliced",
+            "values",
+        ] {
+            properties.insert(
+                PropertyKey::Named(EcmaString::from_utf8(name)),
+                Property::Data {
+                    value: Value::TRUE,
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                },
+            );
+        }
+    }
     let HeapEntry::Array { properties, .. } = &mut heap[super::heap_index(prototype)] else {
         unreachable!()
     };
     properties.insert(
         PropertyKey::Symbol(super::heap_index(builtins.symbol_iterator()) as u32),
         super::builtin_property(values),
+    );
+    properties.insert(
+        PropertyKey::Symbol(super::heap_index(builtins.symbol_unscopables()) as u32),
+        Property::Data {
+            value: unscopables,
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        },
     );
 }
 
@@ -1030,5 +1083,96 @@ mod tests {
         let source = ordinary_object(&mut machine); // no Symbol.iterator
         let result = call_array(&mut machine, "from", &[source]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn array_prototype_unscopables_descriptor_and_entries() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let array_prototype = machine.intrinsics.array_prototype;
+        let unscopables_symbol = machine.intrinsics.builtins.symbol_unscopables();
+        let key = machine.to_property_key(unscopables_symbol).unwrap();
+        let descriptor = machine
+            .own_descriptor(array_prototype, &key)
+            .expect("descriptor lookup succeeds")
+            .expect("Array.prototype[Symbol.unscopables] is defined");
+        let Property::Data {
+            value: unscopables,
+            writable,
+            enumerable,
+            configurable,
+        } = descriptor
+        else {
+            panic!("Array.prototype[Symbol.unscopables] must be a data property");
+        };
+        assert!(
+            !writable,
+            "Array.prototype[Symbol.unscopables] must be non-writable"
+        );
+        assert!(
+            !enumerable,
+            "Array.prototype[Symbol.unscopables] must be non-enumerable"
+        );
+        assert!(
+            configurable,
+            "Array.prototype[Symbol.unscopables] must be configurable"
+        );
+        assert_eq!(
+            machine.prototype_value(unscopables).unwrap(),
+            None,
+            "unscopables object must have a null prototype"
+        );
+        let names = [
+            "at",
+            "copyWithin",
+            "entries",
+            "fill",
+            "find",
+            "findIndex",
+            "findLast",
+            "findLastIndex",
+            "flat",
+            "flatMap",
+            "includes",
+            "keys",
+            "toReversed",
+            "toSorted",
+            "toSpliced",
+            "values",
+        ];
+        for name in names {
+            let entry = machine
+                .get_named_property(unscopables, name)
+                .unwrap_or_else(|_| panic!("{name} must be present on unscopables"));
+            assert_eq!(entry, Value::TRUE, "{name} must be true");
+            let entry_key = PropertyKey::Named(EcmaString::from_utf8(name));
+            let entry_descriptor = machine
+                .own_descriptor(unscopables, &entry_key)
+                .expect("entry descriptor lookup succeeds")
+                .unwrap_or_else(|| panic!("{name} must have an own descriptor"));
+            assert!(
+                matches!(
+                    entry_descriptor,
+                    Property::Data {
+                        value: Value::TRUE,
+                        writable: true,
+                        enumerable: true,
+                        configurable: true,
+                    }
+                ),
+                "{name} must be a CreateDataProperty true entry"
+            );
+        }
+        let expected: Vec<_> = names
+            .into_iter()
+            .map(EcmaString::from_utf8)
+            .map(PropertyKey::Named)
+            .collect();
+        assert_eq!(
+            machine.own_property_keys(unscopables).unwrap(),
+            expected,
+            "unscopables own keys must be exactly the standard entry set"
+        );
     }
 }

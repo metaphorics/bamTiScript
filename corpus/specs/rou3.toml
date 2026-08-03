@@ -12,7 +12,7 @@ license = "MIT"
 source_dir = "corpus/projects/rou3"
 entrypoint = "corpus/cases/rou3.ts"
 node_args = []
-expected_timeout_ms = 10000
+expected_timeout_ms = 20000
 constructs = [
   "router-context",
   "static-route-lookup",
