@@ -434,6 +434,7 @@ pub enum ProgramDecodeErrorKind {
         limit: u64,
         actual: u64,
     },
+    AllocationFailed,
     Module {
         module: ModuleId,
         error: DecodeError,
@@ -485,6 +486,9 @@ impl fmt::Display for ProgramDecodeError {
                 actual,
             } => {
                 write!(formatter, "{field} value {actual} exceeds limit {limit}")
+            }
+            ProgramDecodeErrorKind::AllocationFailed => {
+                formatter.write_str("failed to reserve decode buffer")
             }
             ProgramDecodeErrorKind::Module { module, error } => {
                 write!(formatter, "module {}: {error}", module.get())
@@ -723,9 +727,10 @@ pub fn decode_program(
     }
     let entry = ModuleId::new(decoder.u32()?);
     let module_count = decoder.count("modules", limits.max_modules)?;
-    let mut modules = Vec::with_capacity(module_count);
+    let mut modules = Vec::new();
     for index in 0..module_count {
-        modules.push(decoder.module(ModuleId::new(index as u32))?);
+        let module = decoder.module(ModuleId::new(index as u32))?;
+        decoder.push_decoded(&mut modules, module)?;
     }
     if decoder.offset != bytes.len() {
         return Err(decoder.error(ProgramDecodeErrorKind::TrailingBytes {
@@ -795,7 +800,7 @@ impl<'a> ProgramDecoder<'a> {
             self.limits.max_total_edges,
             Total::Edges,
         )?;
-        let mut edges = Vec::with_capacity(edge_count);
+        let mut edges = Vec::new();
         for _ in 0..edge_count {
             let specifier = ConstantId::new(self.u32()?);
             let tag_at = self.offset;
@@ -819,11 +824,14 @@ impl<'a> ProgramDecoder<'a> {
                     );
                 }
             };
-            edges.push(Edge {
-                specifier,
-                target,
-                kind,
-            });
+            self.push_decoded(
+                &mut edges,
+                Edge {
+                    specifier,
+                    target,
+                    kind,
+                },
+            )?;
         }
 
         let binding_count = self.count("bindings", self.limits.max_bindings_per_module)?;
@@ -833,7 +841,7 @@ impl<'a> ProgramDecoder<'a> {
             self.limits.max_total_bindings,
             Total::Bindings,
         )?;
-        let mut bindings = Vec::with_capacity(binding_count);
+        let mut bindings = Vec::new();
         for _ in 0..binding_count {
             let name = ConstantId::new(self.u32()?);
             let tag_at = self.offset;
@@ -853,7 +861,7 @@ impl<'a> ProgramDecoder<'a> {
                     );
                 }
             };
-            bindings.push(Binding { name, kind });
+            self.push_decoded(&mut bindings, Binding { name, kind })?;
         }
 
         let export_count = self.count("exports", self.limits.max_exports_per_module)?;
@@ -863,7 +871,7 @@ impl<'a> ProgramDecoder<'a> {
             self.limits.max_total_exports,
             Total::Exports,
         )?;
-        let mut exports = Vec::with_capacity(export_count);
+        let mut exports = Vec::new();
         for _ in 0..export_count {
             let name = ConstantId::new(self.u32()?);
             let tag_at = self.offset;
@@ -879,7 +887,7 @@ impl<'a> ProgramDecoder<'a> {
                     );
                 }
             };
-            exports.push(Export { name, source });
+            self.push_decoded(&mut exports, Export { name, source })?;
         }
         Ok(ProgramModule {
             name,
@@ -926,6 +934,14 @@ impl<'a> ProgramDecoder<'a> {
             }));
         }
         Ok(actual as usize)
+    }
+
+    fn push_decoded<T>(&self, values: &mut Vec<T>, value: T) -> Result<(), ProgramDecodeError> {
+        values
+            .try_reserve(1)
+            .map_err(|_| self.error(ProgramDecodeErrorKind::AllocationFailed))?;
+        values.push(value);
+        Ok(())
     }
 
     fn length(&mut self, field: &'static str, limit: usize) -> Result<usize, ProgramDecodeError> {
