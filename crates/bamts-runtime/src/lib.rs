@@ -9018,8 +9018,17 @@ impl<'a, H: Host> Machine<'a, H> {
                     // Promise once.
                     self.settle_module_evaluation(module, Err(error));
                 }
-                self.reject_promise(promise, value, origin)
-                    .map_err(EvalFailure::Runtime)
+                // Normalize through promise_rejection_value: engine-origin
+                // Throw(origin) materializes once; ThrowValue /
+                // ThrowValueOrigin keep their supplied values.
+                let failure = if catch_value_needs_materialization(value, origin) {
+                    EvalFailure::Throw(origin)
+                } else if matches!(origin, ThrowOrigin::Bytecode) {
+                    EvalFailure::ThrowValue(value)
+                } else {
+                    EvalFailure::ThrowValueOrigin { value, origin }
+                };
+                self.reject_promise_failure(promise, failure)
             }
             Err(failure) => Err(failure),
         }
@@ -12568,6 +12577,129 @@ mod tests {
             ))
         ));
         assert_eq!(machine.live_registers, 0);
+    }
+
+    #[test]
+    fn async_engine_type_error_rejection_has_intrinsic_shape() {
+        // An async body that calls a non-callable must reject via start_async_call
+        // with a materialized intrinsic TypeError (not undefined) while retaining
+        // the matching engine TypeError origin on the Promise.
+        let program = verified(
+            vec![Constant::Int32(0)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::CreateArray { dst: reg(1) },
+                        Instruction::Call {
+                            dst: reg(2),
+                            callee: reg(0),
+                            this_value: reg(0),
+                            arguments: reg(1),
+                        },
+                        Instruction::Return { value: reg(2) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let promise = machine
+            .call_value(callable, Value::UNDEFINED, &[])
+            .expect("async call returns a rejected promise");
+        let index = machine
+            .runtime_slot(promise)
+            .unwrap()
+            .expect("async result is a promise");
+        let HeapEntry::Promise {
+            state: PromiseState::Rejected { reason, origin },
+            ..
+        } = &machine.heap[index]
+        else {
+            panic!("async engine TypeError must reject its promise");
+        };
+        let reason = *reason;
+        let origin = *origin;
+        assert_ne!(reason, Value::UNDEFINED);
+        assert_eq!(
+            origin,
+            ThrowOrigin::TypeError {
+                operation: "call",
+            }
+        );
+        let name = machine.get_named_property(reason, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name)
+                .is_some_and(|text| text.eq_ascii("TypeError"))
+        );
+        let message = machine.get_named_property(reason, "message").unwrap();
+        assert!(
+            machine
+                .string_value(message)
+                .is_some_and(|text| text.eq_ascii("call"))
+        );
+        let constructor = machine.intrinsics.global("TypeError").unwrap();
+        assert!(machine.instance_of(reason, constructor).unwrap());
+        machine.run_to_quiescence().unwrap();
+    }
+
+    #[test]
+    fn async_prematerialized_rejection_keeps_identity() {
+        // An async body that throws a preallocated object must reject with that
+        // exact Value and Bytecode origin (no rematerialization).
+        let program = verified(
+            Vec::new(),
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_function(
+                    1,
+                    1,
+                    vec![Instruction::Throw { value: reg(0) }],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let preallocated = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        let callable = generator_callable(&mut machine, 1);
+        let promise = machine
+            .call_value(callable, Value::UNDEFINED, &[preallocated])
+            .expect("async call returns a rejected promise");
+        let index = machine
+            .runtime_slot(promise)
+            .unwrap()
+            .expect("async result is a promise");
+        let HeapEntry::Promise {
+            state: PromiseState::Rejected { reason, origin },
+            ..
+        } = &machine.heap[index]
+        else {
+            panic!("async explicit throw must reject its promise");
+        };
+        assert_eq!(*reason, preallocated);
+        assert_eq!(*origin, ThrowOrigin::Bytecode);
+        machine.run_to_quiescence().unwrap();
     }
 
     fn run_ok(program: &Program<Verified>) -> Execution {
