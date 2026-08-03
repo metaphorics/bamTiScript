@@ -29,9 +29,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use bamts_bytecode::{
-    AccessorKind, BinaryOp, BindingId, BindingKind, Constant, ConstantId, EcmaString,
-    EcmaStringBuilder, EdgeId, EdgeTarget, Function, FunctionId, Instruction, IteratorCloseMode,
-    IteratorKind, Module, ModuleId, Pc, Program, ProgramModule, ResolvedExport, UnaryOp, Verified,
+    AccessorKind, BinaryOp, BindingId, BindingKind, Constant, ConstantId, DescriptorSlot,
+    DisposeHint, EcmaString, EcmaStringBuilder, EdgeId, EdgeTarget, Function, FunctionId,
+    Instruction, IteratorCloseMode, IteratorKind, Module, ModuleId, Pc, Program, ProgramModule,
+    ResolvedExport, UnaryOp, Verified,
 };
 use bamts_native::{Decoded, SlotId, Value};
 
@@ -166,6 +167,12 @@ pub trait Host {
 
     fn delete_env(&mut self, _name: &str) -> bool {
         false
+    }
+
+    /// Supplies the URL exposed by this module's stable `import.meta` object.
+    /// The runtime calls this at most once per instantiated module.
+    fn import_meta_url(&mut self, module_name: &EcmaString) -> EcmaString {
+        module_name.clone()
     }
 
     fn now_ms(&mut self) -> u64 {
@@ -956,6 +963,17 @@ pub(crate) enum PromiseReaction {
         done: bool,
         context: Option<Value>,
     },
+    /// Resolves an `import()` promise when a local module evaluation fulfills.
+    DynamicImportFulfill {
+        promise: Value,
+        target: ModuleId,
+        context: Option<Value>,
+    },
+    /// Propagates a local module evaluation rejection to an `import()` promise.
+    DynamicImportReject {
+        promise: Value,
+        context: Option<Value>,
+    },
 }
 
 impl PromiseReaction {
@@ -970,7 +988,9 @@ impl PromiseReaction {
             | Self::ModuleDepFulfill { context, .. }
             | Self::ModuleDepReject { context, .. }
             | Self::AsyncFromSyncFulfill { context, .. }
-            | Self::AsyncFromSyncReject { context, .. } => *context,
+            | Self::AsyncFromSyncReject { context, .. }
+            | Self::DynamicImportFulfill { context, .. }
+            | Self::DynamicImportReject { context, .. } => *context,
         }
     }
 }
@@ -1345,6 +1365,7 @@ pub(crate) struct BoundCall {
     pub(crate) target: Value,
     pub(crate) this_value: Value,
     pub(crate) arguments: Vec<Value>,
+    pub(crate) new_target: Value,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1413,9 +1434,68 @@ pub(crate) enum EvalFailure {
 
 pub(crate) fn import_failure(error: &RuntimeError) -> EvalFailure {
     match &error.kind {
-        RuntimeErrorKind::UncaughtThrow { value, .. } => EvalFailure::ThrowValue(*value),
+        RuntimeErrorKind::UncaughtThrow { value, origin } => EvalFailure::ThrowValueOrigin {
+            value: *value,
+            origin: *origin,
+        },
         kind => EvalFailure::Runtime(kind.clone()),
     }
+}
+
+/// Returns whether `specifier` uses a relative module-path prefix.
+fn is_relative_module_specifier(specifier: &EcmaString) -> bool {
+    let units = specifier.as_units();
+    units.starts_with(&[u16::from(b'.'), u16::from(b'/')])
+        || units.starts_with(&[u16::from(b'.'), u16::from(b'.'), u16::from(b'/')])
+}
+
+/// Totally normalizes a POSIX-like relative module-name path by collapsing empty,
+/// `.`, and `..` components. Parent escapes past the first component are dropped
+/// rather than rejected, so every input yields a name.
+fn normalize_relative_module_name(name: &EcmaString) -> EcmaString {
+    let slash = u16::from(b'/');
+    let mut stack = Vec::new();
+    for part in name.as_units().split(|&unit| unit == slash) {
+        if part.is_empty() || part == [u16::from(b'.')] {
+            continue;
+        }
+        if part == [u16::from(b'.'), u16::from(b'.')] {
+            let _ = stack.pop();
+            continue;
+        }
+        stack.push(part);
+    }
+    if stack.is_empty() {
+        return EcmaString::default();
+    }
+    let mut units = Vec::with_capacity(name.len_units());
+    for (index, part) in stack.into_iter().enumerate() {
+        if index > 0 {
+            units.push(slash);
+        }
+        units.extend_from_slice(part);
+    }
+    EcmaString::from_units(&units)
+}
+
+/// Resolves a relative specifier against the requester module's canonical directory.
+fn resolve_relative_against_module_name(
+    requester_name: &EcmaString,
+    specifier: &EcmaString,
+) -> EcmaString {
+    let units = requester_name.as_units();
+    let directory = match units.iter().rposition(|&unit| unit == u16::from(b'/')) {
+        Some(index) => &units[..index],
+        None => &[][..],
+    };
+    let mut joined =
+        Vec::with_capacity(directory.len().saturating_add(1).saturating_add(specifier.len_units()));
+    if !directory.is_empty() {
+        joined.extend_from_slice(directory);
+        joined.push(u16::from(b'/'));
+    }
+    joined.extend_from_slice(specifier.as_units());
+    normalize_relative_module_name(&EcmaString::from_units(&joined))
 }
 
 /// The outcome of resolving a property read.
@@ -1515,6 +1595,7 @@ pub struct Machine<'a, H: Host> {
     timer_checkpoint_active: bool,
     intrinsics: intrinsics::Intrinsics<H>,
     current_builtin_id: Option<intrinsics::BuiltinId>,
+    current_new_target: Value,
     registry: ModuleRegistry,
     /// First machine-wide module ID reserved for host-compiled script modules.
     dynamic_base: usize,
@@ -1534,6 +1615,10 @@ struct ModuleRegistry {
     modules: Vec<ModuleInstance>,
     cells: Vec<Cell>,
     external: BTreeMap<EcmaString, ExternalModuleInstance>,
+    /// Canonical program module-name → [`ModuleId`] for bundled-local dynamic
+    /// resolution. Keys are owned [`EcmaString`] values from program constants,
+    /// so this table is rebuilt per instantiation and is not a GC root set.
+    local_modules: BTreeMap<EcmaString, ModuleId>,
 }
 
 #[derive(Clone, Debug)]
@@ -1555,6 +1640,7 @@ struct ModuleInstance {
     constant_cells: Vec<Option<CellId>>,
     namespace: Option<Value>,
     state: ModuleState,
+    import_meta: Option<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -1615,6 +1701,13 @@ enum DynamicImport {
     Ready(Value),
     Pending(Value),
     Failed(RuntimeError),
+}
+
+/// Runtime-only dynamic import resolution deliberately retains the external
+/// specifier rather than an edge id, because expression imports need no edge.
+enum DynamicImportTarget {
+    Local(ModuleId),
+    External(EcmaString),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1777,6 +1870,7 @@ impl<'a, H: Host> Machine<'a, H> {
             dynamic_base: program.map_or(1, |program| program.modules().len()),
             dynamic: Vec::new(),
             current_builtin_id: None,
+            current_new_target: Value::UNDEFINED,
             intrinsics,
         }
     }
@@ -2451,6 +2545,17 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 self.reject_promise(derived, value, origin)
             }
+            PromiseReaction::DynamicImportFulfill {
+                promise, target, ..
+            } => {
+                let namespace = self
+                    .module_namespace(target, target)
+                    .map_err(|error| error.kind)?;
+                self.resolve_promise(promise, namespace)
+            }
+            PromiseReaction::DynamicImportReject { promise, .. } => {
+                self.reject_promise(promise, value, origin)
+            }
         }
     }
 
@@ -3024,6 +3129,108 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
+    pub(crate) fn dispose_capture_raw(
+        &mut self,
+        src: Value,
+        hint: DisposeHint,
+    ) -> Result<(Value, u32), EvalFailure> {
+        if matches!(src.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+            return Ok((Value::UNDEFINED, 0));
+        }
+        if !self.is_object(src) {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "disposable resource is not an object",
+            }));
+        }
+
+        let key = match hint {
+            DisposeHint::Sync => self.to_property_key(self.intrinsics.builtins.symbol_dispose())?,
+            DisposeHint::Async => {
+                self.to_property_key(self.intrinsics.builtins.symbol_async_dispose())?
+            }
+        };
+        let method = self.get_property_key(src, &key)?;
+        if !matches!(method.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+            if self.is_callable(method)? {
+                return Ok((method, 1));
+            }
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "disposal method is not callable",
+            }));
+        }
+        if hint == DisposeHint::Sync {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "disposal method is not callable",
+            }));
+        }
+
+        let key = self.to_property_key(self.intrinsics.builtins.symbol_dispose())?;
+        let method = self.get_property_key(src, &key)?;
+        if self.is_callable(method)? {
+            Ok((method, 2))
+        } else {
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "disposal method is not callable",
+            }))
+        }
+    }
+
+
+    /// Object Environment Record `HasBinding` for a `with` binding object.
+    ///
+    /// Uses the realm-owned `%Symbol.unscopables%` intrinsic (never a user-global
+    /// `Symbol` lookup), performs ordinary `Get`s with the correct receivers, and
+    /// never caches the unscopables object or its named entry.
+    pub(crate) fn with_has_binding(
+        &mut self,
+        object: Value,
+        key: Value,
+    ) -> Result<bool, EvalFailure> {
+        let key = self.to_property_key(key)?;
+        if !self.has_property(object, &key)? {
+            return Ok(false);
+        }
+        let unscopables_key =
+            self.to_property_key(self.intrinsics.builtins.symbol_unscopables())?;
+        let unscopables = self.get_property_key(object, &unscopables_key)?;
+        if !self.is_object(unscopables) {
+            return Ok(true);
+        }
+        let blocked = self.get_property_key(unscopables, &key)?;
+        Ok(!self.truthy(blocked))
+    }
+
+    pub(crate) fn make_suppressed_error(
+        &mut self,
+        error: Value,
+        suppressed: Value,
+    ) -> Result<Value, EvalFailure> {
+        let id = self
+            .intrinsics
+            .builtins
+            .id_named("SuppressedError")
+            .expect("SuppressedError builtin installs first");
+        let mut properties = PropertyMap::default();
+        for (name, value) in [("error", error), ("suppressed", suppressed)] {
+            properties.insert(
+                PropertyKey::Named(EcmaString::from_utf8(name)),
+                Property::Data {
+                    value,
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+        }
+        self.allocate(HeapEntry::Object {
+            properties,
+            prototype: Some(self.intrinsics.error_prototype(id)),
+            boxed_primitive: None,
+            extensible: true,
+        })
+        .map_err(EvalFailure::Runtime)
+    }
+
     fn close_iterator(&mut self, iterator: Value) -> Result<(), EvalFailure> {
         let (result, _) = self.close_iterator_raw(iterator);
         result.map(|_| ())
@@ -3461,25 +3668,39 @@ impl<'a, H: Host> Machine<'a, H> {
                 Ok((Value::UNDEFINED, ThrowOrigin::Bytecode))
             }
             EvalFailure::Throw(origin) => {
-                let (name, message) = match origin {
-                    ThrowOrigin::TypeError { operation } => ("TypeError", operation),
-                    ThrowOrigin::RangeError { operation } => ("RangeError", operation),
-                    ThrowOrigin::ReferenceError { operation } => ("ReferenceError", operation),
-                    ThrowOrigin::UriError { operation } => ("URIError", operation),
-                    ThrowOrigin::Bytecode => unreachable!("handled above"),
-                };
-                let id = self
-                    .intrinsics
-                    .builtins
-                    .id_named(name)
-                    .expect("error constructor is installed");
-                match self.throw_error(id, message.to_owned()) {
-                    EvalFailure::ThrowValue(value) => Ok((value, origin)),
-                    EvalFailure::Runtime(kind) => Err(EvalFailure::Runtime(kind)),
-                    _ => unreachable!("error materialization returns a thrown value"),
-                }
+                let value = self
+                    .materialize_engine_origin(origin)
+                    .map_err(EvalFailure::Runtime)?;
+                Ok((value, origin))
             }
             EvalFailure::Runtime(kind) => Err(EvalFailure::Runtime(kind)),
+        }
+    }
+
+    /// Builds a realm error object for a non-bytecode engine throw origin via
+    /// installed error-constructor intrinsics (not user-global lookup).
+    pub(crate) fn materialize_engine_origin(
+        &mut self,
+        origin: ThrowOrigin,
+    ) -> Result<Value, RuntimeErrorKind> {
+        let (name, message) = match origin {
+            ThrowOrigin::TypeError { operation } => ("TypeError", operation),
+            ThrowOrigin::RangeError { operation } => ("RangeError", operation),
+            ThrowOrigin::ReferenceError { operation } => ("ReferenceError", operation),
+            ThrowOrigin::UriError { operation } => ("URIError", operation),
+            ThrowOrigin::Bytecode => {
+                unreachable!("bytecode throws retain their original value")
+            }
+        };
+        let id = self
+            .intrinsics
+            .builtins
+            .id_named(name)
+            .expect("error constructor is installed");
+        match self.throw_error(id, message.to_owned()) {
+            EvalFailure::ThrowValue(value) => Ok(value),
+            EvalFailure::Runtime(kind) => Err(kind),
+            _ => unreachable!("error materialization returns a thrown value"),
         }
     }
 
@@ -3628,6 +3849,7 @@ impl<'a, H: Host> Machine<'a, H> {
             binding_cells: Vec::new(),
             constant_cells: Vec::new(),
             namespace: None,
+            import_meta: None,
             state: ModuleState::Unevaluated,
         });
         debug_assert_eq!(
@@ -3673,7 +3895,20 @@ impl<'a, H: Host> Machine<'a, H> {
                 binding_cells: vec![None; module.bindings.len()],
                 constant_cells: vec![None; module.code.constants().len()],
                 namespace: None,
+                import_meta: None,
                 state: ModuleState::Unevaluated,
+            })
+            .collect();
+        self.registry.local_modules = program
+            .modules()
+            .iter()
+            .enumerate()
+            .map(|(module_index, module)| {
+                let name = match module.code.constants().get(module.name.get() as usize) {
+                    Some(Constant::String(name)) => name.clone(),
+                    _ => unreachable!("verified program module names are strings"),
+                };
+                (name, ModuleId::new(module_index as u32))
             })
             .collect();
 
@@ -3766,6 +4001,42 @@ impl<'a, H: Host> Machine<'a, H> {
             }
         }
         Ok(())
+    }
+
+    fn load_import_meta(&mut self, module: ModuleId) -> Result<Value, RuntimeErrorKind> {
+        let module_index = module.get() as usize;
+        if let Some(value) = self.registry.modules[module_index].import_meta {
+            return Ok(value);
+        }
+        let module_name = self
+            .constant_text(module, self.program_module(module).name)
+            .clone();
+        let url = self.host.import_meta_url(&module_name);
+        let url_key = PropertyKey::Named(EcmaString::from_utf8("url"));
+        let bytes = url
+            .len_units()
+            .saturating_mul(2)
+            .saturating_add(url_key.charge_bytes().saturating_add(1));
+        self.ensure_allocation_capacity(2, bytes)?;
+        let url_value = self.allocate(HeapEntry::String(url))?;
+        let mut properties = PropertyMap::default();
+        properties.insert(
+            url_key,
+            Property::Data {
+                value: url_value,
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            },
+        );
+        let value = self.allocate(HeapEntry::Object {
+            properties,
+            prototype: Some(self.intrinsics.object_prototype),
+            boxed_primitive: None,
+            extensible: true,
+        })?;
+        self.registry.modules[module_index].import_meta = Some(value);
+        Ok(value)
     }
 
     fn module_namespace(
@@ -4152,6 +4423,157 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
+    /// Resolves a runtime `import()` specifier without requiring an edge.
+    /// Declared requester edges take precedence, then exact external lookup.
+    /// Relative `./` and `../` specifiers then resolve against the requester's
+    /// canonical module directory through the bundled-local name map. Absolute
+    /// and other opaque strings are never treated as local paths.
+    fn resolve_dynamic_specifier(
+        &self,
+        requester: ModuleId,
+        specifier: &EcmaString,
+    ) -> Option<DynamicImportTarget> {
+        if let Some(edge) = self
+            .program_module(requester)
+            .edges
+            .iter()
+            .find(|edge| self.constant_text(requester, edge.specifier) == specifier)
+        {
+            match edge.target {
+                EdgeTarget::Local(target) => return Some(DynamicImportTarget::Local(target)),
+                EdgeTarget::External if self.registry.external.contains_key(specifier) => {
+                    return Some(DynamicImportTarget::External(specifier.clone()));
+                }
+                EdgeTarget::External => return None,
+            }
+        }
+        if self.registry.external.contains_key(specifier) {
+            return Some(DynamicImportTarget::External(specifier.clone()));
+        }
+        if !is_relative_module_specifier(specifier) {
+            return None;
+        }
+        let requester_name = self.constant_text(requester, self.program_module(requester).name);
+        let resolved = resolve_relative_against_module_name(requester_name, specifier);
+        self.registry
+            .local_modules
+            .get(&resolved)
+            .copied()
+            .map(DynamicImportTarget::Local)
+    }
+
+    fn attach_dynamic_import_reactions(
+        &mut self,
+        evaluation: Value,
+        promise: Value,
+        target: ModuleId,
+    ) -> Result<(), EvalFailure> {
+        let index = self
+            .runtime_slot(evaluation)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "dynamic import evaluation promise",
+            }))?;
+        let state = match &self.heap[index] {
+            HeapEntry::Promise { state, .. } => state.clone(),
+            _ => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "dynamic import evaluation promise",
+                }));
+            }
+        };
+        let context = self.context_global;
+        match state {
+            PromiseState::Pending { .. } => {
+                self.charge_promise_reactions(index, 2)?;
+                let HeapEntry::Promise {
+                    state:
+                        PromiseState::Pending {
+                            fulfill_reactions,
+                            reject_reactions,
+                        },
+                    ..
+                } = &mut self.heap[index]
+                else {
+                    unreachable!("promise state was cloned from pending");
+                };
+                fulfill_reactions.push(PromiseReaction::DynamicImportFulfill {
+                    promise,
+                    target,
+                    context,
+                });
+                reject_reactions.push(PromiseReaction::DynamicImportReject { promise, context });
+                Ok(())
+            }
+            PromiseState::Fulfilled { .. } => {
+                let namespace = self
+                    .module_namespace(target, target)
+                    .map_err(|error| EvalFailure::Runtime(error.kind))?;
+                self.resolve_promise(promise, namespace)
+                    .map_err(EvalFailure::Runtime)
+            }
+            PromiseState::Rejected { reason, origin } => self
+                .reject_promise(promise, reason, origin)
+                .map_err(EvalFailure::Runtime),
+        }
+    }
+
+    /// Evaluates `import(specifier)` in the runtime plane. It always returns a
+    /// promise for ordinary resolution and coercion failures rather than
+    /// throwing those failures synchronously.
+    fn import_dynamic_expression(
+        &mut self,
+        requester: ModuleId,
+        specifier: Value,
+    ) -> Result<Value, EvalFailure> {
+        let specifier = match self.coerce_string_observable(specifier) {
+            Ok(specifier) => specifier,
+            Err(EvalFailure::Runtime(kind)) => return Err(EvalFailure::Runtime(kind)),
+            Err(failure) => {
+                let promise = self.create_promise()?;
+                self.reject_promise_failure(promise, failure)?;
+                return Ok(promise);
+            }
+        };
+        let Some(target) = self.resolve_dynamic_specifier(requester, &specifier) else {
+            let promise = self.create_promise()?;
+            self.reject_promise_failure(
+                promise,
+                EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "resolve dynamic module specifier",
+                }),
+            )?;
+            return Ok(promise);
+        };
+        match target {
+            DynamicImportTarget::External(specifier) => {
+                let namespace = self.registry.external[&specifier].namespace;
+                let promise = self.create_promise()?;
+                self.resolve_promise(promise, namespace)
+                    .map_err(EvalFailure::Runtime)?;
+                Ok(promise)
+            }
+            DynamicImportTarget::Local(target) => match self.import_dynamic(requester, target)? {
+                DynamicImport::Ready(namespace) => {
+                    let promise = self.create_promise()?;
+                    self.resolve_promise(promise, namespace)
+                        .map_err(EvalFailure::Runtime)?;
+                    Ok(promise)
+                }
+                DynamicImport::Pending(evaluation) => {
+                    let promise = self.create_promise()?;
+                    self.attach_dynamic_import_reactions(evaluation, promise, target)?;
+                    Ok(promise)
+                }
+                DynamicImport::Failed(error) => {
+                    let promise = self.create_promise()?;
+                    self.reject_promise_failure(promise, import_failure(&error))?;
+                    Ok(promise)
+                }
+            },
+        }
+    }
+
     /// Reports whether the resolved dynamic edge also carries a static
     /// component; coalesced edges follow static namespace semantics.
     fn import_edge_has_static(&self, module: ModuleId, specifier: ConstantId) -> bool {
@@ -4440,6 +4862,16 @@ impl<'a, H: Host> Machine<'a, H> {
                     self.write_register(frame_index, dst.get(), value);
                     self.frames[frame_index].pc = pc + 1;
                 }
+                Instruction::ToObject { dst, src } => {
+                    let source = self.read_register(frame_index, src.get());
+                    match self.to_object(source) {
+                        Ok(value) => {
+                            self.write_register(frame_index, dst.get(), value);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
                 Instruction::CreateArray { dst } => {
                     let value = self
                         .allocate(HeapEntry::Array {
@@ -4591,6 +5023,61 @@ impl<'a, H: Host> Machine<'a, H> {
                         Err(failure) => self.resolve_failure(failure, pc)?,
                     }
                 }
+                Instruction::DefineDataProperty { object, key, value } => {
+                    let object = self.read_register(frame_index, object.get());
+                    let value = self.read_register(frame_index, value.get());
+                    let key_value = self.read_register(frame_index, key.get());
+                    let key = match self.to_property_key(key_value) {
+                        Ok(key) => key,
+                        Err(failure) => {
+                            self.resolve_failure(failure, pc)?;
+                            continue;
+                        }
+                    };
+                    match self.define_descriptor(
+                        object,
+                        key,
+                        Property::Data {
+                            value,
+                            writable: true,
+                            enumerable: false,
+                            configurable: true,
+                        },
+                    ) {
+                        Ok(()) => self.frames[frame_index].pc = pc + 1,
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::LoadOwnDescriptorSlot {
+                    dst,
+                    object,
+                    key,
+                    slot,
+                } => {
+                    let object = self.read_register(frame_index, object.get());
+                    let key = self.read_register(frame_index, key.get());
+                    match self.load_own_descriptor_slot(object, key, slot) {
+                        Ok(value) => {
+                            self.write_register(frame_index, dst.get(), value);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::DefineOwnDescriptorSlot {
+                    object,
+                    key,
+                    src,
+                    slot,
+                } => {
+                    let object = self.read_register(frame_index, object.get());
+                    let key = self.read_register(frame_index, key.get());
+                    let src = self.read_register(frame_index, src.get());
+                    match self.define_own_descriptor_slot(object, key, src, slot) {
+                        Ok(()) => self.frames[frame_index].pc = pc + 1,
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
                 Instruction::Call {
                     dst,
                     callee,
@@ -4624,7 +5111,23 @@ impl<'a, H: Host> Machine<'a, H> {
                     match self.read_arguments(frame_index, arguments.get()) {
                         Ok(arguments) => {
                             self.frames[frame_index].pc = pc + 1;
-                            self.execute_construct(callee, &arguments, dst.get(), pc)?;
+                            self.execute_construct(callee, callee, &arguments, dst.get(), pc)?;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::ConstructWithNewTarget {
+                    dst,
+                    callee,
+                    new_target,
+                    arguments,
+                } => {
+                    let callee = self.read_register(frame_index, callee.get());
+                    let new_target = self.read_register(frame_index, new_target.get());
+                    match self.read_arguments(frame_index, arguments.get()) {
+                        Ok(arguments) => {
+                            self.frames[frame_index].pc = pc + 1;
+                            self.execute_construct(callee, new_target, &arguments, dst.get(), pc)?;
                         }
                         Err(failure) => self.resolve_failure(failure, pc)?,
                     }
@@ -4675,6 +5178,13 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 Instruction::LoadNewTarget { dst } => {
                     let value = self.frames[frame_index].new_target;
+                    self.write_register(frame_index, dst.get(), value);
+                    self.frames[frame_index].pc = pc + 1;
+                }
+                Instruction::LoadImportMeta { dst } => {
+                    let value = self
+                        .load_import_meta(module_id)
+                        .map_err(|kind| self.error_at(kind, function_index, pc))?;
                     self.write_register(frame_index, dst.get(), value);
                     self.frames[frame_index].pc = pc + 1;
                 }
@@ -4836,6 +5346,52 @@ impl<'a, H: Host> Machine<'a, H> {
                         self.frames[frame_index].pc = pc + 1;
                     }
                 }
+                Instruction::DisposeCapture {
+                    method,
+                    kind,
+                    src,
+                    hint,
+                } => {
+                    let src = self.read_register(frame_index, src.get());
+                    match self.dispose_capture_raw(src, hint) {
+                        Ok((captured_method, captured_kind)) => {
+                            self.write_register(frame_index, method.get(), captured_method);
+                            self.write_register(
+                                frame_index,
+                                kind.get(),
+                                Value::int32(captured_kind),
+                            );
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::SuppressError {
+                    dst,
+                    error,
+                    suppressed,
+                } => {
+                    let error = self.read_register(frame_index, error.get());
+                    let suppressed = self.read_register(frame_index, suppressed.get());
+                    match self.make_suppressed_error(error, suppressed) {
+                        Ok(value) => {
+                            self.write_register(frame_index, dst.get(), value);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::WithHasBinding { dst, object, key } => {
+                    let object = self.read_register(frame_index, object.get());
+                    let key = self.read_register(frame_index, key.get());
+                    match self.with_has_binding(object, key) {
+                        Ok(found) => {
+                            self.write_register(frame_index, dst.get(), Value::boolean(found));
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
                 Instruction::Jump { target } => {
                     self.frames[frame_index].pc = target.get() as usize;
                 }
@@ -4931,6 +5487,16 @@ impl<'a, H: Host> Machine<'a, H> {
                     match self.import_namespace(module_id, specifier) {
                         Ok(namespace) => {
                             self.write_register(frame_index, dst.get(), namespace);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::ImportDynamic { dst, specifier } => {
+                    let specifier = self.read_register(frame_index, specifier.get());
+                    match self.import_dynamic_expression(module_id, specifier) {
+                        Ok(promise) => {
+                            self.write_register(frame_index, dst.get(), promise);
                             self.frames[frame_index].pc = pc + 1;
                         }
                         Err(failure) => self.resolve_failure(failure, pc)?,
@@ -5294,6 +5860,7 @@ impl<'a, H: Host> Machine<'a, H> {
         callee: Value,
         this_value: Value,
         arguments: &[Value],
+        mut new_target: Value,
     ) -> Result<BoundCall, RuntimeErrorKind> {
         let mut target = callee;
         let mut receiver = this_value;
@@ -5321,6 +5888,11 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             segments.push(bound.arguments.as_slice());
             receiver = bound.this_value;
+            // BoundFunction [[Construct]]: each wrapper forwards newTarget to its
+            // [[BoundTargetFunction]] only when newTarget is the wrapper itself.
+            if new_target == target {
+                new_target = bound.target;
+            }
             target = bound.target;
         }
         let mut flattened = Vec::with_capacity(total);
@@ -5332,6 +5904,7 @@ impl<'a, H: Host> Machine<'a, H> {
             target,
             this_value: receiver,
             arguments: flattened,
+            new_target,
         })
     }
 
@@ -5711,7 +6284,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 Ok(CalleeKind::Bound) => {
                     let bound = self
-                        .flatten_bound(callee, this_value, arguments.as_ref())
+                        .flatten_bound(callee, this_value, arguments.as_ref(), Value::UNDEFINED)
                         .map_err(|kind| self.error_here_at(kind, call_pc))?;
                     callee = bound.target;
                     if constructed.is_none() {
@@ -5728,16 +6301,19 @@ impl<'a, H: Host> Machine<'a, H> {
     fn execute_construct(
         &mut self,
         callee: Value,
+        new_target: Value,
         arguments: &[Value],
         destination: u32,
         call_pc: usize,
     ) -> Result<(), RuntimeError> {
         let mut callee = callee;
+        let mut new_target = new_target;
         let mut arguments = Cow::Borrowed(arguments);
         if matches!(self.callee_kind(callee), Ok(CalleeKind::Bound)) {
             let bound = self
-                .flatten_bound(callee, Value::UNDEFINED, arguments.as_ref())
+                .flatten_bound(callee, Value::UNDEFINED, arguments.as_ref(), new_target)
                 .map_err(|kind| self.error_here_at(kind, call_pc))?;
+            new_target = bound.new_target;
             callee = bound.target;
             arguments = Cow::Owned(bound.arguments);
         }
@@ -5754,7 +6330,13 @@ impl<'a, H: Host> Machine<'a, H> {
             _ => None,
         };
         if let Some(id) = builtin {
-            return match self.call_builtin(id, Value::UNDEFINED, arguments.as_ref(), true) {
+            return match self.call_builtin_with_new_target(
+                id,
+                Value::UNDEFINED,
+                arguments.as_ref(),
+                true,
+                new_target,
+            ) {
                 Ok(intrinsics::BuiltinOutcome::Value(value)) => {
                     self.write_register(self.frames.len() - 1, destination, value);
                     Ok(())
@@ -5783,7 +6365,7 @@ impl<'a, H: Host> Machine<'a, H> {
             return self.throw_type("construct", call_pc);
         }
         let object = self
-            .allocate_constructed_receiver(callee)
+            .allocate_constructed_receiver(new_target)
             .map_err(|kind| self.error_here_at(kind, call_pc))?;
         self.execute_call(CallRequest {
             callee,
@@ -5792,11 +6374,11 @@ impl<'a, H: Host> Machine<'a, H> {
             destination: Some(destination),
             call_pc,
             constructed: Some(object),
-            new_target: callee,
+            new_target,
         })
     }
 
-    fn constructed_prototype(&self, callee: Value) -> Result<Value, RuntimeErrorKind> {
+    pub(crate) fn constructed_prototype(&self, callee: Value) -> Result<Value, RuntimeErrorKind> {
         let index = self
             .runtime_slot(callee)?
             .ok_or(RuntimeErrorKind::InvalidValue { value: callee })?;
@@ -5811,7 +6393,7 @@ impl<'a, H: Host> Machine<'a, H> {
         self.allocate_constructed_receiver_with(prototype)
     }
 
-    fn allocate_constructed_receiver_with(
+    pub(crate) fn allocate_constructed_receiver_with(
         &mut self,
         prototype: Value,
     ) -> Result<Value, RuntimeErrorKind> {
@@ -5960,9 +6542,15 @@ impl<'a, H: Host> Machine<'a, H> {
         let prototype = match value.decode() {
             Some(Decoded::Boolean(_)) => self.intrinsics.boolean_prototype,
             Some(Decoded::Number(_) | Decoded::Int32(_)) => self.intrinsics.number_prototype,
-            Some(Decoded::HeapRef(_)) if self.string_value(value).is_some() => {
-                self.intrinsics.string_prototype
-            }
+            Some(Decoded::HeapRef(_)) => match self
+                .runtime_slot(value)
+                .map_err(EvalFailure::Runtime)?
+                .map(|index| &self.heap[index])
+            {
+                Some(HeapEntry::String(_)) => self.intrinsics.string_prototype,
+                Some(HeapEntry::Symbol { .. }) => self.intrinsics.builtins.symbol_prototype(),
+                _ => self.intrinsics.object_prototype,
+            },
             _ => self.intrinsics.object_prototype,
         };
         self.allocate(HeapEntry::Object {
@@ -5972,6 +6560,37 @@ impl<'a, H: Host> Machine<'a, H> {
             extensible: true,
         })
         .map_err(EvalFailure::Runtime)
+    }
+
+    pub(crate) fn to_object(&mut self, value: Value) -> Result<Value, EvalFailure> {
+        if matches!(
+            value.decode(),
+            Some(Decoded::Undefined | Decoded::Null | Decoded::Hole | Decoded::Uninitialized)
+                | None
+        ) {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "convert nullish value to object",
+            }));
+        }
+        let heap_primitive = self
+            .runtime_slot(value)
+            .map_err(EvalFailure::Runtime)?
+            .is_some_and(|index| {
+                matches!(
+                    self.heap[index],
+                    HeapEntry::String(_)
+                        | HeapEntry::BigInt(_)
+                        | HeapEntry::Symbol { .. }
+                        | HeapEntry::PrivateName { .. }
+                )
+            });
+        if heap_primitive {
+            return self.box_primitive(value);
+        }
+        if self.is_object(value) {
+            return Ok(value);
+        }
+        self.box_primitive(value)
     }
 
     pub(crate) fn unbox_primitive_or_self(&self, value: Value) -> Result<Value, EvalFailure> {
@@ -6002,6 +6621,12 @@ impl<'a, H: Host> Machine<'a, H> {
 
     pub(crate) fn current_builtin_id(&self) -> Option<intrinsics::BuiltinId> {
         self.current_builtin_id
+    }
+
+    /// The `new.target` value scoped to the currently executing builtin
+    /// constructor, or `Value::UNDEFINED` outside builtin construction.
+    pub(crate) fn current_new_target(&self) -> Value {
+        self.current_new_target
     }
 
     pub(crate) fn throw_error(
@@ -6052,7 +6677,13 @@ impl<'a, H: Host> Machine<'a, H> {
     ) -> Result<Value, EvalFailure> {
         match self.callee_kind(callee).map_err(EvalFailure::Runtime)? {
             CalleeKind::Builtin { id } => {
-                match self.call_builtin(id, Value::UNDEFINED, arguments, true)? {
+                match self.call_builtin_with_new_target(
+                    id,
+                    Value::UNDEFINED,
+                    arguments,
+                    true,
+                    callee,
+                )? {
                     intrinsics::BuiltinOutcome::Value(value) => Ok(value),
                     _ => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                         operation: "construct",
@@ -6092,8 +6723,8 @@ impl<'a, H: Host> Machine<'a, H> {
                     Err(error) => {
                         self.unwind_frames_to(stop_depth);
                         match error.kind {
-                            RuntimeErrorKind::UncaughtThrow { value, .. } => {
-                                Err(EvalFailure::ThrowValue(value))
+                            RuntimeErrorKind::UncaughtThrow { value, origin } => {
+                                Err(EvalFailure::ThrowValueOrigin { value, origin })
                             }
                             kind => Err(EvalFailure::Runtime(kind)),
                         }
@@ -6102,7 +6733,7 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             CalleeKind::Bound => {
                 let bound = self
-                    .flatten_bound(callee, Value::UNDEFINED, arguments)
+                    .flatten_bound(callee, Value::UNDEFINED, arguments, Value::UNDEFINED)
                     .map_err(EvalFailure::Runtime)?;
                 self.construct_value(bound.target, &bound.arguments)
             }
@@ -6210,8 +6841,8 @@ impl<'a, H: Host> Machine<'a, H> {
                         Err(error) => {
                             self.unwind_frames_to(stop_depth);
                             match error.kind {
-                                RuntimeErrorKind::UncaughtThrow { value, .. } => {
-                                    Err(EvalFailure::ThrowValue(value))
+                                RuntimeErrorKind::UncaughtThrow { value, origin } => {
+                                    Err(EvalFailure::ThrowValueOrigin { value, origin })
                                 }
                                 kind => Err(EvalFailure::Runtime(kind)),
                             }
@@ -6220,7 +6851,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 CalleeKind::Bound => {
                     let bound = self
-                        .flatten_bound(callee, this_value, arguments.as_ref())
+                        .flatten_bound(callee, this_value, arguments.as_ref(), Value::UNDEFINED)
                         .map_err(EvalFailure::Runtime)?;
                     callee = bound.target;
                     this_value = bound.this_value;
@@ -6322,8 +6953,23 @@ impl<'a, H: Host> Machine<'a, H> {
             let module = self.frames[frame_index].module;
             let function = &self.module_code(module).functions()[function_index];
             if let Some(handler) = innermost_handler(function, search_pc) {
+                // Bytecode throws and already-materialized engine errors keep
+                // their supplied value. Only an unmaterialized (UNDEFINED)
+                // non-Bytecode origin allocates an intrinsic error object.
+                let catch_value = if catch_value_needs_materialization(value, origin) {
+                    self.materialize_engine_origin(origin).map_err(|kind| {
+                        self.error_at_in_module(
+                            kind,
+                            site_module,
+                            site_function,
+                            faulting_pc,
+                        )
+                    })?
+                } else {
+                    value
+                };
                 let frame = &mut self.frames[frame_index];
-                frame.registers[handler.catch_register.get() as usize] = value;
+                frame.registers[handler.catch_register.get() as usize] = catch_value;
                 frame.pc = handler.handler.get() as usize;
                 return Ok(());
             }
@@ -6563,19 +7209,10 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn primitive_get(&self, index: usize, key: &PropertyKey) -> Option<Found> {
-        if let HeapEntry::String(text) = &self.heap[index]
-            && let PropertyKey::Named(name) = key
-        {
-            if name.eq_ascii("length") {
-                return Some(Found::Value(number_value(text.len_units() as f64)));
-            }
-            if let Some(offset) = array_index(name)
-                && let Some(unit) = text.unit_at(offset as usize)
-            {
-                return Some(Found::Text(EcmaString::from_units(&[unit])));
-            }
+        match &self.heap[index] {
+            HeapEntry::String(text) => string_own_get(text, key),
+            _ => None,
         }
-        None
     }
     fn own_get_ascii(&self, index: usize, name: &str) -> Option<Found> {
         debug_assert!(name.is_ascii());
@@ -6584,8 +7221,24 @@ impl<'a, H: Host> Machine<'a, H> {
             return Some(Found::Value(self.intrinsics.object_to_string()));
         }
         match &self.heap[index] {
-            HeapEntry::Object { properties, .. }
-            | HeapEntry::Generator { properties, .. }
+            HeapEntry::Object {
+                properties,
+                boxed_primitive,
+                ..
+            } => {
+                if let Some(found) = property_lookup_ascii(properties, name) {
+                    return Some(found);
+                }
+                if let Some(primitive) = boxed_primitive {
+                    if let Some(slot) = self.runtime_slot(*primitive).ok().flatten() {
+                        if let HeapEntry::String(text) = &self.heap[slot] {
+                            return string_own_get_ascii(text, name);
+                        }
+                    }
+                }
+                None
+            }
+            HeapEntry::Generator { properties, .. }
             | HeapEntry::AsyncGenerator { properties, .. }
             | HeapEntry::Script { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
@@ -6726,8 +7379,24 @@ impl<'a, H: Host> Machine<'a, H> {
             }
         }
         match &self.heap[index] {
-            HeapEntry::Object { properties, .. }
-            | HeapEntry::Generator { properties, .. }
+            HeapEntry::Object {
+                properties,
+                boxed_primitive,
+                ..
+            } => {
+                if let Some(found) = property_lookup(properties, key) {
+                    return Some(found);
+                }
+                if let Some(primitive) = boxed_primitive {
+                    if let Some(slot) = self.runtime_slot(*primitive).ok().flatten() {
+                        if let HeapEntry::String(text) = &self.heap[slot] {
+                            return string_own_get(text, key);
+                        }
+                    }
+                }
+                None
+            }
+            HeapEntry::Generator { properties, .. }
             | HeapEntry::AsyncGenerator { properties, .. }
             | HeapEntry::Script { properties, .. }
             | HeapEntry::Date { properties, .. }
@@ -6872,8 +7541,8 @@ impl<'a, H: Host> Machine<'a, H> {
                     None
                 }
             }
+            HeapEntry::String(text) => string_own_get(text, key),
             HeapEntry::ProcessEnv { .. }
-            | HeapEntry::String(_)
             | HeapEntry::BigInt(_)
             | HeapEntry::Symbol { .. }
             | HeapEntry::PrivateName { .. }
@@ -10370,6 +11039,14 @@ fn innermost_handler(function: &Function, pc: usize) -> Option<bamts_bytecode::E
         })
 }
 
+/// The catch-value guard shared by the interpreter and the native engine:
+/// bytecode throws and already-materialized (non-`UNDEFINED`) engine values
+/// keep their identity; only a still-lazy (`UNDEFINED`) non-bytecode origin is
+/// materialized into a realm-intrinsic error object at the catch boundary.
+pub(crate) fn catch_value_needs_materialization(value: Value, origin: ThrowOrigin) -> bool {
+    !matches!(origin, ThrowOrigin::Bytecode) && value == Value::UNDEFINED
+}
+
 fn numeric_f64(value: Value) -> Option<f64> {
     match value.decode()? {
         Decoded::Number(number) => Some(number),
@@ -10513,6 +11190,25 @@ fn array_index(key: &EcmaString) -> Option<u32> {
             .checked_add(u32::from(unit - u16::from(b'0')))?;
     }
     (index != u32::MAX).then_some(index)
+}
+
+fn string_own_get(text: &EcmaString, key: &PropertyKey) -> Option<Found> {
+    let PropertyKey::Named(name) = key else {
+        return None;
+    };
+    let Ok(name) = name.to_utf8_strict() else {
+        return None;
+    };
+    string_own_get_ascii(text, &name)
+}
+
+fn string_own_get_ascii(text: &EcmaString, name: &str) -> Option<Found> {
+    if name == "length" {
+        return Some(Found::Value(number_value(text.len_units() as f64)));
+    }
+    let offset = array_index_ascii(name)?;
+    let unit = text.unit_at(offset as usize)?;
+    Some(Found::Text(EcmaString::from_units(&[unit])))
 }
 
 fn uint8array_index(key: &EcmaString) -> Option<Option<usize>> {
@@ -10970,6 +11666,72 @@ mod tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&program, &mut host, limits);
         test(&mut machine);
+    }
+
+    #[test]
+    fn suppressed_error_allocator_preserves_chain_and_hides_fields() {
+        with_machine(Limits::default(), |machine| {
+            let body_error = Value::int32(1);
+            let inner_disposal_error = Value::int32(2);
+            let outer_disposal_error = Value::int32(4);
+            let inner = machine
+                .make_suppressed_error(inner_disposal_error, body_error)
+                .expect("inner suppression allocates");
+            let outer = machine
+                .make_suppressed_error(outer_disposal_error, inner)
+                .expect("outer suppression allocates");
+
+            assert_eq!(
+                machine.get_named_property(outer, "error").unwrap(),
+                outer_disposal_error
+            );
+            assert_eq!(
+                machine.get_named_property(outer, "suppressed").unwrap(),
+                inner
+            );
+            assert_eq!(
+                machine.get_named_property(inner, "error").unwrap(),
+                inner_disposal_error
+            );
+            assert_eq!(
+                machine.get_named_property(inner, "suppressed").unwrap(),
+                body_error
+            );
+            assert!(
+                machine
+                    .own_descriptor(outer, &PropertyKey::Named(EcmaString::from_utf8("message")))
+                    .unwrap()
+                    .is_none()
+            );
+            for (object, name, expected) in [
+                (outer, "error", outer_disposal_error),
+                (outer, "suppressed", inner),
+                (inner, "error", inner_disposal_error),
+                (inner, "suppressed", body_error),
+            ] {
+                let descriptor = machine
+                    .own_descriptor(object, &PropertyKey::Named(EcmaString::from_utf8(name)))
+                    .unwrap()
+                    .expect("suppression field is own");
+                assert!(matches!(
+                    descriptor,
+                    Property::Data {
+                        value,
+                        writable: true,
+                        enumerable: false,
+                        configurable: true,
+                    } if value == expected
+                ));
+            }
+            let constructor = machine
+                .intrinsics
+                .global("SuppressedError")
+                .expect("SuppressedError exists");
+            let prototype = machine
+                .get_named_property(constructor, "prototype")
+                .unwrap();
+            assert!(machine.inherits_from_prototype(outer, prototype).unwrap());
+        });
     }
 
     #[test]
@@ -13013,7 +13775,10 @@ mod tests {
 
         assert!(matches!(
             machine.call_value(callee, Value::UNDEFINED, &[thrown]),
-            Err(EvalFailure::ThrowValue(value)) if value == thrown
+            Err(EvalFailure::ThrowValueOrigin {
+                value,
+                origin: ThrowOrigin::Bytecode,
+            }) if value == thrown
         ));
     }
 
@@ -14130,6 +14895,1127 @@ mod tests {
     }
 
     #[test]
+    fn define_data_property_is_non_enumerable_writable_and_configurable() {
+        // Tag 48 DefineDataProperty installs a fixed data descriptor:
+        // writable / non-enumerable / configurable.
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::Int32(7),
+            ],
+            vec![function(
+                0,
+                4,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(1),
+                    },
+                    Instruction::DefineDataProperty {
+                        object: reg(0),
+                        key: reg(1),
+                        value: reg(2),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(3),
+                        object: reg(0),
+                        key: reg(1),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                vec![],
+            )],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let execution = machine.evaluate().unwrap();
+        assert_eq!(execution.entry_registers[3], Value::int32(7));
+        let object = execution.value;
+        let key = PropertyKey::Named(EcmaString::from_utf8("x"));
+        let descriptor = machine
+            .own_descriptor(object, &key)
+            .unwrap()
+            .expect("DefineDataProperty installs an own data property");
+        assert!(matches!(
+            descriptor,
+            Property::Data {
+                value,
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            } if value == Value::int32(7)
+        ));
+        assert!(
+            machine.enumerable_keys(object).unwrap().is_empty(),
+            "DefineDataProperty must not expose the key to enumeration"
+        );
+        assert!(
+            !machine.own_property_is_enumerable(object, &key).unwrap(),
+            "own property must report non-enumerable"
+        );
+        assert!(
+            machine.delete_property(object, &key).unwrap(),
+            "configurable DefineDataProperty must be deletable"
+        );
+        assert!(machine.own_descriptor(object, &key).unwrap().is_none());
+    }
+
+    #[test]
+    fn define_data_property_preserves_descriptor_errors_on_non_object() {
+        let module = verified(
+            vec![
+                Constant::Int32(1),
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::Int32(7),
+            ],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(1),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(2),
+                    },
+                    Instruction::DefineDataProperty {
+                        object: reg(0),
+                        key: reg(1),
+                        value: reg(2),
+                    },
+                    Instruction::Halt,
+                ],
+                vec![],
+            )],
+        );
+        let mut host = TestHost;
+        let error = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .expect_err("DefineDataProperty on a non-object must throw");
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::TypeError { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn define_data_property_preserves_descriptor_errors_on_non_extensible() {
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("sealed")),
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::Int32(7),
+            ],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(1),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(2),
+                    },
+                    Instruction::DefineDataProperty {
+                        object: reg(0),
+                        key: reg(1),
+                        value: reg(2),
+                    },
+                    Instruction::Halt,
+                ],
+                vec![],
+            )],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let sealed = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: false,
+                boxed_primitive: None,
+            })
+            .unwrap();
+        machine
+            .globals
+            .insert(EcmaString::from_utf8("sealed"), sealed);
+        let error = machine
+            .run()
+            .expect_err("DefineDataProperty on a non-extensible object must throw");
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::TypeError { .. },
+                ..
+            }
+        ));
+    }
+
+
+    #[test]
+    fn load_own_descriptor_slot_instruction_covers_absent_data_accessor_and_mismatch() {
+        // Tag 49 LoadOwnDescriptorSlot is own-only and non-invoking.
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("data")),
+                Constant::Int32(7),
+                Constant::String(EcmaString::from_utf8("accessor")),
+                Constant::String(EcmaString::from_utf8("missing")),
+            ],
+            vec![function(
+                0,
+                10,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(1),
+                    },
+                    Instruction::DefineDataProperty {
+                        object: reg(0),
+                        key: reg(1),
+                        value: reg(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(3),
+                        constant: cid(2),
+                    },
+                    Instruction::CreateObject { dst: reg(4) },
+                    Instruction::DefineAccessor {
+                        object: reg(0),
+                        key: reg(3),
+                        accessor: reg(4),
+                        kind: AccessorKind::Getter,
+                    },
+                    Instruction::LoadOwnDescriptorSlot {
+                        dst: reg(5),
+                        object: reg(0),
+                        key: reg(1),
+                        slot: DescriptorSlot::Value,
+                    },
+                    Instruction::LoadOwnDescriptorSlot {
+                        dst: reg(6),
+                        object: reg(0),
+                        key: reg(1),
+                        slot: DescriptorSlot::Getter,
+                    },
+                    Instruction::LoadOwnDescriptorSlot {
+                        dst: reg(7),
+                        object: reg(0),
+                        key: reg(3),
+                        slot: DescriptorSlot::Getter,
+                    },
+                    Instruction::LoadOwnDescriptorSlot {
+                        dst: reg(8),
+                        object: reg(0),
+                        key: reg(3),
+                        slot: DescriptorSlot::Value,
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(9),
+                        constant: cid(3),
+                    },
+                    Instruction::LoadOwnDescriptorSlot {
+                        dst: reg(9),
+                        object: reg(0),
+                        key: reg(9),
+                        slot: DescriptorSlot::Value,
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                vec![],
+            )],
+        );
+        let execution = run_ok(&module);
+        assert_eq!(execution.entry_registers[5], Value::int32(7));
+        assert_eq!(
+            execution.entry_registers[6],
+            Value::UNDEFINED,
+            "data/getter mismatch yields undefined"
+        );
+        assert_eq!(
+            execution.entry_registers[7],
+            execution.entry_registers[4],
+            "accessor getter slot returns the installed getter"
+        );
+        assert_eq!(
+            execution.entry_registers[8],
+            Value::UNDEFINED,
+            "accessor/value mismatch yields undefined"
+        );
+        assert_eq!(
+            execution.entry_registers[9],
+            Value::UNDEFINED,
+            "absent property yields undefined"
+        );
+    }
+
+    #[test]
+    fn with_has_binding_absent_property_short_circuits_unscopables() {
+        // HasProperty miss must not read @@unscopables.
+        thread_local! {
+            static LOG: std::cell::RefCell<Vec<&'static str>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        fn unscopables_getter<H: Host>(
+            _machine: &mut Machine<'_, H>,
+            _this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            LOG.with(|log| log.borrow_mut().push("unscopables"));
+            Ok(intrinsics::BuiltinOutcome::Value(Value::UNDEFINED))
+        }
+
+        with_machine(Limits::default(), |machine| {
+            LOG.with(|log| log.borrow_mut().clear());
+            let getter_id = machine.intrinsics.builtins.register(intrinsics::BuiltinDef {
+                name: "get @@unscopables",
+                length: 0,
+                handler: unscopables_getter::<TestHost>,
+            });
+            let getter =
+                intrinsics::native_function(&mut machine.heap, getter_id, "get @@unscopables", 0);
+            let unscopables_key = machine
+                .to_property_key(machine.intrinsics.builtins.symbol_unscopables())
+                .unwrap();
+            let mut properties = PropertyMap::default();
+            properties.insert(
+                unscopables_key,
+                Property::Accessor {
+                    getter: Some(getter),
+                    setter: None,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+            let object = machine
+                .allocate(HeapEntry::Object {
+                    properties,
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let key = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("missing")))
+                .unwrap();
+            assert_eq!(machine.with_has_binding(object, key).unwrap(), false);
+            LOG.with(|log| assert!(log.borrow().is_empty(), "absent binding must short-circuit"));
+        });
+    }
+
+    #[test]
+    fn with_has_binding_allows_and_blocks_named_bindings() {
+        with_machine(Limits::default(), |machine| {
+            let unscopables_key = machine
+                .to_property_key(machine.intrinsics.builtins.symbol_unscopables())
+                .unwrap();
+            let name = PropertyKey::Named(EcmaString::from_utf8("x"));
+            let key = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .unwrap();
+            let make = |machine: &mut Machine<'_, TestHost>, blocked: Value| {
+                let blocklist = machine
+                    .allocate(HeapEntry::Object {
+                        properties: {
+                            let mut properties = PropertyMap::default();
+                            properties.insert(
+                                name.clone(),
+                                Property::Data {
+                                    value: blocked,
+                                    writable: true,
+                                    enumerable: true,
+                                    configurable: true,
+                                },
+                            );
+                            properties
+                        },
+                        prototype: None,
+                        boxed_primitive: None,
+                        extensible: true,
+                    })
+                    .unwrap();
+                machine
+                    .allocate(HeapEntry::Object {
+                        properties: {
+                            let mut properties = PropertyMap::default();
+                            properties.insert(
+                                name.clone(),
+                                Property::Data {
+                                    value: Value::int32(1),
+                                    writable: true,
+                                    enumerable: true,
+                                    configurable: true,
+                                },
+                            );
+                            properties.insert(
+                                unscopables_key.clone(),
+                                Property::Data {
+                                    value: blocklist,
+                                    writable: true,
+                                    enumerable: false,
+                                    configurable: true,
+                                },
+                            );
+                            properties
+                        },
+                        prototype: Some(machine.intrinsics.object_prototype),
+                        boxed_primitive: None,
+                        extensible: true,
+                    })
+                    .unwrap()
+            };
+            let allowed = make(machine, Value::FALSE);
+            let blocked = make(machine, Value::TRUE);
+            assert_eq!(machine.with_has_binding(allowed, key).unwrap(), true);
+            assert_eq!(machine.with_has_binding(blocked, key).unwrap(), false);
+        });
+    }
+
+    #[test]
+    fn with_has_binding_follows_inherited_candidate_and_unscopables() {
+        with_machine(Limits::default(), |machine| {
+            let unscopables_key = machine
+                .to_property_key(machine.intrinsics.builtins.symbol_unscopables())
+                .unwrap();
+            let name = PropertyKey::Named(EcmaString::from_utf8("x"));
+            let key = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .unwrap();
+            let candidate_proto = machine
+                .allocate(HeapEntry::Object {
+                    properties: {
+                        let mut properties = PropertyMap::default();
+                        properties.insert(
+                            name.clone(),
+                            Property::Data {
+                                value: Value::int32(7),
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        );
+                        properties
+                    },
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let blocklist_proto = machine
+                .allocate(HeapEntry::Object {
+                    properties: {
+                        let mut properties = PropertyMap::default();
+                        properties.insert(
+                            name.clone(),
+                            Property::Data {
+                                value: Value::TRUE,
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        );
+                        properties
+                    },
+                    prototype: None,
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let blocklist = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(blocklist_proto),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let mid = machine
+                .allocate(HeapEntry::Object {
+                    properties: {
+                        let mut properties = PropertyMap::default();
+                        properties.insert(
+                            unscopables_key,
+                            Property::Data {
+                                value: blocklist,
+                                writable: true,
+                                enumerable: false,
+                                configurable: true,
+                            },
+                        );
+                        properties
+                    },
+                    prototype: Some(candidate_proto),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let object = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(mid),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            assert!(machine.has_property(object, &name).unwrap());
+            assert_eq!(
+                machine.with_has_binding(object, key).unwrap(),
+                false,
+                "inherited unscopables entry must block the inherited candidate"
+            );
+
+            let allowed_blocklist_proto = machine
+                .allocate(HeapEntry::Object {
+                    properties: {
+                        let mut properties = PropertyMap::default();
+                        properties.insert(
+                            name,
+                            Property::Data {
+                                value: Value::FALSE,
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        );
+                        properties
+                    },
+                    prototype: None,
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let allowed_blocklist = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(allowed_blocklist_proto),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let allowed = machine
+                .allocate(HeapEntry::Object {
+                    properties: {
+                        let mut properties = PropertyMap::default();
+                        properties.insert(
+                            machine
+                                .to_property_key(machine.intrinsics.builtins.symbol_unscopables())
+                                .unwrap(),
+                            Property::Data {
+                                value: allowed_blocklist,
+                                writable: true,
+                                enumerable: false,
+                                configurable: true,
+                            },
+                        );
+                        properties
+                    },
+                    prototype: Some(candidate_proto),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            assert_eq!(machine.with_has_binding(allowed, key).unwrap(), true);
+        });
+    }
+
+    #[test]
+    fn with_has_binding_invokes_getters_in_order_with_correct_receivers() {
+        thread_local! {
+            static LOG: std::cell::RefCell<Vec<&'static str>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+            static EXPECTED_BINDING: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+            static EXPECTED_BLOCKLIST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        }
+        fn unscopables_getter<H: Host>(
+            _machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            assert_eq!(this.to_bits(), EXPECTED_BINDING.get(), "@@unscopables receiver");
+            LOG.with(|log| log.borrow_mut().push("unscopables"));
+            Ok(intrinsics::BuiltinOutcome::Value(Value::from_bits(
+                EXPECTED_BLOCKLIST.get(),
+            )))
+        }
+        fn block_getter<H: Host>(
+            _machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            assert_eq!(this.to_bits(), EXPECTED_BLOCKLIST.get(), "blocklist receiver");
+            LOG.with(|log| log.borrow_mut().push("block"));
+            Ok(intrinsics::BuiltinOutcome::Value(Value::FALSE))
+        }
+        fn candidate_getter<H: Host>(
+            _machine: &mut Machine<'_, H>,
+            _this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            LOG.with(|log| log.borrow_mut().push("candidate"));
+            Ok(intrinsics::BuiltinOutcome::Value(Value::int32(1)))
+        }
+
+        with_machine(Limits::default(), |machine| {
+            LOG.with(|log| log.borrow_mut().clear());
+            let mut install = |name, handler| {
+                let id = machine.intrinsics.builtins.register(intrinsics::BuiltinDef {
+                    name,
+                    length: 0,
+                    handler,
+                });
+                intrinsics::native_function(&mut machine.heap, id, name, 0)
+            };
+            let unscopables_get = install(
+                "get @@unscopables",
+                unscopables_getter::<TestHost> as intrinsics::BuiltinHandler<TestHost>,
+            );
+            let block_get = install("get x", block_getter::<TestHost>);
+            let candidate_get = install("get candidate x", candidate_getter::<TestHost>);
+            let name = PropertyKey::Named(EcmaString::from_utf8("x"));
+            let unscopables_key = machine
+                .to_property_key(machine.intrinsics.builtins.symbol_unscopables())
+                .unwrap();
+            let blocklist = machine
+                .allocate(HeapEntry::Object {
+                    properties: {
+                        let mut properties = PropertyMap::default();
+                        properties.insert(
+                            name.clone(),
+                            Property::Accessor {
+                                getter: Some(block_get),
+                                setter: None,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        );
+                        properties
+                    },
+                    prototype: None,
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let object = machine
+                .allocate(HeapEntry::Object {
+                    properties: {
+                        let mut properties = PropertyMap::default();
+                        properties.insert(
+                            name.clone(),
+                            Property::Accessor {
+                                getter: Some(candidate_get),
+                                setter: None,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        );
+                        properties.insert(
+                            unscopables_key,
+                            Property::Accessor {
+                                getter: Some(unscopables_get),
+                                setter: None,
+                                enumerable: false,
+                                configurable: true,
+                            },
+                        );
+                        properties
+                    },
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            EXPECTED_BINDING.set(object.to_bits());
+            EXPECTED_BLOCKLIST.set(blocklist.to_bits());
+            let key = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .unwrap();
+            assert_eq!(machine.with_has_binding(object, key).unwrap(), true);
+            LOG.with(|log| assert_eq!(&*log.borrow(), &["unscopables", "block"]));
+            assert_eq!(
+                machine.get_property_key(object, &name).unwrap(),
+                Value::int32(1)
+            );
+            LOG.with(|log| {
+                assert_eq!(&*log.borrow(), &["unscopables", "block", "candidate"]);
+            });
+        });
+    }
+
+    #[test]
+    fn with_has_binding_propagates_getter_throw_through_opcode_path() {
+        thread_local! {
+            static SENTINEL_BITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        }
+        fn throwing_unscopables<H: Host>(
+            _machine: &mut Machine<'_, H>,
+            _this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            Err(EvalFailure::ThrowValue(Value::from_bits(SENTINEL_BITS.get())))
+        }
+
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("o")),
+                Constant::String(EcmaString::from_utf8("x")),
+            ],
+            vec![function(
+                0,
+                4,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(1),
+                    },
+                    Instruction::WithHasBinding {
+                        dst: reg(2),
+                        object: reg(0),
+                        key: reg(1),
+                    },
+                    Instruction::Halt,
+                    Instruction::Return { value: reg(3) },
+                ],
+                vec![ExceptionHandler {
+                    start: pc(2),
+                    end: pc(3),
+                    handler: pc(4),
+                    catch_register: reg(3),
+                }],
+            )],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let sentinel = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        SENTINEL_BITS.set(sentinel.to_bits());
+        let getter_id = machine.intrinsics.builtins.register(intrinsics::BuiltinDef {
+            name: "throw @@unscopables",
+            length: 0,
+            handler: throwing_unscopables::<TestHost>,
+        });
+        let getter =
+            intrinsics::native_function(&mut machine.heap, getter_id, "throw @@unscopables", 0);
+        let unscopables_key = machine
+            .to_property_key(machine.intrinsics.builtins.symbol_unscopables())
+            .unwrap();
+        let object = machine
+            .allocate(HeapEntry::Object {
+                properties: {
+                    let mut properties = PropertyMap::default();
+                    properties.insert(
+                        PropertyKey::Named(EcmaString::from_utf8("x")),
+                        Property::Data {
+                            value: Value::int32(1),
+                            writable: true,
+                            enumerable: true,
+                            configurable: true,
+                        },
+                    );
+                    properties.insert(
+                        unscopables_key,
+                        Property::Accessor {
+                            getter: Some(getter),
+                            setter: None,
+                            enumerable: false,
+                            configurable: true,
+                        },
+                    );
+                    properties
+                },
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        machine.globals.insert(EcmaString::from_utf8("o"), object);
+        let execution = machine.evaluate().unwrap();
+        assert_eq!(execution.value, sentinel);
+        assert_ne!(
+            execution.entry_registers[2],
+            Value::TRUE,
+            "dst must remain untouched on abrupt completion"
+        );
+        assert_ne!(execution.entry_registers[2], Value::FALSE);
+    }
+
+    #[test]
+    fn with_has_binding_ignores_primitive_blocklist() {
+        with_machine(Limits::default(), |machine| {
+            let unscopables_key = machine
+                .to_property_key(machine.intrinsics.builtins.symbol_unscopables())
+                .unwrap();
+            // Poison String.prototype.x so a mistaken ToObject/Get on a string
+            // blocklist would incorrectly hide the binding.
+            machine
+                .set_data_property(machine.intrinsics.string_prototype, "x", Value::TRUE)
+                .unwrap();
+            let primitive_blocklist = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("blocklist")))
+                .unwrap();
+            let object = machine
+                .allocate(HeapEntry::Object {
+                    properties: {
+                        let mut properties = PropertyMap::default();
+                        properties.insert(
+                            PropertyKey::Named(EcmaString::from_utf8("x")),
+                            Property::Data {
+                                value: Value::int32(1),
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        );
+                        properties.insert(
+                            unscopables_key,
+                            Property::Data {
+                                value: primitive_blocklist,
+                                writable: true,
+                                enumerable: false,
+                                configurable: true,
+                            },
+                        );
+                        properties
+                    },
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let key = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .unwrap();
+            assert_eq!(
+                machine.with_has_binding(object, key).unwrap(),
+                true,
+                "primitive @@unscopables must leave the binding visible"
+            );
+        });
+    }
+
+    #[test]
+    fn with_has_binding_instruction_reports_allowed_and_blocked() {
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("allowed")),
+                Constant::String(EcmaString::from_utf8("blocked")),
+                Constant::String(EcmaString::from_utf8("x")),
+            ],
+            vec![function(
+                0,
+                6,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(1),
+                        name: cid(1),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(2),
+                    },
+                    Instruction::WithHasBinding {
+                        dst: reg(3),
+                        object: reg(0),
+                        key: reg(2),
+                    },
+                    Instruction::WithHasBinding {
+                        dst: reg(4),
+                        object: reg(1),
+                        key: reg(2),
+                    },
+                    Instruction::Return { value: reg(3) },
+                ],
+                vec![],
+            )],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let unscopables_key = machine
+            .to_property_key(machine.intrinsics.builtins.symbol_unscopables())
+            .unwrap();
+        let name = PropertyKey::Named(EcmaString::from_utf8("x"));
+        let mk = |machine: &mut Machine<'_, TestHost>, blocked: bool| {
+            let blocklist = machine
+                .allocate(HeapEntry::Object {
+                    properties: {
+                        let mut properties = PropertyMap::default();
+                        properties.insert(
+                            name.clone(),
+                            Property::Data {
+                                value: Value::boolean(blocked),
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        );
+                        properties
+                    },
+                    prototype: None,
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            machine
+                .allocate(HeapEntry::Object {
+                    properties: {
+                        let mut properties = PropertyMap::default();
+                        properties.insert(
+                            name.clone(),
+                            Property::Data {
+                                value: Value::int32(1),
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        );
+                        properties.insert(
+                            unscopables_key.clone(),
+                            Property::Data {
+                                value: blocklist,
+                                writable: true,
+                                enumerable: false,
+                                configurable: true,
+                            },
+                        );
+                        properties
+                    },
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap()
+        };
+        let allowed = mk(&mut machine, false);
+        let blocked = mk(&mut machine, true);
+        machine
+            .globals
+            .insert(EcmaString::from_utf8("allowed"), allowed);
+        machine
+            .globals
+            .insert(EcmaString::from_utf8("blocked"), blocked);
+        let execution = machine.evaluate().unwrap();
+        assert_eq!(execution.value, Value::TRUE);
+        assert_eq!(execution.entry_registers[3], Value::TRUE);
+        assert_eq!(execution.entry_registers[4], Value::FALSE);
+    }
+
+    #[test]
+    fn define_own_descriptor_slot_instruction_creates_absent_preserves_and_rejects_mismatch() {
+        // Tag 50 DefineOwnDescriptorSlot creates when absent and preserves shape.
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("created")),
+                Constant::Int32(9),
+                Constant::String(EcmaString::from_utf8("data")),
+                Constant::Int32(1),
+                Constant::Int32(8),
+                Constant::String(EcmaString::from_utf8("accessor")),
+            ],
+            vec![function(
+                0,
+                8,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(1),
+                    },
+                    Instruction::DefineOwnDescriptorSlot {
+                        object: reg(0),
+                        key: reg(1),
+                        src: reg(2),
+                        slot: DescriptorSlot::Value,
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(3),
+                        constant: cid(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(4),
+                        constant: cid(3),
+                    },
+                    Instruction::DefineDataProperty {
+                        object: reg(0),
+                        key: reg(3),
+                        value: reg(4),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(5),
+                        constant: cid(4),
+                    },
+                    Instruction::DefineOwnDescriptorSlot {
+                        object: reg(0),
+                        key: reg(3),
+                        src: reg(5),
+                        slot: DescriptorSlot::Value,
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(6),
+                        constant: cid(5),
+                    },
+                    Instruction::CreateObject { dst: reg(7) },
+                    Instruction::DefineAccessor {
+                        object: reg(0),
+                        key: reg(6),
+                        accessor: reg(7),
+                        kind: AccessorKind::Getter,
+                    },
+                    Instruction::CreateObject { dst: reg(1) },
+                    Instruction::DefineOwnDescriptorSlot {
+                        object: reg(0),
+                        key: reg(6),
+                        src: reg(1),
+                        slot: DescriptorSlot::Setter,
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                vec![],
+            )],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let execution = machine.evaluate().unwrap();
+        let object = execution.value;
+        let created = PropertyKey::Named(EcmaString::from_utf8("created"));
+        let data = PropertyKey::Named(EcmaString::from_utf8("data"));
+        let accessor = PropertyKey::Named(EcmaString::from_utf8("accessor"));
+        assert!(matches!(
+            machine.own_descriptor(object, &created).unwrap(),
+            Some(Property::Data {
+                value,
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            }) if value == Value::int32(9)
+        ));
+        assert!(matches!(
+            machine.own_descriptor(object, &data).unwrap(),
+            Some(Property::Data {
+                value,
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            }) if value == Value::int32(8)
+        ));
+        match machine
+            .own_descriptor(object, &accessor)
+            .unwrap()
+            .expect("accessor remains installed")
+        {
+            Property::Accessor {
+                getter: Some(getter),
+                setter: Some(setter),
+                enumerable: true,
+                configurable: true,
+            } => {
+                assert_eq!(getter, execution.entry_registers[7]);
+                assert_eq!(setter, execution.entry_registers[1]);
+            }
+            other => panic!("expected accessor with both halves, got {other:?}"),
+        }
+        drop(machine);
+
+        let mismatch = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("data")),
+                Constant::Int32(1),
+                Constant::Int32(2),
+            ],
+            vec![function(
+                0,
+                4,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(1),
+                    },
+                    Instruction::DefineDataProperty {
+                        object: reg(0),
+                        key: reg(1),
+                        value: reg(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(3),
+                        constant: cid(2),
+                    },
+                    Instruction::DefineOwnDescriptorSlot {
+                        object: reg(0),
+                        key: reg(1),
+                        src: reg(3),
+                        slot: DescriptorSlot::Getter,
+                    },
+                    Instruction::Halt,
+                ],
+                vec![],
+            )],
+        );
+        let error = Machine::new(&mismatch, &mut host, Limits::default())
+            .run()
+            .expect_err("data/getter shape mismatch must throw");
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::TypeError {
+                    operation: "decorator replacement changes descriptor shape"
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn prototype_chain_lookup_and_instanceof() {
         // proto = {}; proto.m = 5; ctor.prototype = proto; obj = new ctor();
         // return (obj.m == 5) && (obj instanceof ctor).
@@ -14495,6 +16381,78 @@ mod tests {
     }
 
     #[test]
+    fn prematerialized_reference_error_keeps_identity_through_catch() {
+        // CreateCell TDZ throws ThrowValueOrigin with a pre-built ReferenceError.
+        // Catch must keep that exact Value: rematerializing would allocate a
+        // different object whose message is the origin operation string.
+        let module = verified(
+            vec![Constant::Int32(0)],
+            vec![function(
+                0,
+                5,
+                vec![
+                    Instruction::CreateCell { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(2),
+                        object: reg(0),
+                        key: reg(1),
+                    },
+                    Instruction::Halt,
+                    // First catch: preserve the prematerialized error, then
+                    // rethrow it so a second catch can StrictEqual identities.
+                    Instruction::Throw { value: reg(3) },
+                    Instruction::Binary {
+                        dst: reg(4),
+                        op: BinaryOp::StrictEqual,
+                        left: reg(3),
+                        right: reg(0),
+                    },
+                    Instruction::Return { value: reg(4) },
+                ],
+                vec![
+                    ExceptionHandler {
+                        start: pc(2),
+                        end: pc(3),
+                        handler: pc(4),
+                        catch_register: reg(3),
+                    },
+                    ExceptionHandler {
+                        start: pc(4),
+                        end: pc(5),
+                        handler: pc(5),
+                        catch_register: reg(0),
+                    },
+                ],
+            )],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let execution = machine.evaluate().unwrap();
+        assert_eq!(execution.value, Value::TRUE);
+        let error = execution.entry_registers[3];
+        assert_eq!(error, execution.entry_registers[0]);
+        let name = machine.get_named_property(error, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name)
+                .is_some_and(|text| text.eq_ascii("ReferenceError"))
+        );
+        let message = machine.get_named_property(error, "message").unwrap();
+        assert!(
+            machine.string_value(message).is_some_and(|text| {
+                text.eq_ascii("Cannot access lexical binding before initialization")
+            })
+        );
+        let constructor = machine.intrinsics.global("ReferenceError").unwrap();
+        assert!(machine.instance_of(error, constructor).unwrap());
+        machine.run_to_quiescence().unwrap();
+    }
+
+    #[test]
     fn create_cell_can_be_initialized_to_undefined() {
         let module = verified(
             vec![Constant::Int32(0), Constant::Undefined],
@@ -14557,12 +16515,75 @@ mod tests {
             )],
         );
         let mut host = TestHost;
-        // No handler at top level path would raise; here it is caught, and the
-        // caught value is undefined (the ReferenceError marker value).
-        let execution = Machine::new(&module, &mut host, Limits::default())
-            .run()
-            .unwrap();
-        assert_eq!(execution.value, Value::UNDEFINED);
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let execution = machine.evaluate().unwrap();
+        let error = execution.value;
+        let name = machine.get_named_property(error, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name)
+                .is_some_and(|text| text.eq_ascii("ReferenceError"))
+        );
+        let message = machine.get_named_property(error, "message").unwrap();
+        assert!(
+            machine
+                .string_value(message)
+                .is_some_and(|text| text.eq_ascii("global is not defined"))
+        );
+        let constructor = machine.intrinsics.global("ReferenceError").unwrap();
+        assert!(machine.instance_of(error, constructor).unwrap());
+        machine.run_to_quiescence().unwrap();
+    }
+
+    #[test]
+    fn caught_engine_type_error_has_intrinsic_shape() {
+        let module = verified(
+            vec![Constant::Int32(0)],
+            vec![function(
+                0,
+                4,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::CreateArray { dst: reg(1) },
+                    Instruction::Call {
+                        dst: reg(2),
+                        callee: reg(0),
+                        this_value: reg(0),
+                        arguments: reg(1),
+                    },
+                    Instruction::Halt,
+                    Instruction::Return { value: reg(3) },
+                ],
+                vec![ExceptionHandler {
+                    start: pc(2),
+                    end: pc(3),
+                    handler: pc(4),
+                    catch_register: reg(3),
+                }],
+            )],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let execution = machine.evaluate().unwrap();
+        let error = execution.value;
+        let name = machine.get_named_property(error, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name)
+                .is_some_and(|text| text.eq_ascii("TypeError"))
+        );
+        let message = machine.get_named_property(error, "message").unwrap();
+        assert!(
+            machine
+                .string_value(message)
+                .is_some_and(|text| text.eq_ascii("call"))
+        );
+        let constructor = machine.intrinsics.global("TypeError").unwrap();
+        assert!(machine.instance_of(error, constructor).unwrap());
+        machine.run_to_quiescence().unwrap();
     }
 
     #[test]
@@ -14587,13 +16608,54 @@ mod tests {
             .run()
             .unwrap_err();
         assert_eq!(error.pc, pc(0));
-        assert!(matches!(
+        assert_eq!(
             error.kind,
             RuntimeErrorKind::UncaughtThrow {
-                origin: ThrowOrigin::ReferenceError { .. },
-                ..
+                value: Value::UNDEFINED,
+                origin: ThrowOrigin::ReferenceError {
+                    operation: "global is not defined",
+                },
             }
-        ));
+        );
+    }
+
+    #[test]
+    fn uncaught_engine_type_error_keeps_origin_diagnostic() {
+        let module = verified(
+            vec![Constant::Int32(0)],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::CreateArray { dst: reg(1) },
+                    Instruction::Call {
+                        dst: reg(2),
+                        callee: reg(0),
+                        this_value: reg(0),
+                        arguments: reg(1),
+                    },
+                    Instruction::Return { value: reg(2) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let error = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap_err();
+        assert_eq!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                value: Value::UNDEFINED,
+                origin: ThrowOrigin::TypeError {
+                    operation: "call",
+                },
+            }
+        );
     }
 
     fn assert_uri_error(global: &str, argument: EcmaString) {
@@ -14922,6 +16984,765 @@ mod tests {
     }
 
     #[test]
+    fn construct_tag12_new_target_is_callee() {
+        // Tag 12 Construct must pass callee as new_target (old behavior).
+        let entry = function(
+            0,
+            4,
+            vec![
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(0),
+                    function: FunctionId::new(1),
+                    captures: reg(3),
+                },
+                Instruction::CreateObject { dst: reg(1) },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(0),
+                },
+                Instruction::SetProperty {
+                    object: reg(0),
+                    key: reg(2),
+                    value: reg(1),
+                },
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::Construct {
+                    dst: reg(1),
+                    callee: reg(0),
+                    arguments: reg(3),
+                },
+                // read this.nt === ctor
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(1),
+                },
+                Instruction::GetProperty {
+                    dst: reg(3),
+                    object: reg(1),
+                    key: reg(2),
+                },
+                Instruction::Binary {
+                    dst: reg(3),
+                    op: BinaryOp::StrictEqual,
+                    left: reg(3),
+                    right: reg(0),
+                },
+                Instruction::Return { value: reg(3) },
+            ],
+            vec![],
+        );
+        let ctor = function(
+            0,
+            3,
+            vec![
+                Instruction::LoadNewTarget { dst: reg(0) },
+                Instruction::LoadThis { dst: reg(1) },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(1),
+                },
+                Instruction::SetProperty {
+                    object: reg(1),
+                    key: reg(2),
+                    value: reg(0),
+                },
+                Instruction::Halt,
+            ],
+            vec![],
+        );
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("prototype")),
+                Constant::String(EcmaString::from_utf8("nt")),
+            ],
+            vec![entry, ctor],
+        );
+        assert_eq!(run_ok(&module).value, Value::TRUE);
+    }
+
+    #[test]
+    fn construct_with_new_target_explicit_receiver_prototype() {
+        // Tag 47: construct callee with a *different* new_target.
+        // The constructed receiver's prototype must come from new_target.prototype,
+        // not callee.prototype, and new.target inside the ctor must be the explicit
+        // new_target.
+        let entry = function(
+            0,
+            7,
+            vec![
+                // Create ctor closure (function 1)
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(0),
+                    function: FunctionId::new(1),
+                    captures: reg(3),
+                },
+                // ctor.prototype = {} (distinct from new_target.prototype)
+                Instruction::CreateObject { dst: reg(1) },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(0),
+                },
+                Instruction::SetProperty {
+                    object: reg(0),
+                    key: reg(2),
+                    value: reg(1),
+                },
+                // Create explicit new_target closure (function 2)
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(4),
+                    function: FunctionId::new(2),
+                    captures: reg(3),
+                },
+                // new_target.prototype = {} with marker = 42
+                Instruction::CreateObject { dst: reg(5) },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(0),
+                },
+                Instruction::SetProperty {
+                    object: reg(4),
+                    key: reg(2),
+                    value: reg(5),
+                },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(1),
+                },
+                Instruction::LoadConst {
+                    dst: reg(6),
+                    constant: cid(2),
+                },
+                Instruction::SetProperty {
+                    object: reg(5),
+                    key: reg(2),
+                    value: reg(6),
+                },
+                // obj = new ctor() with explicit new_target
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ConstructWithNewTarget {
+                    dst: reg(1),
+                    callee: reg(0),
+                    new_target: reg(4),
+                    arguments: reg(3),
+                },
+                // Read obj.marker — should be 42 via new_target.prototype chain
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(1),
+                },
+                Instruction::GetProperty {
+                    dst: reg(3),
+                    object: reg(1),
+                    key: reg(2),
+                },
+                Instruction::Return { value: reg(3) },
+            ],
+            vec![],
+        );
+        // ctor body: store new.target on this.nt
+        let ctor = function(
+            0,
+            3,
+            vec![
+                Instruction::LoadNewTarget { dst: reg(0) },
+                Instruction::LoadThis { dst: reg(1) },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(3),
+                },
+                Instruction::SetProperty {
+                    object: reg(1),
+                    key: reg(2),
+                    value: reg(0),
+                },
+                Instruction::Halt,
+            ],
+            vec![],
+        );
+        // new_target body: just a placeholder (never called as a function)
+        let nt_fn = function(0, 1, vec![Instruction::Halt], vec![]);
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("prototype")),
+                Constant::String(EcmaString::from_utf8("marker")),
+                Constant::Int32(42),
+                Constant::String(EcmaString::from_utf8("nt")),
+            ],
+            vec![entry, ctor, nt_fn],
+        );
+        let execution = run_ok(&module);
+        // obj.marker === 42 via new_target.prototype
+        assert_eq!(execution.value, Value::int32(42));
+    }
+
+    #[test]
+    fn construct_with_new_target_return_selection() {
+        // Tag 47: constructor returns a primitive; the constructed receiver
+        // (allocated with new_target.prototype) must be the result.
+        let entry = function(
+            0,
+            7,
+            vec![
+                // Create ctor closure (function 1) — returns 99 (primitive)
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(0),
+                    function: FunctionId::new(1),
+                    captures: reg(3),
+                },
+                // ctor.prototype = {} (unused for receiver)
+                Instruction::CreateObject { dst: reg(1) },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(0),
+                },
+                Instruction::SetProperty {
+                    object: reg(0),
+                    key: reg(2),
+                    value: reg(1),
+                },
+                // Create explicit new_target closure (function 2)
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(4),
+                    function: FunctionId::new(2),
+                    captures: reg(3),
+                },
+                // new_target.prototype = {} with tag = 77
+                Instruction::CreateObject { dst: reg(5) },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(0),
+                },
+                Instruction::SetProperty {
+                    object: reg(4),
+                    key: reg(2),
+                    value: reg(5),
+                },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(1),
+                },
+                Instruction::LoadConst {
+                    dst: reg(6),
+                    constant: cid(2),
+                },
+                Instruction::SetProperty {
+                    object: reg(5),
+                    key: reg(2),
+                    value: reg(6),
+                },
+                // obj = new ctor() with explicit new_target
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ConstructWithNewTarget {
+                    dst: reg(1),
+                    callee: reg(0),
+                    new_target: reg(4),
+                    arguments: reg(3),
+                },
+                // obj must be an object (constructed receiver), not 99
+                // Read obj.tag — should be 77 via new_target.prototype
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(1),
+                },
+                Instruction::GetProperty {
+                    dst: reg(3),
+                    object: reg(1),
+                    key: reg(2),
+                },
+                Instruction::Return { value: reg(3) },
+            ],
+            vec![],
+        );
+        // ctor returns primitive 99
+        let ctor = function(
+            0,
+            1,
+            vec![
+                Instruction::LoadConst {
+                    dst: reg(0),
+                    constant: cid(3),
+                },
+                Instruction::Return { value: reg(0) },
+            ],
+            vec![],
+        );
+        let nt_fn = function(0, 1, vec![Instruction::Halt], vec![]);
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("prototype")),
+                Constant::String(EcmaString::from_utf8("tag")),
+                Constant::Int32(77),
+                Constant::Int32(99),
+            ],
+            vec![entry, ctor, nt_fn],
+        );
+        // obj.tag === 77 via new_target.prototype, not 99
+        assert_eq!(run_ok(&module).value, Value::int32(77));
+    }
+
+    #[test]
+    fn construct_with_new_target_builtin_object() {
+        // Tag 47: construct Object with explicit new_target whose .prototype
+        // is a custom object. The result must have that prototype.
+        let entry = function(
+            0,
+            6,
+            vec![
+                // Load Object global
+                Instruction::LoadGlobal {
+                    dst: reg(0),
+                    name: cid(0),
+                },
+                // Create explicit new_target closure (function 1)
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(1),
+                    function: FunctionId::new(1),
+                    captures: reg(3),
+                },
+                // new_target.prototype = { marker: 42 }
+                Instruction::CreateObject { dst: reg(2) },
+                Instruction::LoadConst {
+                    dst: reg(3),
+                    constant: cid(1),
+                },
+                Instruction::SetProperty {
+                    object: reg(1),
+                    key: reg(3),
+                    value: reg(2),
+                },
+                Instruction::LoadConst {
+                    dst: reg(3),
+                    constant: cid(2),
+                },
+                Instruction::LoadConst {
+                    dst: reg(4),
+                    constant: cid(3),
+                },
+                Instruction::SetProperty {
+                    object: reg(2),
+                    key: reg(3),
+                    value: reg(4),
+                },
+                // obj = new Object() with explicit new_target
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ConstructWithNewTarget {
+                    dst: reg(4),
+                    callee: reg(0),
+                    new_target: reg(1),
+                    arguments: reg(3),
+                },
+                // Read obj.marker — should be 42 via new_target.prototype
+                Instruction::LoadConst {
+                    dst: reg(3),
+                    constant: cid(2),
+                },
+                Instruction::GetProperty {
+                    dst: reg(5),
+                    object: reg(4),
+                    key: reg(3),
+                },
+                Instruction::Return { value: reg(5) },
+            ],
+            vec![],
+        );
+        let nt_fn = function(0, 1, vec![Instruction::Halt], vec![]);
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("Object")),
+                Constant::String(EcmaString::from_utf8("prototype")),
+                Constant::String(EcmaString::from_utf8("marker")),
+                Constant::Int32(42),
+            ],
+            vec![entry, nt_fn],
+        );
+        assert_eq!(run_ok(&module).value, Value::int32(42));
+    }
+
+    #[test]
+    fn construct_with_new_target_builtin_error() {
+        // Tag 47: construct Error with explicit new_target whose .prototype
+        // is a custom object. The error instance must have that prototype.
+        let entry = function(
+            0,
+            6,
+            vec![
+                // Load Error global
+                Instruction::LoadGlobal {
+                    dst: reg(0),
+                    name: cid(0),
+                },
+                // Create explicit new_target closure (function 1)
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(1),
+                    function: FunctionId::new(1),
+                    captures: reg(3),
+                },
+                // new_target.prototype = { custom: 99 }
+                Instruction::CreateObject { dst: reg(2) },
+                Instruction::LoadConst {
+                    dst: reg(3),
+                    constant: cid(1),
+                },
+                Instruction::SetProperty {
+                    object: reg(1),
+                    key: reg(3),
+                    value: reg(2),
+                },
+                Instruction::LoadConst {
+                    dst: reg(3),
+                    constant: cid(2),
+                },
+                Instruction::LoadConst {
+                    dst: reg(4),
+                    constant: cid(3),
+                },
+                Instruction::SetProperty {
+                    object: reg(2),
+                    key: reg(3),
+                    value: reg(4),
+                },
+                // err = new Error() with explicit new_target
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ConstructWithNewTarget {
+                    dst: reg(4),
+                    callee: reg(0),
+                    new_target: reg(1),
+                    arguments: reg(3),
+                },
+                // Read err.custom — should be 99 via new_target.prototype
+                Instruction::LoadConst {
+                    dst: reg(3),
+                    constant: cid(2),
+                },
+                Instruction::GetProperty {
+                    dst: reg(5),
+                    object: reg(4),
+                    key: reg(3),
+                },
+                Instruction::Return { value: reg(5) },
+            ],
+            vec![],
+        );
+        let nt_fn = function(0, 1, vec![Instruction::Halt], vec![]);
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("Error")),
+                Constant::String(EcmaString::from_utf8("prototype")),
+                Constant::String(EcmaString::from_utf8("custom")),
+                Constant::Int32(99),
+            ],
+            vec![entry, nt_fn],
+        );
+        assert_eq!(run_ok(&module).value, Value::int32(99));
+    }
+
+    #[test]
+    fn construct_with_new_target_bound_forwards_to_target() {
+        // Bound constructor: when new_target is the bound wrapper itself,
+        // it must be substituted with the bound target after flattening.
+        // This mirrors the existing tag-12 behavior where callee === new_target
+        // before flattening.
+        let entry = function(
+            0,
+            8,
+            vec![
+                // Create target ctor closure (function 1)
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(0),
+                    function: FunctionId::new(1),
+                    captures: reg(3),
+                },
+                // target.prototype = { tag: 7 }
+                Instruction::CreateObject { dst: reg(1) },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(0),
+                },
+                Instruction::SetProperty {
+                    object: reg(0),
+                    key: reg(2),
+                    value: reg(1),
+                },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(1),
+                },
+                Instruction::LoadConst {
+                    dst: reg(4),
+                    constant: cid(2),
+                },
+                Instruction::SetProperty {
+                    object: reg(1),
+                    key: reg(2),
+                    value: reg(4),
+                },
+                // bound = target.bind(undefined)
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(3),
+                },
+                Instruction::GetProperty {
+                    dst: reg(4),
+                    object: reg(0),
+                    key: reg(2),
+                },
+                // Load undefined into a register for the bind argument
+                Instruction::LoadConst {
+                    dst: reg(6),
+                    constant: cid(4),
+                },
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ArrayPush {
+                    array: reg(3),
+                    value: reg(6),
+                },
+                Instruction::Call {
+                    dst: reg(5),
+                    callee: reg(4),
+                    this_value: reg(0),
+                    arguments: reg(3),
+                },
+                // obj = new bound() via tag 47 with bound as new_target
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ConstructWithNewTarget {
+                    dst: reg(1),
+                    callee: reg(5),
+                    new_target: reg(5),
+                    arguments: reg(3),
+                },
+                // Read obj.tag — should be 7 via target.prototype
+                // (bound forwarded new_target to target)
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(1),
+                },
+                Instruction::GetProperty {
+                    dst: reg(3),
+                    object: reg(1),
+                    key: reg(2),
+                },
+                Instruction::Return { value: reg(3) },
+            ],
+            vec![],
+        );
+        // target ctor body: does nothing (receiver allocated by engine)
+        let target_ctor = function(0, 1, vec![Instruction::Halt], vec![]);
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("prototype")),
+                Constant::String(EcmaString::from_utf8("tag")),
+                Constant::Int32(7),
+                Constant::String(EcmaString::from_utf8("bind")),
+                Constant::Undefined,
+            ],
+            vec![entry, target_ctor],
+        );
+        assert_eq!(run_ok(&module).value, Value::int32(7));
+    }
+
+    #[test]
+    fn construct_with_new_target_forwards_intermediate_bound_wrapper() {
+        // B2 -> B1 -> Base newTarget matrix:
+        //   ConstructWithNT(B2, B2)        -> Base
+        //   ConstructWithNT(B2, B1)        -> Base
+        //   ConstructWithNT(B2, Base)      -> Base
+        //   ConstructWithNT(B2, Unrelated) -> Unrelated
+        //   Construct(B2)                  -> Base
+        let entry = function(
+            0,
+            14,
+            vec![
+                // Base closure (function 1): returns new.target
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(0),
+                    function: FunctionId::new(1),
+                    captures: reg(3),
+                },
+                // Unrelated closure (function 2)
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(10),
+                    function: FunctionId::new(2),
+                    captures: reg(3),
+                },
+                // B1 = Base.bind(undefined)
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(0),
+                },
+                Instruction::GetProperty {
+                    dst: reg(4),
+                    object: reg(0),
+                    key: reg(2),
+                },
+                Instruction::LoadConst {
+                    dst: reg(6),
+                    constant: cid(1),
+                },
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ArrayPush {
+                    array: reg(3),
+                    value: reg(6),
+                },
+                Instruction::Call {
+                    dst: reg(1),
+                    callee: reg(4),
+                    this_value: reg(0),
+                    arguments: reg(3),
+                },
+                // B2 = B1.bind(undefined)
+                Instruction::GetProperty {
+                    dst: reg(4),
+                    object: reg(1),
+                    key: reg(2),
+                },
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ArrayPush {
+                    array: reg(3),
+                    value: reg(6),
+                },
+                Instruction::Call {
+                    dst: reg(5),
+                    callee: reg(4),
+                    this_value: reg(1),
+                    arguments: reg(3),
+                },
+                // ConstructWithNT(B2, B2) -> Base
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ConstructWithNewTarget {
+                    dst: reg(7),
+                    callee: reg(5),
+                    new_target: reg(5),
+                    arguments: reg(3),
+                },
+                Instruction::Binary {
+                    dst: reg(8),
+                    op: BinaryOp::StrictEqual,
+                    left: reg(7),
+                    right: reg(0),
+                },
+                // ConstructWithNT(B2, B1) -> Base
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ConstructWithNewTarget {
+                    dst: reg(7),
+                    callee: reg(5),
+                    new_target: reg(1),
+                    arguments: reg(3),
+                },
+                Instruction::Binary {
+                    dst: reg(9),
+                    op: BinaryOp::StrictEqual,
+                    left: reg(7),
+                    right: reg(0),
+                },
+                Instruction::Binary {
+                    dst: reg(8),
+                    op: BinaryOp::BitAnd,
+                    left: reg(8),
+                    right: reg(9),
+                },
+                // ConstructWithNT(B2, Base) -> Base
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ConstructWithNewTarget {
+                    dst: reg(7),
+                    callee: reg(5),
+                    new_target: reg(0),
+                    arguments: reg(3),
+                },
+                Instruction::Binary {
+                    dst: reg(9),
+                    op: BinaryOp::StrictEqual,
+                    left: reg(7),
+                    right: reg(0),
+                },
+                Instruction::Binary {
+                    dst: reg(8),
+                    op: BinaryOp::BitAnd,
+                    left: reg(8),
+                    right: reg(9),
+                },
+                // ConstructWithNT(B2, Unrelated) -> Unrelated
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ConstructWithNewTarget {
+                    dst: reg(7),
+                    callee: reg(5),
+                    new_target: reg(10),
+                    arguments: reg(3),
+                },
+                Instruction::Binary {
+                    dst: reg(9),
+                    op: BinaryOp::StrictEqual,
+                    left: reg(7),
+                    right: reg(10),
+                },
+                Instruction::Binary {
+                    dst: reg(8),
+                    op: BinaryOp::BitAnd,
+                    left: reg(8),
+                    right: reg(9),
+                },
+                // ordinary Construct(B2) -> Base
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::Construct {
+                    dst: reg(7),
+                    callee: reg(5),
+                    arguments: reg(3),
+                },
+                Instruction::Binary {
+                    dst: reg(9),
+                    op: BinaryOp::StrictEqual,
+                    left: reg(7),
+                    right: reg(0),
+                },
+                Instruction::Binary {
+                    dst: reg(8),
+                    op: BinaryOp::BitAnd,
+                    left: reg(8),
+                    right: reg(9),
+                },
+                Instruction::Return { value: reg(8) },
+            ],
+            vec![],
+        );
+        let base = function(
+            0,
+            1,
+            vec![
+                Instruction::LoadNewTarget { dst: reg(0) },
+                Instruction::Return { value: reg(0) },
+            ],
+            vec![],
+        );
+        let unrelated = function(
+            0,
+            1,
+            vec![
+                Instruction::LoadNewTarget { dst: reg(0) },
+                Instruction::Return { value: reg(0) },
+            ],
+            vec![],
+        );
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("bind")),
+                Constant::Undefined,
+            ],
+            vec![entry, base, unrelated],
+        );
+        // five true comparisons BitAnd to 1
+        assert_eq!(run_ok(&module).value, Value::int32(1));
+    }
+
+    #[test]
     fn arguments_object_reflects_passed_values() {
         // callee returns arguments[0].
         let entry = function(
@@ -15080,6 +17901,206 @@ mod tests {
         );
 
         assert_eq!(run_ok(&module).value, Value::int32(7));
+    }
+
+    #[test]
+    fn nested_callback_call_engine_type_error_is_intrinsic() {
+        // Array.prototype.map crosses call_value's callback boundary. An engine
+        // TypeError inside the callback must reach the outer catch as an
+        // intrinsic TypeError object, not undefined.
+        let entry = function(
+            0,
+            9,
+            vec![
+                Instruction::CreateArray { dst: reg(0) },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(0),
+                },
+                Instruction::ArrayPush {
+                    array: reg(0),
+                    value: reg(1),
+                },
+                Instruction::CreateArray { dst: reg(2) },
+                Instruction::CreateClosure {
+                    dst: reg(3),
+                    function: FunctionId::new(1),
+                    captures: reg(2),
+                },
+                Instruction::LoadConst {
+                    dst: reg(4),
+                    constant: cid(1),
+                },
+                Instruction::GetProperty {
+                    dst: reg(5),
+                    object: reg(0),
+                    key: reg(4),
+                },
+                Instruction::CreateArray { dst: reg(6) },
+                Instruction::ArrayPush {
+                    array: reg(6),
+                    value: reg(3),
+                },
+                Instruction::Call {
+                    dst: reg(7),
+                    callee: reg(5),
+                    this_value: reg(0),
+                    arguments: reg(6),
+                },
+                Instruction::Halt,
+                Instruction::Return { value: reg(8) },
+            ],
+            vec![ExceptionHandler {
+                start: pc(9),
+                end: pc(10),
+                handler: pc(11),
+                catch_register: reg(8),
+            }],
+        );
+        let callback = closure_function(
+            0,
+            0,
+            3,
+            vec![
+                Instruction::LoadConst {
+                    dst: reg(0),
+                    constant: cid(0),
+                },
+                Instruction::CreateArray { dst: reg(1) },
+                Instruction::Call {
+                    dst: reg(2),
+                    callee: reg(0),
+                    this_value: reg(0),
+                    arguments: reg(1),
+                },
+                Instruction::Return { value: reg(2) },
+            ],
+        );
+        let module = verified(
+            vec![
+                Constant::Int32(0),
+                Constant::String(EcmaString::from_utf8("map")),
+            ],
+            vec![entry, callback],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let execution = machine.evaluate().unwrap();
+        let error = execution.value;
+        assert_ne!(error, Value::UNDEFINED);
+        let name = machine.get_named_property(error, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name)
+                .is_some_and(|text| text.eq_ascii("TypeError"))
+        );
+        let message = machine.get_named_property(error, "message").unwrap();
+        assert!(
+            machine
+                .string_value(message)
+                .is_some_and(|text| text.eq_ascii("call"))
+        );
+        let constructor = machine.intrinsics.global("TypeError").unwrap();
+        assert!(machine.instance_of(error, constructor).unwrap());
+        machine.run_to_quiescence().unwrap();
+    }
+
+    #[test]
+    fn nested_callback_construct_engine_type_error_is_intrinsic() {
+        let entry = function(
+            0,
+            9,
+            vec![
+                Instruction::CreateArray { dst: reg(0) },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(0),
+                },
+                Instruction::ArrayPush {
+                    array: reg(0),
+                    value: reg(1),
+                },
+                Instruction::CreateArray { dst: reg(2) },
+                Instruction::CreateClosure {
+                    dst: reg(3),
+                    function: FunctionId::new(1),
+                    captures: reg(2),
+                },
+                Instruction::LoadConst {
+                    dst: reg(4),
+                    constant: cid(1),
+                },
+                Instruction::GetProperty {
+                    dst: reg(5),
+                    object: reg(0),
+                    key: reg(4),
+                },
+                Instruction::CreateArray { dst: reg(6) },
+                Instruction::ArrayPush {
+                    array: reg(6),
+                    value: reg(3),
+                },
+                Instruction::Call {
+                    dst: reg(7),
+                    callee: reg(5),
+                    this_value: reg(0),
+                    arguments: reg(6),
+                },
+                Instruction::Halt,
+                Instruction::Return { value: reg(8) },
+            ],
+            vec![ExceptionHandler {
+                start: pc(9),
+                end: pc(10),
+                handler: pc(11),
+                catch_register: reg(8),
+            }],
+        );
+        let callback = closure_function(
+            0,
+            0,
+            3,
+            vec![
+                Instruction::LoadConst {
+                    dst: reg(0),
+                    constant: cid(0),
+                },
+                Instruction::CreateArray { dst: reg(1) },
+                Instruction::Construct {
+                    dst: reg(2),
+                    callee: reg(0),
+                    arguments: reg(1),
+                },
+                Instruction::Return { value: reg(2) },
+            ],
+        );
+        let module = verified(
+            vec![
+                Constant::Int32(0),
+                Constant::String(EcmaString::from_utf8("map")),
+            ],
+            vec![entry, callback],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let execution = machine.evaluate().unwrap();
+        let error = execution.value;
+        assert_ne!(error, Value::UNDEFINED);
+        let name = machine.get_named_property(error, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name)
+                .is_some_and(|text| text.eq_ascii("TypeError"))
+        );
+        let message = machine.get_named_property(error, "message").unwrap();
+        assert!(
+            machine
+                .string_value(message)
+                .is_some_and(|text| text.eq_ascii("construct"))
+        );
+        let constructor = machine.intrinsics.global("TypeError").unwrap();
+        assert!(machine.instance_of(error, constructor).unwrap());
+        machine.run_to_quiescence().unwrap();
     }
 
     #[test]
@@ -17197,6 +20218,89 @@ mod tests {
         assert_eq!(execution.entry_registers[1], Value::int32(9));
         assert_eq!(execution.entry_registers[2], Value::int32(9));
         assert_eq!(execution.entry_registers[3], Value::int32(1));
+    }
+
+    #[test]
+    fn failed_import_caught_by_dependent_is_intrinsic_type_error() {
+        // A dynamic Import of a module whose entry throws an engine TypeError
+        // must deliver an intrinsic error object to the dependent's catch,
+        // not undefined from a stripped origin.
+        let root = program_module(
+            "root",
+            vec![Constant::String(EcmaString::from_utf8("./target"))],
+            vec![function(
+                0,
+                2,
+                vec![
+                    Instruction::Import {
+                        dst: reg(0),
+                        specifier: cid(1),
+                    },
+                    Instruction::Halt,
+                    Instruction::Return { value: reg(1) },
+                ],
+                vec![ExceptionHandler {
+                    start: pc(0),
+                    end: pc(1),
+                    handler: pc(2),
+                    catch_register: reg(1),
+                }],
+            )],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::Local(ModuleId::new(1)),
+                kind: EdgeKind::Dynamic,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let target = program_module(
+            "target",
+            vec![Constant::Int32(0)],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::CreateArray { dst: reg(1) },
+                    Instruction::Call {
+                        dst: reg(2),
+                        callee: reg(0),
+                        this_value: reg(0),
+                        arguments: reg(1),
+                    },
+                    Instruction::Return { value: reg(2) },
+                ],
+                Vec::new(),
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut host = TestHost;
+        let program = linked(vec![root, target], 0);
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let execution = machine.evaluate().unwrap();
+        let error = execution.value;
+        assert_ne!(error, Value::UNDEFINED);
+        let name = machine.get_named_property(error, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name)
+                .is_some_and(|text| text.eq_ascii("TypeError"))
+        );
+        let message = machine.get_named_property(error, "message").unwrap();
+        assert!(
+            machine
+                .string_value(message)
+                .is_some_and(|text| text.eq_ascii("call"))
+        );
+        let constructor = machine.intrinsics.global("TypeError").unwrap();
+        assert!(machine.instance_of(error, constructor).unwrap());
+        machine.run_to_quiescence().unwrap();
     }
 
     #[test]
@@ -19843,5 +22947,790 @@ mod tests {
         );
         assert_eq!(read_global(&machine, "a"), Some(Value::int32(1)));
         assert!(machine.microtasks.is_empty());
+    }
+
+    #[derive(Default)]
+    struct ImportMetaHost {
+        seen: Vec<EcmaString>,
+    }
+
+    impl Host for ImportMetaHost {
+        fn import_meta_url(&mut self, module_name: &EcmaString) -> EcmaString {
+            self.seen.push(module_name.clone());
+            EcmaString::from_utf8("host://modules/entry.mjs")
+        }
+    }
+
+    #[test]
+    fn import_meta_is_host_url_backed_stable_and_edge_independent() {
+        let program = linked(
+            vec![program_module(
+                "entry",
+                vec![
+                    Constant::String(EcmaString::from_utf8("url")),
+                    Constant::String(EcmaString::from_utf8("host://modules/entry.mjs")),
+                ],
+                vec![function(
+                    0,
+                    7,
+                    vec![
+                        Instruction::LoadImportMeta { dst: reg(0) },
+                        Instruction::LoadImportMeta { dst: reg(1) },
+                        Instruction::Binary {
+                            dst: reg(2),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(0),
+                            right: reg(1),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(3),
+                            constant: cid(1),
+                        },
+                        Instruction::GetProperty {
+                            dst: reg(4),
+                            object: reg(0),
+                            key: reg(3),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(5),
+                            constant: cid(2),
+                        },
+                        Instruction::Binary {
+                            dst: reg(6),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(4),
+                            right: reg(5),
+                        },
+                        Instruction::Return { value: reg(6) },
+                    ],
+                    Vec::new(),
+                )],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )],
+            0,
+        );
+        assert!(program.modules()[0].edges.is_empty());
+        let mut host = ImportMetaHost::default();
+        let execution = Machine::new(&program, &mut host, Limits::default())
+            .run()
+            .unwrap();
+        assert_eq!(execution.entry_registers[0], execution.entry_registers[1]);
+        assert_eq!(execution.entry_registers[2], Value::TRUE);
+        assert_eq!(execution.value, Value::TRUE);
+        assert_eq!(host.seen, vec![EcmaString::from_utf8("entry")]);
+    }
+
+    #[test]
+    fn to_object_preserves_objects_boxes_primitives_and_rejects_nullish() {
+        let program = verified(
+            vec![Constant::Int32(7)],
+            vec![function(
+                0,
+                4,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::ToObject {
+                        dst: reg(1),
+                        src: reg(0),
+                    },
+                    Instruction::CreateObject { dst: reg(2) },
+                    Instruction::ToObject {
+                        dst: reg(3),
+                        src: reg(2),
+                    },
+                    Instruction::Return { value: reg(3) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let execution = run_ok(&program);
+        assert_ne!(execution.entry_registers[1], Value::int32(7));
+        assert_eq!(execution.entry_registers[2], execution.entry_registers[3]);
+
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let boxed = machine.to_object(Value::int32(7)).expect("primitive boxes");
+        assert_eq!(
+            machine
+                .unbox_primitive_or_self(boxed)
+                .expect("valid wrapper"),
+            Value::int32(7)
+        );
+        assert!(matches!(
+            machine.to_object(Value::NULL),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+    }
+
+    #[test]
+    fn raw_string_own_properties_expose_length_and_in_range_indices() {
+        with_machine(Limits::default(), |machine| {
+            let string = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("ab")))
+                .unwrap();
+            let length = PropertyKey::Named(EcmaString::from_utf8("length"));
+            let zero = PropertyKey::Named(EcmaString::from_utf8("0"));
+            let one = PropertyKey::Named(EcmaString::from_utf8("1"));
+            let two = PropertyKey::Named(EcmaString::from_utf8("2"));
+
+            assert!(machine.has_own_property_key(string, &length).unwrap());
+            assert!(machine.has_own_property_key(string, &zero).unwrap());
+            assert!(machine.has_own_property_key(string, &one).unwrap());
+            assert!(!machine.has_own_property_key(string, &two).unwrap());
+            assert!(machine.has_property(string, &length).unwrap());
+            assert!(machine.has_property(string, &zero).unwrap());
+            assert!(!machine.has_property(string, &two).unwrap());
+
+            assert_eq!(
+                machine.get_property_key(string, &length).unwrap(),
+                number_value(2.0)
+            );
+            let zero_value = machine.get_property_key(string, &zero).unwrap();
+            assert_eq!(
+                machine.string_value(zero_value).unwrap(),
+                EcmaString::from_utf8("a")
+            );
+            let one_value = machine.get_property_key(string, &one).unwrap();
+            assert_eq!(
+                machine.string_value(one_value).unwrap(),
+                EcmaString::from_utf8("b")
+            );
+        });
+    }
+
+    #[test]
+    fn boxed_string_own_properties_expose_length_and_in_range_indices() {
+        with_machine(Limits::default(), |machine| {
+            let string = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("ab")))
+                .unwrap();
+            let boxed = machine.to_object(string).unwrap();
+            let length = PropertyKey::Named(EcmaString::from_utf8("length"));
+            let zero = PropertyKey::Named(EcmaString::from_utf8("0"));
+            let one = PropertyKey::Named(EcmaString::from_utf8("1"));
+            let two = PropertyKey::Named(EcmaString::from_utf8("2"));
+
+            assert!(machine.has_own_property_key(boxed, &length).unwrap());
+            assert!(machine.has_own_property_key(boxed, &zero).unwrap());
+            assert!(machine.has_own_property_key(boxed, &one).unwrap());
+            assert!(!machine.has_own_property_key(boxed, &two).unwrap());
+            assert!(machine.has_property(boxed, &length).unwrap());
+            assert!(machine.has_property(boxed, &zero).unwrap());
+            assert!(!machine.has_property(boxed, &two).unwrap());
+
+            assert_eq!(
+                machine.get_property_key(boxed, &length).unwrap(),
+                number_value(2.0)
+            );
+            assert_eq!(
+                machine.get_named_property(boxed, "length").unwrap(),
+                number_value(2.0)
+            );
+            let zero_value = machine.get_property_key(boxed, &zero).unwrap();
+            assert_eq!(
+                machine.string_value(zero_value).unwrap(),
+                EcmaString::from_utf8("a")
+            );
+            let one_value = machine.get_property_key(boxed, &one).unwrap();
+            assert_eq!(
+                machine.string_value(one_value).unwrap(),
+                EcmaString::from_utf8("b")
+            );
+        });
+    }
+
+    #[test]
+    fn import_dynamic_instruction_resolves_local_module_namespace() {
+        let root = program_module(
+            "root",
+            vec![Constant::String(EcmaString::from_utf8("./target"))],
+            vec![function(
+                0,
+                2,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::ImportDynamic {
+                        dst: reg(1),
+                        specifier: reg(0),
+                    },
+                    Instruction::Return { value: reg(1) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::Local(ModuleId::new(1)),
+                kind: EdgeKind::Dynamic,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let target = program_module(
+            "target",
+            vec![
+                Constant::Int32(7),
+                Constant::String(EcmaString::from_utf8("value")),
+            ],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(2),
+                        value: reg(0),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            Vec::new(),
+            vec![Binding {
+                name: cid(2),
+                kind: BindingKind::Hoisted,
+            }],
+            vec![Export {
+                name: cid(2),
+                source: ExportSource::Local(BindingId::new(0)),
+            }],
+        );
+        let program = linked(vec![root, target], 0);
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+
+        let execution = machine
+            .evaluate()
+            .expect("dynamic import opcode returns its promise normally");
+        let promise = execution.entry_registers[1];
+        let index = machine
+            .runtime_slot(promise)
+            .expect("dynamic import result is a valid runtime value")
+            .expect("dynamic import result is heap allocated");
+        let namespace = match &machine.heap[index] {
+            HeapEntry::Promise {
+                state: PromiseState::Fulfilled { value },
+                ..
+            } => *value,
+            _ => panic!("local ImportDynamic resolves its result promise"),
+        };
+
+        assert_eq!(
+            machine.get_named_property(namespace, "value").unwrap(),
+            Value::int32(7)
+        );
+    }
+
+    #[test]
+    fn import_dynamic_instruction_resolves_registered_external_namespace() {
+        let program = linked(
+            vec![program_module(
+                "root",
+                vec![Constant::String(EcmaString::from_utf8("external"))],
+                vec![function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(1),
+                        },
+                        Instruction::ImportDynamic {
+                            dst: reg(1),
+                            specifier: reg(0),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                )],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )],
+            0,
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let namespace = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        machine.registry.external.insert(
+            EcmaString::from_utf8("external"),
+            ExternalModuleInstance {
+                namespace,
+                exports: BTreeMap::new(),
+                internals: BTreeMap::new(),
+            },
+        );
+
+        let execution = machine
+            .evaluate()
+            .expect("external dynamic import opcode returns its promise normally");
+        let promise = execution.entry_registers[1];
+        let index = machine
+            .runtime_slot(promise)
+            .expect("dynamic import result is a valid runtime value")
+            .expect("dynamic import result is heap allocated");
+        let HeapEntry::Promise {
+            state: PromiseState::Fulfilled { value },
+            ..
+        } = &machine.heap[index]
+        else {
+            panic!("external ImportDynamic resolves its result promise");
+        };
+
+        assert_eq!(*value, namespace);
+    }
+
+    #[test]
+    fn import_dynamic_instruction_rejects_missing_and_symbol_specifiers() {
+        let missing = linked(
+            vec![program_module(
+                "root",
+                vec![Constant::String(EcmaString::from_utf8("missing"))],
+                vec![function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(1),
+                        },
+                        Instruction::ImportDynamic {
+                            dst: reg(1),
+                            specifier: reg(0),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                )],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )],
+            0,
+        );
+        let mut missing_host = TestHost;
+        let mut missing_machine = Machine::new(&missing, &mut missing_host, Limits::default());
+        let missing_promise = missing_machine
+            .evaluate()
+            .expect("unresolved dynamic import returns a rejected promise")
+            .entry_registers[1];
+        let missing_index = missing_machine
+            .runtime_slot(missing_promise)
+            .unwrap()
+            .expect("rejected dynamic import result is a promise");
+        let HeapEntry::Promise {
+            state: PromiseState::Rejected { origin, .. },
+            ..
+        } = &missing_machine.heap[missing_index]
+        else {
+            panic!("missing ImportDynamic target rejects its promise");
+        };
+        assert_eq!(
+            *origin,
+            ThrowOrigin::TypeError {
+                operation: "resolve dynamic module specifier",
+            }
+        );
+
+        let coercion = linked(
+            vec![program_module(
+                "root",
+                vec![Constant::String(EcmaString::from_utf8("specifier"))],
+                vec![function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(1),
+                        },
+                        Instruction::ImportDynamic {
+                            dst: reg(1),
+                            specifier: reg(0),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                )],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )],
+            0,
+        );
+        let mut coercion_host = TestHost;
+        let mut coercion_machine = Machine::new(&coercion, &mut coercion_host, Limits::default());
+        let symbol = coercion_machine
+            .allocate(HeapEntry::Symbol {
+                description: EcmaString::from_utf8("specifier"),
+            })
+            .unwrap();
+        coercion_machine
+            .globals
+            .insert(EcmaString::from_utf8("specifier"), symbol);
+        let coercion_promise = coercion_machine
+            .evaluate()
+            .expect("uncoercible dynamic import returns a rejected promise")
+            .entry_registers[1];
+        let coercion_index = coercion_machine
+            .runtime_slot(coercion_promise)
+            .unwrap()
+            .expect("rejected dynamic import result is a promise");
+        let HeapEntry::Promise {
+            state: PromiseState::Rejected { origin, .. },
+            ..
+        } = &coercion_machine.heap[coercion_index]
+        else {
+            panic!("symbol ImportDynamic specifier rejects its promise");
+        };
+        assert_eq!(
+            *origin,
+            ThrowOrigin::TypeError {
+                operation: "convert symbol to string",
+            }
+        );
+    }
+
+    #[test]
+    fn normalize_relative_module_name_collapses_dot_components() {
+        assert_eq!(
+            normalize_relative_module_name(&EcmaString::from_utf8("a/b/.././c//d")),
+            EcmaString::from_utf8("a/c/d")
+        );
+        assert_eq!(
+            normalize_relative_module_name(&EcmaString::from_utf8("../x")),
+            EcmaString::from_utf8("x")
+        );
+        assert_eq!(
+            normalize_relative_module_name(&EcmaString::from_utf8("./")),
+            EcmaString::default()
+        );
+        assert_eq!(
+            resolve_relative_against_module_name(
+                &EcmaString::from_utf8("src/nested/main.ts"),
+                &EcmaString::from_utf8("../dependency.ts"),
+            ),
+            EcmaString::from_utf8("src/dependency.ts")
+        );
+        assert_eq!(
+            resolve_relative_against_module_name(
+                &EcmaString::from_utf8("main.ts"),
+                &EcmaString::from_utf8("./dependency.ts"),
+            ),
+            EcmaString::from_utf8("dependency.ts")
+        );
+    }
+
+    #[test]
+    fn import_dynamic_expression_resolves_computed_relative_bundled_module() {
+        let root = program_module(
+            "main.ts",
+            vec![Constant::String(EcmaString::from_utf8("./dependency.ts"))],
+            vec![function(
+                0,
+                2,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::ImportDynamic {
+                        dst: reg(1),
+                        specifier: reg(0),
+                    },
+                    Instruction::Return { value: reg(1) },
+                ],
+                Vec::new(),
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let dependency = program_module(
+            "dependency.ts",
+            vec![
+                Constant::Int32(41),
+                Constant::String(EcmaString::from_utf8("answer")),
+            ],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(2),
+                        value: reg(0),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            Vec::new(),
+            vec![Binding {
+                name: cid(2),
+                kind: BindingKind::Hoisted,
+            }],
+            vec![Export {
+                name: cid(2),
+                source: ExportSource::Local(BindingId::new(0)),
+            }],
+        );
+        let program = linked(vec![root, dependency], 0);
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+
+        let execution = machine
+            .evaluate()
+            .expect("computed relative dynamic import returns a promise");
+        let promise = execution.entry_registers[1];
+        let index = machine
+            .runtime_slot(promise)
+            .expect("dynamic import result is a valid runtime value")
+            .expect("dynamic import result is heap allocated");
+        let namespace = match &machine.heap[index] {
+            HeapEntry::Promise {
+                state: PromiseState::Fulfilled { value },
+                ..
+            } => *value,
+            _ => panic!("computed relative ImportDynamic resolves its result promise"),
+        };
+
+        assert_eq!(
+            machine.get_named_property(namespace, "answer").unwrap(),
+            Value::int32(41)
+        );
+        assert_eq!(
+            machine.registry.local_modules.get(&EcmaString::from_utf8("dependency.ts")),
+            Some(&ModuleId::new(1))
+        );
+    }
+
+    #[test]
+    fn import_dynamic_expression_resolves_nested_relative_and_rejects_missing() {
+        let nested = program_module(
+            "src/app.ts",
+            vec![
+                Constant::String(EcmaString::from_utf8("./lib/dependency.ts")),
+                Constant::String(EcmaString::from_utf8("./missing.ts")),
+            ],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::ImportDynamic {
+                        dst: reg(1),
+                        specifier: reg(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(2),
+                    },
+                    Instruction::ImportDynamic {
+                        dst: reg(0),
+                        specifier: reg(2),
+                    },
+                    Instruction::Return { value: reg(1) },
+                ],
+                Vec::new(),
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let dependency = program_module(
+            "src/lib/dependency.ts",
+            vec![
+                Constant::Int32(17),
+                Constant::String(EcmaString::from_utf8("value")),
+            ],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(2),
+                        value: reg(0),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            Vec::new(),
+            vec![Binding {
+                name: cid(2),
+                kind: BindingKind::Hoisted,
+            }],
+            vec![Export {
+                name: cid(2),
+                source: ExportSource::Local(BindingId::new(0)),
+            }],
+        );
+        let program = linked(vec![nested, dependency], 0);
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+
+        let execution = machine
+            .evaluate()
+            .expect("nested relative dynamic import returns normally");
+        let fulfilled = execution.entry_registers[1];
+        let fulfilled_index = machine
+            .runtime_slot(fulfilled)
+            .unwrap()
+            .expect("nested relative import result is a promise");
+        let namespace = match &machine.heap[fulfilled_index] {
+            HeapEntry::Promise {
+                state: PromiseState::Fulfilled { value },
+                ..
+            } => *value,
+            _ => panic!("nested relative ImportDynamic resolves its result promise"),
+        };
+        assert_eq!(
+            machine.get_named_property(namespace, "value").unwrap(),
+            Value::int32(17)
+        );
+
+        let rejected = execution.entry_registers[0];
+        let rejected_index = machine
+            .runtime_slot(rejected)
+            .unwrap()
+            .expect("missing relative import result is a promise");
+        let HeapEntry::Promise {
+            state: PromiseState::Rejected { origin, .. },
+            ..
+        } = &machine.heap[rejected_index]
+        else {
+            panic!("missing relative ImportDynamic rejects its promise");
+        };
+        assert_eq!(
+            *origin,
+            ThrowOrigin::TypeError {
+                operation: "resolve dynamic module specifier",
+            }
+        );
+    }
+
+    #[test]
+    fn import_dynamic_expression_ignores_opaque_and_absolute_as_local_paths() {
+        let program = linked(
+            vec![program_module(
+                "main.ts",
+                vec![
+                    Constant::String(EcmaString::from_utf8("dependency.ts")),
+                    Constant::String(EcmaString::from_utf8("/dependency.ts")),
+                ],
+                vec![function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(1),
+                        },
+                        Instruction::ImportDynamic {
+                            dst: reg(1),
+                            specifier: reg(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(2),
+                            constant: cid(2),
+                        },
+                        Instruction::ImportDynamic {
+                            dst: reg(0),
+                            specifier: reg(2),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                )],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ), program_module(
+                "dependency.ts",
+                vec![
+                    Constant::Int32(9),
+                    Constant::String(EcmaString::from_utf8("value")),
+                ],
+                vec![function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(1),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(2),
+                            value: reg(0),
+                        },
+                        Instruction::Halt,
+                    ],
+                    Vec::new(),
+                )],
+                Vec::new(),
+                vec![Binding {
+                    name: cid(2),
+                    kind: BindingKind::Hoisted,
+                }],
+                vec![Export {
+                    name: cid(2),
+                    source: ExportSource::Local(BindingId::new(0)),
+                }],
+            )],
+            0,
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let execution = machine
+            .evaluate()
+            .expect("opaque and absolute dynamic imports return promises");
+        for register in [0usize, 1usize] {
+            let promise = execution.entry_registers[register];
+            let index = machine
+                .runtime_slot(promise)
+                .unwrap()
+                .expect("unresolved dynamic import result is a promise");
+            let HeapEntry::Promise {
+                state: PromiseState::Rejected { origin, .. },
+                ..
+            } = &machine.heap[index]
+            else {
+                panic!("opaque/absolute ImportDynamic must not resolve as a local path");
+            };
+            assert_eq!(
+                *origin,
+                ThrowOrigin::TypeError {
+                    operation: "resolve dynamic module specifier",
+                }
+            );
+        }
     }
 }
