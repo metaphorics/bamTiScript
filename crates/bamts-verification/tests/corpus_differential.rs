@@ -741,6 +741,71 @@ try {
 }
 
 #[test]
+fn explicit_new_target_construction_matches_node_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("explicit-new-target-construction-{}", process::id());
+    let entrypoint = format!("target/{id}.js");
+    let path = root.join(&entrypoint);
+    fs::write(
+        &path,
+        r#"class Base {
+  constructor(first, second) {
+    this.sum = first + second;
+    Base.seenNewTarget = new.target;
+  }
+}
+class ExplicitMiddle extends Base {
+  constructor(first, second, third) {
+    super(first, second);
+    this.third = third;
+  }
+}
+class ImplicitMiddle extends ExplicitMiddle {}
+class Leaf extends ImplicitMiddle {}
+function capture(label, construct) {
+  try {
+    const value = construct();
+    console.log(`${label}:value=${value.sum}:third=${value.third}:target=${Base.seenNewTarget && Base.seenNewTarget.name}:base=${value instanceof Base}:explicit=${value instanceof ExplicitMiddle}:implicit=${value instanceof ImplicitMiddle}:leaf=${value instanceof Leaf}`);
+  } catch (error) {
+    console.log(`${label}:threw=${error.constructor.name}:${error.message}`);
+  }
+}
+capture("leaf-most-derived", () => new Leaf(2, 3, 4));
+capture("implicit-as-leaf", () => new ImplicitMiddle(5, 6, 7));
+capture("explicit-as-leaf", () => new ExplicitMiddle(8, 9, 10));
+"#,
+    )
+    .expect("write explicit new.target construction fixture");
+    let spec = CaseSpec {
+        id,
+        repository: "local".to_owned(),
+        commit: "0".repeat(40),
+        license: "UNLICENSED".to_owned(),
+        source_dir: "target".to_owned(),
+        entrypoint,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let oracle = NodeOracle::discover(&root).expect("the pinned Node oracle must be available");
+    let bamts = BamtsRunner::new(&root);
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_file(path).expect("remove explicit new.target construction fixture");
+    assert!(
+        failures.is_empty(),
+        "explicit new.target construction differential failures:\n{}",
+        failures.join("\n\n")
+    );
+}
+
+#[test]
 fn import_meta_identity_matches_node_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("import-meta-{}", process::id());
