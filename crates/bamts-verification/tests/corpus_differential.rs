@@ -1462,6 +1462,99 @@ try {
 }
 
 #[test]
+fn invalid_auto_accessor_decorator_return_matches_tsc_oracle_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("auto-accessor-decorator-invalid-{}", process::id());
+    let source_relative = format!("target/{id}.js");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("target/decorator-oracles/{id}.js");
+    let transpiled_path = root.join(&transpiled_relative);
+
+    let source = r#"let sideEffects = 0;
+function invalid(_target, _context) {
+  return function () {
+    sideEffects += 1;
+  };
+}
+function invalidAccessor() {
+  class Bad {
+    @invalid
+    accessor value = 1;
+  }
+  return Bad;
+}
+console.log('before');
+try {
+  invalidAccessor();
+  console.log('unexpected');
+} catch (error) {
+  console.log(`invalid:${error instanceof TypeError}`);
+  console.log(`sideEffects:${sideEffects}`);
+}
+"#;
+    fs::write(&source_path, source).expect("write invalid auto-accessor decorator fixture");
+    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+        .arg(&source_path)
+        .args([
+            "--target",
+            "es2022",
+            "--module",
+            "commonjs",
+            "--strict",
+            "false",
+            "--esModuleInterop",
+            "--skipLibCheck",
+            "--rootDir",
+            "target",
+            "--outDir",
+            "target/decorator-oracles",
+            "--allowJs",
+            "--checkJs",
+            "false",
+        ])
+        .current_dir(&root)
+        .status()
+        .expect("run TypeScript invalid auto-accessor decorator oracle");
+    assert!(
+        status.success(),
+        "TypeScript invalid auto-accessor decorator oracle failed with {status}"
+    );
+    let spec = CaseSpec {
+        id: id.clone(),
+        repository: "local".to_owned(),
+        commit: "0".repeat(40),
+        license: "UNLICENSED".to_owned(),
+        source_dir: "target".to_owned(),
+        entrypoint: transpiled_relative,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    let actual_spec = CaseSpec {
+        entrypoint: source_relative,
+        ..spec.clone()
+    };
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&actual_spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_file(source_path).expect("remove invalid auto-accessor decorator source fixture");
+    fs::remove_file(transpiled_path)
+        .expect("remove invalid auto-accessor decorator oracle fixture");
+    assert!(
+        failures.is_empty(),
+        "invalid auto-accessor decorator differential failures:\n{}",
+        failures.join("\n\n")
+    );
+}
+
+#[test]
 fn interpreter_failure_text_names_mode_stage_and_evidence() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("task-113-interpreter-missing-{}", process::id());

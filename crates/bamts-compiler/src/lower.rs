@@ -4927,10 +4927,13 @@ impl<'a> FunctionContext<'a> {
         &mut self,
         builder: &mut ModuleBuilder,
         range: TextRange,
-        offender: Register,
     ) -> Result<(), LowerError> {
+        // Always call a fresh known non-callable. Never pass a user-returned
+        // value here: a callable invalid decorator return would run user code
+        // instead of throwing an engine TypeError.
+        let dummy = self.load_constant(builder, Constant::Boolean(true), range)?;
         let undefined = self.undefined(builder, range)?;
-        let _ = self.call_with_registers(range, offender, undefined, &[])?;
+        let _ = self.call_with_registers(range, dummy, undefined, &[])?;
         Ok(())
     }
     fn accept_replacement_callable(
@@ -4987,7 +4990,7 @@ impl<'a> FunctionContext<'a> {
                 target: Pc::new(0),
             },
         )?;
-        self.raise_type_error(builder, range, returned)?;
+        self.raise_type_error(builder, range)?;
         let done_error = self.emit(range, Instruction::Jump { target: Pc::new(0) })?;
         self.patch_jump(accept, self.next_pc());
         self.move_to(range, slot, returned)?;
@@ -5054,7 +5057,7 @@ impl<'a> FunctionContext<'a> {
                 target: Pc::new(0),
             },
         )?;
-        self.raise_type_error(builder, range, returned)?;
+        self.raise_type_error(builder, range)?;
         let done_error = self.emit(range, Instruction::Jump { target: Pc::new(0) })?;
         self.patch_jump(accept, self.next_pc());
         self.move_to(range, collected, returned)?;
@@ -5167,8 +5170,7 @@ impl<'a> FunctionContext<'a> {
                         target: Pc::new(0),
                     },
                 )?;
-                let closed_dummy = inner.load_constant(builder, Constant::Boolean(true), range)?;
-                inner.raise_type_error(builder, range, closed_dummy)?;
+                inner.raise_type_error(builder, range)?;
                 let closed_done = inner.emit(range, Instruction::Jump { target: Pc::new(0) })?;
                 inner.patch_jump(still_open, inner.next_pc());
                 let callback_type = inner.alloc_register(range)?;
@@ -5199,7 +5201,7 @@ impl<'a> FunctionContext<'a> {
                         target: Pc::new(0),
                     },
                 )?;
-                inner.raise_type_error(builder, range, callback)?;
+                inner.raise_type_error(builder, range)?;
                 let bad_done = inner.emit(range, Instruction::Jump { target: Pc::new(0) })?;
                 inner.patch_jump(accept, inner.next_pc());
                 inner.emit(
@@ -8308,7 +8310,7 @@ impl<'a> FunctionContext<'a> {
                     target: Pc::new(0),
                 },
             )?;
-            self.raise_type_error(builder, range, returned)?;
+            self.raise_type_error(builder, range)?;
             let errored = self.emit(range, Instruction::Jump { target: Pc::new(0) })?;
             self.patch_jump(accepted_object, self.next_pc());
             let new_get = self.get_named(builder, range, returned, "get")?;
