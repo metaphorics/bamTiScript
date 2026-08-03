@@ -11909,6 +11909,30 @@ mod tests {
     }
 
     #[test]
+    fn gc_traces_active_builtin_new_target() {
+        with_machine(Limits::default(), |machine| {
+            let new_target = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.function_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let index = machine.runtime_slot(new_target).unwrap().unwrap();
+            machine.current_new_target = new_target;
+
+            machine.collect_garbage();
+
+            assert!(!matches!(machine.heap[index], HeapEntry::Vacant));
+            assert_eq!(
+                machine.runtime_slot(machine.current_new_target).unwrap(),
+                Some(index)
+            );
+        });
+    }
+
+    #[test]
     fn interpreter_safe_point_reclaims_overwritten_values() {
         let program = verified(
             vec![Constant::Int32(7)],

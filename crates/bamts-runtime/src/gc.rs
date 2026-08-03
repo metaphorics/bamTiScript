@@ -144,6 +144,7 @@ impl GcState {
         if let Some(value) = machine.last_completion {
             self.mark_value(&machine.heap, value);
         }
+        self.mark_value(&machine.heap, machine.current_new_target);
         if let Some(resume) = &machine.pending_generator_resume {
             trace_generator_resume(resume, &machine.heap, &mut self.marks, &mut self.work);
         }
