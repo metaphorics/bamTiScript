@@ -902,8 +902,8 @@ impl<'a> AstFactCollector<'a> {
                         CallArgument::Missing(_) => continue,
                     };
                     if let Expression::Identifier(identifier) = argument.data() {
-                        self.readonly_aliases
-                            .remove(self.identifier(identifier).as_ref());
+                        let name = self.identifier(identifier).into_owned();
+                        self.readonly_aliases.remove(name.as_str());
                     }
                     self.visit_expr(argument, in_constructor);
                 }
@@ -1070,10 +1070,10 @@ impl<'a> AstFactCollector<'a> {
         let Expression::Identifier(object) = member.object.data() else {
             return;
         };
-        let object_name = self.identifier(object);
+        let object_name = self.identifier(object).into_owned();
         if self
             .variable_types
-            .get(object_name.as_ref())
+            .get(&object_name)
             .is_some_and(|ty| self.index_signature_types.contains(ty))
         {
             self.push(
@@ -1085,7 +1085,7 @@ impl<'a> AstFactCollector<'a> {
                 range,
             );
         }
-        if self.numeric_enums.contains(object_name.as_ref())
+        if self.numeric_enums.contains(&object_name)
             && matches!(member.property, MemberProperty::Computed(_))
         {
             self.push(SemanticHazard::NumericEnumReverseLookup, range);
@@ -1546,9 +1546,15 @@ fn has_esm_default_export(source: &SourceFile) -> bool {
 fn module_export_name<'a>(source: &'a SourceFile, name: &ModuleExportName) -> Option<Cow<'a, str>> {
     match name {
         ModuleExportName::Identifier(node) => source.identifier_text(node.data().token()),
-        ModuleExportName::String(node) => source
-            .token_text(node.data().token())
-            .map(|value| Cow::Borrowed(value.trim_matches(['\"', '\'']))),
+        ModuleExportName::String(node) => {
+            let text = source.source_text();
+            let range = node.range();
+            let start = text.utf16_to_byte(range.start()).ok()?;
+            let end = text.utf16_to_byte(range.end()).ok()?;
+            text.as_str()
+                .get(start..end)
+                .map(|value| Cow::Borrowed(value.trim_matches(['"', '\''])))
+        }
         ModuleExportName::Missing(_) => None,
     }
 }
