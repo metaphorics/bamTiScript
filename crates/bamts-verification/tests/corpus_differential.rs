@@ -1292,19 +1292,22 @@ fn class_decorator_initializer_state_matches_tsc_oracle_in_every_execution_mode(
 
     // Open during decorator application: enqueue two callbacks. Closed after
     // evaluation: escaped addInitializer throws TypeError and the rejected
-    // callback never runs. FIFO extras observe the final replacement as `this`.
+    // callback never runs. FIFO extras and the final binding observe the exact
+    // replacement object, not merely a shared class name.
     let source = r#"const trace = [];
 function log(value) { trace.push(value); }
 let escaped;
+let replacement;
 function replace(value, context) {
   escaped = context.addInitializer;
-  context.addInitializer(function () { log(`extra:first:${this.name}`); });
-  context.addInitializer(function () { log(`extra:second:${this.name}`); });
-  return class Replacement extends value {};
+  replacement = class Replacement extends value {};
+  context.addInitializer(function () { log(`extra:first:this===replacement:${this === replacement}`); });
+  context.addInitializer(function () { log(`extra:second:this===replacement:${this === replacement}`); });
+  return replacement;
 }
 @replace
 class C {}
-log(`finalName:${C.name}`);
+log(`final:C===replacement:${C === replacement}`);
 try {
   escaped(function () { log('late'); });
   log('late:accepted');

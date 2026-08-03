@@ -11560,6 +11560,85 @@ mod tests {
             "shared state cell is captured before application and closed after it"
         );
     }
+
+    #[test]
+    fn class_decoration_state_cell_stores_false_before_decorator_call_and_true_after() {
+        let module = lower_js(
+            "let escaped; function dec(_value, context) { escaped = context.addInitializer; } @dec class C {}",
+        );
+        let constants = module.constants();
+        let entry = module.functions()[module.entry().get() as usize].code();
+        let store_positions = |cell: Register, expected: bool| {
+            entry
+                .iter()
+                .enumerate()
+                .filter_map(|(index, instruction)| match instruction {
+                    Instruction::SetProperty { object, value, .. }
+                        if *object == cell
+                            && entry.iter().any(|candidate| {
+                                matches!(
+                                    candidate,
+                                    Instruction::LoadConst { dst, constant }
+                                        if *dst == *value
+                                            && matches!(
+                                                &constants[constant.get() as usize],
+                                                Constant::Boolean(actual) if *actual == expected
+                                            )
+                                )
+                            }) =>
+                    {
+                        Some(index)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let candidates: Vec<(Register, usize)> = entry
+            .iter()
+            .enumerate()
+            .filter_map(|(index, instruction)| match instruction {
+                Instruction::CreateCell { dst } => {
+                    let captured = entry.iter().any(|candidate| {
+                        matches!(candidate, Instruction::ArrayPush { value, .. } if value == dst)
+                    });
+                    (captured && !store_positions(*dst, true).is_empty()).then_some((*dst, index))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "the empty class has one captured, subsequently closed decoration state cell"
+        );
+        let (cell, create_pc) = candidates[0];
+        let open_store = *store_positions(cell, false)
+            .first()
+            .expect("state cell is seeded open with false before any decorator runs");
+        let close_store = *store_positions(cell, true)
+            .last()
+            .expect("state cell is closed with true");
+        let capture_push = entry
+            .iter()
+            .position(|instruction| {
+                matches!(instruction, Instruction::ArrayPush { value, .. } if *value == cell)
+            })
+            .expect("state cell is captured by the addInitializer helper");
+        let decorator_call = entry[capture_push..close_store]
+            .iter()
+            .position(|instruction| matches!(instruction, Instruction::Call { .. }))
+            .map(|offset| capture_push + offset)
+            .expect("class decorator is called while the state cell is open");
+        assert!(
+            create_pc < open_store && open_store < capture_push,
+            "state cell is seeded after allocation and before helper capture"
+        );
+        assert!(
+            open_store < decorator_call && decorator_call < close_store,
+            "state cell is open for class decoration and closes afterwards"
+        );
+    }
+
     #[test]
     fn using_captures_disposer_before_binding_and_disposes_on_normal_exit() {
         let module = lower_js("{ using value = acquire(); consume(value); }");
