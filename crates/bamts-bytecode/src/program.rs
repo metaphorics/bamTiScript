@@ -1896,6 +1896,45 @@ mod tests {
     }
 
     #[test]
+    fn hostile_tiny_envelope_rejects_large_edge_count_before_allocation() {
+        let code = verified_module("main", &["x"]);
+        let mut bytes = raw_module_prefix(&code);
+        write_u32(u32::MAX, &mut bytes);
+        let limits = ProgramDecodeLimits {
+            max_edges_per_module: u32::MAX,
+            max_total_edges: u32::MAX,
+            ..ProgramDecodeLimits::default()
+        };
+        assert!(matches!(
+            decode_program(&bytes, &limits),
+            Err(ProgramDecodeError {
+                kind: ProgramDecodeErrorKind::UnexpectedEof,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn hostile_tiny_envelope_rejects_large_binding_count_before_allocation() {
+        let code = verified_module("main", &["x"]);
+        let mut bytes = raw_module_prefix(&code);
+        write_u32(0, &mut bytes);
+        write_u32(u32::MAX, &mut bytes);
+        let limits = ProgramDecodeLimits {
+            max_bindings_per_module: u32::MAX,
+            max_total_bindings: u32::MAX,
+            ..ProgramDecodeLimits::default()
+        };
+        assert!(matches!(
+            decode_program(&bytes, &limits),
+            Err(ProgramDecodeError {
+                kind: ProgramDecodeErrorKind::UnexpectedEof,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn invalid_envelope_tags_and_integers_are_rejected() {
         let code = verified_module("main", &["x"]);
 
