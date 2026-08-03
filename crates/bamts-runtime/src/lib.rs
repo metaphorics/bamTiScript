@@ -18104,6 +18104,64 @@ mod tests {
     }
 
     #[test]
+    fn construct_value_preserves_engine_throw_origin() {
+        // A runtime closure constructor whose body raises an engine-origin
+        // TypeError must surface that body's origin verbatim across the
+        // construct_value runtime-constructor boundary. The body calls a
+        // non-callable, throwing TypeError{operation:"call"}; the outer
+        // boundary is construct, so a leaked boundary error would read
+        // operation:"construct".
+        let program = verified(
+            vec![Constant::Int32(0)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::CreateArray { dst: reg(1) },
+                        Instruction::Call {
+                            dst: reg(2),
+                            callee: reg(0),
+                            this_value: reg(1),
+                            arguments: reg(1),
+                        },
+                        Instruction::Return { value: reg(2) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callee = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(1),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+
+        assert!(matches!(
+            machine.construct_value(callee, &[]),
+            Err(EvalFailure::ThrowValueOrigin {
+                value: Value::UNDEFINED,
+                origin: ThrowOrigin::TypeError { operation: "call" },
+            })
+        ));
+        assert!(machine.frames.is_empty());
+    }
+
+    #[test]
     fn native_callback_throw_uncaught_at_outer_call_site() {
         let entry = function(
             0,
