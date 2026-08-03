@@ -3557,12 +3557,34 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(())
     }
 
+    /// Rejects `promise` with `reason`. Lazy engine-origin reasons
+    /// (`UNDEFINED` + non-Bytecode origin) are materialized once here into a
+    /// realm-intrinsic Error before settlement, so every rejection path
+    /// (async functions, async generators, incompatible receivers, failed
+    /// imports, reaction forwarding) stores an observable error object.
+    /// Already-materialized and Bytecode-origin reasons retain identity.
+    /// Already-settled promises are no-ops and do not allocate a reason.
     fn reject_promise(
         &mut self,
         promise: Value,
         reason: Value,
         origin: ThrowOrigin,
     ) -> Result<(), RuntimeErrorKind> {
+        if catch_value_needs_materialization(reason, origin) {
+            let index = self
+                .runtime_slot(promise)?
+                .ok_or(RuntimeErrorKind::InvalidValue { value: promise })?;
+            match &self.heap[index] {
+                HeapEntry::Promise {
+                    state: PromiseState::Pending { .. },
+                    ..
+                } => {}
+                HeapEntry::Promise { .. } => return Ok(()),
+                _ => return Err(RuntimeErrorKind::InvalidValue { value: promise }),
+            }
+            let reason = self.materialize_engine_origin(origin)?;
+            return self.settle_promise(promise, PromiseState::Rejected { reason, origin });
+        }
         self.settle_promise(promise, PromiseState::Rejected { reason, origin })
     }
 
@@ -12702,6 +12724,116 @@ mod tests {
         machine.run_to_quiescence().unwrap();
     }
 
+    #[test]
+    fn reject_promise_materializes_lazy_type_error_once() {
+        // Direct sink contract: UNDEFINED + engine TypeError origin becomes one
+        // intrinsic TypeError object; a second reject on a settled promise is a
+        // no-op and must not allocate another reason.
+        let program = verified(Vec::new(), vec![function(0, 1, vec![Instruction::Halt], Vec::new())]);
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let promise = machine.create_promise().unwrap();
+        let before = machine.heap.len();
+        machine
+            .reject_promise(
+                promise,
+                Value::UNDEFINED,
+                ThrowOrigin::TypeError {
+                    operation: "sink materialize",
+                },
+            )
+            .unwrap();
+        let after_first = machine.heap.len();
+        assert!(after_first > before, "lazy rejection must allocate an error");
+        let index = machine.runtime_slot(promise).unwrap().unwrap();
+        let HeapEntry::Promise {
+            state: PromiseState::Rejected { reason, origin },
+            ..
+        } = &machine.heap[index]
+        else {
+            panic!("sink must reject");
+        };
+        let reason = *reason;
+        let origin = *origin;
+        assert_ne!(reason, Value::UNDEFINED);
+        assert_eq!(
+            origin,
+            ThrowOrigin::TypeError {
+                operation: "sink materialize",
+            }
+        );
+        let name = machine.get_named_property(reason, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name)
+                .is_some_and(|text| text.eq_ascii("TypeError"))
+        );
+        let message = machine.get_named_property(reason, "message").unwrap();
+        assert!(
+            machine
+                .string_value(message)
+                .is_some_and(|text| text.eq_ascii("sink materialize"))
+        );
+        let constructor = machine.intrinsics.global("TypeError").unwrap();
+        assert!(machine.instance_of(reason, constructor).unwrap());
+
+        machine
+            .reject_promise(
+                promise,
+                Value::UNDEFINED,
+                ThrowOrigin::TypeError {
+                    operation: "second materialize",
+                },
+            )
+            .unwrap();
+        assert_eq!(machine.heap.len(), after_first, "settled reject must not rematerialize");
+        let HeapEntry::Promise {
+            state: PromiseState::Rejected {
+                reason: kept_reason,
+                origin: kept_origin,
+            },
+            ..
+        } = &machine.heap[index]
+        else {
+            panic!("sink must stay rejected");
+        };
+        assert_eq!(*kept_reason, reason);
+        assert_eq!(*kept_origin, origin);
+    }
+
+    #[test]
+    fn reject_promise_keeps_prematerialized_identity() {
+        // Direct sink contract: an already-materialized reason and Bytecode
+        // origin keep exact Value identity with no rematerialization.
+        let program = verified(Vec::new(), vec![function(0, 1, vec![Instruction::Halt], Vec::new())]);
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let preallocated = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        let promise = machine.create_promise().unwrap();
+        let before = machine.heap.len();
+        machine
+            .reject_promise(promise, preallocated, ThrowOrigin::Bytecode)
+            .unwrap();
+        assert_eq!(machine.heap.len(), before, "prematerialized reject allocates no error");
+        let index = machine.runtime_slot(promise).unwrap().unwrap();
+        let HeapEntry::Promise {
+            state: PromiseState::Rejected { reason, origin },
+            ..
+        } = &machine.heap[index]
+        else {
+            panic!("sink must reject");
+        };
+        assert_eq!(*reason, preallocated);
+        assert_eq!(*origin, ThrowOrigin::Bytecode);
+    }
+
     fn run_ok(program: &Program<Verified>) -> Execution {
         let mut host = TestHost;
         Machine::new(program, &mut host, Limits::default())
@@ -13800,13 +13932,115 @@ mod tests {
             })
             .unwrap();
 
-        // AsyncGenerator.prototype.next never throws synchronously.
+        // AsyncGenerator.prototype.next never throws synchronously; an
+        // incompatible receiver rejects with a materialized TypeError.
         let capability = machine.call_value(next, receiver, &[]).unwrap();
-        assert!(matches!(
-            machine.runtime_slot(capability),
-            Ok(Some(index)) if matches!(machine.heap[index], HeapEntry::Promise { .. })
-        ));
-        assert!(rejected_reason(&machine, capability) == Value::UNDEFINED);
+        let index = machine
+            .runtime_slot(capability)
+            .unwrap()
+            .expect("next returns a promise");
+        let HeapEntry::Promise {
+            state: PromiseState::Rejected { reason, origin },
+            ..
+        } = &machine.heap[index]
+        else {
+            panic!("incompatible receiver must reject its promise");
+        };
+        let reason = *reason;
+        let origin = *origin;
+        assert_ne!(reason, Value::UNDEFINED);
+        assert_eq!(
+            origin,
+            ThrowOrigin::TypeError {
+                operation: "AsyncGenerator.prototype.next called on incompatible receiver",
+            }
+        );
+        let name = machine.get_named_property(reason, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name)
+                .is_some_and(|text| text.eq_ascii("TypeError"))
+        );
+        let message = machine.get_named_property(reason, "message").unwrap();
+        assert!(machine.string_value(message).is_some_and(|text| {
+            text.eq_ascii("AsyncGenerator.prototype.next called on incompatible receiver")
+        }));
+        let constructor = machine.intrinsics.global("TypeError").unwrap();
+        assert!(machine.instance_of(reason, constructor).unwrap());
+    }
+
+    #[test]
+    fn async_generator_engine_type_error_rejection_has_intrinsic_shape() {
+        // An async generator body that calls a non-callable must reject the
+        // front next() capability with a materialized intrinsic TypeError.
+        let program = verified(
+            vec![Constant::Int32(0)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::CreateArray { dst: reg(1) },
+                        Instruction::Call {
+                            dst: reg(2),
+                            callee: reg(0),
+                            this_value: reg(0),
+                            arguments: reg(1),
+                        },
+                        Instruction::Return { value: reg(2) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        let promise = async_generator_next(&mut machine, generator, Value::UNDEFINED)
+            .expect("next returns a rejected promise");
+        let index = machine
+            .runtime_slot(promise)
+            .unwrap()
+            .expect("next result is a promise");
+        let HeapEntry::Promise {
+            state: PromiseState::Rejected { reason, origin },
+            ..
+        } = &machine.heap[index]
+        else {
+            panic!("async generator engine TypeError must reject its promise");
+        };
+        let reason = *reason;
+        let origin = *origin;
+        assert_ne!(reason, Value::UNDEFINED);
+        assert_eq!(
+            origin,
+            ThrowOrigin::TypeError {
+                operation: "call",
+            }
+        );
+        let name = machine.get_named_property(reason, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name)
+                .is_some_and(|text| text.eq_ascii("TypeError"))
+        );
+        let message = machine.get_named_property(reason, "message").unwrap();
+        assert!(
+            machine
+                .string_value(message)
+                .is_some_and(|text| text.eq_ascii("call"))
+        );
+        let constructor = machine.intrinsics.global("TypeError").unwrap();
+        assert!(machine.instance_of(reason, constructor).unwrap());
+        machine.run_to_quiescence().unwrap();
     }
 
     #[test]
