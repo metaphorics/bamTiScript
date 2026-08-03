@@ -669,51 +669,145 @@ struct LoadState<'a> {
 }
 
 impl LoadState<'_> {
-    fn visit(&mut self, path: PathBuf) -> Result<SourceId, ProgramLoadError> {
-        if let Some(source_id) = self.identities.get(&path) {
-            return Ok(*source_id);
+    /// Loads `entrypoint` and its local import graph with an explicit stack.
+    ///
+    /// SourceIds are assigned in DFS preorder (first discovery). Modules are
+    /// appended in DFS postorder. Local edges are resolved left-to-right; a path
+    /// already present in `identities` is reused immediately, which both
+    /// deduplicates diamonds and retains cycle edges without re-entering.
+    fn visit(&mut self, entrypoint: PathBuf) -> Result<SourceId, ProgramLoadError> {
+        struct Frame {
+            path: PathBuf,
+            source_id: SourceId,
+            script_kind: ScriptKind,
+            source: Arc<SourceText>,
+            remaining: std::vec::IntoIter<UnresolvedEdge>,
+            dependencies: Vec<ModuleEdge>,
+            /// Local edge whose target visit is in flight (child on the stack).
+            pending_edge: Option<UnresolvedEdge>,
         }
-        let source_id = SourceId::new(
-            u32::try_from(self.identities.len()).map_err(|_| ProgramLoadError::TooManySources)?,
-        );
-        self.identities.insert(path.clone(), source_id);
 
-        let script_kind =
-            script_kind(&path).ok_or_else(|| ProgramLoadError::UnsupportedSource(path.clone()))?;
-        let text = fs::read_to_string(&path).map_err(|source| ProgramLoadError::Read {
-            path: path.clone(),
-            source,
-        })?;
-        let source = Arc::new(SourceText::new(text));
-        let parsed = parser::parse(scanner::scan(source_id, script_kind, Arc::clone(&source)));
-        let unresolved = collect_edges(parsed.product()).map_err(|range| {
-            ProgramLoadError::IllFormedModuleSpecifier {
-                importer: path.clone(),
-                range,
-            }
-        })?;
-        let mut dependencies = Vec::with_capacity(unresolved.len());
-        for edge in unresolved {
-            let target = match self.loader.resolve_edge(&path, &edge)? {
-                ResolvedEdgeTarget::Local(target_path) => {
-                    ModuleTarget::Local(self.visit(target_path)?)
-                }
-                ResolvedEdgeTarget::External(specifier) => ModuleTarget::External(specifier),
-            };
-            dependencies.push(ModuleEdge {
-                kind: edge.kind,
-                specifier: edge.specifier,
-                target,
-                range: edge.range,
-            });
+        enum Resume {
+            Enter(PathBuf),
+            Advance,
         }
-        self.modules.push(ResolvedModule {
-            identity: SourceIdentity::new(source_id, Arc::from(path)),
-            script_kind,
-            source,
-            dependencies: Arc::from(dependencies),
-        });
-        Ok(source_id)
+
+        let mut stack: Vec<Frame> = Vec::new();
+        let mut resume = Resume::Enter(entrypoint);
+
+        loop {
+            match resume {
+                Resume::Enter(path) => {
+                    if let Some(&source_id) = self.identities.get(&path) {
+                        let Some(parent) = stack.last_mut() else {
+                            return Ok(source_id);
+                        };
+                        let edge = parent.pending_edge.take().expect(
+                            "deduplicated or cyclic local resume belongs to a pending edge",
+                        );
+                        parent.dependencies.push(ModuleEdge {
+                            kind: edge.kind,
+                            specifier: edge.specifier,
+                            target: ModuleTarget::Local(source_id),
+                            range: edge.range,
+                        });
+                        resume = Resume::Advance;
+                        continue;
+                    }
+
+                    let source_id = SourceId::new(
+                        u32::try_from(self.identities.len())
+                            .map_err(|_| ProgramLoadError::TooManySources)?,
+                    );
+                    self.identities.insert(path.clone(), source_id);
+
+                    let script_kind = script_kind(&path)
+                        .ok_or_else(|| ProgramLoadError::UnsupportedSource(path.clone()))?;
+                    let text =
+                        fs::read_to_string(&path).map_err(|source| ProgramLoadError::Read {
+                            path: path.clone(),
+                            source,
+                        })?;
+                    let source = Arc::new(SourceText::new(text));
+                    let parsed =
+                        parser::parse(scanner::scan(source_id, script_kind, Arc::clone(&source)));
+                    let unresolved = collect_edges(parsed.product()).map_err(|range| {
+                        ProgramLoadError::IllFormedModuleSpecifier {
+                            importer: path.clone(),
+                            range,
+                        }
+                    })?;
+                    let dependencies = Vec::with_capacity(unresolved.len());
+                    stack.push(Frame {
+                        path,
+                        source_id,
+                        script_kind,
+                        source,
+                        remaining: unresolved.into_iter(),
+                        dependencies,
+                        pending_edge: None,
+                    });
+                    resume = Resume::Advance;
+                }
+                Resume::Advance => {
+                    let descend = {
+                        let frame = stack
+                            .last_mut()
+                            .expect("Advance always runs with a frame on the stack");
+                        loop {
+                            let Some(edge) = frame.remaining.next() else {
+                                break None;
+                            };
+                            match self.loader.resolve_edge(&frame.path, &edge)? {
+                                ResolvedEdgeTarget::Local(target_path) => {
+                                    frame.pending_edge = Some(edge);
+                                    break Some(target_path);
+                                }
+                                ResolvedEdgeTarget::External(specifier) => {
+                                    frame.dependencies.push(ModuleEdge {
+                                        kind: edge.kind,
+                                        specifier: edge.specifier,
+                                        target: ModuleTarget::External(specifier),
+                                        range: edge.range,
+                                    });
+                                }
+                            }
+                        }
+                    };
+
+                    if let Some(target_path) = descend {
+                        resume = Resume::Enter(target_path);
+                        continue;
+                    }
+
+                    let frame = stack
+                        .pop()
+                        .expect("finished module must have a frame on the stack");
+                    let source_id = frame.source_id;
+                    self.modules.push(ResolvedModule {
+                        identity: SourceIdentity::new(source_id, Arc::from(frame.path)),
+                        script_kind: frame.script_kind,
+                        source: frame.source,
+                        dependencies: Arc::from(frame.dependencies),
+                    });
+
+                    let Some(parent) = stack.last_mut() else {
+                        return Ok(source_id);
+                    };
+                    let edge = parent
+                        .pending_edge
+                        .take()
+                        .expect("finished child always completes a parent local edge");
+                    parent.dependencies.push(ModuleEdge {
+                        kind: edge.kind,
+                        specifier: edge.specifier,
+                        target: ModuleTarget::Local(source_id),
+                        range: edge.range,
+                    });
+                    resume = Resume::Advance;
+                }
+            }
+        }
     }
 }
 
@@ -3914,6 +4008,49 @@ mod tests {
         assert_eq!(
             b.dependencies()[0].target(),
             &ModuleTarget::Local(program.entrypoint_id())
+        );
+    }
+
+    #[test]
+    fn loads_a_long_acyclic_import_chain_iteratively() {
+        // Deep enough that the previous recursive DFS would blow the thread stack,
+        // but cheap to materialize: one tiny file per hop.
+        const DEPTH: usize = 4096;
+        let fixture = Fixture::new();
+        for index in 0..DEPTH {
+            let name = format!("m{index}.ts");
+            let source = if index + 1 == DEPTH {
+                "export {};\n".to_string()
+            } else {
+                format!("import './m{}.ts';\n", index + 1)
+            };
+            fixture.write(&name, &source);
+        }
+
+        let program = fixture.loader().load("m0.ts").unwrap();
+
+        assert_eq!(program.modules().len(), DEPTH);
+        assert_eq!(program.entrypoint_id().get(), 0);
+        assert_eq!(
+            program.modules().last().map(|module| module.source_id()),
+            Some(program.entrypoint_id())
+        );
+        assert_eq!(
+            program.modules()[0]
+                .path()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("m{}.ts", DEPTH - 1)
+        );
+        assert_eq!(
+            program.modules()[0].source_id().get(),
+            u32::try_from(DEPTH - 1).unwrap()
+        );
+        assert_eq!(
+            program.entrypoint().dependencies()[0].target(),
+            &ModuleTarget::Local(program.modules()[DEPTH - 2].source_id())
         );
     }
 
