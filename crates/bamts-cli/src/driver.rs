@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -30,44 +29,6 @@ const NODE_STATICLIB: &[u8] = include_bytes!(env!("BAMTS_NODE_STATICLIB"));
 const HOST_TARGET: &str = env!("BAMTS_HOST_TARGET");
 const BUILD_TARGET: &str = env!("BAMTS_BUILD_TARGET");
 static NEXT_CACHE_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
-#[cfg(unix)]
-thread_local! {
-    static FALLBACK_CACHE: RefCell<FallbackCacheState> = const {
-        RefCell::new(FallbackCacheState {
-            depth: 0,
-            directory: None,
-        })
-    };
-}
-
-#[cfg(unix)]
-struct FallbackCacheState {
-    depth: usize,
-    directory: Option<tempfile::TempDir>,
-}
-
-#[cfg(unix)]
-struct FallbackCacheScope;
-
-#[cfg(unix)]
-impl FallbackCacheScope {
-    fn enter() -> Self {
-        FALLBACK_CACHE.with(|state| state.borrow_mut().depth += 1);
-        Self
-    }
-}
-
-#[cfg(unix)]
-impl Drop for FallbackCacheScope {
-    fn drop(&mut self) {
-        let directory = FALLBACK_CACHE.with(|state| {
-            let mut state = state.borrow_mut();
-            state.depth = state.depth.checked_sub(1).expect("fallback cache scope");
-            (state.depth == 0).then(|| state.directory.take()).flatten()
-        });
-        drop(directory);
-    }
-}
 
 /// Bytes and process status produced by one successful CLI command.
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -312,8 +273,6 @@ impl Error for DriverError {
 
 /// Executes one already-parsed CLI command.
 pub fn execute(args: &CliArgs) -> Result<CommandOutcome, DriverError> {
-    #[cfg(unix)]
-    let _fallback_cache = FallbackCacheScope::enter();
     match args.mode {
         Mode::Check | Mode::Compile | Mode::Run => {
             let frontend = load_program_frontend(args)?;
@@ -657,14 +616,22 @@ fn cached_node_archive() -> Result<PathBuf, DriverError> {
             }
         }
     };
-    write_cached_archive(&mut file, &temporary)?;
+    if let Err(error) = write_cached_archive(&mut file, &temporary) {
+        drop(file);
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    drop(file);
     match fs::rename(&temporary, &path) {
         Ok(()) => Ok(path),
         Err(_error) if path.is_file() => {
             let _ = fs::remove_file(&temporary);
             Ok(path)
         }
-        Err(source) => Err(DriverError::CacheArchive { path, source }),
+        Err(source) => {
+            let _ = fs::remove_file(&temporary);
+            Err(DriverError::CacheArchive { path, source })
+        }
     }
 }
 
@@ -692,36 +659,8 @@ fn cache_root() -> Result<PathBuf, DriverError> {
 
 #[cfg(unix)]
 fn fallback_cache_root_path() -> Result<PathBuf, DriverError> {
-    FALLBACK_CACHE.with(|state| {
-        let mut state = state.borrow_mut();
-        if state.directory.is_none() {
-            state.directory = Some(create_random_fallback_cache_root_in(&std::env::temp_dir())?);
-        }
-        Ok(state
-            .directory
-            .as_ref()
-            .expect("fallback cache root initialized")
-            .path()
-            .to_owned())
-    })
-}
-
-#[cfg(unix)]
-fn create_random_fallback_cache_root_in(parent: &Path) -> Result<tempfile::TempDir, DriverError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let parent = validate_fallback_parent_chain(parent)?;
-    let prefix = format!("bamts-cache-{}-", fallback_cache_user_key()?);
-    let directory = tempfile::Builder::new()
-        .prefix(&prefix)
-        .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir_in(&parent)
-        .map_err(|source| DriverError::CreateDirectory {
-            path: parent,
-            source,
-        })?;
-    validate_private_fallback_dir(directory.path())?;
-    Ok(directory)
+    let parent = validate_fallback_parent_chain(&std::env::temp_dir())?;
+    Ok(parent.join(format!("bamts-cache-{}", fallback_cache_user_key()?)))
 }
 
 #[cfg(not(unix))]
@@ -1187,6 +1126,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn fallback_cache_root_has_stable_per_user_path() {
+        let parent = super::validate_fallback_parent_chain(&std::env::temp_dir()).unwrap();
+        let expected = parent.join(format!("bamts-cache-{}", super::effective_uid().unwrap()));
+        assert_eq!(super::fallback_cache_root_path().unwrap(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn private_fallback_cache_root_creates_owner_only_directory() {
         use std::os::unix::fs::PermissionsExt;
         use std::sync::atomic::Ordering;
@@ -1248,41 +1195,6 @@ mod tests {
             .expect_err("replaceable parent must be rejected");
 
         assert!(matches!(error, DriverError::UnsafeFallbackCacheRoot { .. }));
-        let _ = std::fs::remove_dir_all(&parent);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn random_fallback_cache_root_uses_private_unpredictable_leaf() {
-        use std::os::unix::fs::PermissionsExt;
-        use std::sync::atomic::Ordering;
-
-        let parent = std::env::temp_dir().join(format!(
-            "bamts-cli-shared-sticky-parent-{}-{}",
-            std::process::id(),
-            super::NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&parent);
-        std::fs::create_dir(&parent).expect("create fixture parent");
-        let mut permissions = std::fs::metadata(&parent).expect("metadata").permissions();
-        permissions.set_mode(0o1777);
-        std::fs::set_permissions(&parent, permissions).expect("chmod");
-
-        let root = super::create_random_fallback_cache_root_in(&parent)
-            .expect("sticky parent must support an atomic random private leaf");
-        let name = root
-            .path()
-            .file_name()
-            .expect("fallback leaf")
-            .to_string_lossy();
-        assert!(name.starts_with(&format!("bamts-cache-{}-", super::effective_uid().unwrap())));
-        assert!(name.len() > "bamts-cache-1000-".len());
-        assert_eq!(
-            std::fs::metadata(root.path()).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-
-        drop(root);
         let _ = std::fs::remove_dir_all(&parent);
     }
 
