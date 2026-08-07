@@ -269,6 +269,10 @@ fn iterator_next<H: Host>(
                     })
                 }
                 HeapEntry::Collection { entries, .. } => {
+                    debug_assert!(
+                        entries.windows(2).all(|w| w[0].order <= w[1].order),
+                        "collection entries must stay sorted ascending by order"
+                    );
                     let index = entries.partition_point(|entry| entry.order < cursor);
                     entries[index..]
                         .iter()
@@ -871,41 +875,61 @@ pub(super) fn append_collection_entry<H: Host>(
             crate::CollectionEntry::BYTES + crate::CollectionIndex::ENTRY_BYTES,
         )
         .map_err(EvalFailure::Runtime)?;
-    let HeapEntry::Collection {
-        entries,
-        index,
-        size,
-        next_order: stored_next_order,
-        ..
-    } = &mut machine.heap[slot]
-    else {
-        unreachable!("collection slot owns collection storage")
-    };
-    // Reuse a tombstoned slot if one exists, so repeated insert-and-delete
-    // does not grow the entries vector without bound.
-    let entry_index = entries
-        .iter()
-        .position(|entry| !entry.live)
-        .unwrap_or(entries.len());
-    if entry_index == entries.len() {
+    // Push-only insertion keeps `entries` sorted ascending by `order`, which
+    // `collection_next`/`iterator_next` rely on for their binary-search cursor
+    // (`partition_point(|e| e.order < cursor)`). Reusing a tombstoned slot
+    // would write the largest order so far into an early position and break
+    // that, silently skipping live entries during iteration.
+    let needs_compact = {
+        let HeapEntry::Collection {
+            entries,
+            index,
+            size,
+            next_order: stored_next_order,
+            ..
+        } = &mut machine.heap[slot]
+        else {
+            unreachable!("collection slot owns collection storage")
+        };
         entries.push(crate::CollectionEntry {
             order,
             key,
             value,
             live: true,
         });
-    } else {
-        entries[entry_index] = crate::CollectionEntry {
-            order,
-            key,
-            value,
-            live: true,
-        };
+        let entry_index = entries.len() - 1;
+        index.insert(hash, entry_index);
+        *size += 1;
+        *stored_next_order = next_order;
+        entries.len() > size.saturating_mul(2)
+    };
+    if needs_compact {
+        compact_collection(machine, slot);
     }
-    index.insert(hash, entry_index);
-    *size += 1;
-    *stored_next_order = next_order;
     Ok(())
+}
+
+/// Drop tombstoned entries and rebuild the hash index, bounding the entries
+/// vector under churn. Live entries retain their `order` values, preserving
+/// the sorted-by-order invariant and any outstanding iterator cursor. Mirrors
+/// the rebuild pattern used by GC weak-collection purging.
+fn compact_collection<H: Host>(machine: &mut Machine<'_, H>, slot: usize) {
+    let (retained, rebuilt) = {
+        let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
+            unreachable!("collection slot owns collection storage")
+        };
+        let retained: Vec<_> = entries.iter().copied().filter(|e| e.live).collect();
+        let mut rebuilt = crate::CollectionIndex::default();
+        for (i, entry) in retained.iter().enumerate() {
+            rebuilt.insert(crate::collection_key_hash(machine, entry.key), i);
+        }
+        (retained, rebuilt)
+    };
+    let HeapEntry::Collection { entries, index, .. } = &mut machine.heap[slot] else {
+        unreachable!("collection slot owns collection storage")
+    };
+    *entries = retained;
+    *index = rebuilt;
 }
 
 fn collection<H: Host>(
@@ -955,6 +979,10 @@ fn collection_next<H: Host>(
     let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
         unreachable!("collection brand was checked")
     };
+    debug_assert!(
+        entries.windows(2).all(|w| w[0].order <= w[1].order),
+        "collection entries must stay sorted ascending by order"
+    );
     let index = entries.partition_point(|entry| entry.order < cursor);
     Ok(entries[index..]
         .iter()
@@ -2225,8 +2253,8 @@ mod tests {
             map_get_for(&mut machine, map, &[Value::int32(1)], CollectionKind::Map),
             Ok(BuiltinOutcome::Value(Value::UNDEFINED))
         ));
-
-        // Re-inserting key 1 must reuse the tombstoned slot, not grow the vector.
+        // Re-inserting key 1 pushes a new entry (the tombstone stays until
+        // compaction); insertion order is now key 2, then the re-added key 1.
         map_put(
             &mut machine,
             map,
@@ -2237,14 +2265,14 @@ mod tests {
         .unwrap();
         assert_eq!(
             raw_entries_len(&machine, map),
-            2,
-            "re-insert must reuse tombstoned slot"
+            3,
+            "push-only re-insert appends; the tombstone remains until compaction"
         );
         assert_eq!(
             collection_entries(&machine, map),
             vec![
-                (Value::int32(1), Value::int32(99)),
-                (Value::int32(2), Value::int32(20))
+                (Value::int32(2), Value::int32(20)),
+                (Value::int32(1), Value::int32(99))
             ],
         );
     }
@@ -2285,6 +2313,106 @@ mod tests {
                 (Value::int32(3), Value::int32(30)),
             ],
             "iteration must skip tombstoned entries"
+        );
+    }
+
+    #[test]
+    fn iteration_visits_all_live_entries_after_delete_then_reinsert() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let map = construct_builtin(&mut machine, "Map", &[]);
+        // The sortedness regression: set, set, delete, re-set left a large
+        // order in an early vector slot, breaking the binary-search cursor
+        // the real iterator protocol uses.
+        map_put(
+            &mut machine,
+            map,
+            Value::int32(1),
+            Value::int32(10),
+            CollectionKind::Map,
+        )
+        .unwrap();
+        map_put(
+            &mut machine,
+            map,
+            Value::int32(2),
+            Value::int32(20),
+            CollectionKind::Map,
+        )
+        .unwrap();
+        assert!(matches!(
+            map_delete_for(&mut machine, map, &[Value::int32(1)], CollectionKind::Map),
+            Ok(BuiltinOutcome::Value(Value::TRUE))
+        ));
+        map_put(
+            &mut machine,
+            map,
+            Value::int32(1),
+            Value::int32(99),
+            CollectionKind::Map,
+        )
+        .unwrap();
+
+        // Iterate via the REAL iterator protocol (collection_next), the path
+        // forEach/for..of use — NOT collection_entries, which scans by vector
+        // position and would miss the sortedness break.
+        let mut visited = Vec::new();
+        let mut cursor = 0;
+        while let Some((next, key, value)) =
+            collection_next(&machine, map, CollectionKind::Map, cursor).unwrap()
+        {
+            cursor = next;
+            visited.push((key, value));
+        }
+        assert_eq!(
+            visited,
+            vec![
+                (Value::int32(2), Value::int32(20)),
+                (Value::int32(1), Value::int32(99)),
+            ],
+            "every live entry must be visited exactly once in insertion order"
+        );
+    }
+
+    #[test]
+    fn repeated_insert_delete_does_not_grow_entries_unboundedly() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let map = construct_builtin(&mut machine, "Map", &[]);
+        const N: usize = 50;
+        const ROUNDS: usize = 20;
+        for _ in 0..ROUNDS {
+            for k in 1..=N {
+                map_put(
+                    &mut machine,
+                    map,
+                    Value::int32(k as u32),
+                    Value::int32((k as u32) * 10),
+                    CollectionKind::Map,
+                )
+                .unwrap();
+            }
+            for k in 1..=N {
+                assert!(matches!(
+                    map_delete_for(
+                        &mut machine,
+                        map,
+                        &[Value::int32(k as u32)],
+                        CollectionKind::Map
+                    ),
+                    Ok(BuiltinOutcome::Value(Value::TRUE))
+                ));
+            }
+        }
+        // Without compaction, 20 rounds of insert-all/delete-all would
+        // accumulate 1000 tombstoned slots. Compaction must keep the vector
+        // bounded near the live-set size.
+        let len = raw_entries_len(&machine, map);
+        assert!(
+            len <= 2 * N,
+            "entries grew to {len} after {ROUNDS} rounds; compaction should bound it near {N}"
         );
     }
 
