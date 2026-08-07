@@ -267,6 +267,7 @@ impl InferredTypeArguments {
                             property.optional(),
                             self.instantiate(table, property.type_id()),
                         )
+                        .with_readonly(property.readonly())
                     })
                     .collect();
                 table.object_type(properties)
@@ -951,6 +952,39 @@ mod tests {
         let string = table.string();
         assert_eq!(inferred.instantiate(&mut table, string), string);
         assert_eq!(inferred.instantiate(&mut table, other), other);
+    }
+
+    /// A `readonly` member of a generic object type keeps its flag through
+    /// instantiation; without `.with_readonly` the flag is silently dropped.
+    #[test]
+    fn instantiation_preserves_readonly_on_object_properties() {
+        let mut table = TypeTable::new();
+        let t = table.named(parameter(1));
+        let composite = table.object_type(vec![
+            PropertyType::new("mutable", false, t),
+            PropertyType::new("locked", false, t).with_readonly(true),
+        ]);
+
+        let number = table.number();
+        let mut context =
+            InferenceContext::new(&mut table, &[InferenceParameter::new(parameter(1))]);
+        context.infer_from_argument(t, number, 0);
+        let inferred = context.resolve();
+
+        let instantiated = inferred.instantiate(&mut table, composite);
+        let Type::ObjectType(properties) = table.get(instantiated).clone() else {
+            panic!("object type");
+        };
+        let locked = properties
+            .iter()
+            .find(|property| property.name() == "locked")
+            .expect("locked property");
+        assert!(locked.readonly(), "readonly survives instantiation");
+        let mutable = properties
+            .iter()
+            .find(|property| property.name() == "mutable")
+            .expect("mutable property");
+        assert!(!mutable.readonly(), "non-readonly stays non-readonly");
     }
 
     /// Resolution is deterministic: the same session built twice yields the
