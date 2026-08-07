@@ -164,13 +164,17 @@ fn node_rlib_from_fingerprint(
         return Ok(None);
     }
 
-    let contents = fs::read_to_string(build_fingerprint)
-        .map_err(|error| format!("could not read `{}`: {error}", build_fingerprint.display()))?;
-    let fingerprint = parse_cargo_build_fingerprint(&contents)
-        .map_err(|error| format!("`{}` is malformed: {error}", build_fingerprint.display()))?;
-    let dependency_hash = fingerprint
-        .bamts_node_hash()
-        .map_err(|error| format!("`{}` {error}", build_fingerprint.display()))?;
+    // Cargo's `.fingerprint` JSON is an undocumented, version-dependent
+    // implementation detail. When the file is absent or does not match the
+    // expected shape, treat the metadata as unavailable and fall back to
+    // the compatible-candidate scan in `select_node_rlib`. Only errors from
+    // `exact_node_rlib` — which indicate valid metadata pointing at a
+    // missing or ambiguous artifact — propagate as hard errors.
+    let dependency_hash = try_parse_fingerprint_hash(build_fingerprint);
+    let Some(dependency_hash) = dependency_hash else {
+        return Ok(None);
+    };
+
     let fingerprint_root = build_fingerprint
         .parent()
         .and_then(Path::parent)
@@ -181,7 +185,16 @@ fn node_rlib_from_fingerprint(
             )
         })?;
 
-    exact_node_rlib(fingerprint_root, dependencies, dependency_hash).map(Some)
+    exact_node_rlib(fingerprint_root, dependencies, dependency_hash)
+}
+
+/// Best-effort extraction of the `bamts_node` fingerprint hash from Cargo's
+/// build-script fingerprint JSON. Returns `None` when the file is absent or
+/// the shape does not match, so callers can fall back to a candidate scan.
+fn try_parse_fingerprint_hash(build_fingerprint: &Path) -> Option<u64> {
+    let contents = fs::read_to_string(build_fingerprint).ok()?;
+    let fingerprint = parse_cargo_build_fingerprint(&contents).ok()?;
+    fingerprint.bamts_node_hash().ok()
 }
 
 struct CargoBuildFingerprint {
@@ -270,7 +283,7 @@ fn exact_node_rlib(
     fingerprint_root: &Path,
     dependencies: &Path,
     dependency_hash: u64,
-) -> Result<PathBuf, String> {
+) -> Result<Option<PathBuf>, String> {
     let wanted_stamp = fingerprint_stamp(dependency_hash);
     let mut matches = Vec::new();
     let entries = fs::read_dir(fingerprint_root).map_err(|error| {
@@ -343,11 +356,10 @@ fn exact_node_rlib(
     }
 
     match matches.as_slice() {
-        [candidate] => Ok(candidate.clone()),
-        [] => Err(format!(
-            "no `bamts-node-*` fingerprint stamp in `{}` matches `{wanted_stamp}`",
-            fingerprint_root.display()
-        )),
+        [candidate] => Ok(Some(candidate.clone())),
+        // No matching stamp: the fingerprint may be stale or a parallel
+        // build has not finished writing yet. Fall back to the candidate scan.
+        [] => Ok(None),
         candidates => Err(format!(
             "multiple `bamts-node-*` fingerprint stamps in `{}` match `{wanted_stamp}`: {}",
             fingerprint_root.display(),
