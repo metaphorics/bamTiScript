@@ -1958,6 +1958,32 @@ mod tests {
     }
 
     #[test]
+    fn jsx_span_tiles_nested_elements_fragments_and_containers() {
+        for source in [
+            "<div />",
+            "<div></div>",
+            "<><a/><b/></>",
+            "<Foo.Bar ns:attr=\"x\" onClick={() => ({a: 1})}>text</Foo.Bar>",
+            "<div>{`x${y}z`}</div>",
+            // Malformed: each must terminate and must not corrupt later tokens.
+            "<div>",
+            "<div>{`x${y",
+            "</div>",
+            "<div / bar>",
+        ] {
+            let text = SourceText::new(source).expect("test source fits the per-file budget");
+            let mut scanner = Scanner::new(SourceId::new(0), ScriptKind::TypeScriptReact, &text);
+            let tokens = scanner.scan_jsx_span();
+            let mut cursor = 0usize;
+            for token in &tokens {
+                assert_eq!(token.range().start().get(), cursor, "gap in {source:?}");
+                assert!(!token.range().is_empty(), "no progress in {source:?}");
+                cursor = token.range().end().get();
+            }
+        }
+    }
+
+    #[test]
     fn unexpected_character_makes_progress() {
         let recovered = scan_text("\u{7}a");
         assert_eq!(recovered.diagnostics()[0].code(), UNEXPECTED_CHARACTER);
