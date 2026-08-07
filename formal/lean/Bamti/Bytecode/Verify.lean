@@ -3,15 +3,15 @@ import Bamti.Bytecode.Model
 namespace Bamti.Bytecode
 
 /-- This bounded model reserves the one-past-last boundary inside one 7-bit address space. -/
-def withinModelBound (program : Program) : Prop := program.code.length < FieldLimit
+def withinModelBound (program : FunctionBody) : Prop := program.code.length < FieldLimit
 
-def instructionAt (program : Program) (pc : Nat) : Option Instr := program.code[pc]?
+def instructionAt (program : FunctionBody) (pc : Nat) : Option Instr := program.code[pc]?
 
-def cfgTargetsValid (program : Program) : Prop :=
+def cfgTargetsValid (program : FunctionBody) : Prop :=
   ∀ target ∈ targets program,
     boundary program target ∧ ∃ instruction, instructionAt program target = some instruction
 
-def handlerBounds (program : Program) (handler : Handler) : Prop :=
+def handlerBounds (program : FunctionBody) (handler : Handler) : Prop :=
   handler.startPc < handler.endPc ∧
   handler.endPc ≤ program.code.length ∧
   boundary program handler.startPc ∧
@@ -25,7 +25,7 @@ def intervalsNested (left right : Handler) : Prop :=
   (left.startPc ≤ right.startPc ∧ right.endPc ≤ left.endPc) ∨
   (right.startPc ≤ left.startPc ∧ left.endPc ≤ right.endPc)
 
-def handlersNested (program : Program) : Prop :=
+def handlersNested (program : FunctionBody) : Prop :=
   (∀ handler ∈ program.handlers, handlerBounds program handler) ∧
   ∀ left ∈ program.handlers, ∀ right ∈ program.handlers, intervalsNested left right
 
@@ -35,7 +35,7 @@ def factAt : List (List Nat) → Nat → List Nat
   | _ :: rest, pc + 1 => factAt rest pc
 
 /-- A certificate is a syntactic forward dataflow witness, not a semantic reachability premise. -/
-structure Certificate (program : Program) where
+structure Certificate (program : FunctionBody) where
   facts : List (List Nat)
   factCount : facts.length = program.code.length
   entryFactsEmpty : factAt facts 0 = []
@@ -53,18 +53,18 @@ structure Certificate (program : Program) where
     ∃ nextInstruction,
       instructionAt program next = some nextInstruction ∧ boundary program next
 
-def hasEntry (program : Program) : Prop :=
+def hasEntry (program : FunctionBody) : Prop :=
   ∃ instruction, instructionAt program 0 = some instruction ∧ boundary program 0
 
-structure Verification (program : Program) where
-  canonical : programCanonical program
+structure Verification (program : FunctionBody) where
+  canonical : functionBodyCanonical program
   bounded : withinModelBound program
   entry : hasEntry program
   cfg : cfgTargetsValid program
   handlers : handlersNested program
   certificate : Certificate program
 
-def verifies (program : Program) : Prop := Nonempty (Verification program)
+def verifies (program : FunctionBody) : Prop := Nonempty (Verification program)
 
 inductive VerifyResult where
   | accepted
@@ -72,7 +72,7 @@ inductive VerifyResult where
   deriving DecidableEq, Repr
 
 /-- The verifier's specification-level decision is defined only from syntax and certificates. -/
-noncomputable def verify (program : Program) : VerifyResult := by
+noncomputable def verify (program : FunctionBody) : VerifyResult := by
   classical
   exact if verifies program then .accepted else .rejected
 
@@ -114,7 +114,7 @@ theorem encode_decode_identity (wire : Wire) (program : ProgramEnvelope)
     rfl
   simp [programEq]
 
-theorem cfg_targets_are_boundaries (program : Program) (h : verifies program) :
+theorem cfg_targets_are_boundaries (program : FunctionBody) (h : verifies program) :
     ∀ target ∈ targets program,
       boundary program target ∧ ∃ instruction, instructionAt program target = some instruction := by
   rcases h with ⟨verification⟩
@@ -135,7 +135,7 @@ structure MachineState where
 def initialState : MachineState := ⟨0, [], .running⟩
 
 /-- Small-step execution only inspects bytecode and machine state; it never calls `verifies`. -/
-inductive Executes (program : Program) : MachineState → MachineState → Prop where
+inductive Executes (program : FunctionBody) : MachineState → MachineState → Prop where
   | advance (state : MachineState) (instruction : Instr) (next : Nat)
       (running : state.mode = .running)
       (fetch : instructionAt program state.pc = some instruction)
@@ -150,19 +150,19 @@ inductive Executes (program : Program) : MachineState → MachineState → Prop 
       (stops : nextPc state.pc instruction = none) :
       Executes program state ⟨state.pc, state.initialized, .halted⟩
 
-inductive Reaches (program : Program) : MachineState → Prop where
+inductive Reaches (program : FunctionBody) : MachineState → Prop where
   | initial : Reaches program initialState
   | step {state next : MachineState} : Reaches program state → Executes program state next → Reaches program next
-def handlerDispatchSafe (program : Program) : Prop :=
+def handlerDispatchSafe (program : FunctionBody) : Prop :=
   ∀ state, Reaches program state → ∀ handler ∈ program.handlers,
     handler.startPc ≤ state.pc → state.pc < handler.endPc →
       boundary program handler.handlerPc ∧
         ∃ instruction, instructionAt program handler.handlerPc = some instruction
 
-def handlerSafety (program : Program) : Prop :=
+def handlerSafety (program : FunctionBody) : Prop :=
   handlersNested program ∧ handlerDispatchSafe program
 
-theorem handlers_well_nested (program : Program) (h : verifies program) : handlerSafety program := by
+theorem handlers_well_nested (program : FunctionBody) (h : verifies program) : handlerSafety program := by
   rcases h with ⟨verification⟩
   refine ⟨verification.handlers, ?_⟩
   intro state _ handler handlerMember _ _
@@ -173,25 +173,25 @@ theorem handlers_well_nested (program : Program) (h : verifies program) : handle
 def factsHeld (certificate : Certificate program) (state : MachineState) : Prop :=
   ∀ register ∈ factAt certificate.facts state.pc, register ∈ state.initialized
 
-def machineInvariant (program : Program) (certificate : Certificate program)
+def machineInvariant (program : FunctionBody) (certificate : Certificate program)
     (state : MachineState) : Prop :=
   state.mode = .halted ∨
     ∃ instruction,
       instructionAt program state.pc = some instruction ∧
       boundary program state.pc ∧ factsHeld certificate state
 
-def reachableInvariant (program : Program) : Prop :=
+def reachableInvariant (program : FunctionBody) : Prop :=
   ∃ certificate : Certificate program,
     ∀ state, Reaches program state → machineInvariant program certificate state
 
-def reachableReadSafe (program : Program) : Prop :=
+def reachableReadSafe (program : FunctionBody) : Prop :=
   ∃ _ : Certificate program,
     ∀ state, Reaches program state → ∀ instruction,
       instructionAt program state.pc = some instruction → state.mode = .running →
         ∀ register ∈ Instr.reads instruction, register ∈ state.initialized
 
-def executionSafe (program : Program) : Prop :=
-  programCanonical program ∧
+def executionSafe (program : FunctionBody) : Prop :=
+  functionBodyCanonical program ∧
   withinModelBound program ∧
   cfgTargetsValid program ∧
   handlerDispatchSafe program ∧
@@ -260,11 +260,11 @@ private theorem progress (verification : Verification program) (state : MachineS
             exact ⟨⟨next, Instr.writes instruction ++ state.initialized, .running⟩,
               Executes.advance state instruction next mode fetch readsReady nextIs⟩
 
-theorem definite_init_sound (program : Program) (h : verifies program) : reachableInvariant program := by
+theorem definite_init_sound (program : FunctionBody) (h : verifies program) : reachableInvariant program := by
   rcases h with ⟨verification⟩
   exact ⟨verification.certificate, reachable_machine_invariant verification⟩
 
-theorem entry_points_complete (program : Program) (target : Nat)
+theorem entry_points_complete (program : FunctionBody) (target : Nat)
     (entryTarget : target ∈ backEdgeTargets program ∨ target ∈ suspendResumePcs program.code)
     (inCode : target < program.code.length) : target ∈ entryPoints program := by
   have candidate : target ∈ entryCandidates program := by
@@ -296,17 +296,17 @@ private theorem ordinal_injective_on (values : List Nat) (left right : Nat)
           exact inductionHypothesis (leftMember.resolve_left leftCurrent)
             (rightMember.resolve_left rightCurrent) tailOrdinal
 
-theorem entry_ordinal_injective (program : Program) (left right : Nat)
+theorem entry_ordinal_injective (program : FunctionBody) (left right : Nat)
     (leftMember : left ∈ entryPoints program) (rightMember : right ∈ entryPoints program)
     (sameOrdinal : ordinal left (entryPoints program) = ordinal right (entryPoints program)) : left = right :=
   ordinal_injective_on (entryPoints program) left right leftMember rightMember sameOrdinal
 
-theorem verify_ok_iff (program : Program) : verify program = .accepted ↔ verifies program := by
+theorem verify_ok_iff (program : FunctionBody) : verify program = .accepted ↔ verifies program := by
   classical
   unfold verify
   split <;> simp_all
 
-theorem verify_sound (program : Program) (h : verifies program) : executionSafe program := by
+theorem verify_sound (program : FunctionBody) (h : verifies program) : executionSafe program := by
   rcases h with ⟨verification⟩
   refine ⟨verification.canonical, verification.bounded, verification.cfg, ?_,
     verification.certificate, ?_⟩
@@ -315,7 +315,7 @@ theorem verify_sound (program : Program) (h : verifies program) : executionSafe 
     have invariant := reachable_machine_invariant verification state reaches
     exact ⟨invariant, progress verification state invariant⟩
 
-theorem verifier_never_skips_invariant (program : Program) (h : verifies program) :
+theorem verifier_never_skips_invariant (program : FunctionBody) (h : verifies program) :
     executionSafe program ∧ reachableReadSafe program := by
   constructor
   · exact verify_sound program h

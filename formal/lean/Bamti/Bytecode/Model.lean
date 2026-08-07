@@ -90,13 +90,13 @@ structure Handler where
   handlerPc : Nat
   deriving DecidableEq, Repr
 
-/-- One production function body. `Program` remains an alias for execution proofs. -/
+/-- One production function body: a code list plus exception handlers. -/
 structure Function where
   code : List Instr
   handlers : List Handler
   deriving DecidableEq, Repr
 
-abbrev Program := Function
+abbrev FunctionBody := Function
 
 /-- Persistable v4 constant-pool values; runtime identities are intentionally absent. -/
 inductive Constant where
@@ -414,7 +414,7 @@ def functionCanonical (function : Function) : Prop :=
   (∀ instruction ∈ function.code, instructionCanonical instruction) ∧
   ∀ handler ∈ function.handlers, handlerCanonical handler
 
-abbrev programCanonical := functionCanonical
+abbrev functionBodyCanonical := functionCanonical
 
 def moduleCanonical (module : Module) : Prop :=
   module.entry < FieldLimit ∧ ∀ function ∈ module.functions, functionCanonical function
@@ -430,8 +430,8 @@ def wireCanonical (wire : Wire) : Prop :=
   ∃ program, envelopeCanonical program ∧ wire = encode program
 
 /-- Instruction boundaries are decoded structure, never a caller-supplied target list. -/
-def instructionBoundaries (program : Program) : List Nat := List.range (program.code.length + 1)
-def boundary (program : Program) (pc : Nat) : Prop := pc ∈ instructionBoundaries program
+def instructionBoundaries (program : FunctionBody) : List Nat := List.range (program.code.length + 1)
+def boundary (program : FunctionBody) (pc : Nat) : Prop := pc ∈ instructionBoundaries program
 
 def controlTargets : List Instr → List Nat
   | [] => []
@@ -440,7 +440,7 @@ def controlTargets : List Instr → List Nat
       | some target => target :: controlTargets rest
       | none => controlTargets rest
 
-def targets (program : Program) : List Nat := controlTargets program.code
+def targets (program : FunctionBody) : List Nat := controlTargets program.code
 
 def backEdgeTargetsFrom (pc : Nat) : List Instr → List Nat
   | [] => []
@@ -449,18 +449,18 @@ def backEdgeTargetsFrom (pc : Nat) : List Instr → List Nat
       else backEdgeTargetsFrom (pc + 1) rest
   | _ :: rest => backEdgeTargetsFrom (pc + 1) rest
 
-def backEdgeTargets (program : Program) : List Nat := backEdgeTargetsFrom 0 program.code
+def backEdgeTargets (program : FunctionBody) : List Nat := backEdgeTargetsFrom 0 program.code
 
 def suspendResumePcs : List Instr → List Nat
   | [] => []
   | .suspend _ _ resumePc :: rest => resumePc :: suspendResumePcs rest
   | _ :: rest => suspendResumePcs rest
 
-def entryCandidates (program : Program) : List Nat :=
+def entryCandidates (program : FunctionBody) : List Nat :=
   0 :: (backEdgeTargets program ++ suspendResumePcs program.code)
 
 /-- Filtering the ordered instruction-boundary list gives sorted, duplicate-free entry ordinals. -/
-def entryPoints (program : Program) : List Nat :=
+def entryPoints (program : FunctionBody) : List Nat :=
   (List.range program.code.length).filter fun pc => decide (pc ∈ entryCandidates program)
 
 def nextPc (pc : Nat) : Instr → Option Nat

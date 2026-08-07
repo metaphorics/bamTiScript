@@ -15,8 +15,8 @@ structure Trace where
   id : Nat
   formal_model : Nat
   property : Nat
-  pre : Program
-  post : Program
+  pre : FunctionBody
+  post : FunctionBody
   action : BridgeAction
   before : MachineState
   after : MachineState
