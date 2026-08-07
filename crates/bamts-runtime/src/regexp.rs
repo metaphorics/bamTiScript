@@ -1,7 +1,12 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 
 use bamts_bytecode::EcmaString;
+
+/// Identity of a backtracking state: input position plus capture bindings. Two
+/// states sharing one continue identically, so a repetition level keeps only the
+/// first — that is what stops equivalent alternatives multiplying per level.
+type StateKey = (usize, Vec<Option<(usize, usize)>>);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Flags {
@@ -324,20 +329,48 @@ impl Regex {
             greedy,
         } = first
         {
+            // Deduplicate states within each repetition level by (position,
+            // captures).  Equivalent alternatives like (a|a|a) produce k
+            // identical states at every level — without dedup these multiply to
+            // k^n states, each cloning its captures Vec.  Two states that share
+            // position and captures yield identical continuations, so collapsing
+            // duplicates is lossless and keeps ordinary patterns (1 state per
+            // level) completely unaffected.
+            //
+            // The step budget remains as a backstop for non-dedupable blowups
+            // (e.g. ((a)|(a))* where branches set different capture groups).
+            const STEP_BUDGET: usize = 100_000;
+
             let mut levels = vec![vec![state]];
             let limit = max.unwrap_or(input.len().saturating_add(*min).saturating_add(1));
+            let mut total_states: usize = 1;
             for count in 0..limit {
                 let mut next = Vec::new();
+                let mut seen: HashSet<StateKey> = HashSet::new();
                 for prior in &levels[count] {
                     for matched in self.match_node(body, input, prior.clone()) {
                         if matched.position == prior.position && count + 1 >= *min {
                             continue;
                         }
-                        next.push(matched);
+                        let key = (
+                            matched.position,
+                            matched
+                                .captures
+                                .iter()
+                                .map(|c| c.as_ref().map(|r| (r.start, r.end)))
+                                .collect(),
+                        );
+                        if seen.insert(key) {
+                            next.push(matched);
+                        }
                     }
                 }
                 if next.is_empty() {
                     break;
+                }
+                total_states += next.len();
+                if total_states > STEP_BUDGET {
+                    return Vec::new();
                 }
                 levels.push(next);
             }
@@ -348,7 +381,10 @@ impl Regex {
             };
             let mut result = Vec::new();
             for count in counts {
-                for candidate in levels[count].clone() {
+                // Move ownership instead of cloning: each level is visited
+                // exactly once, so the deep copy of every captures allocation
+                // on each iteration was pure waste.
+                for candidate in std::mem::take(&mut levels[count]) {
                     result.extend(self.match_sequence(rest, input, candidate));
                 }
             }
@@ -1409,5 +1445,24 @@ mod tests {
         assert!(Regex::compile(&text(r"\a"), &text("u")).is_err());
         assert!(Regex::compile(&text(r"[\a]"), &text("u")).is_err());
         assert!(regex(r"^[\-]$", "u").exec(&text("-"), 0).is_some());
+    }
+
+    #[test]
+    fn exponential_alternation_under_star_fails_within_step_budget() {
+        // (a|a|a)*b on 40 'a's: without a step budget this builds ~3^40 states
+        // (each with its own captures allocation) and exhausts memory before a
+        // single candidate is tested against the trailing literal.  The step
+        // budget must fail the match gracefully instead of OOM'ing.
+        use std::time::Instant;
+        let re = regex("(a|a|a)*b", "");
+        let input = text(&"a".repeat(40));
+        let start = Instant::now();
+        let result = re.exec(&input, 0);
+        let elapsed = start.elapsed();
+        assert!(result.is_none(), "exponential pattern should not match");
+        assert!(
+            elapsed.as_secs() < 5,
+            "match took {elapsed:?}, expected step budget to abort quickly"
+        );
     }
 }
