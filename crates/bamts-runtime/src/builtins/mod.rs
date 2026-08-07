@@ -1037,6 +1037,133 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(properties.get(key).cloned())
     }
 
+    /// ECMA-262 §7.2.10 SameValue(x, y) — like `same_value_zero` except that
+    /// `+0` and `-0` are distinct. Mirrors the helper in `object.rs`; kept here
+    /// so `validate_property_redefinition` does not depend on a private free
+    /// function in another module.
+    fn same_value(&self, left: Value, right: Value) -> bool {
+        match (left.decode(), right.decode()) {
+            (Some(Decoded::Number(a)), Some(Decoded::Number(b))) => {
+                if a.is_nan() && b.is_nan() {
+                    return true;
+                }
+                if a == 0.0 && b == 0.0 {
+                    return a.is_sign_positive() == b.is_sign_positive();
+                }
+                a == b
+            }
+            (Some(Decoded::Number(a)), Some(Decoded::Int32(b)))
+            | (Some(Decoded::Int32(b)), Some(Decoded::Number(a))) => {
+                let b_f64 = f64::from(b);
+                if a == 0.0 && b_f64 == 0.0 {
+                    return a.is_sign_positive();
+                }
+                a == b_f64
+            }
+            _ => self.same_value_zero(left, right),
+        }
+    }
+
+    /// ECMA-262 §10.1.6.3 ValidateAndApplyPropertyDescriptor — redefinition
+    /// guard applied at the `[[DefineOwnProperty]]` seam (`define_descriptor`)
+    /// so every caller — `Object.defineProperty`, decorator slot writes, and
+    /// class-field `DefineDataProperty` instructions — enforces the same
+    /// invariant. Bootstrap installation bypasses `define_descriptor` entirely
+    /// (`define_data`, `define_frozen_data`, `define_to_string_tag` insert
+    /// directly into the property map), so only user-visible redefinition is
+    /// constrained and bootstrap is unaffected.
+    ///
+    /// When `current` is absent the property is being created and any descriptor
+    /// is accepted. When `current` is configurable any change is permitted.
+    /// Otherwise the spec forbids: making the property configurable, changing
+    /// enumerability, converting between data and accessor form, making a
+    /// non-writable data property writable, or changing the value of a
+    /// non-writable data property (using SameValue). A no-op redefinition that
+    /// changes nothing is allowed.
+    fn validate_property_redefinition(
+        &self,
+        current: Option<&Property>,
+        next: &Property,
+    ) -> Result<(), EvalFailure> {
+        let Some(current) = current else {
+            return Ok(());
+        };
+        if current.configurable() {
+            return Ok(());
+        }
+        if next.configurable() {
+            return Err(type_error(
+                "Cannot redefine property: non-configurable property cannot be made configurable",
+            ));
+        }
+        if next.enumerable() != current.enumerable() {
+            return Err(type_error(
+                "Cannot redefine property: cannot change enumerability of non-configurable property",
+            ));
+        }
+        match (current, next) {
+            (
+                Property::Data {
+                    writable, value, ..
+                },
+                Property::Data {
+                    writable: next_writable,
+                    value: next_value,
+                    ..
+                },
+            ) => {
+                if !*writable {
+                    if *next_writable {
+                        return Err(type_error(
+                            "Cannot redefine property: cannot make non-writable property writable",
+                        ));
+                    }
+                    if !self.same_value(*next_value, *value) {
+                        return Err(type_error(
+                            "Cannot redefine property: cannot change value of non-writable property",
+                        ));
+                    }
+                }
+            }
+            (Property::Data { .. }, Property::Accessor { .. }) => {
+                return Err(type_error(
+                    "Cannot redefine property: cannot convert non-configurable data property to accessor",
+                ));
+            }
+            (Property::Accessor { .. }, Property::Data { .. }) => {
+                return Err(type_error(
+                    "Cannot redefine property: cannot convert non-configurable accessor property to data",
+                ));
+            }
+            (
+                Property::Accessor { getter, setter, .. },
+                Property::Accessor {
+                    getter: next_getter,
+                    setter: next_setter,
+                    ..
+                },
+            ) => {
+                if !self.same_value(
+                    next_getter.unwrap_or(Value::UNDEFINED),
+                    getter.unwrap_or(Value::UNDEFINED),
+                ) {
+                    return Err(type_error(
+                        "Cannot redefine property: cannot change getter of non-configurable accessor property",
+                    ));
+                }
+                if !self.same_value(
+                    next_setter.unwrap_or(Value::UNDEFINED),
+                    setter.unwrap_or(Value::UNDEFINED),
+                ) {
+                    return Err(type_error(
+                        "Cannot redefine property: cannot change setter of non-configurable accessor property",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn define_descriptor(
         &mut self,
         object: Value,
@@ -1253,6 +1380,15 @@ impl<'a, H: Host> Machine<'a, H> {
                 "Cannot define property, object is not extensible",
             ));
         }
+        // ECMA-262 §10.1.6.3: reject redefinition of a non-configurable
+        // property unless the change is a permitted no-op. This is the
+        // single enforcement point for every caller of `define_descriptor`;
+        // the `Object.defineProperty` path in `object.rs` pre-validates the
+        // partial user descriptor, but internal callers (decorator slot
+        // writes, class-field installs) reach here directly, so the guard
+        // must live at this seam to close the gap.
+        let current = self.own_descriptor(object, &key)?;
+        self.validate_property_redefinition(current.as_ref(), &descriptor)?;
         self.charge_slot(index, property_growth.saturating_add(element_growth))
             .map_err(EvalFailure::Runtime)?;
         match &mut self.heap[index] {
@@ -1896,10 +2032,7 @@ mod tests {
             .construct_value(error_constructor, &[msg2, options])
             .expect("Error with cause construction succeeds");
         let cause_descriptor = machine
-            .own_descriptor(
-                with_cause,
-                &PropertyKey::Named(EcmaString::encode("cause")),
-            )
+            .own_descriptor(with_cause, &PropertyKey::Named(EcmaString::encode("cause")))
             .expect("descriptor lookup succeeds")
             .expect("Error has an own cause property");
         assert!(
@@ -2148,8 +2281,7 @@ mod tests {
             .expect("object allocation succeeds");
         let missing = allocate_string(&mut machine, EcmaString::encode("missing")).unwrap();
         let data_key = allocate_string(&mut machine, EcmaString::encode("data")).unwrap();
-        let accessor_key =
-            allocate_string(&mut machine, EcmaString::encode("accessor")).unwrap();
+        let accessor_key = allocate_string(&mut machine, EcmaString::encode("accessor")).unwrap();
         let data_pk = PropertyKey::Named(EcmaString::encode("data"));
         let accessor_pk = PropertyKey::Named(EcmaString::encode("accessor"));
         let getter = Value::int32(1);
@@ -2236,8 +2368,7 @@ mod tests {
             })
             .expect("object allocation succeeds");
         let data_key = allocate_string(&mut machine, EcmaString::encode("data")).unwrap();
-        let accessor_key =
-            allocate_string(&mut machine, EcmaString::encode("accessor")).unwrap();
+        let accessor_key = allocate_string(&mut machine, EcmaString::encode("accessor")).unwrap();
         let missing = allocate_string(&mut machine, EcmaString::encode("missing")).unwrap();
         let missing_getter =
             allocate_string(&mut machine, EcmaString::encode("missingGetter")).unwrap();
@@ -2288,9 +2419,15 @@ mod tests {
                 },
             )
             .unwrap();
-        machine
-            .define_own_descriptor_slot(object, data_key, next_value, DescriptorSlot::Value)
-            .unwrap();
+        // The property is non-writable and non-configurable, so changing its
+        // value through the internal slot path must be rejected — the same
+        // invariant `Object.defineProperty` enforces on the user path.
+        assert!(matches!(
+            machine.define_own_descriptor_slot(object, data_key, next_value, DescriptorSlot::Value),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Cannot redefine property: cannot change value of non-writable property"
+            }))
+        ));
         assert!(matches!(
             machine.own_descriptor(object, &data_pk).unwrap(),
             Some(Property::Data {
@@ -2298,7 +2435,7 @@ mod tests {
                 writable: false,
                 enumerable: true,
                 configurable: false,
-            }) if value == next_value
+            }) if value == Value::int32(1)
         ));
         assert!(matches!(
             machine.define_own_descriptor_slot(object, data_key, getter, DescriptorSlot::Getter),
@@ -2365,10 +2502,8 @@ mod tests {
                 boxed_primitive: None,
             })
             .unwrap();
-        let inherited_key =
-            allocate_string(&mut machine, EcmaString::encode("inherited")).unwrap();
-        let accessor_key =
-            allocate_string(&mut machine, EcmaString::encode("accessor")).unwrap();
+        let inherited_key = allocate_string(&mut machine, EcmaString::encode("inherited")).unwrap();
+        let accessor_key = allocate_string(&mut machine, EcmaString::encode("accessor")).unwrap();
         let inherited_pk = PropertyKey::Named(EcmaString::encode("inherited"));
         let accessor_pk = PropertyKey::Named(EcmaString::encode("accessor"));
 
@@ -2451,8 +2586,7 @@ mod tests {
                 boxed_primitive: None,
             })
             .expect("object allocation succeeds");
-        let produced =
-            allocate_string(&mut machine, EcmaString::encode("produced-key")).unwrap();
+        let produced = allocate_string(&mut machine, EcmaString::encode("produced-key")).unwrap();
         let produced_pk = PropertyKey::Named(EcmaString::encode("produced-key"));
         machine
             .define_descriptor(
@@ -2541,6 +2675,142 @@ mod tests {
                 }) if value == Value::int32(99)
             ),
             "define must write through the produced property key"
+        );
+    }
+
+    #[test]
+    fn define_descriptor_rejects_redefinition_of_non_configurable_property() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let object = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .expect("object allocation succeeds");
+        let index = machine
+            .runtime_slot(object)
+            .expect("object slot lookup succeeds")
+            .expect("object has a runtime slot");
+        let key = PropertyKey::Named(EcmaString::encode("x"));
+
+        // Install a writable, configurable data property, then freeze so it
+        // becomes non-writable and non-configurable.
+        machine
+            .define_descriptor(
+                object,
+                key.clone(),
+                Property::Data {
+                    value: Value::int32(1),
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                },
+            )
+            .unwrap();
+        machine.mark_frozen(object).unwrap();
+
+        let baseline_slot = machine.slot_bytes[index];
+        let baseline_heap = machine.heap_bytes;
+
+        // Redefining the frozen property's value through the internal
+        // `define_descriptor` path must throw — previously it silently
+        // succeeded, making `Object.freeze` decorative.
+        assert!(matches!(
+            machine.define_descriptor(
+                object,
+                key.clone(),
+                Property::Data {
+                    value: Value::int32(2),
+                    writable: false,
+                    enumerable: true,
+                    configurable: false,
+                },
+            ),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Cannot redefine property: cannot change value of non-writable property"
+            }))
+        ));
+        assert_eq!(machine.slot_bytes[index], baseline_slot);
+        assert_eq!(machine.heap_bytes, baseline_heap);
+        assert_eq!(
+            machine.get_named_property(object, "x").unwrap(),
+            Value::int32(1),
+            "frozen value must be unchanged"
+        );
+
+        // Converting a non-configurable data property to an accessor must
+        // also throw.
+        assert!(matches!(
+            machine.define_descriptor(
+                object,
+                key.clone(),
+                Property::Accessor {
+                    getter: Some(Value::int32(9)),
+                    setter: None,
+                    enumerable: true,
+                    configurable: false,
+                },
+            ),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Cannot redefine property: cannot convert non-configurable data property to accessor"
+            }))
+        ));
+        assert_eq!(machine.slot_bytes[index], baseline_slot);
+
+        // The decorator slot-write path routes through `define_descriptor`
+        // and must enforce the same guard.
+        let key_value = allocate_string(&mut machine, EcmaString::encode("x")).unwrap();
+        assert!(matches!(
+            machine.define_own_descriptor_slot(
+                object,
+                key_value,
+                Value::int32(5),
+                DescriptorSlot::Value
+            ),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Cannot redefine property: cannot change value of non-writable property"
+            }))
+        ));
+        assert_eq!(
+            machine.get_named_property(object, "x").unwrap(),
+            Value::int32(1),
+            "frozen value must be unchanged after slot write"
+        );
+
+        machine.assert_heap_ledger();
+    }
+
+    #[test]
+    fn bootstrap_installation_bypasses_descriptor_validation() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let object = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .expect("object allocation succeeds");
+
+        // `define_data` and `define_frozen_data` install properties directly
+        // into the property map, bypassing `define_descriptor` and its
+        // validation. This is the bootstrap path — it must always succeed.
+        define_data(&mut machine.heap, object, "bootstrap", Value::int32(42));
+        define_frozen_data(&mut machine.heap, object, "sealed", Value::int32(99));
+
+        assert_eq!(
+            machine.get_named_property(object, "bootstrap").unwrap(),
+            Value::int32(42)
+        );
+        assert_eq!(
+            machine.get_named_property(object, "sealed").unwrap(),
+            Value::int32(99)
         );
     }
 }
