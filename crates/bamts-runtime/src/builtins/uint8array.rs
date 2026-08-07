@@ -8,7 +8,9 @@ use super::{
     to_integer_or_infinity, type_error,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
-use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
+use crate::{
+    EvalFailure, HeapEntry, Host, IterationKind, Machine, Property, PropertyKey, PropertyMap,
+};
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -21,6 +23,20 @@ pub(super) fn install<H: Host>(
     define_data(heap, prototype, "constructor", constructor);
     let join = install_function(heap, builtins, "join", 1, join::<H> as BuiltinHandler<H>);
     define_data(heap, prototype, "join", join);
+    let iterator = install_function(
+        heap,
+        builtins,
+        "[Symbol.iterator]",
+        0,
+        values::<H> as BuiltinHandler<H>,
+    );
+    let HeapEntry::Object { properties, .. } = &mut heap[heap_index(prototype)] else {
+        unreachable!("Uint8Array prototype is ordinary")
+    };
+    properties.insert(
+        PropertyKey::Symbol(heap_index(builtins.symbol_iterator()) as u32),
+        builtin_property(iterator),
+    );
     let tag = super::super::push(heap, HeapEntry::String(EcmaString::from_utf8("Uint8Array")));
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(prototype)] else {
         unreachable!("Uint8Array prototype is ordinary")
@@ -215,6 +231,41 @@ fn join<H: Host>(
     )?))
 }
 
+/// `Uint8Array.prototype[Symbol.iterator]` — yields each byte as a Number in
+/// index order, matching `%TypedArray%.prototype.values` / the default
+/// iterator. Reuses the shared `collections::iterator` over a snapshot array
+/// of the bytes, the same mechanism `String.prototype[Symbol.iterator]` uses.
+fn values<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let Some(slot) = machine.runtime_slot(this).map_err(EvalFailure::Runtime)? else {
+        return Err(type_error(
+            "Uint8Array.prototype[Symbol.iterator] called on incompatible receiver",
+        ));
+    };
+    if !matches!(machine.heap[slot], HeapEntry::Uint8Array { .. }) {
+        return Err(type_error(
+            "Uint8Array.prototype[Symbol.iterator] called on incompatible receiver",
+        ));
+    }
+    let elements: Vec<Value> = match &machine.heap[slot] {
+        HeapEntry::Uint8Array { bytes, .. } => bytes
+            .iter()
+            .copied()
+            .map(|byte| Value::int32(u32::from(byte)))
+            .collect(),
+        _ => unreachable!("Uint8Array brand was checked"),
+    };
+    let source = super::allocate_array(machine, elements)?;
+    Ok(BuiltinOutcome::Value(super::collections::iterator(
+        machine,
+        source,
+        IterationKind::Value,
+    )?))
+}
 fn constructor_prototype<H: Host>(machine: &Machine<'_, H>) -> Result<Value, EvalFailure> {
     let constructor = machine
         .intrinsics
@@ -725,6 +776,68 @@ mod tests {
                     );
                 }
             }
+        });
+    }
+
+    #[test]
+    fn uint8array_prototype_symbol_iterator_yields_elements_in_order() {
+        // Symbol.iterator must be installed on Uint8Array.prototype so that
+        // for...of and spread consume the bytes in index order. iterable_values
+        // is the exact path for...of/spread take (create_iterator + next loop).
+        with_machine(|machine| {
+            let source = array_of(
+                machine,
+                &[Value::int32(10), Value::int32(20), Value::int32(255)],
+            );
+            let typed = construct(machine, source);
+            assert_eq!(int(machine, typed, "length"), 3);
+            // for...of / spread equivalent
+            let collected = machine.iterable_values(typed).expect("iteration succeeds");
+            assert_eq!(
+                collected,
+                vec![Value::int32(10), Value::int32(20), Value::int32(255)],
+                "for...of yields bytes in order"
+            );
+            // Spread into a new array: Array.from uses the iterator too.
+            let array = machine.intrinsics.global("Array").unwrap();
+            let from = machine.get_named_property(array, "from").unwrap();
+            let spread = machine
+                .call_value(from, array, &[typed])
+                .expect("Array.from succeeds");
+            let elements = machine.array_elements(spread).unwrap().unwrap();
+            assert_eq!(
+                elements,
+                vec![Value::int32(10), Value::int32(20), Value::int32(255)],
+                "spread/Array.from yields bytes in order"
+            );
+            // Empty Uint8Array iterates zero times.
+            let empty = construct(machine, Value::int32(0));
+            assert!(
+                machine
+                    .iterable_values(empty)
+                    .expect("empty iteration")
+                    .is_empty()
+            );
+            // Incompatible receiver throws TypeError.
+            let plain = ordinary_object(machine);
+            let prototype = machine
+                .get_named_property(
+                    machine.intrinsics.global("Uint8Array").unwrap(),
+                    "prototype",
+                )
+                .unwrap();
+            let iterator_fn = machine
+                .get_property_key(
+                    prototype,
+                    &machine
+                        .to_property_key(machine.intrinsics.builtins.symbol_iterator())
+                        .unwrap(),
+                )
+                .unwrap();
+            assert!(matches!(
+                machine.call_value(iterator_fn, plain, &[]),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
         });
     }
 }
