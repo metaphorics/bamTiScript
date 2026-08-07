@@ -429,7 +429,6 @@ pub enum ProgramDecodeErrorKind {
     UnsupportedVersion {
         version: u8,
     },
-    MalformedInteger,
     NonCanonicalInteger,
     IntegerOverflow,
     InvalidEdgeTarget {
@@ -473,9 +472,6 @@ impl fmt::Display for ProgramDecodeError {
             ),
             ProgramDecodeErrorKind::UnsupportedVersion { version } => {
                 write!(formatter, "unsupported program version {version}")
-            }
-            ProgramDecodeErrorKind::MalformedInteger => {
-                formatter.write_str("malformed LEB128 integer")
             }
             ProgramDecodeErrorKind::NonCanonicalInteger => {
                 formatter.write_str("noncanonical LEB128 integer")
@@ -1170,21 +1166,14 @@ impl<'a> ProgramDecoder<'a> {
 
     fn u32(&mut self) -> Result<u32, ProgramDecodeError> {
         let start = self.offset;
-        let mut value = 0_u32;
-        for group in 0..5 {
-            let byte = self.byte()?;
-            if group == 4 && byte & 0xf0 != 0 {
-                return Err(self.error_at(start, ProgramDecodeErrorKind::IntegerOverflow));
-            }
-            value |= u32::from(byte & 0x7f) << (group * 7);
-            if byte & 0x80 == 0 {
-                if group != 0 && byte == 0 {
-                    return Err(self.error_at(start, ProgramDecodeErrorKind::NonCanonicalInteger));
-                }
-                return Ok(value);
-            }
-        }
-        Err(self.error_at(start, ProgramDecodeErrorKind::MalformedInteger))
+        read_leb128(self.bytes, &mut self.offset).map_err(|error| {
+            let kind = match error {
+                Leb128Error::UnexpectedEof => ProgramDecodeErrorKind::UnexpectedEof,
+                Leb128Error::IntegerOverflow => ProgramDecodeErrorKind::IntegerOverflow,
+                Leb128Error::NonCanonicalInteger => ProgramDecodeErrorKind::NonCanonicalInteger,
+            };
+            self.error_at(start, kind)
+        })
     }
 
     const fn error(&self, kind: ProgramDecodeErrorKind) -> ProgramDecodeError {
@@ -1193,6 +1182,55 @@ impl<'a> ProgramDecoder<'a> {
 
     const fn error_at(&self, offset: usize, kind: ProgramDecodeErrorKind) -> ProgramDecodeError {
         ProgramDecodeError { offset, kind }
+    }
+}
+
+/// Failure modes for canonical unsigned LEB128 `u32` decoding.
+///
+/// This is the sole LEB128 error taxonomy in the crate: both
+/// [`ProgramDecoder`](struct@ProgramDecoder) and [`crate::Decoder`] delegate to
+/// [`read_leb128`] and map these variants into their own error enums.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Leb128Error {
+    UnexpectedEof,
+    IntegerOverflow,
+    NonCanonicalInteger,
+}
+
+/// Reads one canonical unsigned LEB128 `u32` from `bytes` starting at
+/// `*offset`, advancing `*offset` past the consumed bytes.
+///
+/// Rejects EOF mid-integer, overlong (trailing-zero) encodings, and values
+/// exceeding 32 bits. On error `*offset` is left at the point of failure;
+/// callers that need the original position for diagnostics should save it
+/// before calling.
+pub(crate) fn read_leb128(bytes: &[u8], offset: &mut usize) -> Result<u32, Leb128Error> {
+    let start = *offset;
+    let mut result: u32 = 0;
+    let mut shift: u32 = 0;
+    loop {
+        let byte = *bytes.get(*offset).ok_or(Leb128Error::UnexpectedEof)?;
+        *offset += 1;
+        if shift == 28 {
+            // Fifth group: only the low four bits may be set, and the
+            // continuation bit must be clear (else overflow); a zero final
+            // group would be overlong.
+            if byte & 0x80 != 0 || byte > 0x0f {
+                return Err(Leb128Error::IntegerOverflow);
+            }
+            if byte == 0 {
+                return Err(Leb128Error::NonCanonicalInteger);
+            }
+            return Ok(result | (u32::from(byte) << 28));
+        }
+        result |= u32::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            if byte == 0 && *offset - start > 1 {
+                return Err(Leb128Error::NonCanonicalInteger);
+            }
+            return Ok(result);
+        }
+        shift += 7;
     }
 }
 

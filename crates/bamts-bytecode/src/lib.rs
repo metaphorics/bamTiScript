@@ -2404,7 +2404,6 @@ pub enum DecodeErrorKind {
     UnsupportedVersion {
         version: u8,
     },
-    MalformedInteger,
     NonCanonicalInteger,
     IntegerOverflow,
     InvalidConstantTag {
@@ -2467,7 +2466,6 @@ impl fmt::Display for DecodeError {
             DecodeErrorKind::UnsupportedVersion { version } => {
                 write!(formatter, "unsupported format version {version}")
             }
-            DecodeErrorKind::MalformedInteger => formatter.write_str("malformed LEB128 integer"),
             DecodeErrorKind::NonCanonicalInteger => {
                 formatter.write_str("noncanonical (overlong) LEB128 integer")
             }
@@ -3038,31 +3036,24 @@ impl<'a> Decoder<'a> {
     /// overlong (trailing-zero) encodings, and values exceeding 32 bits.
     fn leb128(&mut self) -> Result<u32, DecodeError> {
         let start = self.offset;
-        let mut result: u32 = 0;
-        let mut shift: u32 = 0;
-        loop {
-            let byte = self.byte()?;
-            if shift == 28 {
-                // Fifth group: only the low four bits may be set, and the
-                // continuation bit must be clear (else overflow); a zero final
-                // group would be overlong.
-                if byte & 0x80 != 0 || byte > 0x0f {
-                    return Err(self.error(start, DecodeErrorKind::IntegerOverflow));
+        crate::program::read_leb128(self.bytes, &mut self.offset).map_err(|error| {
+            // EOF is reported where the missing byte belongs (current offset);
+            // overflow and noncanonical encoding are reported at the integer's
+            // start, matching the original decoder's diagnostics.
+            let offset = match error {
+                crate::program::Leb128Error::UnexpectedEof => self.offset,
+                crate::program::Leb128Error::IntegerOverflow
+                | crate::program::Leb128Error::NonCanonicalInteger => start,
+            };
+            let kind = match error {
+                crate::program::Leb128Error::UnexpectedEof => DecodeErrorKind::UnexpectedEof,
+                crate::program::Leb128Error::IntegerOverflow => DecodeErrorKind::IntegerOverflow,
+                crate::program::Leb128Error::NonCanonicalInteger => {
+                    DecodeErrorKind::NonCanonicalInteger
                 }
-                if byte == 0 {
-                    return Err(self.error(start, DecodeErrorKind::NonCanonicalInteger));
-                }
-                return Ok(result | (u32::from(byte) << 28));
-            }
-            result |= u32::from(byte & 0x7f) << shift;
-            if byte & 0x80 == 0 {
-                if byte == 0 && self.offset - start > 1 {
-                    return Err(self.error(start, DecodeErrorKind::NonCanonicalInteger));
-                }
-                return Ok(result);
-            }
-            shift += 7;
-        }
+            };
+            self.error(offset, kind)
+        })
     }
 
     fn cap(&self, count: u32) -> usize {
@@ -3550,12 +3541,12 @@ mod tests {
     fn rich_module() -> Module<Unverified> {
         let constants = vec![
             Constant::String(EcmaString::encode("main")), // 0: function name + key string
-            Constant::Int32(21),                             // 1
-            Constant::Number(NumberBits::from_f64(1.5)),     // 2
+            Constant::Int32(21),                          // 1
+            Constant::Number(NumberBits::from_f64(1.5)),  // 2
             Constant::BigInt(BigIntLiteral::new("-1234567890123".to_owned()).unwrap()), // 3
-            Constant::Boolean(true),                         // 4
-            Constant::Null,                                  // 5
-            Constant::Undefined,                             // 6
+            Constant::Boolean(true),                      // 4
+            Constant::Null,                               // 5
+            Constant::Undefined,                          // 6
             Constant::String(EcmaString::encode("./dep")), // 7: import specifier
             Constant::String(EcmaString::encode("g")),    // 8: global name
             Constant::String(EcmaString::encode("#p")),   // 9: private description
