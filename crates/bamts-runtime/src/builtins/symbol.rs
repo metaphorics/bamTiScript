@@ -234,9 +234,13 @@ fn value_of<H: Host>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{TestHost, blank_program};
+    use super::super::test_support::{TestHost, blank_program, ordinary_object};
     use super::*;
     use crate::Limits;
+    use crate::PropertyMap;
+    use crate::ThrowOrigin;
+    use crate::intrinsics::{BuiltinDef, BuiltinOutcome, native_function};
+    use bamts_bytecode::{FunctionId, ModuleId};
 
     #[test]
     fn symbol_dispose_is_installed_on_constructor() {
@@ -466,6 +470,202 @@ mod tests {
             ),
             before,
             "a failed Symbol.for call must not allocate or charge before registry publication"
+        );
+    }
+
+    // --- Symbol.hasInstance / instanceof -------------------------------------
+
+    /// A registered builtin that returns the boolean stored on `this` under
+    /// `_hasInstanceResult`, modeling a user-defined `@@hasInstance` handler
+    /// whose outcome the test controls.
+    fn custom_has_instance<H: Host>(
+        machine: &mut Machine<'_, H>,
+        this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let result = machine.get_named_property(this, "_hasInstanceResult")?;
+        Ok(BuiltinOutcome::Value(result))
+    }
+
+    fn has_instance_property_key(machine: &mut Machine<'_, TestHost>) -> PropertyKey {
+        let symbol_constructor = machine
+            .intrinsics
+            .global("Symbol")
+            .expect("Symbol is installed");
+        let has_instance = machine
+            .get_named_property(symbol_constructor, "hasInstance")
+            .expect("Symbol.hasInstance is installed");
+        machine
+            .to_property_key(has_instance)
+            .expect("Symbol.hasInstance is a valid property key")
+    }
+
+    /// An ordinary object whose prototype is `prototype`, giving the test
+    /// exact control over the value's prototype chain.
+    fn object_with_prototype(machine: &mut Machine<'_, TestHost>, prototype: Value) -> Value {
+        machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .expect("object allocation succeeds")
+    }
+
+    /// A minimal constructor function whose `.prototype` is `prototype`. The
+    /// function body is the blank program's halt entry; `instanceof` only
+    /// reads `.prototype`, it never calls the constructor.
+    fn constructor_with_prototype(machine: &mut Machine<'_, TestHost>, prototype: Value) -> Value {
+        let mut properties = PropertyMap::default();
+        properties.insert(
+            PropertyKey::Named(EcmaString::from_utf8("prototype")),
+            Property::Data {
+                value: prototype,
+                writable: true,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(0),
+                captures: Vec::new(),
+                properties,
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .expect("constructor allocation succeeds")
+    }
+
+    #[test]
+    fn instanceof_consults_callable_symbol_has_instance() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        // The value's prototype chain is unrelated to the constructor, so a
+        // true result can only come from the @@hasInstance handler.
+        let ctor_proto = ordinary_object(&mut machine);
+        let constructor = constructor_with_prototype(&mut machine, ctor_proto);
+        let unrelated_proto = ordinary_object(&mut machine);
+        let value = object_with_prototype(&mut machine, unrelated_proto);
+
+        let handler_id = machine.intrinsics.builtins.register(BuiltinDef {
+            name: "custom hasInstance",
+            length: 1,
+            handler: custom_has_instance::<TestHost>,
+        });
+        let handler = native_function(&mut machine.heap, handler_id, "custom hasInstance", 1);
+        machine
+            .set_data_property(constructor, "_hasInstanceResult", Value::TRUE)
+            .unwrap();
+        let key = has_instance_property_key(&mut machine);
+        machine
+            .set_data_property_key(constructor, key, handler)
+            .unwrap();
+
+        assert!(
+            machine.instance_of(value, constructor).unwrap(),
+            "a callable @@hasInstance returning true must make instanceof true"
+        );
+
+        // Flip the handler to false: the same value must now be false, proving
+        // the handler's result is respected rather than the prototype chain.
+        machine
+            .set_data_property(constructor, "_hasInstanceResult", Value::FALSE)
+            .unwrap();
+        assert!(
+            !machine.instance_of(value, constructor).unwrap(),
+            "a callable @@hasInstance returning false must make instanceof false"
+        );
+    }
+
+    #[test]
+    fn instanceof_falls_back_to_prototype_chain_without_symbol_has_instance() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let ctor_proto = ordinary_object(&mut machine);
+        let constructor = constructor_with_prototype(&mut machine, ctor_proto);
+
+        // No @@hasInstance installed: the ordinary prototype-chain check runs.
+        let on_chain = object_with_prototype(&mut machine, ctor_proto);
+        let off_chain_proto = ordinary_object(&mut machine);
+        let off_chain = object_with_prototype(&mut machine, off_chain_proto);
+
+        assert!(
+            machine.instance_of(on_chain, constructor).unwrap(),
+            "a value on the prototype chain must be an instance without @@hasInstance"
+        );
+        assert!(
+            !machine.instance_of(off_chain, constructor).unwrap(),
+            "a value off the prototype chain must not be an instance without @@hasInstance"
+        );
+    }
+
+    #[test]
+    fn instanceof_callable_has_instance_overrides_prototype_chain() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        // The value IS on the constructor's prototype chain, so the ordinary
+        // check would say true; a @@hasInstance returning false must override.
+        let ctor_proto = ordinary_object(&mut machine);
+        let constructor = constructor_with_prototype(&mut machine, ctor_proto);
+        let on_chain = object_with_prototype(&mut machine, ctor_proto);
+
+        let handler_id = machine.intrinsics.builtins.register(BuiltinDef {
+            name: "custom hasInstance override",
+            length: 1,
+            handler: custom_has_instance::<TestHost>,
+        });
+        let handler = native_function(
+            &mut machine.heap,
+            handler_id,
+            "custom hasInstance override",
+            1,
+        );
+        machine
+            .set_data_property(constructor, "_hasInstanceResult", Value::FALSE)
+            .unwrap();
+        let key = has_instance_property_key(&mut machine);
+        machine
+            .set_data_property_key(constructor, key, handler)
+            .unwrap();
+
+        assert!(
+            !machine.instance_of(on_chain, constructor).unwrap(),
+            "a callable @@hasInstance returning false must override a matching prototype chain"
+        );
+    }
+
+    #[test]
+    fn instanceof_non_callable_symbol_has_instance_throws_type_error() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let ctor_proto = ordinary_object(&mut machine);
+        let constructor = constructor_with_prototype(&mut machine, ctor_proto);
+
+        // A present but non-callable @@hasInstance is a TypeError per GetMethod.
+        let key = has_instance_property_key(&mut machine);
+        machine
+            .set_data_property_key(constructor, key, Value::int32(42))
+            .unwrap();
+
+        let value = ordinary_object(&mut machine);
+        assert!(
+            matches!(
+                machine.instance_of(value, constructor),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ),
+            "a non-callable @@hasInstance must throw a TypeError"
         );
     }
 }

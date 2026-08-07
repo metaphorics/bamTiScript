@@ -1625,6 +1625,11 @@ pub struct Machine<'a, H: Host> {
     intrinsics: intrinsics::Intrinsics<H>,
     current_builtin_id: Option<intrinsics::BuiltinId>,
     current_new_target: Value,
+    /// Cached heap index of the well-known `Symbol.hasInstance` symbol, used
+    /// by `instance_of` to consult a user-defined `@@hasInstance` handler.
+    /// Resolved lazily on the first `instanceof` so the hot common path pays
+    /// only the single property lookup the spec requires.
+    has_instance_symbol: Option<u32>,
     registry: ModuleRegistry,
     /// First machine-wide module ID reserved for host-compiled script modules.
     dynamic_base: usize,
@@ -1944,6 +1949,7 @@ impl<'a, H: Host> Machine<'a, H> {
             dynamic: Vec::new(),
             current_builtin_id: None,
             current_new_target: Value::UNDEFINED,
+            has_instance_symbol: None,
             intrinsics,
         }
     }
@@ -10875,12 +10881,45 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(left.partial_cmp(&right))
     }
 
-    /// `value instanceof constructor`: walks `value`'s prototype chain for the
-    /// constructor's own `prototype` object, matching by heap identity.
+    /// `value instanceof constructor` per ECMA-262 §13.10.3 InstanceofOperator.
+    ///
+    /// The right-hand side is first consulted for a callable
+    /// `Symbol.hasInstance`; when present and callable it is called with
+    /// `value` and its result coerced to boolean. Only when `@@hasInstance`
+    /// is absent (or nullish) does the operator fall back to the ordinary
+    /// prototype-chain check. A present-but-non-callable handler is a
+    /// TypeError, matching `GetMethod`.
     fn instance_of(&mut self, value: Value, constructor: Value) -> Result<bool, EvalFailure> {
         let constructor = self
             .bound_target(constructor)
             .map_err(EvalFailure::Runtime)?;
+        let key = self.has_instance_key()?;
+        let handler = self.get_property_key(constructor, &key)?;
+        if matches!(handler.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+            // No `@@hasInstance`: ordinary prototype-chain check, byte-for-byte
+            // the pre-symbol `instanceof` behavior.
+            return self.ordinary_has_instance(value, constructor);
+        }
+        // GetMethod: a present, non-nullish handler must be callable.
+        if !self.is_callable(handler)? {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "instanceof Symbol.hasInstance is not callable",
+            }));
+        }
+        let result = self.call_value(handler, constructor, &[value])?;
+        Ok(self.to_boolean(result))
+    }
+
+    /// `OrdinaryHasInstance` (ECMA-262 §7.3.20): walks `value`'s prototype
+    /// chain for the constructor's own `prototype` object, matching by heap
+    /// identity. This is the fallback for a right-hand side that defines no
+    /// callable `Symbol.hasInstance` and is unchanged from the original
+    /// `instanceof` implementation.
+    fn ordinary_has_instance(
+        &mut self,
+        value: Value,
+        constructor: Value,
+    ) -> Result<bool, EvalFailure> {
         match self
             .runtime_slot(constructor)
             .map_err(EvalFailure::Runtime)?
@@ -10928,6 +10967,37 @@ impl<'a, H: Host> Machine<'a, H> {
                 operation: "instanceof",
             })),
         }
+    }
+
+    /// Resolves and caches the `PropertyKey` for the well-known
+    /// `Symbol.hasInstance` symbol. The symbol is a read-only,
+    /// non-configurable property of the `Symbol` constructor installed once
+    /// during intrinsic initialization, so its heap index is stable for the
+    /// machine's lifetime; caching it keeps the per-`instanceof` cost to the
+    /// single property lookup the spec requires rather than re-deriving the
+    /// symbol key on every call.
+    fn has_instance_key(&mut self) -> Result<PropertyKey, EvalFailure> {
+        if let Some(index) = self.has_instance_symbol {
+            return Ok(PropertyKey::Symbol(index));
+        }
+        let symbol_constructor = self
+            .intrinsics
+            .global("Symbol")
+            .expect("Symbol intrinsics install before instanceof");
+        let index = self
+            .runtime_slot(symbol_constructor)
+            .map_err(EvalFailure::Runtime)?
+            .expect("Symbol constructor is an engine object");
+        let symbol = match self.own_get_ascii(index, "hasInstance") {
+            Some(Found::Value(value)) => value,
+            _ => unreachable!("Symbol.hasInstance is a readonly data property"),
+        };
+        let symbol_index = self
+            .runtime_slot(symbol)
+            .map_err(EvalFailure::Runtime)?
+            .expect("Symbol.hasInstance is an engine symbol") as u32;
+        self.has_instance_symbol = Some(symbol_index);
+        Ok(PropertyKey::Symbol(symbol_index))
     }
 
     fn value_to_string(&self, value: Value, depth: usize) -> Result<EcmaString, EvalFailure> {
