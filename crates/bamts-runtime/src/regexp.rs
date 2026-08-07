@@ -334,8 +334,15 @@ impl Regex {
             // identical states at every level — without dedup these multiply to
             // k^n states, each cloning its captures Vec.  Two states that share
             // position and captures yield identical continuations, so collapsing
-            // duplicates is lossless and keeps ordinary patterns (1 state per
-            // level) completely unaffected.
+            // duplicates is lossless.
+            //
+            // The hash set is allocated once and cleared per level so its bucket
+            // capacity is reused — ordinary patterns (1 state per level) pay one
+            // allocation for the whole repeat, not one per level.  Dedup is kept
+            // even for single-source levels because the body itself can be an
+            // alternation (e.g. (a|a)*) whose branches yield duplicate
+            // (position, captures) states from one prior — skipping would let
+            // those duplicates through and reintroduce the multiplication.
             //
             // The step budget remains as a backstop for non-dedupable blowups
             // (e.g. ((a)|(a))* where branches set different capture groups).
@@ -344,9 +351,10 @@ impl Regex {
             let mut levels = vec![vec![state]];
             let limit = max.unwrap_or(input.len().saturating_add(*min).saturating_add(1));
             let mut total_states: usize = 1;
+            let mut seen: HashSet<StateKey> = HashSet::new();
             for count in 0..limit {
                 let mut next = Vec::new();
-                let mut seen: HashSet<StateKey> = HashSet::new();
+                seen.clear();
                 for prior in &levels[count] {
                     for matched in self.match_node(body, input, prior.clone()) {
                         if matched.position == prior.position && count + 1 >= *min {
@@ -1463,6 +1471,27 @@ mod tests {
         assert!(
             elapsed.as_secs() < 5,
             "match took {elapsed:?}, expected step budget to abort quickly"
+        );
+    }
+
+    #[test]
+    fn repeat_dedup_collapses_equivalent_states_and_stays_linear() {
+        // (a|a)* on 5_000 'a's: each level's single source produces two
+        // identical (position, captures) states that must collapse to one.
+        // Without dedup the state count doubles every level (2^5000) and the
+        // match never finishes; with dedup (hoisted or not) it stays at 1
+        // state per level and completes instantly.  This guards the dedup
+        // semantics that the HashSet hoisting must preserve.
+        use std::time::Instant;
+        let re = regex("(a|a)*", "");
+        let input = text(&"a".repeat(5_000));
+        let start = Instant::now();
+        let matched = re.exec(&input, 0).unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(matched.range, 0..5_000);
+        assert!(
+            elapsed.as_millis() < 500,
+            "dedup should keep this linear; took {elapsed:?}"
         );
     }
 }
