@@ -1678,6 +1678,25 @@ fn can_complete_normally(statement: &Stmt) -> bool {
             });
             try_completes || catch_completes
         }
+        Statement::Switch(statement) => {
+            // Without a default the discriminant may match no case, so the
+            // switch always completes normally. With a default it completes
+            // normally only if some case can fall out the bottom — either by
+            // being empty, ending in a break (which exits the switch), or
+            // ending in a statement that itself completes normally.
+            let has_default = statement
+                .cases
+                .iter()
+                .any(|case| case.data().test.is_none());
+            if !has_default {
+                return true;
+            }
+            statement.cases.iter().any(|case| {
+                case.data().consequent.last().is_none_or(|last| {
+                    matches!(last.data(), Statement::Break(_)) || can_complete_normally(last)
+                })
+            })
+        }
         _ => true,
     }
 }
@@ -1978,6 +1997,16 @@ mod tests {
         assert!(
             diagnostics.contains(&"BAMTS-W085"),
             "BAMTS-W085 must flag TypeScript-only parameter syntax on arrow functions in JavaScript"
+        );
+    }
+
+    #[test]
+    fn w065_switch_returning_from_every_case_is_not_flagged() {
+        let source =
+            "function f(x: 1 | 2) { switch (x) { case 1: return 'a'; default: return 'b'; } }";
+        assert!(
+            !codes(source, ScriptKind::TypeScript).contains(&"BAMTS-W065"),
+            "a function that returns from every switch case must not be flagged as missing a return"
         );
     }
 }
