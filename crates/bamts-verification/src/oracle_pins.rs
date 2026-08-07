@@ -190,9 +190,13 @@ pub fn verify_oracle_pins(root: &Path) -> Result<OraclePins> {
 }
 
 fn observe_pins(sources: &OracleSources, manifests: &NpmManifests) -> Result<OraclePins> {
-    reject_moving_ref("compiler commit", &sources.compiler.commit)?;
-    reject_moving_ref("suite commit", &sources.suite.commit)?;
-    reject_moving_ref("compiler tag", &sources.compiler.pin)?;
+    reject_moving_ref("compiler commit", &sources.compiler.commit, RefKind::Commit)?;
+    reject_moving_ref("suite commit", &sources.suite.commit, RefKind::Commit)?;
+    reject_moving_ref(
+        "compiler tag",
+        &sources.compiler.pin,
+        RefKind::Tag(COMPILER_TAG),
+    )?;
     reject_repository_substitution(&sources.compiler.repository)?;
 
     Ok(OraclePins {
@@ -356,7 +360,11 @@ fn verify_source_record(record: &SourceRecord, expected: &SourceExpectation) -> 
         &record.digest,
         expected.digest,
     )?;
-    reject_moving_ref(&format!("source `{}` commit", record.name), &record.commit)?;
+    reject_moving_ref(
+        &format!("source `{}` commit", record.name),
+        &record.commit,
+        RefKind::Commit,
+    )?;
     require_pin_match(
         &format!("source `{}` commit", record.name),
         &record.commit,
@@ -432,7 +440,11 @@ fn verify_npm_manifests(manifests: &NpmManifests, npm_source: &SourceRecord) -> 
         &manifests.package_version,
         NPM_VERSION,
     )?;
-    reject_moving_ref("installed typescript gitHead", &manifests.package_git_head)?;
+    reject_moving_ref(
+        "installed typescript gitHead",
+        &manifests.package_git_head,
+        RefKind::Commit,
+    )?;
     require_pin_match(
         "installed typescript gitHead",
         &manifests.package_git_head,
@@ -471,9 +483,13 @@ fn verify_npm_manifests(manifests: &NpmManifests, npm_source: &SourceRecord) -> 
 }
 
 fn verify_pin_identity(pins: &OraclePins) -> Result<()> {
-    reject_moving_ref("compiler commit", &pins.compiler_commit)?;
-    reject_moving_ref("suite commit", &pins.suite_commit)?;
-    reject_moving_ref("compiler tag", &pins.compiler_tag)?;
+    reject_moving_ref("compiler commit", &pins.compiler_commit, RefKind::Commit)?;
+    reject_moving_ref("suite commit", &pins.suite_commit, RefKind::Commit)?;
+    reject_moving_ref(
+        "compiler tag",
+        &pins.compiler_tag,
+        RefKind::Tag(COMPILER_TAG),
+    )?;
     reject_repository_substitution(&pins.compiler_repository)?;
 
     let expected = OraclePins::expected();
@@ -507,24 +523,27 @@ fn verify_pin_identity(pins: &OraclePins) -> Result<()> {
     Ok(())
 }
 
-fn reject_moving_ref(field: &str, value: &str) -> Result<()> {
-    if field.contains("tag") {
-        if value == COMPILER_TAG {
-            return Ok(());
-        }
-        return Err(provenance_mismatch(format!(
-            "{field} must be the immutable tag `{COMPILER_TAG}`; \
-             moving branches and alternate tags are insufficient provenance, found `{value}`"
-        )));
-    }
+/// What a ref pin must be: either a fixed 40-char commit, or an exact tag.
+/// Keying validation on this — not on a substring of the human-readable
+/// `field` label — keeps a spelling coincidence (e.g. a label containing
+/// "tag") from silently switching the provenance rule.
+enum RefKind {
+    Commit,
+    Tag(&'static str),
+}
 
-    if is_commit_sha(value) {
-        Ok(())
-    } else {
-        Err(provenance_mismatch(format!(
+fn reject_moving_ref(field: &str, value: &str, kind: RefKind) -> Result<()> {
+    match kind {
+        RefKind::Tag(expected) if value == expected => Ok(()),
+        RefKind::Tag(expected) => Err(provenance_mismatch(format!(
+            "{field} must be the immutable tag `{expected}`; \
+             moving branches and alternate tags are insufficient provenance, found `{value}`"
+        ))),
+        RefKind::Commit if is_commit_sha(value) => Ok(()),
+        RefKind::Commit => Err(provenance_mismatch(format!(
             "{field} must be a {COMMIT_LEN}-char lowercase hex pin; \
              moving branches and tags are insufficient provenance, found `{value}`"
-        )))
+        ))),
     }
 }
 
