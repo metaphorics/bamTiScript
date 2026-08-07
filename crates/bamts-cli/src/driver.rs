@@ -504,7 +504,12 @@ fn run_aot(
     let object_wall_ms = elapsed_ms(object_started);
     let id = NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed);
     let root = cache_root()?;
-    let destination = root.join("run").join(format!(
+    let run_dir = root.join("run");
+    fs::create_dir_all(&run_dir).map_err(|source| DriverError::CreateDirectory {
+        path: run_dir.clone(),
+        source,
+    })?;
+    let destination = run_dir.join(format!(
         "bamts-run-{}-{id}{}",
         std::process::id(),
         std::env::consts::EXE_SUFFIX
@@ -513,7 +518,6 @@ fn run_aot(
     let link_started = Instant::now();
     link_executable(&object.bytes, &destination)?;
     let link_wall_ms = elapsed_ms(link_started);
-    require_within_cache_root(&destination, &root)?;
     let launch_token = format!("{}-{id}", std::process::id());
     let run_started = Instant::now();
     let output = Command::new(&destination)
@@ -872,8 +876,26 @@ fn effective_uid() -> Result<u32, DriverError> {
         })
 }
 
+/// Verify that the resolved parent directory of `path` is genuinely inside
+/// `root` on the filesystem, not just lexically. `root/run` being a symlink
+/// into a directory somebody else controls would pass a pure `starts_with`
+/// check; canonicalizing both paths and comparing catches that escape.
 fn require_within_cache_root(path: &Path, root: &Path) -> Result<(), DriverError> {
-    if path.starts_with(root) {
+    let parent = path
+        .parent()
+        .ok_or_else(|| DriverError::UnsafeFallbackCacheRoot {
+            path: path.to_owned(),
+        })?;
+    let canonical_parent =
+        fs::canonicalize(parent).map_err(|source| DriverError::CreateDirectory {
+            path: parent.to_owned(),
+            source,
+        })?;
+    let canonical_root = fs::canonicalize(root).map_err(|source| DriverError::CreateDirectory {
+        path: root.to_owned(),
+        source,
+    })?;
+    if canonical_parent.starts_with(&canonical_root) {
         Ok(())
     } else {
         Err(DriverError::UnsafeFallbackCacheRoot {
@@ -1102,9 +1124,10 @@ mod tests {
 
     use crate::args::{ArgsError, parse_args};
 
+    #[cfg(target_os = "linux")]
+    use super::peak_rss_kb;
     use super::{
-        DriverError, content_hash, execute_with_telemetry, levels, lower_options, peak_rss_kb,
-        probe_toolchain,
+        DriverError, content_hash, execute_with_telemetry, levels, lower_options, probe_toolchain,
     };
 
     #[test]
@@ -1273,6 +1296,51 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn require_within_cache_root_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        use std::sync::atomic::Ordering;
+
+        let workspace = std::env::temp_dir().join(format!(
+            "bamts-cli-containment-{}-{}",
+            std::process::id(),
+            super::NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&workspace);
+        let root = workspace.join("root");
+        let outside = workspace.join("outside");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::create_dir_all(&outside).expect("create outside");
+        // `root/run` is a symlink to a directory outside the cache root.
+        symlink(&outside, root.join("run")).expect("create escaping symlink");
+        let destination = root.join("run").join("bamts-run-evil");
+        let error = super::require_within_cache_root(&destination, &root)
+            .expect_err("symlink escaping the cache root must be rejected");
+        assert!(matches!(error, DriverError::UnsafeFallbackCacheRoot { .. }));
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn require_within_cache_root_accepts_genuine_subdirectory() {
+        use std::sync::atomic::Ordering;
+
+        let workspace = std::env::temp_dir().join(format!(
+            "bamts-cli-containment-ok-{}-{}",
+            std::process::id(),
+            super::NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&workspace);
+        let root = workspace.join("root");
+        let run_dir = root.join("run");
+        std::fs::create_dir_all(&run_dir).expect("create run dir");
+        let destination = run_dir.join("bamts-run-ok");
+        super::require_within_cache_root(&destination, &root)
+            .expect("genuine subdirectory of the cache root must be accepted");
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn symlinked_entrypoint_uses_one_canonical_config_root()
     -> Result<(), Box<dyn std::error::Error>> {
         use std::os::unix::fs::symlink;
@@ -1346,6 +1414,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn peak_rss_kb_reads_proc_status_on_linux() {
         let rss = peak_rss_kb().expect("VmHWM is readable on this Linux host");
