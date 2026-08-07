@@ -341,9 +341,18 @@ impl<'src> Binder<'src> {
         for parameter in &list.parameters {
             let data = parameter.data();
             let name = self.identifier_text(&data.name).into_owned();
-            let symbol = self.scopes[scope.get() as usize]
-                .type_binding(&name)
-                .expect("type parameter bound above");
+            let Some(symbol) = self.scopes[scope.get() as usize].type_binding(&name) else {
+                // `bind_type_parameters` should have declared every name, but
+                // malformed JSX/TSX can yield an empty or merged name that the
+                // lookup misses. Degrade to `any` per the recovery contract at
+                // the top of this file instead of panicking.
+                self.emit(
+                    CANNOT_FIND_NAME,
+                    data.name.range(),
+                    CANNOT_FIND_NAME_MESSAGE,
+                );
+                continue;
+            };
             let mut inference_parameter = InferenceParameter::new(symbol);
             if let Some(constraint) = &data.constraint {
                 inference_parameter =
@@ -874,6 +883,28 @@ mod tests {
              const bad = <Comp value={{1}} />;"
         );
         assert_eq!(codes(&source), [JSX_ATTRIBUTES_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    // -- malformed type parameters --------------------------------------------------------
+
+    /// A generic JSX factory with a duplicate type parameter name must not
+    /// panic the compiler. The binder reports the duplicate; the factory
+    /// check degrades to a diagnostic instead of crashing on the type
+    /// parameter lookup.
+    #[test]
+    fn generic_factory_with_duplicate_type_parameter_does_not_panic() {
+        use super::super::DUPLICATE_DECLARATION;
+        let source = format!(
+            "{JSX_PREAMBLE} \
+             function Comp<T, T>(props: {{ value: T }}) {{ return props.value; }} \
+             const x = <Comp value={{1}} />;"
+        );
+        let diagnostics = codes(&source);
+        // The compiler must not panic; it reports the duplicate declaration.
+        assert!(
+            diagnostics.contains(&DUPLICATE_DECLARATION.as_str()),
+            "expected DUPLICATE_DECLARATION in {diagnostics:?}"
+        );
     }
 
     // -- namespace resolution degradation ------------------------------------------------
