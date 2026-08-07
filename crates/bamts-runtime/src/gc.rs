@@ -612,7 +612,8 @@ fn trace_runtime_error(
         | RuntimeErrorKind::DynamicImportEdgeMissing { .. }
         | RuntimeErrorKind::InvalidVerifiedProgram { .. }
         | RuntimeErrorKind::InvalidRuntimeHeapReference { .. }
-        | RuntimeErrorKind::ModuleEvaluationStalled { .. } => {}
+        | RuntimeErrorKind::ModuleEvaluationStalled { .. }
+        | RuntimeErrorKind::RegexpStepBudgetExceeded { .. } => {}
     }
 }
 

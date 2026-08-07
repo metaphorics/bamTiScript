@@ -364,6 +364,12 @@ pub enum RuntimeErrorKind {
     ModuleEvaluationStalled {
         module: ModuleId,
     },
+    /// The regexp backtracking step budget was exhausted by a pathologically
+    /// complex pattern. Surfaced as a runtime error (not a silent non-match)
+    /// so callers can distinguish an aborted match from a genuine non-match.
+    RegexpStepBudgetExceeded {
+        limit: usize,
+    },
 }
 
 impl fmt::Display for RuntimeError {
@@ -468,6 +474,9 @@ impl fmt::Display for RuntimeError {
                 "module {} evaluation cannot complete: no pending microtask or live timer",
                 module.get()
             ),
+            RuntimeErrorKind::RegexpStepBudgetExceeded { limit } => {
+                write!(formatter, "regular expression step budget {limit} exceeded")
+            }
         }
     }
 }

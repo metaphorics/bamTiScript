@@ -5,7 +5,7 @@ use bamts_bytecode::EcmaString;
 use bamts_native::Value;
 
 use super::{allocate_array, allocate_string, define_data, install_function, type_error};
-use crate::intrinsics::regexp::{Match, Regex, canonical_flags};
+use crate::intrinsics::regexp::{Match, Regex, RegexErrorKind, STEP_BUDGET, canonical_flags};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
 
@@ -131,7 +131,21 @@ pub(super) fn execute<H: Host>(
     } else {
         0
     };
-    let matched = regex.exec(input, start);
+    let matched = regex.exec(input, start).map_err(|error| {
+        // Budget exhaustion must surface as a runtime error, not a silent
+        // non-match — a caller that validates input with .test() must see a
+        // failure it can handle instead of a false `false`. Compile errors
+        // are impossible here (the regex was already compiled successfully
+        // above), so only BudgetExhausted can reach this point.
+        match error.kind() {
+            RegexErrorKind::BudgetExhausted => {
+                EvalFailure::Runtime(crate::RuntimeErrorKind::RegexpStepBudgetExceeded {
+                    limit: STEP_BUDGET,
+                })
+            }
+            RegexErrorKind::Compile => unreachable!("regex already compiled successfully"),
+        }
+    })?;
     if uses_last_index {
         let next = matched.as_ref().map_or(0, |value| value.range.end);
         machine.set_data_property(regexp, "lastIndex", crate::number_value(next as f64))?;

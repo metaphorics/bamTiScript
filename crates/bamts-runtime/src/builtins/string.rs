@@ -1052,6 +1052,28 @@ fn regexp_for_argument<H: Host>(
     }
 }
 
+/// Run a compiled regex, mapping step-budget exhaustion to a runtime error
+/// instead of a silent non-match. Compile errors are impossible here (the
+/// regex was already compiled by `regexp_for_argument` or `compile`).
+fn exec_regex(
+    regex: &crate::intrinsics::regexp::Regex,
+    input: &EcmaString,
+    start: usize,
+) -> Result<Option<crate::intrinsics::regexp::Match>, EvalFailure> {
+    regex
+        .exec(input, start)
+        .map_err(|error| match error.kind() {
+            crate::intrinsics::regexp::RegexErrorKind::BudgetExhausted => {
+                EvalFailure::Runtime(crate::RuntimeErrorKind::RegexpStepBudgetExceeded {
+                    limit: crate::intrinsics::regexp::STEP_BUDGET,
+                })
+            }
+            crate::intrinsics::regexp::RegexErrorKind::Compile => {
+                unreachable!("regex already compiled successfully")
+            }
+        })
+}
+
 fn string_match<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
@@ -1064,7 +1086,7 @@ fn string_match<H: Host>(
     if !regex.flags().global {
         let matched = match object {
             Some(regexp) => super::regexp::execute(machine, regexp, &input)?,
-            None => regex.exec(&input, 0),
+            None => exec_regex(&regex, &input, 0)?,
         };
         return match matched {
             Some(matched) => Ok(BuiltinOutcome::Value(super::regexp::match_array(
@@ -1076,7 +1098,7 @@ fn string_match<H: Host>(
     if let Some(regexp) = object {
         machine.set_data_property(regexp, "lastIndex", Value::int32(0))?;
     }
-    let matches = collect_matches(&regex, &input);
+    let matches = collect_matches(&regex, &input)?;
     if matches.is_empty() {
         return Ok(BuiltinOutcome::Value(Value::NULL));
     }
@@ -1105,7 +1127,7 @@ fn match_all<H: Host>(
         ));
     }
     let mut values = Vec::new();
-    for matched in collect_matches(&regex, &input) {
+    for matched in collect_matches(&regex, &input)? {
         values.push(super::regexp::match_array(machine, &input, matched)?);
     }
     let source = allocate_array(machine, values)?;
@@ -1126,21 +1148,19 @@ fn search<H: Host>(
     let argument = args.first().copied().unwrap_or(Value::UNDEFINED);
     let (regex, _) = regexp_for_argument(machine, argument)?;
     Ok(BuiltinOutcome::Value(crate::number_value(
-        regex
-            .exec(&input, 0)
-            .map_or(-1.0, |matched| matched.range.start as f64),
+        exec_regex(&regex, &input, 0)?.map_or(-1.0, |matched| matched.range.start as f64),
     )))
 }
 
 fn collect_matches(
     regex: &crate::intrinsics::regexp::Regex,
     input: &EcmaString,
-) -> Vec<crate::intrinsics::regexp::Match> {
+) -> Result<Vec<crate::intrinsics::regexp::Match>, EvalFailure> {
     let mut matches = Vec::new();
     let mut start = 0;
     let length = input.len_units();
     while start <= length {
-        let Some(matched) = regex.exec(input, start) else {
+        let Some(matched) = exec_regex(regex, input, start)? else {
             break;
         };
         let next = if matched.range.end == matched.range.start && matched.range.end < length {
@@ -1160,7 +1180,7 @@ fn collect_matches(
         }
         start = next;
     }
-    matches
+    Ok(matches)
 }
 
 fn split_regexp<H: Host>(
@@ -1198,7 +1218,7 @@ fn split_regexp<H: Host>(
     let mut cursor = 0;
     let length = input.len_units();
     while cursor < length && pieces.len() < limit {
-        let Some(matched) = regex.exec(&input, cursor) else {
+        let Some(matched) = exec_regex(&regex, &input, cursor)? else {
             break;
         };
         if matched.range.start == matched.range.end && matched.range.start == piece_start {
@@ -1269,7 +1289,7 @@ fn replace_regexp<H: Host>(
         ));
     }
     let replacer = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-    let matches = collect_matches(&regex, &input);
+    let matches = collect_matches(&regex, &input)?;
     let mut output = EcmaStringBuilder::new();
     let mut cursor = 0;
     for matched in matches {
