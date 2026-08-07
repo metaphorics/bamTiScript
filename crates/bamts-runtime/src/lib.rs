@@ -1233,7 +1233,9 @@ enum HeapEntry {
         properties: PropertyMap,
         extensible: bool,
         /// Explicit prototype override; `None` falls back to
-        /// `%Function.prototype%` (the historical default for builtins).
+        /// `%Function.prototype%` at read time (see `prototype_index`).
+        /// Construct via [`HeapEntry::native_function`] so the intent is
+        /// stated explicitly at every call site.
         prototype: Option<Value>,
     },
 }
@@ -1340,6 +1342,27 @@ impl HeapEntry {
             | Self::PromiseAll { .. }
             | Self::AsyncActivation { .. }
             | Self::PromiseAllElement { .. } => 1,
+        }
+    }
+
+    /// Construct a `NativeFunction` with an explicit prototype override.
+    ///
+    /// Pass `None` to fall back to `%Function.prototype%` at read time
+    /// (see [`Machine::prototype_index`]). Pass `Some(proto)` to inherit a
+    /// specific prototype — `Function.prototype.bind` passes the target's
+    /// prototype so the bound function inherits it. Routing every
+    /// construction site through this function makes the `None`-means-
+    /// fallback convention impossible to set by accident.
+    pub(crate) fn native_function(
+        callable: NativeCallable,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+    ) -> Self {
+        Self::NativeFunction {
+            callable,
+            properties,
+            extensible: true,
+            prototype,
         }
     }
 }
@@ -2869,16 +2892,15 @@ impl<'a, H: Host> Machine<'a, H> {
         target: Value,
         record: Value,
     ) -> Result<Value, EvalFailure> {
-        self.allocate(HeapEntry::NativeFunction {
-            callable: NativeCallable::Bound(Box::new(BoundCallable {
+        self.allocate(HeapEntry::native_function(
+            NativeCallable::Bound(Box::new(BoundCallable {
                 target,
                 this_value: Value::UNDEFINED,
                 arguments: vec![record],
             })),
-            properties: PropertyMap::default(),
-            extensible: true,
-            prototype: None,
-        })
+            PropertyMap::default(),
+            None,
+        ))
         .map_err(EvalFailure::Runtime)
     }
 

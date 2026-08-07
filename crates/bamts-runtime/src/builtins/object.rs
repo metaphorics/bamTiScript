@@ -1019,16 +1019,15 @@ fn function_bind<H: Host>(
     );
     let bound_prototype = machine.prototype_value(this)?;
     let value = machine
-        .allocate(HeapEntry::NativeFunction {
-            callable: NativeCallable::Bound(Box::new(BoundCallable {
+        .allocate(HeapEntry::native_function(
+            NativeCallable::Bound(Box::new(BoundCallable {
                 target: this,
                 this_value: args.first().copied().unwrap_or(Value::UNDEFINED),
                 arguments: bound_arguments,
             })),
             properties,
-            extensible: true,
-            prototype: bound_prototype,
-        })
+            bound_prototype,
+        ))
         .map_err(EvalFailure::Runtime)?;
     Ok(BuiltinOutcome::Value(value))
 }
@@ -2908,16 +2907,15 @@ mod tests {
         let mut head = target;
         for _ in 0..50_000 {
             head = machine
-                .allocate(HeapEntry::NativeFunction {
-                    callable: NativeCallable::Bound(Box::new(BoundCallable {
+                .allocate(HeapEntry::native_function(
+                    NativeCallable::Bound(Box::new(BoundCallable {
                         target: call,
                         this_value: head,
                         arguments: Vec::new(),
                     })),
-                    properties: PropertyMap::default(),
-                    extensible: true,
-                    prototype: None,
-                })
+                    PropertyMap::default(),
+                    None,
+                ))
                 .unwrap();
         }
         let result = machine.call_value(head, Value::UNDEFINED, &[]).unwrap();

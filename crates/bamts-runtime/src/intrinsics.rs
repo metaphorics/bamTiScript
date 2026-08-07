@@ -561,12 +561,7 @@ pub(crate) fn native_function(
     );
     push(
         heap,
-        HeapEntry::NativeFunction {
-            callable: NativeCallable::Builtin(id),
-            properties,
-            extensible: true,
-            prototype: None,
-        },
+        HeapEntry::native_function(NativeCallable::Builtin(id), properties, None),
     )
 }
 
