@@ -2345,6 +2345,30 @@ mod tests {
     }
 
     #[test]
+    fn a_derived_class_instance_flows_into_its_base_through_the_chain() {
+        let result = check_text(
+            "abstract class A { abstract readonly name: string; }\n\
+             abstract class B extends A { tag(): number { return 1; } }\n\
+             class C extends B {\n\
+               readonly name = 'c';\n\
+               self(): A { const next: A = this; return next; }\n\
+             }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn an_unrelated_class_does_not_flow_into_another() {
+        let result = check_text(
+            "class Named { readonly name: string = 'n'; }\n\
+             class Numbered { readonly count: number = 1; }\n\
+             declare const numbered: Numbered;\n\
+             const named: Named = numbered;",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
     fn an_unmodelled_intrinsic_type_target_stays_permissive() {
         let result = check_text("const record: Record<string, unknown> = { name: 'root' };");
         assert!(checker_codes(&result).is_empty());

@@ -542,6 +542,10 @@ pub struct TypeTable {
     symbol: TypeId,
     object: TypeId,
     object_symbol: Option<SymbolId>,
+    /// Structural instance type per class symbol, so the relation algebra can
+    /// compare a class nominally named on one side against structure on the
+    /// other — the derived-to-base direction included.
+    class_instances: HashMap<SymbolId, TypeId>,
 }
 
 impl Default for TypeTable {
@@ -571,6 +575,7 @@ impl TypeTable {
             symbol: TypeId(0),
             object: TypeId(0),
             object_symbol: None,
+            class_instances: HashMap::new(),
         };
         table.error = table.intern(Type::Error);
         table.any = table.intern(Type::Any);
@@ -683,6 +688,17 @@ impl TypeTable {
     #[must_use]
     pub fn is_object_symbol(&self, symbol: SymbolId) -> bool {
         self.object_symbol == Some(symbol)
+    }
+
+    /// Records the structural instance type of a class symbol.
+    pub fn set_class_instance(&mut self, symbol: SymbolId, instance: TypeId) {
+        self.class_instances.insert(symbol, instance);
+    }
+
+    /// Structural instance type of a class symbol, if one has been built.
+    #[must_use]
+    pub fn class_instance(&self, symbol: SymbolId) -> Option<TypeId> {
+        self.class_instances.get(&symbol).copied()
     }
     /// Interns a boolean literal type.
     pub fn boolean_literal(&mut self, value: bool) -> TypeId {
@@ -1333,6 +1349,18 @@ impl<'src> Binder<'src> {
     }
 
     fn bind_intrinsic_environment(&mut self, scope: ScopeId) {
+        // The Error family are constructor functions whose `prototype` carries
+        // `name`/`message`/`stack`/`cause`. Registering the instance type lets
+        // `class X extends Error` inherit those members (so `X.prototype.name`
+        // resolves) and lets `Error.prototype.name` resolve, while the
+        // constructor-side fallthrough in `property_type_for_member` stays
+        // permissive for intrinsics so `Error.<static>` does not newly C057.
+        let error_instance = self.types.object_type(vec![
+            PropertyType::new("name", false, self.types.string()),
+            PropertyType::new("message", false, self.types.string()),
+            PropertyType::new("stack", true, self.types.string()),
+            PropertyType::new("cause", true, self.types.unknown()),
+        ]);
         for name in self
             .intrinsics
             .values()
@@ -1348,6 +1376,20 @@ impl<'src> Binder<'src> {
             );
             if *name == "undefined" {
                 self.symbol_types[id.get() as usize] = self.types.undefined_type();
+            }
+            if matches!(
+                *name,
+                "Error"
+                    | "AggregateError"
+                    | "EvalError"
+                    | "RangeError"
+                    | "ReferenceError"
+                    | "SyntaxError"
+                    | "TypeError"
+                    | "URIError"
+            ) {
+                self.class_instance_types.insert(id, error_instance);
+                self.types.set_class_instance(id, error_instance);
             }
         }
         for name in self.intrinsics.types() {
@@ -3330,6 +3372,7 @@ impl<'src> Binder<'src> {
         if let Some(owner) = owner {
             let instance_type = self.class_instance_type(class, scope);
             self.class_instance_types.insert(owner, instance_type);
+            self.types.set_class_instance(owner, instance_type);
             self.symbol_types[owner.get() as usize] = self.types.named(owner);
         }
         for member in &class.members {
@@ -3445,6 +3488,21 @@ impl<'src> Binder<'src> {
                 continue;
             }
             properties.push(PropertyType::new(name, optional, type_id));
+        }
+        // Inherit the base class's instance members. Own members win; base
+        // members fill in inherited properties (e.g. `name`/`message` from
+        // `extends Error`). The base expression was resolved in
+        // `resolve_class_body` before this call, so its reference is available.
+        if let Some(heritage) = &class.extends
+            && let Some(base_symbol) = self.resolved_expression_reference(&heritage.expression)
+            && let Some(&base_instance) = self.class_instance_types.get(&base_symbol)
+            && let Type::ObjectType(base_props) = self.types.get(base_instance).clone()
+        {
+            for base_prop in base_props {
+                if seen.insert(base_prop.name.to_string()) {
+                    properties.push(base_prop);
+                }
+            }
         }
         self.types.object_type(properties)
     }

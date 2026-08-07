@@ -298,6 +298,17 @@ impl<'table> TypeRelations<'table> {
             (Type::Object, Type::ObjectType(target_props)) => {
                 target_props.iter().all(|property| property.optional())
             }
+            // A class name stands for its instance structure. Comparing that
+            // structure is what makes a derived class relate to its base, since
+            // the derived instance type carries the base's members.
+            (Type::Named(symbol), _) if self.table.class_instance(*symbol).is_some() => {
+                let instance = self.table.class_instance(*symbol).unwrap_or(source);
+                instance != source && self.relates(instance, target, strictness)
+            }
+            (_, Type::Named(symbol)) if self.table.class_instance(*symbol).is_some() => {
+                let instance = self.table.class_instance(*symbol).unwrap_or(target);
+                instance != target && self.relates(source, instance, strictness)
+            }
             _ => false,
         }
     }
