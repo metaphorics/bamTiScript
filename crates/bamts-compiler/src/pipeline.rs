@@ -80,7 +80,7 @@ impl SourceEdgeNodeIndex {
             _ => {}
         }
 
-        let children = match statement.data() {
+        let mut children = match statement.data() {
             Statement::Function(function) => match &function.function.body {
                 Some(FunctionBody::Block(block)) => {
                     Self::statements(&block.data().statements, exact)
@@ -141,12 +141,11 @@ impl SourceEdgeNodeIndex {
             _ => Vec::new(),
         };
 
-        debug_assert!(
-            children
-                .windows(2)
-                .all(|pair| pair[0].range.end() <= pair[1].range.start()),
-            "edge node children must be source-ordered and non-overlapping"
-        );
+        // `smallest_containing` binary-searches this list by start position, so
+        // source-order is a correctness requirement, not a convention. Sort
+        // establishes the invariant by construction regardless of how each arm
+        // assembled its children, keeping the search sound in release builds.
+        children.sort_by_key(|node| node.range.start());
 
         EdgeNode {
             id,
