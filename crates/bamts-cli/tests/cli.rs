@@ -5,14 +5,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 const EXPECTED_STDOUT: &[u8] = b"hello from bamts\n";
 const UTF16_PROGRAM: &str = r#"const s = "\uD800";
-console.log(s.length);
-console.log(s.charCodeAt(0).toString(16));
-console.log(s.codePointAt(0).toString(16));
-console.log(/./gu.exec("\u{1F600}")[0].length);
-console.log("\u{10003}" < "\u{E000}");
+process.stdout.write(String(s.length) + "\n");
+process.stdout.write(s.charCodeAt(0).toString(16) + "\n");
+process.stdout.write(s.codePointAt(0).toString(16) + "\n");
+process.stdout.write(String(/./gu.exec("\u{1F600}")[0].length) + "\n");
+process.stdout.write(String("\u{10003}" < "\u{E000}") + "\n");
 const key = Object.keys({["\u{1F600}"]: 3})[0];
-console.log(key.length);
-console.log(key.codePointAt(0).toString(16));
+process.stdout.write(String(key.length) + "\n");
+process.stdout.write(key.codePointAt(0).toString(16) + "\n");
 "#;
 const UTF16_STDOUT: &[u8] = b"1\nd800\nd800\n2\ntrue\n2\n1f600\n";
 const CALLABLE_PROGRAM: &str = r#"function probe(a: unknown, b: unknown) {
@@ -61,11 +61,16 @@ const VM_PROGRAM: &str = r#"import { runInNewContext } from 'node:vm';
 console.log(runInNewContext('1 + 1'));
 console.log(typeof runInNewContext('({})'));
 "#;
+const CLASSIC_DYNAMIC_IMPORT_PROGRAM: &str = r#"import vm from 'node:vm';
+vm.runInThisContext("import('node:util').then(function(ns) { process.stdout.write(String(typeof ns.parseArgs) + '\\n'); })");
+"#;
 static NEXT_DIRECTORY: AtomicU32 = AtomicU32::new(0);
 
 #[test]
 fn run_fixture_preserves_stdout_and_exit_code() {
-    let output = Command::new(bamts_binary())
+    let directory = ScratchDirectory::new();
+    let output = directory
+        .command()
         .args(["run", "--target", "jit"])
         .arg(fixture())
         .output()
@@ -75,16 +80,318 @@ fn run_fixture_preserves_stdout_and_exit_code() {
 }
 
 #[test]
+fn aot_and_jit_share_process_argv_entrypoint_parity() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        r#"process.stdout.write(process.argv[0] + "\n");
+process.stdout.write(process.argv[1] + "\n");
+process.stdout.write(process.argv[2] + "\n");
+process.stdout.write(process.argv[3] + "\n");
+process.stdout.write(process.env.BAMTS_AOT_ENTRYPOINT === undefined ? "hidden\n" : "leaked\n");
+"#,
+    );
+
+    let jit = project
+        .command()
+        .env_remove("BAMTS_AOT_ENTRYPOINT")
+        .args(["run", "--target", "jit", "main.ts", "--", "first", "second"])
+        .current_dir(&project.path)
+        .output()
+        .expect("bamts JIT argv program starts");
+    assert_success(&jit, "bamts JIT argv program");
+
+    let aot = project
+        .command()
+        .env_remove("BAMTS_AOT_ENTRYPOINT")
+        .args(["run", "--target", "aot", "main.ts", "--", "first", "second"])
+        .current_dir(&project.path)
+        .output()
+        .expect("bamts AOT argv program starts");
+    assert_success(&aot, "bamts AOT argv program");
+
+    assert_eq!(jit.stdout, b"bamts\nmain.ts\nfirst\nsecond\nhidden\n");
+    assert_eq!(aot.stdout, jit.stdout);
+}
+
+#[test]
+fn aot_and_jit_execute_non_decimal_bigint_literals() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        r#"const hex = 0x100000000000000000000000000000001n;
+const octal = 0o20n;
+const binary = 0b1_0000n;
+if (
+    hex !== 340282366920938463463374607431768211457n ||
+    octal !== 16n ||
+    binary !== 16n
+) {
+    throw "non-decimal BigInt mismatch";
+}
+process.stdout.write("ok\n");
+"#,
+    );
+
+    let jit = project
+        .command()
+        .args(["run", "--target", "jit", "main.ts"])
+        .current_dir(&project.path)
+        .output()
+        .expect("bamts JIT BigInt program starts");
+    assert_success(&jit, "bamts JIT BigInt program");
+
+    let aot = project
+        .command()
+        .args(["run", "--target", "aot", "main.ts"])
+        .current_dir(&project.path)
+        .output()
+        .expect("bamts AOT BigInt program starts");
+    assert_success(&aot, "bamts AOT BigInt program");
+
+    assert_eq!(jit.stdout, b"ok\n");
+    assert_eq!(aot.stdout, jit.stdout);
+}
+
+#[test]
+fn aot_and_jit_execute_classic_script_dynamic_imports() {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", CLASSIC_DYNAMIC_IMPORT_PROGRAM);
+
+    let jit = project
+        .command()
+        .args(["run", "--target", "jit", "main.ts"])
+        .current_dir(&project.path)
+        .output()
+        .expect("bamts JIT classic dynamic import program starts");
+    assert_success(&jit, "bamts JIT classic dynamic import program");
+
+    let aot = project
+        .command()
+        .args(["run", "--target", "aot", "main.ts"])
+        .current_dir(&project.path)
+        .output()
+        .expect("bamts AOT classic dynamic import program starts");
+    assert_success(&aot, "bamts AOT classic dynamic import program");
+
+    assert_eq!(jit.stdout, b"function\n");
+    assert_eq!(aot.stdout, jit.stdout);
+}
+
+#[test]
+fn aot_and_jit_run_all_nested_finally_completions() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        r#"const trace: string[] = [];
+function returnProbe(): number {
+    try {
+        try { return 7; } finally { trace.push("return-inner"); }
+    } finally {
+        trace.push("return-outer");
+    }
+}
+trace.push("return:" + returnProbe());
+try {
+    try {
+        try { throw "boom"; } finally { trace.push("throw-inner"); }
+    } finally {
+        trace.push("throw-outer");
+    }
+} catch (error) {
+    trace.push("catch:" + error);
+}
+for (;;) {
+    try {
+        try { trace.push("break-body"); break; } finally { trace.push("break-inner"); }
+    } finally {
+        trace.push("break-outer");
+    }
+}
+for (let i = 0; i < 2; i++) {
+    try {
+        try { trace.push("continue-body:" + i); continue; }
+        finally { trace.push("continue-inner:" + i); }
+    } finally {
+        trace.push("continue-outer:" + i);
+    }
+}
+process.stdout.write(trace.join(",") + "\n");
+"#,
+    );
+
+    let expected = b"return-inner,return-outer,return:7,throw-inner,throw-outer,catch:boom,\
+break-body,break-inner,break-outer,continue-body:0,continue-inner:0,continue-outer:0,\
+continue-body:1,continue-inner:1,continue-outer:1\n";
+    for target in ["jit", "aot"] {
+        let output = project
+            .command()
+            .args(["run", "--target", target, "main.ts"])
+            .current_dir(&project.path)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("bamts {target} nested-finally program starts: {error}")
+            });
+        assert_success(&output, &format!("bamts {target} nested-finally program"));
+        assert_eq!(output.stdout, expected, "{target}");
+    }
+}
+
+#[test]
+fn aot_and_jit_run_labeled_control_flow() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        r#"const trace: string[] = [];
+block: {
+    trace.push("block");
+    break block;
+    trace.push("bad-block");
+}
+trace.push("after-block");
+let visits = 0;
+first: second: for (let i = 0; i < 3; i++) {
+    visits++;
+    if (i < 2) continue first;
+    trace.push("loop:" + i);
+}
+trace.push("visits:" + visits);
+exit: {
+    try {
+        try { trace.push("break-body"); break exit; }
+        finally { trace.push("break-inner"); }
+    } finally {
+        trace.push("break-outer");
+    }
+    trace.push("bad-exit");
+}
+outer: for (let i = 0; i < 2; i++) {
+    try {
+        try { trace.push("continue-body:" + i); continue outer; }
+        finally { trace.push("continue-inner:" + i); }
+    } finally {
+        trace.push("continue-outer:" + i);
+    }
+}
+crossed: for (let i = 0; i < 2; i++) {
+    try {
+        for (let j = 0; j < 2; j++) {
+            try { break crossed; } finally { trace.push("crossed-inner:" + i); }
+        }
+        trace.push("bad-crossed:" + i);
+    } finally {
+        trace.push("crossed-outer:" + i);
+    }
+}
+choice: switch (1) {
+    case 1: trace.push("switch"); break choice;
+    default: trace.push("bad-switch");
+}
+process.stdout.write(trace.join(",") + "\n");
+"#,
+    );
+
+    let expected = b"block,after-block,loop:2,visits:3,break-body,break-inner,break-outer,\
+continue-body:0,continue-inner:0,continue-outer:0,continue-body:1,continue-inner:1,\
+continue-outer:1,crossed-inner:0,crossed-outer:0,switch\n";
+    for target in ["jit", "aot"] {
+        let output = project
+            .command()
+            .args(["run", "--target", target, "main.ts"])
+            .current_dir(&project.path)
+            .output()
+            .unwrap_or_else(|error| panic!("bamts {target} labeled program starts: {error}"));
+        assert_success(&output, &format!("bamts {target} labeled program"));
+        assert_eq!(output.stdout, expected, "{target}");
+    }
+}
+
+#[test]
+fn aot_and_jit_close_iterators_after_finally_and_preserve_body_throw() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        r#"const trace: string[] = [];
+const iterable = {
+    [Symbol.iterator]() {
+        return {
+            next() { return { value: 1, done: false }; },
+            return() {
+                trace.push("return()");
+                throw "close-error";
+            },
+        };
+    },
+};
+try {
+    for (const value of iterable) {
+        try {
+            trace.push("body:" + value);
+            throw "body-error";
+        } finally {
+            trace.push("finally");
+        }
+    }
+} catch (error) {
+    trace.push("catch:" + error);
+}
+process.stdout.write(trace.join(",") + "\n");
+"#,
+    );
+
+    let expected = b"body:1,finally,return(),catch:body-error\n";
+    for target in ["jit", "aot"] {
+        let output = project
+            .command()
+            .args(["run", "--target", target, "main.ts"])
+            .current_dir(&project.path)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("bamts {target} iterator-close ordering program starts: {error}")
+            });
+        assert_success(
+            &output,
+            &format!("bamts {target} iterator-close ordering program"),
+        );
+        assert_eq!(output.stdout, expected, "{target}");
+    }
+}
+
+#[test]
+fn aot_and_jit_share_escaped_identifier_identity() {
+    let project = ScratchDirectory::new();
+    project.write("dependency.ts", "export const \\u0076alue = 41;\n");
+    project.write(
+        "main.ts",
+        r#"import { value as \u0061lias } from "./dependency.ts";
+const increment = (\u{0000006e}: number) => n + 1;
+process.stdout.write(String(increment(alias)) + "\n");
+"#,
+    );
+
+    for target in ["jit", "aot"] {
+        let output = project
+            .command()
+            .args(["run", "--target", target, "main.ts"])
+            .current_dir(&project.path)
+            .output()
+            .unwrap_or_else(|error| panic!("bamts {target} escaped-name program starts: {error}"));
+        assert_success(&output, &format!("bamts {target} escaped-name program"));
+        assert_eq!(output.stdout, b"42\n", "{target}");
+    }
+}
+
+#[test]
 fn aot_fixture_matches_jit_stdout_and_exit_code() {
     let directory = ScratchDirectory::new();
     let executable = directory
         .path
         .join(format!("hello{}", std::env::consts::EXE_SUFFIX));
-    let compile = Command::new(bamts_binary())
+    let compile = directory
+        .command()
         .args(["compile", "--target", "aot", "--output"])
         .arg(&executable)
         .arg(fixture())
-        .env("BAMTS_CACHE_DIR", directory.path.join("cache"))
         .output()
         .expect("bamts compile starts");
     assert_success(&compile, "bamts compile --target aot");
@@ -105,7 +412,8 @@ fn jit_runs_two_module_program_with_live_imported_mutation() {
         "import { value } from './dependency.js'; console.log(value);\n",
     );
 
-    let output = Command::new(bamts_binary())
+    let output = project
+        .command()
         .args(["run", "--target", "jit", "main.ts"])
         .current_dir(&project.path)
         .output()
@@ -127,12 +435,12 @@ fn aot_runs_two_module_program_with_live_imported_mutation() {
         .path
         .join(format!("two-module{}", std::env::consts::EXE_SUFFIX));
 
-    let compile = Command::new(bamts_binary())
+    let compile = project
+        .command()
         .args(["compile", "--target", "aot", "--output"])
         .arg(&executable)
         .arg("main.ts")
         .current_dir(&project.path)
-        .env("BAMTS_CACHE_DIR", project.path.join("cache"))
         .output()
         .expect("bamts AOT compile starts");
     assert_success(&compile, "bamts compile two-module AOT");
@@ -149,7 +457,8 @@ fn jit_preserves_lone_surrogates_end_to_end() {
     let project = ScratchDirectory::new();
     project.write("main.ts", UTF16_PROGRAM);
 
-    let output = Command::new(bamts_binary())
+    let output = project
+        .command()
         .args(["run", "--target", "jit", "main.ts"])
         .current_dir(&project.path)
         .output()
@@ -167,12 +476,12 @@ fn aot_preserves_lone_surrogates_end_to_end() {
         .path
         .join(format!("utf16{}", std::env::consts::EXE_SUFFIX));
 
-    let compile = Command::new(bamts_binary())
+    let compile = project
+        .command()
         .args(["compile", "--target", "aot", "--output"])
         .arg(&executable)
         .arg("main.ts")
         .current_dir(&project.path)
-        .env("BAMTS_CACHE_DIR", project.path.join("cache"))
         .output()
         .expect("bamts AOT compile starts");
     assert_success(&compile, "bamts compile UTF-16 AOT");
@@ -189,7 +498,8 @@ fn jit_supports_apply_and_bound_callables() {
     let project = ScratchDirectory::new();
     project.write("main.ts", CALLABLE_PROGRAM);
 
-    let output = Command::new(bamts_binary())
+    let output = project
+        .command()
         .args(["run", "--target", "jit", "main.ts"])
         .current_dir(&project.path)
         .output()
@@ -207,12 +517,12 @@ fn aot_supports_apply_and_bound_callables() {
         .path
         .join(format!("callable{}", std::env::consts::EXE_SUFFIX));
 
-    let compile = Command::new(bamts_binary())
+    let compile = project
+        .command()
         .args(["compile", "--target", "aot", "--output"])
         .arg(&executable)
         .arg("main.ts")
         .current_dir(&project.path)
-        .env("BAMTS_CACHE_DIR", project.path.join("cache"))
         .output()
         .expect("bamts callable AOT compile starts");
     assert_success(&compile, "bamts compile callable AOT");
@@ -232,12 +542,12 @@ fn aot_runs_node_vm_in_new_context() {
         .path
         .join(format!("node-vm{}", std::env::consts::EXE_SUFFIX));
 
-    let compile = Command::new(bamts_binary())
+    let compile = project
+        .command()
         .args(["compile", "--target", "aot", "--output"])
         .arg(&executable)
         .arg("main.ts")
         .current_dir(&project.path)
-        .env("BAMTS_CACHE_DIR", project.path.join("cache"))
         .output()
         .expect("bamts node:vm AOT compile starts");
     assert_success(&compile, "bamts compile node:vm AOT");
@@ -252,6 +562,49 @@ fn aot_runs_node_vm_in_new_context() {
         stderr(&output)
     );
     assert_eq!(output.stdout, b"2\nobject\n");
+}
+
+#[test]
+fn jit_runs_external_import_equals_with_one_binding() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        r#"import util = require('node:util');
+process.stdout.write(String(typeof util.parseArgs) + "\n");
+"#,
+    );
+
+    let output = project
+        .command()
+        .args(["run", "--target", "jit", "main.ts"])
+        .current_dir(&project.path)
+        .output()
+        .expect("bamts JIT import-equals run starts");
+
+    assert_success(&output, "bamts JIT import-equals run");
+    assert_eq!(output.stdout, b"function\n");
+}
+
+#[test]
+fn jit_runs_local_commonjs_style_import_equals_with_one_binding() {
+    let project = ScratchDirectory::new();
+    project.write("dependency.ts", "export const value = 41;\n");
+    project.write(
+        "main.ts",
+        r#"import dependency = require('./dependency.js');
+process.stdout.write(String(dependency.value + 1) + "\n");
+"#,
+    );
+
+    let output = project
+        .command()
+        .args(["run", "--target", "jit", "main.ts"])
+        .current_dir(&project.path)
+        .output()
+        .expect("bamts JIT local import-equals run starts");
+
+    assert_success(&output, "bamts JIT local import-equals run");
+    assert_eq!(output.stdout, b"42\n");
 }
 
 #[test]
@@ -385,8 +738,14 @@ impl ScratchDirectory {
         fs::write(path, source).expect("fixture source is written");
     }
 
+    fn command(&self) -> Command {
+        let mut command = Command::new(bamts_binary());
+        command.env("BAMTS_CACHE_DIR", self.path.join("cache"));
+        command
+    }
+
     fn check(&self, entrypoint: &str) -> Output {
-        Command::new(bamts_binary())
+        self.command()
             .args(["check", "--diagnostics-format", "text", entrypoint])
             .current_dir(&self.path)
             .output()
@@ -394,7 +753,7 @@ impl ScratchDirectory {
     }
 
     fn check_from(&self, directory: &str, entrypoint: &str) -> Output {
-        Command::new(bamts_binary())
+        self.command()
             .args(["check", "--diagnostics-format", "text", entrypoint])
             .current_dir(self.path.join(directory))
             .output()

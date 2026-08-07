@@ -207,7 +207,7 @@ fn run_in_this_context<H: Host>(
         ScriptAllocation::Call
     };
     let entry = compile_entry(machine, code, name, allocation)?;
-    call_entry(machine, entry, prototype)
+    call_entry(machine, entry, prototype, None)
 }
 
 fn run_in_new_context<H: Host>(
@@ -228,17 +228,22 @@ fn run_in_new_context<H: Host>(
     } else {
         None
     };
-    let context = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-    if context != Value::UNDEFINED {
-        if !machine.is_object(context) || machine.is_callable(context)? {
+    let context = match args.get(1).copied().unwrap_or(Value::UNDEFINED) {
+        Value::UNDEFINED => machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .map_err(EvalFailure::Runtime)?,
+        context if machine.is_object(context) => context,
+        _ => {
             return Err(type_error(
                 "The \"contextObject\" argument must be an object",
             ));
         }
-        return Err(type_error(
-            "runInNewContext context objects are unsupported",
-        ));
-    }
+    };
     let code = args.first().copied().unwrap_or(Value::UNDEFINED);
     let options = args.get(2).copied().unwrap_or(Value::UNDEFINED);
     let (code, name) = source_arguments(machine, code, options)?;
@@ -248,7 +253,7 @@ fn run_in_new_context<H: Host>(
         ScriptAllocation::Call
     };
     let entry = compile_entry(machine, code, name, allocation)?;
-    call_entry(machine, entry, prototype)
+    call_entry(machine, entry, prototype, Some(context))
 }
 
 fn script_run_in_this_context<H: Host>(
@@ -275,12 +280,12 @@ fn script_run_in_this_context<H: Host>(
             "Script.prototype.runInThisContext called on incompatible receiver",
         ));
     };
-    let HeapEntry::Script { entry, .. } = &machine.heap[index] else {
+    let HeapEntry::Script { entry, .. } = machine.heap[index] else {
         return Err(type_error(
             "Script.prototype.runInThisContext called on incompatible receiver",
         ));
     };
-    call_entry(machine, *entry, None)
+    call_entry(machine, entry, None, None)
 }
 
 fn source_arguments<H: Host>(
@@ -370,27 +375,30 @@ fn script_prototype<H: Host>(machine: &Machine<'_, H>) -> Value {
 }
 
 fn call_entry<H: Host>(
-    machine: &Machine<'_, H>,
+    machine: &mut Machine<'_, H>,
     entry: Value,
     prototype: Option<Value>,
+    context: Option<Value>,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let this_value = machine
-        .intrinsics
-        .global("globalThis")
-        .expect("host objects install globalThis");
-    Ok(match prototype {
-        Some(prototype) => BuiltinOutcome::ConstructCall {
-            callee: entry,
-            this_value,
-            arguments: Vec::new(),
-            prototype,
-        },
-        None => BuiltinOutcome::Call {
-            callee: entry,
-            this_value,
-            arguments: Vec::new(),
-        },
-    })
+    let this_value = context.unwrap_or_else(|| {
+        machine
+            .intrinsics
+            .global("globalThis")
+            .expect("host objects install globalThis")
+    });
+    let previous = std::mem::replace(&mut machine.context_global, context);
+    let result = machine.call_value(entry, this_value, &[]);
+    machine.context_global = previous;
+    let result = result?;
+    if let Some(prototype) = prototype
+        && !machine.is_object(result)
+    {
+        return machine
+            .allocate_constructed_receiver_with(prototype)
+            .map(BuiltinOutcome::Value)
+            .map_err(EvalFailure::Runtime);
+    }
+    Ok(BuiltinOutcome::Value(result))
 }
 
 #[cfg(test)]
@@ -685,26 +693,12 @@ mod tests {
                 extensible: true,
             })
             .unwrap();
-        assert!(matches!(
-            machine.call_value(run, Value::UNDEFINED, &[source, context]),
-            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
-        ));
         assert_eq!(
             machine
-                .host
-                .compiler
-                .as_ref()
-                .expect("compiler remains installed")
-                .sources
-                .len(),
-            1
-        );
-        assert!(matches!(
-            machine
-                .call_builtin(builtin_id(&machine, run), Value::UNDEFINED, &[source], true)
+                .call_value(run, Value::UNDEFINED, &[source, context])
                 .unwrap(),
-            BuiltinOutcome::ConstructCall { .. }
-        ));
+            Value::int32(42)
+        );
         assert_eq!(
             machine
                 .host
@@ -714,6 +708,24 @@ mod tests {
                 .sources
                 .len(),
             2
+        );
+        let BuiltinOutcome::Value(constructed) = machine
+            .call_builtin(builtin_id(&machine, run), Value::UNDEFINED, &[source], true)
+            .unwrap()
+        else {
+            panic!("constructed runInNewContext returns a value");
+        };
+        assert!(machine.is_object(constructed));
+        assert_ne!(constructed, Value::int32(42));
+        assert_eq!(
+            machine
+                .host
+                .compiler
+                .as_ref()
+                .expect("compiler remains installed")
+                .sources
+                .len(),
+            3
         );
     }
 
@@ -734,8 +746,8 @@ mod tests {
         {
             BuiltinOutcome::Value(script) => script,
             BuiltinOutcome::Call { .. }
-            | BuiltinOutcome::ConstructCall { .. }
-            | BuiltinOutcome::GeneratorNext { .. } => {
+            | BuiltinOutcome::GeneratorNext { .. }
+            | BuiltinOutcome::AsyncGeneratorNext { .. } => {
                 panic!("Script construction must not execute")
             }
         };
@@ -999,8 +1011,8 @@ mod tests {
         {
             BuiltinOutcome::Value(script) => script,
             BuiltinOutcome::Call { .. }
-            | BuiltinOutcome::ConstructCall { .. }
-            | BuiltinOutcome::GeneratorNext { .. } => unreachable!(),
+            | BuiltinOutcome::GeneratorNext { .. }
+            | BuiltinOutcome::AsyncGeneratorNext { .. } => unreachable!(),
         };
         let run = machine
             .get_named_property(script, "runInThisContext")

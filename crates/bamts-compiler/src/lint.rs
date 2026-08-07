@@ -354,7 +354,7 @@ macro_rules! rule {
 }
 
 /// The single authoritative identity and default-level registry for all BamTS rules.
-pub static RULES: [RuleDefinition; 86] = [
+pub static RULES: [RuleDefinition; 88] = [
     rule!(
         "BAMTS-W001",
         "method-parameter-bivariance",
@@ -638,7 +638,7 @@ pub static RULES: [RuleDefinition; 86] = [
         Warn,
         "Legacy decorators have semantics that differ from standard ECMAScript decorators.",
         "Use standard decorators or an explicit wrapper.",
-        examples!("@sealed class C {}", "const safe: number = 1;")
+        examples!("class C { m(@dec p: number) {} }", "class C { m(p: number) {} }")
     ),
     rule!(
         "BAMTS-W027",
@@ -1391,15 +1391,33 @@ pub static RULES: [RuleDefinition; 86] = [
             RuleExampleCase::Program(&[
                 RuleExampleSource::new(
                     ScriptKind::TypeScript,
-                    "import { helper } from './legacy.js'; helper();"
+                    "import { helper, other, third } from './legacy.js'; helper(); void other; void third;"
                 )
                 .resolving_to(1),
                 RuleExampleSource::new(
                     ScriptKind::JavaScript,
-                    "function helper() {} module.exports = { helper };"
+                    "const other = 1; module.exports = { other, helper() { return 42; } }; module.exports.third = 3;"
                 )
             ])
         )
+    ),
+    rule!(
+        "BAMTS-W087",
+        "no-debugger",
+        Opinionated,
+        Allow,
+        "A debugger statement halts execution when developer tools are attached.",
+        "Remove the statement before shipping or use a deliberate diagnostic mechanism.",
+        examples!("debugger;", "void 0;")
+    ),
+    rule!(
+        "BAMTS-W088",
+        "no-with",
+        JavaScriptCompatibility,
+        Deny,
+        "A with statement changes name resolution based on dynamic scope.",
+        "Access the object explicitly instead of changing the scope chain.",
+        examples!(JavaScript, "with (obj) body;", "obj.body;")
     ),
 ];
 
@@ -1865,7 +1883,10 @@ impl LintTable {
         if dialect == SourceDialect::TypeScript {
             return self.level(rule);
         }
-        let spec_footgun = matches!(
+        if rule.code() == "BAMTS-W085" {
+            return self.level(rule);
+        }
+        let javascript_rule = matches!(
             rule.code(),
             "BAMTS-W071"
                 | "BAMTS-W072"
@@ -1877,11 +1898,13 @@ impl LintTable {
                 | "BAMTS-W078"
                 | "BAMTS-W079"
                 | "BAMTS-W080"
+                | "BAMTS-W087"
         );
         let control_flow = RULES[rule_index(rule)].group() == RuleGroup::ControlFlow;
-        let javascript_compatibility =
-            RULES[rule_index(rule)].group() == RuleGroup::JavaScriptCompatibility;
-        if spec_footgun || control_flow || javascript_compatibility {
+        let javascript_compatibility = RULES[rule_index(rule)].group()
+            == RuleGroup::JavaScriptCompatibility
+            && rule.code() != "BAMTS-W085";
+        if javascript_rule || control_flow || javascript_compatibility {
             let effective = self.level(rule);
             return if effective == LintLevel::Allow {
                 LintLevel::Allow
@@ -2095,7 +2118,7 @@ mod tests {
 
     #[test]
     fn registry_is_complete_and_unique() {
-        assert_eq!(RULES.len(), 86);
+        assert_eq!(RULES.len(), 88);
         for (index, rule) in RULES.iter().enumerate() {
             assert!(rule.code().starts_with("BAMTS-W"));
             assert!(!rule.slug().is_empty());
@@ -2271,7 +2294,7 @@ mod tests {
     }
 
     #[test]
-    fn javascript_dialect_preserves_allow_and_clamps_enabled_rules_to_warning() {
+    fn javascript_dialect_preserves_syntax_rejection_and_clamps_runtime_footguns() {
         let table = LintTable::new(LintProfile::Pedantic);
         assert_eq!(
             table.level_for_source(
@@ -2293,7 +2316,7 @@ mod tests {
                 rule("javascript-syntax-rejection"),
                 SourceDialect::JavaScript
             ),
-            LintLevel::Warn
+            LintLevel::Deny
         );
         assert_eq!(
             LintTable::new(LintProfile::Default)

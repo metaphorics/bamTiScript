@@ -238,7 +238,7 @@ pub(super) fn match_array<H: Host>(
 }
 
 pub(super) fn slice_units(input: &EcmaString, range: Range<usize>) -> EcmaString {
-    input.slice_units(range)
+    input.slice_units(range).unwrap_or_default()
 }
 fn index_value(value: Value) -> usize {
     match value.decode() {
@@ -292,41 +292,9 @@ mod tests {
         ModuleId, Program, ProgramModule, Register, Verified,
     };
 
+    use super::super::test_support::{TestHost, blank_program};
     use super::*;
     use crate::Limits;
-
-    #[derive(Default)]
-    struct TestHost;
-    impl Host for TestHost {}
-
-    fn module() -> Program<Verified> {
-        let code = Module::new(
-            vec![Constant::String(EcmaString::from_utf8("<test>"))],
-            vec![Function::new(
-                None,
-                0,
-                0,
-                1,
-                FunctionFlags::default(),
-                vec![Instruction::Halt],
-                Vec::new(),
-            )],
-            FunctionId::new(0),
-        )
-        .verify()
-        .expect("valid test module");
-        Program::link(
-            vec![ProgramModule {
-                name: ConstantId::new(0),
-                code,
-                edges: Vec::new(),
-                bindings: Vec::new(),
-                exports: Vec::new(),
-            }],
-            ModuleId::new(0),
-        )
-        .expect("valid test program")
-    }
 
     fn construct_regexp(machine: &mut Machine<'_, TestHost>, pattern: &str, flags: &str) -> Value {
         let constructor = machine.intrinsics.global("RegExp").expect("RegExp exists");
@@ -355,7 +323,7 @@ mod tests {
 
     #[test]
     fn sticky_last_index_is_a_utf16_code_unit_offset() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let regexp = construct_regexp(&mut machine, "x", "y");
@@ -376,7 +344,7 @@ mod tests {
 
     #[test]
     fn exec_index_after_astral_prefix_is_a_code_unit_offset() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let regexp = construct_regexp(&mut machine, "x", "");
@@ -393,7 +361,7 @@ mod tests {
 
     #[test]
     fn source_escapes_solidus_and_line_terminator() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
 
@@ -477,7 +445,7 @@ mod tests {
 
     #[test]
     fn source_and_to_string_preserve_rou3_character_class_solidus() {
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
 
@@ -496,7 +464,10 @@ mod tests {
         ] {
             let regexp = construct_regexp(&mut machine, pattern, "");
             let source_value = machine.get_named_property(regexp, "source").unwrap();
-            assert_eq!(machine.to_string(source_value).unwrap(), EcmaString::from_utf8(source));
+            assert_eq!(
+                machine.to_string(source_value).unwrap(),
+                EcmaString::from_utf8(source)
+            );
 
             let BuiltinOutcome::Value(string_value) =
                 to_string(&mut machine, regexp, &[], false).unwrap()
@@ -538,7 +509,7 @@ mod tests {
         // The ASCII fast path (`get_named_property` -> `own_get_ascii`) hits the
         // other source fallback on a `CreateRegExp`-shaped RegExp (empty own
         // properties), confirming both read paths share one canonicalizer.
-        let module = module();
+        let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let regexp = machine

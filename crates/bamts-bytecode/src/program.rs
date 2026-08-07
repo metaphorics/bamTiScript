@@ -11,7 +11,7 @@ use crate::{
 /// `BMTPC\0\0\1`: the canonical whole-program container, distinct from module magic.
 pub const PROGRAM_MAGIC: [u8; 8] = [66, 77, 84, 80, 67, 0, 0, 1];
 /// The sole supported program-envelope version.
-pub const PROGRAM_VERSION: u8 = 3;
+pub const PROGRAM_VERSION: u8 = 4;
 
 index_type!(
     /// Index of a module within a program.
@@ -434,6 +434,7 @@ pub enum ProgramDecodeErrorKind {
         limit: u64,
         actual: u64,
     },
+    AllocationFailed,
     Module {
         module: ModuleId,
         error: DecodeError,
@@ -485,6 +486,9 @@ impl fmt::Display for ProgramDecodeError {
                 actual,
             } => {
                 write!(formatter, "{field} value {actual} exceeds limit {limit}")
+            }
+            ProgramDecodeErrorKind::AllocationFailed => {
+                formatter.write_str("failed to reserve decode buffer")
             }
             ProgramDecodeErrorKind::Module { module, error } => {
                 write!(formatter, "module {}: {error}", module.get())
@@ -589,6 +593,10 @@ pub enum ProgramVerifyErrorKind {
     },
     StaticBindingRequiresStaticEdge {
         binding: BindingId,
+        edge: EdgeId,
+    },
+    IndirectExportRequiresStaticEdge {
+        export: u32,
         edge: EdgeId,
     },
     MissingImportedExport {
@@ -719,9 +727,10 @@ pub fn decode_program(
     }
     let entry = ModuleId::new(decoder.u32()?);
     let module_count = decoder.count("modules", limits.max_modules)?;
-    let mut modules = Vec::with_capacity(module_count);
+    let mut modules = Vec::new();
     for index in 0..module_count {
-        modules.push(decoder.module(ModuleId::new(index as u32))?);
+        let module = decoder.module(ModuleId::new(index as u32))?;
+        decoder.push_decoded(&mut modules, module)?;
     }
     if decoder.offset != bytes.len() {
         return Err(decoder.error(ProgramDecodeErrorKind::TrailingBytes {
@@ -791,7 +800,7 @@ impl<'a> ProgramDecoder<'a> {
             self.limits.max_total_edges,
             Total::Edges,
         )?;
-        let mut edges = Vec::with_capacity(edge_count);
+        let mut edges = Vec::new();
         for _ in 0..edge_count {
             let specifier = ConstantId::new(self.u32()?);
             let tag_at = self.offset;
@@ -815,11 +824,14 @@ impl<'a> ProgramDecoder<'a> {
                     );
                 }
             };
-            edges.push(Edge {
-                specifier,
-                target,
-                kind,
-            });
+            self.push_decoded(
+                &mut edges,
+                Edge {
+                    specifier,
+                    target,
+                    kind,
+                },
+            )?;
         }
 
         let binding_count = self.count("bindings", self.limits.max_bindings_per_module)?;
@@ -829,7 +841,7 @@ impl<'a> ProgramDecoder<'a> {
             self.limits.max_total_bindings,
             Total::Bindings,
         )?;
-        let mut bindings = Vec::with_capacity(binding_count);
+        let mut bindings = Vec::new();
         for _ in 0..binding_count {
             let name = ConstantId::new(self.u32()?);
             let tag_at = self.offset;
@@ -849,7 +861,7 @@ impl<'a> ProgramDecoder<'a> {
                     );
                 }
             };
-            bindings.push(Binding { name, kind });
+            self.push_decoded(&mut bindings, Binding { name, kind })?;
         }
 
         let export_count = self.count("exports", self.limits.max_exports_per_module)?;
@@ -859,7 +871,7 @@ impl<'a> ProgramDecoder<'a> {
             self.limits.max_total_exports,
             Total::Exports,
         )?;
-        let mut exports = Vec::with_capacity(export_count);
+        let mut exports = Vec::new();
         for _ in 0..export_count {
             let name = ConstantId::new(self.u32()?);
             let tag_at = self.offset;
@@ -875,7 +887,7 @@ impl<'a> ProgramDecoder<'a> {
                     );
                 }
             };
-            exports.push(Export { name, source });
+            self.push_decoded(&mut exports, Export { name, source })?;
         }
         Ok(ProgramModule {
             name,
@@ -922,6 +934,14 @@ impl<'a> ProgramDecoder<'a> {
             }));
         }
         Ok(actual as usize)
+    }
+
+    fn push_decoded<T>(&self, values: &mut Vec<T>, value: T) -> Result<(), ProgramDecodeError> {
+        values
+            .try_reserve(1)
+            .map_err(|_| self.error(ProgramDecodeErrorKind::AllocationFailed))?;
+        values.push(value);
+        Ok(())
     }
 
     fn length(&mut self, field: &'static str, limit: usize) -> Result<usize, ProgramDecodeError> {
@@ -1223,10 +1243,19 @@ fn verify_module_metadata(
                 }
             }
             ExportSource::Indirect { edge, name } => {
-                if edge.get() as usize >= module.edges.len() {
-                    return Err(module_error(
+                let dependency = module.edges.get(edge.get() as usize).ok_or_else(|| {
+                    module_error(
                         module_id,
                         ProgramVerifyErrorKind::ExportEdgeOutOfBounds {
+                            export: export_id,
+                            edge,
+                        },
+                    )
+                })?;
+                if !dependency.kind.has_static() {
+                    return Err(module_error(
+                        module_id,
+                        ProgramVerifyErrorKind::IndirectExportRequiresStaticEdge {
                             export: export_id,
                             edge,
                         },
@@ -1706,6 +1735,19 @@ mod tests {
     }
 
     #[test]
+    fn version_three_programs_are_rejected() {
+        let mut encoded = PROGRAM_MAGIC.to_vec();
+        encoded.push(3);
+        assert!(matches!(
+            decode_program(&encoded, &ProgramDecodeLimits::default()),
+            Err(ProgramDecodeError {
+                kind: ProgramDecodeErrorKind::UnsupportedVersion { version: 3 },
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn canonical_edge_kind_tags_and_version_round_trip() {
         let mut module = program_module("main");
         module.edges = vec![
@@ -1851,6 +1893,45 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn hostile_tiny_envelope_rejects_large_edge_count_before_allocation() {
+        let code = verified_module("main", &["x"]);
+        let mut bytes = raw_module_prefix(&code);
+        write_u32(u32::MAX, &mut bytes);
+        let limits = ProgramDecodeLimits {
+            max_edges_per_module: u32::MAX,
+            max_total_edges: u32::MAX,
+            ..ProgramDecodeLimits::default()
+        };
+        assert!(matches!(
+            decode_program(&bytes, &limits),
+            Err(ProgramDecodeError {
+                kind: ProgramDecodeErrorKind::UnexpectedEof,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn hostile_tiny_envelope_rejects_large_binding_count_before_allocation() {
+        let code = verified_module("main", &["x"]);
+        let mut bytes = raw_module_prefix(&code);
+        write_u32(0, &mut bytes);
+        write_u32(u32::MAX, &mut bytes);
+        let limits = ProgramDecodeLimits {
+            max_bindings_per_module: u32::MAX,
+            max_total_bindings: u32::MAX,
+            ..ProgramDecodeLimits::default()
+        };
+        assert!(matches!(
+            decode_program(&bytes, &limits),
+            Err(ProgramDecodeError {
+                kind: ProgramDecodeErrorKind::UnexpectedEof,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2232,6 +2313,27 @@ mod tests {
     }
 
     #[test]
+    fn indirect_exports_require_static_edges() {
+        let mut module = program_module("main");
+        module.edges.push(Edge {
+            specifier: ConstantId::new(2),
+            target: EdgeTarget::External,
+            kind: EdgeKind::Dynamic,
+        });
+        module.exports[0].source = ExportSource::Indirect {
+            edge: EdgeId::new(0),
+            name: ConstantId::new(1),
+        };
+
+        assert!(matches!(
+            Program::link(vec![module], ModuleId::new(0))
+                .unwrap_err()
+                .kind,
+            ProgramVerifyErrorKind::IndirectExportRequiresStaticEdge { .. }
+        ));
+    }
+
+    #[test]
     fn export_cycles_and_missing_targets_are_rejected() {
         let mut left = program_module("left");
         let mut right = program_module("right");
@@ -2375,6 +2477,46 @@ mod tests {
                 .kind,
             ProgramVerifyErrorKind::DynamicImportMissingEdge { .. }
         ));
+    }
+
+    #[test]
+    fn runtime_dynamic_import_needs_no_linkage_edge() {
+        let code = Module::new(
+            vec![Constant::String(EcmaString::from_utf8("main"))],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                2,
+                FunctionFlags::default(),
+                vec![
+                    Instruction::LoadConst {
+                        dst: Register::new(0),
+                        constant: ConstantId::new(0),
+                    },
+                    Instruction::ImportDynamic {
+                        dst: Register::new(1),
+                        specifier: Register::new(0),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("runtime dynamic-import instruction verifies");
+        Program::link(
+            vec![ProgramModule {
+                name: ConstantId::new(0),
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect("runtime dynamic import has no static-edge requirement");
     }
 
     #[test]

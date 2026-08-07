@@ -23,13 +23,11 @@ pub(crate) enum BuiltinOutcome {
         this_value: Value,
         arguments: Vec<Value>,
     },
-    ConstructCall {
-        callee: Value,
-        this_value: Value,
-        arguments: Vec<Value>,
-        prototype: Value,
-    },
     GeneratorNext {
+        generator: Value,
+        resume_value: Value,
+    },
+    AsyncGeneratorNext {
         generator: Value,
         resume_value: Value,
     },
@@ -59,14 +57,20 @@ pub(crate) struct BuiltinTable<H: Host> {
     boolean_prototype: Value,
     error_prototypes: Vec<(BuiltinId, Value)>,
     symbol_iterator: Option<Value>,
+    symbol_async_iterator: Option<Value>,
     symbol_to_string_tag: Option<Value>,
+    symbol_species: Option<Value>,
+    symbol_dispose: Option<Value>,
+    symbol_async_dispose: Option<Value>,
+    symbol_unscopables: Option<Value>,
     symbol_prototype: Option<Value>,
     object_to_string: Option<Value>,
     regexp_prototype: Option<Value>,
     iterator_prototype: Option<Value>,
+    async_iterator_prototype: Option<Value>,
     generator_prototype: Option<Value>,
+    async_generator_prototype: Option<Value>,
     promise_resolver_targets: Option<(Value, Value)>,
-    promise_finally_targets: Option<(Value, Value)>,
     promise_all_targets: Option<(Value, Value)>,
     promise_prototype: Option<Value>,
     marker: PhantomData<fn() -> H>,
@@ -91,14 +95,20 @@ impl<H: Host> BuiltinTable<H> {
             boolean_prototype,
             error_prototypes: Vec::new(),
             symbol_iterator: None,
+            symbol_async_iterator: None,
             symbol_to_string_tag: None,
+            symbol_species: None,
+            symbol_dispose: None,
+            symbol_async_dispose: None,
+            symbol_unscopables: None,
             symbol_prototype: None,
             object_to_string: None,
             regexp_prototype: None,
             iterator_prototype: None,
+            async_iterator_prototype: None,
             generator_prototype: None,
+            async_generator_prototype: None,
             promise_resolver_targets: None,
-            promise_finally_targets: None,
             promise_all_targets: None,
             promise_prototype: None,
             marker: PhantomData,
@@ -149,6 +159,49 @@ impl<H: Host> BuiltinTable<H> {
         self.symbol_iterator.expect("Symbol builtins install first")
     }
 
+    pub(crate) fn set_symbol_async_iterator(&mut self, iterator: Value) {
+        self.symbol_async_iterator = Some(iterator);
+    }
+
+    pub(crate) fn symbol_async_iterator(&self) -> Value {
+        self.symbol_async_iterator
+            .expect("Symbol builtins install first")
+    }
+
+    pub(crate) fn set_symbol_dispose(&mut self, symbol: Value) {
+        self.symbol_dispose = Some(symbol);
+    }
+
+    pub(crate) fn symbol_dispose(&self) -> Value {
+        self.symbol_dispose.expect("Symbol builtins install first")
+    }
+
+    pub(crate) fn set_symbol_async_dispose(&mut self, symbol: Value) {
+        self.symbol_async_dispose = Some(symbol);
+    }
+
+    pub(crate) fn symbol_async_dispose(&self) -> Value {
+        self.symbol_async_dispose
+            .expect("Symbol builtins install first")
+    }
+
+    pub(crate) fn set_symbol_unscopables(&mut self, symbol: Value) {
+        self.symbol_unscopables = Some(symbol);
+    }
+
+    pub(crate) fn symbol_unscopables(&self) -> Value {
+        self.symbol_unscopables
+            .expect("Symbol builtins install first")
+    }
+
+    pub(crate) fn set_symbol_species(&mut self, symbol: Value) {
+        self.symbol_species = Some(symbol);
+    }
+
+    pub(crate) fn symbol_species(&self) -> Value {
+        self.symbol_species.expect("Symbol builtins install first")
+    }
+
     pub(crate) fn set_symbol_to_string_tag(&mut self, symbol: Value) {
         self.symbol_to_string_tag = Some(symbol);
     }
@@ -193,6 +246,15 @@ impl<H: Host> BuiltinTable<H> {
             .expect("iterator builtins install their prototype")
     }
 
+    pub(crate) fn set_async_iterator_prototype(&mut self, prototype: Value) {
+        self.async_iterator_prototype = Some(prototype);
+    }
+
+    pub(crate) fn async_iterator_prototype(&self) -> Value {
+        self.async_iterator_prototype
+            .expect("async iterator builtins install their prototype")
+    }
+
     pub(crate) fn set_generator_prototype(&mut self, prototype: Value) {
         self.generator_prototype = Some(prototype);
     }
@@ -200,6 +262,15 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn generator_prototype(&self) -> Value {
         self.generator_prototype
             .expect("generator builtins install their prototype")
+    }
+
+    pub(crate) fn set_async_generator_prototype(&mut self, prototype: Value) {
+        self.async_generator_prototype = Some(prototype);
+    }
+
+    pub(crate) fn async_generator_prototype(&self) -> Value {
+        self.async_generator_prototype
+            .expect("async generator builtins install their prototype")
     }
 
     pub(crate) fn set_promise_prototype(&mut self, prototype: Value) {
@@ -218,15 +289,6 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn promise_resolver_targets(&self) -> (Value, Value) {
         self.promise_resolver_targets
             .expect("Promise builtins install resolver targets")
-    }
-
-    pub(crate) fn set_promise_finally_targets(&mut self, fulfill: Value, reject: Value) {
-        self.promise_finally_targets = Some((fulfill, reject));
-    }
-
-    pub(crate) fn promise_finally_targets(&self) -> (Value, Value) {
-        self.promise_finally_targets
-            .expect("Promise builtins install finally targets")
     }
 
     pub(crate) fn set_promise_all_targets(&mut self, fulfill: Value, reject: Value) {
@@ -257,6 +319,22 @@ impl<H: Host> BuiltinTable<H> {
                 configurable: false,
             },
         );
+        let prototype_index = heap_index(prototype);
+        let constructor_property = crate::Property::Data {
+            value: constructor,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        };
+        match &mut heap[prototype_index] {
+            HeapEntry::Object { properties, .. } | HeapEntry::Array { properties, .. } => {
+                properties.insert(
+                    crate::PropertyKey::Named(EcmaString::from_utf8("constructor")),
+                    constructor_property,
+                );
+            }
+            _ => panic!("builtin prototype must be an ordinary object or array"),
+        }
     }
 
     pub(crate) fn set_function_prototype(
@@ -302,6 +380,46 @@ impl<H: Host> BuiltinTable<H> {
             .iter()
             .position(|definition| definition.name == name)
             .map(BuiltinId)
+    }
+    fn for_each_value(&self, mut visit: impl FnMut(Value)) {
+        visit(self.object_prototype);
+        visit(self.function_prototype);
+        visit(self.array_prototype);
+        visit(self.string_prototype);
+        visit(self.number_prototype);
+        visit(self.boolean_prototype);
+        for (_, value) in &self.error_prototypes {
+            visit(*value);
+        }
+        for value in [
+            self.symbol_iterator,
+            self.symbol_async_iterator,
+            self.symbol_to_string_tag,
+            self.symbol_species,
+            self.symbol_dispose,
+            self.symbol_async_dispose,
+            self.symbol_unscopables,
+            self.symbol_prototype,
+            self.object_to_string,
+            self.regexp_prototype,
+            self.iterator_prototype,
+            self.async_iterator_prototype,
+            self.generator_prototype,
+            self.async_generator_prototype,
+            self.promise_prototype,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            visit(value);
+        }
+        for (first, second) in [self.promise_resolver_targets, self.promise_all_targets]
+            .into_iter()
+            .flatten()
+        {
+            visit(first);
+            visit(second);
+        }
     }
 }
 
@@ -389,6 +507,18 @@ impl<H: Host> Intrinsics<H> {
     pub(crate) fn object_to_string(&self) -> Value {
         self.builtins.object_to_string()
     }
+    pub(crate) fn for_each_value(&self, mut visit: impl FnMut(Value)) {
+        for value in self.globals.values().chain(self.symbol_registry.values()) {
+            visit(*value);
+        }
+        visit(self.object_prototype);
+        visit(self.function_prototype);
+        visit(self.array_prototype);
+        visit(self.string_prototype);
+        visit(self.number_prototype);
+        visit(self.boolean_prototype);
+        self.builtins.for_each_value(visit);
+    }
 }
 
 fn ordinary_prototype(heap: &mut Vec<HeapEntry>, object_prototype: Value) -> Value {
@@ -462,10 +592,23 @@ impl<'a, H: Host> Machine<'a, H> {
         arguments: &[Value],
         constructing: bool,
     ) -> Result<BuiltinOutcome, EvalFailure> {
+        self.call_builtin_with_new_target(id, this_value, arguments, constructing, Value::UNDEFINED)
+    }
+
+    pub(crate) fn call_builtin_with_new_target(
+        &mut self,
+        id: BuiltinId,
+        this_value: Value,
+        arguments: &[Value],
+        constructing: bool,
+        new_target: Value,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
         let handler = self.intrinsics.builtins.get(id).handler;
-        let previous = self.current_builtin_id.replace(id);
+        let previous_id = self.current_builtin_id.replace(id);
+        let previous_new_target = std::mem::replace(&mut self.current_new_target, new_target);
         let outcome = handler(self, this_value, arguments, constructing);
-        self.current_builtin_id = previous;
+        self.current_builtin_id = previous_id;
+        self.current_new_target = previous_new_target;
         outcome
     }
 
@@ -534,17 +677,17 @@ impl<'a, H: Host> Machine<'a, H> {
         &mut self,
         value: Value,
     ) -> Result<EcmaString, EvalFailure> {
-        if let Some(index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
-            if let HeapEntry::Symbol { description } = &self.heap[index] {
-                let mut text =
-                    EcmaStringBuilder::with_capacity(description.len_units().saturating_add(8));
-                text.push_utf8("Symbol(");
-                for &unit in description.as_units() {
-                    text.push_unit(unit);
-                }
-                text.push_unit(u16::from(b')'));
-                return Ok(text.finish());
+        if let Some(index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)?
+            && let HeapEntry::Symbol { description } = &self.heap[index]
+        {
+            let mut text =
+                EcmaStringBuilder::with_capacity(description.len_units().saturating_add(8));
+            text.push_utf8("Symbol(");
+            for &unit in description.as_units() {
+                text.push_unit(unit);
             }
+            text.push_unit(u16::from(b')'));
+            return Ok(text.finish());
         }
 
         if !self.is_object(value) {
@@ -566,7 +709,6 @@ impl<'a, H: Host> Machine<'a, H> {
             operation: "cannot convert object to primitive without invoking user code",
         }))
     }
-
     pub(crate) fn to_boolean(&self, value: Value) -> bool {
         self.truthy(value)
     }
@@ -577,7 +719,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 a == b || (a.is_nan() && b.is_nan())
             }
             (Some(Decoded::Number(a)), Some(Decoded::Int32(b)))
-            | (Some(Decoded::Int32(b)), Some(Decoded::Number(a))) => a == f64::from(b),
+            | (Some(Decoded::Int32(b)), Some(Decoded::Number(a))) => a == f64::from(b as i32),
             _ => self.strict_equal(left, right),
         }
     }
@@ -1126,5 +1268,86 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].key, Value::int32(2_048));
         assert_eq!(*next_order, 1_025);
+    }
+
+    fn constructor_name(machine: &mut Machine<'_, TestHost>, constructor: Value) -> EcmaString {
+        let name = machine
+            .get_named_property(constructor, "name")
+            .expect("constructor has name");
+        machine.to_string(name).expect("constructor name is string")
+    }
+
+    fn instance_constructor_name(
+        machine: &mut Machine<'_, TestHost>,
+        instance: Value,
+    ) -> EcmaString {
+        let constructor = machine
+            .get_named_property(instance, "constructor")
+            .expect("instance resolves constructor");
+        constructor_name(machine, constructor)
+    }
+
+    #[test]
+    fn object_prototype_constructor_identity() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let object = machine.intrinsics.global("Object").expect("Object exists");
+        let prototype = machine.intrinsics.object_prototype;
+        assert_eq!(
+            machine
+                .get_named_property(prototype, "constructor")
+                .expect("Object.prototype.constructor exists"),
+            object,
+            "Object.prototype.constructor must reference Object"
+        );
+        assert!(
+            constructor_name(&mut machine, object).eq_ascii("Object"),
+            "Object constructor name must be Object"
+        );
+    }
+
+    #[test]
+    fn error_and_range_error_prototype_constructor_identity() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        for name in ["Error", "RangeError"] {
+            let constructor = machine
+                .intrinsics
+                .global(name)
+                .unwrap_or_else(|| panic!("{name} exists"));
+            let prototype = machine
+                .get_named_property(constructor, "prototype")
+                .unwrap_or_else(|_| panic!("{name}.prototype exists"));
+            assert_eq!(
+                machine
+                    .get_named_property(prototype, "constructor")
+                    .unwrap_or_else(|_| panic!("{name}.prototype.constructor exists")),
+                constructor,
+                "{name}.prototype.constructor must reference {name}"
+            );
+            assert!(
+                constructor_name(&mut machine, constructor).eq_ascii(name),
+                "{name} constructor name must match"
+            );
+        }
+    }
+
+    #[test]
+    fn error_instances_resolve_constructor_name_through_own_prototype() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        for name in ["Error", "RangeError"] {
+            let instance = construct_builtin(&mut machine, name, &[]);
+            assert!(
+                instance_constructor_name(&mut machine, instance).eq_ascii(name),
+                "{name} instance constructor.name must resolve through its prototype"
+            );
+        }
     }
 }

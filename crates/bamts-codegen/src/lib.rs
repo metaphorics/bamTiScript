@@ -11,7 +11,7 @@
 //!
 //! This slice performs **no** executable-memory allocation and **no** object
 //! linking; it only builds and verifies IR. Both later backends supply their
-//! own [`isa::TargetFrontendConfig`] (via `isa.frontend_config()`), so the ISA
+//! own `isa::TargetFrontendConfig` (via `isa.frontend_config()`), so the ISA
 //! choice, calling convention, and pointer type stay outside this crate.
 //!
 //! # Entry ABI
@@ -27,7 +27,7 @@
 //! * `frame` points at the register frame; `frame.handles` (offset 16) is the
 //!   `*mut Value` register array. `frame.bytecode_pc` (offset 8) records the
 //!   active instruction and carries the resume token after
-//!   [`Suspend`](#suspend-and-the-resume-helper).
+//!   [`Suspend`](#suspendawait-and-the-resume-helper).
 //! * `out` receives the completion value; the returned `u32` is a
 //!   `bamts_native::CompletionTag` discriminant (`Normal`/`Throw`/`Suspend`/
 //!   `FatalTrap`).
@@ -36,7 +36,7 @@
 //!
 //! Register `r[i]` lives at `frame.handles + i * 8` (one `Value`/`u64` slot).
 //! Every access derives the byte offset as `i64::from(register.get()) * 8`; the
-//! validation pass ([`validate_slots`]) proves this offset fits the `Offset32`
+//! validation pass (`validate_slots`) proves this offset fits the `Offset32`
 //! used by loads and stores, so `u32` register ids and CLIF addresses never mix
 //! widths inconsistently. This holds for register ids well past 127: a slot
 //! offset is a full 32-bit displacement, not a signed byte.
@@ -72,10 +72,11 @@
 //!
 //! * [`Helper::Truthy`] performs the total ToBoolean coercion and returns the
 //!   truth value directly as `0`/`1`; it never writes `out` and never throws.
-//! * [`Helper::IteratorNext`] writes **two** registers — it receives the `done`
-//!   and `value` register indices and, on `Normal`, writes both slots in the
-//!   frame directly (a single completion channel cannot carry two results);
-//!   `out.value` is used only to carry a thrown handle on `Throw`.
+//! * [`Helper::IteratorNext`] and [`Helper::IteratorResult`] write **two**
+//!   registers — they receive the `done` and `value` register indices and, on
+//!   `Normal`, write both slots in the frame directly (a single completion
+//!   channel cannot carry two results); `out.value` is used only to carry a
+//!   thrown handle on `Throw`.
 //!
 //! A subset of the completion helpers is **total** (`Normal` only, never
 //! `Throw`/`FatalTrap`): [`Helper::TypeOfGlobal`], [`Helper::LoadThis`],
@@ -93,15 +94,21 @@
 //! | `Unary`             | [`Helper::Unary`] with the operator selector               |
 //! | `Binary`            | [`Helper::Binary`] with the operator selector              |
 //! | `CreateObject`      | [`Helper::CreateObject`] → `dst`                            |
+//! | `ToObject`          | [`Helper::ToObject`] (`src`) → `dst`; throws on nullish    |
 //! | `CreateArray`       | [`Helper::CreateArray`] → `dst`                             |
 //! | `CreateCell`        | [`Helper::CreateCell`] → `dst`                             |
 //! | `CreateClosure`     | [`Helper::CreateClosure`] (`function`, `captures` array)→dst|
 //! | `GetProperty`       | [`Helper::GetProperty`] (`object`, register `key`) → `dst`  |
 //! | `SetProperty`       | [`Helper::SetProperty`] (`object`, register `key`, `value`) |
+//! | `DefineDataProperty`| [`Helper::DefineDataProperty`] (`object`, register `key`, `value`) |
+//! | `LoadOwnDescriptorSlot` | [`Helper::LoadOwnDescriptorSlot`] (`object`, register `key`, slot) → `dst` |
+//! | `DefineOwnDescriptorSlot` | [`Helper::DefineOwnDescriptorSlot`] (`object`, register `key`, `src`, slot) |
+//! | `WithHasBinding`    | [`Helper::WithHasBinding`] (`object`, register `key`) → `dst` |
 //! | `DeleteProperty`    | [`Helper::DeleteProperty`] (`object`, register `key`) → dst |
 //! | `DefineAccessor`    | [`Helper::DefineAccessor`] (`object`, `key`, `accessor`, kind)|
 //! | `Call`              | [`Helper::Call`] (`callee`, `this`, `arguments` array) → dst|
 //! | `Construct`         | [`Helper::Construct`] (`callee`, `arguments` array) → `dst` |
+//! | `ConstructWithNewTarget` | [`Helper::ConstructWithNewTarget`] (`callee`, `new_target`, `arguments` array) → `dst` |
 //! | `LoadGlobal`        | [`Helper::LoadGlobal`] by string `name` → `dst`            |
 //! | `StoreGlobal`       | [`Helper::StoreGlobal`] (string `name`, `value`)          |
 //! | `TypeOfGlobal`      | [`Helper::TypeOfGlobal`] by string `name` → `dst` (total)  |
@@ -116,6 +123,12 @@
 //! | `CreateRegExp`      | [`Helper::CreateRegExp`] (`pattern`, `flags`) → `dst`      |
 //! | `GetIterator`       | [`Helper::GetIterator`] (`src`, kind) → `dst`             |
 //! | `IteratorNext`      | [`Helper::IteratorNext`] (`iterator`) → `done` + `value`   |
+//! | `IteratorStep`      | [`Helper::IteratorStep`] (`iterator`) → `dst` (raw result) |
+//! | `IteratorResult`    | [`Helper::IteratorResult`] (`result`) → `done` + `value`   |
+//! | `IteratorClose`     | [`Helper::IteratorClose`] (`iterator`, mode) → `result` + `called` |
+//! | `RequireCloseResult` | [`Helper::RequireCloseResult`] (`result`, `called`)               |
+//! | `DisposeCapture`    | [`Helper::DisposeCapture`] (`src`, hint) → `method` + `kind`       |
+//! | `SuppressError`     | [`Helper::SuppressError`] (`error`, `suppressed`) → `dst`               |
 //! | `Import`            | [`Helper::Import`] by string `specifier` → `dst`          |
 //! | `Export`            | [`Helper::Export`] (string `name`, `src`)                 |
 //! | `Jump`              | unconditional branch                                       |
@@ -125,6 +138,7 @@
 //! | `Throw`             | route to covering handler (bind `catch_register`) or       |
 //! |                     | `out.value` + return `Throw`                              |
 //! | `Suspend`           | yield path + resume path via [`Helper::ResumeValue`]      |
+//! | `Await`             | same suspension ABI as `Suspend` (await operand)         |
 //! | `Halt`              | `undefined` → `out.value`, return `Normal`               |
 //!
 //! No opcode is silently dropped and none is lowered to a placeholder no-op.
@@ -138,18 +152,20 @@
 //! `FatalTrap` bypasses handlers. When no handler covers the pc, the completion
 //! is returned to the caller.
 //!
-//! # Suspend and the resume helper
+//! # Suspend/Await and the resume helper
 //!
-//! `Suspend { dst, src, resume }` yields `src` and, when resumed, delivers the
-//! resumed value into `dst` before continuing at `resume`. The native entry ABI
+//! `Suspend { dst, src, resume }` (the `yield` form) and
+//! `Await { dst, src, resume }` (the `await` form) share one suspension ABI:
+//! yield `src` and, when resumed, deliver the resumed value into `dst` before
+//! continuing at `resume`. The native entry ABI
 //! carries no resume input (`out.value` is the *yielded* value, not an input),
 //! so the resumed value is obtained through an explicit runtime contract rather
 //! than invented:
 //!
-//! * **Yield path** — store this suspend's resume token into `frame.bytecode_pc`
-//!   (`0` is a fresh call; the suspend at bytecode pc `P` uses token `P + 1`, so
-//!   tokens never collide with a fresh entry or with each other), write `src`
-//!   into `out.value`, and return `Suspend`.
+//! * **Yield path** — store this suspension's resume token into `frame.bytecode_pc`
+//!   (`0` is a fresh call; the `Suspend`/`Await` at bytecode pc `P` uses token
+//!   `P + 1`, so tokens never collide with a fresh entry or with each other),
+//!   write `src` into `out.value`, and return `Suspend`.
 //! * **Resume path** — the dispatch prologue for token `P + 1` calls
 //!   [`Helper::ResumeValue`], which the runtime resolves to write the verified
 //!   resumed value for this frame into `out.value` (it may return `Throw` for
@@ -160,10 +176,13 @@
 //! [`Helper::ResumeValue`] is a **new required contract** the runtime must
 //! provide for any module that suspends.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 #[cfg(feature = "host-jit")]
 mod jit;
+#[cfg(feature = "host-jit")]
+#[allow(unsafe_code)]
+mod jit_memory;
 #[cfg(feature = "host-jit")]
 pub use jit::{JitError, JitProgram, compile_jit};
 
@@ -177,8 +196,8 @@ use std::error::Error;
 use std::fmt;
 
 use bamts_bytecode::{
-    AccessorKind, BinaryOp, ExceptionHandler, FunctionId, Instruction, IteratorKind, Module,
-    ModuleId, Pc, Program, Register, UnaryOp, Verified,
+    AccessorKind, BinaryOp, DescriptorSlot, DisposeHint, ExceptionHandler, FunctionId, Instruction,
+    IteratorCloseMode, IteratorKind, Module, ModuleId, Pc, Program, Register, UnaryOp, Verified,
 };
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
@@ -195,6 +214,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 /// Byte offset of `ShadowFrame.bytecode_pc` (a `u32`).
 const SHADOW_FRAME_PC_OFFSET: i32 = 8;
 /// Byte offset of `ShadowFrame.module_id` (a `u32`).
+#[cfg(feature = "host-jit")]
 const SHADOW_FRAME_MODULE_OFFSET: i32 = 12;
 /// Byte offset of `ShadowFrame.handles` (a `*mut Value`).
 const SHADOW_FRAME_HANDLES_OFFSET: i32 = 16;
@@ -292,6 +312,17 @@ const _: () = {
 /// | 29  | `Export`            | `name: i32, src: i64`                        |
 /// | 30  | `ConsumeFuel`       | `amount: i32` (total except `FatalTrap`)     |
 /// | 31 | `CreateCell`        | —                                            |
+/// | 32 | `IteratorStep`      | `iterator: i64` (raw, possibly-promised result) |
+/// | 33 | `IteratorResult`    | `result: i64, done_reg: i32, value_reg: i32` (two-write) |
+/// | 34 | `IteratorClose`     | `iterator: i64, mode: i32, called_reg: i32`  |
+/// | 35 | `RequireCloseResult` | `result: i64, called: i64`                  |
+/// | 39 | `DisposeCapture`    | `src: i64, hint: i32, kind_reg: i32`        |
+/// | 40 | `SuppressError`     | `error: i64, suppressed: i64`              |
+/// | 41 | `ConstructWithNewTarget` | `callee: i64, new_target: i64, arguments: i64` |
+/// | 42 | `DefineDataProperty` | `object: i64, key: i64, value: i64`         |
+/// | 43 | `LoadOwnDescriptorSlot` | `object: i64, key: i64, slot: i32`      |
+/// | 44 | `DefineOwnDescriptorSlot` | `object: i64, key: i64, src: i64, slot: i32` |
+/// | 45 | `WithHasBinding`     | `object: i64, key: i64`                     |
 ///
 /// Every helper except [`Helper::Truthy`] returns a
 /// `bamts_native::CompletionTag`. [`Helper::Truthy`] returns `0`/`1`.
@@ -301,10 +332,10 @@ pub enum Helper {
     /// constant named by `const_id` into `out.value`.
     LoadConstant,
     /// `bamts_unary(frame, op, operand, out)`: apply the unary operator `op`
-    /// (see [`unary_op_selector`]) to `operand`.
+    /// (see `unary_op_selector`) to `operand`.
     Unary,
     /// `bamts_binary(frame, op, left, right, out)`: apply the binary operator
-    /// `op` (see [`binary_op_selector`]) to `left` and `right`.
+    /// `op` (see `binary_op_selector`) to `left` and `right`.
     Binary,
     /// `bamts_create_object(frame, out)`: fresh empty object into `out.value`.
     CreateObject,
@@ -344,7 +375,7 @@ pub enum Helper {
     /// or `FatalTrap`.
     ResumeValue,
     /// `bamts_define_accessor(frame, object, key, accessor, kind, out)`: install
-    /// a getter or setter (`kind`, see [`accessor_kind_selector`]) under `key`.
+    /// a getter or setter (`kind`, see `accessor_kind_selector`) under `key`.
     DefineAccessor,
     /// `bamts_load_global(frame, name, out)`: `out.value = globalThis[name]`;
     /// throws a `ReferenceError` for an undeclared global.
@@ -381,7 +412,7 @@ pub enum Helper {
     /// the string-constant `pattern` and `flags` into `out.value`.
     CreateRegExp,
     /// `bamts_get_iterator(frame, src, kind, out)`: acquire an iterator over
-    /// `src` using protocol `kind` (see [`iterator_kind_selector`]).
+    /// `src` using protocol `kind` (see `iterator_kind_selector`).
     GetIterator,
     /// `bamts_iterator_next(frame, iterator, done_reg, value_reg, out)`: advance
     /// `iterator`, writing the done flag into `handles[done_reg]` and the
@@ -395,6 +426,63 @@ pub enum Helper {
     /// instructions from the shared machine budget. Returns `FatalTrap` on
     /// exhaustion and never routes through a bytecode exception handler.
     ConsumeFuel,
+    /// `bamts_iterator_step(frame, iterator, out)`: advance `iterator`,
+    /// writing the raw iterator result object (possibly a promise for an
+    /// async iterator) into `out.value`. `for await` suspends on that result
+    /// before [`Helper::IteratorResult`] reads it.
+    IteratorStep,
+    /// `bamts_iterator_result(frame, result, done_reg, value_reg, out)`:
+    /// validate the iterator result object `result`, writing the done flag
+    /// into `handles[done_reg]` and the produced value into
+    /// `handles[value_reg]` directly (two writes), exactly like
+    /// [`Helper::IteratorNext`]. On `Throw`, the thrown handle is in
+    /// `out.value` and neither slot is written.
+    IteratorResult,
+    /// `bamts_iterator_close(frame, iterator, mode, called_reg, out)`: close
+    /// `iterator`, writing whether callable `return` was invoked into
+    /// `handles[called_reg]` before invocation and the raw close result into
+    /// `out.value`; `mode` selects whether a user close throw propagates or
+    /// preserves an existing abrupt completion.
+    IteratorClose,
+    /// `bamts_require_close_result(frame, result, called, out)`: throw when
+    /// `called` is true and `result` is not an object.
+    RequireCloseResult,
+    /// `bamts_to_object(frame, value, out)`: ECMAScript ToObject coercion.
+    ToObject,
+    /// `bamts_import_dynamic(frame, specifier, out)`: runtime expression import.
+    ImportDynamic,
+    /// `bamts_load_import_meta(frame, out)`: load the current module's cached import-meta object.
+    LoadImportMeta,
+    /// `bamts_dispose_capture(frame, src, hint, kind_reg, out)`: capture a
+    /// callable disposal method into `out.value` and write its kind directly
+    /// into `handles[kind_reg]` on normal completion.
+    DisposeCapture,
+    /// `bamts_suppress_error(frame, error, suppressed, out)`: allocate the
+    /// intrinsic SuppressedError chain node without consulting the global binding.
+    SuppressError,
+    /// `bamts_construct_with_new_target(frame, callee, new_target, arguments, out)`:
+    /// construct with `callee` over the dynamic `arguments` array value,
+    /// installing the explicit `new_target` instead of `callee`.
+    ConstructWithNewTarget,
+    /// `bamts_define_data_property(frame, object, key, value, out)`: define an own
+    /// data property on `object` at register `key` with `value` (fixed descriptor).
+    DefineDataProperty,
+    /// `bamts_load_own_descriptor_slot(frame, object, key, slot, out)`: read one
+    /// own-descriptor slot (`slot`, see `descriptor_slot_selector`) of
+    /// `object[key]` into `out.value` without invoking accessors or walking the
+    /// prototype chain. Codegen transports `key` once as a raw `i64` Value; the
+    /// Machine helper coerces it to a property key.
+    LoadOwnDescriptorSlot,
+    /// `bamts_define_own_descriptor_slot(frame, object, key, src, slot, out)`:
+    /// write `src` into one own-descriptor slot (`slot`, see
+    /// `descriptor_slot_selector`) of `object[key]`, preserving sibling
+    /// attributes and the opposite accessor half. Codegen transports `key` once
+    /// as a raw `i64` Value; the Machine helper coerces it to a property key.
+    DefineOwnDescriptorSlot,
+    /// `bamts_with_has_binding(frame, object, key, out)`: Object Environment
+    /// Record `HasBinding` for a `with` binding object. Uses the realm-owned
+    /// `%Symbol.unscopables%` intrinsic and writes a Boolean into `out.value`.
+    WithHasBinding,
 }
 
 impl Helper {
@@ -431,6 +519,20 @@ impl Helper {
             Helper::CreateRegExp => "bamts_create_regexp",
             Helper::GetIterator => "bamts_get_iterator",
             Helper::IteratorNext => "bamts_iterator_next",
+            Helper::IteratorStep => "bamts_iterator_step",
+            Helper::IteratorResult => "bamts_iterator_result",
+            Helper::IteratorClose => "bamts_iterator_close",
+            Helper::RequireCloseResult => "bamts_require_close_result",
+            Helper::ToObject => "bamts_to_object",
+            Helper::ImportDynamic => "bamts_import_dynamic",
+            Helper::LoadImportMeta => "bamts_load_import_meta",
+            Helper::DisposeCapture => "bamts_dispose_capture",
+            Helper::SuppressError => "bamts_suppress_error",
+            Helper::ConstructWithNewTarget => "bamts_construct_with_new_target",
+            Helper::DefineDataProperty => "bamts_define_data_property",
+            Helper::LoadOwnDescriptorSlot => "bamts_load_own_descriptor_slot",
+            Helper::DefineOwnDescriptorSlot => "bamts_define_own_descriptor_slot",
+            Helper::WithHasBinding => "bamts_with_has_binding",
             Helper::Export => "bamts_export",
             Helper::ConsumeFuel => "bamts_consume_fuel",
             Helper::CreateCell => "bamts_create_cell",
@@ -474,6 +576,20 @@ impl Helper {
             Helper::Export => 29,
             Helper::ConsumeFuel => 30,
             Helper::CreateCell => 31,
+            Helper::IteratorStep => 32,
+            Helper::IteratorResult => 33,
+            Helper::IteratorClose => 34,
+            Helper::RequireCloseResult => 35,
+            Helper::ToObject => 36,
+            Helper::ImportDynamic => 37,
+            Helper::LoadImportMeta => 38,
+            Helper::DisposeCapture => 39,
+            Helper::SuppressError => 40,
+            Helper::ConstructWithNewTarget => 41,
+            Helper::DefineDataProperty => 42,
+            Helper::LoadOwnDescriptorSlot => 43,
+            Helper::DefineOwnDescriptorSlot => 44,
+            Helper::WithHasBinding => 45,
         }
     }
 
@@ -514,6 +630,20 @@ impl Helper {
             29 => Some(Helper::Export),
             30 => Some(Helper::ConsumeFuel),
             31 => Some(Helper::CreateCell),
+            32 => Some(Helper::IteratorStep),
+            33 => Some(Helper::IteratorResult),
+            34 => Some(Helper::IteratorClose),
+            35 => Some(Helper::RequireCloseResult),
+            36 => Some(Helper::ToObject),
+            37 => Some(Helper::ImportDynamic),
+            38 => Some(Helper::LoadImportMeta),
+            39 => Some(Helper::DisposeCapture),
+            40 => Some(Helper::SuppressError),
+            41 => Some(Helper::ConstructWithNewTarget),
+            42 => Some(Helper::DefineDataProperty),
+            43 => Some(Helper::LoadOwnDescriptorSlot),
+            44 => Some(Helper::DefineOwnDescriptorSlot),
+            45 => Some(Helper::WithHasBinding),
             _ => None,
         }
     }
@@ -536,23 +666,29 @@ impl Helper {
             | Helper::ResumeValue
             | Helper::LoadThis
             | Helper::LoadArguments
-            | Helper::LoadNewTarget => &[types::I64, types::I64],
+            | Helper::LoadNewTarget
+            | Helper::LoadImportMeta => &[types::I64, types::I64],
             // (frame, index, out)
             Helper::Import
             | Helper::LoadGlobal
             | Helper::TypeOfGlobal
             | Helper::CreatePrivateName
             | Helper::ConsumeFuel => &[types::I64, types::I32, types::I64],
+            // (frame, value, out)
+            Helper::ImportDynamic => &[types::I64, types::I64, types::I64],
             // (frame, function_id, captures, out)
             Helper::CreateClosure => &[types::I64, types::I32, types::I64, types::I64],
             // (frame, object, key, out)
-            Helper::GetProperty | Helper::DeleteProperty => {
+            Helper::GetProperty | Helper::DeleteProperty | Helper::WithHasBinding => {
                 &[types::I64, types::I64, types::I64, types::I64]
             }
             // (frame, object, key, value, out)
-            Helper::SetProperty => &[types::I64, types::I64, types::I64, types::I64, types::I64],
-            // (frame, object, key, accessor, kind, out)
-            Helper::DefineAccessor => &[
+            Helper::SetProperty | Helper::DefineDataProperty => {
+                &[types::I64, types::I64, types::I64, types::I64, types::I64]
+            }
+            // (frame, object, key, accessor, kind, out) or
+            // (frame, object, key, src, slot, out)
+            Helper::DefineAccessor | Helper::DefineOwnDescriptorSlot => &[
                 types::I64,
                 types::I64,
                 types::I64,
@@ -560,8 +696,14 @@ impl Helper {
                 types::I32,
                 types::I64,
             ],
-            // (frame, callee, this, arguments, out)
-            Helper::Call => &[types::I64, types::I64, types::I64, types::I64, types::I64],
+            // (frame, object, key, slot, out)
+            Helper::LoadOwnDescriptorSlot => {
+                &[types::I64, types::I64, types::I64, types::I32, types::I64]
+            }
+            // (frame, callee, this/new_target, arguments, out)
+            Helper::Call | Helper::ConstructWithNewTarget => {
+                &[types::I64, types::I64, types::I64, types::I64, types::I64]
+            }
             // (frame, callee, arguments, out)
             Helper::Construct => &[types::I64, types::I64, types::I64, types::I64],
             // (frame, a, b, out): array/object mutations over two value operands
@@ -577,8 +719,23 @@ impl Helper {
             Helper::CreateRegExp => &[types::I64, types::I32, types::I32, types::I64],
             // (frame, src, kind, out)
             Helper::GetIterator => &[types::I64, types::I64, types::I32, types::I64],
-            // (frame, iterator, done_reg, value_reg, out)
-            Helper::IteratorNext => &[types::I64, types::I64, types::I32, types::I32, types::I64],
+            // (frame, iterator, out)
+            Helper::IteratorStep => &[types::I64, types::I64, types::I64],
+            // (frame, value, out)
+            Helper::ToObject => &[types::I64, types::I64, types::I64],
+            // (frame, iterator/result, done_reg, value_reg, out)
+            Helper::IteratorNext | Helper::IteratorResult => {
+                &[types::I64, types::I64, types::I32, types::I32, types::I64]
+            }
+            // (frame, iterator, mode, called_reg, out) or
+            // (frame, src, hint, kind_reg, out)
+            Helper::IteratorClose | Helper::DisposeCapture => {
+                &[types::I64, types::I64, types::I32, types::I32, types::I64]
+            }
+            // (frame, result, called, out)
+            Helper::RequireCloseResult
+            // (frame, error, suppressed, out)
+            | Helper::SuppressError => &[types::I64, types::I64, types::I64, types::I64],
             // (frame, value)
             Helper::Truthy => &[types::I64, types::I64],
         }
@@ -649,12 +806,40 @@ const fn iterator_kind_selector(kind: IteratorKind) -> i64 {
     }
 }
 
+/// The ABI selector for iterator close behavior, passed as the `mode` argument
+/// to [`Helper::IteratorClose`]. This is the stable codegen-side encoding.
+const fn iterator_close_mode_selector(mode: IteratorCloseMode) -> i64 {
+    match mode {
+        IteratorCloseMode::Propagate => 0,
+        IteratorCloseMode::PreserveAbrupt => 1,
+    }
+}
+
+/// The ABI selector for a disposal hint, passed as `hint` to
+/// [`Helper::DisposeCapture`].
+const fn dispose_hint_selector(hint: DisposeHint) -> i64 {
+    match hint {
+        DisposeHint::Sync => 0,
+        DisposeHint::Async => 1,
+    }
+}
+
 /// The ABI selector for an accessor half, passed as the `kind` argument to
 /// [`Helper::DefineAccessor`]. This is the stable codegen-side encoding.
 const fn accessor_kind_selector(kind: AccessorKind) -> i64 {
     match kind {
         AccessorKind::Getter => 0,
         AccessorKind::Setter => 1,
+    }
+}
+
+/// The ABI selector for an own-descriptor slot, passed as the `slot` argument
+/// to [`Helper::LoadOwnDescriptorSlot`] / [`Helper::DefineOwnDescriptorSlot`].
+const fn descriptor_slot_selector(slot: DescriptorSlot) -> i64 {
+    match slot {
+        DescriptorSlot::Value => 0,
+        DescriptorSlot::Getter => 1,
+        DescriptorSlot::Setter => 2,
     }
 }
 
@@ -998,8 +1183,8 @@ struct Lowering<'a> {
     /// One block per reachable bytecode pc; `None` for unreachable pcs, which
     /// are never emitted (keeping every block dominated by the entry block).
     pc_blocks: Vec<Option<Block>>,
-    /// The resume prologue block for each reachable `Suspend`, keyed by the
-    /// suspend's bytecode pc.
+    /// The resume prologue block for each reachable `Suspend`/`Await`, keyed
+    /// by the suspension's bytecode pc.
     resume_blocks: BTreeMap<usize, Block>,
     handlers: &'a [ExceptionHandler],
     call_conv: CallConv,
@@ -1040,7 +1225,7 @@ impl<'a> Lowering<'a> {
             self.pc_blocks[pc] = Some(self.builder.create_block());
         }
         for &pc in reachable {
-            if let Instruction::Suspend { .. } = code[pc] {
+            if let Instruction::Suspend { .. } | Instruction::Await { .. } = code[pc] {
                 let block = self.builder.create_block();
                 self.resume_blocks.insert(pc, block);
             }
@@ -1050,8 +1235,12 @@ impl<'a> Lowering<'a> {
             self.emit_instruction(pc, code[pc]);
         }
         for &pc in reachable {
-            if let Instruction::Suspend { dst, resume, .. } = code[pc] {
-                self.emit_resume_prologue(pc, dst, resume);
+            match code[pc] {
+                Instruction::Suspend { dst, resume, .. }
+                | Instruction::Await { dst, resume, .. } => {
+                    self.emit_resume_prologue(pc, dst, resume);
+                }
+                _ => {}
             }
         }
         self.builder.seal_all_blocks();
@@ -1165,6 +1354,12 @@ impl<'a> Lowering<'a> {
                 let tag = self.call_helper(Helper::CreateObject, &[self.frame, self.out]);
                 self.route_completion(pc, tag, Some(dst));
             }
+            Instruction::ToObject { dst, src } => {
+                let handles = self.load_handles();
+                let value = self.load_register(handles, src);
+                let tag = self.call_helper(Helper::ToObject, &[self.frame, value, self.out]);
+                self.route_completion(pc, tag, Some(dst));
+            }
             Instruction::CreateArray { dst } => {
                 let tag = self.call_helper(Helper::CreateArray, &[self.frame, self.out]);
                 self.route_completion(pc, tag, Some(dst));
@@ -1207,6 +1402,67 @@ impl<'a> Lowering<'a> {
                     &[self.frame, object_value, key_value, value_value, self.out],
                 );
                 self.route_completion(pc, tag, None);
+            }
+            Instruction::DefineDataProperty { object, key, value } => {
+                let handles = self.load_handles();
+                let object_value = self.load_register(handles, object);
+                let key_value = self.load_register(handles, key);
+                let value_value = self.load_register(handles, value);
+                let tag = self.call_helper(
+                    Helper::DefineDataProperty,
+                    &[self.frame, object_value, key_value, value_value, self.out],
+                );
+                self.route_completion(pc, tag, None);
+            }
+            Instruction::LoadOwnDescriptorSlot {
+                dst,
+                object,
+                key,
+                slot,
+            } => {
+                let handles = self.load_handles();
+                let object_value = self.load_register(handles, object);
+                let key_value = self.load_register(handles, key);
+                let selector = self.iconst32(descriptor_slot_selector(slot));
+                let tag = self.call_helper(
+                    Helper::LoadOwnDescriptorSlot,
+                    &[self.frame, object_value, key_value, selector, self.out],
+                );
+                self.route_completion(pc, tag, Some(dst));
+            }
+            Instruction::DefineOwnDescriptorSlot {
+                object,
+                key,
+                src,
+                slot,
+            } => {
+                let handles = self.load_handles();
+                let object_value = self.load_register(handles, object);
+                let key_value = self.load_register(handles, key);
+                let src_value = self.load_register(handles, src);
+                let selector = self.iconst32(descriptor_slot_selector(slot));
+                let tag = self.call_helper(
+                    Helper::DefineOwnDescriptorSlot,
+                    &[
+                        self.frame,
+                        object_value,
+                        key_value,
+                        src_value,
+                        selector,
+                        self.out,
+                    ],
+                );
+                self.route_completion(pc, tag, None);
+            }
+            Instruction::WithHasBinding { dst, object, key } => {
+                let handles = self.load_handles();
+                let object_value = self.load_register(handles, object);
+                let key_value = self.load_register(handles, key);
+                let tag = self.call_helper(
+                    Helper::WithHasBinding,
+                    &[self.frame, object_value, key_value, self.out],
+                );
+                self.route_completion(pc, tag, Some(dst));
             }
             Instruction::DeleteProperty { dst, object, key } => {
                 let handles = self.load_handles();
@@ -1258,6 +1514,22 @@ impl<'a> Lowering<'a> {
                 );
                 self.route_completion(pc, tag, Some(dst));
             }
+            Instruction::ConstructWithNewTarget {
+                dst,
+                callee,
+                new_target,
+                arguments,
+            } => {
+                let handles = self.load_handles();
+                let callee_value = self.load_register(handles, callee);
+                let new_target_value = self.load_register(handles, new_target);
+                let args = self.load_register(handles, arguments);
+                let tag = self.call_helper(
+                    Helper::ConstructWithNewTarget,
+                    &[self.frame, callee_value, new_target_value, args, self.out],
+                );
+                self.route_completion(pc, tag, Some(dst));
+            }
             Instruction::Construct {
                 dst,
                 callee,
@@ -1302,6 +1574,10 @@ impl<'a> Lowering<'a> {
             }
             Instruction::LoadNewTarget { dst } => {
                 let tag = self.call_helper(Helper::LoadNewTarget, &[self.frame, self.out]);
+                self.route_completion(pc, tag, Some(dst));
+            }
+            Instruction::LoadImportMeta { dst } => {
+                let tag = self.call_helper(Helper::LoadImportMeta, &[self.frame, self.out]);
                 self.route_completion(pc, tag, Some(dst));
             }
             Instruction::ArrayPush { array, value } => {
@@ -1392,9 +1668,99 @@ impl<'a> Lowering<'a> {
                 );
                 self.route_completion(pc, tag, None);
             }
+            Instruction::IteratorStep { dst, iterator } => {
+                let handles = self.load_handles();
+                let iterator_value = self.load_register(handles, iterator);
+                let tag = self.call_helper(
+                    Helper::IteratorStep,
+                    &[self.frame, iterator_value, self.out],
+                );
+                self.route_completion(pc, tag, Some(dst));
+            }
+            Instruction::IteratorResult {
+                done,
+                value,
+                result,
+            } => {
+                let handles = self.load_handles();
+                let result_value = self.load_register(handles, result);
+                let done_reg = self.iconst32(i64::from(done.get()));
+                let value_reg = self.iconst32(i64::from(value.get()));
+                // Two-write, like IteratorNext: the helper writes both `done`
+                // and `value` slots directly from the frame on Normal, so no
+                // `dst` store here.
+                let tag = self.call_helper(
+                    Helper::IteratorResult,
+                    &[self.frame, result_value, done_reg, value_reg, self.out],
+                );
+                self.route_completion(pc, tag, None);
+            }
+            Instruction::IteratorClose {
+                result,
+                called,
+                iterator,
+                mode,
+            } => {
+                let handles = self.load_handles();
+                let iterator_value = self.load_register(handles, iterator);
+                let selector = self.iconst32(iterator_close_mode_selector(mode));
+                let called_reg = self.iconst32(i64::from(called.get()));
+                let tag = self.call_helper(
+                    Helper::IteratorClose,
+                    &[self.frame, iterator_value, selector, called_reg, self.out],
+                );
+                self.route_completion(pc, tag, Some(result));
+            }
+            Instruction::RequireCloseResult { result, called } => {
+                let handles = self.load_handles();
+                let result_value = self.load_register(handles, result);
+                let called_value = self.load_register(handles, called);
+                let tag = self.call_helper(
+                    Helper::RequireCloseResult,
+                    &[self.frame, result_value, called_value, self.out],
+                );
+                self.route_completion(pc, tag, None);
+            }
+            Instruction::DisposeCapture {
+                method,
+                kind,
+                src,
+                hint,
+            } => {
+                let handles = self.load_handles();
+                let src_value = self.load_register(handles, src);
+                let selector = self.iconst32(dispose_hint_selector(hint));
+                let kind_reg = self.iconst32(i64::from(kind.get()));
+                let tag = self.call_helper(
+                    Helper::DisposeCapture,
+                    &[self.frame, src_value, selector, kind_reg, self.out],
+                );
+                self.route_completion(pc, tag, Some(method));
+            }
+            Instruction::SuppressError {
+                dst,
+                error,
+                suppressed,
+            } => {
+                let handles = self.load_handles();
+                let error_value = self.load_register(handles, error);
+                let suppressed_value = self.load_register(handles, suppressed);
+                let tag = self.call_helper(
+                    Helper::SuppressError,
+                    &[self.frame, error_value, suppressed_value, self.out],
+                );
+                self.route_completion(pc, tag, Some(dst));
+            }
             Instruction::Import { dst, specifier } => {
                 let specifier_id = self.iconst32(i64::from(specifier.get()));
                 let tag = self.call_helper(Helper::Import, &[self.frame, specifier_id, self.out]);
+                self.route_completion(pc, tag, Some(dst));
+            }
+            Instruction::ImportDynamic { dst, specifier } => {
+                let handles = self.load_handles();
+                let specifier = self.load_register(handles, specifier);
+                let tag =
+                    self.call_helper(Helper::ImportDynamic, &[self.frame, specifier, self.out]);
                 self.route_completion(pc, tag, Some(dst));
             }
             Instruction::Export { name, src } => {
@@ -1417,7 +1783,9 @@ impl<'a> Lowering<'a> {
             }
             Instruction::Return { value } => self.emit_return(value),
             Instruction::Throw { value } => self.emit_throw(pc, value),
-            Instruction::Suspend { src, .. } => self.emit_suspend(pc, src),
+            Instruction::Suspend { src, .. } | Instruction::Await { src, .. } => {
+                self.emit_suspend(pc, src);
+            }
             Instruction::Halt => self.emit_halt(),
         }
     }
@@ -1525,8 +1893,11 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// Emits the `Suspend` yield path: store this suspend's resume token into
-    /// `frame.bytecode_pc`, yield `src` in `out.value`, and return `Suspend`.
+    /// Emits the `Suspend`/`Await` suspension path: store this suspension's
+    /// resume token into `frame.bytecode_pc`, yield `src` in `out.value`, and
+    /// return `Suspend`. Both opcodes share this ABI; only the runtime driver
+    /// interprets the yielded value differently (generator item vs awaited
+    /// operand).
     fn emit_suspend(&mut self, pc: usize, src: Register) {
         let token = self.iconst32(i64::from(pc as u32 + 1));
         self.builder.ins().store(
@@ -1542,10 +1913,10 @@ impl<'a> Lowering<'a> {
         self.builder.ins().return_(&[tag]);
     }
 
-    /// Emits a `Suspend` resume prologue: obtain the resumed value from the
-    /// runtime via [`Helper::ResumeValue`], store it into `dst`, and continue at
-    /// `resume`. A `Throw` from the resume (e.g. `generator.throw`) routes to a
-    /// covering handler; `FatalTrap` propagates.
+    /// Emits a `Suspend`/`Await` resume prologue: obtain the resumed value
+    /// from the runtime via [`Helper::ResumeValue`], store it into `dst`, and
+    /// continue at `resume`. A `Throw` from the resume (e.g. `generator.throw`)
+    /// routes to a covering handler; `FatalTrap` propagates.
     fn emit_resume_prologue(&mut self, pc: usize, dst: Register, resume: Pc) {
         let block = self.resume_blocks[&pc];
         self.builder.switch_to_block(block);
@@ -1701,9 +2072,9 @@ fn register_offset(register: Register) -> i32 {
 // -- CFG analysis ------------------------------------------------------------
 
 /// The set of pcs reachable from a fresh call (pc 0) plus every resumable
-/// suspend point, following fallthrough, jumps, conditional targets, suspend
-/// resumes, and the handler edge of any instruction that can route a `Throw`
-/// completion into a covering handler.
+/// `Suspend`/`Await` point, following fallthrough, jumps, conditional targets,
+/// suspension resumes, and the handler edge of any instruction that can route
+/// a `Throw` completion into a covering handler.
 fn reachable_pcs(code: &[Instruction], handlers: &[ExceptionHandler]) -> BTreeSet<usize> {
     let mut reachable = BTreeSet::new();
     let mut worklist = Vec::new();
@@ -1741,15 +2112,21 @@ fn routes_to_handler(instruction: Instruction) -> bool {
         | Instruction::Unary { .. }
         | Instruction::Binary { .. }
         | Instruction::CreateObject { .. }
+        | Instruction::ToObject { .. }
         | Instruction::CreateArray { .. }
         | Instruction::CreateCell { .. }
         | Instruction::CreateClosure { .. }
         | Instruction::GetProperty { .. }
         | Instruction::SetProperty { .. }
+        | Instruction::DefineDataProperty { .. }
+        | Instruction::LoadOwnDescriptorSlot { .. }
+        | Instruction::DefineOwnDescriptorSlot { .. }
+        | Instruction::WithHasBinding { .. }
         | Instruction::DeleteProperty { .. }
         | Instruction::DefineAccessor { .. }
         | Instruction::Call { .. }
         | Instruction::Construct { .. }
+        | Instruction::ConstructWithNewTarget { .. }
         | Instruction::LoadGlobal { .. }
         | Instruction::StoreGlobal { .. }
         | Instruction::ArrayPush { .. }
@@ -1759,9 +2136,18 @@ fn routes_to_handler(instruction: Instruction) -> bool {
         | Instruction::CreateRegExp { .. }
         | Instruction::GetIterator { .. }
         | Instruction::IteratorNext { .. }
+        | Instruction::IteratorStep { .. }
+        | Instruction::IteratorResult { .. }
+        | Instruction::IteratorClose { .. }
+        | Instruction::RequireCloseResult { .. }
+        | Instruction::LoadImportMeta { .. }
+        | Instruction::DisposeCapture { .. }
+        | Instruction::SuppressError { .. }
         | Instruction::Import { .. }
+        | Instruction::ImportDynamic { .. }
         | Instruction::Export { .. }
         | Instruction::Suspend { .. }
+        | Instruction::Await { .. }
         | Instruction::Throw { .. } => true,
         Instruction::Move { .. }
         | Instruction::TypeOfGlobal { .. }
@@ -1789,26 +2175,34 @@ fn is_inline_instruction(instruction: Instruction) -> bool {
         | Instruction::Return { .. }
         | Instruction::Halt
         | Instruction::Throw { .. }
-        | Instruction::Suspend { .. } => true,
+        | Instruction::Suspend { .. }
+        | Instruction::Await { .. } => true,
         Instruction::LoadConst { .. }
         | Instruction::Unary { .. }
         | Instruction::Binary { .. }
         | Instruction::CreateObject { .. }
+        | Instruction::ToObject { .. }
         | Instruction::CreateArray { .. }
         | Instruction::CreateCell { .. }
         | Instruction::CreateClosure { .. }
         | Instruction::GetProperty { .. }
         | Instruction::SetProperty { .. }
+        | Instruction::DefineDataProperty { .. }
+        | Instruction::LoadOwnDescriptorSlot { .. }
+        | Instruction::DefineOwnDescriptorSlot { .. }
+        | Instruction::WithHasBinding { .. }
         | Instruction::DeleteProperty { .. }
         | Instruction::DefineAccessor { .. }
         | Instruction::Call { .. }
         | Instruction::Construct { .. }
+        | Instruction::ConstructWithNewTarget { .. }
         | Instruction::LoadGlobal { .. }
         | Instruction::StoreGlobal { .. }
         | Instruction::TypeOfGlobal { .. }
         | Instruction::LoadThis { .. }
         | Instruction::LoadArguments { .. }
         | Instruction::LoadNewTarget { .. }
+        | Instruction::LoadImportMeta { .. }
         | Instruction::ArrayPush { .. }
         | Instruction::ArrayExtend { .. }
         | Instruction::ObjectSpread { .. }
@@ -1817,20 +2211,29 @@ fn is_inline_instruction(instruction: Instruction) -> bool {
         | Instruction::CreateRegExp { .. }
         | Instruction::GetIterator { .. }
         | Instruction::IteratorNext { .. }
+        | Instruction::IteratorStep { .. }
+        | Instruction::IteratorResult { .. }
+        | Instruction::IteratorClose { .. }
+        | Instruction::RequireCloseResult { .. }
+        | Instruction::DisposeCapture { .. }
+        | Instruction::SuppressError { .. }
         | Instruction::Import { .. }
+        | Instruction::ImportDynamic { .. }
         | Instruction::Export { .. } => false,
     }
 }
 
 /// The resume-dispatch tokens the entry accepts: `0` (fresh call) plus `P + 1`
-/// for each reachable `Suspend` at bytecode pc `P`, sorted and deduplicated.
+/// for each reachable `Suspend`/`Await` at bytecode pc `P`, sorted and
+/// deduplicated. One pc holds one instruction, so tokens are unique across
+/// both suspension opcodes by construction.
 fn resume_tokens(code: &[Instruction], reachable: &BTreeSet<usize>) -> Vec<u32> {
     let mut tokens = BTreeSet::new();
     if !code.is_empty() {
         tokens.insert(0u32);
     }
     for &pc in reachable {
-        if let Instruction::Suspend { .. } = code[pc] {
+        if let Instruction::Suspend { .. } | Instruction::Await { .. } = code[pc] {
             tokens.insert(pc as u32 + 1);
         }
     }
@@ -1876,30 +2279,40 @@ impl NormalSuccessors for Instruction {
                 visit(target.get() as usize);
                 visit(pc + 1);
             }
-            // A suspend returns now; its `resume` pc is entered by a later call
-            // through the resume prologue.
-            Instruction::Suspend { resume, .. } => visit(resume.get() as usize),
+            // A suspension returns now; its `resume` pc is entered by a later
+            // call through the resume prologue.
+            Instruction::Suspend { resume, .. } | Instruction::Await { resume, .. } => {
+                visit(resume.get() as usize);
+            }
             Instruction::Return { .. } | Instruction::Throw { .. } | Instruction::Halt => {}
             Instruction::LoadConst { .. }
             | Instruction::Move { .. }
             | Instruction::Unary { .. }
             | Instruction::Binary { .. }
             | Instruction::CreateObject { .. }
+            | Instruction::ToObject { .. }
             | Instruction::CreateArray { .. }
             | Instruction::CreateCell { .. }
             | Instruction::CreateClosure { .. }
             | Instruction::GetProperty { .. }
             | Instruction::SetProperty { .. }
+            | Instruction::DefineDataProperty { .. }
+            | Instruction::LoadOwnDescriptorSlot { .. }
+            | Instruction::DefineOwnDescriptorSlot { .. }
+            | Instruction::WithHasBinding { .. }
             | Instruction::DeleteProperty { .. }
             | Instruction::DefineAccessor { .. }
             | Instruction::Call { .. }
             | Instruction::Construct { .. }
+            | Instruction::ConstructWithNewTarget { .. }
             | Instruction::LoadGlobal { .. }
             | Instruction::StoreGlobal { .. }
             | Instruction::TypeOfGlobal { .. }
             | Instruction::LoadThis { .. }
             | Instruction::LoadArguments { .. }
             | Instruction::LoadNewTarget { .. }
+            | Instruction::LoadImportMeta { .. }
+            | Instruction::SuppressError { .. }
             | Instruction::ArrayPush { .. }
             | Instruction::ArrayExtend { .. }
             | Instruction::ObjectSpread { .. }
@@ -1908,7 +2321,13 @@ impl NormalSuccessors for Instruction {
             | Instruction::CreateRegExp { .. }
             | Instruction::GetIterator { .. }
             | Instruction::IteratorNext { .. }
+            | Instruction::IteratorStep { .. }
+            | Instruction::IteratorResult { .. }
+            | Instruction::IteratorClose { .. }
+            | Instruction::RequireCloseResult { .. }
+            | Instruction::DisposeCapture { .. }
             | Instruction::Import { .. }
+            | Instruction::ImportDynamic { .. }
             | Instruction::Export { .. } => visit(pc + 1),
         }
     }
@@ -2060,7 +2479,7 @@ mod tests {
     #[test]
     fn helper_index_table_is_a_stable_bijection() {
         // Every helper round-trips through its external index, and the table
-        // covers a dense 0..=31 range with unique symbols.
+        // covers a dense 0..=42 range with unique symbols.
         let helpers = [
             Helper::LoadConstant,
             Helper::Unary,
@@ -2094,6 +2513,20 @@ mod tests {
             Helper::Export,
             Helper::ConsumeFuel,
             Helper::CreateCell,
+            Helper::IteratorStep,
+            Helper::IteratorResult,
+            Helper::IteratorClose,
+            Helper::RequireCloseResult,
+            Helper::ToObject,
+            Helper::ImportDynamic,
+            Helper::LoadImportMeta,
+            Helper::DisposeCapture,
+            Helper::SuppressError,
+            Helper::ConstructWithNewTarget,
+            Helper::DefineDataProperty,
+            Helper::LoadOwnDescriptorSlot,
+            Helper::DefineOwnDescriptorSlot,
+            Helper::WithHasBinding,
         ];
         let mut symbols = BTreeSet::new();
         for (expected_index, helper) in helpers.iter().copied().enumerate() {
@@ -2106,8 +2539,61 @@ mod tests {
             );
             assert!(symbols.insert(helper.symbol()), "unique symbol {helper:?}");
         }
-        assert_eq!(symbols.len(), 32);
-        assert_eq!(Helper::from_external_index(32), None);
+        assert_eq!(symbols.len(), 46);
+        assert_eq!(Helper::from_external_index(46), None);
+    }
+    #[test]
+    fn iterator_close_helpers_use_the_pinned_abis() {
+        let module = single(func(
+            3,
+            vec![
+                load_undef(reg(0)),
+                Instruction::IteratorClose {
+                    result: reg(1),
+                    called: reg(2),
+                    iterator: reg(0),
+                    mode: IteratorCloseMode::Propagate,
+                },
+                Instruction::RequireCloseResult {
+                    result: reg(1),
+                    called: reg(2),
+                },
+                Instruction::DisposeCapture {
+                    method: reg(1),
+                    kind: reg(2),
+                    src: reg(0),
+                    hint: DisposeHint::Async,
+                },
+                Instruction::SuppressError {
+                    dst: reg(1),
+                    error: reg(0),
+                    suppressed: reg(1),
+                },
+                Instruction::Halt,
+            ],
+            Vec::new(),
+        ));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::IteratorClose));
+        assert!(helpers.contains(&Helper::RequireCloseResult));
+        assert!(helpers.contains(&Helper::DisposeCapture));
+        assert!(helpers.contains(&Helper::SuppressError));
+        assert_eq!(Helper::IteratorClose.external_index(), 34);
+        assert_eq!(Helper::RequireCloseResult.external_index(), 35);
+        assert_eq!(Helper::DisposeCapture.external_index(), 39);
+        assert_eq!(Helper::SuppressError.external_index(), 40);
+        assert!(
+            clif.contains("(i64, i64, i32, i32, i64) -> i32"),
+            "iterator-close helper sig wrong:\n{clif}"
+        );
+        assert!(
+            clif.contains("(i64, i64, i64, i64) -> i32"),
+            "require-close-result helper sig wrong:\n{clif}"
+        );
+        assert!(
+            clif.contains("u1:39"),
+            "dispose-capture helper import missing:\n{clif}"
+        );
     }
 
     #[test]
@@ -2397,6 +2883,168 @@ mod tests {
         assert!(
             clif.contains("(i64, i64, i64, i64) -> i32"),
             "construct helper sig wrong:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn construct_with_new_target_uses_call_shaped_five_i64_abi() {
+        // r0 = callee; r1 = new_target; r2 = arguments array; r3 = dst.
+        let code = vec![
+            load_undef(reg(0)),
+            load_undef(reg(1)),
+            load_undef(reg(2)),
+            Instruction::ConstructWithNewTarget {
+                dst: reg(3),
+                callee: reg(0),
+                new_target: reg(1),
+                arguments: reg(2),
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(4, code, Vec::new()));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::ConstructWithNewTarget));
+        assert_eq!(Helper::ConstructWithNewTarget.external_index(), 41);
+        assert_eq!(
+            Helper::ConstructWithNewTarget.symbol(),
+            "bamts_construct_with_new_target"
+        );
+        assert_eq!(Helper::Construct.external_index(), 10);
+        assert!(
+            clif.contains("u1:41"),
+            "construct-with-new-target import missing:\n{clif}"
+        );
+        assert!(
+            clif.contains("(i64, i64, i64, i64, i64) -> i32"),
+            "construct-with-new-target must share Call's five-I64 ABI:\n{clif}"
+        );
+        assert!(
+            !clif.contains("iadd"),
+            "arguments must be a value, not a window pointer:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn define_data_property_uses_call_shaped_five_i64_abi() {
+        // r0 = object; r1 = key; r2 = value. No destination register.
+        let code = vec![
+            Instruction::CreateObject { dst: reg(0) },
+            load_undef(reg(1)),
+            load_undef(reg(2)),
+            Instruction::DefineDataProperty {
+                object: reg(0),
+                key: reg(1),
+                value: reg(2),
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(3, code, Vec::new()));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::DefineDataProperty));
+        assert_eq!(Helper::DefineDataProperty.external_index(), 42);
+        assert_eq!(
+            Helper::DefineDataProperty.symbol(),
+            "bamts_define_data_property"
+        );
+        assert_eq!(Helper::SetProperty.external_index(), 7);
+        assert!(
+            clif.contains("u1:42"),
+            "define-data-property import missing:\n{clif}"
+        );
+        assert!(
+            clif.contains("(i64, i64, i64, i64, i64) -> i32"),
+            "define-data-property must share Call's five-I64 ABI:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn load_own_descriptor_slot_uses_object_key_slot_abi() {
+        let code = vec![
+            Instruction::CreateObject { dst: reg(0) },
+            load_undef(reg(1)),
+            Instruction::LoadOwnDescriptorSlot {
+                dst: reg(2),
+                object: reg(0),
+                key: reg(1),
+                slot: DescriptorSlot::Getter,
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(3, code, Vec::new()));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::LoadOwnDescriptorSlot));
+        assert_eq!(Helper::LoadOwnDescriptorSlot.external_index(), 43);
+        assert_eq!(
+            Helper::LoadOwnDescriptorSlot.symbol(),
+            "bamts_load_own_descriptor_slot"
+        );
+        assert!(
+            clif.contains("u1:43"),
+            "load-own-descriptor-slot import missing:\n{clif}"
+        );
+        assert!(
+            clif.contains("(i64, i64, i64, i32, i64) -> i32"),
+            "load-own-descriptor-slot ABI wrong:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn define_own_descriptor_slot_uses_define_accessor_shaped_abi() {
+        let code = vec![
+            Instruction::CreateObject { dst: reg(0) },
+            load_undef(reg(1)),
+            load_undef(reg(2)),
+            Instruction::DefineOwnDescriptorSlot {
+                object: reg(0),
+                key: reg(1),
+                src: reg(2),
+                slot: DescriptorSlot::Value,
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(3, code, Vec::new()));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::DefineOwnDescriptorSlot));
+        assert_eq!(Helper::DefineOwnDescriptorSlot.external_index(), 44);
+        assert_eq!(
+            Helper::DefineOwnDescriptorSlot.symbol(),
+            "bamts_define_own_descriptor_slot"
+        );
+        assert_eq!(Helper::DefineAccessor.external_index(), 14);
+        assert!(
+            clif.contains("u1:44"),
+            "define-own-descriptor-slot import missing:\n{clif}"
+        );
+        assert!(
+            clif.contains("(i64, i64, i64, i64, i32, i64) -> i32"),
+            "define-own-descriptor-slot must share DefineAccessor ABI:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn with_has_binding_uses_get_property_shaped_abi() {
+        let code = vec![
+            Instruction::CreateObject { dst: reg(0) },
+            load_undef(reg(1)),
+            Instruction::WithHasBinding {
+                dst: reg(2),
+                object: reg(0),
+                key: reg(1),
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(3, code, Vec::new()));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::WithHasBinding));
+        assert_eq!(Helper::WithHasBinding.external_index(), 45);
+        assert_eq!(Helper::WithHasBinding.symbol(), "bamts_with_has_binding");
+        assert!(
+            clif.contains("u1:45"),
+            "with-has-binding import missing:\n{clif}"
+        );
+        assert!(
+            clif.contains("(i64, i64, i64, i64) -> i32"),
+            "with-has-binding ABI wrong:\n{clif}"
         );
     }
 
@@ -2774,6 +3422,66 @@ mod tests {
     }
 
     #[test]
+    fn iterator_step_routes_its_raw_result_through_the_step_helper() {
+        // r0 = iterator; IteratorStep dst=r1 iterator=r0.
+        let code = vec![
+            load_undef(reg(0)),
+            Instruction::IteratorStep {
+                dst: reg(1),
+                iterator: reg(0),
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(2, code, Vec::new()));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::IteratorStep));
+        assert_eq!(Helper::IteratorStep.external_index(), 32);
+        assert!(
+            clif.contains("u1:32"),
+            "iterator-step import missing:\n{clif}"
+        );
+        // (frame, iterator:i64, out) -> tag: one value operand, result via out.
+        assert!(
+            clif.contains("(i64, i64, i64) -> i32"),
+            "iterator-step helper sig wrong:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn iterator_result_writes_both_done_and_value_registers() {
+        // r0 = raw result; IteratorResult done=r1 value=r2 result=r0.
+        let code = vec![
+            load_undef(reg(0)),
+            Instruction::IteratorResult {
+                done: reg(1),
+                value: reg(2),
+                result: reg(0),
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(3, code, Vec::new()));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::IteratorResult));
+        assert_eq!(Helper::IteratorResult.external_index(), 33);
+        assert!(
+            clif.contains("u1:33"),
+            "iterator-result import missing:\n{clif}"
+        );
+        // (frame, result:i64, done_reg:i32, value_reg:i32, out) -> tag: the two
+        // destination register indices are passed so the helper writes both.
+        assert!(
+            clif.contains("(i64, i64, i32, i32, i64) -> i32"),
+            "iterator-result helper sig wrong:\n{clif}"
+        );
+        // Both destination register indices (r1 -> 1, r2 -> 2) are materialized
+        // as i32 constants and handed to the helper.
+        assert!(
+            clif.contains("iconst.i32 1") && clif.contains("iconst.i32 2"),
+            "both destination register indices must be passed:\n{clif}"
+        );
+    }
+
+    #[test]
     fn export_lowers_to_the_export_helper() {
         let code = vec![
             load_undef(reg(0)),
@@ -2828,6 +3536,45 @@ mod tests {
             clif.contains("store"),
             "resume token store missing:\n{clif}"
         );
+        assert!(
+            clif.contains("u1:13"),
+            "resume helper import missing:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn await_shares_the_suspend_abi_with_a_distinct_resume_token() {
+        // r0 = undef; suspend (yield r0) at pc 1 resuming at pc 2; await r0 at
+        // pc 2 resuming at pc 3; pc 3 halts. Both suspensions are reachable,
+        // each through the other's resume edge.
+        let code = vec![
+            load_undef(reg(0)),
+            Instruction::Suspend {
+                dst: reg(0),
+                src: reg(0),
+                resume: Pc::new(2),
+            },
+            Instruction::Await {
+                dst: reg(0),
+                src: reg(0),
+                resume: Pc::new(3),
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(1, code, Vec::new()));
+        let lowered = lower_code_module(ModuleId::new(0), &module, host_config()).expect("lowers");
+        let function = &lowered.functions[0];
+        // Fresh token 0, the suspend at pc 1 -> token 2, the await at pc 2 ->
+        // token 3: distinct tokens across both suspension opcodes.
+        assert_eq!(function.entry_points, vec![0, 2, 3]);
+        assert!(function.helpers.contains(&Helper::ResumeValue));
+        let clif = function.clif.display().to_string();
+        // Multi-token dispatch loads and compares the resume token.
+        assert!(
+            clif.contains("load.i32"),
+            "dispatch token load missing:\n{clif}"
+        );
+        assert!(clif.contains("icmp"), "dispatch compare missing:\n{clif}");
         assert!(
             clif.contains("u1:13"),
             "resume helper import missing:\n{clif}"
@@ -3130,5 +3877,47 @@ mod tests {
         assert_eq!(lowered.modules[1].functions[0].symbol, "bamts_m1_fn_0");
         assert_eq!(lowered.entry_module, ModuleId::new(1));
         assert_eq!(lowered.entry_function, FunctionId::new(0));
+    }
+
+    #[test]
+    fn load_import_meta_lowers_to_helper_38() {
+        let module = single(func(
+            1,
+            vec![
+                Instruction::LoadImportMeta { dst: reg(0) },
+                Instruction::Halt,
+            ],
+            Vec::new(),
+        ));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::LoadImportMeta));
+        assert!(
+            clif.contains("u1:38"),
+            "load-import-meta import missing:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn to_object_uses_the_pinned_throwing_helper_abi() {
+        let module = single(func(
+            2,
+            vec![
+                load_undef(reg(0)),
+                Instruction::ToObject {
+                    dst: reg(1),
+                    src: reg(0),
+                },
+                Instruction::Halt,
+            ],
+            Vec::new(),
+        ));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::ToObject));
+        assert_eq!(Helper::ToObject.external_index(), 36);
+        assert!(clif.contains("u1:36"), "ToObject import missing:\n{clif}");
+        assert!(
+            clif.contains("(i64, i64, i64) -> i32"),
+            "ToObject helper ABI wrong:\n{clif}"
+        );
     }
 }

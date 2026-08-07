@@ -80,7 +80,7 @@ use crate::syntax::{
     TypeParameterNode, TypePredicate, TypePropertySignature, TypeQuery, TypeReference,
     UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclaration,
     VariableDeclarator, VariableDeclaratorNode, VariableKind, Variance, WhileStatement,
-    WithStatement, YieldExpression,
+    WithStatement, YieldExpression, cook_identifier_text,
 };
 
 /// A token of one kind was required by the grammar but absent.
@@ -103,6 +103,8 @@ const UNSUPPORTED_SYNTAX: DiagnosticCode = DiagnosticCode::new("BAMTS-P008");
 const EXPECTED_PROPERTY_NAME: DiagnosticCode = DiagnosticCode::new("BAMTS-P009");
 /// Nesting exceeded the recovery depth bound; the construct was abandoned.
 const NESTING_TOO_DEEP: DiagnosticCode = DiagnosticCode::new("BAMTS-P010");
+/// A `using` / `await using` declaration violated the resource grammar.
+const INVALID_USING_DECLARATION: DiagnosticCode = DiagnosticCode::new("BAMTS-P011");
 /// Unterminated regular-expression literal (shared with the scanner code).
 const UNTERMINATED_REGEX: DiagnosticCode = DiagnosticCode::new("BAMTS-L004");
 
@@ -197,6 +199,12 @@ struct ParserCheckpoint {
     journal: usize,
 }
 
+#[derive(Clone, Copy, Default)]
+struct KeywordContext {
+    await_reserved: bool,
+    yield_reserved: bool,
+}
+
 struct Parser {
     source_id: SourceId,
     script_kind: ScriptKind,
@@ -211,6 +219,7 @@ struct Parser {
     next_node_id: u32,
     journal: Vec<RescanEdit>,
     depth: u32,
+    keyword_context: KeywordContext,
 }
 
 fn is_trivia(kind: TokenKind) -> bool {
@@ -244,6 +253,7 @@ fn is_identifier_like(kind: TokenKind) -> bool {
     matches!(
         kind,
         TokenKind::Identifier
+            | TokenKind::EscapedContextualKeyword
             | TokenKind::KwAbstract
             | TokenKind::KwAccessor
             | TokenKind::KwAny
@@ -291,6 +301,7 @@ fn is_identifier_like(kind: TokenKind) -> bool {
 /// object literal, or as a class member name. Every keyword qualifies.
 fn is_any_word(kind: TokenKind) -> bool {
     is_identifier_like(kind)
+        || kind == TokenKind::EscapedReservedWord
         || matches!(
             kind,
             TokenKind::KwBreak
@@ -352,6 +363,7 @@ impl Parser {
             next_node_id: 0,
             journal: Vec::new(),
             depth: 0,
+            keyword_context: KeywordContext::default(),
         };
         parser.cursor = parser.next_significant(0);
         parser
@@ -561,8 +573,46 @@ impl Parser {
         let range = token.range();
         self.node_at(range, Identifier::new(token))
     }
+    fn with_keyword_context<T>(
+        &mut self,
+        context: KeywordContext,
+        parse: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let previous = std::mem::replace(&mut self.keyword_context, context);
+        let result = parse(self);
+        self.keyword_context = previous;
+        result
+    }
+
+    fn escaped_identifier_is_reserved(&self, token: Token) -> bool {
+        match token.kind() {
+            TokenKind::EscapedReservedWord => true,
+            TokenKind::EscapedContextualKeyword => {
+                let cooked = cook_identifier_text(self.lexeme(token));
+                matches!(cooked.as_deref(), Some("await")) && self.keyword_context.await_reserved
+                    || matches!(cooked.as_deref(), Some("yield"))
+                        && self.keyword_context.yield_reserved
+            }
+            _ => false,
+        }
+    }
+
+    fn reject_reserved_identifier(&mut self, token: Token) {
+        if self.escaped_identifier_is_reserved(token) {
+            self.error_at(
+                EXPECTED_IDENTIFIER,
+                token.range(),
+                "an escaped reserved word cannot be used as an identifier",
+            );
+        }
+    }
 
     fn ident_from(&mut self, token: Token) -> IdentifierNode {
+        self.reject_reserved_identifier(token);
+        self.identifier_name_from(token)
+    }
+
+    fn identifier_name_from(&mut self, token: Token) -> IdentifierNode {
         let range = token.range();
         self.node_at(range, Identifier::new(token))
     }
@@ -1221,12 +1271,40 @@ impl Parser {
         let mut declarations = Vec::new();
         loop {
             let declarator = self.parse_variable_declarator(allow_in);
+            self.validate_using_declarator(kind, &declarator, true);
             declarations.push(declarator);
             if self.eat(TokenKind::Comma).is_none() {
                 break;
             }
         }
         VariableDeclaration { kind, declarations }
+    }
+
+    /// Resource declarations require a BindingIdentifier and an initializer.
+    fn validate_using_declarator(
+        &mut self,
+        kind: VariableKind,
+        declarator: &VariableDeclaratorNode,
+        require_initializer: bool,
+    ) {
+        if !matches!(kind, VariableKind::Using | VariableKind::AwaitUsing) {
+            return;
+        }
+        let data = declarator.data();
+        if !matches!(data.binding.data(), BindingPattern::Identifier(_)) {
+            self.error_at(
+                INVALID_USING_DECLARATION,
+                data.binding.range(),
+                "`using` and `await using` bindings must be identifiers",
+            );
+        }
+        if require_initializer && data.initializer.is_none() {
+            self.error_at(
+                INVALID_USING_DECLARATION,
+                declarator.range(),
+                "`using` and `await using` declarations require an initializer",
+            );
+        }
     }
 
     fn parse_variable_declarator(&mut self, allow_in: bool) -> VariableDeclaratorNode {
@@ -1383,6 +1461,13 @@ impl Parser {
             let first = self.parse_for_head_declarator();
             match self.kind() {
                 TokenKind::KwIn => {
+                    if matches!(kind, VariableKind::Using | VariableKind::AwaitUsing) {
+                        self.error_at(
+                            INVALID_USING_DECLARATION,
+                            first.range(),
+                            "`using` and `await using` are not allowed in a for-in head",
+                        );
+                    }
                     self.bump();
                     let object = self.parse_expression(false);
                     let body = self.finish_for_body();
@@ -1400,6 +1485,10 @@ impl Parser {
                     );
                 }
                 TokenKind::KwOf => {
+                    // `for (using x of …)` / `for await (await using x of …)` are
+                    // valid resource heads; enforce identifier-only binding and
+                    // leave lowering to a later pass.
+                    self.validate_using_declarator(kind, &first, false);
                     self.bump();
                     let iterable = self.parse_assignment_expression(false);
                     let body = self.finish_for_body();
@@ -1425,6 +1514,13 @@ impl Parser {
                 _ => {
                     // Classic head: finish this declarator's initializer and
                     // any further declarators.
+                    if matches!(kind, VariableKind::Using | VariableKind::AwaitUsing) {
+                        self.error_at(
+                            INVALID_USING_DECLARATION,
+                            first.range(),
+                            "`using` and `await using` are not allowed in a classic for head",
+                        );
+                    }
                     let mut declarations = vec![self.finish_for_declarator(first)];
                     while self.eat(TokenKind::Comma).is_some() {
                         declarations.push(self.parse_variable_declarator(false));
@@ -1737,7 +1833,7 @@ impl Parser {
         while self.at(TokenKind::At) {
             let start = self.cur_start();
             self.bump();
-            let expression = self.parse_lhs_expression(false);
+            let expression = self.parse_lhs_expression(LhsContext::Decorator);
             let decorator: DecoratorNode = self.node(
                 start,
                 Decorator {
@@ -1778,7 +1874,7 @@ impl Parser {
         loop {
             if self.at(TokenKind::KwExtends) && extends.is_none() {
                 self.bump();
-                let expression = self.parse_lhs_expression(true);
+                let expression = self.parse_lhs_expression(LhsContext::Expression);
                 let type_arguments = self.try_parse_type_arguments_in_heritage();
                 extends = Some(ClassHeritage {
                     expression: Box::new(expression),
@@ -1953,6 +2049,7 @@ impl Parser {
                 return self.node(
                     start,
                     ClassMember::Constructor(ConstructorDeclaration {
+                        decorators,
                         modifiers,
                         parameters,
                         body,
@@ -1985,11 +2082,18 @@ impl Parser {
 
         // Method, getter, or setter.
         if self.at(TokenKind::LParen) || self.at_less_like() || is_generator {
+            let keyword_context = KeywordContext {
+                await_reserved: is_async,
+                yield_reserved: is_generator,
+            };
             let type_parameters = self.parse_optional_type_parameters();
-            let parameters = self.parse_parameter_list();
+            let parameters =
+                self.with_keyword_context(keyword_context, |this| this.parse_parameter_list());
             let return_type = self.parse_optional_type_annotation();
             let body = if self.at(TokenKind::LBrace) {
-                Some(FunctionBody::Block(self.parse_block()))
+                Some(FunctionBody::Block(
+                    self.with_keyword_context(keyword_context, Self::parse_block),
+                ))
             } else {
                 self.expect_semicolon();
                 None
@@ -2027,6 +2131,7 @@ impl Parser {
             return self.node(
                 start,
                 ClassMember::AutoAccessor(AutoAccessor {
+                    decorators,
                     modifiers,
                     name,
                     type_annotation,
@@ -2037,6 +2142,7 @@ impl Parser {
         self.node(
             start,
             ClassMember::Property(ClassProperty {
+                decorators,
                 modifiers,
                 name,
                 optional,
@@ -2486,7 +2592,7 @@ impl Parser {
         }
         if is_any_word(self.kind()) {
             let token = self.bump();
-            return ModuleExportName::Identifier(self.ident_from(token));
+            return ModuleExportName::Identifier(self.identifier_name_from(token));
         }
         self.error_here(EXPECTED_IDENTIFIER, "expected a module export name");
         ModuleExportName::Missing(MissingNode::new(NodeKind::Identifier))
@@ -2775,6 +2881,13 @@ impl Parser {
         } else {
             (None, None)
         };
+        if source.is_none() {
+            for specifier in &specifiers {
+                if let ModuleExportName::Identifier(local) = &specifier.data().local {
+                    self.reject_reserved_identifier(*local.data().token());
+                }
+            }
+        }
         self.expect_semicolon();
         self.node(
             start,
@@ -2833,6 +2946,18 @@ fn binary_precedence(kind: TokenKind) -> Option<(BinaryOrLogical, u8)> {
 enum BinaryOrLogical {
     Binary(BinaryOperator),
     Logical(LogicalOperator),
+}
+
+#[derive(Clone, Copy)]
+enum LhsContext {
+    Expression,
+    Decorator,
+}
+
+impl LhsContext {
+    fn allows_newline_computed_member(self) -> bool {
+        matches!(self, Self::Expression)
+    }
 }
 
 fn assignment_operator(kind: TokenKind) -> Option<AssignmentOperator> {
@@ -3183,7 +3308,7 @@ impl Parser {
 
     fn parse_postfix_expression(&mut self) -> Expr {
         let start = self.cur_start();
-        let expr = self.parse_lhs_expression(false);
+        let expr = self.parse_lhs_expression(LhsContext::Expression);
         if matches!(self.kind(), TokenKind::PlusPlus | TokenKind::MinusMinus)
             && !self.has_newline_before()
         {
@@ -3208,19 +3333,19 @@ impl Parser {
 
     /// Parses a left-hand-side expression: a primary or `new` expression
     /// followed by member accesses, calls, non-null assertions, and template
-    /// tags. `no_call` suppresses call parsing for a heritage/decorator head.
-    fn parse_lhs_expression(&mut self, no_call: bool) -> Expr {
+    /// tags. Decorators stop before a newline-following computed class member.
+    fn parse_lhs_expression(&mut self, ctx: LhsContext) -> Expr {
         let start = self.cur_start();
         let mut expr = if self.at(TokenKind::KwNew) {
-            self.parse_new_expression()
+            self.parse_new_expression(ctx)
         } else {
             self.parse_primary_expression()
         };
-        expr = self.parse_call_and_member_tail(start, expr, no_call);
+        expr = self.parse_call_and_member_tail(start, expr, ctx);
         expr
     }
 
-    fn parse_new_expression(&mut self) -> Expr {
+    fn parse_new_expression(&mut self, ctx: LhsContext) -> Expr {
         let start = self.cur_start();
         self.bump();
         if self.at(TokenKind::Dot) {
@@ -3230,10 +3355,10 @@ impl Parser {
             return self.node(start, Expression::Meta(MetaProperty::NewTarget));
         }
         let callee = if self.at(TokenKind::KwNew) {
-            self.parse_new_expression()
+            self.parse_new_expression(ctx)
         } else {
             let primary = self.parse_primary_expression();
-            self.parse_member_tail(start, primary)
+            self.parse_member_tail(start, primary, ctx)
         };
         let type_arguments = self.try_parse_type_arguments_speculative();
         let arguments = if self.at(TokenKind::LParen) {
@@ -3252,7 +3377,7 @@ impl Parser {
     }
 
     /// Member-only tail (no calls): used for a `new` callee.
-    fn parse_member_tail(&mut self, start: Utf16Pos, mut expr: Expr) -> Expr {
+    fn parse_member_tail(&mut self, start: Utf16Pos, mut expr: Expr, ctx: LhsContext) -> Expr {
         loop {
             match self.kind() {
                 TokenKind::Dot => {
@@ -3267,7 +3392,9 @@ impl Parser {
                         }),
                     );
                 }
-                TokenKind::LBracket => {
+                TokenKind::LBracket
+                    if ctx.allows_newline_computed_member() || !self.has_newline_before() =>
+                {
                     self.bump();
                     let index = self.parse_expression(false);
                     self.expect(TokenKind::RBracket, "expected `]`");
@@ -3299,7 +3426,7 @@ impl Parser {
         &mut self,
         start: Utf16Pos,
         mut expr: Expr,
-        no_call: bool,
+        ctx: LhsContext,
     ) -> Expr {
         loop {
             match self.kind() {
@@ -3317,9 +3444,11 @@ impl Parser {
                 }
                 TokenKind::QuestionDot => {
                     self.bump();
-                    expr = self.parse_optional_chain_link(start, expr, no_call);
+                    expr = self.parse_optional_chain_link(start, expr, false);
                 }
-                TokenKind::LBracket => {
+                TokenKind::LBracket
+                    if ctx.allows_newline_computed_member() || !self.has_newline_before() =>
+                {
                     self.bump();
                     let index = self.parse_expression(false);
                     self.expect(TokenKind::RBracket, "expected `]`");
@@ -3332,7 +3461,7 @@ impl Parser {
                         }),
                     );
                 }
-                TokenKind::LParen if !no_call => {
+                TokenKind::LParen => {
                     let arguments = self.parse_arguments();
                     expr = self.node(
                         start,
@@ -3363,7 +3492,7 @@ impl Parser {
                         }),
                     );
                 }
-                _ if !no_call && self.at_less_like() => {
+                _ if self.at_less_like() => {
                     // `f<T>(...)` / `f<T>\`...\``: only a call/tagged-template
                     // if type arguments parse and are followed by `(` or a
                     // template. Otherwise this `<` is a comparison.
@@ -3477,7 +3606,7 @@ impl Parser {
         }
         if is_any_word(self.kind()) {
             let token = self.bump();
-            return MemberProperty::Named(self.ident_from(token));
+            return MemberProperty::Named(self.identifier_name_from(token));
         }
         self.error_here(EXPECTED_IDENTIFIER, "expected a property name");
         MemberProperty::Named(self.missing_ident())
@@ -3587,6 +3716,7 @@ impl Parser {
                 let class = self.parse_class(Vec::new(), DeclarationModifiers::default(), false);
                 self.node(start, Expression::Class(ClassExpression { class }))
             }
+            TokenKind::At => self.parse_decorated_class_expression(start),
             TokenKind::KwImport => self.parse_import_expression(start),
             TokenKind::PrivateIdentifier => {
                 // `#field in obj`: represent the private name as an identifier
@@ -3611,6 +3741,24 @@ impl Parser {
                 self.missing_expr()
             }
         }
+    }
+
+    /// Expression-path `@decorator class`: a primary, so postfix member/call
+    /// and lower-precedence binary/assignment continuations apply exactly as
+    /// for an undecorated class expression. Malformed trailing material on the
+    /// same line is consumed through its assignment-expression boundary so it
+    /// cannot escape as a sibling statement.
+    fn parse_decorated_class_expression(&mut self, start: Utf16Pos) -> Expr {
+        let decorators = self.parse_decorators();
+        if !self.at(TokenKind::KwClass) {
+            self.error_here(EXPECTED_TOKEN, "decorators must precede a class");
+            if self.can_start_expression() && !self.has_newline_before() {
+                let _ = self.parse_assignment_expression(false);
+            }
+            return self.missing_expr();
+        }
+        let class = self.parse_class(decorators, DeclarationModifiers::default(), false);
+        self.node(start, Expression::Class(ClassExpression { class }))
     }
 
     fn parse_import_expression(&mut self, start: Utf16Pos) -> Expr {
@@ -3788,11 +3936,18 @@ impl Parser {
 
         // Method.
         if self.at(TokenKind::LParen) || self.at_less_like() {
+            let keyword_context = KeywordContext {
+                await_reserved: is_async,
+                yield_reserved: is_generator,
+            };
             let type_parameters = self.parse_optional_type_parameters();
-            let parameters = self.parse_parameter_list();
+            let parameters =
+                self.with_keyword_context(keyword_context, |this| this.parse_parameter_list());
             let return_type = self.parse_optional_type_annotation();
             let body = if self.at(TokenKind::LBrace) {
-                Some(FunctionBody::Block(self.parse_block()))
+                Some(FunctionBody::Block(
+                    self.with_keyword_context(keyword_context, Self::parse_block),
+                ))
             } else {
                 self.error_here(EXPECTED_TOKEN, "expected a method body");
                 None
@@ -3906,7 +4061,7 @@ impl Parser {
             }
             kind if is_any_word(kind) => {
                 let token = self.bump();
-                PropertyName::Identifier(self.ident_from(token))
+                PropertyName::Identifier(self.identifier_name_from(token))
             }
             _ => {
                 self.error_here(EXPECTED_PROPERTY_NAME, "expected a property name");
@@ -4165,11 +4320,18 @@ impl Parser {
             }
             None
         };
+        let keyword_context = KeywordContext {
+            await_reserved: is_async,
+            yield_reserved: is_generator,
+        };
         let type_parameters = self.parse_optional_type_parameters();
-        let parameters = self.parse_parameter_list();
+        let parameters =
+            self.with_keyword_context(keyword_context, |this| this.parse_parameter_list());
         let return_type = self.parse_optional_type_annotation();
         let body = if self.at(TokenKind::LBrace) {
-            Some(FunctionBody::Block(self.parse_block()))
+            Some(FunctionBody::Block(
+                self.with_keyword_context(keyword_context, Self::parse_block),
+            ))
         } else {
             self.expect_semicolon();
             None
@@ -4381,9 +4543,13 @@ impl Parser {
     }
 
     fn parse_simple_arrow(&mut self, start: Utf16Pos, is_async: bool, no_in: bool) -> Expr {
+        let keyword_context = KeywordContext {
+            await_reserved: is_async,
+            yield_reserved: false,
+        };
         let param_start = self.cur_start();
         let token = self.bump();
-        let name = self.ident_from(token);
+        let name = self.with_keyword_context(keyword_context, |this| this.ident_from(token));
         let binding = self.node(param_start, BindingPattern::Identifier(name));
         let parameter = self.node(
             param_start,
@@ -4397,7 +4563,7 @@ impl Parser {
             },
         );
         self.expect(TokenKind::Arrow, "expected `=>`");
-        let body = self.parse_arrow_body(no_in);
+        let body = self.parse_arrow_body(no_in, keyword_context);
         self.node(
             start,
             Expression::Arrow(ArrowFunction {
@@ -4411,10 +4577,15 @@ impl Parser {
     }
 
     fn parse_paren_arrow(&mut self, start: Utf16Pos, is_async: bool, no_in: bool) -> Expr {
-        let parameters = self.parse_parameter_list();
+        let keyword_context = KeywordContext {
+            await_reserved: is_async,
+            yield_reserved: false,
+        };
+        let parameters =
+            self.with_keyword_context(keyword_context, |this| this.parse_parameter_list());
         let return_type = self.parse_optional_type_annotation();
         self.expect(TokenKind::Arrow, "expected `=>`");
-        let body = self.parse_arrow_body(no_in);
+        let body = self.parse_arrow_body(no_in, keyword_context);
         self.node(
             start,
             Expression::Arrow(ArrowFunction {
@@ -4427,12 +4598,14 @@ impl Parser {
         )
     }
 
-    fn parse_arrow_body(&mut self, no_in: bool) -> FunctionBody {
-        if self.at(TokenKind::LBrace) {
-            FunctionBody::Block(self.parse_block())
-        } else {
-            FunctionBody::Expression(Box::new(self.parse_assignment_expression(no_in)))
-        }
+    fn parse_arrow_body(&mut self, no_in: bool, keyword_context: KeywordContext) -> FunctionBody {
+        self.with_keyword_context(keyword_context, |this| {
+            if this.at(TokenKind::LBrace) {
+                FunctionBody::Block(this.parse_block())
+            } else {
+                FunctionBody::Expression(Box::new(this.parse_assignment_expression(no_in)))
+            }
+        })
     }
 
     fn speculate_paren_arrow(
@@ -4442,14 +4615,19 @@ impl Parser {
         no_in: bool,
     ) -> Option<Expr> {
         let checkpoint = self.checkpoint();
-        let parameters = self.parse_parameter_list();
+        let keyword_context = KeywordContext {
+            await_reserved: is_async,
+            yield_reserved: false,
+        };
+        let parameters =
+            self.with_keyword_context(keyword_context, |this| this.parse_parameter_list());
         let return_type = self.parse_optional_type_annotation();
         if !self.at(TokenKind::Arrow) || self.has_newline_before() {
             self.rollback(checkpoint);
             return None;
         }
         self.bump();
-        let body = self.parse_arrow_body(no_in);
+        let body = self.parse_arrow_body(no_in, keyword_context);
         Some(self.node(
             start,
             Expression::Arrow(ArrowFunction {
@@ -4465,14 +4643,19 @@ impl Parser {
     fn speculate_async_paren_arrow(&mut self, start: Utf16Pos, no_in: bool) -> Option<Expr> {
         let checkpoint = self.checkpoint();
         self.bump(); // `async`
-        let parameters = self.parse_parameter_list();
+        let keyword_context = KeywordContext {
+            await_reserved: true,
+            yield_reserved: false,
+        };
+        let parameters =
+            self.with_keyword_context(keyword_context, |this| this.parse_parameter_list());
         let return_type = self.parse_optional_type_annotation();
         if !self.at(TokenKind::Arrow) || self.has_newline_before() {
             self.rollback(checkpoint);
             return None;
         }
         self.bump();
-        let body = self.parse_arrow_body(no_in);
+        let body = self.parse_arrow_body(no_in, keyword_context);
         Some(self.node(
             start,
             Expression::Arrow(ArrowFunction {
@@ -4500,14 +4683,19 @@ impl Parser {
             self.rollback(checkpoint);
             return None;
         }
-        let parameters = self.parse_parameter_list();
+        let keyword_context = KeywordContext {
+            await_reserved: is_async,
+            yield_reserved: false,
+        };
+        let parameters =
+            self.with_keyword_context(keyword_context, |this| this.parse_parameter_list());
         let return_type = self.parse_optional_type_annotation();
         if !self.at(TokenKind::Arrow) || self.has_newline_before() {
             self.rollback(checkpoint);
             return None;
         }
         self.bump();
-        let body = self.parse_arrow_body(no_in);
+        let body = self.parse_arrow_body(no_in, keyword_context);
         Some(self.node(
             start,
             Expression::Arrow(ArrowFunction {
@@ -5808,6 +5996,23 @@ mod tests {
     }
 
     #[test]
+    fn escaped_keywords_obey_identifier_context() {
+        assert!(!errors(&parse_ts("const \\u0069f = 1;")).is_empty());
+        assert!(!errors(&parse_ts("\\u0069f (true) {}")).is_empty());
+        assert!(!errors(&parse_ts("function* g() { \\u0079ield; }")).is_empty());
+        assert!(!errors(&parse_ts("async function f() { \\u0061wait; }")).is_empty());
+        assert!(!errors(&parse_ts("const value = { \\u0069f };")).is_empty());
+        assert!(!errors(&parse_ts("import { \\u0069f } from 'm';")).is_empty());
+        assert!(!errors(&parse_ts("export { \\u0069f };")).is_empty());
+
+        assert!(errors(&parse_ts("const \\u0061wait = 1; const \\u0079ield = 2;")).is_empty());
+        assert!(errors(&parse_ts("const value = { \\u0069f: 1 }; value.\\u0069f;")).is_empty());
+        assert!(errors(&parse_ts("import { \\u0069f as value } from 'm';")).is_empty());
+        assert!(errors(&parse_ts("const value = 1; export { value as \\u0069f };")).is_empty());
+        assert!(errors(&parse_ts("export { \\u0069f } from 'm';")).is_empty());
+    }
+
+    #[test]
     fn unions_lexical_and_parse_diagnostics() {
         // Unterminated string is a lexical (L-code) diagnostic; the trailing
         // `+` with no operand is a parse (P-code) diagnostic.
@@ -6008,6 +6213,139 @@ mod tests {
             panic!("expected a class declaration");
         };
         assert_eq!(class.decorators.len(), 1);
+    }
+
+    #[test]
+    fn expression_path_decorated_class_expression_retains_decorator() {
+        let recovered = assert_clean("const C = @dec class Named {}");
+        let file = recovered.product();
+        let Statement::Variable(decl) = file.statements()[0].data() else {
+            panic!("expected a variable declaration");
+        };
+        let init = decl.declarations[0]
+            .data()
+            .initializer
+            .as_ref()
+            .expect("initializer");
+        let Expression::Class(class_expr) = init.data() else {
+            panic!("expected a class expression, got {:?}", init.kind());
+        };
+        assert_eq!(class_expr.class.decorators.len(), 1);
+        let decorator = &class_expr.class.decorators[0];
+        let Expression::Identifier(dec) = decorator.data().expression.data() else {
+            panic!("expected the decorator expression to be an identifier");
+        };
+        assert_eq!(file.token_text(dec.data().token()), Some("dec"));
+        let Some(name) = &class_expr.class.name else {
+            panic!("expected a named class expression");
+        };
+        assert_eq!(file.token_text(name.data().token()), Some("Named"));
+        assert!(
+            class_expr.class.decorators[0].range().start()
+                < class_expr.class.name.as_ref().unwrap().range().start()
+        );
+    }
+
+    #[test]
+    fn expression_path_malformed_decorator_recovers() {
+        let recovered = parse_ts("const x = @dec 1;");
+        assert!(
+            errors(&recovered)
+                .iter()
+                .any(|d| d.code() == EXPECTED_TOKEN
+                    && d.message() == "decorators must precede a class"),
+            "expected BAMTS-P001 for `@dec` not followed by `class`"
+        );
+        assert_eq!(
+            recovered.product().statements().len(),
+            1,
+            "malformed decorator recovery must yield one statement, not a trailing `1;`"
+        );
+        let Statement::Variable(decl) = recovered.product().statements()[0].data() else {
+            panic!("expected a variable declaration");
+        };
+        let init = decl.declarations[0]
+            .data()
+            .initializer
+            .as_ref()
+            .expect("initializer");
+        assert!(
+            matches!(
+                init.data(),
+                Expression::Missing(m) if m.expected() == NodeKind::MissingExpression
+            ),
+            "malformed decorator expression should yield a missing initializer"
+        );
+        assert_eq!(recovered.product().eof().kind(), TokenKind::EndOfFile);
+        assert_tokens_tile(&recovered);
+    }
+
+    #[test]
+    fn expression_path_decorated_class_expression_allows_postfix_member() {
+        let recovered = assert_clean("const name = @dec class {}.name;");
+        assert_eq!(
+            recovered.product().statements().len(),
+            1,
+            "decorated class postfix must stay one statement"
+        );
+        let file = recovered.product();
+        let Statement::Variable(decl) = file.statements()[0].data() else {
+            panic!("expected a variable declaration");
+        };
+        let init = decl.declarations[0]
+            .data()
+            .initializer
+            .as_ref()
+            .expect("initializer");
+        let Expression::Member(member) = init.data() else {
+            panic!("expected a member expression, got {:?}", init.kind());
+        };
+        let Expression::Class(class_expr) = member.object.data() else {
+            panic!(
+                "expected the member object to be a decorated class expression, got {:?}",
+                member.object.kind()
+            );
+        };
+        assert_eq!(class_expr.class.decorators.len(), 1);
+        let MemberProperty::Named(prop) = &member.property else {
+            panic!("expected a named member property");
+        };
+        assert_eq!(file.token_text(prop.data().token()), Some("name"));
+        assert!(!member.optional);
+    }
+
+    #[test]
+    fn expression_path_malformed_decorator_consumes_call() {
+        let recovered = parse_ts("const x = @dec foo();");
+        assert!(
+            errors(&recovered)
+                .iter()
+                .any(|d| d.code() == EXPECTED_TOKEN
+                    && d.message() == "decorators must precede a class"),
+            "expected BAMTS-P001 for `@dec` not followed by `class`"
+        );
+        assert_eq!(
+            recovered.product().statements().len(),
+            1,
+            "malformed decorator recovery must consume `foo()` and yield one statement"
+        );
+        let Statement::Variable(decl) = recovered.product().statements()[0].data() else {
+            panic!("expected a variable declaration");
+        };
+        let init = decl.declarations[0]
+            .data()
+            .initializer
+            .as_ref()
+            .expect("initializer");
+        assert!(
+            matches!(
+                init.data(),
+                Expression::Missing(m) if m.expected() == NodeKind::MissingExpression
+            ),
+            "malformed decorator call recovery should yield a missing initializer"
+        );
+        assert_eq!(recovered.product().eof().kind(), TokenKind::EndOfFile);
+        assert_tokens_tile(&recovered);
     }
 
     #[test]
@@ -6309,6 +6647,103 @@ mod tests {
             no_init.product().statements()[0].data(),
             Statement::Expression(_)
         ));
+    }
+
+    #[test]
+    fn using_declaration_requires_initializer() {
+        let missing = parse_ts("{ using x; }");
+        assert!(
+            errors(&missing)
+                .iter()
+                .any(|d| d.code() == INVALID_USING_DECLARATION),
+            "expected BAMTS-P011 for `using x;`"
+        );
+        let Statement::Block(block) = missing.product().statements()[0].data() else {
+            panic!("expected a block");
+        };
+        assert!(matches!(
+            block.data().statements[0].data(),
+            Statement::Variable(_)
+        ));
+
+        let awaited = parse_ts("async function f() { await using h; }");
+        assert!(
+            errors(&awaited)
+                .iter()
+                .any(|d| d.code() == INVALID_USING_DECLARATION),
+            "expected BAMTS-P011 for `await using h;`"
+        );
+    }
+
+    #[test]
+    fn using_declaration_rejects_non_identifier_binding() {
+        // Lookahead only admits identifier-led using decls; a later declarator
+        // may still introduce a pattern binding, which must be diagnosed.
+        let recovered = parse_ts("{ using a = acquire(), { b } = obj; }");
+        assert!(
+            errors(&recovered)
+                .iter()
+                .any(|d| d.code() == INVALID_USING_DECLARATION),
+            "expected BAMTS-P011 for a destructuring using binding"
+        );
+    }
+
+    #[test]
+    fn using_for_in_and_classic_heads_are_rejected() {
+        let for_in = parse_ts("for (using x in obj) {}");
+        assert!(
+            errors(&for_in)
+                .iter()
+                .any(|d| d.code() == INVALID_USING_DECLARATION),
+            "expected BAMTS-P011 for for-in using head"
+        );
+        assert_eq!(stmt_kind(&for_in, 0), NodeKind::ForInStatement);
+
+        let classic = parse_ts("for (using x = acquire(); false; ) {}");
+        assert!(
+            errors(&classic)
+                .iter()
+                .any(|d| d.code() == INVALID_USING_DECLARATION),
+            "expected BAMTS-P011 for classic for using head"
+        );
+        assert_eq!(stmt_kind(&classic, 0), NodeKind::ForStatement);
+
+        let await_in = parse_ts("async function f() { for (await using x in obj) {} }");
+        assert!(
+            errors(&await_in)
+                .iter()
+                .any(|d| d.code() == INVALID_USING_DECLARATION),
+            "expected BAMTS-P011 for await using for-in head"
+        );
+    }
+
+    #[test]
+    fn using_for_of_heads_remain_parseable() {
+        let sync = assert_clean("for (using x of items) {}");
+        assert_eq!(stmt_kind(&sync, 0), NodeKind::ForOfStatement);
+        let Statement::ForOf(for_of) = sync.product().statements()[0].data() else {
+            panic!("expected for-of");
+        };
+        let ForBinding::Variable(decl) = &for_of.binding else {
+            panic!("expected a variable binding");
+        };
+        assert_eq!(decl.kind, VariableKind::Using);
+
+        let async_of = assert_clean("async function f() { for await (await using x of items) {} }");
+        let Statement::Function(func) = async_of.product().statements()[0].data() else {
+            panic!("expected a function");
+        };
+        let Some(FunctionBody::Block(body)) = func.function.body.as_ref() else {
+            panic!("expected a block body");
+        };
+        let Statement::ForOf(for_of) = body.data().statements[0].data() else {
+            panic!("expected for-of inside async function");
+        };
+        let ForBinding::Variable(decl) = &for_of.binding else {
+            panic!("expected a variable binding");
+        };
+        assert_eq!(decl.kind, VariableKind::AwaitUsing);
+        assert_eq!(for_of.mode, ForOfMode::Async);
     }
 
     #[test]

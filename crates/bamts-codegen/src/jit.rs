@@ -6,12 +6,14 @@ use std::fmt;
 use bamts_bytecode::{Program as BytecodeProgram, Verified};
 use bamts_native::{
     AbiError, Completion, CompletionTag, JitEntry, NativeEntryTable, NativeHelper, ShadowFrame,
+    require_frame_module_id,
 };
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::{ExternalName, Function, UserExternalName};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, ModuleError, default_libcall_names};
 
+use crate::jit_memory::{FinalizedMemory, WxMemoryHandle, WxMemoryProvider};
 use crate::{HELPER_NAMESPACE, Helper, LoweredProgram, ProgramLowerError, lower_program};
 
 /// A typed host-JIT compilation failure.
@@ -19,9 +21,11 @@ use crate::{HELPER_NAMESPACE, Helper, LoweredProgram, ProgramLowerError, lower_p
 pub enum JitError {
     /// Backend-neutral program lowering failed.
     Lower(ProgramLowerError),
+    /// The lowered program violated the canonical module/function identity order.
+    InvalidLoweredModule(String),
     /// Cranelift could not declare, compile, or finalize the module.
     Module(Box<ModuleError>),
-    /// Lowered IR named a runtime helper outside the pinned 30-entry table.
+    /// Lowered IR named a runtime helper not present in the runtime helper table.
     UnknownHelper { index: u32 },
 }
 
@@ -32,6 +36,9 @@ impl fmt::Display for JitError {
                 formatter,
                 "could not lower program for the host JIT: {error}"
             ),
+            JitError::InvalidLoweredModule(message) => {
+                write!(formatter, "invalid lowered module for host JIT: {message}")
+            }
             JitError::Module(error) => write!(formatter, "host JIT compilation failed: {error}"),
             JitError::UnknownHelper { index } => {
                 write!(
@@ -47,8 +54,8 @@ impl Error for JitError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             JitError::Lower(error) => Some(error),
+            JitError::InvalidLoweredModule(_) | JitError::UnknownHelper { .. } => None,
             JitError::Module(error) => Some(error.as_ref()),
-            JitError::UnknownHelper { .. } => None,
         }
     }
 }
@@ -72,11 +79,14 @@ struct JitUnit {
     function: FuncId,
 }
 
-/// A finalized host-native program. Its executable memory remains owned by the
-/// contained [`JITModule`] and entries are callable only through
-/// [`NativeEntryTable`].
+/// A finalized host-native program. It owns its [`JITModule`] *and* the
+/// `FinalizedMemory` receipt proving every owned mapping reached its exact
+/// final protection. Entries are callable only through [`NativeEntryTable`],
+/// reached through the receipt-owning program; its module remains private.
 pub struct JitProgram {
     module: JITModule,
+    /// Proof that every mapping finalized before this program was published.
+    _memory: FinalizedMemory,
     functions: Vec<JitUnit>,
     program_bytes: Vec<u8>,
     entry_module: u32,
@@ -118,7 +128,9 @@ impl NativeEntryTable for JitProgram {
                 module_id,
                 function_id,
             })?;
-        Ok(JitEntry::new(&self.module, self.functions[index].function).invoke(frame, out))
+        let entry = &self.functions[index];
+        require_frame_module_id(frame, entry.module_id)?;
+        Ok(JitEntry::new(&self.module, entry.function).invoke(frame, out))
     }
 }
 
@@ -126,16 +138,36 @@ impl NativeEntryTable for JitProgram {
 /// for the current host. Module-local ids remain local and native entries are
 /// keyed by `(module_id, function_id)`.
 pub fn compile_jit(bytecode: &BytecodeProgram<Verified>) -> Result<JitProgram, JitError> {
+    let (module, memory, program_bytes) = build_module(bytecode)?;
+    let lowered = lower_program(bytecode, module.target_config())?;
+    compile_lowered(module, memory, lowered, program_bytes)
+}
+
+/// Builds a `JITModule` with the W^X memory provider installed *before*
+/// [`JITModule::new`], and returns the lifecycle handle that mints the
+/// publication receipt once finalization completes.
+///
+/// The handle is held outside the module because `JITModule` consumes the
+/// provider: the provider moves into the module and is unreachable afterward,
+/// but everything `compile_lowered` needs (the receipt) is observable through
+/// the handle.
+fn build_module(
+    bytecode: &BytecodeProgram<Verified>,
+) -> Result<(JITModule, WxMemoryHandle, Vec<u8>), JitError> {
     let program_bytes = bytecode.encode();
     let mut builder = JITBuilder::new(default_libcall_names())?;
+    let (provider, memory) = WxMemoryProvider::new();
+    // Install the W^X provider before construction so no executable mapping is
+    // ever created through the default `SystemMemoryProvider` ceiling.
+    builder.memory_provider(Box::new(provider));
     bind_runtime_helpers(&mut builder);
     let module = JITModule::new(builder);
-    let lowered = lower_program(bytecode, module.target_config())?;
-    compile_lowered(module, lowered, program_bytes)
+    Ok((module, memory, program_bytes))
 }
 
 fn compile_lowered(
     mut module: JITModule,
+    memory: WxMemoryHandle,
     lowered: LoweredProgram,
     program_bytes: Vec<u8>,
 ) -> Result<JitProgram, JitError> {
@@ -145,16 +177,35 @@ fn compile_lowered(
         .map(|module| module.functions.len())
         .sum();
     let mut functions = Vec::with_capacity(function_count);
-    for lowered_module in &lowered.modules {
-        for function in &lowered_module.functions {
+    let mut declared_functions = std::collections::HashMap::with_capacity(function_count);
+    for (module_index, lowered_module) in lowered.modules.iter().enumerate() {
+        let module_id = lowered_module.id.get();
+        if module_id as usize != module_index {
+            return Err(JitError::InvalidLoweredModule(format!(
+                "module {module_id} appears at index {module_index}"
+            )));
+        }
+        for (function_index, function) in lowered_module.functions.iter().enumerate() {
+            let function_id = function.id.get();
+            if function_id as usize != function_index {
+                return Err(JitError::InvalidLoweredModule(format!(
+                    "module {module_id} function {function_id} appears at local index {function_index}"
+                )));
+            }
+            let declared =
+                module.declare_function(&function.symbol, Linkage::Local, &function.signature)?;
+            if declared_functions
+                .insert((module_id, function_id), declared)
+                .is_some()
+            {
+                return Err(JitError::InvalidLoweredModule(format!(
+                    "duplicate declaration for module {module_id} function {function_id}"
+                )));
+            }
             functions.push(JitUnit {
-                module_id: lowered_module.id.get(),
-                function_id: function.id.get(),
-                function: module.declare_function(
-                    &function.symbol,
-                    Linkage::Local,
-                    &function.signature,
-                )?,
+                module_id,
+                function_id,
+                function: declared,
             });
         }
     }
@@ -170,20 +221,36 @@ fn compile_lowered(
         )?);
     }
 
-    let mut unit_index = 0;
     for lowered_module in lowered.modules {
         for function in lowered_module.functions {
+            let declared = declared_functions
+                .get(&(lowered_module.id.get(), function.id.get()))
+                .copied()
+                .ok_or_else(|| {
+                    JitError::InvalidLoweredModule(format!(
+                        "missing declaration for module {} function {}",
+                        lowered_module.id.get(),
+                        function.id.get()
+                    ))
+                })?;
             let mut clif = function.clif;
             rebind_helper_imports(&mut clif, &helpers)?;
             let mut context = Context::for_function(clif);
-            module.define_function(functions[unit_index].function, &mut context)?;
-            unit_index += 1;
+            module.define_function(declared, &mut context)?;
         }
     }
     module.finalize_definitions()?;
 
+    // Publication requires the receipt. `finalize_definitions` returned `Ok`, so
+    // the provider reached `Executable` only after every owned mapping
+    // transitioned to its exact final protection; `require_finalized` is then
+    // infallible in practice. No receipt exists in `Writable` or `Freed`, so a
+    // partially-finalized module (which errors above) can never publish.
+    let receipt = memory.require_finalized();
+
     Ok(JitProgram {
         module,
+        _memory: receipt,
         functions,
         program_bytes,
         entry_module: lowered.entry_module.get(),
@@ -236,7 +303,17 @@ fn helper_address(helper: Helper) -> *const u8 {
         Helper::DeleteProperty => bamts_native::bamts_delete_property as *const u8,
         Helper::Call => bamts_native::bamts_call as *const u8,
         Helper::Construct => bamts_native::bamts_construct as *const u8,
+        Helper::ConstructWithNewTarget => {
+            bamts_native::bamts_construct_with_new_target as *const u8
+        }
+        Helper::DefineDataProperty => bamts_native::bamts_define_data_property as *const u8,
+        Helper::LoadOwnDescriptorSlot => bamts_native::bamts_load_own_descriptor_slot as *const u8,
+        Helper::DefineOwnDescriptorSlot => {
+            bamts_native::bamts_define_own_descriptor_slot as *const u8
+        }
+        Helper::WithHasBinding => bamts_native::bamts_with_has_binding as *const u8,
         Helper::Import => bamts_native::bamts_import as *const u8,
+        Helper::ImportDynamic => bamts_native::bamts_import_dynamic as *const u8,
         Helper::Truthy => bamts_native::bamts_truthy as *const u8,
         Helper::ResumeValue => bamts_native::bamts_resume_value as *const u8,
         Helper::DefineAccessor => bamts_native::bamts_define_accessor as *const u8,
@@ -256,6 +333,14 @@ fn helper_address(helper: Helper) -> *const u8 {
         Helper::IteratorNext => bamts_native::bamts_iterator_next as *const u8,
         Helper::Export => bamts_native::bamts_export as *const u8,
         Helper::ConsumeFuel => bamts_native::bamts_consume_fuel as *const u8,
+        Helper::IteratorStep => bamts_native::bamts_iterator_step as *const u8,
+        Helper::IteratorResult => bamts_native::bamts_iterator_result as *const u8,
+        Helper::IteratorClose => bamts_native::bamts_iterator_close as *const u8,
+        Helper::RequireCloseResult => bamts_native::bamts_require_close_result as *const u8,
+        Helper::LoadImportMeta => bamts_native::bamts_load_import_meta as *const u8,
+        Helper::ToObject => bamts_native::bamts_to_object as *const u8,
+        Helper::DisposeCapture => bamts_native::bamts_dispose_capture as *const u8,
+        Helper::SuppressError => bamts_native::bamts_suppress_error as *const u8,
     }
 }
 
@@ -272,7 +357,8 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use bamts_bytecode::{
-        BinaryOp, Constant, ConstantId, EcmaString, ExceptionHandler, Function as BytecodeFunction,
+        BinaryOp, Binding, BindingKind, Constant, ConstantId, EcmaString, Edge, EdgeKind,
+        EdgeTarget, ExceptionHandler, Export, ExportSource, Function as BytecodeFunction,
         FunctionFlags, FunctionId, Instruction, Module, ModuleId, Pc, Program, ProgramModule,
         Register,
     };
@@ -281,12 +367,14 @@ mod tests {
         NativeFrame, NativeHelper, NativeOps, ShadowFrame, Value, with_native_ops,
     };
     use bamts_runtime::{
-        Host, Limits, NativeError, RuntimeError, RuntimeErrorKind, run_linked_program,
+        Host, Limits, Machine, NativeError, RuntimeError, RuntimeErrorKind, run_linked_program,
     };
+    use cranelift_module::Module as _;
 
-    use crate::Helper;
+    use crate::{Helper, lower_program};
 
-    use super::compile_jit;
+    use super::{JitProgram, build_module, compile_jit, compile_lowered};
+    use crate::jit_memory::WxPhase;
 
     struct SilentHost;
 
@@ -511,6 +599,18 @@ mod tests {
                 Ok(CompletionTag::FatalTrap)
             );
         }
+
+        let mut register = Value::UNINITIALIZED;
+        let mut mismatched_frame = ShadowFrame::new(core::ptr::null_mut(), 0, 1, &mut register, 1);
+        let mut mismatched_out = Completion::new(Value::int32(123));
+        assert_eq!(
+            program.invoke(0, 0, &mut mismatched_frame, &mut mismatched_out),
+            Err(AbiError::FrameModuleMismatch {
+                selected_module_id: 0,
+                frame_module_id: 1,
+            })
+        );
+        assert_eq!(mismatched_out.value.as_int32(), Some(123));
     }
 
     #[test]
@@ -822,6 +922,69 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn finalized_jit_code_is_executable_and_not_writable() {
+        let program = compile_jit(&two_module_program()).expect("host JIT compiles");
+        let maps = std::fs::read_to_string("/proc/self/maps").expect("process maps are readable");
+
+        // Every compiled function address is executable and not writable, as an
+        // independent smoke test against `/proc/self/maps`.
+        for unit in &program.functions {
+            let address = program.module.get_finalized_function(unit.function) as usize;
+            let permissions = maps
+                .lines()
+                .find_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    let range = fields.next()?;
+                    let permissions = fields.next()?;
+                    let (start, end) = range.split_once('-')?;
+                    let start = usize::from_str_radix(start, 16).ok()?;
+                    let end = usize::from_str_radix(end, 16).ok()?;
+                    (start <= address && address < end).then_some(permissions)
+                })
+                .unwrap_or_else(|| panic!("finalized function at {address:#x} has no mapped page"));
+
+            // `finalize_definitions` must publish code with an RW -> RX transition.
+            assert!(permissions.contains('x'), "{permissions}");
+            assert!(!permissions.contains('w'), "{permissions}");
+        }
+    }
+
+    #[test]
+    fn compiled_jit_program_owns_executable_receipt_and_drops_to_freed() {
+        let bytecode = two_module_program();
+        let (module, memory, program_bytes) = build_module(&bytecode).expect("module builds");
+        let lowered = lower_program(&bytecode, module.target_config()).expect("program lowers");
+        let program = compile_lowered(module, memory.clone(), lowered, program_bytes)
+            .expect("host JIT compiles");
+
+        // The program was published, so it owns an executable receipt.
+        assert_eq!(memory.phase(), WxPhase::Executable);
+        drop(program);
+        // Dropping the program drops the module, whose provider marks `Freed`
+        // and unmaps every owned mapping exactly once.
+        assert_eq!(memory.phase(), WxPhase::Freed);
+    }
+
+    /// Compile-time proof that `JitProgram` is not `Sync`. `JITModule` carries a
+    /// `RefCell` and is not `Sync`; that guarantee is the ownership rule letting
+    /// `invoke(&self)` borrow the program safely without an active-call counter.
+    /// If `JitProgram: Sync` ever held, the trait resolution below would become
+    /// ambiguous and fail the build.
+    trait AmbiguousIfSync<A> {
+        #[allow(dead_code)]
+        fn token() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
+
+    #[test]
+    fn jit_program_is_not_sync() {
+        // If `JitProgram: Sync`, both impls apply and `A` is ambiguous.
+        let _ = <JitProgram as AmbiguousIfSync<_>>::token;
+    }
+
+    #[test]
     fn unknown_module_and_function_tuples_are_rejected() {
         let program = compile_jit(&two_module_program()).expect("host JIT compiles");
         let mut register = Value::UNINITIALIZED;
@@ -837,5 +1000,213 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn compile_lowered_rejects_out_of_order_function_identity() {
+        let bytecode = callback_reentry_program();
+        let (module, memory, program_bytes) = build_module(&bytecode).expect("module builds");
+        let mut lowered = lower_program(&bytecode, module.target_config()).expect("program lowers");
+        lowered.modules[0].functions.swap(0, 1);
+
+        assert!(matches!(
+            compile_lowered(module, memory, lowered, program_bytes),
+            Err(super::JitError::InvalidLoweredModule(message))
+                if message.contains("function 1 appears at local index 0")
+        ));
+    }
+
+    #[test]
+    fn jit_import_dynamic_instruction_matches_interpreter() {
+        let root = ProgramModule {
+            name: ConstantId::new(0),
+            code: Module::new(
+                vec![
+                    Constant::String(EcmaString::from_utf8("root")),
+                    Constant::String(EcmaString::from_utf8("./target")),
+                    Constant::String(EcmaString::from_utf8("then")),
+                    Constant::String(EcmaString::from_utf8("console")),
+                    Constant::String(EcmaString::from_utf8("log")),
+                    Constant::Int32(0),
+                    Constant::String(EcmaString::from_utf8("value")),
+                ],
+                vec![
+                    BytecodeFunction::new(
+                        None,
+                        0,
+                        0,
+                        8,
+                        FunctionFlags::default(),
+                        vec![
+                            Instruction::LoadConst {
+                                dst: Register::new(0),
+                                constant: ConstantId::new(1),
+                            },
+                            Instruction::ImportDynamic {
+                                dst: Register::new(1),
+                                specifier: Register::new(0),
+                            },
+                            Instruction::LoadConst {
+                                dst: Register::new(2),
+                                constant: ConstantId::new(2),
+                            },
+                            Instruction::GetProperty {
+                                dst: Register::new(3),
+                                object: Register::new(1),
+                                key: Register::new(2),
+                            },
+                            Instruction::CreateArray {
+                                dst: Register::new(4),
+                            },
+                            Instruction::CreateClosure {
+                                dst: Register::new(5),
+                                function: FunctionId::new(1),
+                                captures: Register::new(4),
+                            },
+                            Instruction::CreateArray {
+                                dst: Register::new(6),
+                            },
+                            Instruction::ArrayPush {
+                                array: Register::new(6),
+                                value: Register::new(5),
+                            },
+                            Instruction::Call {
+                                dst: Register::new(7),
+                                callee: Register::new(3),
+                                this_value: Register::new(1),
+                                arguments: Register::new(6),
+                            },
+                            Instruction::Halt,
+                        ],
+                        Vec::new(),
+                    ),
+                    BytecodeFunction::new(
+                        None,
+                        0,
+                        1,
+                        10,
+                        FunctionFlags::default(),
+                        vec![
+                            Instruction::LoadArguments {
+                                dst: Register::new(0),
+                            },
+                            Instruction::LoadConst {
+                                dst: Register::new(1),
+                                constant: ConstantId::new(5),
+                            },
+                            Instruction::GetProperty {
+                                dst: Register::new(2),
+                                object: Register::new(0),
+                                key: Register::new(1),
+                            },
+                            Instruction::LoadConst {
+                                dst: Register::new(3),
+                                constant: ConstantId::new(6),
+                            },
+                            Instruction::GetProperty {
+                                dst: Register::new(4),
+                                object: Register::new(2),
+                                key: Register::new(3),
+                            },
+                            Instruction::LoadGlobal {
+                                dst: Register::new(5),
+                                name: ConstantId::new(3),
+                            },
+                            Instruction::LoadConst {
+                                dst: Register::new(6),
+                                constant: ConstantId::new(4),
+                            },
+                            Instruction::GetProperty {
+                                dst: Register::new(7),
+                                object: Register::new(5),
+                                key: Register::new(6),
+                            },
+                            Instruction::CreateArray {
+                                dst: Register::new(8),
+                            },
+                            Instruction::ArrayPush {
+                                array: Register::new(8),
+                                value: Register::new(4),
+                            },
+                            Instruction::Call {
+                                dst: Register::new(9),
+                                callee: Register::new(7),
+                                this_value: Register::new(5),
+                                arguments: Register::new(8),
+                            },
+                            Instruction::Halt,
+                        ],
+                        Vec::new(),
+                    ),
+                ],
+                FunctionId::new(0),
+            )
+            .verify()
+            .expect("dynamic import root verifies"),
+            edges: vec![Edge {
+                specifier: ConstantId::new(1),
+                target: EdgeTarget::Local(ModuleId::new(1)),
+                kind: EdgeKind::Dynamic,
+            }],
+            bindings: Vec::new(),
+            exports: Vec::new(),
+        };
+        let target = ProgramModule {
+            name: ConstantId::new(0),
+            code: Module::new(
+                vec![
+                    Constant::String(EcmaString::from_utf8("target")),
+                    Constant::Int32(7),
+                    Constant::String(EcmaString::from_utf8("value")),
+                ],
+                vec![BytecodeFunction::new(
+                    None,
+                    0,
+                    0,
+                    1,
+                    FunctionFlags::default(),
+                    vec![
+                        Instruction::LoadConst {
+                            dst: Register::new(0),
+                            constant: ConstantId::new(1),
+                        },
+                        Instruction::StoreGlobal {
+                            name: ConstantId::new(2),
+                            value: Register::new(0),
+                        },
+                        Instruction::Halt,
+                    ],
+                    Vec::new(),
+                )],
+                FunctionId::new(0),
+            )
+            .verify()
+            .expect("dynamic import target verifies"),
+            edges: Vec::new(),
+            bindings: vec![Binding {
+                name: ConstantId::new(2),
+                kind: BindingKind::Hoisted,
+            }],
+            exports: vec![Export {
+                name: ConstantId::new(2),
+                source: ExportSource::Local(bamts_bytecode::BindingId::new(0)),
+            }],
+        };
+        let bytecode = Program::link(vec![root, target], ModuleId::new(0))
+            .expect("dynamic import fixture links");
+
+        let mut interpreter_host = RecordingHost::default();
+        let interpreter = Machine::new(&bytecode, &mut interpreter_host, Limits::default())
+            .run()
+            .expect("interpreter resolves local ImportDynamic");
+        assert_eq!(interpreter.outcome.exit_code, 0);
+        assert_eq!(interpreter_host.stdout, b"7\n");
+
+        let compiled = compile_jit(&bytecode).expect("JIT compiles ImportDynamic");
+        let mut jit_host = RecordingHost::default();
+        let outcome = run_linked_program(&bytecode, &compiled, &mut jit_host, &Limits::default())
+            .expect("JIT resolves local ImportDynamic");
+        assert_eq!(outcome.exit_code, interpreter.outcome.exit_code);
+        assert_eq!(jit_host.stdout, interpreter_host.stdout);
     }
 }

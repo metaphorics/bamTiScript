@@ -144,8 +144,81 @@ fn is_nan<H: Host>(
             .is_some_and(f64::is_nan),
     )))
 }
-fn trim_js(s: &str) -> &str {
-    s.trim_matches(char::is_whitespace)
+fn is_js_whitespace(unit: u16) -> bool {
+    matches!(
+        unit,
+        0x0009 | 0x000a | 0x000b | 0x000c | 0x000d | 0x0020 | 0x00a0 | 0x1680 | 0x2000
+            ..=0x200a | 0x2028 | 0x2029 | 0x202f | 0x205f | 0x3000 | 0xfeff
+    )
+}
+fn trim_start_js(units: &[u16]) -> &[u16] {
+    &units[units
+        .iter()
+        .take_while(|unit| is_js_whitespace(**unit))
+        .count()..]
+}
+fn is_ascii_digit(unit: u16) -> bool {
+    (u16::from(b'0')..=u16::from(b'9')).contains(&unit)
+}
+fn starts_ascii(units: &[u16], ascii: &[u8]) -> bool {
+    units.len() >= ascii.len()
+        && units
+            .iter()
+            .zip(ascii)
+            .all(|(unit, byte)| *unit == u16::from(*byte))
+}
+fn parse_float_units(units: &[u16]) -> f64 {
+    let units = trim_start_js(units);
+    let mut cursor = 0;
+    let mut sign = 1.0;
+    match units.first() {
+        Some(unit) if *unit == u16::from(b'-') => {
+            sign = -1.0;
+            cursor = 1;
+        }
+        Some(unit) if *unit == u16::from(b'+') => cursor = 1,
+        _ => {}
+    }
+    if starts_ascii(&units[cursor..], b"Infinity") {
+        return sign * f64::INFINITY;
+    }
+    let digits_start = cursor;
+    while units.get(cursor).is_some_and(|unit| is_ascii_digit(*unit)) {
+        cursor += 1;
+    }
+    let mut found = cursor > digits_start;
+    if units.get(cursor) == Some(&u16::from(b'.')) {
+        cursor += 1;
+        let fraction_start = cursor;
+        while units.get(cursor).is_some_and(|unit| is_ascii_digit(*unit)) {
+            cursor += 1;
+        }
+        found |= cursor > fraction_start;
+    }
+    if !found {
+        return f64::NAN;
+    }
+    if matches!(units.get(cursor), Some(unit) if *unit == u16::from(b'e') || *unit == u16::from(b'E'))
+    {
+        let exponent = cursor;
+        cursor += 1;
+        if matches!(units.get(cursor), Some(unit) if *unit == u16::from(b'+') || *unit == u16::from(b'-'))
+        {
+            cursor += 1;
+        }
+        let exponent_digits = cursor;
+        while units.get(cursor).is_some_and(|unit| is_ascii_digit(*unit)) {
+            cursor += 1;
+        }
+        if cursor == exponent_digits {
+            cursor = exponent;
+        }
+    }
+    EcmaString::from_units(&units[..cursor])
+        .to_utf8_strict()
+        .expect("numeric prefix contains only ASCII units")
+        .parse()
+        .unwrap_or(f64::NAN)
 }
 pub(super) fn parse_float<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -153,31 +226,10 @@ pub(super) fn parse_float<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let Ok(s) = machine
-        .to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?
-        .to_utf8_strict()
-    else {
-        return Ok(BuiltinOutcome::Value(crate::number_value(f64::NAN)));
-    };
-    let s = trim_js(&s);
-    let value = if s.starts_with("Infinity") {
-        f64::INFINITY
-    } else if s.starts_with("-Infinity") {
-        f64::NEG_INFINITY
-    } else {
-        let mut end = 0;
-        for i in 1..=s.len() {
-            if s[..i].parse::<f64>().is_ok() {
-                end = i
-            }
-        }
-        if end == 0 {
-            f64::NAN
-        } else {
-            s[..end].parse().unwrap_or(f64::NAN)
-        }
-    };
-    Ok(BuiltinOutcome::Value(crate::number_value(value)))
+    let text = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    Ok(BuiltinOutcome::Value(crate::number_value(
+        parse_float_units(text.as_units()),
+    )))
 }
 pub(super) fn parse_int<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -185,19 +237,17 @@ pub(super) fn parse_int<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let Ok(text) = machine
-        .to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?
-        .to_utf8_strict()
-    else {
-        return Ok(BuiltinOutcome::Value(crate::number_value(f64::NAN)));
-    };
-    let mut s = trim_js(&text);
+    let text = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let units = trim_start_js(text.as_units());
+    let mut cursor = 0;
     let mut sign = 1.0;
-    if let Some(rest) = s.strip_prefix('-') {
-        sign = -1.0;
-        s = rest
-    } else if let Some(rest) = s.strip_prefix('+') {
-        s = rest
+    match units.first() {
+        Some(unit) if *unit == u16::from(b'-') => {
+            sign = -1.0;
+            cursor = 1;
+        }
+        Some(unit) if *unit == u16::from(b'+') => cursor = 1,
+        _ => {}
     }
     let requested =
         value_number(machine.to_number(args.get(1).copied().unwrap_or(Value::int32(0)))?) as i32;
@@ -205,24 +255,32 @@ pub(super) fn parse_int<H: Host>(
     if !(2..=36).contains(&radix) {
         return Ok(BuiltinOutcome::Value(crate::number_value(f64::NAN)));
     }
-    if (requested == 0 || radix == 16) && s.get(..2).is_some_and(|x| x.eq_ignore_ascii_case("0x")) {
+    if (requested == 0 || radix == 16)
+        && (starts_ascii(&units[cursor..], b"0x") || starts_ascii(&units[cursor..], b"0X"))
+    {
         radix = 16;
-        s = &s[2..]
+        cursor += 2;
     }
     let mut value = 0.0;
     let mut found = false;
-    for byte in s.bytes() {
-        let digit = match byte {
-            b'0'..=b'9' => u32::from(byte - b'0'),
-            b'a'..=b'z' => u32::from(byte - b'a') + 10,
-            b'A'..=b'Z' => u32::from(byte - b'A') + 10,
+    for &unit in &units[cursor..] {
+        let digit = match unit {
+            unit if (u16::from(b'0')..=u16::from(b'9')).contains(&unit) => {
+                u32::from(unit - u16::from(b'0'))
+            }
+            unit if (u16::from(b'a')..=u16::from(b'z')).contains(&unit) => {
+                u32::from(unit - u16::from(b'a')) + 10
+            }
+            unit if (u16::from(b'A')..=u16::from(b'Z')).contains(&unit) => {
+                u32::from(unit - u16::from(b'A')) + 10
+            }
             _ => break,
         };
         if digit >= radix as u32 {
             break;
         }
         found = true;
-        value = value * radix as f64 + f64::from(digit);
+        value = value * f64::from(radix) + f64::from(digit);
     }
     Ok(BuiltinOutcome::Value(crate::number_value(if found {
         sign * value
@@ -331,4 +389,43 @@ fn value_of<H: Host>(
         "Number.prototype.valueOf requires that 'this' be a Number",
     )?;
     Ok(BuiltinOutcome::Value(crate::number_value(n)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::{TestHost, blank_program};
+    use super::*;
+    use crate::Limits;
+
+    #[test]
+    fn numeric_prefixes_stop_at_lone_surrogates() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let text = machine
+            .allocate(HeapEntry::String(EcmaString::from_units(&[
+                u16::from(b'1'),
+                0xd800,
+            ])))
+            .expect("malformed UTF-16 string allocation succeeds");
+
+        let BuiltinOutcome::Value(float) =
+            parse_float(&mut machine, Value::UNDEFINED, &[text], false)
+                .expect("parseFloat handles a lone surrogate after its prefix")
+        else {
+            panic!("parseFloat returns a value");
+        };
+        let BuiltinOutcome::Value(integer) = parse_int(
+            &mut machine,
+            Value::UNDEFINED,
+            &[text, Value::int32(10)],
+            false,
+        )
+        .expect("parseInt handles a lone surrogate after its prefix") else {
+            panic!("parseInt returns a value");
+        };
+
+        assert_eq!(float, Value::int32(1));
+        assert_eq!(integer, Value::int32(1));
+    }
 }

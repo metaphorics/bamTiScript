@@ -161,6 +161,9 @@ async fn worker_loop(
                 deadline_ms,
                 delay,
             })) => {
+                if let Some(previous) = keys.remove(&id) {
+                    queue.try_remove(&previous);
+                }
                 let key = queue.insert(TimerWakeup { id, deadline_ms }, delay);
                 keys.insert(id, key);
             }
@@ -305,5 +308,59 @@ impl TimerProvider for NodeTimers {
 
     fn has_pending(&self) -> bool {
         !self.pending.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Command, worker_loop};
+    use std::sync::mpsc::TryRecvError;
+    use std::time::Duration;
+
+    use tokio::runtime::Builder;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    #[test]
+    fn rescheduling_removes_the_old_deadline_before_it_can_fire() {
+        let runtime = Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime builds");
+        let (command_tx, command_rx) = unbounded_channel();
+        let (expiry_tx, expiry_rx) = std::sync::mpsc::channel();
+
+        command_tx
+            .send(Command::Schedule {
+                id: 7,
+                deadline_ms: 10,
+                delay: Duration::from_millis(10),
+            })
+            .expect("first timer command sends");
+        command_tx
+            .send(Command::Schedule {
+                id: 7,
+                deadline_ms: 500,
+                delay: Duration::from_millis(500),
+            })
+            .expect("replacement timer command sends");
+
+        runtime.block_on(async move {
+            let worker = tokio::spawn(worker_loop(command_rx, expiry_tx));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(matches!(expiry_rx.try_recv(), Err(TryRecvError::Empty)));
+
+            command_tx
+                .send(Command::Cancel { id: 7 })
+                .expect("replacement cancellation sends");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(matches!(expiry_rx.try_recv(), Err(TryRecvError::Empty)));
+
+            drop(command_tx);
+            worker.await.expect("worker exits cleanly");
+            assert!(matches!(
+                expiry_rx.try_recv(),
+                Err(TryRecvError::Disconnected)
+            ));
+        });
     }
 }

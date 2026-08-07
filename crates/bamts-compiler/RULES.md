@@ -259,8 +259,8 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Rationale: Legacy decorators have semantics that differ from standard ECMAScript decorators.
 - Sound alternative: Use standard decorators or an explicit wrapper.
 - Silence: `-A legacy-decorator-semantics`
-- Trigger: <code>TypeScript: @sealed class C {}</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Trigger: <code>TypeScript: class C { m(@dec p: number) {} }</code>
+- Clean: <code>TypeScript: class C { m(p: number) {} }</code>
 
 ## `BAMTS-W027`: `angle-bracket-assertion`
 
@@ -860,4 +860,24 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Use the CommonJS default export or a declared named export.
 - Silence: `-A cjs-esm-named-export-mismatch`
 - Trigger: <code>TypeScript: import { helper } from './legacy.js'; helper();</code><br><code>JavaScript: exports.other = () =&gt; 1;</code>
-- Clean: <code>TypeScript: import { helper } from './legacy.js'; helper();</code><br><code>JavaScript: function helper() {} module.exports = { helper };</code>
+- Clean: <code>TypeScript: import { helper, other, third } from './legacy.js'; helper(); void other; void third;</code><br><code>JavaScript: const other = 1; module.exports = { other, helper() { return 42; } }; module.exports.third = 3;</code>
+
+## `BAMTS-W087`: `no-debugger`
+
+- Group: `opinionated`
+- Default level: `allow`
+- Rationale: A debugger statement halts execution when developer tools are attached.
+- Sound alternative: Remove the statement before shipping or use a deliberate diagnostic mechanism.
+- Silence: `-A no-debugger`
+- Trigger: <code>TypeScript: debugger;</code>
+- Clean: <code>TypeScript: void 0;</code>
+
+## `BAMTS-W088`: `no-with`
+
+- Group: `javascript-compatibility`
+- Default level: `deny`
+- Rationale: A with statement changes name resolution based on dynamic scope.
+- Sound alternative: Access the object explicitly instead of changing the scope chain.
+- Silence: `-A no-with`
+- Trigger: <code>JavaScript: with (obj) body;</code>
+- Clean: <code>JavaScript: obj.body;</code>

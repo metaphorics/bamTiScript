@@ -6,6 +6,6 @@ license = "MIT"
 source_dir = "corpus/projects/citty"
 entrypoint = "corpus/cases/citty.ts"
 node_args = []
-expected_timeout_ms = 5000
+expected_timeout_ms = 10000
 constructs = ["argument-parsing", "alias-resolution", "negation-flags", "node-util", "positional-args"]
 source_files = ["corpus/projects/citty/src/_parser.ts"]

@@ -43,24 +43,41 @@ fn constructor<H: Host>(
     args: &[Value],
     constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let milliseconds = if args.len() == 1 {
-        let value = args[0];
-        match machine.string_value(value) {
-            Some(text) => parse_iso_date(&text).unwrap_or(f64::NAN),
-            None => value_number(machine.to_number(value)?),
-        }
-    } else if let Some(value) = args.first().copied() {
-        value_number(machine.to_number(value)?)
-    } else {
-        machine.host.now_ms() as f64
-    };
     if !constructing {
-        let text = iso_string(milliseconds).unwrap_or_else(|| "Invalid Date".to_owned());
+        let text = iso_string(time_clip(machine.host.now_ms() as f64))
+            .unwrap_or_else(|| "Invalid Date".to_owned());
         return Ok(BuiltinOutcome::Value(allocate_string(
             machine,
             EcmaString::from_utf8(&text),
         )?));
     }
+
+    let milliseconds = if args.is_empty() {
+        time_clip(machine.host.now_ms() as f64)
+    } else if args.len() == 1 {
+        let value = args[0];
+        let copied_time = machine
+            .runtime_slot(value)
+            .map_err(EvalFailure::Runtime)?
+            .and_then(|index| match &machine.heap[index] {
+                HeapEntry::Date { time, .. } => Some(*time),
+                _ => None,
+            });
+        if let Some(time) = copied_time {
+            time_clip(time)
+        } else if let Some(text) = machine.string_value(value) {
+            parse_iso_date(&text).unwrap_or(f64::NAN)
+        } else {
+            time_clip(value_number(machine.coerce_number_observable(value)?))
+        }
+    } else {
+        let mut components = [0.0; 7];
+        components[2] = 1.0;
+        for (component, argument) in components.iter_mut().zip(args.iter().copied()) {
+            *component = value_number(machine.to_number(argument)?);
+        }
+        date_from_components(components)
+    };
     let constructor = machine.intrinsics.global("Date").expect("Date installed");
     let prototype = machine.get_named_property(constructor, "prototype")?;
     let object = machine
@@ -147,45 +164,230 @@ fn iso_string(milliseconds: f64) -> Option<String> {
 
 fn parse_iso_date(text: &EcmaString) -> Option<f64> {
     let units = text.as_units();
-    if units.len() != 24
-        || units[4] != u16::from(b'-')
-        || units[7] != u16::from(b'-')
-        || units[10] != u16::from(b'T')
-        || units[13] != u16::from(b':')
-        || units[16] != u16::from(b':')
-        || units[19] != u16::from(b'.')
-        || units[23] != u16::from(b'Z')
-    {
-        return None;
+    let mut cursor = 0;
+    let year = parse_year(units, &mut cursor)?;
+    if cursor == units.len() {
+        return time_clip_option(milliseconds_from_civil(year, 1, 1, 0, 0, 0, 0)?);
     }
 
-    let year = decimal_component(units, 0, 4)?;
-    let month = decimal_component(units, 5, 2)?;
-    let day = decimal_component(units, 8, 2)?;
-    let hour = decimal_component(units, 11, 2)?;
-    let minute = decimal_component(units, 14, 2)?;
-    let second = decimal_component(units, 17, 2)?;
-    let millisecond = decimal_component(units, 20, 3)?;
-    if !(1..=12).contains(&month)
-        || day == 0
-        || day > days_in_month(year, month)
-        || hour > 23
+    consume(units, &mut cursor, b'-')?;
+    let month = parse_component(units, &mut cursor, 2)?;
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    if cursor == units.len() {
+        return time_clip_option(milliseconds_from_civil(year, month, 1, 0, 0, 0, 0)?);
+    }
+
+    consume(units, &mut cursor, b'-')?;
+    let day = parse_component(units, &mut cursor, 2)?;
+    if day == 0 || day > days_in_month(year, month) {
+        return None;
+    }
+    if cursor == units.len() {
+        return time_clip_option(milliseconds_from_civil(year, month, day, 0, 0, 0, 0)?);
+    }
+
+    consume(units, &mut cursor, b'T')?;
+    let hour = parse_component(units, &mut cursor, 2)?;
+    consume(units, &mut cursor, b':')?;
+    let minute = parse_component(units, &mut cursor, 2)?;
+    let mut second = 0;
+    let mut millisecond = 0;
+    if matches!(units.get(cursor), Some(unit) if *unit == u16::from(b':')) {
+        cursor += 1;
+        second = parse_component(units, &mut cursor, 2)?;
+        millisecond = parse_fraction(units, &mut cursor)?;
+    }
+    if hour > 24
         || minute > 59
         || second > 59
+        || (hour == 24 && (minute != 0 || second != 0 || millisecond != 0))
     {
         return None;
     }
 
-    let days = days_from_civil(year, month, day);
-    Some(
-        (days * 86_400_000 + hour * 3_600_000 + minute * 60_000 + second * 1_000 + millisecond)
-            as f64,
-    )
+    let offset_minutes = match units.get(cursor).copied() {
+        None => 0,
+        Some(unit) if unit == u16::from(b'Z') => {
+            cursor += 1;
+            0
+        }
+        Some(unit @ (0x002B | 0x002D)) => {
+            cursor += 1;
+            let offset_hour = parse_component(units, &mut cursor, 2)?;
+            consume(units, &mut cursor, b':')?;
+            let offset_minute = parse_component(units, &mut cursor, 2)?;
+            if offset_hour > 23 || offset_minute > 59 {
+                return None;
+            }
+            let minutes = offset_hour.checked_mul(60)?.checked_add(offset_minute)?;
+            if unit == u16::from(b'-') {
+                -minutes
+            } else {
+                minutes
+            }
+        }
+        Some(_) => return None,
+    };
+    if cursor != units.len() {
+        return None;
+    }
+
+    let milliseconds =
+        milliseconds_from_civil(year, month, day, hour, minute, second, millisecond)?
+            .checked_sub(offset_minutes.checked_mul(60_000)?)?;
+    time_clip_option(milliseconds)
+}
+
+fn date_from_components(components: [f64; 7]) -> f64 {
+    let [year, month, day, hour, minute, second, millisecond] = components;
+    let Some(mut year) = integer_component(year) else {
+        return f64::NAN;
+    };
+    let Some(month) = integer_component(month) else {
+        return f64::NAN;
+    };
+    let Some(day) = integer_component(day) else {
+        return f64::NAN;
+    };
+    let Some(hour) = integer_component(hour) else {
+        return f64::NAN;
+    };
+    let Some(minute) = integer_component(minute) else {
+        return f64::NAN;
+    };
+    let Some(second) = integer_component(second) else {
+        return f64::NAN;
+    };
+    let Some(millisecond) = integer_component(millisecond) else {
+        return f64::NAN;
+    };
+
+    if (0..=99).contains(&year) {
+        year = year.saturating_add(1900);
+    }
+    let Some(year) = year.checked_add(month.div_euclid(12)) else {
+        return f64::NAN;
+    };
+    let month = month.rem_euclid(12) + 1;
+    let Some(milliseconds) =
+        milliseconds_from_civil(year, month, day, hour, minute, second, millisecond)
+    else {
+        return f64::NAN;
+    };
+    time_clip(milliseconds as f64)
+}
+
+fn time_clip(milliseconds: f64) -> f64 {
+    if !milliseconds.is_finite() || milliseconds.abs() > 8_640_000_000_000_000.0 {
+        return f64::NAN;
+    }
+    let milliseconds = milliseconds.trunc();
+    if milliseconds == 0.0 {
+        0.0
+    } else {
+        milliseconds
+    }
+}
+
+fn time_clip_option(milliseconds: i64) -> Option<f64> {
+    let milliseconds = time_clip(milliseconds as f64);
+    milliseconds.is_finite().then_some(milliseconds)
+}
+
+fn integer_component(value: f64) -> Option<i64> {
+    (value.is_finite()
+        && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&value))
+    .then(|| value.trunc() as i64)
+}
+
+fn parse_year(units: &[u16], cursor: &mut usize) -> Option<i64> {
+    let signed = matches!(units.get(*cursor), Some(unit) if *unit == u16::from(b'+') || *unit == u16::from(b'-'));
+    let sign = if signed {
+        let sign = units[*cursor];
+        *cursor += 1;
+        sign
+    } else {
+        u16::from(b'+')
+    };
+    let year = parse_component(units, cursor, if signed { 6 } else { 4 })?;
+    if sign == u16::from(b'-') {
+        (year != 0).then_some(-year)
+    } else {
+        Some(year)
+    }
+}
+
+fn parse_component(units: &[u16], cursor: &mut usize, len: usize) -> Option<i64> {
+    let value = decimal_component(units, *cursor, len)?;
+    *cursor = cursor.checked_add(len)?;
+    Some(value)
+}
+
+fn consume(units: &[u16], cursor: &mut usize, expected: u8) -> Option<()> {
+    (units.get(*cursor) == Some(&u16::from(expected))).then(|| {
+        *cursor += 1;
+    })
+}
+
+fn parse_fraction(units: &[u16], cursor: &mut usize) -> Option<i64> {
+    if units.get(*cursor) != Some(&u16::from(b'.')) {
+        return Some(0);
+    }
+    *cursor += 1;
+    let mut millisecond = 0;
+    let mut place = 100;
+    let mut digits = 0;
+    while let Some(&unit) = units.get(*cursor) {
+        if !(u16::from(b'0')..=u16::from(b'9')).contains(&unit) {
+            break;
+        }
+        if place > 0 {
+            millisecond += i64::from(unit - u16::from(b'0')) * place;
+            place /= 10;
+        }
+        digits += 1;
+        *cursor += 1;
+    }
+    (digits > 0).then_some(millisecond)
+}
+
+fn milliseconds_from_civil(
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    millisecond: i64,
+) -> Option<i64> {
+    let days = days_from_civil_checked(year, month, day)?;
+    days.checked_mul(86_400_000)?
+        .checked_add(hour.checked_mul(3_600_000)?)?
+        .checked_add(minute.checked_mul(60_000)?)?
+        .checked_add(second.checked_mul(1_000)?)?
+        .checked_add(millisecond)
+}
+
+fn days_from_civil_checked(year: i64, month: i64, day: i64) -> Option<i64> {
+    let year = year.checked_sub(i64::from(month <= 2))?;
+    let era = year.div_euclid(400);
+    let year_of_era = year.checked_sub(era.checked_mul(400)?)?;
+    let month_prime = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + day.checked_sub(1)?;
+    era.checked_mul(146_097)?
+        .checked_add(year_of_era * 365)?
+        .checked_add(year_of_era / 4)?
+        .checked_sub(year_of_era / 100)?
+        .checked_add(day_of_year)?
+        .checked_sub(719_468)
 }
 
 fn decimal_component(units: &[u16], start: usize, len: usize) -> Option<i64> {
+    let end = start.checked_add(len)?;
     let mut value = 0_i64;
-    for &unit in &units[start..start + len] {
+    for &unit in units.get(start..end)? {
         if !(u16::from(b'0')..=u16::from(b'9')).contains(&unit) {
             return None;
         }
@@ -202,15 +404,6 @@ fn days_in_month(year: i64, month: i64) -> i64 {
         2 => 28,
         _ => 0,
     }
-}
-
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let year = year - i64::from(month <= 2);
-    let era = year.div_euclid(400);
-    let year_of_era = year - era * 400;
-    let month_prime = month + if month > 2 { -3 } else { 9 };
-    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
-    era * 146_097 + year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year - 719_468
 }
 
 fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
@@ -230,8 +423,41 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{iso_string, parse_iso_date};
-    use bamts_bytecode::EcmaString;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use bamts_native::Value;
+
+    use super::super::test_support::{blank_program, ordinary_object};
+    use super::*;
+    use crate::Limits;
+    use crate::intrinsics::{BuiltinDef, BuiltinHandler, native_function};
+
+    struct TestHost;
+
+    impl Host for TestHost {
+        fn now_ms(&mut self) -> u64 {
+            1_704_067_200_123
+        }
+    }
+
+    fn call_date(machine: &mut Machine<'_, TestHost>, args: &[Value], constructing: bool) -> Value {
+        let constructor = machine.intrinsics.global("Date").expect("Date exists");
+        let index = machine.runtime_slot(constructor).unwrap().unwrap();
+        let HeapEntry::NativeFunction {
+            callable: crate::NativeCallable::Builtin(id),
+            ..
+        } = machine.heap[index]
+        else {
+            panic!("Date constructor is native");
+        };
+        let BuiltinOutcome::Value(value) = machine
+            .call_builtin(id, Value::UNDEFINED, args, constructing)
+            .expect("Date call succeeds")
+        else {
+            panic!("Date returns a value");
+        };
+        value
+    }
 
     #[test]
     fn formats_node_24_iso_dates() {
@@ -247,11 +473,63 @@ mod tests {
     }
 
     #[test]
-    fn parses_pinned_utc_iso_dates_without_utf8_flattening() {
+    fn call_form_ignores_every_argument_and_uses_host_time() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let garbage = machine
+            .allocate(HeapEntry::String(EcmaString::from_utf8("not a date")))
+            .expect("string allocation succeeds");
+
+        for args in [&[][..], &[Value::int32(0)][..], &[garbage][..]] {
+            let value = call_date(&mut machine, args, false);
+            assert_eq!(
+                machine.string_value(value).unwrap().as_units(),
+                EcmaString::from_utf8("2024-01-01T00:00:00.123Z").as_units()
+            );
+        }
+    }
+
+    #[test]
+    fn multi_argument_construction_normalizes_components_and_time_clips() {
+        assert_eq!(
+            date_from_components([2024.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
+            1_704_067_200_000.0
+        );
+        assert_eq!(
+            date_from_components([99.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
+            915_148_800_000.0
+        );
+        assert_eq!(
+            date_from_components([2024.0, 1.0, 30.0, 24.0, 0.0, 0.0, 0.0]),
+            1_709_337_600_000.0
+        );
+        assert!(date_from_components([1.0e9, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]).is_nan());
+
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let value = call_date(
+            &mut machine,
+            &[Value::int32(2024), Value::int32(0), Value::int32(1)],
+            true,
+        );
+        assert_eq!(date_time(&machine, value).unwrap(), 1_704_067_200_000.0);
+    }
+
+    #[test]
+    fn parses_node_date_only_time_offset_and_extended_year_forms() {
         for (text, milliseconds) in [
-            ("1970-01-01T00:00:00.000Z", 0.0),
-            ("2024-02-29T23:59:59.123Z", 1_709_251_199_123.0),
-            ("2026-01-01T00:00:00.000Z", 1_767_225_600_000.0),
+            ("2024", 1_704_067_200_000.0),
+            ("2024-01", 1_704_067_200_000.0),
+            ("2024-01-01", 1_704_067_200_000.0),
+            ("2024-01-01T00:00Z", 1_704_067_200_000.0),
+            ("2024-01-01T00:00:00Z", 1_704_067_200_000.0),
+            ("2024-01-01T00:00:00", 1_704_067_200_000.0),
+            ("2024-01-01T00:00:00.1Z", 1_704_067_200_100.0),
+            ("2024-01-01T01:30:00+01:30", 1_704_067_200_000.0),
+            ("2024-01-01T00:00:00-02:30", 1_704_076_200_000.0),
+            ("2024-01-01T24:00:00Z", 1_704_153_600_000.0),
         ] {
             assert_eq!(
                 parse_iso_date(&EcmaString::from_utf8(text)),
@@ -260,17 +538,124 @@ mod tests {
             );
         }
 
+        for (text, expected) in [
+            ("+006024-02-29T23:59:59.123Z", "6024-02-29T23:59:59.123Z"),
+            ("+010000-01-01T00:00:00.000Z", "+010000-01-01T00:00:00.000Z"),
+            ("-000001-01-01T00:00:00.000Z", "-000001-01-01T00:00:00.000Z"),
+        ] {
+            let milliseconds =
+                parse_iso_date(&EcmaString::from_utf8(text)).expect("valid extended year");
+            assert_eq!(
+                iso_string(milliseconds).as_deref(),
+                Some(expected),
+                "{text}"
+            );
+        }
+
         for text in [
             "2024-02-30T00:00:00.000Z",
             "2023-02-29T00:00:00.000Z",
-            "2024-01-01T24:00:00.000Z",
+            "2024-01-01T24:00:00.001Z",
             "2024-01-01T00:60:00.000Z",
             "2024-01-01T00:00:60.000Z",
-            "2024-01-01T00:00:00.000+00:00",
-            "2024-01-01T00:00:00.00Z",
+            "2024-01-01T00:00:00.Z",
             "2024-01-01 00:00:00.000Z",
+            "-000000-01-01T00:00:00.000Z",
         ] {
             assert_eq!(parse_iso_date(&EcmaString::from_utf8(text)), None, "{text}");
         }
+    }
+    static VALUE_OF_CALLED: AtomicBool = AtomicBool::new(false);
+    static DATE_VALUE_OF_CALLED: AtomicBool = AtomicBool::new(false);
+
+    fn native(
+        machine: &mut Machine<'_, TestHost>,
+        name: &'static str,
+        handler: BuiltinHandler<TestHost>,
+    ) -> Value {
+        let id = machine.intrinsics.builtins.register(BuiltinDef {
+            name,
+            length: 0,
+            handler,
+        });
+        native_function(&mut machine.heap, id, name, 0)
+    }
+
+    fn generic_value_of(
+        _machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        VALUE_OF_CALLED.store(true, Ordering::SeqCst);
+        Ok(BuiltinOutcome::Value(Value::int32(12_345)))
+    }
+
+    fn date_value_of_override(
+        _machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        DATE_VALUE_OF_CALLED.store(true, Ordering::SeqCst);
+        Ok(BuiltinOutcome::Value(Value::int32(99_999)))
+    }
+
+    #[test]
+    fn one_argument_copies_valid_and_invalid_date_time_values() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let valid = call_date(&mut machine, &[Value::int32(0)], true);
+        let valid_copy = call_date(&mut machine, &[valid], true);
+        assert_eq!(date_time(&machine, valid_copy).unwrap(), 0.0);
+
+        let invalid = call_date(&mut machine, &[Value::number(f64::NAN)], true);
+        assert!(date_time(&machine, invalid).unwrap().is_nan());
+        let invalid_copy = call_date(&mut machine, &[invalid], true);
+        assert!(date_time(&machine, invalid_copy).unwrap().is_nan());
+    }
+
+    #[test]
+    fn one_argument_observes_generic_object_value_of() {
+        VALUE_OF_CALLED.store(false, Ordering::SeqCst);
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let source = ordinary_object(&mut machine);
+        let value_of = native(&mut machine, "valueOf", generic_value_of);
+        machine
+            .set_data_property(source, "valueOf", value_of)
+            .expect("valueOf install succeeds");
+
+        let copy = call_date(&mut machine, &[source], true);
+        assert!(
+            VALUE_OF_CALLED.load(Ordering::SeqCst),
+            "valueOf must be called"
+        );
+        assert_eq!(date_time(&machine, copy).unwrap(), 12_345.0);
+    }
+
+    #[test]
+    fn one_argument_copies_date_time_without_calling_overridden_value_of() {
+        DATE_VALUE_OF_CALLED.store(false, Ordering::SeqCst);
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let source = call_date(&mut machine, &[Value::int32(0)], true);
+        let value_of = native(&mut machine, "valueOf", date_value_of_override);
+        machine
+            .set_data_property(source, "valueOf", value_of)
+            .expect("valueOf install succeeds");
+
+        let copy = call_date(&mut machine, &[source], true);
+        assert!(
+            !DATE_VALUE_OF_CALLED.load(Ordering::SeqCst),
+            "Date valueOf must not be called when copying"
+        );
+        assert_eq!(date_time(&machine, copy).unwrap(), 0.0);
     }
 }

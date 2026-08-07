@@ -60,13 +60,14 @@ impl EcmaString {
         self.0.get(offset).copied()
     }
 
-    /// Returns a copy of the requested code-unit range.
+    /// Returns a copy of the requested code-unit range, or [`None`] when the
+    /// range is out of bounds or inverted.
     ///
     /// This deliberately permits ranges that split a surrogate pair, matching
     /// ECMAScript's code-unit indexing semantics.
     #[must_use]
-    pub fn slice_units(&self, range: Range<usize>) -> Self {
-        Self::from_units(&self.0[range])
+    pub fn slice_units(&self, range: Range<usize>) -> Option<Self> {
+        self.0.get(range).map(Self::from_units)
     }
 
     /// Returns whether every surrogate code unit is part of a valid pair.
@@ -346,8 +347,18 @@ mod tests {
     fn slices_may_split_surrogate_pairs() {
         let string = EcmaString::from_units(&[0xD800, 0xDC00]);
 
-        assert_eq!(string.slice_units(0..1).as_units(), &[0xD800]);
-        assert_eq!(string.slice_units(1..2).as_units(), &[0xDC00]);
+        assert_eq!(string.slice_units(0..1).unwrap().as_units(), &[0xD800]);
+        assert_eq!(string.slice_units(1..2).unwrap().as_units(), &[0xDC00]);
+    }
+
+    #[test]
+    fn slices_reject_invalid_ranges_without_panicking() {
+        let string = EcmaString::from_utf8("ab");
+
+        assert_eq!(string.slice_units(2..3), None);
+        let start = string.len_units() - 1;
+        let end = start - 1;
+        assert_eq!(string.slice_units(start..end), None);
     }
 
     #[test]

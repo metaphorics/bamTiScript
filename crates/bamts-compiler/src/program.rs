@@ -14,7 +14,9 @@ use bamts_bytecode::{
 };
 
 use crate::{
+    enum_plan::EnumFacts,
     lower::{self, LowerError, LowerOptions},
+    namespace_plan::NamespaceFacts,
     parser,
     pipeline::ProgramFrontendOutput,
     project::{
@@ -145,6 +147,7 @@ pub struct ResolvedProgram {
     entrypoint: SourceId,
     modules: Arc<[ResolvedModule]>,
     module_indices: HashMap<SourceId, usize>,
+    commonjs: bool,
 }
 
 impl ResolvedProgram {
@@ -174,6 +177,12 @@ impl ResolvedProgram {
         self.module_indices
             .get(&source_id)
             .map(|index| &self.modules[*index])
+    }
+
+    /// Whether compiler options select the CommonJS wrapper environment.
+    #[must_use]
+    pub const fn is_commonjs(&self) -> bool {
+        self.commonjs
     }
 
     /// Returns the eager runtime closure in the program's canonical order.
@@ -386,6 +395,10 @@ impl ProgramLoader {
             entrypoint,
             modules: Arc::from(state.modules),
             module_indices,
+            commonjs: self
+                .options
+                .module()
+                .is_some_and(|module| module.eq_ignore_ascii_case("commonjs")),
         })
     }
 
@@ -656,51 +669,145 @@ struct LoadState<'a> {
 }
 
 impl LoadState<'_> {
-    fn visit(&mut self, path: PathBuf) -> Result<SourceId, ProgramLoadError> {
-        if let Some(source_id) = self.identities.get(&path) {
-            return Ok(*source_id);
+    /// Loads `entrypoint` and its local import graph with an explicit stack.
+    ///
+    /// SourceIds are assigned in DFS preorder (first discovery). Modules are
+    /// appended in DFS postorder. Local edges are resolved left-to-right; a path
+    /// already present in `identities` is reused immediately, which both
+    /// deduplicates diamonds and retains cycle edges without re-entering.
+    fn visit(&mut self, entrypoint: PathBuf) -> Result<SourceId, ProgramLoadError> {
+        struct Frame {
+            path: PathBuf,
+            source_id: SourceId,
+            script_kind: ScriptKind,
+            source: Arc<SourceText>,
+            remaining: std::vec::IntoIter<UnresolvedEdge>,
+            dependencies: Vec<ModuleEdge>,
+            /// Local edge whose target visit is in flight (child on the stack).
+            pending_edge: Option<UnresolvedEdge>,
         }
-        let source_id = SourceId::new(
-            u32::try_from(self.identities.len()).map_err(|_| ProgramLoadError::TooManySources)?,
-        );
-        self.identities.insert(path.clone(), source_id);
 
-        let script_kind =
-            script_kind(&path).ok_or_else(|| ProgramLoadError::UnsupportedSource(path.clone()))?;
-        let text = fs::read_to_string(&path).map_err(|source| ProgramLoadError::Read {
-            path: path.clone(),
-            source,
-        })?;
-        let source = Arc::new(SourceText::new(text));
-        let parsed = parser::parse(scanner::scan(source_id, script_kind, Arc::clone(&source)));
-        let unresolved = collect_edges(parsed.product()).map_err(|range| {
-            ProgramLoadError::IllFormedModuleSpecifier {
-                importer: path.clone(),
-                range,
-            }
-        })?;
-        let mut dependencies = Vec::with_capacity(unresolved.len());
-        for edge in unresolved {
-            let target = match self.loader.resolve_edge(&path, &edge)? {
-                ResolvedEdgeTarget::Local(target_path) => {
-                    ModuleTarget::Local(self.visit(target_path)?)
-                }
-                ResolvedEdgeTarget::External(specifier) => ModuleTarget::External(specifier),
-            };
-            dependencies.push(ModuleEdge {
-                kind: edge.kind,
-                specifier: edge.specifier,
-                target,
-                range: edge.range,
-            });
+        enum Resume {
+            Enter(PathBuf),
+            Advance,
         }
-        self.modules.push(ResolvedModule {
-            identity: SourceIdentity::new(source_id, Arc::from(path)),
-            script_kind,
-            source,
-            dependencies: Arc::from(dependencies),
-        });
-        Ok(source_id)
+
+        let mut stack: Vec<Frame> = Vec::new();
+        let mut resume = Resume::Enter(entrypoint);
+
+        loop {
+            match resume {
+                Resume::Enter(path) => {
+                    if let Some(&source_id) = self.identities.get(&path) {
+                        let Some(parent) = stack.last_mut() else {
+                            return Ok(source_id);
+                        };
+                        let edge = parent.pending_edge.take().expect(
+                            "deduplicated or cyclic local resume belongs to a pending edge",
+                        );
+                        parent.dependencies.push(ModuleEdge {
+                            kind: edge.kind,
+                            specifier: edge.specifier,
+                            target: ModuleTarget::Local(source_id),
+                            range: edge.range,
+                        });
+                        resume = Resume::Advance;
+                        continue;
+                    }
+
+                    let source_id = SourceId::new(
+                        u32::try_from(self.identities.len())
+                            .map_err(|_| ProgramLoadError::TooManySources)?,
+                    );
+                    self.identities.insert(path.clone(), source_id);
+
+                    let script_kind = script_kind(&path)
+                        .ok_or_else(|| ProgramLoadError::UnsupportedSource(path.clone()))?;
+                    let text =
+                        fs::read_to_string(&path).map_err(|source| ProgramLoadError::Read {
+                            path: path.clone(),
+                            source,
+                        })?;
+                    let source = Arc::new(SourceText::new(text));
+                    let parsed =
+                        parser::parse(scanner::scan(source_id, script_kind, Arc::clone(&source)));
+                    let unresolved = collect_edges(parsed.product()).map_err(|range| {
+                        ProgramLoadError::IllFormedModuleSpecifier {
+                            importer: path.clone(),
+                            range,
+                        }
+                    })?;
+                    let dependencies = Vec::with_capacity(unresolved.len());
+                    stack.push(Frame {
+                        path,
+                        source_id,
+                        script_kind,
+                        source,
+                        remaining: unresolved.into_iter(),
+                        dependencies,
+                        pending_edge: None,
+                    });
+                    resume = Resume::Advance;
+                }
+                Resume::Advance => {
+                    let descend = {
+                        let frame = stack
+                            .last_mut()
+                            .expect("Advance always runs with a frame on the stack");
+                        loop {
+                            let Some(edge) = frame.remaining.next() else {
+                                break None;
+                            };
+                            match self.loader.resolve_edge(&frame.path, &edge)? {
+                                ResolvedEdgeTarget::Local(target_path) => {
+                                    frame.pending_edge = Some(edge);
+                                    break Some(target_path);
+                                }
+                                ResolvedEdgeTarget::External(specifier) => {
+                                    frame.dependencies.push(ModuleEdge {
+                                        kind: edge.kind,
+                                        specifier: edge.specifier,
+                                        target: ModuleTarget::External(specifier),
+                                        range: edge.range,
+                                    });
+                                }
+                            }
+                        }
+                    };
+
+                    if let Some(target_path) = descend {
+                        resume = Resume::Enter(target_path);
+                        continue;
+                    }
+
+                    let frame = stack
+                        .pop()
+                        .expect("finished module must have a frame on the stack");
+                    let source_id = frame.source_id;
+                    self.modules.push(ResolvedModule {
+                        identity: SourceIdentity::new(source_id, Arc::from(frame.path)),
+                        script_kind: frame.script_kind,
+                        source: frame.source,
+                        dependencies: Arc::from(frame.dependencies),
+                    });
+
+                    let Some(parent) = stack.last_mut() else {
+                        return Ok(source_id);
+                    };
+                    let edge = parent
+                        .pending_edge
+                        .take()
+                        .expect("finished child always completes a parent local edge");
+                    parent.dependencies.push(ModuleEdge {
+                        kind: edge.kind,
+                        specifier: edge.specifier,
+                        target: ModuleTarget::Local(source_id),
+                        range: edge.range,
+                    });
+                    resume = Resume::Advance;
+                }
+            }
+        }
     }
 }
 
@@ -716,8 +823,7 @@ fn collect_edges(source: &SourceFile) -> Result<Vec<UnresolvedEdge>, TextRange> 
     for statement in source.statements() {
         match statement.data() {
             Statement::Import(import) => {
-                let kind = if import.type_only || import_clause_is_type_only(import.clause.as_ref())
-                {
+                let kind = if import_is_type_only(import) {
                     ModuleEdgeKind::TypeOnly
                 } else {
                     ModuleEdgeKind::StaticRuntime
@@ -852,6 +958,13 @@ impl DynamicEdgeCollector<'_> {
             }
             Statement::Function(declaration) => self.scan_function(&declaration.function),
             Statement::Class(class) => self.scan_class(class),
+            Statement::Enum(declaration) => {
+                for member in &declaration.members {
+                    if let Some(initializer) = &member.data().initializer {
+                        self.scan_expression(initializer);
+                    }
+                }
+            }
             Statement::Namespace(namespace) => {
                 self.scan_statements(&namespace.body.data().statements)
             }
@@ -971,13 +1084,17 @@ impl DynamicEdgeCollector<'_> {
 
     fn scan_parameters(&mut self, parameters: &[crate::syntax::ParameterNode]) {
         for parameter in parameters {
-            for decorator in &parameter.data().decorators {
-                self.scan_expression(&decorator.data().expression);
-            }
+            self.scan_decorators(&parameter.data().decorators);
             self.scan_pattern(&parameter.data().binding);
             if let Some(initializer) = &parameter.data().initializer {
                 self.scan_expression(initializer);
             }
+        }
+    }
+
+    fn scan_decorators(&mut self, decorators: &[crate::syntax::DecoratorNode]) {
+        for decorator in decorators {
+            self.scan_expression(&decorator.data().expression);
         }
     }
 
@@ -1028,25 +1145,26 @@ impl DynamicEdgeCollector<'_> {
 
     fn scan_class(&mut self, class: &crate::syntax::ClassDeclaration) {
         use crate::syntax::{ClassMember, PropertyName};
-        for decorator in &class.decorators {
-            self.scan_expression(&decorator.data().expression);
-        }
+        self.scan_decorators(&class.decorators);
         if let Some(heritage) = &class.extends {
             self.scan_expression(&heritage.expression);
         }
         for member in &class.members {
             match member.data() {
                 ClassMember::Constructor(value) => {
+                    self.scan_decorators(&value.decorators);
                     self.scan_parameters(&value.parameters);
                     self.scan_statements(&value.body.data().statements);
                 }
                 ClassMember::Method(value) => {
+                    self.scan_decorators(&value.function.decorators);
                     if let PropertyName::Computed(expression) = &value.name {
                         self.scan_expression(expression);
                     }
                     self.scan_function(&value.function);
                 }
                 ClassMember::Property(value) => {
+                    self.scan_decorators(&value.decorators);
                     if let PropertyName::Computed(expression) = &value.name {
                         self.scan_expression(expression);
                     }
@@ -1055,6 +1173,7 @@ impl DynamicEdgeCollector<'_> {
                     }
                 }
                 ClassMember::AutoAccessor(value) => {
+                    self.scan_decorators(&value.decorators);
                     if let PropertyName::Computed(expression) = &value.name {
                         self.scan_expression(expression);
                     }
@@ -1249,6 +1368,10 @@ fn import_clause_is_type_only(clause: Option<&crate::syntax::ImportClause>) -> b
                         specifier.data().mode == ImportSpecifierMode::TypeOnly
                     })
         )
+}
+
+fn import_is_type_only(import: &crate::syntax::ImportDeclaration) -> bool {
+    import.type_only || import_clause_is_type_only(import.clause.as_ref())
 }
 
 fn push_literal_edge(
@@ -1539,6 +1662,7 @@ enum RawBindingKind {
     Lexical,
     Imported { edge: EdgeId, name: String },
     Namespace { edge: EdgeId },
+    ImportEquals { edge: EdgeId },
 }
 
 #[derive(Clone)]
@@ -1635,10 +1759,13 @@ pub fn lower_program(
         raw_modules.push(collect_raw_module(
             module,
             output.source_file(),
+            output.semantic_model().enum_facts(),
+            output.semantic_model().namespace_facts(),
             name,
             &module_ids,
         )?);
     }
+    resolve_import_equals_bindings(&mut raw_modules);
     expand_star_exports(&mut raw_modules);
 
     let mut linked_modules = Vec::with_capacity(raw_modules.len());
@@ -1649,26 +1776,32 @@ pub fn lower_program(
         .zip(raw_modules.iter())
         .enumerate()
     {
-        let file = frontend
+        let output = frontend
             .module(resolved_module.source_id())
-            .expect("frontend presence checked above")
-            .source_file();
+            .expect("frontend presence checked above");
+        let file = output.source_file();
         let strings = linkage_strings(raw);
-        let code = lower::assemble_program_module(file, options, &strings)
-            .and_then(|module| {
-                module.verify().map_err(|error| LowerError {
-                    source: file.source_id(),
-                    range: file.range(),
-                    kind: lower::LowerErrorKind::Verify(error),
-                })
+        let code = lower::assemble_program_module(
+            file,
+            options,
+            &strings,
+            output.semantic_model().enum_facts(),
+            output.semantic_model().namespace_facts(),
+        )
+        .and_then(|module| {
+            module.verify().map_err(|error| LowerError {
+                source: file.source_id(),
+                range: file.range(),
+                kind: lower::LowerErrorKind::Verify(error),
             })
-            .map_err(|error| {
-                program_lower_error(
-                    resolved_module.path(),
-                    ProgramLowerPhase::Module,
-                    ProgramLowerErrorKind::Lower(error),
-                )
-            })?;
+        })
+        .map_err(|error| {
+            program_lower_error(
+                resolved_module.path(),
+                ProgramLowerPhase::Module,
+                ProgramLowerErrorKind::Lower(error),
+            )
+        })?;
         linked_modules.push(materialize_program_module(code, raw));
         provenance.push(ExecutableModuleProvenance {
             module: ModuleId::new(index as u32),
@@ -1694,6 +1827,8 @@ pub fn lower_program(
 fn collect_raw_module(
     module: &ResolvedModule,
     file: &SourceFile,
+    enum_facts: &EnumFacts,
+    namespace_facts: &NamespaceFacts,
     name: String,
     module_ids: &HashMap<SourceId, ModuleId>,
 ) -> Result<RawModule, ProgramLowerError> {
@@ -1755,15 +1890,19 @@ fn collect_raw_module(
     }));
     let mut exports = Vec::new();
     let mut stars = Vec::new();
+    let mut exported_local_names = HashSet::new();
     for statement in file.statements() {
         collect_top_level_statement(
             module,
             file,
-            statement.data(),
+            enum_facts,
+            namespace_facts,
+            statement,
             &edge,
             &mut bindings,
             &mut exports,
             &mut stars,
+            &mut exported_local_names,
         )?;
     }
     let mut hoisted_names = HashSet::new();
@@ -1788,30 +1927,29 @@ fn collect_raw_module(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "top-level statement collection threads module binding/export accumulation state"
+)]
 fn collect_top_level_statement(
     module: &ResolvedModule,
     file: &SourceFile,
-    statement: &Statement,
+    enum_facts: &EnumFacts,
+    namespace_facts: &NamespaceFacts,
+    statement: &crate::syntax::Stmt,
     edge: &impl Fn(String) -> Result<EdgeId, ProgramLowerError>,
     bindings: &mut Vec<RawBinding>,
     exports: &mut Vec<RawExport>,
     stars: &mut Vec<EdgeId>,
+    exported_local_names: &mut HashSet<String>,
 ) -> Result<(), ProgramLowerError> {
-    match statement {
-        Statement::Import(import) if !import.type_only => {
-            let runtime = import.clause.as_ref().is_none_or(|clause| {
-                clause.default.is_some()
-                    || !matches!(
-                        &clause.binding,
-                        Some(ImportBinding::Named(specifiers))
-                            if specifiers.iter().all(|specifier| {
-                                specifier.data().mode == ImportSpecifierMode::TypeOnly
-                            })
-                    )
-            });
-            if !runtime {
-                return Ok(());
-            }
+    match statement.data() {
+        Statement::Import(import) if !import_is_type_only(import) => {
+            // Const-enum binding elision is separate from type-only erasure: a
+            // resolved const-enum named binding may omit its local runtime
+            // binding while the non-type-only declaration still retains module
+            // evaluation through the existing StaticRuntime raw edge
+            // (side-effect-import shape). No manufactured binding is created.
             let edge_id = edge(metadata_string_literal(module, file, &import.source)?)?;
             if let Some(clause) = &import.clause {
                 if let Some(default) = &clause.default {
@@ -1830,10 +1968,12 @@ fn collect_top_level_statement(
                     }),
                     Some(ImportBinding::Named(specifiers)) => {
                         for specifier in specifiers {
-                            let specifier = specifier.data();
-                            if specifier.mode == ImportSpecifierMode::TypeOnly {
+                            if enum_facts.is_elided_import_specifier(specifier.id())
+                                || specifier.data().mode == ImportSpecifierMode::TypeOnly
+                            {
                                 continue;
                             }
+                            let specifier = specifier.data();
                             bindings.push(RawBinding {
                                 name: identifier(file, &specifier.local),
                                 kind: RawBindingKind::Imported {
@@ -1846,6 +1986,29 @@ fn collect_top_level_statement(
                     None => {}
                 }
             }
+        }
+        Statement::ImportEquals(import)
+            if !import.is_type_only
+                && let crate::syntax::ExternalModuleReference::Require(specifier) =
+                    &import.reference =>
+        {
+            let edge_id = edge(metadata_string_literal(module, file, specifier)?)?;
+            bindings.push(RawBinding {
+                name: identifier(file, &import.local),
+                kind: RawBindingKind::ImportEquals { edge: edge_id },
+            });
+        }
+        Statement::ImportEquals(import)
+            if !import.is_type_only
+                && matches!(
+                    &import.reference,
+                    crate::syntax::ExternalModuleReference::Qualified(_)
+                ) =>
+        {
+            bindings.push(RawBinding {
+                name: identifier(file, &import.local),
+                kind: RawBindingKind::Lexical,
+            });
         }
         Statement::Variable(declaration)
             if matches!(declaration.kind, VariableKind::Let | VariableKind::Const) =>
@@ -1871,46 +2034,117 @@ fn collect_top_level_statement(
         }
         Statement::Class(class) => {
             if let Some(name) = &class.name {
-                bindings.push(RawBinding {
-                    name: identifier(file, name),
-                    kind: RawBindingKind::Lexical,
-                });
+                let name = identifier(file, name);
+                // `collect_var_names` already hoists merged namespace names, and
+                // class/namespace merges share that one value slot.
+                if !module_has_binding_namespace(file, namespace_facts, &name) {
+                    bindings.push(RawBinding {
+                        name,
+                        kind: RawBindingKind::Lexical,
+                    });
+                }
             }
         }
-        Statement::Export(export) => {
-            collect_export(module, file, export, edge, bindings, exports, stars)?
+        Statement::Enum(declaration) if !declaration.is_const => {
+            bindings.push(RawBinding {
+                name: identifier(file, &declaration.name),
+                kind: RawBindingKind::Hoisted,
+            });
         }
+        Statement::Namespace(_) => {
+            let plan = namespace_facts
+                .declaration(statement.id())
+                .expect("guarded namespace plan");
+            if matches!(
+                plan.acquisition(),
+                crate::namespace_plan::ContainerAcquisition::Binding
+            ) {
+                let Statement::Namespace(declaration) = statement.data() else {
+                    unreachable!("namespace plan belongs to namespace statement");
+                };
+                let name = identifier(file, &declaration.name);
+                if !bindings.iter().any(|binding| binding.name == name) {
+                    bindings.push(RawBinding {
+                        name,
+                        kind: RawBindingKind::Hoisted,
+                    });
+                }
+            }
+        }
+        Statement::Export(export) => collect_export(
+            module,
+            file,
+            enum_facts,
+            namespace_facts,
+            export,
+            edge,
+            bindings,
+            exports,
+            stars,
+            exported_local_names,
+        )?,
         _ => {}
     }
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "export collection threads module binding/export accumulation state"
+)]
 fn collect_export(
     module: &ResolvedModule,
     file: &SourceFile,
+    enum_facts: &EnumFacts,
+    namespace_facts: &NamespaceFacts,
     declaration: &ExportDeclaration,
     edge: &impl Fn(String) -> Result<EdgeId, ProgramLowerError>,
     bindings: &mut Vec<RawBinding>,
     exports: &mut Vec<RawExport>,
     stars: &mut Vec<EdgeId>,
+    exported_local_names: &mut HashSet<String>,
 ) -> Result<(), ProgramLowerError> {
     match declaration {
         ExportDeclaration::Named(ExportNamedDeclaration::Declaration(statement)) => {
             collect_top_level_statement(
                 module,
                 file,
-                statement.data(),
+                enum_facts,
+                namespace_facts,
+                statement,
                 edge,
                 bindings,
                 exports,
                 stars,
+                exported_local_names,
             )?;
-            let has_runtime_value = !matches!(
-                statement.data(),
-                Statement::Function(declaration) if declaration.function.body.is_none()
-            );
+            let has_runtime_value = match statement.data() {
+                Statement::Function(declaration) => declaration.function.body.is_some(),
+                Statement::Enum(declaration) => !declaration.is_const,
+                Statement::Namespace(declaration) => namespace_facts
+                    .declaration(statement.id())
+                    .is_some_and(|plan| {
+                        // Value-bearing bodies export as today. Empty
+                        // `export namespace N {}` still contributes one local
+                        // value export name; interface-only bodies do not.
+                        plan.is_value_bearing()
+                            || (matches!(
+                                plan.acquisition(),
+                                crate::namespace_plan::ContainerAcquisition::Binding
+                            ) && declaration.body.data().statements.is_empty())
+                    }),
+                Statement::Declare(_) => false,
+                _ => true,
+            };
             if has_runtime_value {
                 for name in lower::declared_names(file, statement) {
+                    // Merged value declarations (namespace/namespace,
+                    // class|function|enum + namespace, enum/enum) share one
+                    // local export name. Specifier-form duplicates still pass
+                    // through and fail link with DuplicateExport.
+                    if !exported_local_names.insert(name.clone()) {
+                        continue;
+                    }
                     exports.push(RawExport {
                         name: name.clone(),
                         source: RawExportSource::Local(name),
@@ -1973,6 +2207,16 @@ fn collect_export(
                 stars.push(edge_id);
             }
         }
+        ExportDeclaration::Assignment(_) => {
+            bindings.push(RawBinding {
+                name: "*export=*".to_owned(),
+                kind: RawBindingKind::Lexical,
+            });
+            exports.push(RawExport {
+                name: "default".to_owned(),
+                source: RawExportSource::Local("*export=*".to_owned()),
+            });
+        }
         ExportDeclaration::Default(default) => {
             let kind = match &default.value {
                 ExportDefaultValue::Function(function) if function.body.is_some() => {
@@ -2010,6 +2254,42 @@ fn collect_export(
     Ok(())
 }
 
+/// Rewrites each `import x = require(...)` binding to its final form.
+///
+/// A local target that re-exports its entire value via `export =` exposes the
+/// required module's value as the `default` export, so the binding becomes an
+/// `Imported { name: "default" }` reference. Everything else (external modules,
+/// local targets without `export =`) stays a namespace binding.
+fn resolve_import_equals_bindings(modules: &mut [RawModule]) {
+    let has_export_assignment: Vec<bool> = modules
+        .iter()
+        .map(|module| {
+            module
+                .bindings
+                .iter()
+                .any(|binding| binding.name == "*export=*")
+        })
+        .collect();
+    for module in modules {
+        for binding in &mut module.bindings {
+            let edge = match &binding.kind {
+                RawBindingKind::ImportEquals { edge } => *edge,
+                _ => continue,
+            };
+            let target = module.edges[edge.get() as usize].target;
+            binding.kind = match target {
+                EdgeTarget::Local(target_id) if has_export_assignment[target_id.get() as usize] => {
+                    RawBindingKind::Imported {
+                        edge,
+                        name: "default".to_owned(),
+                    }
+                }
+                EdgeTarget::Local(_) | EdgeTarget::External => RawBindingKind::Namespace { edge },
+            };
+        }
+    }
+}
+
 fn expand_star_exports(modules: &mut [RawModule]) {
     let explicit: Vec<BTreeSet<String>> = modules
         .iter()
@@ -2021,7 +2301,8 @@ fn expand_star_exports(modules: &mut [RawModule]) {
                 .collect()
         })
         .collect();
-    let mut origins: Vec<BTreeMap<String, BTreeSet<ExportOrigin>>> = modules
+    let mut cache = HashMap::new();
+    let mut additions: Vec<BTreeMap<String, BTreeSet<ExportOrigin>>> = modules
         .iter()
         .enumerate()
         .map(|(index, module)| {
@@ -2041,93 +2322,156 @@ fn expand_star_exports(modules: &mut [RawModule]) {
                 .collect()
         })
         .collect();
-    loop {
-        let previous = origins.clone();
-        let mut changed = false;
-        for (index, module) in modules.iter().enumerate() {
-            for star in &module.stars {
-                let EdgeTarget::Local(target) = module.edges[star.get() as usize].target else {
+    for (index, module) in modules.iter().enumerate() {
+        for star in &module.stars {
+            let EdgeTarget::Local(target) = module.edges[star.get() as usize].target else {
+                continue;
+            };
+            let names: Vec<String> = {
+                let mut names = modules[target.get() as usize]
+                    .exports
+                    .iter()
+                    .map(|export| export.name.clone())
+                    .collect::<Vec<_>>();
+                names.extend(additions[target.get() as usize].keys().cloned());
+                names.sort();
+                names.dedup();
+                names
+            };
+            for name in names {
+                if name == "default" || explicit[index].contains(&name) {
                     continue;
-                };
-                for (name, candidates) in &previous[target.get() as usize] {
-                    if name == "default" || explicit[index].contains(name) {
-                        continue;
-                    }
-                    let entry = origins[index].entry(name.clone()).or_default();
-                    let before = entry.len();
-                    entry.extend(candidates.iter().cloned());
-                    changed |= entry.len() != before;
+                }
+                let mut visited = BTreeSet::new();
+                visited.insert((index, name.clone()));
+                let candidates = star_export_origins(
+                    modules,
+                    &mut cache,
+                    target.get() as usize,
+                    &name,
+                    &mut visited,
+                );
+                if !candidates.is_empty() {
+                    additions[index].entry(name).or_default().extend(candidates);
                 }
             }
         }
-        if !changed {
-            break;
-        }
     }
-    for (index, module) in modules.iter_mut().enumerate() {
-        for (name, candidates) in &origins[index] {
-            if explicit[index].contains(name) || candidates.len() != 1 {
+    let mut selected: Vec<(usize, RawExport)> = Vec::new();
+    for (index, module) in modules.iter().enumerate() {
+        // Ambiguous star bindings are deliberately omitted.
+        for (name, origin) in additions[index]
+            .iter()
+            .filter(|&(_name, candidates)| candidates.len() == 1)
+            .map(|(name, candidates)| (name, candidates.first().expect("singleton candidate")))
+        {
+            // Explicit exports stay authoritative; do not re-materialize them via
+            // cyclic star edges (that would trip link-time DuplicateExport).
+            if explicit[index].contains(name) {
                 continue;
             }
-            let origin = candidates.first().expect("singleton candidate");
-            if let Some(edge) = module.stars.iter().copied().find(|edge| {
+            let selected_edge = module.stars.iter().copied().find(|edge| {
                 let EdgeTarget::Local(target) = module.edges[edge.get() as usize].target else {
                     return false;
                 };
-                origins[target.get() as usize]
-                    .get(name)
-                    .is_some_and(|origins| origins.contains(origin))
-            }) {
-                module.exports.push(RawExport {
-                    name: name.clone(),
-                    source: RawExportSource::Indirect {
-                        edge,
+                let mut visited = BTreeSet::new();
+                visited.insert((index, name.clone()));
+                star_export_origins(
+                    modules,
+                    &mut cache,
+                    target.get() as usize,
+                    name,
+                    &mut visited,
+                )
+                .contains(origin)
+            });
+            if let Some(edge) = selected_edge {
+                selected.push((
+                    index,
+                    RawExport {
                         name: name.clone(),
+                        source: RawExportSource::Indirect {
+                            edge,
+                            name: name.clone(),
+                        },
                     },
-                });
+                ));
             }
         }
     }
+    for (index, export) in selected {
+        modules[index].exports.push(export);
+    }
+}
+
+fn star_export_origins(
+    modules: &[RawModule],
+    cache: &mut HashMap<(usize, String), BTreeSet<ExportOrigin>>,
+    module_index: usize,
+    name: &str,
+    visited: &mut BTreeSet<(usize, String)>,
+) -> BTreeSet<ExportOrigin> {
+    if !visited.insert((module_index, name.to_owned())) {
+        return BTreeSet::new();
+    }
+    if let Some(candidates) = cache.get(&(module_index, name.to_owned())) {
+        return candidates.clone();
+    }
+    let module = &modules[module_index];
+    let mut candidates = BTreeSet::new();
+    if let Some(export) = module.exports.iter().find(|export| export.name == name) {
+        // An explicit export ends traversal for this module; do not also collect
+        // `export *` candidates (they must not compete with the explicit origin).
+        candidates.insert(canonical_export_origin(
+            modules,
+            export_origin(ModuleId::new(module_index as u32), module, export),
+            &mut BTreeSet::new(),
+        ));
+    } else if name != "default" {
+        for star in &module.stars {
+            let EdgeTarget::Local(target) = module.edges[star.get() as usize].target else {
+                continue;
+            };
+            candidates.extend(star_export_origins(
+                modules,
+                cache,
+                target.get() as usize,
+                name,
+                visited,
+            ));
+        }
+    }
+    cache.insert((module_index, name.to_owned()), candidates.clone());
+    candidates
 }
 
 fn export_origin(module_id: ModuleId, module: &RawModule, export: &RawExport) -> ExportOrigin {
     match &export.source {
-        RawExportSource::Local(name) => {
-            if let Some(binding) = module.bindings.iter().find(|binding| binding.name == *name) {
-                match &binding.kind {
-                    RawBindingKind::Imported { edge, name } => match module.edges
-                        [edge.get() as usize]
-                        .target
-                    {
-                        EdgeTarget::Local(target) => ExportOrigin::Indirect(target, name.clone()),
-                        EdgeTarget::External => ExportOrigin::External(
-                            module.edges[edge.get() as usize]
-                                .external_identity
-                                .clone()
-                                .unwrap_or_else(|| {
-                                    module.edges[edge.get() as usize].specifier.clone()
-                                }),
-                            name.clone(),
-                        ),
-                    },
-                    _ => ExportOrigin::Local(module_id, name.clone()),
+        RawExportSource::Local(name) => module
+            .bindings
+            .iter()
+            .find(|binding| binding.name == *name)
+            .and_then(|binding| match &binding.kind {
+                RawBindingKind::Imported { edge, name } => {
+                    Some(edge_export_origin(module, *edge, name))
                 }
-            } else {
-                ExportOrigin::Local(module_id, name.clone())
-            }
-        }
-        RawExportSource::Indirect { edge, name } => {
-            match module.edges[edge.get() as usize].target {
-                EdgeTarget::Local(target) => ExportOrigin::Indirect(target, name.clone()),
-                EdgeTarget::External => ExportOrigin::External(
-                    module.edges[edge.get() as usize]
-                        .external_identity
-                        .clone()
-                        .unwrap_or_else(|| module.edges[edge.get() as usize].specifier.clone()),
-                    name.clone(),
-                ),
-            }
-        }
+                _ => None,
+            })
+            .unwrap_or_else(|| ExportOrigin::Local(module_id, name.clone())),
+        RawExportSource::Indirect { edge, name } => edge_export_origin(module, *edge, name),
+    }
+}
+
+fn edge_export_origin(module: &RawModule, edge: EdgeId, name: &str) -> ExportOrigin {
+    let edge = &module.edges[edge.get() as usize];
+    match edge.target {
+        EdgeTarget::Local(target) => ExportOrigin::Indirect(target, name.to_owned()),
+        EdgeTarget::External => ExportOrigin::External(
+            edge.external_identity
+                .clone()
+                .unwrap_or_else(|| edge.specifier.clone()),
+            name.to_owned(),
+        ),
     }
 }
 
@@ -2214,6 +2558,9 @@ fn materialize_program_module(
                     name: constant(name),
                 },
                 RawBindingKind::Namespace { edge } => BindingKind::Namespace { edge: *edge },
+                RawBindingKind::ImportEquals { .. } => {
+                    unreachable!("import equals bindings are resolved before materialization")
+                }
             },
         })
         .collect();
@@ -2252,10 +2599,48 @@ fn normalized_module_name(root: &ProjectRoot, path: &Path) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+fn module_has_binding_namespace(
+    file: &SourceFile,
+    namespace_facts: &NamespaceFacts,
+    name: &str,
+) -> bool {
+    fn matches_namespace(
+        file: &SourceFile,
+        namespace_facts: &NamespaceFacts,
+        statement: &crate::syntax::Stmt,
+        name: &str,
+    ) -> bool {
+        let Statement::Namespace(declaration) = statement.data() else {
+            return false;
+        };
+        if identifier(file, &declaration.name) != name {
+            return false;
+        }
+        namespace_facts
+            .declaration(statement.id())
+            .is_some_and(|plan| {
+                matches!(
+                    plan.acquisition(),
+                    crate::namespace_plan::ContainerAcquisition::Binding
+                )
+            })
+    }
+
+    file.statements()
+        .iter()
+        .any(|statement| match statement.data() {
+            Statement::Namespace(_) => matches_namespace(file, namespace_facts, statement, name),
+            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
+                inner,
+            ))) => matches_namespace(file, namespace_facts, inner, name),
+            _ => false,
+        })
+}
+
 fn identifier(file: &SourceFile, node: &crate::syntax::IdentifierNode) -> String {
-    file.token_text(node.data().token())
+    file.identifier_text(node.data().token())
         .expect("parser identifier range belongs to its source")
-        .to_owned()
+        .into_owned()
 }
 
 fn metadata_string_literal(
@@ -2325,8 +2710,8 @@ mod tests {
         project::{ProjectConfig, ProjectRoot},
     };
     use bamts_bytecode::{
-        BindingKind, EcmaString, EdgeKind, EdgeTarget, ExportSource, Instruction, ProgramModule,
-        ProgramVerifyErrorKind, ResolvedExport, Verified,
+        BindingId, BindingKind, EcmaString, EdgeId, EdgeKind, EdgeTarget, ExportSource,
+        Instruction, ProgramModule, ProgramVerifyErrorKind, ResolvedExport, Verified,
     };
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -2351,8 +2736,13 @@ mod tests {
         }
 
         fn loader(&self) -> ProgramLoader {
+            self.loader_with_config("{}")
+        }
+
+        fn loader_with_config(&self, config_source: &str) -> ProgramLoader {
             let root = ProjectRoot::new(fs::canonicalize(&self.0).unwrap()).unwrap();
-            let config = ProjectConfig::parse(&root, self.0.join("tsconfig.json"), "{}").unwrap();
+            let config =
+                ProjectConfig::parse(&root, self.0.join("tsconfig.json"), config_source).unwrap();
             ProgramLoader::new(&root, config.options()).unwrap()
         }
     }
@@ -2438,6 +2828,267 @@ mod tests {
     }
 
     #[test]
+    fn program_lowering_inlines_a_local_const_enum_member() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "const enum K { X = 2, Y = X + 3 } K.Y !== 5;");
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        assert!(
+            !instructions(main)
+                .any(|instruction| matches!(instruction, Instruction::LoadGlobal { .. }))
+        );
+    }
+
+    #[test]
+    fn program_lowering_binds_a_qualified_import_equals_without_a_runtime_edge() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "main.ts",
+            "declare namespace A { export namespace B { export const value: number; } } import X = A.B; const observed = X;",
+        );
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        assert!(main.edges().is_empty());
+        let binding = main
+            .bindings()
+            .iter()
+            .find(|binding| constant_string(main, binding.name) == "X")
+            .expect("qualified import equals declares a module binding");
+        assert!(matches!(binding.kind, BindingKind::Lexical));
+        assert!(
+            !instructions(main)
+                .any(|instruction| matches!(instruction, Instruction::Import { .. }))
+        );
+    }
+
+    #[test]
+    fn program_lowering_erases_ambient_qualified_import_equals_without_load_global() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "main.ts",
+            "declare namespace A { export namespace B { export const value: number; } } import X = A.B; type Alias = X;",
+        );
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        assert!(
+            !instructions(main)
+                .any(|instruction| matches!(instruction, Instruction::LoadGlobal { .. })),
+            "ambient qualified import-equals must not fall back to LoadGlobal"
+        );
+    }
+
+    #[test]
+    fn program_lowering_elides_a_sole_imported_const_enum_binding() {
+        let fixture = Fixture::new();
+        fixture.write("a.ts", "export const enum K { X = 2, Y = X + 3 }");
+        fixture.write(
+            "main.ts",
+            "import { K } from './a.ts'; if (K.Y !== 5) throw 'incorrect';",
+        );
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        assert!(main.bindings().is_empty());
+        assert_eq!(main.edges().len(), 1);
+        assert_eq!(main.edges()[0].kind, EdgeKind::Static);
+        assert_eq!(constant_string(main, main.edges()[0].specifier), "./a.ts");
+    }
+
+    #[test]
+    fn program_lowering_elides_only_imported_const_enum_bindings() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "a.ts",
+            "export const enum K { X = 2, Y = X + 3 } export const value = 7;",
+        );
+        fixture.write(
+            "main.ts",
+            "import { K, value } from './a.ts'; if (K.Y !== 5 || value !== 7) throw 'incorrect';",
+        );
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        assert_eq!(main.edges().len(), 1);
+        assert_eq!(main.edges()[0].kind, EdgeKind::Static);
+        assert_eq!(main.bindings().len(), 1);
+        let binding = &main.bindings()[0];
+        assert_eq!(constant_string(main, binding.name), "value");
+        assert!(matches!(binding.kind, BindingKind::Imported { .. }));
+    }
+
+    #[test]
+    fn program_lowering_distinguishes_same_named_enum_and_value_imports() {
+        let fixture = Fixture::new();
+        fixture.write("enum.ts", "export const enum K { Y = 5 }");
+        fixture.write("value.ts", "export const K = 7;");
+        fixture.write(
+            "main.ts",
+            "import { K as enum_k } from './enum.ts'; import { K } from './value.ts'; if (enum_k.Y !== 5 || K !== 7) throw 'incorrect';",
+        );
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        assert_eq!(main.bindings().len(), 1);
+        let binding = &main.bindings()[0];
+        assert_eq!(constant_string(main, binding.name), "K");
+        assert!(matches!(binding.kind, BindingKind::Imported { .. }));
+    }
+
+    #[test]
+    fn program_lowering_retains_module_evaluation_for_elided_const_enum_imports() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "enum_dep.ts",
+            "export let evaluated = 0; evaluated += 1; export const enum K { X = 1, Y = X + 2 }",
+        );
+        fixture.write(
+            "type_dep.ts",
+            "export let type_evaluated = 0; type_evaluated += 1; export const enum OnlyType { Z = 9 }",
+        );
+        fixture.write(
+            "mixed_dep.ts",
+            "export const enum MixedEnum { A = 4 } export const value = 7;",
+        );
+        fixture.write(
+            "main.ts",
+            "import { K } from './enum_dep.ts'; import type { OnlyType } from './type_dep.ts'; import { MixedEnum, value } from './mixed_dep.ts'; type Shape = K; const typed: OnlyType = 9 as OnlyType; if (value !== 7) throw 'incorrect'; typed as Shape;",
+        );
+
+        let resolved = fixture.loader().load("main.ts").unwrap();
+        let runtime: Vec<_> = resolved
+            .runtime_modules()
+            .iter()
+            .map(|module| module.path().file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert!(
+            runtime.contains(&"enum_dep.ts"),
+            "non-type-only const-enum import keeps the dependency in the runtime closure"
+        );
+        assert!(runtime.contains(&"mixed_dep.ts"));
+        assert!(
+            !runtime.contains(&"type_dep.ts"),
+            "import type stays outside the runtime closure"
+        );
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        let enum_dep = module(&executable, "enum_dep.ts");
+        let mixed_dep = module(&executable, "mixed_dep.ts");
+
+        assert!(
+            main.edges().iter().any(|edge| {
+                edge.kind == EdgeKind::Static
+                    && constant_string(main, edge.specifier) == "./enum_dep.ts"
+            }),
+            "elided const-enum import retains a side-effect StaticRuntime edge"
+        );
+        assert!(
+            main.bindings()
+                .iter()
+                .all(|binding| constant_string(main, binding.name) != "K"),
+            "importer emits no runtime local for the const enum"
+        );
+        assert!(
+            enum_dep
+                .bindings()
+                .iter()
+                .all(|binding| constant_string(enum_dep, binding.name) != "K"),
+            "exported const enum itself has no runtime binding"
+        );
+        assert!(
+            enum_dep
+                .bindings()
+                .iter()
+                .any(|binding| constant_string(enum_dep, binding.name) == "evaluated"),
+            "observable top-level work in the enum module remains"
+        );
+
+        assert!(
+            main.edges()
+                .iter()
+                .all(|edge| constant_string(main, edge.specifier) != "./type_dep.ts"),
+            "import type is erased from wire edges"
+        );
+        let provenance = executable
+            .provenance()
+            .iter()
+            .find(|item| item.source().path().ends_with("main.ts"))
+            .expect("main provenance");
+        assert!(
+            provenance
+                .type_only_edges()
+                .any(|edge| edge.specifier() == "./type_dep.ts")
+        );
+
+        let mixed_edges: Vec<_> = main
+            .edges()
+            .iter()
+            .filter(|edge| constant_string(main, edge.specifier) == "./mixed_dep.ts")
+            .collect();
+        assert_eq!(mixed_edges.len(), 1);
+        assert_eq!(mixed_edges[0].kind, EdgeKind::Static);
+        assert_eq!(
+            main.bindings()
+                .iter()
+                .filter(|binding| matches!(binding.kind, BindingKind::Imported { .. }))
+                .count(),
+            1
+        );
+        let value = main
+            .bindings()
+            .iter()
+            .find(|binding| constant_string(main, binding.name) == "value")
+            .expect("mixed import keeps the real value binding once");
+        assert!(matches!(value.kind, BindingKind::Imported { .. }));
+        assert!(
+            main.bindings()
+                .iter()
+                .all(|binding| constant_string(main, binding.name) != "MixedEnum")
+        );
+        assert!(
+            mixed_dep
+                .bindings()
+                .iter()
+                .all(|binding| constant_string(mixed_dep, binding.name) != "MixedEnum")
+        );
+    }
+
+    #[test]
+    fn program_lowering_binds_export_star_namespace_as_live_export_metadata() {
+        let fixture = Fixture::new();
+        fixture.write("dep.ts", "export const value = 7;");
+        fixture.write("main.ts", "export * as ns from './dep.ts';");
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        assert_eq!(main.edges().len(), 1);
+        assert_eq!(main.edges()[0].kind, EdgeKind::Static);
+
+        let binding = main
+            .bindings()
+            .iter()
+            .find(|binding| constant_string(main, binding.name) == "*namespace:ns*")
+            .expect("export * as ns keeps a synthetic namespace binding");
+        assert!(
+            matches!(binding.kind, BindingKind::Namespace { edge } if edge == EdgeId::new(0)),
+            "namespace export binds the existing module namespace object"
+        );
+
+        let export = main
+            .exports()
+            .iter()
+            .find(|export| constant_string(main, export.name) == "ns")
+            .expect("export * as ns exposes the named export");
+        assert!(
+            matches!(export.source, ExportSource::Local(binding) if constant_string(main, main.bindings()[binding.get() as usize].name) == "*namespace:ns*"),
+            "named namespace export points at the namespace binding"
+        );
+    }
+
+    #[test]
     fn program_lowering_keeps_static_imports_live_without_snapshot_opcodes() {
         let fixture = Fixture::new();
         fixture.write("dep.ts", "export let value = 1; value = 2;");
@@ -2474,6 +3125,73 @@ mod tests {
             executable.wire().resolve_export(main_id, &EcmaString::from_utf8("observed")),
             Some(ResolvedExport::Local { module, .. })
                 if module != main_id
+        ));
+    }
+
+    #[test]
+    fn program_lowering_links_external_import_equals_as_one_namespace_binding() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "main.ts",
+            "import util = require('node:util'); util.parseArgs;",
+        );
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        assert_eq!(main.edges().len(), 1);
+        assert_eq!(main.edges()[0].target, EdgeTarget::External);
+        assert_eq!(main.edges()[0].kind, EdgeKind::Static);
+        assert_eq!(main.bindings().len(), 1);
+        let binding = &main.bindings()[0];
+        assert_eq!(constant_string(main, binding.name), "util");
+        assert!(matches!(
+            binding.kind,
+            BindingKind::Namespace { edge } if edge == EdgeId::new(0)
+        ));
+        assert!(!instructions(main).any(|instruction| matches!(
+            instruction,
+            Instruction::Import { .. } | Instruction::Export { .. }
+        )));
+    }
+
+    #[test]
+    fn program_lowering_links_local_import_equals_as_one_namespace_binding() {
+        let fixture = Fixture::new();
+        fixture.write("dep.ts", "export const value = 7;");
+        fixture.write("main.ts", "import dep = require('./dep.js'); dep.value;");
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        assert_eq!(main.edges().len(), 1);
+        assert!(matches!(main.edges()[0].target, EdgeTarget::Local(_)));
+        assert_eq!(main.edges()[0].kind, EdgeKind::Static);
+        assert_eq!(main.bindings().len(), 1);
+        let binding = &main.bindings()[0];
+        assert_eq!(constant_string(main, binding.name), "dep");
+        assert!(matches!(
+            binding.kind,
+            BindingKind::Namespace { edge } if edge == EdgeId::new(0)
+        ));
+    }
+
+    #[test]
+    fn program_lowering_links_local_export_assignment_import_equals_as_default_binding() {
+        let fixture = Fixture::new();
+        fixture.write("dep.ts", "export = { value: 7 };");
+        fixture.write("main.ts", "import dep = require('./dep.js'); dep;");
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        assert_eq!(main.edges().len(), 1);
+        assert!(matches!(main.edges()[0].target, EdgeTarget::Local(_)));
+        assert_eq!(main.edges()[0].kind, EdgeKind::Static);
+        assert_eq!(main.bindings().len(), 1);
+        let binding = &main.bindings()[0];
+        assert_eq!(constant_string(main, binding.name), "dep");
+        assert!(matches!(
+            binding.kind,
+            BindingKind::Imported { edge, name }
+                if edge == EdgeId::new(0) && constant_string(main, name) == "default"
         ));
     }
 
@@ -2600,6 +3318,192 @@ mod tests {
     }
 
     #[test]
+    fn program_lowering_discovers_transitive_star_exports() {
+        let fixture = Fixture::new();
+        fixture.write("dep.ts", "export let value = 1;");
+        fixture.write("mid.ts", "export * from './dep.js';");
+        fixture.write("main.ts", "export * from './mid.js';");
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        let export = main
+            .exports()
+            .iter()
+            .find(|export| constant_string(main, export.name) == "value")
+            .unwrap();
+        assert!(matches!(export.source, ExportSource::Indirect { .. }));
+        let resolved = executable
+            .wire()
+            .resolve_export(executable.wire().entry(), &EcmaString::from_utf8("value"))
+            .expect("transitive star export must resolve");
+        let ResolvedExport::Local {
+            module: resolved, ..
+        } = resolved
+        else {
+            panic!("transitive star export must stay local");
+        };
+        assert_eq!(
+            module_name(&executable.wire().modules()[resolved.get() as usize]),
+            "dep.ts"
+        );
+    }
+
+    #[test]
+    fn program_lowering_preserves_explicit_shadowing_over_star_reexports() {
+        let fixture = Fixture::new();
+        fixture.write("dep.ts", "export const value = 1;");
+        fixture.write(
+            "main.ts",
+            "export { value as shadowed } from './dep.js'; export * from './dep.js';",
+        );
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        assert!(main.exports().iter().any(|export| {
+            constant_string(main, export.name) == "shadowed"
+                && matches!(export.source, ExportSource::Indirect { .. })
+        }));
+        assert_eq!(
+            main.exports()
+                .iter()
+                .filter(|export| constant_string(main, export.name) == "value")
+                .count(),
+            1
+        );
+        assert!(
+            executable
+                .wire()
+                .resolve_export(executable.wire().entry(), &EcmaString::from_utf8("value"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn program_lowering_downstream_star_prefers_explicit_over_star_collision() {
+        let fixture = Fixture::new();
+        fixture.write("other.ts", "export const value = 1;");
+        fixture.write(
+            "mid.ts",
+            "export const value = 2; export * from './other.js';",
+        );
+        fixture.write("main.ts", "export * from './mid.js';");
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        assert_eq!(
+            main.exports()
+                .iter()
+                .filter(|export| constant_string(main, export.name) == "value")
+                .count(),
+            1
+        );
+        let resolved = executable
+            .wire()
+            .resolve_export(executable.wire().entry(), &EcmaString::from_utf8("value"))
+            .expect("downstream star must expose mid's explicit value unambiguously");
+        let ResolvedExport::Local {
+            module: resolved, ..
+        } = resolved
+        else {
+            panic!("explicit-over-star reexport must stay local");
+        };
+        assert_eq!(
+            module_name(&executable.wire().modules()[resolved.get() as usize]),
+            "mid.ts"
+        );
+    }
+
+    #[test]
+    fn program_lowering_excludes_default_from_star_reexports() {
+        let fixture = Fixture::new();
+        fixture.write("dep.ts", "export default 1; export const named = 2;");
+        fixture.write("main.ts", "export * from './dep.js';");
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        let names: Vec<_> = main
+            .exports()
+            .iter()
+            .map(|export| constant_string(main, export.name))
+            .collect();
+        assert_eq!(names, ["named"]);
+        assert!(
+            executable
+                .wire()
+                .resolve_export(executable.wire().entry(), &EcmaString::from_utf8("default"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn program_lowering_terminates_cyclic_star_reexports_without_pollution() {
+        let fixture = Fixture::new();
+        fixture.write("a.ts", "export * from './b.js'; export const a = 1;");
+        fixture.write("b.ts", "export * from './a.js'; export const b = 2;");
+        fixture.write("main.ts", "export * from './a.js';");
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        let names: Vec<_> = main
+            .exports()
+            .iter()
+            .map(|export| constant_string(main, export.name))
+            .collect();
+        assert_eq!(names, ["a", "b"]);
+        for name in ["a", "b"] {
+            let resolved = executable
+                .wire()
+                .resolve_export(executable.wire().entry(), &EcmaString::from_utf8(name))
+                .expect("cyclic star graph must resolve both direct exports");
+            let ResolvedExport::Local {
+                module: resolved, ..
+            } = resolved
+            else {
+                panic!("star reexport must stay local");
+            };
+            assert_eq!(
+                module_name(&executable.wire().modules()[resolved.get() as usize]),
+                format!("{name}.ts")
+            );
+        }
+    }
+
+    #[test]
+    fn program_lowering_star_reexports_track_live_imported_cells() {
+        let fixture = Fixture::new();
+        fixture.write("dep.ts", "export let value = 1;");
+        fixture.write(
+            "mid.ts",
+            "import { value } from './dep.js'; export { value };",
+        );
+        fixture.write("main.ts", "export * from './mid.js';");
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        let export = main
+            .exports()
+            .iter()
+            .find(|export| constant_string(main, export.name) == "value")
+            .unwrap();
+        assert!(matches!(export.source, ExportSource::Indirect { .. }));
+        let dep_index = executable
+            .wire()
+            .modules()
+            .iter()
+            .position(|candidate| module_name(candidate) == "dep.ts")
+            .unwrap() as u32;
+        let resolved = executable
+            .wire()
+            .resolve_export(executable.wire().entry(), &EcmaString::from_utf8("value"))
+            .expect("live imported cell reexport must resolve");
+        let ResolvedExport::Local { module, binding } = resolved else {
+            panic!("live imported cell reexport must stay local");
+        };
+        assert_eq!(module.get(), dep_index);
+        assert_eq!(binding, BindingId::new(0));
+    }
+
+    #[test]
     fn program_lowering_materializes_default_expression_binding() {
         let fixture = Fixture::new();
         fixture.write("main.ts", "export default 1 + 2;");
@@ -2621,6 +3525,62 @@ mod tests {
             !instructions(main)
                 .any(|instruction| matches!(instruction, Instruction::Export { .. }))
         );
+    }
+
+    #[test]
+    fn program_lowering_materializes_export_assignment_as_default_export() {
+        let fixture = Fixture::new();
+        fixture.write("equal.ts", "export = 1 + 2;");
+        fixture.write(
+            "main.ts",
+            "import * as equal from './equal.ts'; import fallback from './equal.ts';",
+        );
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let equal = module(&executable, "equal.ts");
+        let binding_index = equal
+            .bindings()
+            .iter()
+            .position(|binding| constant_string(equal, binding.name) == "*export=*")
+            .expect("export assignment owns a dedicated binding");
+        assert_eq!(equal.bindings()[binding_index].kind, BindingKind::Lexical);
+        assert!(equal.exports().iter().any(|export| {
+            constant_string(equal, export.name) == "default"
+                && export.source
+                    == ExportSource::Local(bamts_bytecode::BindingId::new(binding_index as u32))
+        }));
+        assert!(
+            !instructions(equal)
+                .any(|instruction| matches!(instruction, Instruction::Export { .. }))
+        );
+
+        let main = module(&executable, "main.ts");
+        assert!(main.bindings().iter().any(|binding| {
+            constant_string(main, binding.name) == "equal"
+                && matches!(binding.kind, BindingKind::Namespace { .. })
+        }));
+        assert!(main.bindings().iter().any(|binding| {
+            constant_string(main, binding.name) == "fallback"
+                && matches!(binding.kind, BindingKind::Imported { name, .. } if constant_string(main, name) == "default")
+        }));
+    }
+
+    #[test]
+    fn export_assignment_combined_with_default_export_is_rejected_during_link() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "export = 1; export default 2;");
+
+        let resolved = fixture.loader().load("main.ts").unwrap();
+        let frontend = compile_program_frontend(&resolved, FrontendMode::Check);
+        let error = lower_program(&resolved, &frontend, LowerOptions::default()).unwrap_err();
+        assert_eq!(error.phase, ProgramLowerPhase::Link);
+        assert!(matches!(
+            error.kind,
+            ProgramLowerErrorKind::Link(bamts_bytecode::ProgramVerifyError {
+                kind: ProgramVerifyErrorKind::DuplicateExport { .. },
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2711,7 +3671,8 @@ mod tests {
         assert_eq!(main.edges().len(), 1);
         assert_eq!(main.edges()[0].kind, EdgeKind::Dynamic);
         assert!(
-            instructions(main).any(|instruction| matches!(instruction, Instruction::Import { .. }))
+            instructions(main)
+                .any(|instruction| matches!(instruction, Instruction::ImportDynamic { .. }))
         );
     }
 
@@ -2733,8 +3694,29 @@ mod tests {
                 && matches!(binding.kind, BindingKind::Imported { .. })
         }));
         assert!(
-            instructions(main).any(|instruction| matches!(instruction, Instruction::Import { .. }))
+            instructions(main)
+                .any(|instruction| matches!(instruction, Instruction::ImportDynamic { .. }))
         );
+    }
+
+    #[test]
+    fn program_lowering_emits_import_meta_without_linkage_metadata() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "const meta = import.meta; meta.url;");
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        let loads = instructions(main)
+            .filter(|instruction| matches!(instruction, Instruction::LoadImportMeta { .. }))
+            .count();
+        assert_eq!(loads, 1);
+        assert!(main.edges().is_empty());
+        assert!(main.bindings().iter().any(|binding| {
+            constant_string(main, binding.name) == "meta"
+                && matches!(binding.kind, BindingKind::Lexical)
+        }));
+        assert!(main.exports().is_empty());
+        assert_eq!(module_name(main), "main.ts");
     }
 
     #[test]
@@ -2774,6 +3756,128 @@ mod tests {
                 specifier: "./dep.js".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn program_lowering_binds_export_namespace_as_single_value_export() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "export namespace N {}");
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        let binding_index = main
+            .bindings()
+            .iter()
+            .position(|binding| constant_string(main, binding.name) == "N")
+            .expect("export namespace owns one local binding");
+        assert_eq!(main.bindings()[binding_index].kind, BindingKind::Hoisted);
+        let exports: Vec<_> = main
+            .exports()
+            .iter()
+            .map(|export| constant_string(main, export.name))
+            .collect();
+        assert_eq!(exports, ["N"]);
+        assert_eq!(
+            main.exports()[0].source,
+            ExportSource::Local(BindingId::new(binding_index as u32))
+        );
+    }
+
+    #[test]
+    fn program_lowering_merges_duplicate_export_namespaces_into_one_export() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "main.ts",
+            "export namespace N { export const x = 1; } export namespace N { export const y = 2; }",
+        );
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        assert_eq!(
+            main.bindings()
+                .iter()
+                .filter(|binding| constant_string(main, binding.name) == "N")
+                .count(),
+            1,
+            "merged namespaces share one binding"
+        );
+        let exports: Vec<_> = main
+            .exports()
+            .iter()
+            .map(|export| constant_string(main, export.name))
+            .collect();
+        assert_eq!(exports, ["N"]);
+    }
+
+    #[test]
+    fn program_lowering_merges_export_function_and_export_namespace_without_duplicate_export() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "main.ts",
+            "export function F() { return 1; } export namespace F { export const x = 2; }",
+        );
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        assert_eq!(
+            main.bindings()
+                .iter()
+                .filter(|binding| constant_string(main, binding.name) == "F")
+                .count(),
+            1
+        );
+        let exports: Vec<_> = main
+            .exports()
+            .iter()
+            .map(|export| constant_string(main, export.name))
+            .collect();
+        assert_eq!(exports, ["F"]);
+    }
+
+    #[test]
+    fn program_lowering_merges_export_class_and_export_namespace_without_duplicate_export() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "main.ts",
+            "export class C {} export namespace C { export const x = 1; }",
+        );
+
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main = module(&executable, "main.ts");
+        assert_eq!(
+            main.bindings()
+                .iter()
+                .filter(|binding| constant_string(main, binding.name) == "C")
+                .count(),
+            1,
+            "class/namespace merge must not emit DuplicateBinding"
+        );
+        let exports: Vec<_> = main
+            .exports()
+            .iter()
+            .map(|export| constant_string(main, export.name))
+            .collect();
+        assert_eq!(exports, ["C"]);
+    }
+
+    #[test]
+    fn program_lowering_preserves_true_duplicate_namespace_exports() {
+        let fixture = Fixture::new();
+        // Specifier-form duplicates remain link failures even after namespace merge
+        // dedup for declaration exports.
+        fixture.write("main.ts", "const N = 1; export { N }; export { N };");
+
+        let resolved = fixture.loader().load("main.ts").unwrap();
+        let frontend = compile_program_frontend(&resolved, FrontendMode::Check);
+        let error = lower_program(&resolved, &frontend, LowerOptions::default()).unwrap_err();
+        assert_eq!(error.phase, ProgramLowerPhase::Link);
+        assert!(matches!(
+            error.kind,
+            ProgramLowerErrorKind::Link(bamts_bytecode::ProgramVerifyError {
+                kind: ProgramVerifyErrorKind::DuplicateExport { .. },
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2908,6 +4012,49 @@ mod tests {
     }
 
     #[test]
+    fn loads_a_long_acyclic_import_chain_iteratively() {
+        // Deep enough that the previous recursive DFS would blow the thread stack,
+        // but cheap to materialize: one tiny file per hop.
+        const DEPTH: usize = 4096;
+        let fixture = Fixture::new();
+        for index in 0..DEPTH {
+            let name = format!("m{index}.ts");
+            let source = if index + 1 == DEPTH {
+                "export {};\n".to_string()
+            } else {
+                format!("import './m{}.ts';\n", index + 1)
+            };
+            fixture.write(&name, &source);
+        }
+
+        let program = fixture.loader().load("m0.ts").unwrap();
+
+        assert_eq!(program.modules().len(), DEPTH);
+        assert_eq!(program.entrypoint_id().get(), 0);
+        assert_eq!(
+            program.modules().last().map(|module| module.source_id()),
+            Some(program.entrypoint_id())
+        );
+        assert_eq!(
+            program.modules()[0]
+                .path()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("m{}.ts", DEPTH - 1)
+        );
+        assert_eq!(
+            program.modules()[0].source_id().get(),
+            u32::try_from(DEPTH - 1).unwrap()
+        );
+        assert_eq!(
+            program.entrypoint().dependencies()[0].target(),
+            &ModuleTarget::Local(program.modules()[DEPTH - 2].source_id())
+        );
+    }
+
+    #[test]
     fn resolves_package_exports_entry() {
         let fixture = Fixture::new();
         fixture.write("main.ts", "import { answer } from 'waybread'; void answer;");
@@ -3000,6 +4147,46 @@ mod tests {
         );
         assert_eq!(program.runtime_modules().len(), 1);
     }
+
+    #[test]
+    fn retains_dynamic_imports_from_class_decorators() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "main.ts",
+            "@import('./class') class C {\n\
+             @import('./constructor') constructor() {}\n\
+             @import('./method') method() {}\n\
+             @import('./property') property;\n\
+             @import('./accessor') accessor value;\n\
+             }",
+        );
+        for module in ["class", "constructor", "method", "property", "accessor"] {
+            fixture.write(&format!("{module}.ts"), "export {};");
+        }
+
+        let program = fixture.loader().load("main.ts").unwrap();
+        let dependencies = program.entrypoint().dependencies();
+        assert_eq!(dependencies.len(), 5);
+        assert!(
+            dependencies
+                .iter()
+                .all(|dependency| dependency.kind() == ModuleEdgeKind::DynamicRuntime)
+        );
+        assert_eq!(
+            dependencies
+                .iter()
+                .map(|dependency| dependency.specifier())
+                .collect::<Vec<_>>(),
+            [
+                "./class",
+                "./constructor",
+                "./method",
+                "./property",
+                "./accessor",
+            ]
+        );
+    }
+
     #[test]
     fn classifies_import_types_without_creating_dynamic_runtime_edges() {
         let fixture = Fixture::new();
@@ -3155,5 +4342,37 @@ mod tests {
             .unwrap_or_else(|error| panic!("{entrypoint}: {error}"));
             assert_eq!(executable.wire().modules().len(), resolved.modules().len());
         }
+    }
+
+    #[test]
+    fn compiler_module_option_controls_commonjs_wrapper_bindings() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "main.ts",
+            "module; exports; require; __filename; __dirname;",
+        );
+
+        let commonjs = fixture
+            .loader_with_config(r#"{"compilerOptions": {"module": "CommonJS"}}"#)
+            .load("main.ts")
+            .unwrap();
+        assert!(commonjs.is_commonjs());
+        let commonjs_frontend = compile_program_frontend(&commonjs, FrontendMode::Check);
+        assert!(commonjs_frontend.modules().iter().all(|module| {
+            module
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.code().as_str() != "BAMTS-C002")
+        }));
+
+        let esm = fixture.loader().load("main.ts").unwrap();
+        assert!(!esm.is_commonjs());
+        let esm_frontend = compile_program_frontend(&esm, FrontendMode::Check);
+        assert!(esm_frontend.modules().iter().any(|module| {
+            module
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code().as_str() == "BAMTS-C002")
+        }));
     }
 }

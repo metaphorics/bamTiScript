@@ -1,16 +1,15 @@
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::{
     checker::{
         AnalysisFacts, HazardFact, ProgramSemanticModel, ResolvedModuleEdge, SemanticHazard,
-        SemanticModel,
+        SemanticModel, SymbolKind, is_numeric_enum_initializer,
     },
     diagnostic::{Diagnostic, Recovered},
     lint::{LintTable, SourceDialect, rule_by_code},
-    source::{SourceId, TextRange, Utf16Pos},
-    syntax::{
-        ExportDeclaration, ImportBinding, ModuleExportName, SourceFile, Statement, TokenKind,
-    },
+    source::{SourceId, TextRange},
+    syntax::*,
 };
 
 mod coercions;
@@ -26,7 +25,6 @@ mod object_types;
 pub(crate) struct SemanticRuleContext<'a> {
     source: &'a SourceFile,
     model: &'a SemanticModel,
-    program: Option<&'a ProgramSemanticModel>,
     levels: &'a LintTable,
     dialect: SourceDialect,
 }
@@ -52,7 +50,7 @@ impl<'a> SemanticRuleContext<'a> {
 pub(crate) fn analyze(
     source: &SourceFile,
     model: &SemanticModel,
-    program: Option<&ProgramSemanticModel>,
+    _program: Option<&ProgramSemanticModel>,
     levels: &LintTable,
 ) -> Vec<Diagnostic> {
     let dialect = match source.script_kind() {
@@ -64,11 +62,9 @@ pub(crate) fn analyze(
     let context = SemanticRuleContext {
         source,
         model,
-        program,
         levels,
         dialect,
     };
-    let _ = context.program;
     let mut diagnostics = Vec::new();
     object_types::analyze(&context, &mut diagnostics);
     functions::analyze(&context, &mut diagnostics);
@@ -107,647 +103,1140 @@ pub(crate) fn emit(
     }
 }
 
-fn range(source: &SourceFile, start: usize, len: usize) -> TextRange {
-    let text = source.source_text();
-    let start_position = text.byte_to_utf16(start).unwrap_or(Utf16Pos::ZERO);
-    let end_position = text
-        .byte_to_utf16(start.saturating_add(len).min(text.as_str().len()))
-        .unwrap_or(start_position);
-    TextRange::new(start_position, end_position).unwrap_or_else(|_| source.range())
-}
-
-fn push_at(
-    facts: &mut AnalysisFacts,
-    source: &SourceFile,
-    hazard: SemanticHazard,
-    start: usize,
-    len: usize,
-    note: Option<&str>,
-) {
-    facts.push(HazardFact {
-        hazard,
-        range: range(source, start, len.max(1)),
-        note: note.map(Into::into),
-    });
-}
-
-fn find_all(text: &str, needle: &str) -> Vec<usize> {
-    text.match_indices(needle).map(|(index, _)| index).collect()
-}
-
-fn unshadowed(text: &str, name: &str) -> bool {
-    ![
-        format!("const {name}"),
-        format!("let {name}"),
-        format!("var {name}"),
-        format!("function {name}"),
-        format!("class {name}"),
-        format!("import {name}"),
-    ]
-    .iter()
-    .any(|declaration| text.contains(declaration))
-}
-
-fn line_bounds(text: &str, offset: usize) -> (usize, usize) {
-    let start = text[..offset].rfind('\n').map_or(0, |index| index + 1);
-    let end = text[offset..]
-        .find('\n')
-        .map_or(text.len(), |index| offset + index);
-    (start, end)
-}
-
-fn line_at(text: &str, offset: usize) -> &str {
-    let (start, end) = line_bounds(text, offset);
-    &text[start..end]
-}
-
-fn statement_at(text: &str, offset: usize) -> &str {
-    let start = text[..offset]
-        .rfind([';', '{', '}', '\n'])
-        .map_or(0, |index| index + 1);
-    let end = text[offset..]
-        .find([';', '{', '}', '\n'])
-        .map_or(text.len(), |index| offset + index);
-    &text[start..end]
-}
-
-fn identifier_before(text: &str, offset: usize) -> Option<&str> {
-    let prefix = &text[..offset];
-    let end = prefix.trim_end().len();
-    let start = prefix[..end]
-        .rfind(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-        .map_or(0, |index| index + 1);
-    (start < end).then_some(&prefix[start..end])
-}
-
-/// Builds immutable checker evidence. Detection is centralized here so rule
-/// leaves cannot drift into independent name, type, or flow analyses.
+/// Builds immutable checker evidence from parsed nodes and resolved symbols.
 pub(crate) fn collect_facts(source: &SourceFile, model: &SemanticModel) -> AnalysisFacts {
-    let text = source.source_text().as_str();
-    let mut facts = AnalysisFacts::default();
-
-    // Index signatures and exact optional properties.
-    if text.contains("[key:") || text.contains("[name:") || text.contains("[id:") {
-        for (index, _) in text.match_indices('[') {
-            let statement = statement_at(text, index);
-            if !statement.contains(':')
-                && !statement.contains(" in ")
-                && !statement.contains("!== undefined")
-            {
-                push_at(
-                    &mut facts,
-                    source,
-                    SemanticHazard::UncheckedIndexRead,
-                    index,
-                    1,
-                    None,
-                );
-            }
-        }
-        for (index, _) in text.match_indices('.') {
-            let statement = statement_at(text, index);
-            if !statement.contains("interface ") && !statement.contains("type ") {
-                push_at(
-                    &mut facts,
-                    source,
-                    SemanticHazard::IndexSignatureDotAccess,
-                    index,
-                    1,
-                    None,
-                );
-            }
-        }
-    }
-    for (index, _) in text.match_indices("?:") {
-        let name = identifier_before(text, index).unwrap_or("");
-        let declaration_end = text[index + 2..]
-            .find('}')
-            .map_or(text.len(), |end| index + 2 + end);
-        let declaration_admits_undefined = text[index + 2..declaration_end].contains("undefined");
-        if !declaration_admits_undefined && text.contains(&format!("{name}: undefined")) {
-            let at = text.find(&format!("{name}: undefined")).unwrap_or(index);
-            push_at(
-                &mut facts,
-                source,
-                SemanticHazard::ExplicitUndefinedOptional,
-                at,
-                name.len(),
-                None,
-            );
-        }
-    }
-
-    // Function boundary hazards and inference origins.
-    for (index, _) in text.match_indices(" = ") {
-        let line = line_at(text, index);
-        if line.contains("=>") && line.contains("void") {
-            let (annotation, value) = line.split_once(" = ").unwrap_or((line, ""));
-            let annotation_params = annotation.split("=>").next().unwrap_or("");
-            let value_params = value.split("=>").next().unwrap_or("");
-            let expected = annotation_params.matches(',').count()
-                + usize::from(annotation_params.contains('(') && !annotation_params.contains("()"));
-            let actual = value_params.matches(',').count()
-                + usize::from(value_params.contains('(') && !value_params.contains("()"));
-            if expected > actual {
-                push_at(
-                    &mut facts,
-                    source,
-                    SemanticHazard::FewerCallbackParameters,
-                    index,
-                    1,
-                    None,
-                );
-            }
-            let body = value.split("=>").nth(1).unwrap_or("").trim();
-            if !body.is_empty() && !body.starts_with('{') && body != "undefined" {
-                push_at(
-                    &mut facts,
-                    source,
-                    SemanticHazard::ValueReturnedToVoid,
-                    index,
-                    1,
-                    None,
-                );
-            }
-        }
-        if line.contains('.')
-            && (line.trim_start().starts_with("const ") || line.trim_start().starts_with("let "))
-        {
-            let alias = line
-                .split_whitespace()
-                .nth(1)
-                .map(|word| word.trim_end_matches(':'))
-                .unwrap_or("");
-            if !alias.is_empty()
-                && text[index + 3..].contains(&format!("{alias}("))
-                && !line.contains(".bind(")
-            {
-                push_at(
-                    &mut facts,
-                    source,
-                    SemanticHazard::DetachedMethod,
-                    index,
-                    1,
-                    None,
-                );
-            }
-        }
-    }
-    for (index, _) in text.match_indices("function ") {
-        let (_, line_end) = line_bounds(text, index);
-        let function_text = &text[index..line_end];
-        if let Some(open) = function_text.find('(')
-            && let Some(close_offset) = function_text[open + 1..].find(')')
-        {
-            let close = open + 1 + close_offset;
-            let params = &function_text[open + 1..close];
-            for parameter in params
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                if !parameter.contains(':')
-                    && !parameter.starts_with('_')
-                    && !parameter.contains('=')
-                {
-                    push_at(
-                        &mut facts,
-                        source,
-                        SemanticHazard::ImplicitAny,
-                        index + open + 1,
-                        parameter.len(),
-                        None,
-                    );
-                }
-            }
-        }
-    }
-
-    // A readonly view remains actionable only while the object has not escaped.
-    for (readonly_index, _) in text.match_indices("readonly ") {
-        let tail = &text[readonly_index..];
-        let Some(after_equals) = tail.split('=').nth(1) else {
-            continue;
-        };
-        let alias = after_equals
-            .trim_start()
-            .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-            .next()
-            .unwrap_or("");
-        if alias.is_empty() {
-            continue;
-        }
-        let tail = &text[readonly_index..];
-        let Some(relative_write) = tail.find(&format!("{alias}.")) else {
-            continue;
-        };
-        let before_write = &tail[..relative_write];
-        let escaped = before_write
-            .lines()
-            .any(|candidate| candidate.contains(&format!("({alias})")));
-        let write_line = line_at(text, readonly_index + relative_write);
-        if !escaped && write_line.contains('=') {
-            push_at(
-                &mut facts,
-                source,
-                SemanticHazard::ReadonlyAliasMutation,
-                readonly_index + relative_write,
-                alias.len(),
-                None,
-            );
-        }
-    }
-
-    // Assertions and tainted built-ins.
-    for (index, _) in text.match_indices(" as ") {
-        let suffix = &text[index + 4..];
-        if !suffix.trim_start().starts_with("const") && !line_at(text, index).contains("JSON.parse")
-        {
-            push_at(
-                &mut facts,
-                source,
-                SemanticHazard::UncheckedAssertion,
-                index,
-                4,
-                None,
-            );
-        }
-    }
-    if unshadowed(text, "Object") {
-        for index in find_all(text, "Object.keys(") {
-            let line = line_at(text, index);
-            if line.contains("keyof") {
-                push_at(
-                    &mut facts,
-                    source,
-                    SemanticHazard::OpenObjectKeys,
-                    index,
-                    11,
-                    None,
-                );
-            }
-            if (line.contains('{') && line.contains("\"") && line.contains(':'))
-                && (line.contains("\"0\"")
-                    || line.contains("\"1\"")
-                    || line.contains("\"2\"")
-                    || line.contains("\"3\""))
-                && !line.contains(".sort(")
-            {
-                push_at(
-                    &mut facts,
-                    source,
-                    SemanticHazard::NumericKeyOrder,
-                    index,
-                    11,
-                    None,
-                );
-            }
-        }
-    }
-    if unshadowed(text, "JSON") {
-        for index in find_all(text, "JSON.parse(") {
-            let line = line_at(text, index);
-            if line.contains(':')
-                && !line.contains(": unknown")
-                && !line.contains("validate(")
-                && !line.contains("decode(")
-            {
-                push_at(
-                    &mut facts,
-                    source,
-                    SemanticHazard::UncheckedJsonParse,
-                    index,
-                    10,
-                    None,
-                );
-            }
-        }
-        for index in find_all(text, "JSON.stringify(") {
-            let line = line_at(text, index);
-            let unsafe_value = line.contains('n')
-                && line.chars().any(|character| character.is_ascii_digit())
-                || line.contains("undefined")
-                || line.contains("Symbol(")
-                || line.contains("function");
-            let has_replacer = line.matches(',').count() >= 1 || text.contains("toJSON(");
-            if unsafe_value && !has_replacer {
-                push_at(
-                    &mut facts,
-                    source,
-                    SemanticHazard::JsonStringifyUnserializable,
-                    index,
-                    14,
-                    None,
-                );
-            }
-        }
-    }
-
-    // Number and Array intrinsic rules.
-    for method in [".toString(", ".toFixed("] {
-        for index in find_all(text, method) {
-            let line = line_at(text, index);
-            let argument = line
-                .split(method)
-                .nth(1)
-                .and_then(|tail| tail.split(')').next())
-                .and_then(|value| value.trim().parse::<i32>().ok());
-            let invalid = match (method, argument) {
-                (".toString(", Some(value)) => !(2..=36).contains(&value),
-                (".toFixed(", Some(value)) => !(0..=100).contains(&value),
-                _ => false,
-            };
-            if invalid {
-                push_at(
-                    &mut facts,
-                    source,
-                    SemanticHazard::InvalidNumberFormatting,
-                    index,
-                    method.len(),
-                    None,
-                );
-            }
-        }
-    }
-    for index in find_all(text, ".sort(") {
-        let line = line_at(text, index);
-        let argument = line
-            .split(".sort(")
-            .nth(1)
-            .and_then(|tail| tail.split(')').next())
-            .unwrap_or("")
-            .trim();
-        let numeric =
-            line.contains('[') && line.chars().any(|character| character.is_ascii_digit());
-        if (argument.is_empty() || argument == "undefined")
-            && numeric
-            && !line.contains('"')
-            && !line.contains('\'')
-        {
-            push_at(
-                &mut facts,
-                source,
-                SemanticHazard::NumericDefaultSort,
-                index,
-                6,
-                None,
-            );
-        }
-    }
-
-    // Operators and interpolation.
-    for operator in [" == ", " != "] {
-        for index in find_all(text, operator) {
-            let line = line_at(text, index);
-            if !line.contains(" == null") && !line.contains(" != null") {
-                let left = line.split(operator).next().unwrap_or("");
-                let right = line.split(operator).nth(1).unwrap_or("");
-                let domains_differ = left.contains('"') != right.contains('"')
-                    || left.contains("true")
-                    || left.contains("false")
-                    || right.contains("true")
-                    || right.contains("false");
-                if domains_differ || left.contains("any") || right.contains("any") {
-                    push_at(
-                        &mut facts,
-                        source,
-                        SemanticHazard::LooseEqualityCoercion,
-                        index,
-                        operator.len(),
-                        None,
-                    );
-                }
-            }
-        }
-    }
-    for operator in [" + ", " - ", " * ", " / "] {
-        for index in find_all(text, operator) {
-            let line = line_at(text, index);
-            let object_like =
-                line.contains("Object.create(") || line.contains("{}") || line.contains("[]");
-            if object_like
-                && !line.contains("String(")
-                && !line.contains("Number(")
-                && !text.contains("Symbol.toPrimitive")
-            {
-                push_at(
-                    &mut facts,
-                    source,
-                    SemanticHazard::ObjectToPrimitive,
-                    index,
-                    operator.len(),
-                    None,
-                );
-            }
-        }
-    }
-    if unshadowed(text, "Symbol") {
-        for index in find_all(text, "${Symbol(") {
-            let tagged = text[..index]
-                .rfind('`')
-                .and_then(|tick| text[..tick].chars().last())
-                .is_some_and(|character| character.is_ascii_alphanumeric() || character == ')');
-            if !tagged {
-                push_at(
-                    &mut facts,
-                    source,
-                    SemanticHazard::SymbolInterpolation,
-                    index,
-                    2,
-                    None,
-                );
-            }
-        }
-        for index in find_all(text, "[Symbol.toStringTag]") {
-            let line = line_at(text, index);
-            let value = line.split(':').nth(1).unwrap_or("").trim();
-            if !value.starts_with('"') && !value.starts_with('\'') && !value.starts_with('`') {
-                push_at(
-                    &mut facts,
-                    source,
-                    SemanticHazard::UnsafeToStringTag,
-                    index,
-                    20,
-                    None,
-                );
-            }
-        }
-    }
-
-    collect_class_and_enum_facts(source, text, &mut facts);
-    collect_switch_facts(source, text, &mut facts);
-
-    // Suppress intrinsic spelling when the checker bound a same-named local.
-    let _ = model;
-    facts
+    let mut collector = AstFactCollector::new(source, model);
+    collector.index_declarations(source.statements());
+    collector.collect_called_names(source.statements());
+    collector.visit_statements(source.statements());
+    collector.finish()
 }
 
-fn collect_class_and_enum_facts(source: &SourceFile, text: &str, facts: &mut AnalysisFacts) {
-    for (index, _) in text.match_indices("constructor(") {
-        let tail = &text[index..];
-        if let Some(call) = tail.find("this.") {
-            let line = line_at(text, index + call);
-            if line.contains("this.") && line.contains("()") && !line.contains("super.") {
-                push_at(
-                    facts,
-                    source,
-                    SemanticHazard::VirtualCallInConstructor,
-                    index + call,
-                    5,
-                    None,
-                );
-            }
+#[derive(Clone)]
+struct ClassFacts {
+    base: Option<String>,
+    accessors: HashSet<String>,
+    methods: HashSet<String>,
+}
+
+struct AstFactCollector<'a> {
+    source: &'a SourceFile,
+    model: &'a SemanticModel,
+    facts: AnalysisFacts,
+    index_signature_types: HashSet<String>,
+    numeric_enums: HashSet<String>,
+    variable_types: HashMap<String, String>,
+    readonly_aliases: HashSet<String>,
+    called_names: HashSet<String>,
+    safe_json_parses: HashSet<TextRange>,
+    sorted_object_keys: HashSet<TextRange>,
+    classes: HashMap<String, ClassFacts>,
+    union_variants: HashMap<String, usize>,
+}
+
+impl<'a> AstFactCollector<'a> {
+    fn new(source: &'a SourceFile, model: &'a SemanticModel) -> Self {
+        Self {
+            source,
+            model,
+            facts: AnalysisFacts::default(),
+            index_signature_types: HashSet::new(),
+            numeric_enums: HashSet::new(),
+            variable_types: HashMap::new(),
+            readonly_aliases: HashSet::new(),
+            called_names: HashSet::new(),
+            safe_json_parses: HashSet::new(),
+            sorted_object_keys: HashSet::new(),
+            classes: HashMap::new(),
+            union_variants: HashMap::new(),
         }
     }
-    for (get_index, _) in text.match_indices("get ") {
-        let getter_tail = &text[get_index..];
-        let getter_head = getter_tail.split(['{', '\n']).next().unwrap_or(getter_tail);
-        let name = getter_head
-            .split_whitespace()
-            .nth(1)
-            .and_then(|part| part.split('(').next())
-            .unwrap_or("");
-        if name.is_empty() {
-            continue;
-        }
-        if let Some(set_index) = text.find(&format!("set {name}(")) {
-            let setter_line = &text[set_index..];
-            let get_type = getter_head.split("():").nth(1).map(str::trim);
-            let set_type = setter_line
-                .split(':')
-                .nth(1)
-                .and_then(|tail| tail.split(')').next())
-                .map(str::trim);
-            if get_type.is_some() && set_type.is_some() && get_type != set_type {
-                push_at(
-                    facts,
-                    source,
-                    SemanticHazard::DivergentAccessor,
-                    set_index,
-                    name.len() + 4,
-                    None,
-                );
-            }
-        }
-        if text.contains(" extends ") {
-            for (name_index, _) in text.match_indices(name) {
-                let statement = statement_at(text, name_index);
-                if statement.contains('=')
-                    && !statement.contains("get ")
-                    && !statement.contains("set ")
-                {
-                    push_at(
-                        facts,
-                        source,
-                        SemanticHazard::InitializedFieldShadowsAccessor,
-                        name_index,
-                        name.len(),
-                        None,
-                    );
-                } else if statement.contains(':')
-                    && !statement.contains('=')
-                    && !statement.contains("declare ")
-                    && !statement.contains("get ")
-                {
-                    push_at(
-                        facts,
-                        source,
-                        SemanticHazard::UninitializedFieldShadowsAccessor,
-                        name_index,
-                        name.len(),
-                        None,
-                    );
-                }
-            }
+
+    fn finish(self) -> AnalysisFacts {
+        self.facts
+    }
+
+    fn push(&mut self, hazard: SemanticHazard, range: TextRange) {
+        self.facts.push(HazardFact {
+            hazard,
+            range,
+            note: None,
+        });
+    }
+
+    fn identifier(&self, identifier: &IdentifierNode) -> Cow<'_, str> {
+        self.source
+            .identifier_text(identifier.data().token())
+            .unwrap_or_default()
+    }
+
+    fn property_name(&self, name: &PropertyName) -> Option<String> {
+        match name {
+            PropertyName::Identifier(identifier) => Some(self.identifier(identifier).into_owned()),
+            PropertyName::Private(identifier) => self
+                .source
+                .token_text(identifier.data().token())
+                .map(ToOwned::to_owned),
+            PropertyName::String(string) => Some(
+                self.source
+                    .token_text(string.data().token())
+                    .unwrap_or("")
+                    .trim_matches(['\"', '\''])
+                    .to_owned(),
+            ),
+            PropertyName::Number(number) => self
+                .source
+                .token_text(number.data().token())
+                .map(ToOwned::to_owned),
+            PropertyName::Computed(_) | PropertyName::Missing(_) => None,
         }
     }
-    if text.contains(" extends ") {
-        let mut base_methods = Vec::new();
-        if let Some(extends) = text.find(" extends ") {
-            for (index, _) in text[..extends].match_indices('(') {
-                if let Some(name) = identifier_before(text, index) {
-                    base_methods.push(name.to_owned());
-                }
+
+    fn reference_type_name(&self, ty: &Ty) -> Option<String> {
+        let TypeNode::Reference(reference) = ty.data() else {
+            return None;
+        };
+        let EntityName::Identifier(identifier) = &reference.name else {
+            return None;
+        };
+        Some(self.identifier(identifier).into_owned())
+    }
+
+    fn annotation_type_name(&self, annotation: &TypeAnnotationNode) -> Option<String> {
+        match annotation.data().type_node.data() {
+            TypeNode::Keyword(KeywordType::Number) => Some("number".to_owned()),
+            _ => self.reference_type_name(&annotation.data().type_node),
+        }
+    }
+
+    fn type_contains_undefined(ty: &Ty) -> bool {
+        match ty.data() {
+            TypeNode::Keyword(KeywordType::Any | KeywordType::Unknown | KeywordType::Undefined) => {
+                true
             }
-            for method in base_methods {
-                for (index, _) in text[extends..].match_indices(&format!("{method}(")) {
-                    let absolute = extends + index;
-                    let line = line_at(text, absolute);
-                    if !line.contains("override")
-                        && !line.contains("private")
-                        && !line.contains("static")
+            TypeNode::Union(members) => members.iter().any(Self::type_contains_undefined),
+            TypeNode::Parenthesized(inner) => Self::type_contains_undefined(inner),
+            _ => false,
+        }
+    }
+
+    fn type_is_readonly(ty: &Ty) -> bool {
+        match ty.data() {
+            TypeNode::Operator {
+                operator: TypeOperator::Readonly,
+                ..
+            } => true,
+            TypeNode::Object(object) => object.members.iter().any(|member| {
+                matches!(
+                    member.data(),
+                    TypeMember::Property(TypePropertySignature { readonly: true, .. })
+                        | TypeMember::Index(TypeIndexSignature { readonly: true, .. })
+                )
+            }),
+            TypeNode::Parenthesized(inner) => Self::type_is_readonly(inner),
+            _ => false,
+        }
+    }
+
+    fn type_is_keyof_array(ty: &Ty) -> bool {
+        match ty.data() {
+            TypeNode::Array(element) => Self::type_is_keyof(element),
+            TypeNode::Parenthesized(inner) => Self::type_is_keyof_array(inner),
+            _ => false,
+        }
+    }
+
+    fn type_is_keyof(ty: &Ty) -> bool {
+        match ty.data() {
+            TypeNode::Operator {
+                operator: TypeOperator::Keyof,
+                ..
+            } => true,
+            TypeNode::Parenthesized(inner) => Self::type_is_keyof(inner),
+            _ => false,
+        }
+    }
+
+    fn has_explicit_undefined_optional(&self, annotation: &Ty, initializer: &Expr) -> bool {
+        let (TypeNode::Object(object_type), Expression::Object(object)) =
+            (annotation.data(), initializer.data())
+        else {
+            return false;
+        };
+        object_type.members.iter().any(|member| {
+            let TypeMember::Property(property) = member.data() else {
+                return false;
+            };
+            if !property.optional
+                || property.type_annotation.as_ref().is_some_and(|annotation| {
+                    Self::type_contains_undefined(&annotation.data().type_node)
+                })
+            {
+                return false;
+            }
+            let Some(expected_name) = self.property_name(&property.name) else {
+                return false;
+            };
+            object.members.iter().any(|member| {
+                let ObjectMember::Property(actual) = member.data() else {
+                    return false;
+                };
+                self.property_name(&actual.name).as_deref() == Some(expected_name.as_str())
+                    && self.is_global_identifier(&actual.value, "undefined")
+            })
+        })
+    }
+
+    fn is_global_identifier(&self, expression: &Expr, expected: &str) -> bool {
+        let Expression::Identifier(identifier) = expression.data() else {
+            return false;
+        };
+        if self.identifier(identifier) != expected {
+            return false;
+        }
+        self.model
+            .reference(identifier.id())
+            .is_some_and(|symbol| self.model.symbol(symbol).kind() == SymbolKind::IntrinsicValue)
+    }
+
+    fn member_name(&self, member: &MemberExpression) -> Option<String> {
+        match &member.property {
+            MemberProperty::Named(identifier) => Some(self.identifier(identifier).into_owned()),
+            _ => None,
+        }
+    }
+
+    fn index_declarations(&mut self, statements: &[Stmt]) {
+        for statement in statements {
+            let statement = match statement.data() {
+                Statement::Export(ExportDeclaration::Named(
+                    ExportNamedDeclaration::Declaration(inner),
+                )) => inner.data(),
+                other => other,
+            };
+            match statement {
+                Statement::Interface(interface) => {
+                    if interface
+                        .members
+                        .iter()
+                        .any(|member| matches!(member.data(), TypeMember::Index(_)))
                     {
-                        push_at(
-                            facts,
-                            source,
-                            SemanticHazard::ImplicitOverride,
-                            absolute,
-                            method.len(),
-                            None,
-                        );
+                        self.index_signature_types
+                            .insert(self.identifier(&interface.name).into_owned());
+                    }
+                }
+                Statement::TypeAlias(alias) => {
+                    if let TypeNode::Union(members) = alias.type_node.data() {
+                        self.union_variants
+                            .insert(self.identifier(&alias.name).into_owned(), members.len());
+                    }
+                }
+                Statement::Enum(enumeration) => {
+                    if enumeration.members.iter().all(|member| {
+                        member
+                            .data()
+                            .initializer
+                            .as_deref()
+                            .is_none_or(is_numeric_enum_initializer)
+                    }) {
+                        self.numeric_enums
+                            .insert(self.identifier(&enumeration.name).into_owned());
+                    }
+                }
+                Statement::Class(class) => {
+                    let Some(name) = class
+                        .name
+                        .as_ref()
+                        .map(|name| self.identifier(name).into_owned())
+                    else {
+                        continue;
+                    };
+                    let base = class.extends.as_ref().and_then(|heritage| {
+                        let Expression::Identifier(identifier) = heritage.expression.data() else {
+                            return None;
+                        };
+                        Some(self.identifier(identifier).into_owned())
+                    });
+                    let mut accessors = HashSet::new();
+                    let mut methods = HashSet::new();
+                    for member in &class.members {
+                        if let ClassMember::Method(method) = member.data()
+                            && let Some(member_name) = self.property_name(&method.name)
+                        {
+                            methods.insert(member_name.clone());
+                            if matches!(
+                                method.modifier,
+                                PropertyModifier::Get | PropertyModifier::Set
+                            ) {
+                                accessors.insert(member_name);
+                            }
+                        }
+                    }
+                    self.classes.insert(
+                        name,
+                        ClassFacts {
+                            base,
+                            accessors,
+                            methods,
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn collect_called_names(&mut self, statements: &[Stmt]) {
+        for statement in statements {
+            self.collect_calls_statement(statement);
+        }
+    }
+
+    fn collect_calls_statement(&mut self, statement: &Stmt) {
+        match statement.data() {
+            Statement::Variable(variable) => {
+                for declaration in &variable.declarations {
+                    if let Some(initializer) = &declaration.data().initializer {
+                        self.collect_calls_expr(initializer);
                     }
                 }
             }
+            Statement::Expression(statement) => self.collect_calls_expr(&statement.expression),
+            Statement::Block(block) => self.collect_called_names(&block.data().statements),
+            Statement::Function(function) => {
+                self.collect_calls_body(function.function.body.as_ref())
+            }
+            Statement::Class(class) => {
+                for member in &class.members {
+                    match member.data() {
+                        ClassMember::Constructor(constructor) => {
+                            self.collect_called_names(&constructor.body.data().statements)
+                        }
+                        ClassMember::Method(method) => {
+                            self.collect_calls_body(method.function.body.as_ref())
+                        }
+                        ClassMember::Property(property) => {
+                            if let Some(initializer) = &property.initializer {
+                                self.collect_calls_expr(initializer);
+                            }
+                        }
+                        ClassMember::AutoAccessor(accessor) => {
+                            if let Some(initializer) = &accessor.initializer {
+                                self.collect_calls_expr(initializer);
+                            }
+                        }
+                        ClassMember::StaticBlock(block) => {
+                            self.collect_called_names(&block.data().statements)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Statement::If(branch) => {
+                self.collect_calls_expr(&branch.test);
+                self.collect_calls_statement(&branch.consequent);
+                if let Some(alternate) = &branch.alternate {
+                    self.collect_calls_statement(alternate);
+                }
+            }
+            Statement::Return(statement) => {
+                if let Some(argument) = &statement.argument {
+                    self.collect_calls_expr(argument);
+                }
+            }
+            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
+                inner,
+            )))
+            | Statement::Declare(inner) => self.collect_calls_statement(inner),
+            Statement::Namespace(namespace) => {
+                self.collect_called_names(&namespace.body.data().statements)
+            }
+            _ => {}
         }
     }
-    for (enum_index, _) in text.match_indices("enum ") {
-        let line = line_at(text, enum_index);
-        let enum_name = line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|part| part.split('{').next())
-            .unwrap_or("");
-        let enum_annotation =
-            text.contains(&format!(": {enum_name}")) || text.contains(&format!(":{enum_name}"));
-        let number_annotation = text.contains(": number") || text.contains(":number");
-        if !enum_name.is_empty() && enum_annotation && number_annotation {
-            push_at(
-                facts,
-                source,
-                SemanticHazard::NumericEnumNumber,
-                enum_index,
-                enum_name.len() + 5,
-                None,
-            );
-        }
-        for (index, _) in text.match_indices(&format!("{enum_name}[")) {
-            push_at(
-                facts,
-                source,
-                SemanticHazard::NumericEnumReverseLookup,
-                index,
-                enum_name.len(),
-                None,
-            );
-        }
-    }
-}
 
-fn collect_switch_facts(source: &SourceFile, text: &str, facts: &mut AnalysisFacts) {
-    for (switch_index, _) in text.match_indices("switch (") {
-        let before = &text[..switch_index];
-        let Some(type_index) = before.rfind("type ") else {
-            continue;
-        };
-        let declaration = line_at(text, type_index);
-        if !declaration.contains('|') || !declaration.contains("kind:") {
-            continue;
+    fn collect_calls_body(&mut self, body: Option<&FunctionBody>) {
+        match body {
+            Some(FunctionBody::Block(block)) => self.collect_called_names(&block.data().statements),
+            Some(FunctionBody::Expression(expression)) => self.collect_calls_expr(expression),
+            _ => {}
         }
-        let variants = declaration.matches("kind:").count();
-        let tail = &text[switch_index..];
-        let body_end = tail.find('}').unwrap_or(tail.len());
-        let body = &tail[..body_end];
-        let cases = body.matches("case ").count();
-        if cases < variants && !body.contains("default:") {
-            push_at(
-                facts,
-                source,
-                SemanticHazard::NonExhaustiveSwitch,
-                switch_index,
-                6,
-                Some("the finite discriminated union has reachable variants not covered by a case"),
+    }
+
+    fn collect_calls_expr(&mut self, expression: &Expr) {
+        match expression.data() {
+            Expression::Call(call) => {
+                if let Expression::Identifier(identifier) = call.callee.data() {
+                    self.called_names
+                        .insert(self.identifier(identifier).into_owned());
+                }
+                if let Expression::Member(member) = call.callee.data()
+                    && self.member_name(member).as_deref() == Some("sort")
+                    && let Expression::Call(inner) = member.object.data()
+                    && self.is_object_keys_call(inner)
+                {
+                    self.sorted_object_keys.insert(member.object.range());
+                }
+                self.collect_calls_expr(&call.callee);
+                for argument in &call.arguments {
+                    if let CallArgument::Expression(argument) = argument {
+                        self.collect_calls_expr(argument);
+                    }
+                }
+            }
+            Expression::Member(member) => self.collect_calls_expr(&member.object),
+            Expression::Parenthesized(inner)
+            | Expression::NonNull(NonNullExpression { expression: inner }) => {
+                self.collect_calls_expr(inner)
+            }
+            Expression::Binary(binary) => {
+                self.collect_calls_expr(&binary.left);
+                self.collect_calls_expr(&binary.right);
+            }
+            Expression::Arrow(arrow) => self.collect_calls_body(Some(&arrow.body)),
+            Expression::Function(function) => {
+                self.collect_calls_body(function.function.body.as_ref())
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_statements(&mut self, statements: &[Stmt]) {
+        for statement in statements {
+            self.visit_statement(statement, false);
+        }
+    }
+
+    fn visit_statement(&mut self, statement: &Stmt, in_constructor: bool) {
+        match statement.data() {
+            Statement::Variable(variable) => self.visit_variable(variable),
+            Statement::Function(function) => self.visit_function(&function.function),
+            Statement::Class(class) => self.visit_class(class),
+            Statement::Block(block) => self.visit_statements(&block.data().statements),
+            Statement::Expression(statement) => {
+                self.visit_expr(&statement.expression, in_constructor)
+            }
+            Statement::If(branch) => {
+                self.visit_expr(&branch.test, in_constructor);
+                self.visit_statement(&branch.consequent, in_constructor);
+                if let Some(alternate) = &branch.alternate {
+                    self.visit_statement(alternate, in_constructor);
+                }
+            }
+            Statement::Switch(switch) => {
+                self.visit_switch(statement.range(), switch);
+                self.visit_expr(&switch.discriminant, in_constructor);
+                for case in &switch.cases {
+                    if let Some(test) = &case.data().test {
+                        self.visit_expr(test, in_constructor);
+                    }
+                    self.visit_statements(&case.data().consequent);
+                }
+            }
+            Statement::For(statement) => {
+                if let Some(initializer) = &statement.initializer {
+                    match initializer {
+                        ForInitializer::Variable(variable) => self.visit_variable(variable),
+                        ForInitializer::Expression(expression) => {
+                            self.visit_expr(expression, in_constructor)
+                        }
+                    }
+                }
+                if let Some(test) = &statement.test {
+                    self.visit_expr(test, in_constructor);
+                }
+                if let Some(update) = &statement.update {
+                    self.visit_expr(update, in_constructor);
+                }
+                self.visit_statement(&statement.body, in_constructor);
+            }
+            Statement::ForIn(statement) => {
+                if let ForBinding::Variable(variable) = &statement.binding {
+                    self.visit_variable(variable);
+                }
+                self.visit_expr(&statement.object, in_constructor);
+                self.visit_statement(&statement.body, in_constructor);
+            }
+            Statement::ForOf(statement) => {
+                if let ForBinding::Variable(variable) = &statement.binding {
+                    self.visit_variable(variable);
+                }
+                self.visit_expr(&statement.iterable, in_constructor);
+                self.visit_statement(&statement.body, in_constructor);
+            }
+            Statement::While(statement) => {
+                self.visit_expr(&statement.test, in_constructor);
+                self.visit_statement(&statement.body, in_constructor);
+            }
+            Statement::DoWhile(statement) => {
+                self.visit_statement(&statement.body, in_constructor);
+                self.visit_expr(&statement.test, in_constructor);
+            }
+            Statement::With(statement) => {
+                self.visit_expr(&statement.object, in_constructor);
+                self.visit_statement(&statement.body, in_constructor);
+            }
+            Statement::Labeled(statement) => self.visit_statement(&statement.body, in_constructor),
+            Statement::Return(statement) => {
+                if let Some(argument) = &statement.argument {
+                    self.visit_expr(argument, in_constructor);
+                }
+            }
+            Statement::Throw(statement) => self.visit_expr(&statement.argument, in_constructor),
+            Statement::Enum(enumeration) => {
+                for member in &enumeration.members {
+                    if let Some(initializer) = &member.data().initializer {
+                        self.visit_expr(initializer, in_constructor);
+                    }
+                }
+            }
+            Statement::Export(ExportDeclaration::Default(export)) => match &export.value {
+                ExportDefaultValue::Function(function) => self.visit_function(function),
+                ExportDefaultValue::Class(class) => self.visit_class(class),
+                ExportDefaultValue::Expression(expression) => {
+                    self.visit_expr(expression, in_constructor)
+                }
+                ExportDefaultValue::Missing(_) => {}
+            },
+            Statement::Export(ExportDeclaration::Assignment(expression)) => {
+                self.visit_expr(expression, in_constructor)
+            }
+            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
+                inner,
+            )))
+            | Statement::Declare(inner) => self.visit_statement(inner, in_constructor),
+            Statement::Namespace(namespace) => {
+                self.visit_statements(&namespace.body.data().statements)
+            }
+            Statement::Try(statement) => {
+                self.visit_statements(&statement.block.data().statements);
+                if let Some(handler) = &statement.handler {
+                    self.visit_statements(&handler.data().body.data().statements);
+                }
+                if let Some(finalizer) = &statement.finalizer {
+                    self.visit_statements(&finalizer.data().statements);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_variable(&mut self, variable: &VariableDeclaration) {
+        for declaration in &variable.declarations {
+            let declaration = declaration.data();
+            let binding_name = match declaration.binding.data() {
+                BindingPattern::Identifier(identifier) => {
+                    Some(self.identifier(identifier).into_owned())
+                }
+                _ => None,
+            };
+            let annotation_name = declaration
+                .type_annotation
+                .as_ref()
+                .and_then(|annotation| self.annotation_type_name(annotation));
+            if let (Some(name), Some(type_name)) = (&binding_name, &annotation_name) {
+                self.variable_types.insert(name.clone(), type_name.clone());
+            }
+            if let Some(initializer) = &declaration.initializer {
+                if declaration
+                    .type_annotation
+                    .as_ref()
+                    .is_some_and(|annotation| {
+                        matches!(
+                            annotation.data().type_node.data(),
+                            TypeNode::Keyword(KeywordType::Unknown)
+                        )
+                    })
+                    && self.is_json_parse_expr(initializer)
+                {
+                    self.safe_json_parses.insert(initializer.range());
+                }
+                if let (Some(alias), Expression::Member(_)) = (&binding_name, initializer.data())
+                    && self.called_names.contains(alias)
+                {
+                    self.push(SemanticHazard::DetachedMethod, initializer.range());
+                }
+                if let (Some(alias), Expression::Identifier(source)) =
+                    (&binding_name, initializer.data())
+                    && declaration
+                        .type_annotation
+                        .as_ref()
+                        .is_some_and(|annotation| {
+                            Self::type_is_readonly(&annotation.data().type_node)
+                        })
+                {
+                    self.readonly_aliases
+                        .insert(self.identifier(source).into_owned());
+                    self.readonly_aliases.insert(alias.clone());
+                }
+                if let (Some(target), Expression::Identifier(source)) =
+                    (annotation_name.as_deref(), initializer.data())
+                    && let Some(source_type) =
+                        self.variable_types.get(self.identifier(source).as_ref())
+                    && ((target == "number" && self.numeric_enums.contains(source_type))
+                        || (self.numeric_enums.contains(target) && source_type == "number"))
+                {
+                    self.push(SemanticHazard::NumericEnumNumber, initializer.range());
+                }
+                if let Some(annotation) = &declaration.type_annotation
+                    && self
+                        .has_explicit_undefined_optional(&annotation.data().type_node, initializer)
+                {
+                    self.push(
+                        SemanticHazard::ExplicitUndefinedOptional,
+                        initializer.range(),
+                    );
+                }
+                if let Some(annotation) = &declaration.type_annotation
+                    && let TypeNode::Function(expected) = annotation.data().type_node.data()
+                    && let Expression::Arrow(actual) = initializer.data()
+                {
+                    if expected.parameters.len() > actual.parameters.len() {
+                        self.push(SemanticHazard::FewerCallbackParameters, initializer.range());
+                    }
+                    if matches!(
+                        expected.return_type.data(),
+                        TypeNode::Keyword(KeywordType::Void)
+                    ) && matches!(&actual.body, FunctionBody::Expression(_))
+                    {
+                        self.push(SemanticHazard::ValueReturnedToVoid, initializer.range());
+                    }
+                }
+                self.visit_expr(initializer, false);
+            }
+        }
+    }
+
+    fn visit_function(&mut self, function: &FunctionLike) {
+        let mut shadowed_types = Vec::new();
+        for parameter in &function.parameters {
+            if let (BindingPattern::Identifier(identifier), Some(annotation)) = (
+                parameter.data().binding.data(),
+                parameter.data().type_annotation.as_ref(),
+            ) && let Some(type_name) = self.reference_type_name(&annotation.data().type_node)
+            {
+                let name = self.identifier(identifier).into_owned();
+                shadowed_types.push((name.clone(), self.variable_types.insert(name, type_name)));
+            }
+            if parameter.data().type_annotation.is_none() {
+                self.push(SemanticHazard::ImplicitAny, parameter.range());
+            }
+            if let Some(initializer) = &parameter.data().initializer {
+                self.visit_expr(initializer, false);
+            }
+        }
+        self.visit_body(function.body.as_ref(), false);
+        for (name, previous) in shadowed_types {
+            if let Some(previous) = previous {
+                self.variable_types.insert(name, previous);
+            } else {
+                self.variable_types.remove(&name);
+            }
+        }
+    }
+
+    fn visit_body(&mut self, body: Option<&FunctionBody>, in_constructor: bool) {
+        match body {
+            Some(FunctionBody::Block(block)) => {
+                for statement in &block.data().statements {
+                    self.visit_statement(statement, in_constructor);
+                }
+            }
+            Some(FunctionBody::Expression(expression)) => {
+                self.visit_expr(expression, in_constructor)
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_class(&mut self, class: &ClassDeclaration) {
+        let base = class
+            .name
+            .as_ref()
+            .and_then(|name| self.classes.get(self.identifier(name).as_ref()))
+            .and_then(|class| class.base.as_ref())
+            .and_then(|base| self.classes.get(base))
+            .cloned();
+        let mut accessor_types = HashMap::new();
+        for member in &class.members {
+            match member.data() {
+                ClassMember::Constructor(constructor) => {
+                    for statement in &constructor.body.data().statements {
+                        self.visit_statement(statement, true);
+                    }
+                }
+                ClassMember::Method(method) => {
+                    if let Some(name) = self.property_name(&method.name) {
+                        let implicit_override = base
+                            .as_ref()
+                            .is_some_and(|base| base.methods.contains(&name))
+                            && !method.modifiers.is_override
+                            && !method.modifiers.is_static
+                            && method.modifiers.accessibility != Some(Accessibility::Private);
+                        if matches!(
+                            method.modifier,
+                            PropertyModifier::Get | PropertyModifier::Set
+                        ) {
+                            let annotation =
+                                if method.modifier == PropertyModifier::Get {
+                                    method.function.return_type.as_ref()
+                                } else {
+                                    method.function.parameters.first().and_then(|parameter| {
+                                        parameter.data().type_annotation.as_ref()
+                                    })
+                                };
+                            let current = annotation
+                                .and_then(|annotation| {
+                                    self.model.resolved_type(annotation.data().type_node.id())
+                                })
+                                .unwrap_or_else(|| self.model.types().any());
+                            let key = (method.modifiers.is_static, name);
+                            if let Some(previous) = accessor_types.get(&key)
+                                && previous != &current
+                            {
+                                self.push(SemanticHazard::DivergentAccessor, member.range());
+                            }
+                            accessor_types.insert(key, current);
+                        }
+                        if implicit_override {
+                            self.push(SemanticHazard::ImplicitOverride, member.range());
+                        }
+                    }
+                    self.visit_function(&method.function);
+                }
+                ClassMember::Property(property) => {
+                    if let Some(name) = self.property_name(&property.name)
+                        && base
+                            .as_ref()
+                            .is_some_and(|base| base.accessors.contains(&name))
+                        && !property.modifiers.is_declare
+                    {
+                        self.push(
+                            if property.initializer.is_some() {
+                                SemanticHazard::InitializedFieldShadowsAccessor
+                            } else {
+                                SemanticHazard::UninitializedFieldShadowsAccessor
+                            },
+                            member.range(),
+                        );
+                    }
+                    if let Some(initializer) = &property.initializer {
+                        self.visit_expr(initializer, false);
+                    }
+                }
+                ClassMember::AutoAccessor(accessor) => {
+                    if let Some(initializer) = &accessor.initializer {
+                        self.visit_expr(initializer, false);
+                    }
+                }
+                ClassMember::StaticBlock(block) => self.visit_statements(&block.data().statements),
+                _ => {}
+            }
+        }
+    }
+
+    fn visit_switch(&mut self, range: TextRange, switch: &SwitchStatement) {
+        let identifier = match switch.discriminant.data() {
+            Expression::Identifier(identifier) => identifier,
+            Expression::Member(MemberExpression { object, .. }) => {
+                let Expression::Identifier(identifier) = object.data() else {
+                    return;
+                };
+                identifier
+            }
+            _ => return,
+        };
+        let Some(type_name) = self
+            .variable_types
+            .get(self.identifier(identifier).as_ref())
+            .cloned()
+        else {
+            return;
+        };
+        let Some(variant_count) = self.union_variants.get(&type_name).copied() else {
+            return;
+        };
+        let covered = switch
+            .cases
+            .iter()
+            .filter(|case| case.data().test.is_some())
+            .count();
+        if covered < variant_count && !switch.cases.iter().any(|case| case.data().test.is_none()) {
+            self.push(SemanticHazard::NonExhaustiveSwitch, range);
+        }
+    }
+
+    fn visit_expr(&mut self, expression: &Expr, in_constructor: bool) {
+        match expression.data() {
+            Expression::As(assertion) => {
+                self.push(SemanticHazard::UncheckedAssertion, expression.range());
+                if let Expression::Call(call) = assertion.expression.data()
+                    && self.is_object_keys_call(call)
+                    && assertion
+                        .type_node
+                        .as_deref()
+                        .is_some_and(Self::type_is_keyof_array)
+                {
+                    self.push(SemanticHazard::OpenObjectKeys, expression.range());
+                }
+                self.visit_expr(&assertion.expression, in_constructor);
+            }
+            Expression::TypeAssertion(assertion) => {
+                self.push(SemanticHazard::UncheckedAssertion, expression.range());
+                self.visit_expr(&assertion.expression, in_constructor);
+            }
+            Expression::Member(member) => {
+                self.visit_member(expression.range(), member);
+                self.visit_expr(&member.object, in_constructor);
+                if let MemberProperty::Computed(property) = &member.property {
+                    self.visit_expr(property, in_constructor);
+                }
+            }
+            Expression::Call(call) => {
+                self.visit_call(expression.range(), call, in_constructor);
+                self.visit_expr(&call.callee, in_constructor);
+                for argument in &call.arguments {
+                    let argument = match argument {
+                        CallArgument::Expression(argument) => argument,
+                        CallArgument::Spread(spread) => &spread.argument,
+                        CallArgument::Missing(_) => continue,
+                    };
+                    if let Expression::Identifier(identifier) = argument.data() {
+                        let name = self.identifier(identifier).into_owned();
+                        self.readonly_aliases.remove(name.as_str());
+                    }
+                    self.visit_expr(argument, in_constructor);
+                }
+            }
+            Expression::Binary(binary) => {
+                if matches!(
+                    binary.operator,
+                    BinaryOperator::Equal | BinaryOperator::NotEqual
+                ) {
+                    self.push(SemanticHazard::LooseEqualityCoercion, expression.range());
+                }
+                if binary.operator == BinaryOperator::Add
+                    && (self.is_object_create_call(&binary.left)
+                        || self.is_object_create_call(&binary.right))
+                {
+                    self.push(SemanticHazard::ObjectToPrimitive, expression.range());
+                }
+                self.visit_expr(&binary.left, in_constructor);
+                self.visit_expr(&binary.right, in_constructor);
+            }
+            Expression::Template(template) => {
+                for interpolation in &template.expressions {
+                    if self.is_symbol_call(interpolation) {
+                        self.push(SemanticHazard::SymbolInterpolation, interpolation.range());
+                    }
+                    self.visit_expr(interpolation, in_constructor);
+                }
+            }
+            Expression::Object(object) => {
+                for member in &object.members {
+                    if let ObjectMember::Property(property) = member.data() {
+                        if self.is_to_string_tag(&property.name)
+                            && !matches!(
+                                property.value.data(),
+                                Expression::Literal(Literal::String(_))
+                            )
+                        {
+                            self.push(SemanticHazard::UnsafeToStringTag, member.range());
+                        }
+                        self.visit_expr(&property.value, in_constructor);
+                    }
+                }
+            }
+            Expression::Array(array) => {
+                for element in &array.elements {
+                    match element {
+                        ArrayElement::Expression(element) => {
+                            self.visit_expr(element, in_constructor)
+                        }
+                        ArrayElement::Spread(spread) => {
+                            self.visit_expr(&spread.argument, in_constructor)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Expression::Function(function) => self.visit_function(&function.function),
+            Expression::Arrow(arrow) => {
+                for parameter in &arrow.parameters {
+                    if parameter.data().type_annotation.is_none() {
+                        self.push(SemanticHazard::ImplicitAny, parameter.range());
+                    }
+                }
+                self.visit_body(Some(&arrow.body), false);
+            }
+            Expression::Class(class) => self.visit_class(&class.class),
+            Expression::Logical(logical) => {
+                self.visit_expr(&logical.left, in_constructor);
+                self.visit_expr(&logical.right, in_constructor);
+            }
+            Expression::Conditional(conditional) => {
+                self.visit_expr(&conditional.test, in_constructor);
+                self.visit_expr(&conditional.consequent, in_constructor);
+                self.visit_expr(&conditional.alternate, in_constructor);
+            }
+            Expression::Update(update) => {
+                self.visit_assignment_target(&update.argument, in_constructor)
+            }
+            Expression::Assignment(assignment) => {
+                if let AssignmentTarget::Member(member) = assignment.left.data()
+                    && let Expression::Identifier(identifier) = member.object.data()
+                    && self
+                        .readonly_aliases
+                        .contains(self.identifier(identifier).as_ref())
+                {
+                    self.push(SemanticHazard::ReadonlyAliasMutation, expression.range());
+                }
+                self.visit_assignment_target(&assignment.left, in_constructor);
+                self.visit_expr(&assignment.right, in_constructor);
+            }
+            Expression::Sequence(sequence) => {
+                for expression in &sequence.expressions {
+                    self.visit_expr(expression, in_constructor);
+                }
+            }
+            Expression::Parenthesized(inner) => self.visit_expr(inner, in_constructor),
+            Expression::Satisfies(assertion) => {
+                self.visit_expr(&assertion.expression, in_constructor)
+            }
+            Expression::NonNull(assertion) => {
+                self.visit_expr(&assertion.expression, in_constructor)
+            }
+            Expression::Await(await_expression) => {
+                self.visit_expr(&await_expression.argument, in_constructor)
+            }
+            Expression::Yield(yield_expression) => {
+                if let Some(argument) = &yield_expression.argument {
+                    self.visit_expr(argument, in_constructor);
+                }
+            }
+            Expression::Unary(unary) => self.visit_expr(&unary.argument, in_constructor),
+            Expression::New(call) => {
+                self.visit_expr(&call.callee, in_constructor);
+                for argument in &call.arguments {
+                    if let CallArgument::Expression(argument) = argument {
+                        self.visit_expr(argument, in_constructor);
+                    }
+                }
+            }
+            Expression::TaggedTemplate(tagged) => {
+                self.visit_expr(&tagged.tag, in_constructor);
+                for expression in &tagged.template.expressions {
+                    self.visit_expr(expression, in_constructor);
+                }
+            }
+            Expression::Import(import) => {
+                self.visit_expr(&import.source, in_constructor);
+                if let Some(options) = &import.options {
+                    self.visit_expr(options, in_constructor);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_assignment_target(&mut self, target: &AssignmentTargetNode, in_constructor: bool) {
+        match target.data() {
+            AssignmentTarget::Member(member) => {
+                self.visit_expr(&member.object, in_constructor);
+                if let MemberProperty::Computed(property) = &member.property {
+                    self.visit_expr(property, in_constructor);
+                }
+            }
+            AssignmentTarget::Object(object) => {
+                for property in &object.properties {
+                    self.visit_assignment_target(&property.target, in_constructor);
+                    if let Some(initializer) = &property.initializer {
+                        self.visit_expr(initializer, in_constructor);
+                    }
+                }
+            }
+            AssignmentTarget::Array(array) => {
+                for element in &array.elements {
+                    if let AssignmentArrayElement::Target(target) = element {
+                        self.visit_assignment_target(target, in_constructor);
+                    }
+                }
+            }
+            AssignmentTarget::Identifier(_) | AssignmentTarget::Missing(_) => {}
+        }
+    }
+
+    fn visit_member(&mut self, range: TextRange, member: &MemberExpression) {
+        let Expression::Identifier(object) = member.object.data() else {
+            return;
+        };
+        let object_name = self.identifier(object).into_owned();
+        if self
+            .variable_types
+            .get(&object_name)
+            .is_some_and(|ty| self.index_signature_types.contains(ty))
+        {
+            self.push(
+                if matches!(member.property, MemberProperty::Computed(_)) {
+                    SemanticHazard::UncheckedIndexRead
+                } else {
+                    SemanticHazard::IndexSignatureDotAccess
+                },
+                range,
             );
         }
+        if self.numeric_enums.contains(&object_name)
+            && matches!(member.property, MemberProperty::Computed(_))
+        {
+            self.push(SemanticHazard::NumericEnumReverseLookup, range);
+        }
+    }
+
+    fn visit_call(&mut self, range: TextRange, call: &CallExpression, in_constructor: bool) {
+        let Expression::Member(member) = call.callee.data() else {
+            return;
+        };
+        let Some(method) = self.member_name(member) else {
+            return;
+        };
+        if in_constructor
+            && matches!(member.object.data(), Expression::This)
+            && method != "constructor"
+        {
+            self.push(SemanticHazard::VirtualCallInConstructor, range);
+        }
+        if self.is_global_identifier(&member.object, "Object")
+            && method == "keys"
+            && call.arguments.first().is_some_and(|argument| {
+                let CallArgument::Expression(argument) = argument else {
+                    return false;
+                };
+                let Expression::Object(object) = argument.data() else {
+                    return false;
+                };
+                object.members.iter().any(|member| {
+                    let ObjectMember::Property(property) = member.data() else {
+                        return false;
+                    };
+                    match &property.name {
+                        PropertyName::Number(_) => true,
+                        PropertyName::String(string) => self
+                            .source
+                            .token_text(string.data().token())
+                            .unwrap_or("")
+                            .trim_matches(['"', '\''])
+                            .parse::<u32>()
+                            .is_ok(),
+                        _ => false,
+                    }
+                })
+            })
+            && !self.sorted_object_keys.contains(&range)
+        {
+            self.push(SemanticHazard::NumericKeyOrder, range);
+        }
+        if self.is_global_identifier(&member.object, "JSON") {
+            if method == "parse" && !self.safe_json_parses.contains(&range) {
+                self.push(SemanticHazard::UncheckedJsonParse, range);
+            } else if method == "stringify"
+                && call.arguments.len() == 1
+                && call.arguments.first().is_some_and(|argument| {
+                    matches!(
+                        argument,
+                        CallArgument::Expression(argument)
+                            if self.json_unserializable(argument)
+                    )
+                })
+            {
+                self.push(SemanticHazard::JsonStringifyUnserializable, range);
+            }
+        }
+        if matches!(method.as_str(), "toString" | "toFixed")
+            && let Some(CallArgument::Expression(argument)) = call.arguments.first()
+            && let Expression::Literal(Literal::Number(number)) = argument.data()
+            && let Ok(value) = self
+                .source
+                .token_text(number.data().token())
+                .unwrap_or("")
+                .parse::<i32>()
+            && ((method == "toString" && !(2..=36).contains(&value))
+                || (method == "toFixed" && !(0..=100).contains(&value)))
+        {
+            self.push(SemanticHazard::InvalidNumberFormatting, range);
+        }
+        if method == "sort"
+            && call.arguments.is_empty()
+            && matches!(member.object.data(), Expression::Array(_))
+        {
+            self.push(SemanticHazard::NumericDefaultSort, range);
+        }
+    }
+
+    fn json_unserializable(&self, expression: &Expr) -> bool {
+        match expression.data() {
+            Expression::Literal(Literal::BigInt(_))
+            | Expression::Function(_)
+            | Expression::Arrow(_) => true,
+            Expression::Identifier(identifier) => {
+                self.is_global_identifier(expression, "undefined")
+                    || self
+                        .variable_types
+                        .get(self.identifier(identifier).as_ref())
+                        .is_some_and(|ty| {
+                            matches!(ty.as_str(), "bigint" | "BigInt" | "symbol" | "Symbol")
+                        })
+            }
+            Expression::Call(_) => self.is_symbol_call(expression),
+            _ => false,
+        }
+    }
+
+    fn is_object_keys_call(&self, call: &CallExpression) -> bool {
+        let Expression::Member(member) = call.callee.data() else {
+            return false;
+        };
+        self.is_global_identifier(&member.object, "Object")
+            && self.member_name(member).as_deref() == Some("keys")
+    }
+
+    fn is_json_parse_expr(&self, expression: &Expr) -> bool {
+        let Expression::Call(call) = expression.data() else {
+            return false;
+        };
+        let Expression::Member(member) = call.callee.data() else {
+            return false;
+        };
+        self.is_global_identifier(&member.object, "JSON")
+            && self.member_name(member).as_deref() == Some("parse")
+    }
+
+    fn is_object_create_call(&self, expression: &Expr) -> bool {
+        let Expression::Call(call) = expression.data() else {
+            return false;
+        };
+        let Expression::Member(member) = call.callee.data() else {
+            return false;
+        };
+        self.is_global_identifier(&member.object, "Object")
+            && self.member_name(member).as_deref() == Some("create")
+    }
+
+    fn is_symbol_call(&self, expression: &Expr) -> bool {
+        let Expression::Call(call) = expression.data() else {
+            return false;
+        };
+        self.is_global_identifier(&call.callee, "Symbol")
+    }
+
+    fn is_to_string_tag(&self, name: &PropertyName) -> bool {
+        let PropertyName::Computed(expression) = name else {
+            return false;
+        };
+        let Expression::Member(member) = expression.data() else {
+            return false;
+        };
+        self.is_global_identifier(&member.object, "Symbol")
+            && self.member_name(member).as_deref() == Some("toStringTag")
     }
 }
 
@@ -760,199 +1249,289 @@ pub(crate) fn collect_program_facts(
         .iter()
         .map(|source| (source.product().source_id(), source.product()))
         .collect::<BTreeMap<_, _>>();
-    for edge in edges {
-        let (Some(from), Some(to)) = (source_map.get(&edge.from), source_map.get(&edge.to)) else {
-            continue;
-        };
-        let from_text = from.source_text().as_str();
-        let to_text = to.source_text().as_str();
-        let mut additions = Vec::new();
-        for declaration in ["interface ", "type "] {
-            for (index, _) in to_text.match_indices(declaration) {
-                let name = to_text[index + declaration.len()..]
-                    .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-                    .next()
-                    .unwrap_or("");
-                if name.is_empty()
-                    || to_text.contains(&format!("class {name}"))
-                    || to_text.contains(&format!("enum {name}"))
-                {
-                    continue;
-                }
-                for (use_index, _) in from_text.match_indices(name) {
-                    let line = line_at(from_text, use_index);
-                    if line.contains("import {") && !line.contains("import type") {
-                        additions.push((
-                            SemanticHazard::TypeImportedAsValue,
-                            use_index,
-                            name.len(),
-                        ));
-                    }
-                    if line.contains("export {") && !line.contains("export type") {
-                        additions.push((
-                            SemanticHazard::TypeReexportedAsValue,
-                            use_index,
-                            name.len(),
-                        ));
-                    }
-                }
-            }
-        }
-        if from_text.contains("export ")
-            && from_text.contains(" = ")
-            && from_text.contains("import ")
-            && let Some(index) = from_text.find("export ")
-        {
-            additions.push((SemanticHazard::DeclarationInferenceDependency, index, 6));
-        }
-        if let Some(model) = models.get_mut(&edge.from) {
-            let mut facts = model.facts().clone();
-            for (hazard, start, len) in additions {
-                push_at(&mut facts, from, hazard, start, len, None);
-            }
-            model.replace_facts(facts);
-        }
-    }
+    let mut additions = BTreeMap::<SourceId, Vec<HazardFact>>::new();
 
     for recovered in sources {
         let source = recovered.product();
-        let mut additions = Vec::new();
+        let source_id = source.source_id();
+        let has_local_edge = edges.iter().any(|edge| edge.from == source_id);
         for statement in source.statements() {
-            let Statement::Import(import) = statement.data() else {
-                continue;
-            };
             let edge = edges
                 .iter()
-                .find(|edge| edge.from == source.source_id() && edge.specifier == statement.id());
-            if import.clause.is_none() {
-                if edge.is_none() {
-                    additions.push(HazardFact {
-                        hazard: SemanticHazard::UncheckedSideEffectImport,
-                        range: statement.range(),
-                        note: None,
-                    });
-                }
-                continue;
-            }
-            let Some(edge) = edge else {
-                continue;
-            };
-            let Some(target) = source_map.get(&edge.to) else {
-                continue;
-            };
-            let commonjs = commonjs_exports(target);
-            if !commonjs.is_commonjs {
-                continue;
-            }
-            let clause = import.clause.as_ref().expect("checked above");
-            if clause.default.is_some() && !has_esm_default_export(target) {
-                additions.push(HazardFact {
-                    hazard: SemanticHazard::InteropDependentDefaultImport,
-                    range: statement.range(),
-                    note: None,
-                });
-            }
-            if let Some(ImportBinding::Named(specifiers)) = &clause.binding {
-                for specifier in specifiers {
-                    let Some(name) = module_export_name(source, &specifier.data().imported) else {
+                .find(|edge| edge.from == source_id && edge.specifier == statement.id());
+            match statement.data() {
+                Statement::Import(import) => {
+                    if import.clause.is_none() {
+                        if edge.is_none() {
+                            push_program_fact(
+                                &mut additions,
+                                source_id,
+                                SemanticHazard::UncheckedSideEffectImport,
+                                statement.range(),
+                                None,
+                            );
+                        }
+                        continue;
+                    }
+                    let Some(edge) = edge else {
                         continue;
                     };
-                    if !commonjs.named.iter().any(|exported| exported == &name) {
-                        additions.push(HazardFact {
-                            hazard: SemanticHazard::CjsEsmNamedExportMismatch,
-                            range: specifier.range(),
-                            note: Some(
-                                format!("CommonJS target does not statically export `{name}`")
-                                    .into_boxed_str(),
-                            ),
-                        });
+                    let Some(target) = source_map.get(&edge.to).copied() else {
+                        continue;
+                    };
+                    let target_model = models
+                        .get(&edge.to)
+                        .expect("program model contains the edge target");
+                    let commonjs = commonjs_exports(target, target_model);
+                    let clause = import.clause.as_ref().expect("checked above");
+                    if clause.default.is_some()
+                        && commonjs.is_commonjs
+                        && !has_esm_default_export(target)
+                    {
+                        push_program_fact(
+                            &mut additions,
+                            source_id,
+                            SemanticHazard::InteropDependentDefaultImport,
+                            statement.range(),
+                            None,
+                        );
+                    }
+                    if let Some(ImportBinding::Named(specifiers)) = &clause.binding {
+                        let type_exports = exported_type_names(target);
+                        for specifier in specifiers {
+                            let Some(name) = module_export_name(source, &specifier.data().imported)
+                            else {
+                                continue;
+                            };
+                            if !import.type_only
+                                && specifier.data().mode == ImportSpecifierMode::Value
+                                && type_exports.contains(name.as_ref())
+                            {
+                                push_program_fact(
+                                    &mut additions,
+                                    source_id,
+                                    SemanticHazard::TypeImportedAsValue,
+                                    specifier.range(),
+                                    None,
+                                );
+                            }
+                            if commonjs.is_commonjs && !commonjs.named.contains(name.as_ref()) {
+                                push_program_fact(
+                                    &mut additions,
+                                    source_id,
+                                    SemanticHazard::CjsEsmNamedExportMismatch,
+                                    specifier.range(),
+                                    Some(
+                                        format!(
+                                            "CommonJS target does not statically export `{name}`"
+                                        )
+                                        .into_boxed_str(),
+                                    ),
+                                );
+                            }
+                        }
                     }
                 }
-            }
-        }
-        if let Some(model) = models.get_mut(&source.source_id()) {
-            let mut facts = model.facts().clone();
-            for fact in additions {
-                facts.push(fact);
-            }
-            model.replace_facts(facts);
-        }
-    }
-}
-
-struct CommonJsExports<'a> {
-    is_commonjs: bool,
-    named: Vec<&'a str>,
-}
-
-fn commonjs_exports(source: &SourceFile) -> CommonJsExports<'_> {
-    let tokens = source
-        .tokens()
-        .iter()
-        .filter_map(|token| {
-            if matches!(
-                token.kind(),
-                TokenKind::Whitespace | TokenKind::LineComment | TokenKind::BlockComment
-            ) {
-                return None;
-            }
-            Some((token.kind(), source.token_text(token)?))
-        })
-        .collect::<Vec<_>>();
-    let mut is_commonjs = false;
-    let mut named = Vec::new();
-    for window in tokens.windows(3) {
-        if window[0].1 == "module" && window[1].0 == TokenKind::Dot && window[2].1 == "exports" {
-            is_commonjs = true;
-        }
-        if window[0].1 == "exports"
-            && window[1].0 == TokenKind::Dot
-            && window[2].0 == TokenKind::Identifier
-        {
-            is_commonjs = true;
-            named.push(window[2].1);
-        }
-    }
-    for index in 0..tokens.len().saturating_sub(4) {
-        if tokens[index].1 != "module"
-            || tokens[index + 1].0 != TokenKind::Dot
-            || tokens[index + 2].1 != "exports"
-            || tokens[index + 3].0 != TokenKind::Eq
-            || tokens[index + 4].0 != TokenKind::LBrace
-        {
-            continue;
-        }
-        is_commonjs = true;
-        let mut depth = 1_usize;
-        let mut cursor = index + 5;
-        while cursor < tokens.len() && depth > 0 {
-            match tokens[cursor].0 {
-                TokenKind::LBrace => depth += 1,
-                TokenKind::RBrace => depth -= 1,
-                TokenKind::Identifier | TokenKind::StringLiteral
-                    if depth == 1
-                        && matches!(
-                            tokens.get(cursor.wrapping_sub(1)).map(|token| token.0),
-                            Some(TokenKind::LBrace | TokenKind::Comma)
-                        )
-                        && matches!(
-                            tokens.get(cursor + 1).map(|token| token.0),
-                            Some(
-                                TokenKind::Colon
-                                    | TokenKind::Comma
-                                    | TokenKind::RBrace
-                                    | TokenKind::LParen
-                            )
-                        ) =>
-                {
-                    named.push(tokens[cursor].1.trim_matches(['"', '\'']));
+                Statement::Export(ExportDeclaration::Named(
+                    ExportNamedDeclaration::Specifiers {
+                        type_only,
+                        specifiers,
+                        source: Some(_),
+                        ..
+                    },
+                )) => {
+                    let Some(edge) = edge else {
+                        continue;
+                    };
+                    let Some(target) = source_map.get(&edge.to).copied() else {
+                        continue;
+                    };
+                    let type_exports = exported_type_names(target);
+                    for specifier in specifiers {
+                        let Some(name) = module_export_name(source, &specifier.data().local) else {
+                            continue;
+                        };
+                        if !*type_only
+                            && specifier.data().mode == ExportSpecifierMode::Value
+                            && type_exports.contains(name.as_ref())
+                        {
+                            push_program_fact(
+                                &mut additions,
+                                source_id,
+                                SemanticHazard::TypeReexportedAsValue,
+                                specifier.range(),
+                                None,
+                            );
+                        }
+                    }
+                }
+                Statement::Export(ExportDeclaration::Named(
+                    ExportNamedDeclaration::Declaration(declaration),
+                )) if has_local_edge && declaration_depends_on_inference(declaration) => {
+                    push_program_fact(
+                        &mut additions,
+                        source_id,
+                        SemanticHazard::DeclarationInferenceDependency,
+                        declaration.range(),
+                        None,
+                    );
                 }
                 _ => {}
             }
-            cursor += 1;
         }
     }
-    CommonJsExports { is_commonjs, named }
+
+    for (source_id, facts) in additions {
+        let model = models
+            .get_mut(&source_id)
+            .expect("program facts only target checked modules");
+        model.facts_mut().extend(facts);
+    }
+}
+
+fn push_program_fact(
+    additions: &mut BTreeMap<SourceId, Vec<HazardFact>>,
+    source_id: SourceId,
+    hazard: SemanticHazard,
+    range: TextRange,
+    note: Option<Box<str>>,
+) {
+    additions.entry(source_id).or_default().push(HazardFact {
+        hazard,
+        range,
+        note,
+    });
+}
+
+fn declaration_depends_on_inference(statement: &Stmt) -> bool {
+    match statement.data() {
+        Statement::Variable(variable) => variable
+            .declarations
+            .iter()
+            .any(|declaration| declaration.data().type_annotation.is_none()),
+        Statement::Function(function) => function.function.return_type.is_none(),
+        _ => false,
+    }
+}
+
+fn exported_type_names<'a>(source: &'a SourceFile) -> HashSet<Cow<'a, str>> {
+    source
+        .statements()
+        .iter()
+        .filter_map(|statement| {
+            let Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
+                declaration,
+            ))) = statement.data()
+            else {
+                return None;
+            };
+            match declaration.data() {
+                Statement::Interface(interface) => {
+                    source.identifier_text(interface.name.data().token())
+                }
+                Statement::TypeAlias(alias) => source.identifier_text(alias.name.data().token()),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+struct CommonJsExports {
+    is_commonjs: bool,
+    named: HashSet<String>,
+}
+
+fn commonjs_exports(source: &SourceFile, model: &SemanticModel) -> CommonJsExports {
+    let mut exports = CommonJsExports {
+        is_commonjs: false,
+        named: HashSet::new(),
+    };
+    for statement in source.statements() {
+        let Statement::Expression(statement) = statement.data() else {
+            continue;
+        };
+        let Expression::Assignment(assignment) = statement.expression.data() else {
+            continue;
+        };
+        let AssignmentTarget::Member(member) = assignment.left.data() else {
+            continue;
+        };
+        let MemberProperty::Named(property) = &member.property else {
+            continue;
+        };
+        let property_name = source
+            .identifier_text(property.data().token())
+            .unwrap_or_default();
+        if let Expression::Member(namespace) = member.object.data() {
+            let Expression::Identifier(module) = namespace.object.data() else {
+                continue;
+            };
+            let MemberProperty::Named(namespace_property) = &namespace.property else {
+                continue;
+            };
+            let module_name = source
+                .identifier_text(module.data().token())
+                .unwrap_or_default();
+            let namespace_name = source
+                .identifier_text(namespace_property.data().token())
+                .unwrap_or_default();
+            if module_name == "module"
+                && namespace_name == "exports"
+                && !model
+                    .reference(module.id())
+                    .is_some_and(|symbol| model.symbol(symbol).kind() != SymbolKind::IntrinsicValue)
+            {
+                exports.is_commonjs = true;
+                exports.named.insert(property_name.into_owned());
+            }
+            continue;
+        }
+        let Expression::Identifier(object) = member.object.data() else {
+            continue;
+        };
+        let object_name = source
+            .identifier_text(object.data().token())
+            .unwrap_or_default();
+        if model.reference(object.id()).is_some_and(|symbol| {
+            model.symbol(symbol).kind() != SymbolKind::IntrinsicValue
+                || !matches!(object_name.as_ref(), "module" | "exports")
+        }) {
+            continue;
+        }
+        match (object_name.as_ref(), property_name.as_ref()) {
+            ("module", "exports") => {
+                exports.is_commonjs = true;
+                let Expression::Object(object) = assignment.right.data() else {
+                    continue;
+                };
+                for member in &object.members {
+                    let name = match member.data() {
+                        ObjectMember::Property(property) => &property.name,
+                        ObjectMember::Method(method) => &method.name,
+                        ObjectMember::Spread(_) | ObjectMember::Missing(_) => continue,
+                    };
+                    let name = match name {
+                        PropertyName::Identifier(identifier) => {
+                            source.identifier_text(identifier.data().token())
+                        }
+                        PropertyName::String(string) => source
+                            .token_text(string.data().token())
+                            .map(|name| Cow::Borrowed(name.trim_matches(['"', '\'']))),
+                        _ => None,
+                    };
+                    if let Some(name) = name {
+                        exports.named.insert(name.into_owned());
+                    }
+                }
+            }
+            ("exports", name) => {
+                exports.is_commonjs = true;
+                exports.named.insert(name.to_owned());
+            }
+            _ => {}
+        }
+    }
+    exports
 }
 
 fn has_esm_default_export(source: &SourceFile) -> bool {
@@ -964,18 +1543,20 @@ fn has_esm_default_export(source: &SourceFile) -> bool {
     })
 }
 
-fn module_export_name<'a>(source: &'a SourceFile, name: &ModuleExportName) -> Option<&'a str> {
-    let range = match name {
-        ModuleExportName::Identifier(node) => node.range(),
-        ModuleExportName::String(node) => node.range(),
-        ModuleExportName::Missing(_) => return None,
-    };
-    let text = source.source_text();
-    let start = text.utf16_to_byte(range.start()).ok()?;
-    let end = text.utf16_to_byte(range.end()).ok()?;
-    text.as_str()
-        .get(start..end)
-        .map(|value| value.trim_matches(['"', '\'']))
+fn module_export_name<'a>(source: &'a SourceFile, name: &ModuleExportName) -> Option<Cow<'a, str>> {
+    match name {
+        ModuleExportName::Identifier(node) => source.identifier_text(node.data().token()),
+        ModuleExportName::String(node) => {
+            let text = source.source_text();
+            let range = node.range();
+            let start = text.utf16_to_byte(range.start()).ok()?;
+            let end = text.utf16_to_byte(range.end()).ok()?;
+            text.as_str()
+                .get(start..end)
+                .map(|value| Cow::Borrowed(value.trim_matches(['"', '\''])))
+        }
+        ModuleExportName::Missing(_) => None,
+    }
 }
 
 #[cfg(test)]
@@ -987,7 +1568,7 @@ mod tests {
         lint::{LintProfile, LintTable},
         parser, scanner,
         source::{ScriptKind, SourceId, SourceText},
-        syntax::{NodeId, SourceFile},
+        syntax::SourceFile,
     };
 
     fn parsed(
@@ -1028,6 +1609,47 @@ mod tests {
             .expect("parameter starts on a UTF-8 boundary");
         assert_eq!(diagnostic.range().start(), expected_start);
         assert!(diagnostic.range().start() <= diagnostic.range().end());
+    }
+
+    #[test]
+    fn unary_non_number_enum_initializer_is_not_a_numeric_enum() {
+        let source = "enum E { A = -C } let e: E = E.A; let n: number = e;";
+        assert!(
+            !codes(source).contains(&"BAMTS-W045"),
+            "a nonnumeric enum initializer must not create a numeric-enum hazard"
+        );
+    }
+
+    #[test]
+    fn accessor_types_compare_by_canonical_checker_identity() {
+        let equivalent = "type Value = number|string; class C { get x(): Value { return 1; } set x(value: number | string) {} }";
+        assert!(
+            !codes(equivalent).contains(&"BAMTS-W011"),
+            "aliases and formatting must not make equivalent accessor types diverge"
+        );
+
+        let different = "class C { get x(): number { return 1; } set x(value: string) {} }";
+        assert!(
+            codes(different).contains(&"BAMTS-W011"),
+            "different accessor types must still diverge"
+        );
+    }
+
+    #[test]
+    fn static_and_instance_accessor_pairs_do_not_diverge() {
+        let static_get_instance_set =
+            "class C { static get x(): number { return 1; } set x(value: string) {} }";
+        assert!(
+            !codes(static_get_instance_set).contains(&"BAMTS-W011"),
+            "static and instance accessors are independent and must not be compared"
+        );
+
+        let static_get_static_set_divergent =
+            "class C { static get x(): number { return 1; } static set x(value: string) {} }";
+        assert!(
+            codes(static_get_static_set_divergent).contains(&"BAMTS-W011"),
+            "same-staticness divergent accessor pairs must still report divergence"
+        );
     }
 
     #[test]
@@ -1201,7 +1823,7 @@ mod tests {
             ];
             let edge = [ResolvedModuleEdge {
                 from: SourceId::new(0),
-                specifier: NodeId::new(0),
+                specifier: files[0].product().statements()[0].id(),
                 to: SourceId::new(1),
             }];
             let result = check_program(
@@ -1226,7 +1848,11 @@ mod tests {
             let safe = check_program(
                 ProgramCheckInput {
                     files: &safe_files,
-                    edges: &edge,
+                    edges: &[ResolvedModuleEdge {
+                        from: SourceId::new(0),
+                        specifier: safe_files[0].product().statements()[0].id(),
+                        to: SourceId::new(1),
+                    }],
                 },
                 &levels,
             );

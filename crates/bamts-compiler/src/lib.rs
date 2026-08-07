@@ -1,8 +1,11 @@
 pub mod checker;
 pub mod diagnostic;
 pub mod emitter;
+pub mod enum_plan;
 pub mod lint;
+mod literal;
 pub mod lower;
+pub mod namespace_plan;
 pub mod parser;
 pub mod pipeline;
 pub mod program;

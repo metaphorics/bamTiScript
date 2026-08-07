@@ -1,4 +1,4 @@
-# @bamti/cli-win32-x64
+# bamti-cli-win32-x64
 
 Windows x64 artifact package for `bamti-cli`.
 

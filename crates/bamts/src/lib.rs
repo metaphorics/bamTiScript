@@ -145,22 +145,14 @@ pub fn compile_source_file(
     path: impl AsRef<Path>,
 ) -> Result<bamts_compiler::program::ExecutableProgram> {
     let path = canonical_entrypoint(path.as_ref())?;
-    let config_path = path
-        .ancestors()
-        .skip(1)
-        .map(|directory| directory.join("tsconfig.json"))
-        .find(|candidate| candidate.is_file());
-    let root_path = config_path
-        .as_deref()
-        .and_then(Path::parent)
-        .or_else(|| path.parent())
-        .ok_or_else(|| {
-            Error::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "entrypoint has no parent directory",
-            )))
-        })?;
-    let root_path = fs::canonicalize(root_path)
+    let fallback_root = path.parent().map(Path::to_path_buf).ok_or_else(|| {
+        Error::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "entrypoint has no parent directory",
+        )))
+    })?;
+    let project = discover_project(&path, fallback_root);
+    let root_path = fs::canonicalize(project.root())
         .map_err(|error| Error::ProgramLoad(ProgramLoadError::InvalidRoot(error)))?;
     let root = ProjectRoot::new(&root_path).map_err(|error| {
         Error::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(
@@ -168,7 +160,7 @@ pub fn compile_source_file(
             error,
         )))
     })?;
-    let config_path = config_path.unwrap_or_else(|| root_path.join("tsconfig.json"));
+    let config_path = project.config().to_owned();
     let config_source = if config_path.is_file() {
         fs::read_to_string(&config_path).map_err(|source| Error::ReadConfig {
             path: config_path.clone(),
@@ -290,6 +282,47 @@ fn canonical_entrypoint(path: &Path) -> Result<PathBuf> {
     })
 }
 
+/// The root and compiler configuration selected for a canonical entrypoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectDiscovery {
+    root: PathBuf,
+    config: PathBuf,
+}
+
+impl ProjectDiscovery {
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    #[must_use]
+    pub fn config(&self) -> &Path {
+        &self.config
+    }
+}
+
+/// Selects one project root and `tsconfig.json` for a canonical entrypoint.
+///
+/// A `bamts.toml` ancestor takes precedence over every `tsconfig.json`
+/// ancestor. When neither exists, `fallback_root` defines the project.
+#[must_use]
+pub fn discover_project(entrypoint: &Path, fallback_root: PathBuf) -> ProjectDiscovery {
+    let ancestors = || entrypoint.parent().into_iter().flat_map(Path::ancestors);
+    let root = ancestors()
+        .find(|directory| directory.join("bamts.toml").is_file())
+        .or_else(|| ancestors().find(|directory| directory.join("tsconfig.json").is_file()))
+        .map_or(fallback_root, Path::to_path_buf);
+    let config = entrypoint
+        .parent()
+        .into_iter()
+        .flat_map(Path::ancestors)
+        .take_while(|directory| directory.starts_with(&root))
+        .map(|directory| directory.join("tsconfig.json"))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| root.join("tsconfig.json"));
+    ProjectDiscovery { root, config }
+}
+
 #[cfg(test)]
 mod tests {
     use super::compile_source_file;
@@ -317,6 +350,72 @@ mod tests {
 
     fn remove_fixture(directory: &Path) -> Result<(), Box<dyn Error>> {
         std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    fn tree_fixture(name: &str) -> Result<PathBuf, Box<dyn Error>> {
+        let directory = std::env::temp_dir().join(format!(
+            "bamts-facade-discovery-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(directory.join("sub"))?;
+        Ok(directory)
+    }
+
+    #[test]
+    fn bamts_toml_root_wins_over_a_closer_tsconfig() -> Result<(), Box<dyn Error>> {
+        let directory = tree_fixture("toml-precedence")?;
+        std::fs::write(directory.join("bamts.toml"), "")?;
+        std::fs::write(directory.join("shared.ts"), "export let value = 1;")?;
+        std::fs::write(directory.join("sub/tsconfig.json"), "{}")?;
+        let entrypoint = directory.join("sub/main.ts");
+        std::fs::write(
+            &entrypoint,
+            "import { value } from '../shared.js'; let answer = value;",
+        )?;
+
+        // The root is the nearest bamts.toml directory, so the `..` import
+        // stays inside the project and compiles.
+        let executable = compile_source_file(&entrypoint)?;
+        assert_eq!(executable.wire().modules().len(), 2);
+
+        // Without bamts.toml the tsconfig.json directory becomes the root and
+        // the same import escapes it.
+        std::fs::remove_file(directory.join("bamts.toml"))?;
+        let error = compile_source_file(&entrypoint)
+            .expect_err("the import must escape the tsconfig-only root");
+        assert!(matches!(error, super::Error::ProgramLoad(_)));
+
+        remove_fixture(&directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn nearest_tsconfig_within_the_root_wins() -> Result<(), Box<dyn Error>> {
+        let directory = tree_fixture("tsconfig-chain")?;
+        std::fs::write(directory.join("bamts.toml"), "")?;
+        std::fs::write(directory.join("tsconfig.json"), "this is not json")?;
+        std::fs::write(directory.join("sub/tsconfig.json"), "{}")?;
+        let entrypoint = directory.join("sub/main.ts");
+        std::fs::write(&entrypoint, "let answer = 42;")?;
+
+        // The nearest tsconfig.json between the entrypoint and the root wins,
+        // so the malformed root-level file is never read.
+        compile_source_file(&entrypoint)?;
+
+        // With no closer tsconfig.json the root's own file becomes the project
+        // configuration and its parse failure names that exact path.
+        std::fs::remove_file(directory.join("sub/tsconfig.json"))?;
+        let error =
+            compile_source_file(&entrypoint).expect_err("the root tsconfig.json must be parsed");
+        let expected = std::fs::canonicalize(directory.join("tsconfig.json"))?;
+        assert!(matches!(
+            error,
+            super::Error::ProjectConfig { ref path, .. } if *path == expected
+        ));
+
+        remove_fixture(&directory)?;
         Ok(())
     }
 
@@ -408,11 +507,131 @@ mod tests {
 
     #[cfg(feature = "node-host")]
     #[test]
+    fn runs_qualified_import_equals_namespace_alias() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            declare namespace A { export namespace B { export const value: number; } }
+            import X = A.B;
+            type Alias = X;
+            const erased: Alias | undefined = undefined;
+            process.stdout.write(String(erased === undefined) + "\n");
+        "#;
+        let (directory, entrypoint) = script_fixture("qualified-import-equals", source)?;
+        let output = run_program(&entrypoint)?;
+
+        assert_eq!(output.stdout, b"true\n");
+        assert_eq!(output.exit_code, 0);
+        remove_fixture(&directory)
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn runs_nested_ambient_qualified_import_equals_namespace_alias() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            declare namespace A {
+                export namespace B {
+                    export namespace C {
+                        export const value: number;
+                    }
+                }
+            }
+            import X = A.B.C;
+            type Alias = X;
+            const erased: Alias | undefined = undefined;
+            process.stdout.write(String(erased === undefined) + "\n");
+        "#;
+        let (directory, entrypoint) = script_fixture("nested-qualified-import-equals", source)?;
+        let output = run_program(&entrypoint)?;
+
+        assert_eq!(output.stdout, b"true\n");
+        assert_eq!(output.exit_code, 0);
+        remove_fixture(&directory)
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn runs_merged_export_namespace_value_export() -> Result<(), Box<dyn Error>> {
+        let directory = std::env::temp_dir().join(format!(
+            "bamts-facade-merged-export-namespace-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(
+            directory.join("ns.ts"),
+            r#"
+                export class C {}
+                export namespace C {
+                    export const tag = "ns";
+                }
+                export namespace N {
+                    export const x = 1;
+                }
+                export namespace N {
+                    export const y = 2;
+                }
+                export function F() {
+                    return "fn";
+                }
+                export namespace F {
+                    export const z = 3;
+                }
+            "#,
+        )?;
+        let entrypoint = directory.join("main.ts");
+        std::fs::write(
+            &entrypoint,
+            r#"
+                import { C, N, F } from "./ns.ts";
+                process.stdout.write(String(C.tag) + "\n");
+                process.stdout.write(String(N.x + N.y) + "\n");
+                process.stdout.write(String(F() + F.z) + "\n");
+            "#,
+        )?;
+        let output = run_program(&entrypoint)?;
+        assert_eq!(output.stdout, b"ns\n3\nfn3\n");
+        assert_eq!(output.exit_code, 0);
+        remove_fixture(&directory)
+    }
+
+    #[test]
     fn runs_two_module_program_with_live_imported_mutation() -> Result<(), Box<dyn Error>> {
         let (directory, entrypoint) = fixture("run")?;
         let output = run_program(&entrypoint)?;
 
         assert_eq!(output.stdout, b"2\n");
+        assert_eq!(output.exit_code, 0);
+        remove_fixture(&directory)
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn runs_commonjs_export_equals_import_require() -> Result<(), Box<dyn Error>> {
+        let directory = std::env::temp_dir().join(format!(
+            "bamts-facade-export-equals-require-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(
+            directory.join("dep.ts"),
+            r#"
+                function run() {
+                    process.stdout.write("executed\n");
+                }
+                export = run;
+            "#,
+        )?;
+        let entrypoint = directory.join("main.ts");
+        std::fs::write(
+            &entrypoint,
+            r#"
+                import run = require("./dep.js");
+                run();
+            "#,
+        )?;
+        let output = run_program(&entrypoint)?;
+
+        assert_eq!(output.stdout, b"executed\n");
         assert_eq!(output.exit_code, 0);
         remove_fixture(&directory)
     }
@@ -535,6 +754,34 @@ mod tests {
                 "import vm from 'node:vm'; process.stdout.write(String(vm.runInThisContext({script:?})) + '\\n');"
             );
             let (directory, entrypoint) = script_fixture(&format!("completion-{name}"), &source)?;
+            let output = run_program(&entrypoint)?;
+            assert_eq!(output.stdout, expected_stdout, "{name}");
+            assert_eq!(output.exit_code, 0, "{name}");
+            remove_fixture(&directory)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn classic_script_dynamic_import_resolves_external_namespaces() -> Result<(), Box<dyn Error>> {
+        let cases = [
+            (
+                "external-namespace",
+                "import('node:util').then(function(ns) { process.stdout.write(String(typeof ns.parseArgs) + '\\n'); })",
+                b"function\n".as_slice(),
+            ),
+            (
+                "computed-specifier",
+                "const name = 'node:util'; import(name).then(function(ns) { process.stdout.write(String(typeof ns.parseArgs) + '\\n'); })",
+                b"function\n".as_slice(),
+            ),
+        ];
+
+        for (name, script, expected_stdout) in cases {
+            let source = format!("import vm from 'node:vm'; vm.runInThisContext({script:?});");
+            let (directory, entrypoint) =
+                script_fixture(&format!("classic-import-{name}"), &source)?;
             let output = run_program(&entrypoint)?;
             assert_eq!(output.stdout, expected_stdout, "{name}");
             assert_eq!(output.exit_code, 0, "{name}");
@@ -864,6 +1111,76 @@ mod tests {
         assert!(drain.uncaught.is_empty());
         assert_eq!(stdout, b"caught:7\nuncaught:8\nreturn:6\n");
         Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn run_program_drains_microtasks_and_timers_to_quiescence_in_phase_order()
+    -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            process.stdout.write("sync\n");
+            Promise.resolve().then(() => {
+                process.stdout.write("promise\n");
+            });
+            setTimeout(() => {
+                process.stdout.write("timer\n");
+                Promise.resolve().then(() => {
+                    process.stdout.write("timer-promise\n");
+                });
+            }, 1);
+        "#;
+        let (directory, entrypoint) = script_fixture("quiescence-phase-order", source)?;
+        let output = run_program(&entrypoint)?;
+
+        assert_eq!(output.stdout, b"sync\npromise\ntimer\ntimer-promise\n");
+        assert_eq!(output.exit_code, 0);
+        remove_fixture(&directory)
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn run_program_keeps_alive_for_a_future_timer() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            process.stdout.write("start\n");
+            setTimeout(() => {
+                process.stdout.write("fired\n");
+            }, 2);
+        "#;
+        let (directory, entrypoint) = script_fixture("future-timer", source)?;
+        let output = run_program(&entrypoint)?;
+
+        assert_eq!(output.stdout, b"start\nfired\n");
+        assert_eq!(output.exit_code, 0);
+        remove_fixture(&directory)
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn run_program_maps_the_first_uncaught_timer_throw() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            setTimeout(() => {
+                throw 7;
+            }, 1);
+            setTimeout(() => {
+                throw 99;
+            }, 2);
+        "#;
+        let (directory, entrypoint) = script_fixture("uncaught-timer", source)?;
+        let error = run_program(&entrypoint).expect_err("an uncaught timer callback fails the run");
+        let super::Error::Runtime(runtime) = error else {
+            panic!("expected a runtime error, got {error:?}");
+        };
+        match runtime.kind {
+            bamts_runtime::RuntimeErrorKind::UncaughtThrow { value, .. } => {
+                assert_eq!(
+                    value,
+                    bamts_runtime::constant_value(&bamts_bytecode::Constant::Int32(7)).unwrap(),
+                    "expected the first timer's uncaught throw (7)"
+                );
+            }
+            other => panic!("expected UncaughtThrow, got {other:?}"),
+        }
+        remove_fixture(&directory)
     }
 
     #[cfg(feature = "aot")]

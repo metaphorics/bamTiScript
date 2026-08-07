@@ -14,6 +14,19 @@ use std::sync::Arc;
 use bamts_bytecode::{Program, Verified};
 use bamts_runtime::Host;
 
+/// Parent-to-AOT-child transport for the logical source entrypoint.
+///
+/// `initialize_aot_process_context` consumes this before publishing
+/// `process.env`, so it is not observable to JavaScript. It supplies the
+/// logical `argv[1]` slot only when the launch proof matches.
+pub const AOT_ENTRYPOINT_ENV: &str = "BAMTS_AOT_ENTRYPOINT";
+/// Parent-to-AOT-child launch proof paired with the private process argument.
+///
+/// `initialize_aot_process_context` compares the token against
+/// `process_args[1]`; the executable path otherwise fills the logical
+/// `argv[1]` slot.
+pub const AOT_LAUNCH_TOKEN_ENV: &str = "BAMTS_AOT_LAUNCH_TOKEN";
+
 /// Classic-script compiler capability for Node hosts.
 #[cfg(feature = "script-compiler")]
 #[derive(Default)]
@@ -517,7 +530,7 @@ enum AotCompletion<'a> {
     Failure(AotMainFailure),
 }
 
-/// Emits buffered host stdout only on success and always flushes host stderr.
+/// Emits buffered host output for every completion and flushes both streams.
 #[cfg(any(feature = "aot-main", test))]
 fn write_aot_completion(
     host: &NodeHost,
@@ -525,9 +538,9 @@ fn write_aot_completion(
     stdout: &mut impl std::io::Write,
     stderr: &mut impl std::io::Write,
 ) -> std::io::Result<i32> {
+    stdout.write_all(host.stdout())?;
     let (exit_code, failure) = match completion {
         AotCompletion::Success(outcome) => {
-            stdout.write_all(host.stdout())?;
             stdout.write_all(&outcome.stdout)?;
             (
                 if host.exit_code() == 0 {
@@ -540,6 +553,7 @@ fn write_aot_completion(
         }
         AotCompletion::Failure(error) => (1, Some(error)),
     };
+    stdout.flush()?;
     stderr.write_all(host.stderr())?;
     if let Some(error) = failure {
         writeln!(stderr, "bamts: {error}")?;
@@ -573,18 +587,24 @@ enum AotProcessContextError {
 
 /// Populate an AOT host from an explicit process snapshot.
 ///
-/// The leading `bamts` mirrors the JIT driver's argv convention; the AOT
-/// executable path occupies the entrypoint slot. Conversion is all-or-nothing
-/// so an invalid OS string cannot leave a partially populated host.
+/// The leading `bamts` mirrors the JIT driver's argv convention, so the
+/// executable always maps to logical `argv[1]`. A matching launch token
+/// (compared against the private `process_args[1]`) authenticates a
+/// parent-launched child: the token slot is skipped and `AOT_ENTRYPOINT_ENV`
+/// fills that `argv[1]` position, falling back to the executable path when no
+/// entrypoint was transported. Without a match, direct execution keeps the
+/// executable at `argv[1]` and drops any inherited transport variables.
+/// Conversion is all-or-nothing so an invalid OS string cannot leave a
+/// partially populated host.
 #[cfg(any(feature = "aot-main", test))]
 fn initialize_aot_process_context(
     host: &mut NodeHost,
     args: impl IntoIterator<Item = std::ffi::OsString>,
     environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> Result<(), AotProcessContextError> {
-    let mut argv = vec!["bamts".to_owned()];
+    let mut process_args = Vec::new();
     for argument in args {
-        argv.push(
+        process_args.push(
             argument
                 .into_string()
                 .map_err(|_| AotProcessContextError::Argument)?,
@@ -602,6 +622,30 @@ fn initialize_aot_process_context(
         env.insert(name, value);
     }
 
+    let entrypoint_env = env.remove(AOT_ENTRYPOINT_ENV);
+    let launch_token_env = env.remove(AOT_LAUNCH_TOKEN_ENV);
+
+    // A matching launch token authenticates a parent-launched AOT child: the
+    // token is supplied both as `AOT_LAUNCH_TOKEN_ENV` and as the private
+    // `process_args[1]`. On a match the token slot is consumed so it never
+    // reaches JavaScript, regardless of whether an entrypoint was transported.
+    let launch_authenticated = match (launch_token_env.as_ref(), process_args.get(1)) {
+        (Some(token), Some(argument)) => argument == token,
+        _ => false,
+    };
+
+    let (entrypoint, first_program_argument) = if launch_authenticated {
+        let entrypoint = entrypoint_env.or_else(|| process_args.first().cloned());
+        (entrypoint, 2)
+    } else {
+        (process_args.first().cloned(), 1)
+    };
+    let mut argv = vec!["bamts".to_owned()];
+    if let Some(entrypoint) = entrypoint {
+        argv.push(entrypoint);
+    }
+    argv.extend(process_args.into_iter().skip(first_program_argument));
+
     host.argv = argv;
     host.env = env;
     Ok(())
@@ -610,6 +654,28 @@ fn initialize_aot_process_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FlushProbe {
+        bytes: Vec<u8>,
+        flushes: usize,
+        flush_error: Option<std::io::ErrorKind>,
+    }
+
+    impl std::io::Write for FlushProbe {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            match self.flush_error {
+                Some(kind) => Err(std::io::Error::from(kind)),
+                None => Ok(()),
+            }
+        }
+    }
+
     #[cfg(feature = "aot-main")]
     #[test]
     fn linked_descriptor_decodes_whole_program_and_tuple_entry() {
@@ -726,11 +792,110 @@ mod tests {
     }
 
     #[test]
+    fn aot_process_context_replaces_the_executable_with_a_private_entrypoint() {
+        let mut host = NodeHost::new();
+        initialize_aot_process_context(
+            &mut host,
+            [
+                std::ffi::OsString::from("/tmp/cache/aot-image"),
+                std::ffi::OsString::from("launch-7"),
+                std::ffi::OsString::from("--flag"),
+            ],
+            [
+                (
+                    std::ffi::OsString::from(AOT_ENTRYPOINT_ENV),
+                    std::ffi::OsString::from("src/main.ts"),
+                ),
+                (
+                    std::ffi::OsString::from(AOT_LAUNCH_TOKEN_ENV),
+                    std::ffi::OsString::from("launch-7"),
+                ),
+                (
+                    std::ffi::OsString::from("VISIBLE"),
+                    std::ffi::OsString::from("value"),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(host.argv(), ["bamts", "src/main.ts", "--flag"]);
+        assert_eq!(host.env("BAMTS_AOT_ENTRYPOINT"), None);
+        assert_eq!(host.env("VISIBLE"), Some("value"));
+    }
+
+    #[test]
+    fn aot_process_context_ignores_inherited_transport_without_launch_proof() {
+        let mut host = NodeHost::new();
+        initialize_aot_process_context(
+            &mut host,
+            [
+                std::ffi::OsString::from("/tmp/direct-aot-image"),
+                std::ffi::OsString::from("--flag"),
+            ],
+            [
+                (
+                    std::ffi::OsString::from(AOT_ENTRYPOINT_ENV),
+                    std::ffi::OsString::from("stale.ts"),
+                ),
+                (
+                    std::ffi::OsString::from(AOT_LAUNCH_TOKEN_ENV),
+                    std::ffi::OsString::from("stale-token"),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(host.argv(), ["bamts", "/tmp/direct-aot-image", "--flag"]);
+        assert_eq!(host.env(AOT_ENTRYPOINT_ENV), None);
+        assert_eq!(host.env(AOT_LAUNCH_TOKEN_ENV), None);
+    }
+
+    #[test]
+    fn aot_process_context_consumes_authenticated_token_without_entrypoint() {
+        let mut host = NodeHost::new();
+        initialize_aot_process_context(
+            &mut host,
+            [
+                std::ffi::OsString::from("/tmp/cache/aot-image"),
+                std::ffi::OsString::from("launch-7"),
+                std::ffi::OsString::from("--flag"),
+                std::ffi::OsString::from("extra.ts"),
+            ],
+            [
+                (
+                    std::ffi::OsString::from(AOT_LAUNCH_TOKEN_ENV),
+                    std::ffi::OsString::from("launch-7"),
+                ),
+                (
+                    std::ffi::OsString::from("VISIBLE"),
+                    std::ffi::OsString::from("value"),
+                ),
+            ],
+        )
+        .unwrap();
+
+        // A matching token still consumes the token slot (argv[1] stays the
+        // executable and the token never appears) even with no transported
+        // entrypoint; transport env keys remain hidden.
+        assert_eq!(
+            host.argv(),
+            ["bamts", "/tmp/cache/aot-image", "--flag", "extra.ts"]
+        );
+        assert_eq!(host.env(AOT_LAUNCH_TOKEN_ENV), None);
+        assert_eq!(host.env(AOT_ENTRYPOINT_ENV), None);
+        assert_eq!(host.env("VISIBLE"), Some("value"));
+    }
+
+    #[test]
     fn aot_runtime_failure_emits_host_stderr_and_stable_error() {
         let mut host = NodeHost::new();
         Host::write_stdout(&mut host, b"before failure");
         Host::write_stderr(&mut host, b"host diagnostic\n");
-        let mut stdout = Vec::new();
+        let mut stdout = FlushProbe {
+            bytes: Vec::new(),
+            flushes: 0,
+            flush_error: None,
+        };
         let mut stderr = Vec::new();
 
         let exit_code = write_aot_completion(
@@ -742,7 +907,8 @@ mod tests {
         .expect("completion writes");
 
         assert_eq!(exit_code, 1);
-        assert!(stdout.is_empty());
+        assert_eq!(stdout.bytes, b"before failure");
+        assert_eq!(stdout.flushes, 1);
         assert_eq!(stderr, b"host diagnostic\nbamts: aot runtime\n");
     }
 
@@ -794,6 +960,60 @@ mod tests {
         assert_eq!(exit_code, 11);
         assert_eq!(stdout, b"host stdoutruntime stdout");
         assert_eq!(stderr, b"host stderr");
+    }
+
+    #[test]
+    fn aot_completion_flushes_trailing_stdout_without_a_newline() {
+        let mut host = NodeHost::new();
+        Host::write_stdout(&mut host, b"trailing host output");
+        let outcome = bamts_runtime::ExecutionOutcome {
+            stdout: b" and runtime output".to_vec(),
+            exit_code: 0,
+        };
+        let mut stdout = FlushProbe {
+            bytes: Vec::new(),
+            flushes: 0,
+            flush_error: None,
+        };
+        let mut stderr = Vec::new();
+
+        let exit_code = write_aot_completion(
+            &host,
+            AotCompletion::Success(&outcome),
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("completion writes");
+
+        assert_eq!(exit_code, 0);
+        assert_eq!(stdout.bytes, b"trailing host output and runtime output");
+        assert_eq!(stdout.flushes, 1);
+    }
+
+    #[test]
+    fn aot_completion_propagates_stdout_flush_failure() {
+        let host = NodeHost::new();
+        let outcome = bamts_runtime::ExecutionOutcome {
+            stdout: Vec::new(),
+            exit_code: 0,
+        };
+        let mut stdout = FlushProbe {
+            bytes: Vec::new(),
+            flushes: 0,
+            flush_error: Some(std::io::ErrorKind::BrokenPipe),
+        };
+        let mut stderr = Vec::new();
+
+        let error = write_aot_completion(
+            &host,
+            AotCompletion::Success(&outcome),
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect_err("stdout flush failure is reported");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(stdout.flushes, 1);
     }
 
     #[cfg(unix)]

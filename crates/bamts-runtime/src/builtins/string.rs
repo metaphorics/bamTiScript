@@ -111,8 +111,9 @@ fn locale_compare<H: Host>(
     if matches!(this.decode(), Some(Decoded::Undefined | Decoded::Null)) {
         return Err(type_error("String method called on null or undefined"));
     }
-    let this = machine.to_string_observable(this)?;
-    let other = machine.to_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let this = machine.coerce_string_observable(this)?;
+    let other =
+        machine.coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let result: i32 = match this.as_units().cmp(other.as_units()) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
@@ -271,7 +272,9 @@ fn slice<H: Host>(
         string.len_units(),
     );
     let result = if end > start {
-        string.slice_units(start..end)
+        string
+            .slice_units(start..end)
+            .expect("slice bounds were clamped to the string")
     } else {
         EcmaString::default()
     };
@@ -298,7 +301,9 @@ fn substring<H: Host>(
     }
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
-        string.slice_units(start..end),
+        string
+            .slice_units(start..end)
+            .expect("substring bounds were clamped to the string"),
     )?))
 }
 fn search_units(h: &[u16], n: &[u16], start: usize) -> Option<usize> {
@@ -433,10 +438,18 @@ fn split<H: Host>(
             let mut parts = Vec::new();
             let mut cursor = 0;
             while let Some(offset) = search_units(string.as_units(), separator.as_units(), cursor) {
-                parts.push(string.slice_units(cursor..offset));
+                parts.push(
+                    string
+                        .slice_units(cursor..offset)
+                        .expect("separator search returns string bounds"),
+                );
                 cursor = offset + separator.len_units();
             }
-            parts.push(string.slice_units(cursor..string.len_units()));
+            parts.push(
+                string
+                    .slice_units(cursor..string.len_units())
+                    .expect("separator search preserves string bounds"),
+            );
             parts
         }
     };
@@ -482,12 +495,19 @@ fn replacement<H: Host>(
             unit if unit == u16::from(b'$') => output.push_unit(u16::from(b'$')),
             unit if unit == u16::from(b'&') => append(&mut output, matched),
             unit if unit == u16::from(b'`') => {
-                append(&mut output, &whole.slice_units(0..index));
+                append(
+                    &mut output,
+                    &whole
+                        .slice_units(0..index)
+                        .expect("match index is within the source string"),
+                );
             }
             unit if unit == u16::from(b'\'') => {
                 append(
                     &mut output,
-                    &whole.slice_units(index + matched.len_units()..whole.len_units()),
+                    &whole
+                        .slice_units(index + matched.len_units()..whole.len_units())
+                        .expect("match range is within the source string"),
                 );
             }
             _ => {
@@ -520,7 +540,12 @@ fn replace_impl<H: Host>(
         let Some(index) = search_units(string.as_units(), needle.as_units(), cursor) else {
             break;
         };
-        append(&mut output, &string.slice_units(cursor..index));
+        append(
+            &mut output,
+            &string
+                .slice_units(cursor..index)
+                .expect("search result is within the source string"),
+        );
         append(
             &mut output,
             &replacement(machine, replacer, &needle, index, &string)?,
@@ -538,7 +563,9 @@ fn replace_impl<H: Host>(
     }
     append(
         &mut output,
-        &string.slice_units(cursor.min(string.len_units())..string.len_units()),
+        &string
+            .slice_units(cursor.min(string.len_units())..string.len_units())
+            .expect("cursor was clamped to the source string"),
     );
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
@@ -597,6 +624,7 @@ fn trim_range(text: &EcmaString, trim_start: bool, trim_end: bool) -> EcmaString
         units.len()
     };
     text.slice_units(start..end.max(start))
+        .expect("trim bounds were derived from the source string")
 }
 
 macro_rules! trim_fn {
@@ -673,9 +701,10 @@ fn pad<H: Host>(
     start: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let string = text(machine, this)?;
-    let target = to_integer_or_infinity(machine, args.first().copied().unwrap_or(Value::UNDEFINED))?
-        .max(0.0) as usize;
-    if target <= string.len_units() {
+    let target =
+        to_integer_or_infinity(machine, args.first().copied().unwrap_or(Value::UNDEFINED))?
+            .max(0.0);
+    if target <= string.len_units() as f64 {
         return Ok(BuiltinOutcome::Value(allocate_string(machine, string)?));
     }
     let filler = if args.len() < 2 || args[1] == Value::UNDEFINED {
@@ -686,28 +715,47 @@ fn pad<H: Host>(
     if filler.is_empty() {
         return Ok(BuiltinOutcome::Value(allocate_string(machine, string)?));
     }
+    if target > (machine.limits.max_heap_bytes / std::mem::size_of::<u16>()) as f64 {
+        return Err(EvalFailure::Runtime(
+            crate::RuntimeErrorKind::HeapByteLimitExceeded {
+                limit: machine.limits.max_heap_bytes,
+            },
+        ));
+    }
+    let target = target as usize;
+    preflight_string_allocation(machine, target)?;
     let needed = target - string.len_units();
-    let padding = EcmaString::from_units(
-        &filler
-            .as_units()
-            .iter()
-            .copied()
-            .cycle()
-            .take(needed)
-            .collect::<Vec<_>>(),
-    );
     let mut output = EcmaStringBuilder::with_capacity(target);
     if start {
-        append(&mut output, &padding);
+        for unit in filler.as_units().iter().copied().cycle().take(needed) {
+            output.push_unit(unit);
+        }
         append(&mut output, &string);
     } else {
         append(&mut output, &string);
-        append(&mut output, &padding);
+        for unit in filler.as_units().iter().copied().cycle().take(needed) {
+            output.push_unit(unit);
+        }
     }
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
         output.finish(),
     )?))
+}
+fn preflight_string_allocation<H: Host>(
+    machine: &Machine<'_, H>,
+    units: usize,
+) -> Result<(), EvalFailure> {
+    let bytes = units
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or(EvalFailure::Runtime(
+            crate::RuntimeErrorKind::HeapByteLimitExceeded {
+                limit: machine.limits.max_heap_bytes,
+            },
+        ))?;
+    machine
+        .ensure_allocation_capacity(1, bytes)
+        .map_err(EvalFailure::Runtime)
 }
 fn pad_start<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -736,9 +784,28 @@ fn repeat<H: Host>(
     if count < 0.0 || count.is_infinite() {
         return Err(range_error("Invalid count value"));
     }
-    let mut output =
-        EcmaStringBuilder::with_capacity(string.len_units().saturating_mul(count as usize));
-    for _ in 0..count as usize {
+    if string.is_empty() {
+        return Ok(BuiltinOutcome::Value(allocate_string(machine, string)?));
+    }
+    if count > (machine.limits.max_heap_bytes / std::mem::size_of::<u16>()) as f64 {
+        return Err(EvalFailure::Runtime(
+            crate::RuntimeErrorKind::HeapByteLimitExceeded {
+                limit: machine.limits.max_heap_bytes,
+            },
+        ));
+    }
+    let count = count as usize;
+    let output_units = string
+        .len_units()
+        .checked_mul(count)
+        .ok_or(EvalFailure::Runtime(
+            crate::RuntimeErrorKind::HeapByteLimitExceeded {
+                limit: machine.limits.max_heap_bytes,
+            },
+        ))?;
+    preflight_string_allocation(machine, output_units)?;
+    let mut output = EcmaStringBuilder::with_capacity(output_units);
+    for _ in 0..count {
         append(&mut output, &string);
     }
     Ok(BuiltinOutcome::Value(allocate_string(
@@ -835,7 +902,8 @@ pub(super) fn unescape<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let source = machine.to_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let source =
+        machine.coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let units = source.as_units();
     let mut output = EcmaStringBuilder::with_capacity(units.len());
     let mut offset = 0;
@@ -1255,47 +1323,10 @@ fn regexp_replacement<H: Host>(
 
 #[cfg(test)]
 mod unescape_tests {
-    use bamts_bytecode::{
-        Constant, ConstantId, Function, FunctionFlags, FunctionId, Instruction, Module, ModuleId,
-        Program, ProgramModule, Verified,
-    };
-
+    use super::super::test_support::{TestHost, blank_program, ordinary_object};
     use super::*;
     use crate::intrinsics::{BuiltinDef, native_function};
-    use crate::{Limits, PropertyMap, ThrowOrigin};
-
-    #[derive(Default)]
-    struct TestHost;
-    impl Host for TestHost {}
-
-    fn module() -> Program<Verified> {
-        let code = Module::new(
-            vec![Constant::String(EcmaString::from_utf8("<test>"))],
-            vec![Function::new(
-                None,
-                0,
-                0,
-                1,
-                FunctionFlags::default(),
-                vec![Instruction::Halt],
-                Vec::new(),
-            )],
-            FunctionId::new(0),
-        )
-        .verify()
-        .expect("valid test module");
-        Program::link(
-            vec![ProgramModule {
-                name: ConstantId::new(0),
-                code,
-                edges: Vec::new(),
-                bindings: Vec::new(),
-                exports: Vec::new(),
-            }],
-            ModuleId::new(0),
-        )
-        .expect("valid test program")
-    }
+    use crate::{Limits, ThrowOrigin};
 
     fn escape_string(
         machine: &mut Machine<'_, TestHost>,
@@ -1334,20 +1365,9 @@ mod unescape_tests {
         native_function(&mut machine.heap, id, name, 0)
     }
 
-    fn object(machine: &mut Machine<'_, TestHost>) -> Value {
-        machine
-            .allocate(HeapEntry::Object {
-                properties: PropertyMap::default(),
-                prototype: Some(machine.intrinsics.object_prototype),
-                extensible: true,
-                boxed_primitive: None,
-            })
-            .expect("object allocation succeeds")
-    }
-
     #[test]
     fn locale_compare_uses_observable_utf16_lexical_signs() {
-        let program = module();
+        let program = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&program, &mut host, Limits::default());
         let locale_compare = machine
@@ -1394,7 +1414,7 @@ mod unescape_tests {
             Value::int32(1)
         );
 
-        let coercible = object(&mut machine);
+        let coercible = ordinary_object(&mut machine);
         let to_string = native(&mut machine, "localeCompare toString", escape_string);
         machine
             .set_data_property(coercible, "toString", to_string)
@@ -1409,7 +1429,7 @@ mod unescape_tests {
 
     #[test]
     fn string_constructor_renders_symbols_without_relaxing_implicit_coercion() {
-        let program = module();
+        let program = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&program, &mut host, Limits::default());
         let symbol_constructor = machine
@@ -1446,7 +1466,7 @@ mod unescape_tests {
 
     #[test]
     fn string_constructor_uses_error_to_string_for_constructed_errors() {
-        let program = module();
+        let program = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&program, &mut host, Limits::default());
         let message = machine
@@ -1490,14 +1510,14 @@ mod unescape_tests {
 
     #[test]
     fn unescape_observes_string_coercion_and_preserves_malformed_utf16() {
-        let program = module();
+        let program = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&program, &mut host, Limits::default());
         let unescape = machine
             .intrinsics
             .global("unescape")
             .expect("unescape installs");
-        let coercible = object(&mut machine);
+        let coercible = ordinary_object(&mut machine);
         let to_string = native(&mut machine, "toString", escape_string);
         machine
             .set_data_property(coercible, "toString", to_string)
@@ -1540,7 +1560,7 @@ mod unescape_tests {
             ]
         );
 
-        let throwing = object(&mut machine);
+        let throwing = ordinary_object(&mut machine);
         let throwing_to_string = native(&mut machine, "throwing toString", throw_on_coercion);
         machine
             .set_data_property(throwing, "toString", throwing_to_string)
@@ -1550,5 +1570,45 @@ mod unescape_tests {
                 .call_value(unescape, Value::UNDEFINED, &[throwing])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn pad_and_repeat_preflight_large_finite_outputs() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let source = machine
+            .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+            .expect("source string allocation succeeds");
+        let pad_start = machine
+            .get_named_property(machine.intrinsics.builtins.string_prototype(), "padStart")
+            .expect("padStart is installed");
+        let repeat = machine
+            .get_named_property(machine.intrinsics.builtins.string_prototype(), "repeat")
+            .expect("repeat is installed");
+        let before = (
+            machine.heap.len(),
+            machine.heap_bytes,
+            machine.machine_bytes,
+        );
+        machine.limits.max_heap_bytes = machine.heap_bytes;
+
+        for method in [pad_start, repeat] {
+            assert!(matches!(
+                machine.call_value(method, source, &[Value::number(1e300)]),
+                Err(EvalFailure::Runtime(
+                    crate::RuntimeErrorKind::HeapByteLimitExceeded { .. }
+                ))
+            ));
+            assert_eq!(
+                (
+                    machine.heap.len(),
+                    machine.heap_bytes,
+                    machine.machine_bytes
+                ),
+                before,
+                "failed string expansion must not allocate or charge the machine"
+            );
+        }
     }
 }

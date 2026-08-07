@@ -5,7 +5,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use bamts::discover_project;
 use bamts_compiler::lower::LowerOptions;
 use bamts_compiler::pipeline::{
     FrontendMode, ProgramFrontendOutput, compile_program_frontend_with_lints,
@@ -26,6 +28,7 @@ use crate::diagnostics::{self, DiagnosticSource};
 const NODE_STATICLIB: &[u8] = include_bytes!(env!("BAMTS_NODE_STATICLIB"));
 const HOST_TARGET: &str = env!("BAMTS_HOST_TARGET");
 const BUILD_TARGET: &str = env!("BAMTS_BUILD_TARGET");
+static NEXT_CACHE_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// Bytes and process status produced by one successful CLI command.
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -105,6 +108,9 @@ pub enum DriverError {
     CrossTargetLink {
         host: &'static str,
         target: &'static str,
+    },
+    UnsafeFallbackCacheRoot {
+        path: PathBuf,
     },
 }
 
@@ -223,6 +229,11 @@ impl fmt::Display for DriverError {
                 formatter,
                 "native linking for Cargo target `{target}` is unsupported from host `{host}`"
             ),
+            Self::UnsafeFallbackCacheRoot { path } => write!(
+                formatter,
+                "fallback cache root `{}` is not a private directory owned by the current user",
+                path.display()
+            ),
         }
     }
 }
@@ -254,7 +265,8 @@ impl Error for DriverError {
             | Self::ToolchainMissing { .. }
             | Self::ToolchainRejected { .. }
             | Self::LinkFailed { .. }
-            | Self::CrossTargetLink { .. } => None,
+            | Self::CrossTargetLink { .. }
+            | Self::UnsafeFallbackCacheRoot { .. } => None,
         }
     }
 }
@@ -285,7 +297,7 @@ pub fn execute(args: &CliArgs) -> Result<CommandOutcome, DriverError> {
     }
 }
 
-fn levels(args: &CliArgs) -> Result<LintTable, DriverError> {
+fn levels(args: &CliArgs, project_root: &Path) -> Result<LintTable, DriverError> {
     let profile = if args.pedantic {
         LintProfile::Pedantic
     } else if args.strict {
@@ -294,7 +306,8 @@ fn levels(args: &CliArgs) -> Result<LintTable, DriverError> {
         LintProfile::Default
     };
     let mut levels = LintTable::new(profile);
-    if let Some(path) = lint_config_path(args) {
+    let path = project_root.join("bamts.toml");
+    if path.is_file() {
         let source = fs::read_to_string(&path).map_err(|source| DriverError::ReadSource {
             path: path.clone(),
             source,
@@ -334,25 +347,10 @@ fn forbidden_lint_override(error: bamts_compiler::lint::ForbidOverrideError) -> 
     })
 }
 
-fn lint_config_path(args: &CliArgs) -> Option<PathBuf> {
-    let start = args.entrypoint.as_deref().map_or_else(
-        || std::env::current_dir().ok(),
-        |entrypoint| {
-            let path = Path::new(entrypoint);
-            let parent = path.parent().unwrap_or_else(|| Path::new("."));
-            if parent.is_absolute() {
-                Some(parent.to_path_buf())
-            } else {
-                std::env::current_dir()
-                    .ok()
-                    .map(|directory| directory.join(parent))
-            }
-        },
-    )?;
-    start
-        .ancestors()
-        .map(|directory| directory.join("bamts.toml"))
-        .find(|path| path.is_file())
+fn lower_options(args: &CliArgs) -> LowerOptions {
+    LowerOptions {
+        javascript_compatibility: args.js_compat.enabled,
+    }
 }
 
 fn check(args: &CliArgs, frontend: &LoadedProgramFrontend) -> Result<CommandOutcome, DriverError> {
@@ -390,14 +388,8 @@ fn compile(
 
     let entrypoint = required_entrypoint(args)?;
     let warnings = require_clean_frontend(args, frontend)?;
-    let executable = lower_program(
-        &frontend.program,
-        &frontend.output,
-        LowerOptions {
-            javascript_compatibility: true,
-        },
-    )
-    .map_err(DriverError::Lower)?;
+    let executable = lower_program(&frontend.program, &frontend.output, lower_options(args))
+        .map_err(DriverError::Lower)?;
     if BUILD_TARGET != HOST_TARGET {
         return Err(DriverError::CrossTargetLink {
             host: HOST_TARGET,
@@ -417,14 +409,20 @@ fn compile(
 fn run(args: &CliArgs, frontend: &LoadedProgramFrontend) -> Result<CommandOutcome, DriverError> {
     let entrypoint = required_entrypoint(args)?;
     let warnings = require_clean_frontend(args, frontend)?;
-    let executable = lower_program(
-        &frontend.program,
-        &frontend.output,
-        LowerOptions {
-            javascript_compatibility: true,
-        },
-    )
-    .map_err(DriverError::Lower)?;
+    let executable = lower_program(&frontend.program, &frontend.output, lower_options(args))
+        .map_err(DriverError::Lower)?;
+    match args.target {
+        ExecutionTarget::Jit => run_jit(args, entrypoint, warnings, &executable),
+        ExecutionTarget::Aot => run_aot(args, entrypoint, warnings, &executable),
+    }
+}
+
+fn run_jit(
+    args: &CliArgs,
+    entrypoint: &Path,
+    warnings: String,
+    executable: &bamts_compiler::program::ExecutableProgram,
+) -> Result<CommandOutcome, DriverError> {
     let program = bamts_codegen::compile_jit(executable.wire()).map_err(DriverError::Jit)?;
     let mut host = bamts_node::NodeHost::new();
     host.set_script_compiler(Box::new(bamts::ScriptCompiler));
@@ -448,6 +446,51 @@ fn run(args: &CliArgs, frontend: &LoadedProgramFrontend) -> Result<CommandOutcom
         stdout,
         stderr,
         exit_code,
+    })
+}
+
+fn run_aot(
+    args: &CliArgs,
+    entrypoint: &Path,
+    warnings: String,
+    executable: &bamts_compiler::program::ExecutableProgram,
+) -> Result<CommandOutcome, DriverError> {
+    if BUILD_TARGET != HOST_TARGET {
+        return Err(DriverError::CrossTargetLink {
+            host: HOST_TARGET,
+            target: BUILD_TARGET,
+        });
+    }
+    let object =
+        bamts_codegen::compile_aot(executable.wire(), HOST_TARGET).map_err(DriverError::Aot)?;
+    let id = NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let root = cache_root()?;
+    let destination = root.join("run").join(format!(
+        "bamts-run-{}-{id}{}",
+        std::process::id(),
+        std::env::consts::EXE_SUFFIX
+    ));
+    require_within_cache_root(&destination, &root)?;
+    link_executable(&object.bytes, &destination)?;
+    require_within_cache_root(&destination, &root)?;
+    let launch_token = format!("{}-{id}", std::process::id());
+    let output = Command::new(&destination)
+        .env(bamts_node::AOT_ENTRYPOINT_ENV, entrypoint.as_os_str())
+        .env(bamts_node::AOT_LAUNCH_TOKEN_ENV, &launch_token)
+        .arg(launch_token)
+        .args(&args.program_args)
+        .output();
+    let _ = fs::remove_file(&destination);
+    let output = output.map_err(|source| DriverError::LinkStart {
+        program: destination.into_os_string(),
+        source,
+    })?;
+    let mut stderr = warnings.into_bytes();
+    stderr.extend_from_slice(&output.stderr);
+    Ok(CommandOutcome {
+        stdout: output.stdout,
+        stderr,
+        exit_code: output.status.code().unwrap_or(1),
     })
 }
 
@@ -537,7 +580,7 @@ fn probe_toolchain(program: OsString) -> Result<OsString, DriverError> {
 }
 
 fn cached_node_archive() -> Result<PathBuf, DriverError> {
-    let cache_dir = cache_root().join("runtime");
+    let cache_dir = cache_root()?.join("runtime");
     fs::create_dir_all(&cache_dir).map_err(|source| DriverError::CacheArchive {
         path: cache_dir.clone(),
         source,
@@ -554,37 +597,41 @@ fn cached_node_archive() -> Result<PathBuf, DriverError> {
     if path.is_file() {
         return Ok(path);
     }
-    let temporary = path.with_extension(format!("{extension}.{}.tmp", std::process::id()));
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-    {
-        Ok(mut file) => {
-            write_cached_archive(&mut file, &temporary)?;
-            match fs::rename(&temporary, &path) {
-                Ok(()) => Ok(path),
-                Err(_error) if path.is_file() => {
-                    let _ = fs::remove_file(&temporary);
-                    Ok(path)
-                }
-                Err(source) => Err(DriverError::CacheArchive { path, source }),
-            }
-        }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            if path.is_file() {
-                Ok(path)
-            } else {
-                Err(DriverError::CacheArchive {
+    let (temporary, mut file) = loop {
+        let id = NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let temporary =
+            path.with_extension(format!("{extension}.{}.{}.tmp", std::process::id(), id));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(DriverError::CacheArchive {
                     path: temporary,
-                    source: error,
-                })
+                    source,
+                });
             }
         }
-        Err(source) => Err(DriverError::CacheArchive {
-            path: temporary,
-            source,
-        }),
+    };
+    if let Err(error) = write_cached_archive(&mut file, &temporary) {
+        drop(file);
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    drop(file);
+    match fs::rename(&temporary, &path) {
+        Ok(()) => Ok(path),
+        Err(_error) if path.is_file() => {
+            let _ = fs::remove_file(&temporary);
+            Ok(path)
+        }
+        Err(source) => {
+            let _ = fs::remove_file(&temporary);
+            Err(DriverError::CacheArchive { path, source })
+        }
     }
 }
 
@@ -597,17 +644,172 @@ fn write_cached_archive(file: &mut File, path: &Path) -> Result<(), DriverError>
         })
 }
 
-fn cache_root() -> PathBuf {
+fn cache_root() -> Result<PathBuf, DriverError> {
     if let Some(path) = std::env::var_os("BAMTS_CACHE_DIR") {
-        return PathBuf::from(path);
+        return Ok(PathBuf::from(path));
     }
     if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
-        return PathBuf::from(path).join("bamts");
+        return Ok(PathBuf::from(path).join("bamts"));
     }
     if let Some(path) = std::env::var_os("HOME") {
-        return PathBuf::from(path).join(".cache/bamts");
+        return Ok(PathBuf::from(path).join(".cache/bamts"));
     }
-    std::env::temp_dir().join("bamts-cache")
+    ensure_private_fallback_cache_root(fallback_cache_root_path()?)
+}
+
+#[cfg(unix)]
+fn fallback_cache_root_path() -> Result<PathBuf, DriverError> {
+    let parent = validate_fallback_parent_chain(&std::env::temp_dir())?;
+    Ok(parent.join(format!("bamts-cache-{}", fallback_cache_user_key()?)))
+}
+
+#[cfg(not(unix))]
+fn fallback_cache_root_path() -> Result<PathBuf, DriverError> {
+    Ok(std::env::temp_dir().join(format!("bamts-cache-{}", fallback_cache_user_key()?)))
+}
+
+#[cfg(unix)]
+fn fallback_cache_user_key() -> Result<String, DriverError> {
+    Ok(effective_uid()?.to_string())
+}
+
+#[cfg(not(unix))]
+fn fallback_cache_user_key() -> Result<String, DriverError> {
+    Ok(std::env::var_os("USERNAME")
+        .or_else(|| std::env::var_os("USER"))
+        .map(|value| value.to_string_lossy().into_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "default".to_owned()))
+}
+
+fn ensure_private_fallback_cache_root(path: PathBuf) -> Result<PathBuf, DriverError> {
+    #[cfg(unix)]
+    let path = {
+        let parent = path
+            .parent()
+            .ok_or_else(|| DriverError::UnsafeFallbackCacheRoot { path: path.clone() })?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| DriverError::UnsafeFallbackCacheRoot { path: path.clone() })?;
+        validate_fallback_parent_chain(parent)?.join(name)
+    };
+    match create_private_fallback_dir(&path) {
+        Ok(()) => {}
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(source) => {
+            return Err(DriverError::CreateDirectory { path, source });
+        }
+    }
+    validate_private_fallback_dir(&path)?;
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn create_private_fallback_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_fallback_dir(path: &Path) -> io::Result<()> {
+    fs::create_dir(path)
+}
+
+#[cfg(unix)]
+fn validate_fallback_parent_chain(path: &Path) -> Result<PathBuf, DriverError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let canonical = fs::canonicalize(path).map_err(|source| DriverError::CreateDirectory {
+        path: path.to_owned(),
+        source,
+    })?;
+    let euid = effective_uid()?;
+    for ancestor in canonical.ancestors() {
+        let metadata =
+            fs::symlink_metadata(ancestor).map_err(|source| DriverError::CreateDirectory {
+                path: ancestor.to_owned(),
+                source,
+            })?;
+        let mode = metadata.permissions().mode();
+        let writable = mode & 0o022 != 0;
+        let owner = metadata.uid();
+        let protected_by_sticky_owner = mode & 0o1000 != 0 && (owner == 0 || owner == euid);
+        if !metadata.is_dir() || (writable && !protected_by_sticky_owner) {
+            return Err(DriverError::UnsafeFallbackCacheRoot {
+                path: ancestor.to_owned(),
+            });
+        }
+    }
+    Ok(canonical)
+}
+
+#[cfg(unix)]
+fn validate_private_fallback_dir(path: &Path) -> Result<(), DriverError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = fs::symlink_metadata(path).map_err(|source| DriverError::CreateDirectory {
+        path: path.to_owned(),
+        source,
+    })?;
+    let euid = effective_uid()?;
+    let permissions = metadata.permissions().mode() & 0o777;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != euid
+        || permissions & 0o077 != 0
+    {
+        return Err(DriverError::UnsafeFallbackCacheRoot {
+            path: path.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_private_fallback_dir(path: &Path) -> Result<(), DriverError> {
+    let metadata = fs::metadata(path).map_err(|source| DriverError::CreateDirectory {
+        path: path.to_owned(),
+        source,
+    })?;
+    if !metadata.is_dir() {
+        return Err(DriverError::UnsafeFallbackCacheRoot {
+            path: path.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Probe the effective user id without `unsafe` through an atomic random file.
+#[cfg(unix)]
+fn effective_uid() -> Result<u32, DriverError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let parent = std::env::temp_dir();
+    let probe = tempfile::Builder::new()
+        .prefix(".bamts-euid-")
+        .tempfile_in(&parent)
+        .map_err(|source| DriverError::CreateDirectory {
+            path: parent,
+            source,
+        })?;
+    probe
+        .as_file()
+        .metadata()
+        .map(|metadata| metadata.uid())
+        .map_err(|source| DriverError::CreateDirectory {
+            path: probe.path().to_owned(),
+            source,
+        })
+}
+
+fn require_within_cache_root(path: &Path, root: &Path) -> Result<(), DriverError> {
+    if path.starts_with(root) {
+        Ok(())
+    } else {
+        Err(DriverError::UnsafeFallbackCacheRoot {
+            path: path.to_owned(),
+        })
+    }
 }
 
 const fn content_hash(bytes: &[u8]) -> u64 {
@@ -718,17 +920,16 @@ fn load_program_frontend(args: &CliArgs) -> Result<LoadedProgramFrontend, Driver
             path: absolute_entrypoint,
             source,
         })?;
-    let root_path = discover_project_root(&absolute_entrypoint).unwrap_or_else(|| {
-        if absolute_entrypoint.starts_with(&current_directory) {
-            current_directory
-        } else {
-            absolute_entrypoint
-                .parent()
-                .unwrap_or_else(|| Path::new("/"))
-                .to_path_buf()
-        }
-    });
-    let canonical_root = fs::canonicalize(&root_path)
+    let fallback_root = if absolute_entrypoint.starts_with(&current_directory) {
+        current_directory
+    } else {
+        absolute_entrypoint
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .to_path_buf()
+    };
+    let project = discover_project(&absolute_entrypoint, fallback_root);
+    let canonical_root = fs::canonicalize(project.root())
         .map_err(|error| DriverError::ProgramLoad(ProgramLoadError::InvalidRoot(error)))?;
     let root = ProjectRoot::new(canonical_root).map_err(|error| {
         DriverError::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(
@@ -736,8 +937,7 @@ fn load_program_frontend(args: &CliArgs) -> Result<LoadedProgramFrontend, Driver
             error,
         )))
     })?;
-    let config_path = project_config_path(&absolute_entrypoint, root.path())
-        .unwrap_or_else(|| root.path().join("tsconfig.json"));
+    let config_path = project.config().to_owned();
     let config_source = if config_path.is_file() {
         fs::read_to_string(&config_path).map_err(|source| DriverError::ReadSource {
             path: config_path.clone(),
@@ -756,26 +956,9 @@ fn load_program_frontend(args: &CliArgs) -> Result<LoadedProgramFrontend, Driver
     let program = loader
         .load(&absolute_entrypoint)
         .map_err(DriverError::ProgramLoad)?;
-    let levels = levels(args)?;
+    let levels = levels(args, root.path())?;
     let output = compile_program_frontend_with_lints(&program, FrontendMode::Check, &levels);
     Ok(LoadedProgramFrontend { program, output })
-}
-
-fn discover_project_root(entrypoint: &Path) -> Option<PathBuf> {
-    let ancestors = || entrypoint.parent().into_iter().flat_map(Path::ancestors);
-    ancestors()
-        .find(|directory| directory.join("bamts.toml").is_file())
-        .or_else(|| ancestors().find(|directory| directory.join("tsconfig.json").is_file()))
-        .map(Path::to_path_buf)
-}
-
-fn project_config_path(entrypoint: &Path, root: &Path) -> Option<PathBuf> {
-    entrypoint
-        .parent()?
-        .ancestors()
-        .take_while(|directory| directory.starts_with(root))
-        .map(|directory| directory.join("tsconfig.json"))
-        .find(|path| path.is_file())
 }
 
 fn render_program_diagnostics(args: &CliArgs, frontend: &LoadedProgramFrontend) -> String {
@@ -827,13 +1010,29 @@ fn require_clean_frontend(
     }
 }
 
+/// Compiles a source entrypoint through the same frontend, lint, and lowering
+/// pipeline as [`execute`], returning the lowered executable program without
+/// running or linking it.  This is the in-process interpreter seam used by the
+/// corpus differential harness so that CLI-supplied lint overrides and
+/// JavaScript-compatibility flags reach the lowering stage.
+pub fn compile_program(
+    args: &CliArgs,
+) -> Result<bamts_compiler::program::ExecutableProgram, DriverError> {
+    let frontend = load_program_frontend(args)?;
+    require_clean_frontend(args, &frontend)?;
+    lower_program(&frontend.program, &frontend.output, lower_options(args))
+        .map_err(DriverError::Lower)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use bamts_compiler::lint::{LintLevel, SourceDialect, rule_by_name};
 
     use crate::args::{ArgsError, parse_args};
 
-    use super::{DriverError, content_hash, levels, probe_toolchain};
+    use super::{DriverError, content_hash, levels, lower_options, probe_toolchain};
 
     #[test]
     fn content_hash_is_stable_and_sensitive() {
@@ -871,7 +1070,8 @@ mod tests {
             "main.ts",
         ])
         .expect("arguments parse");
-        let table = levels(&args).expect("overrides resolve");
+        let table =
+            levels(&args, Path::new("/definitely/no/bamts/config")).expect("overrides resolve");
         let explicit_any = rule_by_name("explicit-any").expect("registered rule").id();
         let implicit_any = rule_by_name("implicit-any").expect("registered rule").id();
         assert_eq!(table.level(explicit_any), LintLevel::Allow);
@@ -890,15 +1090,26 @@ mod tests {
         ])
         .expect("arguments parse");
         assert!(matches!(
-            levels(&args),
+            levels(&args, Path::new("/definitely/no/bamts/config")),
             Err(DriverError::Usage(ArgsError::ForbiddenLintOverride { .. }))
         ));
     }
 
     #[test]
+    fn lowering_options_follow_javascript_compatibility_selection() {
+        let disabled = parse_args(["compile", "main.ts"]).expect("arguments parse");
+        let enabled =
+            parse_args(["compile", "--compat", "strict", "main.ts"]).expect("arguments parse");
+
+        assert!(!lower_options(&disabled).javascript_compatibility);
+        assert!(lower_options(&enabled).javascript_compatibility);
+    }
+
+    #[test]
     fn strict_cli_profile_keeps_javascript_rules_nonfatal() {
         let args = parse_args(["check", "--strict", "vendored.js"]).expect("arguments parse");
-        let table = levels(&args).expect("profile resolves");
+        let table =
+            levels(&args, Path::new("/definitely/no/bamts/config")).expect("profile resolves");
         let footgun = rule_by_name("invalid-number-formatting-options")
             .expect("registered footgun")
             .id();
@@ -911,6 +1122,107 @@ mod tests {
             table.level_for_source(typescript_only, SourceDialect::JavaScript),
             LintLevel::Allow
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fallback_cache_root_has_stable_per_user_path() {
+        let parent = super::validate_fallback_parent_chain(&std::env::temp_dir()).unwrap();
+        let expected = parent.join(format!("bamts-cache-{}", super::effective_uid().unwrap()));
+        assert_eq!(super::fallback_cache_root_path().unwrap(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_fallback_cache_root_creates_owner_only_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::Ordering;
+
+        let path = std::env::temp_dir().join(format!(
+            "bamts-cli-private-cache-create-{}-{}",
+            std::process::id(),
+            super::NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        let root = super::ensure_private_fallback_cache_root(path.clone())
+            .expect("private fallback root should be created");
+        let metadata = std::fs::symlink_metadata(&root).expect("metadata");
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_fallback_cache_root_rejects_group_or_other_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::Ordering;
+
+        let path = std::env::temp_dir().join(format!(
+            "bamts-cli-private-cache-unsafe-{}-{}",
+            std::process::id(),
+            super::NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir(&path).expect("create fixture root");
+        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o710);
+        std::fs::set_permissions(&path, permissions).expect("chmod");
+        let error = super::ensure_private_fallback_cache_root(path.clone())
+            .expect_err("group/other bits must be rejected");
+        assert!(matches!(error, DriverError::UnsafeFallbackCacheRoot { .. }));
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_fallback_cache_root_rejects_replaceable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::Ordering;
+
+        let parent = std::env::temp_dir().join(format!(
+            "bamts-cli-replaceable-parent-{}-{}",
+            std::process::id(),
+            super::NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::create_dir(&parent).expect("create fixture parent");
+        let mut permissions = std::fs::metadata(&parent).expect("metadata").permissions();
+        permissions.set_mode(0o777);
+        std::fs::set_permissions(&parent, permissions).expect("chmod");
+
+        let error = super::ensure_private_fallback_cache_root(parent.join("cache"))
+            .expect_err("replaceable parent must be rejected");
+
+        assert!(matches!(error, DriverError::UnsafeFallbackCacheRoot { .. }));
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_entrypoint_uses_one_canonical_config_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let directory =
+            std::env::temp_dir().join(format!("bamts-cli-symlink-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let real = directory.join("real");
+        let alias = directory.join("alias");
+        std::fs::create_dir_all(real.join("src"))?;
+        std::fs::create_dir_all(&alias)?;
+        std::fs::write(real.join("bamts.toml"), "")?;
+        std::fs::write(real.join("src/main.ts"), "let answer = 42;")?;
+        std::fs::write(alias.join("bamts.toml"), "this is not valid TOML = [")?;
+        symlink(real.join("src/main.ts"), alias.join("main.ts"))?;
+
+        let alias_entrypoint = alias.join("main.ts");
+        let args = parse_args(["check", alias_entrypoint.to_str().expect("UTF-8 temp path")])?;
+        let outcome = super::execute(&args)?;
+        assert_eq!(outcome.exit_code, 0);
+
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
     }
 
     #[test]
