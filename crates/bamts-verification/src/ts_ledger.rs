@@ -786,20 +786,27 @@ pub struct TsLedgerWriter;
 
 impl TsLedgerWriter {
     /// Serialize a ledger to a stable, deterministic JSON string.
+    ///
+    /// The `to_value` step is load-bearing, not a formality: `serde_json` is
+    /// built without `preserve_order`, so a `Value` object is a `BTreeMap` and
+    /// converting through it is what puts object keys in lexicographic order.
+    /// Serializing the typed ledger directly would emit struct-declaration
+    /// order instead. Writing that tree into a byte buffer avoids the extra
+    /// full-document `String` that `to_string_pretty` would allocate.
     pub fn to_string(ledger: &TsLedger) -> Result<String> {
-        // Sort and recompute first, then validate the canonical form.
         let mut sorted = ledger.clone();
         sorted.sort_and_recompute();
         sorted.validate()?;
 
-        let mut value = serde_json::to_value(&sorted)
+        let value = serde_json::to_value(&sorted)
             .map_err(|error| VerificationError::new(ErrorCode::Json, format!("{error}")))?;
-        sort_json_keys(&mut value);
-
-        let text = serde_json::to_string_pretty(&value)
+        // `to_writer_pretty` needs an `io::Write`, which `String` is not; a byte
+        // buffer converts back by moving the same allocation.
+        let mut buf = Vec::with_capacity(1 << 20);
+        serde_json::to_writer_pretty(&mut buf, &value)
             .map_err(|error| VerificationError::new(ErrorCode::Json, format!("{error}")))?;
-
-        Ok(canonicalize_json(&text))
+        String::from_utf8(buf)
+            .map_err(|error| VerificationError::new(ErrorCode::Json, format!("{error}")))
     }
 
     /// Serialize a ledger to a file.
@@ -972,32 +979,6 @@ fn is_sub_delimiter(byte: u8) -> bool {
         byte,
         b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'='
     )
-}
-
-/// Recursively sort every JSON object key lexicographically so the emitted bytes
-/// never depend on struct field order or serde_json's map implementation.
-fn sort_json_keys(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(map) => {
-            map.sort_keys();
-            for member in map.values_mut() {
-                sort_json_keys(member);
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                sort_json_keys(item);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn canonicalize_json(text: &str) -> String {
-    text.lines()
-        .map(|line| line.trim_end().replace('\r', ""))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn is_lowercase_hex(value: &str, expected_len: usize) -> bool {
