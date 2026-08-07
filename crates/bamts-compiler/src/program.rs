@@ -1303,9 +1303,14 @@ impl DynamicEdgeCollector<'_> {
             ArrayElement, Expression, Literal, MemberProperty, ObjectMember, PropertyName,
         };
         match expression.data() {
-            Expression::JsxElement(_)
-            | Expression::JsxFragment(_)
-            | Expression::JsxSelfClosingElement(_) => {}
+            Expression::JsxElement(value) => {
+                self.scan_jsx_attributes(&value.opening.data().attributes);
+                self.scan_jsx_children(&value.children);
+            }
+            Expression::JsxFragment(value) => self.scan_jsx_children(&value.children),
+            Expression::JsxSelfClosingElement(value) => {
+                self.scan_jsx_attributes(&value.attributes);
+            }
             Expression::Template(value) => {
                 for expression in &value.expressions {
                     self.scan_expression(expression);
@@ -1422,6 +1427,41 @@ impl DynamicEdgeCollector<'_> {
             | Expression::Literal(_)
             | Expression::Meta(_)
             | Expression::Missing(_) => {}
+        }
+    }
+
+    fn scan_jsx_attributes(&mut self, attributes: &[crate::syntax::JsxAttributeItem]) {
+        use crate::syntax::JsxAttributeInitializer;
+        for attribute in attributes {
+            match attribute {
+                crate::syntax::JsxAttributeItem::Attribute(attribute) => {
+                    if let Some(JsxAttributeInitializer::Expression(container)) =
+                        &attribute.data().initializer
+                        && let Some(expression) = &container.data().expression
+                    {
+                        self.scan_expression(expression);
+                    }
+                }
+                crate::syntax::JsxAttributeItem::Spread(spread) => {
+                    self.scan_expression(&spread.data().expression);
+                }
+            }
+        }
+    }
+
+    fn scan_jsx_children(&mut self, children: &[crate::syntax::JsxChild]) {
+        use crate::syntax::JsxChild;
+        for child in children {
+            match child {
+                JsxChild::ExpressionContainer(container) => {
+                    if let Some(expression) = &container.data().expression {
+                        self.scan_expression(expression);
+                    }
+                }
+                JsxChild::Spread(spread) => self.scan_expression(&spread.data().expression),
+                JsxChild::Element(expression) => self.scan_expression(expression),
+                JsxChild::Text(_) => {}
+            }
         }
     }
 
@@ -1573,7 +1613,7 @@ fn parse_hex(bytes: &[u8]) -> Option<u32> {
     bytes.iter().try_fold(0_u32, |value, byte| {
         char::from(*byte)
             .to_digit(16)
-            .map(|digit| value * 16 + digit)
+            .and_then(|digit| value.checked_mul(16)?.checked_add(digit))
     })
 }
 
@@ -2460,12 +2500,14 @@ fn expand_star_exports(modules: &mut [RawModule]) {
                 }
                 let mut visited = BTreeSet::new();
                 visited.insert((index, name.clone()));
+                let mut truncated = false;
                 let candidates = star_export_origins(
                     modules,
                     &mut cache,
                     target.get() as usize,
                     &name,
                     &mut visited,
+                    &mut truncated,
                 );
                 if !candidates.is_empty() {
                     additions[index].entry(name).or_default().extend(candidates);
@@ -2492,12 +2534,14 @@ fn expand_star_exports(modules: &mut [RawModule]) {
                 };
                 let mut visited = BTreeSet::new();
                 visited.insert((index, name.clone()));
+                let mut truncated = false;
                 star_export_origins(
                     modules,
                     &mut cache,
                     target.get() as usize,
                     name,
                     &mut visited,
+                    &mut truncated,
                 )
                 .contains(origin)
             });
@@ -2526,8 +2570,12 @@ fn star_export_origins(
     module_index: usize,
     name: &str,
     visited: &mut BTreeSet<(usize, String)>,
+    truncated: &mut bool,
 ) -> BTreeSet<ExportOrigin> {
     if !visited.insert((module_index, name.to_owned())) {
+        // Truncation: this (module, name) is already on the current path. The
+        // result is path-dependent, so the caller must not cache it.
+        *truncated = true;
         return BTreeSet::new();
     }
     if let Some(candidates) = cache.get(&(module_index, name.to_owned())) {
@@ -2548,16 +2596,23 @@ fn star_export_origins(
             let EdgeTarget::Local(target) = module.edges[star.get() as usize].target else {
                 continue;
             };
+            let mut child_truncated = false;
             candidates.extend(star_export_origins(
                 modules,
                 cache,
                 target.get() as usize,
                 name,
                 visited,
+                &mut child_truncated,
             ));
+            if child_truncated {
+                *truncated = true;
+            }
         }
     }
-    cache.insert((module_index, name.to_owned()), candidates.clone());
+    if !*truncated {
+        cache.insert((module_index, name.to_owned()), candidates.clone());
+    }
     candidates
 }
 
@@ -4221,6 +4276,18 @@ mod tests {
     }
 
     #[test]
+    fn rejects_overflowing_unicode_escape_in_module_specifier() {
+        // More than eight hex digits overflow u32 in parse_hex; the compiler
+        // must drop the edge rather than panicking.
+        let fixture = Fixture::new();
+        fixture.write("main.ts", r#"import "./\u{FFFFFFFFFF}";"#);
+
+        let program = fixture.loader().load("main.ts").unwrap();
+        assert_eq!(names(&program), ["main.ts"]);
+        assert!(program.entrypoint().dependencies().is_empty());
+    }
+
+    #[test]
     fn rejects_ill_formed_utf16_module_specifiers() {
         for source in [
             r#"import type { T } from "\uD800";"#,
@@ -4266,6 +4333,23 @@ mod tests {
             ModuleEdgeKind::DynamicRuntime
         );
         assert_eq!(program.runtime_modules().len(), 1);
+    }
+
+    #[test]
+    fn retains_dynamic_imports_inside_jsx_expressions() {
+        let fixture = Fixture::new();
+        fixture.write("dep.ts", "export const value = 1;");
+        fixture.write(
+            "main.tsx",
+            "const element = <Foo onClick={() => import('./dep')} />;",
+        );
+
+        let program = fixture.loader().load("main.tsx").unwrap();
+        assert_eq!(names(&program), ["dep.ts", "main.tsx"]);
+        assert_eq!(
+            program.entrypoint().dependencies()[0].kind(),
+            ModuleEdgeKind::DynamicRuntime
+        );
     }
 
     #[test]
