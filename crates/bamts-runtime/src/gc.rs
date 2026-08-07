@@ -318,7 +318,13 @@ fn runtime_index(value: Value) -> Option<usize> {
     let Decoded::HeapRef(id) = value.decode()? else {
         return None;
     };
-    (id.segment() == RUNTIME_HEAP_SEGMENT).then(|| id.slot() as usize - 1)
+    if id.segment() != RUNTIME_HEAP_SEGMENT {
+        return None;
+    }
+    // SlotId stores a NonZeroU32 slot (from_parts rejects zero), so every
+    // decoded HeapRef has slot() >= 1; the subtraction cannot underflow.
+    debug_assert!(id.slot() > 0, "SlotId slot is NonZeroU32");
+    (id.slot() as usize).checked_sub(1)
 }
 
 fn is_marked_value(marks: &[bool], value: Value) -> bool {
