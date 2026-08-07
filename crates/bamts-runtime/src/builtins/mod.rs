@@ -85,6 +85,7 @@ pub(crate) fn define_data(heap: &mut [HeapEntry], object: Value, name: &str, val
         | HeapEntry::Array { properties, .. }
         | HeapEntry::Function { properties, .. }
         | HeapEntry::Script { properties, .. }
+        | HeapEntry::NativeFunction { properties, .. }
         | HeapEntry::RegExp { properties, .. } => {
             properties.insert(
                 PropertyKey::Named(EcmaString::from_utf8(name)),
@@ -495,6 +496,11 @@ fn install_globals<H: Host>(
         crate::number_value(f64::INFINITY),
     );
     globals.insert(EcmaString::from_utf8("NaN"), crate::number_value(f64::NAN));
+    // Node exposes `Atomics` as a global, and the corpus differential compares
+    // our output against Node byte-for-byte. `corpus/cases/is-plain-obj.ts`
+    // reads the global, so omitting it throws a ReferenceError and fails Node
+    // parity. Populating the namespace requires SharedArrayBuffer / shared
+    // memory, which the runtime does not have yet, so it is deliberately empty.
     let atomics = push(
         heap,
         HeapEntry::Object {
