@@ -665,7 +665,183 @@ impl fmt::Display for ProgramVerifyError {
         if let Some(module) = self.module {
             write!(formatter, "module {}: ", module.get())?;
         }
-        write!(formatter, "{:?}", self.kind)
+        match &self.kind {
+            ProgramVerifyErrorKind::EmptyProgram => formatter.write_str("program has no modules"),
+            ProgramVerifyErrorKind::TooManyModules { count } => {
+                write!(formatter, "{count} modules exceed the program limit")
+            }
+            ProgramVerifyErrorKind::EntryModuleOutOfBounds {
+                entry,
+                module_count,
+            } => write!(
+                formatter,
+                "entry module {entry} is outside {module_count} modules"
+            ),
+            ProgramVerifyErrorKind::Module(verify_error) => {
+                write!(formatter, "{verify_error}")
+            }
+            ProgramVerifyErrorKind::ModuleNameOutOfBounds { constant } => write!(
+                formatter,
+                "module name constant {} is out of bounds",
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::ModuleNameNotString { constant } => write!(
+                formatter,
+                "module name constant {} is not a string",
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::InvalidModuleName => {
+                formatter.write_str("module name is not a normalized module name")
+            }
+            ProgramVerifyErrorKind::MetadataStringIllFormed { constant } => write!(
+                formatter,
+                "metadata string constant {} is ill-formed UTF-16",
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::DuplicateModuleName { first } => write!(
+                formatter,
+                "duplicate module name, first seen at module {}",
+                first.get()
+            ),
+            ProgramVerifyErrorKind::TooManyEdges { count } => {
+                write!(formatter, "{count} edges exceed the per-module limit")
+            }
+            ProgramVerifyErrorKind::TooManyBindings { count } => {
+                write!(formatter, "{count} bindings exceed the per-module limit")
+            }
+            ProgramVerifyErrorKind::TooManyExports { count } => {
+                write!(formatter, "{count} exports exceed the per-module limit")
+            }
+            ProgramVerifyErrorKind::SpecifierOutOfBounds { edge, constant } => write!(
+                formatter,
+                "edge {} specifier constant {} is out of bounds",
+                edge.get(),
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::SpecifierNotString { edge, constant } => write!(
+                formatter,
+                "edge {} specifier constant {} is not a string",
+                edge.get(),
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::AbsoluteSpecifier { edge } => {
+                write!(formatter, "edge {} has an absolute specifier", edge.get())
+            }
+            ProgramVerifyErrorKind::DuplicateSpecifier { first, second } => write!(
+                formatter,
+                "edges {} and {} share one specifier",
+                first.get(),
+                second.get()
+            ),
+            ProgramVerifyErrorKind::LocalTargetOutOfBounds { edge, target } => write!(
+                formatter,
+                "edge {} targets module {} which is out of bounds",
+                edge.get(),
+                target.get()
+            ),
+            ProgramVerifyErrorKind::BindingNameOutOfBounds { binding, constant } => write!(
+                formatter,
+                "binding {} name constant {} is out of bounds",
+                binding.get(),
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::BindingNameNotString { binding, constant } => write!(
+                formatter,
+                "binding {} name constant {} is not a string",
+                binding.get(),
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::BindingEdgeOutOfBounds { binding, edge } => write!(
+                formatter,
+                "binding {} references edge {} which is out of bounds",
+                binding.get(),
+                edge.get()
+            ),
+            ProgramVerifyErrorKind::ImportedNameOutOfBounds { binding, constant } => write!(
+                formatter,
+                "binding {} imported name constant {} is out of bounds",
+                binding.get(),
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::ImportedNameNotString { binding, constant } => write!(
+                formatter,
+                "binding {} imported name constant {} is not a string",
+                binding.get(),
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::DuplicateBinding { first, second } => write!(
+                formatter,
+                "bindings {} and {} share one name",
+                first.get(),
+                second.get()
+            ),
+            ProgramVerifyErrorKind::StaticBindingRequiresStaticEdge { binding, edge } => write!(
+                formatter,
+                "binding {} requires a static edge but edge {} is not static",
+                binding.get(),
+                edge.get()
+            ),
+            ProgramVerifyErrorKind::IndirectExportRequiresStaticEdge { export, edge } => write!(
+                formatter,
+                "export {export} requires a static edge but edge {} is not static",
+                edge.get()
+            ),
+            ProgramVerifyErrorKind::MissingImportedExport { binding } => write!(
+                formatter,
+                "binding {} imports a name not exported by its edge",
+                binding.get()
+            ),
+            ProgramVerifyErrorKind::ExportNameOutOfBounds { export, constant } => write!(
+                formatter,
+                "export {export} name constant {} is out of bounds",
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::ExportNameNotString { export, constant } => write!(
+                formatter,
+                "export {export} name constant {} is not a string",
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::DuplicateExport { first, second } => {
+                write!(formatter, "exports {first} and {second} share one name")
+            }
+            ProgramVerifyErrorKind::ExportBindingOutOfBounds { export, binding } => write!(
+                formatter,
+                "export {export} references binding {} which is out of bounds",
+                binding.get()
+            ),
+            ProgramVerifyErrorKind::ExportEdgeOutOfBounds { export, edge } => write!(
+                formatter,
+                "export {export} references edge {} which is out of bounds",
+                edge.get()
+            ),
+            ProgramVerifyErrorKind::IndirectNameOutOfBounds { export, constant } => write!(
+                formatter,
+                "export {export} indirect name constant {} is out of bounds",
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::IndirectNameNotString { export, constant } => write!(
+                formatter,
+                "export {export} indirect name constant {} is not a string",
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::DynamicImportMissingEdge { specifier } => write!(
+                formatter,
+                "dynamic import specifier constant {} has no matching edge",
+                specifier.get()
+            ),
+            ProgramVerifyErrorKind::SnapshotExportInstruction { function, pc } => write!(
+                formatter,
+                "function {function} at instruction {pc} performs a snapshot export, which is not executable"
+            ),
+            ProgramVerifyErrorKind::MissingIndirectExport { export } => write!(
+                formatter,
+                "export {export} is an indirect export with no resolution"
+            ),
+            ProgramVerifyErrorKind::IndirectExportCycle { export } => write!(
+                formatter,
+                "export {export} is part of an indirect export cycle"
+            ),
+        }
     }
 }
 
@@ -2828,5 +3004,35 @@ mod tests {
                 .kind,
             ProgramVerifyErrorKind::MissingImportedExport { .. }
         ));
+    }
+
+    #[test]
+    fn verify_error_display_is_human_readable_not_debug() {
+        // Pin the Display output: it must read as a sentence, never as
+        // Rust struct syntax like `DuplicateSpecifier { first: EdgeId(1), second: EdgeId(4) }`.
+        let error = ProgramVerifyError {
+            module: Some(ModuleId::new(3)),
+            kind: ProgramVerifyErrorKind::DuplicateSpecifier {
+                first: EdgeId::new(1),
+                second: EdgeId::new(4),
+            },
+        };
+        assert_eq!(
+            error.to_string(),
+            "module 3: edges 1 and 4 share one specifier"
+        );
+
+        // No module prefix variant.
+        let no_module = ProgramVerifyError {
+            module: None,
+            kind: ProgramVerifyErrorKind::EmptyProgram,
+        };
+        assert_eq!(no_module.to_string(), "program has no modules");
+
+        // Verify the output never contains debug-style braces or field names.
+        assert!(
+            !error.to_string().contains('{'),
+            "Display must not emit Debug struct syntax"
+        );
     }
 }
