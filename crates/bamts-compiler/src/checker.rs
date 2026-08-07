@@ -2400,6 +2400,17 @@ mod tests {
     }
 
     #[test]
+    fn generic_signatures_relate_up_to_type_parameter_renaming() {
+        let result = check_text(
+            "type Source = <T>(value: T) => T;\n\
+             type Target = <U>(value: U) => U;\n\
+             declare const source: Source;\n\
+             const target: Target = source;",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
     fn an_unmodelled_intrinsic_type_target_stays_permissive() {
         let result = check_text("const record: Record<string, unknown> = { name: 'root' };");
         assert!(checker_codes(&result).is_empty());

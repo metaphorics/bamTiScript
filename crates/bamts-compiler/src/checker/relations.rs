@@ -80,6 +80,10 @@ pub struct TypeRelations<'table> {
     cache: RefCell<HashMap<(TypeId, TypeId, Strictness), bool>>,
     /// Pairs currently being compared, to break recursive structural types.
     visiting: RefCell<HashSet<(TypeId, TypeId, Strictness)>>,
+    /// Type parameters paired positionally by the generic signatures currently
+    /// being compared, so `<T>(x: T) => T` relates to `<U>(x: U) => U`.
+    /// Non-empty only inside such a comparison.
+    parameter_aliases: RefCell<Vec<(SymbolId, SymbolId)>>,
 }
 
 impl<'table> TypeRelations<'table> {
@@ -89,6 +93,7 @@ impl<'table> TypeRelations<'table> {
             table,
             cache: RefCell::new(HashMap::new()),
             visiting: RefCell::new(HashSet::new()),
+            parameter_aliases: RefCell::new(Vec::new()),
         }
     }
 
@@ -192,8 +197,11 @@ impl<'table> TypeRelations<'table> {
         }
         let key = (source, target, strictness);
         // Only structural queries are memoized; primitive pairs resolve in one
-        // match arm, so caching them would only spend memory.
-        let cacheable = self.is_structural(source) || self.is_structural(target);
+        // match arm, so caching them would only spend memory. A result reached
+        // under a type-parameter alias holds only for that comparison, so it is
+        // never cached.
+        let cacheable = (self.is_structural(source) || self.is_structural(target))
+            && self.parameter_aliases.borrow().is_empty();
         if cacheable && let Some(result) = self.cache.borrow().get(&key) {
             return *result;
         }
@@ -298,6 +306,16 @@ impl<'table> TypeRelations<'table> {
             (Type::Object, Type::ObjectType(target_props)) => {
                 target_props.iter().all(|property| property.optional())
             }
+            // Two generic signatures under comparison pair their type parameters
+            // positionally, which is what makes them relate up to renaming.
+            (Type::Named(source_symbol), Type::Named(target_symbol))
+                if self
+                    .parameter_aliases
+                    .borrow()
+                    .contains(&(*source_symbol, *target_symbol)) =>
+            {
+                true
+            }
             // A class name stands for its instance structure. Comparing that
             // structure is what makes a derived class relate to its base, since
             // the derived instance type carries the base's members.
@@ -314,6 +332,38 @@ impl<'table> TypeRelations<'table> {
     }
     fn is_object_symbol(&self, symbol: SymbolId) -> bool {
         self.table.is_object_symbol(symbol)
+    }
+
+    /// Pairs the type parameters of two generic signatures for the duration of
+    /// `compare`. Pairing is positional, and only applies when both signatures
+    /// declare the same number of parameters; otherwise they are compared as-is.
+    fn with_parameter_aliases(
+        &self,
+        source: &FunctionSignature,
+        target: &FunctionSignature,
+        compare: impl FnOnce() -> bool,
+    ) -> bool {
+        let (source_parameters, target_parameters) =
+            (source.type_parameters(), target.type_parameters());
+        if source_parameters.is_empty() || source_parameters.len() != target_parameters.len() {
+            return compare();
+        }
+        // Renaming is symmetric, and parameters are compared contravariantly, so
+        // the pair arrives in either order. Record both.
+        let added = source_parameters.len() * 2;
+        let mut aliases = self.parameter_aliases.borrow_mut();
+        for (&source_parameter, &target_parameter) in
+            source_parameters.iter().zip(target_parameters.iter())
+        {
+            aliases.push((source_parameter, target_parameter));
+            aliases.push((target_parameter, source_parameter));
+        }
+        drop(aliases);
+        let result = compare();
+        let mut aliases = self.parameter_aliases.borrow_mut();
+        let kept = aliases.len() - added;
+        aliases.truncate(kept);
+        result
     }
 
     fn is_structural(&self, type_id: TypeId) -> bool {
@@ -360,34 +410,36 @@ impl<'table> TypeRelations<'table> {
         target: &FunctionSignature,
         strictness: Strictness,
     ) -> bool {
-        // A source signature is only too narrow when it *requires* more than the
-        // target can ever supply. A trailing rest parameter supplies any count,
-        // so `arity` reports `usize::MAX` and no fixed source arity exceeds it.
-        let (source_required, _, _) = source.arity();
-        let (_, target_total, _) = target.arity();
-        if source_required > target_total {
-            return false;
-        }
-        let positions = source.parameters().len().max(target.parameters().len());
-        for index in 0..positions {
-            // A position absent from either side needs no check: extra target
-            // parameters go unread, and extra optional source parameters go unsupplied.
-            let (Some(source_type), Some(target_type)) = (
-                self.parameter_type_at(source, index),
-                self.parameter_type_at(target, index),
-            ) else {
-                continue;
-            };
-            // Parameters are contravariant: the target must supply a value the
-            // source accepts.
-            if !self.relates(target_type, source_type, strictness) {
+        self.with_parameter_aliases(source, target, || {
+            // A source signature is only too narrow when it *requires* more than the
+            // target can ever supply. A trailing rest parameter supplies any count,
+            // so `arity` reports `usize::MAX` and no fixed source arity exceeds it.
+            let (source_required, _, _) = source.arity();
+            let (_, target_total, _) = target.arity();
+            if source_required > target_total {
                 return false;
             }
-        }
-        // The return position is covariant; a `void` target return absorbs any
-        // source return, a genuine subtyping rule kept in both modes.
-        matches!(self.table.get(target.return_type()), Type::Void)
-            || self.relates(source.return_type(), target.return_type(), strictness)
+            let positions = source.parameters().len().max(target.parameters().len());
+            for index in 0..positions {
+                // A position absent from either side needs no check: extra target
+                // parameters go unread, and extra optional source parameters go unsupplied.
+                let (Some(source_type), Some(target_type)) = (
+                    self.parameter_type_at(source, index),
+                    self.parameter_type_at(target, index),
+                ) else {
+                    continue;
+                };
+                // Parameters are contravariant: the target must supply a value the
+                // source accepts.
+                if !self.relates(target_type, source_type, strictness) {
+                    return false;
+                }
+            }
+            // The return position is covariant; a `void` target return absorbs any
+            // source return, a genuine subtyping rule kept in both modes.
+            matches!(self.table.get(target.return_type()), Type::Void)
+                || self.relates(source.return_type(), target.return_type(), strictness)
+        })
     }
 
     /// Type a signature accepts at `index`, or `None` when it accepts nothing
