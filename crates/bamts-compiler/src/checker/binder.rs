@@ -3190,8 +3190,12 @@ impl<'src> Binder<'src> {
                 continue;
             }
             if let ClassMember::Method(method) = first
-                && method.function.body.is_some()
+                && (method.function.body.is_some() || method.modifiers.is_abstract)
             {
+                // A method with a body is an implementation, not a group
+                // start. An abstract method is a complete declaration with no
+                // body by definition — it is not an overload signature and
+                // requires no following implementation.
                 i += 1;
                 continue;
             }
@@ -3202,7 +3206,9 @@ impl<'src> Binder<'src> {
                 let next = members[i].data();
                 let next_name = self.class_member_method_name(next);
                 let is_overload_signature = matches!(next, ClassMember::Method(method)
-                    if method.modifier == PropertyModifier::None && method.function.body.is_none());
+                    if method.modifier == PropertyModifier::None
+                        && method.function.body.is_none()
+                        && !method.modifiers.is_abstract);
                 if is_overload_signature && next_name.as_ref() == Some(&name) {
                     i += 1;
                 } else {
@@ -3222,7 +3228,9 @@ impl<'src> Binder<'src> {
             let implementation_name = self.class_member_method_name(implementation);
             let matches_name = implementation_name.as_ref() == Some(&name);
             let is_overload_signature = matches!(implementation, ClassMember::Method(method)
-                if method.modifier == PropertyModifier::None && method.function.body.is_none());
+                if method.modifier == PropertyModifier::None
+                    && method.function.body.is_none()
+                    && !method.modifiers.is_abstract);
 
             if matches!(implementation, ClassMember::Method(method)
                 if method.modifier == PropertyModifier::None && method.function.body.is_some() && matches_name)
@@ -6742,6 +6750,35 @@ mod tests {
                 .iter()
                 .any(|d| d.code() == FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION
                     || d.code() == FUNCTION_IMPLEMENTATION_WRONG_NAME),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn abstract_method_is_not_an_overload_signature() {
+        // An abstract method is a complete declaration: it has no body by
+        // definition and must not be treated as an overload signature that
+        // requires a following implementation, nor paired against the next
+        // method as a name-mismatched implementation.
+        let (_, diagnostics) = bound("abstract class C { abstract foo(): void; bar() { } }");
+        assert!(
+            !diagnostics.iter().any(|d| {
+                d.code() == FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION
+                    || d.code() == FUNCTION_IMPLEMENTATION_WRONG_NAME
+            }),
+            "{diagnostics:?}"
+        );
+
+        // The abstract exemption must not blanket-disable the diagnostic: a
+        // genuine bodyless non-abstract overload signature with no following
+        // implementation still reports C039, even inside an abstract class.
+        let (_, diagnostics) = bound("abstract class C { real(): void; }");
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|d| d.code() == FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION)
+                .count(),
+            1,
             "{diagnostics:?}"
         );
     }
