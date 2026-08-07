@@ -1883,9 +1883,6 @@ impl LintTable {
         if dialect == SourceDialect::TypeScript {
             return self.level(rule);
         }
-        if rule.code() == "BAMTS-W085" {
-            return self.level(rule);
-        }
         let javascript_rule = matches!(
             rule.code(),
             "BAMTS-W071"
@@ -1901,11 +1898,17 @@ impl LintTable {
                 | "BAMTS-W087"
         );
         let control_flow = RULES[rule_index(rule)].group() == RuleGroup::ControlFlow;
-        let javascript_compatibility = RULES[rule_index(rule)].group()
-            == RuleGroup::JavaScriptCompatibility
-            && rule.code() != "BAMTS-W085";
+        let javascript_compatibility =
+            RULES[rule_index(rule)].group() == RuleGroup::JavaScriptCompatibility;
         if javascript_rule || control_flow || javascript_compatibility {
             let effective = self.level(rule);
+            // Deny/Forbid rules in the JavaScript-compatibility group are hard
+            // rejections even in .js files; only Warn/Allow entries clamp down.
+            if javascript_compatibility
+                && (effective == LintLevel::Deny || effective == LintLevel::Forbid)
+            {
+                return effective;
+            }
             return if effective == LintLevel::Allow {
                 LintLevel::Allow
             } else {
@@ -2316,6 +2319,10 @@ mod tests {
                 rule("javascript-syntax-rejection"),
                 SourceDialect::JavaScript
             ),
+            LintLevel::Deny
+        );
+        assert_eq!(
+            table.level_for_source(rule("no-with"), SourceDialect::JavaScript),
             LintLevel::Deny
         );
         assert_eq!(
