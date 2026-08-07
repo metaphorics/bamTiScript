@@ -94,10 +94,10 @@ pub(super) fn install<H: Host>(
 
     let constructor = install_function(heap, builtins, "Promise", 1, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
-    globals.insert(EcmaString::from_utf8("Promise"), constructor);
+    globals.insert(EcmaString::encode("Promise"), constructor);
     let queue_microtask =
         install_function(heap, builtins, "queueMicrotask", 1, queue_microtask::<H>);
-    globals.insert(EcmaString::from_utf8("queueMicrotask"), queue_microtask);
+    globals.insert(EcmaString::encode("queueMicrotask"), queue_microtask);
 
     let resolve = install_function(heap, builtins, "resolve", 1, resolve::<H>);
     let reject = install_function(heap, builtins, "reject", 1, reject::<H>);
@@ -146,7 +146,7 @@ fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: 
         panic!("Promise constructor must be native")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8(name)),
+        PropertyKey::Named(EcmaString::encode(name)),
         super::builtin_property(value),
     );
 }
@@ -841,7 +841,7 @@ mod tests {
     ) -> Result<BuiltinOutcome, EvalFailure> {
         machine
             .globals
-            .insert(EcmaString::from_utf8("thenSeen"), Value::int32(2));
+            .insert(EcmaString::encode("thenSeen"), Value::int32(2));
         machine.call_value(
             args.first().copied().unwrap_or(Value::UNDEFINED),
             Value::UNDEFINED,
@@ -858,9 +858,9 @@ mod tests {
     ) -> Result<BuiltinOutcome, EvalFailure> {
         machine
             .globals
-            .insert(EcmaString::from_utf8("handlerSeen"), Value::int32(1));
+            .insert(EcmaString::encode("handlerSeen"), Value::int32(1));
         Ok(BuiltinOutcome::Value(
-            machine.globals[&EcmaString::from_utf8("thenable")],
+            machine.globals[&EcmaString::encode("thenable")],
         ))
     }
 
@@ -871,7 +871,7 @@ mod tests {
         _constructing: bool,
     ) -> Result<BuiltinOutcome, EvalFailure> {
         Ok(BuiltinOutcome::Value(
-            machine.globals[&EcmaString::from_utf8("testIterator")],
+            machine.globals[&EcmaString::encode("testIterator")],
         ))
     }
 
@@ -883,7 +883,7 @@ mod tests {
     ) -> Result<BuiltinOutcome, EvalFailure> {
         let seen = machine
             .globals
-            .insert(EcmaString::from_utf8("nextSeen"), Value::TRUE)
+            .insert(EcmaString::encode("nextSeen"), Value::TRUE)
             .is_some();
         Ok(BuiltinOutcome::Value(
             machine.iterator_result(Value::int32(1), seen)?,
@@ -898,7 +898,7 @@ mod tests {
     ) -> Result<BuiltinOutcome, EvalFailure> {
         machine
             .globals
-            .insert(EcmaString::from_utf8("iteratorClosed"), Value::TRUE);
+            .insert(EcmaString::encode("iteratorClosed"), Value::TRUE);
         Ok(BuiltinOutcome::Value(this))
     }
 
@@ -910,7 +910,7 @@ mod tests {
     ) -> Result<BuiltinOutcome, EvalFailure> {
         machine
             .globals
-            .insert(EcmaString::from_utf8("resolveReceiver"), this);
+            .insert(EcmaString::encode("resolveReceiver"), this);
         Err(EvalFailure::ThrowValue(Value::int32(99)))
     }
 
@@ -922,7 +922,7 @@ mod tests {
     ) -> Result<BuiltinOutcome, EvalFailure> {
         let count = machine
             .globals
-            .get(&EcmaString::from_utf8("resolveGetCount"))
+            .get(&EcmaString::encode("resolveGetCount"))
             .and_then(|value| value.decode())
             .and_then(|value| match value {
                 bamts_native::Decoded::Int32(raw) => Some(raw),
@@ -930,11 +930,11 @@ mod tests {
             })
             .unwrap_or(0);
         machine.globals.insert(
-            EcmaString::from_utf8("resolveGetCount"),
+            EcmaString::encode("resolveGetCount"),
             Value::int32(count + 1),
         );
         Ok(BuiltinOutcome::Value(
-            machine.globals[&EcmaString::from_utf8("throwingResolve")],
+            machine.globals[&EcmaString::encode("throwingResolve")],
         ))
     }
 
@@ -948,7 +948,7 @@ mod tests {
             .unwrap();
         machine
             .globals
-            .insert(EcmaString::from_utf8("testIterator"), iterator);
+            .insert(EcmaString::encode("testIterator"), iterator);
 
         let iterable = super::super::ordinary_runtime(machine, None).unwrap();
         let method = callback(machine, "test iterator method", iterator_method);
@@ -969,12 +969,12 @@ mod tests {
         let resolve = callback(&mut machine, "throwing resolve", throwing_resolve);
         machine
             .globals
-            .insert(EcmaString::from_utf8("throwingResolve"), resolve);
+            .insert(EcmaString::encode("throwingResolve"), resolve);
         let getter = callback(&mut machine, "resolve getter", resolve_getter);
         machine
             .define_accessor(
                 constructor,
-                PropertyKey::Named(EcmaString::from_utf8("resolve")),
+                PropertyKey::Named(EcmaString::encode("resolve")),
                 getter,
                 crate::AccessorKind::Getter,
             )
@@ -990,19 +990,19 @@ mod tests {
         assert_eq!(
             machine
                 .globals
-                .get(&EcmaString::from_utf8("resolveGetCount")),
+                .get(&EcmaString::encode("resolveGetCount")),
             Some(&Value::int32(1))
         );
         assert_eq!(
             machine
                 .globals
-                .get(&EcmaString::from_utf8("resolveReceiver")),
+                .get(&EcmaString::encode("resolveReceiver")),
             Some(&constructor)
         );
         assert_eq!(
             machine
                 .globals
-                .get(&EcmaString::from_utf8("iteratorClosed")),
+                .get(&EcmaString::encode("iteratorClosed")),
             Some(&Value::TRUE)
         );
         assert!(
@@ -1065,7 +1065,7 @@ mod tests {
         machine.set_data_property(thenable, "then", then).unwrap();
         machine
             .globals
-            .insert(EcmaString::from_utf8("thenable"), thenable);
+            .insert(EcmaString::encode("thenable"), thenable);
 
         let source = machine.create_promise().unwrap();
         let finally = machine.get_named_property(source, "finally").unwrap();
@@ -1074,11 +1074,11 @@ mod tests {
         machine.drain_microtasks().unwrap();
 
         assert_eq!(
-            machine.globals.get(&EcmaString::from_utf8("handlerSeen")),
+            machine.globals.get(&EcmaString::encode("handlerSeen")),
             Some(&Value::int32(1))
         );
         assert_eq!(
-            machine.globals.get(&EcmaString::from_utf8("thenSeen")),
+            machine.globals.get(&EcmaString::encode("thenSeen")),
             Some(&Value::int32(2))
         );
         assert!(
@@ -1154,7 +1154,7 @@ mod tests {
         machine
             .define_accessor(
                 spy,
-                PropertyKey::Named(EcmaString::from_utf8("constructor")),
+                PropertyKey::Named(EcmaString::encode("constructor")),
                 getter,
                 crate::AccessorKind::Getter,
             )
@@ -1174,7 +1174,7 @@ mod tests {
         assert_eq!(
             machine
                 .globals
-                .get(&EcmaString::from_utf8("constructorGetCount")),
+                .get(&EcmaString::encode("constructorGetCount")),
             None
         );
     }
@@ -1187,7 +1187,7 @@ mod tests {
     ) -> Result<BuiltinOutcome, EvalFailure> {
         let count = machine
             .globals
-            .get(&EcmaString::from_utf8("constructorGetCount"))
+            .get(&EcmaString::encode("constructorGetCount"))
             .and_then(|value| value.decode())
             .and_then(|value| match value {
                 bamts_native::Decoded::Int32(raw) => Some(raw),
@@ -1195,7 +1195,7 @@ mod tests {
             })
             .unwrap_or(0);
         machine.globals.insert(
-            EcmaString::from_utf8("constructorGetCount"),
+            EcmaString::encode("constructorGetCount"),
             Value::int32(count + 1),
         );
         Ok(BuiltinOutcome::Value(

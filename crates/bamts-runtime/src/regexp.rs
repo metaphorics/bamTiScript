@@ -1272,7 +1272,7 @@ mod tests {
     use bamts_bytecode::EcmaString;
 
     fn text(value: &str) -> EcmaString {
-        EcmaString::from_utf8(value)
+        EcmaString::encode(value)
     }
 
     fn regex(pattern: &str, flags: &str) -> Regex {

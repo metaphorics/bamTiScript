@@ -49,9 +49,9 @@ fn install_map<H: Host>(
     define_getter(heap, prototype, "size", size);
     let entries = named_property(heap, prototype, "entries");
     define_symbol(heap, prototype, builtins.symbol_iterator(), entries);
-    let map_tag = super::super::push(heap, HeapEntry::String(EcmaString::from_utf8("Map")));
+    let map_tag = super::super::push(heap, HeapEntry::String(EcmaString::encode("Map")));
     define_to_string_tag(heap, prototype, builtins.symbol_to_string_tag(), map_tag);
-    globals.insert(EcmaString::from_utf8("Map"), constructor);
+    globals.insert(EcmaString::encode("Map"), constructor);
 }
 
 fn install_set<H: Host>(
@@ -79,9 +79,9 @@ fn install_set<H: Host>(
     define_getter(heap, prototype, "size", size);
     let values = named_property(heap, prototype, "values");
     define_symbol(heap, prototype, builtins.symbol_iterator(), values);
-    let set_tag = super::super::push(heap, HeapEntry::String(EcmaString::from_utf8("Set")));
+    let set_tag = super::super::push(heap, HeapEntry::String(EcmaString::encode("Set")));
     define_to_string_tag(heap, prototype, builtins.symbol_to_string_tag(), set_tag);
-    globals.insert(EcmaString::from_utf8("Set"), constructor);
+    globals.insert(EcmaString::encode("Set"), constructor);
 }
 
 fn install_weak_map<H: Host>(
@@ -101,7 +101,7 @@ fn install_weak_map<H: Host>(
         let function = install_function(heap, builtins, name, length, handler);
         define_data(heap, prototype, name, function);
     }
-    globals.insert(EcmaString::from_utf8("WeakMap"), constructor);
+    globals.insert(EcmaString::encode("WeakMap"), constructor);
 }
 
 fn install_weak_set<H: Host>(
@@ -120,7 +120,7 @@ fn install_weak_set<H: Host>(
         let function = install_function(heap, builtins, name, length, handler);
         define_data(heap, prototype, name, function);
     }
-    globals.insert(EcmaString::from_utf8("WeakSet"), constructor);
+    globals.insert(EcmaString::encode("WeakSet"), constructor);
 }
 
 pub(super) fn install_iterator_prototype<H: Host>(
@@ -1082,7 +1082,7 @@ fn constructor_prototype<H: Host>(
     let HeapEntry::NativeFunction { properties, .. } = &machine.heap[index] else {
         return Err(type_error("invalid collection constructor"));
     };
-    match properties.get(&PropertyKey::Named(EcmaString::from_utf8("prototype"))) {
+    match properties.get(&PropertyKey::Named(EcmaString::encode("prototype"))) {
         Some(Property::Data { value, .. }) => Ok(*value),
         _ => Err(type_error("missing collection prototype")),
     }
@@ -1116,7 +1116,7 @@ fn define_getter(heap: &mut [HeapEntry], object: Value, name: &str, getter: Valu
         unreachable!()
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8(name)),
+        PropertyKey::Named(EcmaString::encode(name)),
         Property::Accessor {
             getter: Some(getter),
             setter: None,
@@ -1152,7 +1152,7 @@ fn named_property(heap: &[HeapEntry], object: Value, name: &str) -> Value {
     let HeapEntry::Object { properties, .. } = &heap[heap_index(object)] else {
         unreachable!()
     };
-    match properties.get(&PropertyKey::Named(EcmaString::from_utf8(name))) {
+    match properties.get(&PropertyKey::Named(EcmaString::encode(name))) {
         Some(Property::Data { value, .. }) => *value,
         _ => unreachable!(),
     }
@@ -1953,7 +1953,7 @@ mod tests {
     }
 
     fn root(machine: &mut Machine<'_, TestHost>, name: &str, value: Value) {
-        machine.globals.insert(EcmaString::from_utf8(name), value);
+        machine.globals.insert(EcmaString::encode(name), value);
     }
 
     fn slot(machine: &Machine<'_, TestHost>, value: Value) -> usize {
@@ -1978,10 +1978,7 @@ mod tests {
 
         assert!(matches!(machine.heap[dead_slot], HeapEntry::Vacant));
         assert_eq!(slot(&machine, survivor), survivor_slot);
-        assert_eq!(
-            machine.globals[&EcmaString::from_utf8("survivor")],
-            survivor
-        );
+        assert_eq!(machine.globals[&EcmaString::encode("survivor")], survivor);
         assert!(matches!(
             machine.runtime_slot(dead),
             Err(RuntimeErrorKind::InvalidRuntimeHeapReference { .. })

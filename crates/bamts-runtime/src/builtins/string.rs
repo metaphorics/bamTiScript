@@ -18,7 +18,7 @@ pub(super) fn install<H: Host>(
     let prototype = builtins.string_prototype();
     let constructor = install_function(heap, builtins, "String", 1, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
-    globals.insert(EcmaString::from_utf8("String"), constructor);
+    globals.insert(EcmaString::encode("String"), constructor);
     for (name, length, handler) in [
         ("fromCharCode", 1, from_char_code::<H> as BuiltinHandler<H>),
         ("raw", 1, raw::<H>),
@@ -74,7 +74,7 @@ fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: 
         panic!("String constructor must be native")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8(name)),
+        PropertyKey::Named(EcmaString::encode(name)),
         super::builtin_property(value),
     );
 }
@@ -708,7 +708,7 @@ fn pad<H: Host>(
         return Ok(BuiltinOutcome::Value(allocate_string(machine, string)?));
     }
     let filler = if args.len() < 2 || args[1] == Value::UNDEFINED {
-        EcmaString::from_utf8(" ")
+        EcmaString::encode(" ")
     } else {
         machine.to_string(args[1])?
     };
@@ -875,7 +875,7 @@ pub(super) fn encode_uri_component<H: Host>(
     }
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
-        EcmaString::from_utf8(&output),
+        EcmaString::encode(&output),
     )?))
 }
 fn hex_value(unit: u16) -> Option<u8> {
@@ -1346,7 +1346,7 @@ mod unescape_tests {
     ) -> Result<BuiltinOutcome, EvalFailure> {
         Ok(BuiltinOutcome::Value(
             machine
-                .allocate(HeapEntry::String(EcmaString::from_utf8("%u0041")))
+                .allocate(HeapEntry::String(EcmaString::encode("%u0041")))
                 .map_err(EvalFailure::Runtime)?,
         ))
     }
@@ -1387,16 +1387,16 @@ mod unescape_tests {
             )
             .expect("localeCompare is installed");
         let lower_a = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("alpha")))
+            .allocate(HeapEntry::String(EcmaString::encode("alpha")))
             .unwrap();
         let lower_b = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("beta")))
+            .allocate(HeapEntry::String(EcmaString::encode("beta")))
             .unwrap();
         let lower_a_again = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("alpha")))
+            .allocate(HeapEntry::String(EcmaString::encode("alpha")))
             .unwrap();
         let upper_a = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("Alpha")))
+            .allocate(HeapEntry::String(EcmaString::encode("Alpha")))
             .unwrap();
 
         assert_eq!(
@@ -1447,7 +1447,7 @@ mod unescape_tests {
             .global("Symbol")
             .expect("Symbol is installed");
         let description = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("event")))
+            .allocate(HeapEntry::String(EcmaString::encode("event")))
             .expect("description allocation succeeds");
         let symbol = machine
             .call_value(symbol_constructor, Value::UNDEFINED, &[description])
@@ -1480,7 +1480,7 @@ mod unescape_tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&program, &mut host, Limits::default());
         let message = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("message")))
+            .allocate(HeapEntry::String(EcmaString::encode("message")))
             .expect("message allocation succeeds");
         let error_constructor = machine
             .intrinsics
@@ -1542,7 +1542,7 @@ mod unescape_tests {
         );
 
         let malformed = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8(
+            .allocate(HeapEntry::String(EcmaString::encode(
                 "%uD800%u0041%uZZZZ%4G%u12",
             )))
             .unwrap();
@@ -1588,7 +1588,7 @@ mod unescape_tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&program, &mut host, Limits::default());
         let source = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+            .allocate(HeapEntry::String(EcmaString::encode("x")))
             .expect("source string allocation succeeds");
         let pad_start = machine
             .get_named_property(machine.intrinsics.builtins.string_prototype(), "padStart")
@@ -1628,7 +1628,7 @@ mod unescape_tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&program, &mut host, Limits::default());
         let source = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+            .allocate(HeapEntry::String(EcmaString::encode("x")))
             .expect("source string allocation succeeds");
         let iterator_key = machine
             .to_property_key(machine.intrinsics.builtins.symbol_iterator())

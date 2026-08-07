@@ -479,7 +479,7 @@ mod tests {
             name: ConstantId::new(0),
             code: Module::new(
                 vec![
-                    Constant::String(EcmaString::from_utf8(name)),
+                    Constant::String(EcmaString::encode(name)),
                     Constant::Int32(value),
                 ],
                 vec![function(code, u32::from(loads_constant))],

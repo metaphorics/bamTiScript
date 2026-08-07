@@ -17,7 +17,7 @@ pub(super) fn install<H: Host>(
     let prototype = builtins.number_prototype();
     let constructor = install_function(heap, builtins, "Number", 1, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
-    globals.insert(EcmaString::from_utf8("Number"), constructor);
+    globals.insert(EcmaString::encode("Number"), constructor);
     for (name, length, handler) in [
         ("isInteger", 1, is_integer::<H> as BuiltinHandler<H>),
         ("isSafeInteger", 1, is_safe_integer::<H>),
@@ -56,7 +56,7 @@ fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: 
         panic!("Number constructor must be native")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8(name)),
+        PropertyKey::Named(EcmaString::encode(name)),
         super::builtin_property(value),
     );
 }
@@ -349,7 +349,7 @@ fn to_string<H: Host>(
     };
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
-        EcmaString::from_utf8(&text),
+        EcmaString::encode(&text),
     )?))
 }
 fn radix_string(n: f64, radix: u32) -> String {
@@ -392,7 +392,7 @@ fn to_fixed<H: Host>(
     };
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
-        EcmaString::from_utf8(&text),
+        EcmaString::encode(&text),
     )?))
 }
 fn value_of<H: Host>(
@@ -449,7 +449,7 @@ mod tests {
 
     fn parse_int_radix(machine: &mut Machine<'_, TestHost>, input: &str, radix: Value) -> Value {
         let text = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8(input)))
+            .allocate(HeapEntry::String(EcmaString::encode(input)))
             .expect("input string allocation succeeds");
         let BuiltinOutcome::Value(result) =
             parse_int(&mut *machine, Value::UNDEFINED, &[text, radix], false)

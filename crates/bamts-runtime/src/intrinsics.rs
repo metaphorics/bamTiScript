@@ -311,7 +311,7 @@ impl<H: Host> BuiltinTable<H> {
             panic!("builtin constructor is a native function");
         };
         properties.insert(
-            crate::PropertyKey::Named(EcmaString::from_utf8("prototype")),
+            crate::PropertyKey::Named(EcmaString::encode("prototype")),
             crate::Property::Data {
                 value: prototype,
                 writable: false,
@@ -329,7 +329,7 @@ impl<H: Host> BuiltinTable<H> {
         match &mut heap[prototype_index] {
             HeapEntry::Object { properties, .. } | HeapEntry::Array { properties, .. } => {
                 properties.insert(
-                    crate::PropertyKey::Named(EcmaString::from_utf8("constructor")),
+                    crate::PropertyKey::Named(EcmaString::encode("constructor")),
                     constructor_property,
                 );
             }
@@ -348,7 +348,7 @@ impl<H: Host> BuiltinTable<H> {
             panic!("builtin function is a native function");
         };
         properties.insert(
-            crate::PropertyKey::Named(EcmaString::from_utf8("prototype")),
+            crate::PropertyKey::Named(EcmaString::encode("prototype")),
             crate::Property::Data {
                 value: prototype,
                 writable: true,
@@ -539,10 +539,10 @@ pub(crate) fn native_function(
     name: &'static str,
     length: u32,
 ) -> Value {
-    let name_value = push(heap, HeapEntry::String(EcmaString::from_utf8(name)));
+    let name_value = push(heap, HeapEntry::String(EcmaString::encode(name)));
     let mut properties = PropertyMap::default();
     properties.insert(
-        crate::PropertyKey::Named(EcmaString::from_utf8("length")),
+        crate::PropertyKey::Named(EcmaString::encode("length")),
         crate::Property::Data {
             value: crate::number_value(f64::from(length)),
             writable: false,
@@ -551,7 +551,7 @@ pub(crate) fn native_function(
         },
     );
     properties.insert(
-        crate::PropertyKey::Named(EcmaString::from_utf8("name")),
+        crate::PropertyKey::Named(EcmaString::encode("name")),
         crate::Property::Data {
             value: name_value,
             writable: false,
@@ -746,7 +746,7 @@ mod tests {
 
     fn module() -> Program<Verified> {
         let code = Module::new(
-            vec![Constant::String(EcmaString::from_utf8("<test>"))],
+            vec![Constant::String(EcmaString::encode("<test>"))],
             vec![Function::new(
                 None,
                 0,
@@ -821,7 +821,7 @@ mod tests {
         let json_text = machine.call_value(stringify, json, &[object]).unwrap();
 
         let test_key = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("test")))
+            .allocate(HeapEntry::String(EcmaString::encode("test")))
             .unwrap();
         let has_own = call_static(&mut machine, "Object", "hasOwn", &[object, test_key]);
 
@@ -839,7 +839,7 @@ mod tests {
                 unreachable!()
             };
             properties.insert(
-                PropertyKey::Named(EcmaString::from_utf8(key)),
+                PropertyKey::Named(EcmaString::encode(key)),
                 Property::Data {
                     value: Value::int32(value),
                     writable: true,
@@ -911,7 +911,7 @@ mod tests {
         let symbol = machine.intrinsics.global("Symbol").unwrap();
         let symbol_for = machine.get_named_property(symbol, "for").unwrap();
         let key_text = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("shared")))
+            .allocate(HeapEntry::String(EcmaString::encode("shared")))
             .unwrap();
         let first = machine.call_value(symbol_for, symbol, &[key_text]).unwrap();
         let second = machine.call_value(symbol_for, symbol, &[key_text]).unwrap();
@@ -940,12 +940,12 @@ mod tests {
         );
 
         let pattern = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("^(a|b)\\.js$")))
+            .allocate(HeapEntry::String(EcmaString::encode("^(a|b)\\.js$")))
             .unwrap();
         let regexp = construct_builtin(&mut machine, "RegExp", &[pattern]);
         let test = machine.get_named_property(regexp, "test").unwrap();
         let input = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("b.js")))
+            .allocate(HeapEntry::String(EcmaString::encode("b.js")))
             .unwrap();
         assert_eq!(
             machine.call_value(test, regexp, &[input]).unwrap(),
@@ -953,7 +953,7 @@ mod tests {
         );
 
         let message = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("boom")))
+            .allocate(HeapEntry::String(EcmaString::encode("boom")))
             .unwrap();
         let error = construct_builtin(&mut machine, "TypeError", &[message]);
         let error_message = machine.get_named_property(error, "message").unwrap();

@@ -1021,7 +1021,7 @@ fn collect_import_targets(
                     (source_id, symbol),
                     ImportTarget::Named {
                         source: target_source,
-                        name: EcmaString::from_utf8("default"),
+                        name: EcmaString::encode("default"),
                         specifier: None,
                     },
                 );
@@ -1096,7 +1096,7 @@ fn collect_export_targets(
                         };
                         let Some(name) = source
                             .identifier_text(declaration.name.data().token())
-                            .map(|name| EcmaString::from_utf8(name.as_ref()))
+                            .map(|name| EcmaString::encode(name.as_ref()))
                         else {
                             continue;
                         };
@@ -1108,7 +1108,7 @@ fn collect_export_targets(
                                 continue;
                             };
                             targets.insert(
-                                (source_id, EcmaString::from_utf8(&name)),
+                                (source_id, EcmaString::encode(&name)),
                                 ExportTarget::Local(symbol),
                             );
                         }
@@ -1450,7 +1450,7 @@ fn module_export_name(source: &SourceFile, name: &ModuleExportName) -> Option<Ec
     match name {
         ModuleExportName::Identifier(identifier) => source
             .identifier_text(identifier.data().token())
-            .map(|name| EcmaString::from_utf8(name.as_ref())),
+            .map(|name| EcmaString::encode(name.as_ref())),
         ModuleExportName::String(string) => source
             .token_text(string.data().token())
             .and_then(crate::literal::string_value),

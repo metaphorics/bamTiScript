@@ -15,7 +15,7 @@ pub(crate) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
     object_prototype: Value,
 ) -> InstalledModule {
-    let specifier = EcmaString::from_utf8("node:vm");
+    let specifier = EcmaString::encode("node:vm");
     let namespace = intrinsics::push(
         heap,
         HeapEntry::ExternalModuleNamespace {
@@ -99,12 +99,9 @@ pub(crate) fn install<H: Host>(
         specifier,
         namespace,
         exports: vec![
-            (EcmaString::from_utf8("Script"), script),
-            (EcmaString::from_utf8("runInNewContext"), run_in_new_context),
-            (
-                EcmaString::from_utf8("runInThisContext"),
-                run_in_this_context,
-            ),
+            (EcmaString::encode("Script"), script),
+            (EcmaString::encode("runInNewContext"), run_in_new_context),
+            (EcmaString::encode("runInThisContext"), run_in_this_context),
         ],
         internals: BTreeMap::from([("vm.script.prototype", script_prototype)]),
     }
@@ -182,12 +179,8 @@ fn run_in_this_context<H: Host>(
         let function = machine
             .registry
             .external
-            .get(&EcmaString::from_utf8("node:vm"))
-            .and_then(|module| {
-                module
-                    .exports
-                    .get(&EcmaString::from_utf8("runInThisContext"))
-            })
+            .get(&EcmaString::encode("node:vm"))
+            .and_then(|module| module.exports.get(&EcmaString::encode("runInThisContext")))
             .expect("node:vm installs runInThisContext")
             .value;
         Some(
@@ -217,8 +210,8 @@ fn run_in_new_context<H: Host>(
     constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let prototype = if constructing {
-        let function = machine.registry.external[&EcmaString::from_utf8("node:vm")].exports
-            [&EcmaString::from_utf8("runInNewContext")]
+        let function = machine.registry.external[&EcmaString::encode("node:vm")].exports
+            [&EcmaString::encode("runInNewContext")]
             .value;
         Some(
             machine
@@ -316,7 +309,7 @@ fn source_arguments<H: Host>(
 ) -> Result<(EcmaString, EcmaString), EvalFailure> {
     let code = machine.to_string(code)?;
     if options == Value::UNDEFINED {
-        return Ok((code, EcmaString::from_utf8("evalmachine.<anonymous>")));
+        return Ok((code, EcmaString::encode("evalmachine.<anonymous>")));
     }
     if let Some(name) = machine.string_value(options) {
         return Ok((code, name));
@@ -327,7 +320,7 @@ fn source_arguments<H: Host>(
     reject_unsupported_timeout(machine, options)?;
     let filename = machine.get_named_property(options, "filename")?;
     if filename == Value::UNDEFINED {
-        return Ok((code, EcmaString::from_utf8("evalmachine.<anonymous>")));
+        return Ok((code, EcmaString::encode("evalmachine.<anonymous>")));
     }
     let Some(name) = machine.string_value(filename) else {
         return Err(type_error("The \"filename\" option must be of type string"));
@@ -391,7 +384,7 @@ fn script_prototype<H: Host>(machine: &Machine<'_, H>) -> Value {
     *machine
         .registry
         .external
-        .get(&EcmaString::from_utf8("node:vm"))
+        .get(&EcmaString::encode("node:vm"))
         .and_then(|module| module.internals.get("vm.script.prototype"))
         .expect("node:vm installs Script.prototype")
 }
@@ -467,7 +460,7 @@ mod tests {
     fn program_returning(value: i32) -> Program<Verified> {
         let constants = vec![
             Constant::Int32(value),
-            Constant::String(EcmaString::from_utf8("test")),
+            Constant::String(EcmaString::encode("test")),
         ];
         let code = Module::new(
             constants,
@@ -518,15 +511,15 @@ mod tests {
         let vm = machine
             .registry
             .external
-            .get(&EcmaString::from_utf8("node:vm"))
+            .get(&EcmaString::encode("node:vm"))
             .expect("node:vm is installed");
         (
             vm.exports
-                .get(&EcmaString::from_utf8("Script"))
+                .get(&EcmaString::encode("Script"))
                 .expect("Script is exported")
                 .value,
             vm.exports
-                .get(&EcmaString::from_utf8("runInThisContext"))
+                .get(&EcmaString::encode("runInThisContext"))
                 .expect("runInThisContext is exported")
                 .value,
         )
@@ -556,7 +549,7 @@ mod tests {
             !machine
                 .registry
                 .external
-                .contains_key(&EcmaString::from_utf8("node:vm"))
+                .contains_key(&EcmaString::encode("node:vm"))
         );
     }
 
@@ -569,31 +562,31 @@ mod tests {
             let vm = machine
                 .registry
                 .external
-                .get(&EcmaString::from_utf8("node:vm"))
+                .get(&EcmaString::encode("node:vm"))
                 .expect("node:vm is installed");
             let names: Vec<_> = vm.exports.keys().cloned().collect();
             assert_eq!(
                 names,
                 vec![
-                    EcmaString::from_utf8("Script"),
-                    EcmaString::from_utf8("default"),
-                    EcmaString::from_utf8("runInNewContext"),
-                    EcmaString::from_utf8("runInThisContext"),
+                    EcmaString::encode("Script"),
+                    EcmaString::encode("default"),
+                    EcmaString::encode("runInNewContext"),
+                    EcmaString::encode("runInThisContext"),
                 ]
             );
             let script = vm
                 .exports
-                .get(&EcmaString::from_utf8("Script"))
+                .get(&EcmaString::encode("Script"))
                 .expect("Script is exported")
                 .value;
             let run = vm
                 .exports
-                .get(&EcmaString::from_utf8("runInThisContext"))
+                .get(&EcmaString::encode("runInThisContext"))
                 .expect("runInThisContext is exported")
                 .value;
             let run_new = vm
                 .exports
-                .get(&EcmaString::from_utf8("runInNewContext"))
+                .get(&EcmaString::encode("runInNewContext"))
                 .expect("runInNewContext is exported")
                 .value;
             (script, run, run_new)
@@ -690,11 +683,11 @@ mod tests {
         let mut host = compiler_host();
         let mut machine = Machine::new(&program, &mut host, Limits::default());
         machine.instantiate_modules().unwrap();
-        let run = machine.registry.external[&EcmaString::from_utf8("node:vm")].exports
-            [&EcmaString::from_utf8("runInNewContext")]
+        let run = machine.registry.external[&EcmaString::encode("node:vm")].exports
+            [&EcmaString::encode("runInNewContext")]
             .value;
         let source = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("({})")))
+            .allocate(HeapEntry::String(EcmaString::encode("({})")))
             .unwrap();
 
         assert_eq!(
@@ -759,7 +752,7 @@ mod tests {
         machine.instantiate_modules().unwrap();
         let (script_constructor, _) = vm_exports(&machine);
         let source = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("ignored")))
+            .allocate(HeapEntry::String(EcmaString::encode("ignored")))
             .expect("source allocation succeeds");
         let script_constructor_id = builtin_id(&machine, script_constructor);
         let script = match machine
@@ -844,7 +837,7 @@ mod tests {
             "1".encode_utf16().collect::<Vec<_>>()
         );
         let filename = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("custom.js")))
+            .allocate(HeapEntry::String(EcmaString::encode("custom.js")))
             .unwrap();
         assert_eq!(
             machine
@@ -898,7 +891,7 @@ mod tests {
         machine.instantiate_modules().unwrap();
         let (_, run) = vm_exports(&machine);
         let source = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("ignored")))
+            .allocate(HeapEntry::String(EcmaString::encode("ignored")))
             .unwrap();
         let used_slots = machine.heap.len() - machine.intrinsic_slots;
         machine.limits.max_heap_slots = used_slots + 1;
@@ -936,7 +929,7 @@ mod tests {
         machine.instantiate_modules().unwrap();
         let (script_constructor, _) = vm_exports(&machine);
         let source = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("ignored")))
+            .allocate(HeapEntry::String(EcmaString::encode("ignored")))
             .unwrap();
         let used_slots = machine.heap.len() - machine.intrinsic_slots;
         machine.limits.max_heap_slots = used_slots + 1;
@@ -979,7 +972,7 @@ mod tests {
         machine.instantiate_modules().unwrap();
         let (script_constructor, _) = vm_exports(&machine);
         let source = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("ignored")))
+            .allocate(HeapEntry::String(EcmaString::encode("ignored")))
             .unwrap();
         let script_bytes = Machine::<ScriptHost>::script_heap_cost(
             &machine.host.compiler.as_ref().unwrap().program,
@@ -1024,7 +1017,7 @@ mod tests {
         machine.instantiate_modules().unwrap();
         let (script_constructor, _) = vm_exports(&machine);
         let source = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("ignored")))
+            .allocate(HeapEntry::String(EcmaString::encode("ignored")))
             .expect("source allocation succeeds");
         let script_constructor_id = builtin_id(&machine, script_constructor);
         let script = match machine
@@ -1075,11 +1068,11 @@ mod tests {
         let mut machine = Machine::new(&program, &mut host, Limits::default());
         machine.instantiate_modules().unwrap();
         let (script_constructor, run) = vm_exports(&machine);
-        let run_new = machine.registry.external[&EcmaString::from_utf8("node:vm")].exports
-            [&EcmaString::from_utf8("runInNewContext")]
+        let run_new = machine.registry.external[&EcmaString::encode("node:vm")].exports
+            [&EcmaString::encode("runInNewContext")]
             .value;
         let source = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("ignored")))
+            .allocate(HeapEntry::String(EcmaString::encode("ignored")))
             .unwrap();
 
         // Script.prototype.runInThisContext rejects a timeout it cannot honor.

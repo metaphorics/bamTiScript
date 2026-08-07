@@ -23,7 +23,7 @@ pub(super) fn install<H: Host>(
         unreachable!()
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8("now")),
+        PropertyKey::Named(EcmaString::encode("now")),
         super::builtin_property(now),
     );
     for (name, handler) in [
@@ -34,7 +34,7 @@ pub(super) fn install<H: Host>(
         let function = install_function(heap, builtins, name, 0, handler);
         define_data(heap, prototype, name, function);
     }
-    globals.insert(EcmaString::from_utf8("Date"), constructor);
+    globals.insert(EcmaString::encode("Date"), constructor);
 }
 
 fn constructor<H: Host>(
@@ -48,7 +48,7 @@ fn constructor<H: Host>(
             .unwrap_or_else(|| "Invalid Date".to_owned());
         return Ok(BuiltinOutcome::Value(allocate_string(
             machine,
-            EcmaString::from_utf8(&text),
+            EcmaString::encode(&text),
         )?));
     }
 
@@ -131,7 +131,7 @@ fn to_iso_string<H: Host>(
     let text = iso_string(milliseconds).ok_or_else(|| range_error("Invalid time value"))?;
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
-        EcmaString::from_utf8(&text),
+        EcmaString::encode(&text),
     )?))
 }
 
@@ -528,7 +528,7 @@ mod tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let garbage = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("not a date")))
+            .allocate(HeapEntry::String(EcmaString::encode("not a date")))
             .expect("string allocation succeeds");
 
         // Date() without `new` returns ToDateString — the human-readable
@@ -538,13 +538,13 @@ mod tests {
             let value = call_date(&mut machine, args, false);
             assert_eq!(
                 machine.string_value(value).unwrap().as_units(),
-                EcmaString::from_utf8(&expected).as_units(),
+                EcmaString::encode(&expected).as_units(),
                 "Date() must return the toString form, not ISO-8601"
             );
             // Guard against regression to the ISO form.
             assert_ne!(
                 machine.string_value(value).unwrap().as_units(),
-                EcmaString::from_utf8("2024-01-01T00:00:00.123Z").as_units()
+                EcmaString::encode("2024-01-01T00:00:00.123Z").as_units()
             );
         }
     }
@@ -571,7 +571,7 @@ mod tests {
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let value = call_date(&mut machine, &[], false);
         let result = machine.string_value(value).unwrap();
-        assert_eq!(result.as_units(), EcmaString::from_utf8(&text).as_units());
+        assert_eq!(result.as_units(), EcmaString::encode(&text).as_units());
     }
 
     #[test]
@@ -595,7 +595,7 @@ mod tests {
 
         let mut properties = PropertyMap::default();
         properties.insert(
-            PropertyKey::Named(EcmaString::from_utf8("prototype")),
+            PropertyKey::Named(EcmaString::encode("prototype")),
             Property::Data {
                 value: sub_prototype,
                 writable: true,
@@ -690,7 +690,7 @@ mod tests {
             ("2024-01-01T24:00:00Z", 1_704_153_600_000.0),
         ] {
             assert_eq!(
-                parse_iso_date(&EcmaString::from_utf8(text)),
+                parse_iso_date(&EcmaString::encode(text)),
                 Some(milliseconds),
                 "{text}"
             );
@@ -702,7 +702,7 @@ mod tests {
             ("-000001-01-01T00:00:00.000Z", "-000001-01-01T00:00:00.000Z"),
         ] {
             let milliseconds =
-                parse_iso_date(&EcmaString::from_utf8(text)).expect("valid extended year");
+                parse_iso_date(&EcmaString::encode(text)).expect("valid extended year");
             assert_eq!(
                 iso_string(milliseconds).as_deref(),
                 Some(expected),
@@ -720,7 +720,7 @@ mod tests {
             "2024-01-01 00:00:00.000Z",
             "-000000-01-01T00:00:00.000Z",
         ] {
-            assert_eq!(parse_iso_date(&EcmaString::from_utf8(text)), None, "{text}");
+            assert_eq!(parse_iso_date(&EcmaString::encode(text)), None, "{text}");
         }
     }
     static VALUE_OF_CALLED: AtomicBool = AtomicBool::new(false);

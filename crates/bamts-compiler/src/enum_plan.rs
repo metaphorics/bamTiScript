@@ -352,14 +352,14 @@ pub(crate) fn cook_member_name(
     match name {
         PropertyName::Identifier(identifier) => source
             .identifier_text(identifier.data().token())
-            .map(|name| EcmaString::from_utf8(name.as_ref())),
+            .map(|name| EcmaString::encode(name.as_ref())),
         PropertyName::String(string) => source
             .token_text(string.data().token())
             .and_then(string_value),
         PropertyName::Number(number) => source
             .token_text(number.data().token())
             .and_then(number_value)
-            .map(|value| EcmaString::from_utf8(&number_name(value))),
+            .map(|value| EcmaString::encode(&number_name(value))),
         PropertyName::Private(_) | PropertyName::Computed(_) | PropertyName::Missing(_) => None,
     }
 }
@@ -1072,7 +1072,7 @@ pub(crate) fn cook_member_property_name(
     match property {
         MemberProperty::Named(identifier) => source
             .token_text(identifier.data().token())
-            .map(EcmaString::from_utf8),
+            .map(EcmaString::encode),
         MemberProperty::Computed(expression) => match expression.data() {
             Expression::Literal(Literal::String(string)) => source
                 .token_text(string.data().token())

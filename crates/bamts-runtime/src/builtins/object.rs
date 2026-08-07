@@ -21,7 +21,7 @@ pub(super) fn install<H: Host>(
     let prototype = builtins.object_prototype();
     let constructor = install_function(heap, builtins, "Object", 1, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
-    globals.insert(EcmaString::from_utf8("Object"), constructor);
+    globals.insert(EcmaString::encode("Object"), constructor);
 
     for (name, length, handler) in [
         ("keys", 1, keys::<H> as BuiltinHandler<H>),
@@ -78,7 +78,7 @@ fn machine_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value:
         panic!("constructor must be native");
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8(name)),
+        PropertyKey::Named(EcmaString::encode(name)),
         super::builtin_property(value),
     );
 }
@@ -361,7 +361,7 @@ fn descriptor_field<H: Host>(
     descriptor: Value,
     name: &str,
 ) -> Result<Option<Value>, EvalFailure> {
-    let key = PropertyKey::Named(EcmaString::from_utf8(name));
+    let key = PropertyKey::Named(EcmaString::encode(name));
     if !machine.has_property(descriptor, &key)? {
         return Ok(None);
     }
@@ -804,8 +804,8 @@ fn prototype_to_string<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let tag = match this.decode() {
-        Some(Decoded::Undefined) => EcmaString::from_utf8("Undefined"),
-        Some(Decoded::Null) => EcmaString::from_utf8("Null"),
+        Some(Decoded::Undefined) => EcmaString::encode("Undefined"),
+        Some(Decoded::Null) => EcmaString::encode("Null"),
         _ => {
             let fallback = machine.object_to_string_tag(this)?;
             let symbol = machine.intrinsics.builtins.symbol_to_string_tag();
@@ -818,7 +818,7 @@ fn prototype_to_string<H: Host>(
             let tag_value = machine.get_property_key(this, &key)?;
             machine
                 .string_value(tag_value)
-                .unwrap_or_else(|| EcmaString::from_utf8(fallback))
+                .unwrap_or_else(|| EcmaString::encode(fallback))
         }
     };
     let mut output =
@@ -950,7 +950,7 @@ fn create_list_from_array_like<H: Host>(
     let length = length as usize;
     let mut arguments = Vec::with_capacity(length);
     for index in 0..length {
-        let key = PropertyKey::Named(EcmaString::from_utf8(&index.to_string()));
+        let key = PropertyKey::Named(EcmaString::encode(&index.to_string()));
         arguments.push(machine.get_property_key(source, &key)?);
     }
     Ok(arguments)
@@ -971,7 +971,7 @@ fn function_bind<H: Host>(
         ));
     }
     let bound_arguments = args.get(1..).unwrap_or_default().to_vec();
-    let length_key = PropertyKey::Named(EcmaString::from_utf8("length"));
+    let length_key = PropertyKey::Named(EcmaString::encode("length"));
     let length = if machine.has_own_property_key(this, &length_key)? {
         let target_length = machine.get_property_key(this, &length_key)?;
         match target_length.decode() {
@@ -991,7 +991,7 @@ fn function_bind<H: Host>(
     let target_name = machine.get_named_property(this, "name")?;
     let target_name = machine
         .string_value(target_name)
-        .unwrap_or_else(|| EcmaString::from_utf8(""));
+        .unwrap_or_else(|| EcmaString::encode(""));
     let mut name = EcmaStringBuilder::with_capacity(target_name.len_units().saturating_add(6));
     name.push_utf8("bound ");
     for unit in target_name.as_units() {
@@ -1009,7 +1009,7 @@ fn function_bind<H: Host>(
         },
     );
     properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8("name")),
+        PropertyKey::Named(EcmaString::encode("name")),
         Property::Data {
             value: name,
             writable: false,
@@ -1223,12 +1223,12 @@ mod tests {
         );
         assert!(
             !machine
-                .has_own_property_key(target, &PropertyKey::Named(EcmaString::from_utf8("first")))
+                .has_own_property_key(target, &PropertyKey::Named(EcmaString::encode("first")))
                 .unwrap()
         );
         assert!(
             !machine
-                .has_own_property_key(target, &PropertyKey::Named(EcmaString::from_utf8("second")))
+                .has_own_property_key(target, &PropertyKey::Named(EcmaString::encode("second")))
                 .unwrap()
         );
     }
@@ -1240,7 +1240,7 @@ mod tests {
     fn symbol(machine: &mut Machine<'_, TestHost>, description: &str) -> Value {
         machine
             .allocate(HeapEntry::Symbol {
-                description: EcmaString::from_utf8(description),
+                description: EcmaString::encode(description),
             })
             .unwrap()
     }
@@ -1312,7 +1312,7 @@ mod tests {
             _args: &[Value],
             _constructing: bool,
         ) -> Result<BuiltinOutcome, EvalFailure> {
-            machine.delete_property(this, &PropertyKey::Named(EcmaString::from_utf8("next")))?;
+            machine.delete_property(this, &PropertyKey::Named(EcmaString::encode("next")))?;
             Ok(BuiltinOutcome::Value(Value::int32(1)))
         }
 
@@ -1331,8 +1331,8 @@ mod tests {
             crate::intrinsics::native_function(&mut machine.heap, getter_id, "delete next", 0);
         let source = ordinary_object(&mut machine);
         let target = ordinary_object(&mut machine);
-        let first = PropertyKey::Named(EcmaString::from_utf8("first"));
-        let next = PropertyKey::Named(EcmaString::from_utf8("next"));
+        let first = PropertyKey::Named(EcmaString::encode("first"));
+        let next = PropertyKey::Named(EcmaString::encode("next"));
         machine
             .define_descriptor(
                 source,
@@ -1366,7 +1366,7 @@ mod tests {
             _args: &[Value],
             _constructing: bool,
         ) -> Result<BuiltinOutcome, EvalFailure> {
-            machine.delete_property(this, &PropertyKey::Named(EcmaString::from_utf8("10")))?;
+            machine.delete_property(this, &PropertyKey::Named(EcmaString::encode("10")))?;
             Ok(BuiltinOutcome::Value(Value::int32(1)))
         }
 
@@ -1393,7 +1393,7 @@ mod tests {
         machine
             .define_descriptor(
                 source,
-                PropertyKey::Named(EcmaString::from_utf8("2")),
+                PropertyKey::Named(EcmaString::encode("2")),
                 Property::Accessor {
                     getter: Some(getter),
                     setter: None,
@@ -1403,7 +1403,7 @@ mod tests {
             )
             .unwrap();
         let target = ordinary_object(&mut machine);
-        let later = PropertyKey::Named(EcmaString::from_utf8("10"));
+        let later = PropertyKey::Named(EcmaString::encode("10"));
 
         call_object(&mut machine, "assign", &[target, source]).unwrap();
 
@@ -1442,7 +1442,7 @@ mod tests {
         let descriptors = ordinary_object(&mut machine);
         let private = machine
             .allocate(HeapEntry::PrivateName {
-                description: EcmaString::from_utf8("private"),
+                description: EcmaString::encode("private"),
             })
             .unwrap();
         let key = machine.to_property_key(private).unwrap();
@@ -1556,7 +1556,7 @@ mod tests {
         let symbol = symbol(&mut machine, "public");
         let private = machine
             .allocate(HeapEntry::PrivateName {
-                description: EcmaString::from_utf8("private"),
+                description: EcmaString::encode("private"),
             })
             .unwrap();
         machine
@@ -1601,7 +1601,7 @@ mod tests {
             vec![Value::int32(1), Value::HOLE, Value::HOLE]
         );
         let length = machine
-            .own_descriptor(array, &PropertyKey::Named(EcmaString::from_utf8("length")))
+            .own_descriptor(array, &PropertyKey::Named(EcmaString::encode("length")))
             .unwrap()
             .unwrap();
         assert!(matches!(
@@ -1628,7 +1628,7 @@ mod tests {
         machine
             .set_data_property(locked, "writable", Value::FALSE)
             .unwrap();
-        let length_key = allocate_string(&mut machine, EcmaString::from_utf8("length")).unwrap();
+        let length_key = allocate_string(&mut machine, EcmaString::encode("length")).unwrap();
         call_object(&mut machine, "defineProperty", &[array, length_key, locked]).unwrap();
         let same_length = ordinary_object(&mut machine);
         machine
@@ -1685,7 +1685,7 @@ mod tests {
         assert_eq!(machine.array_elements(array).unwrap().unwrap().len(), 4);
         assert!(matches!(
             machine
-                .own_descriptor(array, &PropertyKey::Named(EcmaString::from_utf8("3")))
+                .own_descriptor(array, &PropertyKey::Named(EcmaString::encode("3")))
                 .unwrap(),
             Some(Property::Accessor { .. })
         ));
@@ -1694,7 +1694,7 @@ mod tests {
         machine
             .set_data_property(lock, "writable", Value::FALSE)
             .unwrap();
-        let length_key = allocate_string(&mut machine, EcmaString::from_utf8("length")).unwrap();
+        let length_key = allocate_string(&mut machine, EcmaString::encode("length")).unwrap();
         call_object(&mut machine, "defineProperty", &[array, length_key, lock]).unwrap();
         let blocked_accessor = ordinary_object(&mut machine);
         machine
@@ -1774,7 +1774,7 @@ mod tests {
         machine
             .define_descriptor(
                 second,
-                PropertyKey::Named(EcmaString::from_utf8("get")),
+                PropertyKey::Named(EcmaString::encode("get")),
                 Property::Accessor {
                     getter: Some(throwing_getter),
                     setter: None,
@@ -1818,10 +1818,7 @@ mod tests {
 
         assert_eq!(
             machine.enumerable_keys(target).unwrap(),
-            vec![
-                EcmaString::from_utf8("first"),
-                EcmaString::from_utf8("second")
-            ]
+            vec![EcmaString::encode("first"), EcmaString::encode("second")]
         );
         assert_eq!(
             machine.get_named_property(target, "first").unwrap(),
@@ -1848,7 +1845,7 @@ mod tests {
             .set_data_property(prototype, "value", Value::int32(1))
             .unwrap();
         let descriptor = call_object(&mut machine, "create", &[prototype]).unwrap();
-        let length_key = allocate_string(&mut machine, EcmaString::from_utf8("length")).unwrap();
+        let length_key = allocate_string(&mut machine, EcmaString::encode("length")).unwrap();
 
         call_object(
             &mut machine,
@@ -1877,7 +1874,7 @@ mod tests {
         machine
             .define_descriptor(
                 descriptor,
-                PropertyKey::Named(EcmaString::from_utf8("value")),
+                PropertyKey::Named(EcmaString::encode("value")),
                 Property::Accessor {
                     getter: Some(pop),
                     setter: None,
@@ -1915,7 +1912,7 @@ mod tests {
         machine
             .set_data_property(data_descriptor, "writable", Value::FALSE)
             .unwrap();
-        let data_key = allocate_string(&mut machine, EcmaString::from_utf8("data")).unwrap();
+        let data_key = allocate_string(&mut machine, EcmaString::encode("data")).unwrap();
 
         call_object(
             &mut machine,
@@ -1926,7 +1923,7 @@ mod tests {
 
         assert!(matches!(
             machine
-                .own_descriptor(target, &PropertyKey::Named(EcmaString::from_utf8("data")))
+                .own_descriptor(target, &PropertyKey::Named(EcmaString::encode("data")))
                 .unwrap(),
             Some(Property::Data {
                 value,
@@ -1941,7 +1938,7 @@ mod tests {
         machine
             .define_descriptor(
                 target,
-                PropertyKey::Named(EcmaString::from_utf8("accessor")),
+                PropertyKey::Named(EcmaString::encode("accessor")),
                 Property::Accessor {
                     getter: Some(getter),
                     setter: Some(setter),
@@ -1954,8 +1951,7 @@ mod tests {
         machine
             .set_data_property(accessor_descriptor, "set", Value::UNDEFINED)
             .unwrap();
-        let accessor_key =
-            allocate_string(&mut machine, EcmaString::from_utf8("accessor")).unwrap();
+        let accessor_key = allocate_string(&mut machine, EcmaString::encode("accessor")).unwrap();
 
         call_object(
             &mut machine,
@@ -1966,7 +1962,7 @@ mod tests {
 
         assert!(matches!(
             machine
-                .own_descriptor(target, &PropertyKey::Named(EcmaString::from_utf8("accessor")))
+                .own_descriptor(target, &PropertyKey::Named(EcmaString::encode("accessor")))
                 .unwrap(),
             Some(Property::Accessor {
                 getter: Some(actual_getter),
@@ -1983,7 +1979,7 @@ mod tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let getter = machine.intrinsics.global("Object").unwrap();
-        let length_key = allocate_string(&mut machine, EcmaString::from_utf8("length")).unwrap();
+        let length_key = allocate_string(&mut machine, EcmaString::encode("length")).unwrap();
 
         let array = allocate_array(&mut machine, Vec::new()).unwrap();
         let configurable_index = ordinary_object(&mut machine);
@@ -2009,7 +2005,7 @@ mod tests {
         assert!(machine.array_elements(array).unwrap().unwrap().is_empty());
         assert!(
             machine
-                .own_descriptor(array, &PropertyKey::Named(EcmaString::from_utf8("3")))
+                .own_descriptor(array, &PropertyKey::Named(EcmaString::encode("3")))
                 .unwrap()
                 .is_none()
         );
@@ -2044,7 +2040,7 @@ mod tests {
         assert_eq!(machine.array_elements(blocked).unwrap().unwrap().len(), 4);
         assert!(matches!(
             machine
-                .own_descriptor(blocked, &PropertyKey::Named(EcmaString::from_utf8("3")))
+                .own_descriptor(blocked, &PropertyKey::Named(EcmaString::encode("3")))
                 .unwrap(),
             Some(Property::Accessor {
                 configurable: false,
@@ -2053,7 +2049,7 @@ mod tests {
         ));
         assert!(matches!(
             machine
-                .own_descriptor(blocked, &PropertyKey::Named(EcmaString::from_utf8("length")))
+                .own_descriptor(blocked, &PropertyKey::Named(EcmaString::encode("length")))
                 .unwrap(),
             Some(Property::Data {
                 value,
@@ -2140,7 +2136,7 @@ mod tests {
         );
         for primitive in [
             machine
-                .allocate(HeapEntry::String(EcmaString::from_utf8("not array-like")))
+                .allocate(HeapEntry::String(EcmaString::encode("not array-like")))
                 .unwrap(),
             Value::int32(1),
             Value::TRUE,
@@ -2166,7 +2162,7 @@ mod tests {
             machine.set_data_property(this, "reads", Value::int32(1))?;
             machine.define_descriptor(
                 this,
-                PropertyKey::Named(EcmaString::from_utf8("length")),
+                PropertyKey::Named(EcmaString::encode("length")),
                 Property::Data {
                     value: Value::int32(0),
                     writable: true,
@@ -2236,7 +2232,7 @@ mod tests {
             machine
                 .define_descriptor(
                     arguments,
-                    PropertyKey::Named(EcmaString::from_utf8(key)),
+                    PropertyKey::Named(EcmaString::encode(key)),
                     Property::Accessor {
                         getter: Some(getter),
                         setter: None,
@@ -2292,7 +2288,7 @@ mod tests {
         machine
             .define_descriptor(
                 arguments,
-                PropertyKey::Named(EcmaString::from_utf8("length")),
+                PropertyKey::Named(EcmaString::encode("length")),
                 Property::Accessor {
                     getter: Some(getter),
                     setter: None,
@@ -2366,17 +2362,14 @@ mod tests {
         );
         assert!(
             !machine
-                .has_own_property_key(
-                    bound,
-                    &PropertyKey::Named(EcmaString::from_utf8("prototype")),
-                )
+                .has_own_property_key(bound, &PropertyKey::Named(EcmaString::encode("prototype")),)
                 .unwrap()
         );
         assert_eq!(
             machine.own_property_keys(bound).unwrap(),
             vec![
-                PropertyKey::Named(EcmaString::from_utf8("length")),
-                PropertyKey::Named(EcmaString::from_utf8("name")),
+                PropertyKey::Named(EcmaString::encode("length")),
+                PropertyKey::Named(EcmaString::encode("name")),
             ]
         );
 
@@ -2404,7 +2397,7 @@ mod tests {
         let prototype = ordinary_object(&mut machine);
         let mut properties = PropertyMap::default();
         properties.insert(
-            PropertyKey::Named(EcmaString::from_utf8("prototype")),
+            PropertyKey::Named(EcmaString::encode("prototype")),
             Property::Data {
                 value: prototype,
                 writable: true,
@@ -2456,7 +2449,7 @@ mod tests {
             .unwrap();
         let mut properties = PropertyMap::default();
         properties.insert(
-            PropertyKey::Named(EcmaString::from_utf8("prototype")),
+            PropertyKey::Named(EcmaString::encode("prototype")),
             Property::Data {
                 value: custom_prototype,
                 writable: true,
@@ -2498,10 +2491,7 @@ mod tests {
         );
         assert!(
             !machine
-                .has_own_property_key(
-                    from_object,
-                    &PropertyKey::Named(EcmaString::from_utf8("own"))
-                )
+                .has_own_property_key(from_object, &PropertyKey::Named(EcmaString::encode("own")))
                 .unwrap()
         );
         assert_eq!(
@@ -2602,7 +2592,7 @@ mod tests {
         // Non-object constructor prototype still falls back for a valid object NewTarget.
         let mut bare_properties = PropertyMap::default();
         bare_properties.insert(
-            PropertyKey::Named(EcmaString::from_utf8("prototype")),
+            PropertyKey::Named(EcmaString::encode("prototype")),
             Property::Data {
                 value: Value::int32(1),
                 writable: true,
@@ -2690,7 +2680,7 @@ mod tests {
             .unwrap();
         let mut properties = PropertyMap::default();
         properties.insert(
-            PropertyKey::Named(EcmaString::from_utf8("prototype")),
+            PropertyKey::Named(EcmaString::encode("prototype")),
             Property::Data {
                 value: custom_prototype,
                 writable: true,
@@ -2828,7 +2818,7 @@ mod tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let target = probe(&mut machine, "probe", 2);
-        let call_key = PropertyKey::Named(EcmaString::from_utf8("call"));
+        let call_key = PropertyKey::Named(EcmaString::encode("call"));
 
         assert!(!machine.has_own_property_key(target, &call_key).unwrap());
         machine
@@ -3035,7 +3025,7 @@ mod tests {
 
     fn entry_pair(machine: &mut Machine<'_, TestHost>, key: &str, value: Value) -> Value {
         let entry = ordinary_object(machine);
-        let key_str = allocate_string(machine, EcmaString::from_utf8(key)).unwrap();
+        let key_str = allocate_string(machine, EcmaString::encode(key)).unwrap();
         machine.set_data_property(entry, "0", key_str).unwrap();
         machine.set_data_property(entry, "1", value).unwrap();
         entry
@@ -3105,9 +3095,9 @@ mod tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
 
-        let a_key = allocate_string(&mut machine, EcmaString::from_utf8("a")).unwrap();
+        let a_key = allocate_string(&mut machine, EcmaString::encode("a")).unwrap();
         let e1 = allocate_array(&mut machine, vec![a_key, Value::int32(1)]).unwrap();
-        let b_key = allocate_string(&mut machine, EcmaString::from_utf8("b")).unwrap();
+        let b_key = allocate_string(&mut machine, EcmaString::encode("b")).unwrap();
         let e2 = allocate_array(&mut machine, vec![b_key, Value::int32(2)]).unwrap();
         let source = allocate_array(&mut machine, vec![e1, e2]).unwrap();
 
@@ -3139,7 +3129,7 @@ mod tests {
         machine
             .set_data_property(descriptor, "enumerable", Value::FALSE)
             .unwrap();
-        let key = allocate_string(machine, EcmaString::from_utf8("x")).unwrap();
+        let key = allocate_string(machine, EcmaString::encode("x")).unwrap();
         call_object(machine, "defineProperty", &[target, key, descriptor]).unwrap();
         target
     }
@@ -3154,7 +3144,7 @@ mod tests {
         machine
             .set_data_property(change_value, "value", Value::int32(2))
             .unwrap();
-        let key = allocate_string(&mut machine, EcmaString::from_utf8("x")).unwrap();
+        let key = allocate_string(&mut machine, EcmaString::encode("x")).unwrap();
         let result = call_object(&mut machine, "defineProperty", &[target, key, change_value]);
         assert!(
             matches!(
@@ -3180,7 +3170,7 @@ mod tests {
         machine
             .set_data_property(make_configurable, "configurable", Value::TRUE)
             .unwrap();
-        let key = allocate_string(&mut machine, EcmaString::from_utf8("x")).unwrap();
+        let key = allocate_string(&mut machine, EcmaString::encode("x")).unwrap();
         let result = call_object(
             &mut machine,
             "defineProperty",
@@ -3206,7 +3196,7 @@ mod tests {
         machine
             .set_data_property(to_accessor, "get", getter)
             .unwrap();
-        let key = allocate_string(&mut machine, EcmaString::from_utf8("x")).unwrap();
+        let key = allocate_string(&mut machine, EcmaString::encode("x")).unwrap();
         let result = call_object(&mut machine, "defineProperty", &[target, key, to_accessor]);
         assert!(
             matches!(
@@ -3231,7 +3221,7 @@ mod tests {
         machine
             .set_data_property(change_value, "value", Value::int32(4))
             .unwrap();
-        let key = allocate_string(&mut machine, EcmaString::from_utf8("x")).unwrap();
+        let key = allocate_string(&mut machine, EcmaString::encode("x")).unwrap();
         let result = call_object(&mut machine, "defineProperty", &[target, key, change_value]);
         assert!(
             matches!(
@@ -3267,7 +3257,7 @@ mod tests {
         machine
             .set_data_property(no_op, "enumerable", Value::FALSE)
             .unwrap();
-        let key = allocate_string(&mut machine, EcmaString::from_utf8("x")).unwrap();
+        let key = allocate_string(&mut machine, EcmaString::encode("x")).unwrap();
         call_object(&mut machine, "defineProperty", &[target, key, no_op])
             .expect("no-op redefinition of non-configurable property must succeed");
         assert_eq!(
@@ -3286,7 +3276,7 @@ mod tests {
         machine
             .set_data_property(make_writable, "writable", Value::TRUE)
             .unwrap();
-        let key = allocate_string(&mut machine, EcmaString::from_utf8("x")).unwrap();
+        let key = allocate_string(&mut machine, EcmaString::encode("x")).unwrap();
         let result = call_object(
             &mut machine,
             "defineProperty",

@@ -693,7 +693,7 @@ mod tests {
         let module = |name: &str| ProgramModule {
             name: ConstantId::new(0),
             code: Module::new(
-                vec![Constant::String(EcmaString::from_utf8(name))],
+                vec![Constant::String(EcmaString::encode(name))],
                 vec![Function::new(
                     None,
                     0,

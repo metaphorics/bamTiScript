@@ -30,7 +30,7 @@ pub(super) fn install<H: Host>(
     let flags_get = install_function(heap, builtins, "get flags", 0, flags_getter::<H>);
     define_getter(heap, prototype, "flags", flags_get);
     builtins.set_regexp_prototype(prototype);
-    globals.insert(EcmaString::from_utf8("RegExp"), constructor);
+    globals.insert(EcmaString::encode("RegExp"), constructor);
 }
 
 fn constructor<H: Host>(
@@ -95,7 +95,7 @@ pub(super) fn compile<H: Host>(
 pub(crate) fn initial_regexp_properties() -> PropertyMap {
     let mut properties = PropertyMap::default();
     properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8("lastIndex")),
+        PropertyKey::Named(EcmaString::encode("lastIndex")),
         Property::Data {
             value: Value::int32(0),
             writable: true,
@@ -222,7 +222,7 @@ fn define_getter(heap: &mut [HeapEntry], object: Value, name: &str, getter: Valu
         panic!("accessor target must be an ordinary object");
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8(name)),
+        PropertyKey::Named(EcmaString::encode(name)),
         Property::Accessor {
             getter: Some(getter),
             setter: None,
@@ -337,10 +337,10 @@ mod tests {
     fn construct_regexp(machine: &mut Machine<'_, TestHost>, pattern: &str, flags: &str) -> Value {
         let constructor = machine.intrinsics.global("RegExp").expect("RegExp exists");
         let pattern = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8(pattern)))
+            .allocate(HeapEntry::String(EcmaString::encode(pattern)))
             .unwrap();
         let flags = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8(flags)))
+            .allocate(HeapEntry::String(EcmaString::encode(flags)))
             .unwrap();
         let index = machine.runtime_slot(constructor).unwrap().unwrap();
         let HeapEntry::NativeFunction {
@@ -369,7 +369,7 @@ mod tests {
             .set_data_property(regexp, "lastIndex", Value::int32(2))
             .unwrap();
 
-        let matched = execute(&mut machine, regexp, &EcmaString::from_utf8("😀x"))
+        let matched = execute(&mut machine, regexp, &EcmaString::encode("😀x"))
             .unwrap()
             .unwrap();
 
@@ -386,7 +386,7 @@ mod tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let regexp = construct_regexp(&mut machine, "x", "");
-        let input = EcmaString::from_utf8("😀x");
+        let input = EcmaString::encode("😀x");
         let matched = execute(&mut machine, regexp, &input).unwrap().unwrap();
 
         let result = match_array(&mut machine, &input, matched).unwrap();
@@ -408,7 +408,7 @@ mod tests {
             let source = machine.get_named_property(regexp, "source").unwrap();
             assert_eq!(
                 machine.to_string(source).unwrap(),
-                EcmaString::from_utf8(expected)
+                EcmaString::encode(expected)
             );
         }
     }
@@ -418,13 +418,13 @@ mod tests {
     /// `source` property), reads `.source`, and returns `source === expected`.
     fn literal_source_program(pattern: &str, flags: &str, expected: &str) -> Program<Verified> {
         let mut constants = vec![
-            Constant::String(EcmaString::from_utf8(pattern)),
-            Constant::String(EcmaString::from_utf8(flags)),
-            Constant::String(EcmaString::from_utf8("source")),
-            Constant::String(EcmaString::from_utf8(expected)),
+            Constant::String(EcmaString::encode(pattern)),
+            Constant::String(EcmaString::encode(flags)),
+            Constant::String(EcmaString::encode("source")),
+            Constant::String(EcmaString::encode(expected)),
         ];
         let name = ConstantId::new(constants.len() as u32);
-        constants.push(Constant::String(EcmaString::from_utf8("<test>")));
+        constants.push(Constant::String(EcmaString::encode("<test>")));
         let code = Module::new(
             constants,
             vec![Function::new(
@@ -504,7 +504,7 @@ mod tests {
             let source_value = machine.get_named_property(regexp, "source").unwrap();
             assert_eq!(
                 machine.to_string(source_value).unwrap(),
-                EcmaString::from_utf8(source)
+                EcmaString::encode(source)
             );
 
             let BuiltinOutcome::Value(string_value) =
@@ -514,7 +514,7 @@ mod tests {
             };
             assert_eq!(
                 machine.to_string(string_value).unwrap(),
-                EcmaString::from_utf8(string)
+                EcmaString::encode(string)
             );
         }
     }
@@ -552,7 +552,7 @@ mod tests {
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let regexp = machine
             .allocate(HeapEntry::RegExp {
-                pattern: EcmaString::from_utf8("/"),
+                pattern: EcmaString::encode("/"),
                 flags: EcmaString::default(),
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.regexp_prototype()),
@@ -562,7 +562,7 @@ mod tests {
         let source = machine.get_named_property(regexp, "source").unwrap();
         assert_eq!(
             machine.to_string(source).unwrap(),
-            EcmaString::from_utf8("\\/")
+            EcmaString::encode("\\/")
         );
     }
 
@@ -582,7 +582,7 @@ mod tests {
         // the same own properties as the constructor: `lastIndex` alone.
         let mut properties = PropertyMap::default();
         properties.insert(
-            PropertyKey::Named(EcmaString::from_utf8("lastIndex")),
+            PropertyKey::Named(EcmaString::encode("lastIndex")),
             Property::Data {
                 value: Value::int32(0),
                 writable: true,
@@ -592,8 +592,8 @@ mod tests {
         );
         let literal = machine
             .allocate(HeapEntry::RegExp {
-                pattern: EcmaString::from_utf8("x"),
-                flags: EcmaString::from_utf8("i"),
+                pattern: EcmaString::encode("x"),
+                flags: EcmaString::encode("i"),
                 properties,
                 prototype: Some(machine.intrinsics.regexp_prototype()),
                 extensible: true,
@@ -638,7 +638,7 @@ mod tests {
         };
         assert_eq!(
             machine.to_string(flags_value).unwrap(),
-            EcmaString::from_utf8("gim"),
+            EcmaString::encode("gim"),
             "flags_getter must return flags in canonical gimsuy order"
         );
 
@@ -651,7 +651,7 @@ mod tests {
         };
         assert_eq!(
             machine.to_string(all_value).unwrap(),
-            EcmaString::from_utf8("gimsuy"),
+            EcmaString::encode("gimsuy"),
             "flags_getter must return all flags in canonical gimsuy order"
         );
     }

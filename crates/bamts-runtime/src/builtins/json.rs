@@ -35,7 +35,7 @@ pub(super) fn install<H: Host>(
     let stringify = install_function(heap, builtins, "stringify", 3, stringify::<H>);
     define_data(heap, json, "parse", parse);
     define_data(heap, json, "stringify", stringify);
-    globals.insert(EcmaString::from_utf8("JSON"), json);
+    globals.insert(EcmaString::encode("JSON"), json);
 }
 
 fn parse<H: Host>(
@@ -94,7 +94,7 @@ fn walk_reviver<H: Host>(
             return Err(json_depth_error());
         }
         for index in 0..elements.len() {
-            let name = EcmaString::from_utf8(&index.to_string());
+            let name = EcmaString::encode(&index.to_string());
             let child = walk_reviver(machine, value, name.clone(), reviver, depth + 1)?;
             let key = PropertyKey::Named(name);
             if child == Value::UNDEFINED {
@@ -135,10 +135,10 @@ fn stringify<H: Host>(
     let space = args.get(2).copied().unwrap_or(Value::UNDEFINED);
     let gap = match space.decode() {
         Some(Decoded::Int32(number)) => {
-            EcmaString::from_utf8(&" ".repeat(((number as i32).max(0) as usize).min(10)))
+            EcmaString::encode(&" ".repeat(((number as i32).max(0) as usize).min(10)))
         }
         Some(Decoded::Number(number)) => {
-            EcmaString::from_utf8(&" ".repeat((number.max(0.0) as usize).min(10)))
+            EcmaString::encode(&" ".repeat((number.max(0.0) as usize).min(10)))
         }
         Some(Decoded::HeapRef(_)) => {
             let text = machine.to_string(machine.unbox_primitive_or_self(space)?)?;
@@ -227,20 +227,20 @@ fn serialize_property<H: Host>(
     }
     value = machine.unbox_primitive_or_self(value)?;
     match value.decode() {
-        Some(Decoded::Null) => Ok(Some(EcmaString::from_utf8("null"))),
-        Some(Decoded::Boolean(value)) => Ok(Some(EcmaString::from_utf8(if value {
+        Some(Decoded::Null) => Ok(Some(EcmaString::encode("null"))),
+        Some(Decoded::Boolean(value)) => Ok(Some(EcmaString::encode(if value {
             "true"
         } else {
             "false"
         }))),
-        Some(Decoded::Int32(value)) => Ok(Some(EcmaString::from_utf8(&(value as i32).to_string()))),
+        Some(Decoded::Int32(value)) => Ok(Some(EcmaString::encode(&(value as i32).to_string()))),
         Some(Decoded::Number(value)) => {
             let text = if value.is_finite() {
                 crate::format_number(value)
             } else {
                 "null".to_owned()
             };
-            Ok(Some(EcmaString::from_utf8(&text)))
+            Ok(Some(EcmaString::encode(&text)))
         }
         Some(Decoded::HeapRef(_)) => {
             if let Some(text) = machine.string_value(value) {
@@ -279,12 +279,12 @@ fn serialize_array<H: Host>(
             serialize_property(
                 machine,
                 array,
-                EcmaString::from_utf8(&index.to_string()),
+                EcmaString::encode(&index.to_string()),
                 options,
                 depth + 1,
                 stack,
             )?
-            .unwrap_or_else(|| EcmaString::from_utf8("null")),
+            .unwrap_or_else(|| EcmaString::encode("null")),
         );
     }
     Ok(compose(b'[', b']', partial, options.gap, depth))
@@ -793,7 +793,7 @@ mod tests {
             .expect("object allocation succeeds");
 
         for reviver in [Value::NULL, Value::FALSE, object] {
-            let source = allocate_string(&mut machine, EcmaString::from_utf8("1"))
+            let source = allocate_string(&mut machine, EcmaString::encode("1"))
                 .expect("string allocation succeeds");
             let value = machine
                 .call_value(parse, json, &[source, reviver])
@@ -807,12 +807,12 @@ mod tests {
         let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
-        let lone = call_json(&mut machine, "parse", EcmaString::from_utf8("\"\\uD83D\""));
+        let lone = call_json(&mut machine, "parse", EcmaString::encode("\"\\uD83D\""));
         assert_eq!(machine.string_value(lone).unwrap().as_units(), &[0xD83D]);
         let pair = call_json(
             &mut machine,
             "parse",
-            EcmaString::from_utf8("\"\\uD83D\\uDE03\""),
+            EcmaString::encode("\"\\uD83D\\uDE03\""),
         );
         assert_eq!(
             machine.string_value(pair).unwrap().as_units(),
@@ -829,7 +829,7 @@ mod tests {
         let parse = machine
             .get_named_property(json, "parse")
             .expect("JSON.parse exists");
-        let source = allocate_string(&mut machine, EcmaString::from_utf8("{]"))
+        let source = allocate_string(&mut machine, EcmaString::encode("{]"))
             .expect("string allocation succeeds");
         let error = machine
             .call_value(parse, json, &[source])
@@ -867,7 +867,7 @@ mod tests {
         let parse = machine
             .get_named_property(json, "parse")
             .expect("JSON.parse exists");
-        let source = allocate_string(&mut machine, EcmaString::from_utf8("\"x\""))
+        let source = allocate_string(&mut machine, EcmaString::encode("\"x\""))
             .expect("input consumes the final slot");
         assert!(matches!(
             machine.call_value(parse, json, &[source]),
@@ -883,7 +883,7 @@ mod tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let source = format!("{}0{}", "[".repeat(16), "]".repeat(16));
-        let value = call_json(&mut machine, "parse", EcmaString::from_utf8(&source));
+        let value = call_json(&mut machine, "parse", EcmaString::encode(&source));
         let json = machine.intrinsics.global("JSON").expect("JSON exists");
         let stringify = machine
             .get_named_property(json, "stringify")
@@ -913,7 +913,7 @@ mod tests {
         let parse = machine
             .get_named_property(json, "parse")
             .expect("JSON.parse exists");
-        let source = allocate_string(&mut machine, EcmaString::from_utf8(&source))
+        let source = allocate_string(&mut machine, EcmaString::encode(&source))
             .expect("string allocation succeeds");
         assert!(matches!(
             machine.call_value(parse, json, &[source]),

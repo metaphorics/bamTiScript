@@ -74,8 +74,8 @@ pub(crate) fn install<H: Host>(
         put(heap, process, name, function);
     }
 
-    globals.insert(EcmaString::from_utf8("console"), console);
-    globals.insert(EcmaString::from_utf8("process"), process);
+    globals.insert(EcmaString::encode("console"), console);
+    globals.insert(EcmaString::encode("process"), process);
 
     let global_this = object(heap, object_prototype);
     for (name, value) in globals.iter() {
@@ -90,17 +90,17 @@ pub(crate) fn install<H: Host>(
     define_global_data(
         heap,
         global_this,
-        EcmaString::from_utf8("globalThis"),
+        EcmaString::encode("globalThis"),
         global_this,
     );
     define_global_data(
         heap,
         global_this,
-        EcmaString::from_utf8("global"),
+        EcmaString::encode("global"),
         global_this,
     );
-    globals.insert(EcmaString::from_utf8("global"), global_this);
-    globals.insert(EcmaString::from_utf8("globalThis"), global_this);
+    globals.insert(EcmaString::encode("global"), global_this);
+    globals.insert(EcmaString::encode("globalThis"), global_this);
 }
 
 fn stream<H: Host>(
@@ -145,7 +145,7 @@ fn object(heap: &mut Vec<HeapEntry>, prototype: Value) -> Value {
 }
 
 fn put(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) {
-    put_ecma(heap, object, EcmaString::from_utf8(name), value);
+    put_ecma(heap, object, EcmaString::encode(name), value);
 }
 
 fn define_data(
@@ -182,7 +182,7 @@ fn define_global_data(heap: &mut [HeapEntry], object: Value, name: EcmaString, v
 }
 
 fn put_text(heap: &mut Vec<HeapEntry>, object: Value, name: &str, text: &str) {
-    let value = intrinsics::push(heap, HeapEntry::String(EcmaString::from_utf8(text)));
+    let value = intrinsics::push(heap, HeapEntry::String(EcmaString::encode(text)));
     put(heap, object, name, value);
 }
 
@@ -251,7 +251,7 @@ fn console_write<H: Host>(
         line.push_str(&machine.console_format(value, true, 0)?);
     }
     line.push('\n');
-    let line = EcmaString::from_utf8(&line);
+    let line = EcmaString::encode(&line);
     if stderr {
         machine.host.write_stderr(&text_bytes_lossy(&line));
     } else {

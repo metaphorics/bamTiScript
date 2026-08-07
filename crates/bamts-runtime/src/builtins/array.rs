@@ -21,7 +21,7 @@ pub(super) fn install<H: Host>(
     let prototype = builtins.array_prototype();
     let constructor = install_function(heap, builtins, "Array", 1, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
-    globals.insert(EcmaString::from_utf8("Array"), constructor);
+    globals.insert(EcmaString::encode("Array"), constructor);
     for (name, length, handler) in [
         ("isArray", 1, is_array::<H> as BuiltinHandler<H>),
         ("from", 1, from::<H>),
@@ -100,7 +100,7 @@ pub(super) fn install<H: Host>(
             "values",
         ] {
             properties.insert(
-                PropertyKey::Named(EcmaString::from_utf8(name)),
+                PropertyKey::Named(EcmaString::encode(name)),
                 Property::Data {
                     value: Value::TRUE,
                     writable: true,
@@ -134,7 +134,7 @@ fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: 
         panic!("Array constructor must be native")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8(name)),
+        PropertyKey::Named(EcmaString::encode(name)),
         super::builtin_property(value),
     );
 }
@@ -383,7 +383,7 @@ fn join<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let values = elements(machine, this)?;
     let separator = if args.is_empty() || args[0] == Value::UNDEFINED {
-        EcmaString::from_utf8(",")
+        EcmaString::encode(",")
     } else {
         machine.to_string(args[0])?
     };
@@ -1067,7 +1067,7 @@ mod tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
 
-        let text = allocate_string(&mut machine, EcmaString::from_utf8("abc")).unwrap();
+        let text = allocate_string(&mut machine, EcmaString::encode("abc")).unwrap();
         let result = call_array(&mut machine, "from", &[text]).unwrap();
         let elements = machine.array_elements(result).unwrap().unwrap();
         assert_eq!(elements.len(), 3);
@@ -1160,7 +1160,7 @@ mod tests {
                 .get_named_property(unscopables, name)
                 .unwrap_or_else(|_| panic!("{name} must be present on unscopables"));
             assert_eq!(entry, Value::TRUE, "{name} must be true");
-            let entry_key = PropertyKey::Named(EcmaString::from_utf8(name));
+            let entry_key = PropertyKey::Named(EcmaString::encode(name));
             let entry_descriptor = machine
                 .own_descriptor(unscopables, &entry_key)
                 .expect("entry descriptor lookup succeeds")
@@ -1180,7 +1180,7 @@ mod tests {
         }
         let expected: Vec<_> = names
             .into_iter()
-            .map(EcmaString::from_utf8)
+            .map(EcmaString::encode)
             .map(PropertyKey::Named)
             .collect();
         assert_eq!(

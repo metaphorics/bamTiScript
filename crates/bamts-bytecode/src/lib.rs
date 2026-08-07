@@ -3549,19 +3549,19 @@ mod tests {
     /// * handler over [0,34) catches into r25
     fn rich_module() -> Module<Unverified> {
         let constants = vec![
-            Constant::String(EcmaString::from_utf8("main")), // 0: function name + key string
+            Constant::String(EcmaString::encode("main")), // 0: function name + key string
             Constant::Int32(21),                             // 1
             Constant::Number(NumberBits::from_f64(1.5)),     // 2
             Constant::BigInt(BigIntLiteral::new("-1234567890123".to_owned()).unwrap()), // 3
             Constant::Boolean(true),                         // 4
             Constant::Null,                                  // 5
             Constant::Undefined,                             // 6
-            Constant::String(EcmaString::from_utf8("./dep")), // 7: import specifier
-            Constant::String(EcmaString::from_utf8("g")),    // 8: global name
-            Constant::String(EcmaString::from_utf8("#p")),   // 9: private description
-            Constant::String(EcmaString::from_utf8("ab")),   // 10: regexp pattern
-            Constant::String(EcmaString::from_utf8("gi")),   // 11: regexp flags
-            Constant::String(EcmaString::from_utf8("x")),    // 12: export name
+            Constant::String(EcmaString::encode("./dep")), // 7: import specifier
+            Constant::String(EcmaString::encode("g")),    // 8: global name
+            Constant::String(EcmaString::encode("#p")),   // 9: private description
+            Constant::String(EcmaString::encode("ab")),   // 10: regexp pattern
+            Constant::String(EcmaString::encode("gi")),   // 11: regexp flags
+            Constant::String(EcmaString::encode("x")),    // 12: export name
         ];
         let code = vec![
             Instruction::LoadConst {

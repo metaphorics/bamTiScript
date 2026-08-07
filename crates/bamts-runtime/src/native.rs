@@ -3273,10 +3273,8 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                         .borrow_mut()
                         .load_global(module, ConstantId::new(name));
                     let text = match resolved {
-                        Ok(Some(value)) => {
-                            EcmaString::from_utf8(self.machine.borrow().type_of(value))
-                        }
-                        Ok(None) => EcmaString::from_utf8("undefined"),
+                        Ok(Some(value)) => EcmaString::encode(self.machine.borrow().type_of(value)),
+                        Ok(None) => EcmaString::encode("undefined"),
                         Err(failure) => break 'result self.fail(failure),
                     };
                     self.allocated(HeapEntry::String(text))
@@ -3651,7 +3649,7 @@ mod tests {
         bindings: Vec<Binding>,
         exports: Vec<Export>,
     ) -> ProgramModule<Verified> {
-        constants.insert(0, Constant::String(EcmaString::from_utf8(name)));
+        constants.insert(0, Constant::String(EcmaString::encode(name)));
         ProgramModule {
             name: cid(0),
             code: Module::new(constants, functions, FunctionId::new(0))
@@ -3670,7 +3668,7 @@ mod tests {
     fn dynamic_cycle_program() -> Program<Verified> {
         let root = program_module(
             "root",
-            vec![Constant::String(EcmaString::from_utf8("./target"))],
+            vec![Constant::String(EcmaString::encode("./target"))],
             vec![entry_function(
                 3,
                 vec![
@@ -3701,7 +3699,7 @@ mod tests {
         );
         let target = program_module(
             "target",
-            vec![Constant::String(EcmaString::from_utf8("./root"))],
+            vec![Constant::String(EcmaString::encode("./root"))],
             vec![entry_function(1, vec![Instruction::Halt])],
             vec![Edge {
                 specifier: cid(1),
@@ -3773,8 +3771,8 @@ mod tests {
                 vec![
                     Constant::Int32(11),
                     Constant::Int32(22),
-                    Constant::String(EcmaString::from_utf8("error")),
-                    Constant::String(EcmaString::from_utf8("suppressed")),
+                    Constant::String(EcmaString::encode("error")),
+                    Constant::String(EcmaString::encode("suppressed")),
                 ],
                 vec![entry_function(
                     7,
@@ -3841,9 +3839,9 @@ mod tests {
                 vec![program_module(
                     "root",
                     vec![
-                        Constant::String(EcmaString::from_utf8("Symbol")),
-                        Constant::String(EcmaString::from_utf8(property)),
-                        Constant::String(EcmaString::from_utf8("Array")),
+                        Constant::String(EcmaString::encode("Symbol")),
+                        Constant::String(EcmaString::encode(property)),
+                        Constant::String(EcmaString::encode("Array")),
                     ],
                     vec![entry_function(
                         7,
@@ -3998,8 +3996,8 @@ mod tests {
             vec![program_module(
                 "root",
                 vec![
-                    Constant::String(EcmaString::from_utf8("queueMicrotask")),
-                    Constant::String(EcmaString::from_utf8("observed")),
+                    Constant::String(EcmaString::encode("queueMicrotask")),
+                    Constant::String(EcmaString::encode("observed")),
                     Constant::Int32(7),
                     Constant::Undefined,
                 ],
@@ -4057,7 +4055,7 @@ mod tests {
             )],
             0,
         );
-        let observed = EcmaString::from_utf8("observed");
+        let observed = EcmaString::encode("observed");
 
         let mut interpreter_host = SilentHost;
         let mut interpreter = Machine::new(&program, &mut interpreter_host, Limits::default());
@@ -4102,11 +4100,11 @@ mod tests {
             vec![program_module(
                 "root",
                 vec![
-                    Constant::String(EcmaString::from_utf8("console")),
-                    Constant::String(EcmaString::from_utf8("log")),
-                    Constant::String(EcmaString::from_utf8("sync")),
-                    Constant::String(EcmaString::from_utf8("async")),
-                    Constant::String(EcmaString::from_utf8("queueMicrotask")),
+                    Constant::String(EcmaString::encode("console")),
+                    Constant::String(EcmaString::encode("log")),
+                    Constant::String(EcmaString::encode("sync")),
+                    Constant::String(EcmaString::encode("async")),
+                    Constant::String(EcmaString::encode("queueMicrotask")),
                     Constant::Int32(42),
                     Constant::Undefined,
                 ],
@@ -4384,7 +4382,7 @@ mod tests {
             vec![program_module(
                 "root",
                 vec![
-                    Constant::String(EcmaString::from_utf8("observed")),
+                    Constant::String(EcmaString::encode("observed")),
                     Constant::Int32(7),
                     Constant::Undefined,
                 ],
@@ -4438,7 +4436,7 @@ mod tests {
             )],
             0,
         );
-        let observed = EcmaString::from_utf8("observed");
+        let observed = EcmaString::encode("observed");
 
         let mut interpreter_host = SilentHost;
         let mut interpreter = Machine::new(&program, &mut interpreter_host, Limits::default());
@@ -4722,7 +4720,7 @@ mod tests {
             program_module(
                 name,
                 vec![
-                    Constant::String(EcmaString::from_utf8("x")),
+                    Constant::String(EcmaString::encode("x")),
                     Constant::Int32(value),
                 ],
                 vec![module_function(
@@ -4754,11 +4752,11 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String(EcmaString::from_utf8("left")),
-                Constant::String(EcmaString::from_utf8("right")),
-                Constant::String(EcmaString::from_utf8("x")),
-                Constant::String(EcmaString::from_utf8("one")),
-                Constant::String(EcmaString::from_utf8("two")),
+                Constant::String(EcmaString::encode("left")),
+                Constant::String(EcmaString::encode("right")),
+                Constant::String(EcmaString::encode("x")),
+                Constant::String(EcmaString::encode("one")),
+                Constant::String(EcmaString::encode("two")),
             ],
             vec![module_function(
                 0,
@@ -4824,10 +4822,10 @@ mod tests {
         let dependency = program_module(
             "dependency",
             vec![
-                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::encode("x")),
                 Constant::Int32(1),
                 Constant::Int32(2),
-                Constant::String(EcmaString::from_utf8("set")),
+                Constant::String(EcmaString::encode("set")),
             ],
             vec![
                 module_function(
@@ -4896,9 +4894,9 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String(EcmaString::from_utf8("set")),
-                Constant::String(EcmaString::from_utf8("x")),
-                Constant::String(EcmaString::from_utf8("dependency")),
+                Constant::String(EcmaString::encode("set")),
+                Constant::String(EcmaString::encode("x")),
+                Constant::String(EcmaString::encode("dependency")),
             ],
             vec![module_function(
                 0,
@@ -4958,9 +4956,9 @@ mod tests {
         let first = program_module(
             "first",
             vec![
-                Constant::String(EcmaString::from_utf8("a")),
+                Constant::String(EcmaString::encode("a")),
                 Constant::Int32(1),
-                Constant::String(EcmaString::from_utf8("second")),
+                Constant::String(EcmaString::encode("second")),
             ],
             vec![module_function(
                 0,
@@ -4994,8 +4992,8 @@ mod tests {
         let second = program_module(
             "second",
             vec![
-                Constant::String(EcmaString::from_utf8("a")),
-                Constant::String(EcmaString::from_utf8("first")),
+                Constant::String(EcmaString::encode("a")),
+                Constant::String(EcmaString::encode("first")),
             ],
             vec![module_function(
                 0,
@@ -5035,7 +5033,7 @@ mod tests {
         let dependency = program_module(
             "dependency",
             vec![
-                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::encode("x")),
                 Constant::Int32(7),
             ],
             vec![module_function(
@@ -5066,9 +5064,9 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String(EcmaString::from_utf8("ns")),
-                Constant::String(EcmaString::from_utf8("x")),
-                Constant::String(EcmaString::from_utf8("dependency")),
+                Constant::String(EcmaString::encode("ns")),
+                Constant::String(EcmaString::encode("x")),
+                Constant::String(EcmaString::encode("dependency")),
             ],
             vec![module_function(
                 0,
@@ -5116,7 +5114,7 @@ mod tests {
         let dependency = program_module(
             "dependency",
             vec![
-                Constant::String(EcmaString::from_utf8("count")),
+                Constant::String(EcmaString::encode("count")),
                 Constant::Int32(0),
                 Constant::Int32(1),
             ],
@@ -5171,9 +5169,9 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String(EcmaString::from_utf8("count")),
-                Constant::String(EcmaString::from_utf8("dependency")),
-                Constant::String(EcmaString::from_utf8("dependency-again")),
+                Constant::String(EcmaString::encode("count")),
+                Constant::String(EcmaString::encode("dependency")),
+                Constant::String(EcmaString::encode("dependency-again")),
             ],
             vec![module_function(
                 0,
@@ -5427,7 +5425,7 @@ mod tests {
     fn native_matches_interpreter_on_object_property_roundtrip() {
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::encode("x")),
                 Constant::Int32(5),
             ],
             vec![entry_function(
@@ -5542,7 +5540,7 @@ mod tests {
     fn one_module_program(module: &Module<Verified>) -> Program<Verified> {
         let mut constants = module.constants().to_vec();
         let name = ConstantId::new(constants.len() as u32);
-        constants.push(Constant::String(EcmaString::from_utf8("test-module")));
+        constants.push(Constant::String(EcmaString::encode("test-module")));
         let code = Module::new(constants, module.functions().to_vec(), module.entry())
             .verify()
             .expect("test module remains verified");
@@ -5593,7 +5591,7 @@ mod tests {
 
     fn trivial_program() -> Program<Verified> {
         let code = verified(
-            vec![Constant::String(EcmaString::from_utf8("<test>"))],
+            vec![Constant::String(EcmaString::encode("<test>"))],
             vec![entry_function(1, vec![Instruction::Halt])],
         );
         Program::link(
@@ -5690,7 +5688,7 @@ mod tests {
         let first = single.modules()[0].clone();
         let second = program_module(
             "entry",
-            vec![Constant::String(EcmaString::from_utf8("dependency"))],
+            vec![Constant::String(EcmaString::encode("dependency"))],
             vec![entry_function(1, vec![Instruction::Halt])],
             vec![Edge {
                 specifier: cid(1),
@@ -5715,7 +5713,7 @@ mod tests {
         let module = program_module(
             "root",
             vec![
-                Constant::String(EcmaString::from_utf8("after")),
+                Constant::String(EcmaString::encode("after")),
                 Constant::Int32(7),
             ],
             vec![entry_function(
@@ -5763,7 +5761,7 @@ mod tests {
                 .machine
                 .borrow()
                 .globals
-                .get(&EcmaString::from_utf8("after")),
+                .get(&EcmaString::encode("after")),
             Some(&Value::int32(7)),
         );
     }
@@ -5773,7 +5771,7 @@ mod tests {
         let dependency = program_module(
             "dependency",
             vec![
-                Constant::String(EcmaString::from_utf8("after")),
+                Constant::String(EcmaString::encode("after")),
                 Constant::Undefined,
                 Constant::Int32(7),
             ],
@@ -5807,8 +5805,8 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String(EcmaString::from_utf8("after")),
-                Constant::String(EcmaString::from_utf8("dependency")),
+                Constant::String(EcmaString::encode("after")),
+                Constant::String(EcmaString::encode("dependency")),
             ],
             vec![entry_function(
                 1,
@@ -5861,7 +5859,7 @@ mod tests {
                 .machine
                 .borrow()
                 .globals
-                .get(&EcmaString::from_utf8("after")),
+                .get(&EcmaString::encode("after")),
             Some(&Value::int32(7)),
         );
     }
@@ -5924,9 +5922,9 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String(EcmaString::from_utf8("rejecting")),
-                Constant::String(EcmaString::from_utf8("pending")),
-                Constant::String(EcmaString::from_utf8("root-ran")),
+                Constant::String(EcmaString::encode("rejecting")),
+                Constant::String(EcmaString::encode("pending")),
+                Constant::String(EcmaString::encode("root-ran")),
                 Constant::Int32(1),
             ],
             vec![entry_function(
@@ -5975,7 +5973,7 @@ mod tests {
         assert!(
             !machine
                 .globals
-                .contains_key(&EcmaString::from_utf8("root-ran")),
+                .contains_key(&EcmaString::encode("root-ran")),
             "the root body must not run after a dependency rejects"
         );
 
@@ -6025,7 +6023,7 @@ mod tests {
                 .machine
                 .borrow()
                 .globals
-                .contains_key(&EcmaString::from_utf8("root-ran")),
+                .contains_key(&EcmaString::encode("root-ran")),
             "the linked root body must not run after a dependency rejects"
         );
     }
@@ -6041,7 +6039,7 @@ mod tests {
     fn dynamic_import_throw_is_caught_at_the_requester_in_both_backends() {
         let root = program_module(
             "root",
-            vec![Constant::String(EcmaString::from_utf8("./target"))],
+            vec![Constant::String(EcmaString::encode("./target"))],
             vec![Function::new(
                 None,
                 0,
@@ -6151,11 +6149,11 @@ mod tests {
     fn native_functions_call_and_construct_with_engine_parity() {
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("Object")),
-                Constant::String(EcmaString::from_utf8("prototype")),
-                Constant::String(EcmaString::from_utf8("toString")),
-                Constant::String(EcmaString::from_utf8("call")),
-                Constant::String(EcmaString::from_utf8("[object Object]")),
+                Constant::String(EcmaString::encode("Object")),
+                Constant::String(EcmaString::encode("prototype")),
+                Constant::String(EcmaString::encode("toString")),
+                Constant::String(EcmaString::encode("call")),
+                Constant::String(EcmaString::encode("[object Object]")),
                 Constant::Undefined,
             ],
             vec![entry_function(
@@ -6264,10 +6262,10 @@ mod tests {
     fn bound_calls_match_between_engines() {
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("bind")),
-                Constant::String(EcmaString::from_utf8("marker")),
-                Constant::String(EcmaString::from_utf8("0")),
-                Constant::String(EcmaString::from_utf8("1")),
+                Constant::String(EcmaString::encode("bind")),
+                Constant::String(EcmaString::encode("marker")),
+                Constant::String(EcmaString::encode("0")),
+                Constant::String(EcmaString::encode("1")),
                 Constant::Int32(7),
                 Constant::Int32(1),
                 Constant::Int32(2),
@@ -6356,14 +6354,14 @@ mod tests {
     fn applied_calls_match_between_engines() {
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("apply")),
-                Constant::String(EcmaString::from_utf8("marker")),
-                Constant::String(EcmaString::from_utf8("0")),
-                Constant::String(EcmaString::from_utf8("1")),
+                Constant::String(EcmaString::encode("apply")),
+                Constant::String(EcmaString::encode("marker")),
+                Constant::String(EcmaString::encode("0")),
+                Constant::String(EcmaString::encode("1")),
                 Constant::Int32(7),
                 Constant::Int32(1),
                 Constant::Int32(2),
-                Constant::String(EcmaString::from_utf8("length")),
+                Constant::String(EcmaString::encode("length")),
                 Constant::Undefined,
             ],
             vec![
@@ -6501,11 +6499,11 @@ mod tests {
     fn bound_construction_matches_between_engines() {
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("bind")),
-                Constant::String(EcmaString::from_utf8("prototype")),
-                Constant::String(EcmaString::from_utf8("sum")),
-                Constant::String(EcmaString::from_utf8("0")),
-                Constant::String(EcmaString::from_utf8("1")),
+                Constant::String(EcmaString::encode("bind")),
+                Constant::String(EcmaString::encode("prototype")),
+                Constant::String(EcmaString::encode("sum")),
+                Constant::String(EcmaString::encode("0")),
+                Constant::String(EcmaString::encode("1")),
                 Constant::Int32(4),
                 Constant::Int32(5),
                 Constant::Int32(9),
@@ -6781,7 +6779,7 @@ mod tests {
     fn construct_with_new_target_preserves_explicit_target_through_bound_callee() {
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("bind")),
+                Constant::String(EcmaString::encode("bind")),
                 Constant::Undefined,
             ],
             vec![
@@ -6874,7 +6872,7 @@ mod tests {
         //   Construct(B2)                   -> Base
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("bind")),
+                Constant::String(EcmaString::encode("bind")),
                 Constant::Undefined,
             ],
             vec![
@@ -7061,12 +7059,12 @@ mod tests {
         // and allocates under customNewTarget.prototype in both engines.
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("Object")),
-                Constant::String(EcmaString::from_utf8("prototype")),
-                Constant::String(EcmaString::from_utf8("marker")),
+                Constant::String(EcmaString::encode("Object")),
+                Constant::String(EcmaString::encode("prototype")),
+                Constant::String(EcmaString::encode("marker")),
                 Constant::Int32(42),
                 Constant::Int32(7),
-                Constant::String(EcmaString::from_utf8("own")),
+                Constant::String(EcmaString::encode("own")),
             ],
             vec![
                 entry_function(
@@ -7937,7 +7935,7 @@ mod tests {
         let resumed_value = engine
             .machine
             .borrow_mut()
-            .allocate(HeapEntry::String(EcmaString::from_utf8("resume")))
+            .allocate(HeapEntry::String(EcmaString::encode("resume")))
             .unwrap();
         engine.activations.borrow_mut().push(Activation {
             this_value: Value::UNDEFINED,
@@ -8116,7 +8114,7 @@ mod tests {
             ]
             .map(|text| {
                 machine
-                    .allocate(HeapEntry::String(EcmaString::from_utf8(text)))
+                    .allocate(HeapEntry::String(EcmaString::encode(text)))
                     .unwrap()
             })
         };
@@ -8168,7 +8166,7 @@ mod tests {
     impl Host for ImportMetaHost {
         fn import_meta_url(&mut self, module_name: &EcmaString) -> EcmaString {
             self.seen.push(module_name.clone());
-            EcmaString::from_utf8("host://modules/entry.mjs")
+            EcmaString::encode("host://modules/entry.mjs")
         }
     }
 
@@ -8178,8 +8176,8 @@ mod tests {
             vec![program_module(
                 "entry",
                 vec![
-                    Constant::String(EcmaString::from_utf8("url")),
-                    Constant::String(EcmaString::from_utf8("host://modules/entry.mjs")),
+                    Constant::String(EcmaString::encode("url")),
+                    Constant::String(EcmaString::encode("host://modules/entry.mjs")),
                 ],
                 vec![entry_function(
                     7,
@@ -8234,8 +8232,8 @@ mod tests {
         assert_eq!(native.entry_registers[0], native.entry_registers[1]);
         assert_eq!(native.entry_registers[2], Value::TRUE);
         assert_eq!(native.value, Value::TRUE);
-        assert_eq!(interpreter_host.seen, vec![EcmaString::from_utf8("entry")]);
-        assert_eq!(native_host.seen, vec![EcmaString::from_utf8("entry")]);
+        assert_eq!(interpreter_host.seen, vec![EcmaString::encode("entry")]);
+        assert_eq!(native_host.seen, vec![EcmaString::encode("entry")]);
     }
 
     #[test]
@@ -8302,7 +8300,7 @@ mod tests {
     fn import_dynamic_instruction_matches_interpreter_and_native_engine() {
         let root = program_module(
             "root",
-            vec![Constant::String(EcmaString::from_utf8("./target"))],
+            vec![Constant::String(EcmaString::encode("./target"))],
             vec![entry_function(
                 2,
                 vec![
@@ -8470,8 +8468,8 @@ mod tests {
         verified(
             vec![
                 Constant::Int32(7),
-                Constant::String(EcmaString::from_utf8("ReferenceError")),
-                Constant::String(EcmaString::from_utf8("missing_global")),
+                Constant::String(EcmaString::encode("ReferenceError")),
+                Constant::String(EcmaString::encode("missing_global")),
             ],
             vec![Function::new(
                 None,
@@ -8670,7 +8668,7 @@ mod tests {
     /// Entry loads a missing global with no covering handler.
     fn uncaught_missing_global_module() -> Module<Verified> {
         verified(
-            vec![Constant::String(EcmaString::from_utf8("missing_global"))],
+            vec![Constant::String(EcmaString::encode("missing_global"))],
             vec![entry_function(
                 1,
                 vec![
@@ -8765,7 +8763,7 @@ mod tests {
     fn caught_missing_global_sentinel_module() -> Module<Verified> {
         verified(
             vec![
-                Constant::String(EcmaString::from_utf8("missing_global")),
+                Constant::String(EcmaString::encode("missing_global")),
                 Constant::Int32(99),
             ],
             vec![Function::new(
@@ -8878,7 +8876,7 @@ mod tests {
     /// materialization failure originates in the nested activation.
     fn nested_caught_missing_global_module() -> Module<Verified> {
         verified(
-            vec![Constant::String(EcmaString::from_utf8("missing_global"))],
+            vec![Constant::String(EcmaString::encode("missing_global"))],
             vec![
                 Function::new(
                     None,
@@ -9101,7 +9099,7 @@ mod tests {
         let key = engine
             .machine
             .borrow_mut()
-            .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+            .allocate(HeapEntry::String(EcmaString::encode("x")))
             .unwrap();
         let mut registers = vec![Value::UNINITIALIZED];
         engine.activations.borrow_mut().push(Activation {
@@ -9182,12 +9180,12 @@ mod tests {
         let key_x = engine
             .machine
             .borrow_mut()
-            .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+            .allocate(HeapEntry::String(EcmaString::encode("x")))
             .unwrap();
         let key_missing = engine
             .machine
             .borrow_mut()
-            .allocate(HeapEntry::String(EcmaString::from_utf8("missing")))
+            .allocate(HeapEntry::String(EcmaString::encode("missing")))
             .unwrap();
         let mut registers = vec![Value::UNINITIALIZED; 2];
         engine.activations.borrow_mut().push(Activation {
@@ -9286,7 +9284,7 @@ mod tests {
         let primitive = engine
             .machine
             .borrow_mut()
-            .allocate(HeapEntry::String(EcmaString::from_utf8("not-object")))
+            .allocate(HeapEntry::String(EcmaString::encode("not-object")))
             .unwrap();
         assert_eq!(
             engine
@@ -9319,8 +9317,8 @@ mod tests {
     fn with_has_binding_propagates_unscopables_getter_throw() {
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("<test>")),
-                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::encode("<test>")),
+                Constant::String(EcmaString::encode("x")),
                 Constant::Int32(1),
             ],
             vec![
@@ -9350,7 +9348,7 @@ mod tests {
         let key_x = engine
             .machine
             .borrow_mut()
-            .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+            .allocate(HeapEntry::String(EcmaString::encode("x")))
             .unwrap();
         let mut registers = vec![Value::UNINITIALIZED; 2];
         engine.activations.borrow_mut().push(Activation {
@@ -9463,10 +9461,10 @@ mod tests {
     fn load_own_descriptor_slot_parity_covers_absent_data_accessor_and_mismatch() {
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("data")),
+                Constant::String(EcmaString::encode("data")),
                 Constant::Int32(7),
-                Constant::String(EcmaString::from_utf8("accessor")),
-                Constant::String(EcmaString::from_utf8("missing")),
+                Constant::String(EcmaString::encode("accessor")),
+                Constant::String(EcmaString::encode("missing")),
             ],
             vec![entry_function(
                 10,
@@ -9567,12 +9565,12 @@ mod tests {
     fn define_own_descriptor_slot_parity_creates_absent_preserves_and_rejects_mismatch() {
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("created")),
+                Constant::String(EcmaString::encode("created")),
                 Constant::Int32(9),
-                Constant::String(EcmaString::from_utf8("data")),
+                Constant::String(EcmaString::encode("data")),
                 Constant::Int32(1),
                 Constant::Int32(8),
-                Constant::String(EcmaString::from_utf8("accessor")),
+                Constant::String(EcmaString::encode("accessor")),
             ],
             vec![entry_function(
                 8,
@@ -9638,9 +9636,9 @@ mod tests {
             )],
         );
         let program = one_module_program(&module);
-        let created = PropertyKey::Named(EcmaString::from_utf8("created"));
-        let data = PropertyKey::Named(EcmaString::from_utf8("data"));
-        let accessor = PropertyKey::Named(EcmaString::from_utf8("accessor"));
+        let created = PropertyKey::Named(EcmaString::encode("created"));
+        let data = PropertyKey::Named(EcmaString::encode("data"));
+        let accessor = PropertyKey::Named(EcmaString::encode("accessor"));
 
         let mut interpreter_host = SilentHost;
         let mut interpreter = Machine::new(&program, &mut interpreter_host, Limits::default());
@@ -9708,7 +9706,7 @@ mod tests {
 
         let mismatch = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("data")),
+                Constant::String(EcmaString::encode("data")),
                 Constant::Int32(1),
                 Constant::Int32(2),
             ],
@@ -9825,7 +9823,7 @@ mod tests {
             let accessor_key = engine
                 .machine
                 .borrow_mut()
-                .allocate(HeapEntry::String(EcmaString::from_utf8("acc")))
+                .allocate(HeapEntry::String(EcmaString::encode("acc")))
                 .unwrap();
             let installed = engine.dispatch(
                 &mut frame,

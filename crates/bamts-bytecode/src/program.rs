@@ -1598,11 +1598,11 @@ mod tests {
     use crate::{Function, FunctionFlags, FunctionId, Register};
 
     fn verified_module(name: &str, extra: &[&str]) -> Module<Verified> {
-        let mut constants = vec![Constant::String(EcmaString::from_utf8(name))];
+        let mut constants = vec![Constant::String(EcmaString::encode(name))];
         constants.extend(
             extra
                 .iter()
-                .map(|value| Constant::String(EcmaString::from_utf8(value))),
+                .map(|value| Constant::String(EcmaString::encode(value))),
         );
         Module::new(
             constants,
@@ -1714,7 +1714,7 @@ mod tests {
         let decoded = decode_verified_program(&encoded, &ProgramDecodeLimits::default()).unwrap();
         assert_eq!(decoded.encode(), encoded);
         assert_eq!(
-            decoded.resolve_export(ModuleId::new(0), &EcmaString::from_utf8("x")),
+            decoded.resolve_export(ModuleId::new(0), &EcmaString::encode("x")),
             Some(ResolvedExport::Local {
                 module: ModuleId::new(0),
                 binding: BindingId::new(0),
@@ -2194,7 +2194,7 @@ mod tests {
     fn every_metadata_string_reference_checks_bounds_and_kind() {
         let code = Module::new(
             vec![
-                Constant::String(EcmaString::from_utf8("main")),
+                Constant::String(EcmaString::encode("main")),
                 Constant::Int32(7),
             ],
             vec![Function::new(
@@ -2416,7 +2416,7 @@ mod tests {
         };
         let program = Program::link(vec![module], ModuleId::new(0)).unwrap();
         assert_eq!(
-            program.resolve_export(ModuleId::new(0), &EcmaString::from_utf8("x")),
+            program.resolve_export(ModuleId::new(0), &EcmaString::encode("x")),
             Some(ResolvedExport::External {
                 module: ModuleId::new(0),
                 edge: EdgeId::new(0),
@@ -2452,8 +2452,8 @@ mod tests {
     fn dynamic_imports_require_dynamic_capability() {
         let code = Module::new(
             vec![
-                Constant::String(EcmaString::from_utf8("main")),
-                Constant::String(EcmaString::from_utf8("./dep")),
+                Constant::String(EcmaString::encode("main")),
+                Constant::String(EcmaString::encode("./dep")),
             ],
             vec![Function::new(
                 None,
@@ -2503,7 +2503,7 @@ mod tests {
     #[test]
     fn runtime_dynamic_import_needs_no_linkage_edge() {
         let code = Module::new(
-            vec![Constant::String(EcmaString::from_utf8("main"))],
+            vec![Constant::String(EcmaString::encode("main"))],
             vec![Function::new(
                 None,
                 0,
@@ -2571,9 +2571,9 @@ mod tests {
     fn static_and_dynamic_edge_satisfies_both_linkage_capabilities() {
         let code = Module::new(
             vec![
-                Constant::String(EcmaString::from_utf8("main")),
-                Constant::String(EcmaString::from_utf8("./dep")),
-                Constant::String(EcmaString::from_utf8("value")),
+                Constant::String(EcmaString::encode("main")),
+                Constant::String(EcmaString::encode("./dep")),
+                Constant::String(EcmaString::encode("value")),
             ],
             vec![Function::new(
                 None,
@@ -2620,7 +2620,7 @@ mod tests {
     #[test]
     fn executable_program_rejects_snapshot_exports() {
         let module = Module::new(
-            vec![Constant::String(EcmaString::from_utf8("main"))],
+            vec![Constant::String(EcmaString::encode("main"))],
             vec![Function::new(
                 None,
                 0,
@@ -2665,9 +2665,9 @@ mod tests {
     fn post_import_mutation_keeps_external_binding_as_live_identity() {
         let code = Module::new(
             vec![
-                Constant::String(EcmaString::from_utf8("main")),
-                Constant::String(EcmaString::from_utf8("x")),
-                Constant::String(EcmaString::from_utf8("builtin:live")),
+                Constant::String(EcmaString::encode("main")),
+                Constant::String(EcmaString::encode("x")),
+                Constant::String(EcmaString::encode("builtin:live")),
             ],
             vec![Function::new(
                 None,
@@ -2729,7 +2729,7 @@ mod tests {
         };
         let program = Program::link(vec![module], ModuleId::new(0)).unwrap();
         assert_eq!(
-            program.resolve_export(ModuleId::new(0), &EcmaString::from_utf8("x")),
+            program.resolve_export(ModuleId::new(0), &EcmaString::encode("x")),
             Some(ResolvedExport::External {
                 module: ModuleId::new(0),
                 edge: EdgeId::new(0),
@@ -2803,11 +2803,11 @@ mod tests {
             binding: BindingId::new(0),
         });
         assert_eq!(
-            program.resolve_export(ModuleId::new(0), &EcmaString::from_utf8("x")),
+            program.resolve_export(ModuleId::new(0), &EcmaString::encode("x")),
             leaf
         );
         assert_eq!(
-            program.resolve_export(ModuleId::new(1), &EcmaString::from_utf8("x")),
+            program.resolve_export(ModuleId::new(1), &EcmaString::encode("x")),
             leaf
         );
 

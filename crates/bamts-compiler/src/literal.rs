@@ -44,7 +44,7 @@ pub(crate) fn string_value(lexeme: &str) -> Option<EcmaString> {
 /// Cooks JavaScript escape sequences in a string or template interior.
 pub(crate) fn cook_escapes(input: &str) -> EcmaString {
     if !input.contains('\\') {
-        return EcmaString::from_utf8(input);
+        return EcmaString::encode(input);
     }
     let mut output = EcmaStringBuilder::with_capacity(input.encode_utf16().count());
     let mut chars = input.chars().peekable();

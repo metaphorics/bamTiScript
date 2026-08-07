@@ -88,7 +88,7 @@ pub(crate) fn define_data(heap: &mut [HeapEntry], object: Value, name: &str, val
         | HeapEntry::NativeFunction { properties, .. }
         | HeapEntry::RegExp { properties, .. } => {
             properties.insert(
-                PropertyKey::Named(EcmaString::from_utf8(name)),
+                PropertyKey::Named(EcmaString::encode(name)),
                 builtin_property(value),
             );
         }
@@ -102,7 +102,7 @@ pub(super) fn define_to_string_tag(
     symbol: Value,
     tag: &str,
 ) {
-    let value = push(heap, HeapEntry::String(EcmaString::from_utf8(tag)));
+    let value = push(heap, HeapEntry::String(EcmaString::encode(tag)));
     let index = heap_index(object);
     let HeapEntry::Object { properties, .. } = &mut heap[index] else {
         panic!("namespace tag target must be an ordinary object");
@@ -132,7 +132,7 @@ pub(crate) fn define_frozen_data(heap: &mut [HeapEntry], object: Value, name: &s
         _ => panic!("frozen property target must be an ordinary object"),
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8(name)),
+        PropertyKey::Named(EcmaString::encode(name)),
         Property::Data {
             value,
             writable: false,
@@ -235,7 +235,7 @@ fn install_boolean<H: Host>(
     let prototype = builtins.boolean_prototype();
     let constructor = install_function(heap, builtins, "Boolean", 1, boolean_constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
-    globals.insert(EcmaString::from_utf8("Boolean"), constructor);
+    globals.insert(EcmaString::encode("Boolean"), constructor);
     let value_of = install_function(heap, builtins, "valueOf", 0, boolean_value_of::<H>);
     define_data(heap, prototype, "valueOf", value_of);
 }
@@ -303,7 +303,7 @@ fn install_math<H: Host>(
         define_data(heap, math, name, function);
     }
     define_to_string_tag(heap, math, builtins.symbol_to_string_tag(), "Math");
-    globals.insert(EcmaString::from_utf8("Math"), math);
+    globals.insert(EcmaString::encode("Math"), math);
 }
 
 fn numeric_args<H: Host>(
@@ -489,13 +489,13 @@ fn install_globals<H: Host>(
         ("structuredClone", 1, object::structured_clone::<H>),
     ] {
         let value = install_function(heap, builtins, name, length, handler);
-        globals.insert(EcmaString::from_utf8(name), value);
+        globals.insert(EcmaString::encode(name), value);
     }
     globals.insert(
-        EcmaString::from_utf8("Infinity"),
+        EcmaString::encode("Infinity"),
         crate::number_value(f64::INFINITY),
     );
-    globals.insert(EcmaString::from_utf8("NaN"), crate::number_value(f64::NAN));
+    globals.insert(EcmaString::encode("NaN"), crate::number_value(f64::NAN));
     // Node exposes `Atomics` as a global, and the corpus differential compares
     // our output against Node byte-for-byte. `corpus/cases/is-plain-obj.ts`
     // reads the global, so omitting it throws a ReferenceError and fails Node
@@ -511,7 +511,7 @@ fn install_globals<H: Host>(
         },
     );
     define_to_string_tag(heap, atomics, builtins.symbol_to_string_tag(), "Atomics");
-    globals.insert(EcmaString::from_utf8("Atomics"), atomics);
+    globals.insert(EcmaString::encode("Atomics"), atomics);
 }
 
 fn install_errors<H: Host>(
@@ -584,13 +584,13 @@ fn install_error_type<H: Host>(
     prototype: Value,
     _error_prototype: Value,
 ) {
-    let name_value = push(heap, HeapEntry::String(EcmaString::from_utf8(name)));
+    let name_value = push(heap, HeapEntry::String(EcmaString::encode(name)));
     let empty = push(heap, HeapEntry::String(EcmaString::default()));
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(prototype)] else {
         unreachable!()
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8("name")),
+        PropertyKey::Named(EcmaString::encode("name")),
         Property::Data {
             value: name_value,
             writable: true,
@@ -599,7 +599,7 @@ fn install_error_type<H: Host>(
         },
     );
     properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8("message")),
+        PropertyKey::Named(EcmaString::encode("message")),
         Property::Data {
             value: empty,
             writable: true,
@@ -610,7 +610,7 @@ fn install_error_type<H: Host>(
     let constructor = install_function(heap, builtins, name, length, error_constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     builtins.set_error_prototype(heap, constructor, prototype);
-    globals.insert(EcmaString::from_utf8(name), constructor);
+    globals.insert(EcmaString::encode(name), constructor);
 }
 
 /// Installs a non-enumerable, writable, configurable data property on an error
@@ -627,7 +627,7 @@ fn define_error_field<H: Host>(
 ) -> Result<(), EvalFailure> {
     machine.define_descriptor(
         object,
-        PropertyKey::Named(EcmaString::from_utf8(name)),
+        PropertyKey::Named(EcmaString::encode(name)),
         Property::Data {
             value,
             writable: true,
@@ -703,7 +703,7 @@ fn error_constructor<H: Host>(
         .copied()
         .filter(|value| *value != Value::UNDEFINED)
     {
-        let cause_key = PropertyKey::Named(EcmaString::from_utf8("cause"));
+        let cause_key = PropertyKey::Named(EcmaString::encode("cause"));
         if machine.has_property(options, &cause_key)? {
             let cause = machine.get_named_property(options, "cause")?;
             define_error_field(machine, object, "cause", cause)?;
@@ -1467,7 +1467,7 @@ mod tests {
         );
         let mut properties = PropertyMap::default();
         properties.insert(
-            PropertyKey::Named(EcmaString::from_utf8("message")),
+            PropertyKey::Named(EcmaString::encode("message")),
             Property::Accessor {
                 getter: Some(getter),
                 setter: None,
@@ -1533,7 +1533,7 @@ mod tests {
             })
             .expect("second derived receiver allocation succeeds");
         let message = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("issue")))
+            .allocate(HeapEntry::String(EcmaString::encode("issue")))
             .expect("message allocation succeeds");
         assert_eq!(
             machine
@@ -1561,7 +1561,7 @@ mod tests {
             .intrinsics
             .global("globalThis")
             .expect("globalThis is installed");
-        let key = PropertyKey::Named(EcmaString::from_utf8("Infinity"));
+        let key = PropertyKey::Named(EcmaString::encode("Infinity"));
         let descriptor = machine
             .own_descriptor(global_this, &key)
             .expect("descriptor lookup succeeds")
@@ -1594,7 +1594,7 @@ mod tests {
             .intrinsics
             .global("globalThis")
             .expect("globalThis is installed");
-        let key = PropertyKey::Named(EcmaString::from_utf8("NaN"));
+        let key = PropertyKey::Named(EcmaString::encode("NaN"));
         let descriptor = machine
             .own_descriptor(global_this, &key)
             .expect("descriptor lookup succeeds")
@@ -1710,7 +1710,7 @@ mod tests {
             .intrinsics
             .global("globalThis")
             .expect("globalThis is installed");
-        let key = PropertyKey::Named(EcmaString::from_utf8("Atomics"));
+        let key = PropertyKey::Named(EcmaString::encode("Atomics"));
         let descriptor = machine
             .own_descriptor(global_this, &key)
             .expect("descriptor lookup succeeds")
@@ -1796,7 +1796,7 @@ mod tests {
         let error = Value::int32(11);
         let suppressed = Value::int32(22);
         let message = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("outer")))
+            .allocate(HeapEntry::String(EcmaString::encode("outer")))
             .expect("message allocation succeeds");
         let result = machine
             .construct_value(constructor, &[error, suppressed, message])
@@ -1813,7 +1813,7 @@ mod tests {
         assert!(machine.inherits_from_prototype(result, prototype).unwrap());
         for (name, expected) in [("error", error), ("suppressed", suppressed)] {
             let descriptor = machine
-                .own_descriptor(result, &PropertyKey::Named(EcmaString::from_utf8(name)))
+                .own_descriptor(result, &PropertyKey::Named(EcmaString::encode(name)))
                 .unwrap()
                 .expect("SuppressedError has an own error field");
             assert!(matches!(
@@ -1841,7 +1841,7 @@ mod tests {
         // Plain Error with a message: message + stack must be non-enumerable.
         let error_constructor = machine.intrinsics.global("Error").expect("Error exists");
         let message = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("boom")))
+            .allocate(HeapEntry::String(EcmaString::encode("boom")))
             .expect("message allocation succeeds");
         let error = machine
             .construct_value(error_constructor, &[message])
@@ -1852,7 +1852,7 @@ mod tests {
         );
         for field in ["message", "stack"] {
             let descriptor = machine
-                .own_descriptor(error, &PropertyKey::Named(EcmaString::from_utf8(field)))
+                .own_descriptor(error, &PropertyKey::Named(EcmaString::encode(field)))
                 .expect("descriptor lookup succeeds")
                 .expect("Error has an own {field} property");
             assert!(
@@ -1890,7 +1890,7 @@ mod tests {
             .set_data_property(options, "cause", cause)
             .expect("options.cause set succeeds");
         let msg2 = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("outer")))
+            .allocate(HeapEntry::String(EcmaString::encode("outer")))
             .expect("message allocation succeeds");
         let with_cause = machine
             .construct_value(error_constructor, &[msg2, options])
@@ -1898,7 +1898,7 @@ mod tests {
         let cause_descriptor = machine
             .own_descriptor(
                 with_cause,
-                &PropertyKey::Named(EcmaString::from_utf8("cause")),
+                &PropertyKey::Named(EcmaString::encode("cause")),
             )
             .expect("descriptor lookup succeeds")
             .expect("Error has an own cause property");
@@ -1934,7 +1934,7 @@ mod tests {
             })
             .expect("errors array allocation succeeds");
         let agg_message = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("several")))
+            .allocate(HeapEntry::String(EcmaString::encode("several")))
             .expect("message allocation succeeds");
         let aggregate = machine
             .construct_value(aggregate_constructor, &[errors_array, agg_message])
@@ -1945,7 +1945,7 @@ mod tests {
         );
         for field in ["errors", "message", "stack"] {
             let descriptor = machine
-                .own_descriptor(aggregate, &PropertyKey::Named(EcmaString::from_utf8(field)))
+                .own_descriptor(aggregate, &PropertyKey::Named(EcmaString::encode(field)))
                 .expect("descriptor lookup succeeds")
                 .expect("AggregateError has an own {field} property");
             assert!(
@@ -1980,8 +1980,8 @@ mod tests {
             .runtime_slot(object)
             .expect("object slot lookup succeeds")
             .expect("object has a runtime slot");
-        let data_key = PropertyKey::Named(EcmaString::from_utf8("data"));
-        let accessor_key = PropertyKey::Named(EcmaString::from_utf8("accessor"));
+        let data_key = PropertyKey::Named(EcmaString::encode("data"));
+        let accessor_key = PropertyKey::Named(EcmaString::encode("accessor"));
         let baseline_slot = machine.slot_bytes[index];
         let baseline_heap = machine.heap_bytes;
 
@@ -2051,7 +2051,7 @@ mod tests {
             .expect("object has a runtime slot");
         let before_slot = machine.slot_bytes[index];
         let before_heap = machine.heap_bytes;
-        let key = PropertyKey::Named(EcmaString::from_utf8("x"));
+        let key = PropertyKey::Named(EcmaString::encode("x"));
 
         assert!(matches!(
             machine.define_descriptor(
@@ -2091,7 +2091,7 @@ mod tests {
             .runtime_slot(array)
             .expect("array slot lookup succeeds")
             .expect("array has a runtime slot");
-        let length_key = PropertyKey::Named(EcmaString::from_utf8("length"));
+        let length_key = PropertyKey::Named(EcmaString::encode("length"));
 
         // Freeze the length so subsequent redefinitions with a different value fail.
         machine
@@ -2146,12 +2146,12 @@ mod tests {
                 boxed_primitive: None,
             })
             .expect("object allocation succeeds");
-        let missing = allocate_string(&mut machine, EcmaString::from_utf8("missing")).unwrap();
-        let data_key = allocate_string(&mut machine, EcmaString::from_utf8("data")).unwrap();
+        let missing = allocate_string(&mut machine, EcmaString::encode("missing")).unwrap();
+        let data_key = allocate_string(&mut machine, EcmaString::encode("data")).unwrap();
         let accessor_key =
-            allocate_string(&mut machine, EcmaString::from_utf8("accessor")).unwrap();
-        let data_pk = PropertyKey::Named(EcmaString::from_utf8("data"));
-        let accessor_pk = PropertyKey::Named(EcmaString::from_utf8("accessor"));
+            allocate_string(&mut machine, EcmaString::encode("accessor")).unwrap();
+        let data_pk = PropertyKey::Named(EcmaString::encode("data"));
+        let accessor_pk = PropertyKey::Named(EcmaString::encode("accessor"));
         let getter = Value::int32(1);
         let setter = Value::int32(2);
 
@@ -2235,16 +2235,16 @@ mod tests {
                 boxed_primitive: None,
             })
             .expect("object allocation succeeds");
-        let data_key = allocate_string(&mut machine, EcmaString::from_utf8("data")).unwrap();
+        let data_key = allocate_string(&mut machine, EcmaString::encode("data")).unwrap();
         let accessor_key =
-            allocate_string(&mut machine, EcmaString::from_utf8("accessor")).unwrap();
-        let missing = allocate_string(&mut machine, EcmaString::from_utf8("missing")).unwrap();
+            allocate_string(&mut machine, EcmaString::encode("accessor")).unwrap();
+        let missing = allocate_string(&mut machine, EcmaString::encode("missing")).unwrap();
         let missing_getter =
-            allocate_string(&mut machine, EcmaString::from_utf8("missingGetter")).unwrap();
-        let data_pk = PropertyKey::Named(EcmaString::from_utf8("data"));
-        let accessor_pk = PropertyKey::Named(EcmaString::from_utf8("accessor"));
-        let missing_pk = PropertyKey::Named(EcmaString::from_utf8("missing"));
-        let missing_getter_pk = PropertyKey::Named(EcmaString::from_utf8("missingGetter"));
+            allocate_string(&mut machine, EcmaString::encode("missingGetter")).unwrap();
+        let data_pk = PropertyKey::Named(EcmaString::encode("data"));
+        let accessor_pk = PropertyKey::Named(EcmaString::encode("accessor"));
+        let missing_pk = PropertyKey::Named(EcmaString::encode("missing"));
+        let missing_getter_pk = PropertyKey::Named(EcmaString::encode("missingGetter"));
         let getter = Value::int32(11);
         let setter = Value::int32(22);
         let next_getter = Value::int32(33);
@@ -2366,11 +2366,11 @@ mod tests {
             })
             .unwrap();
         let inherited_key =
-            allocate_string(&mut machine, EcmaString::from_utf8("inherited")).unwrap();
+            allocate_string(&mut machine, EcmaString::encode("inherited")).unwrap();
         let accessor_key =
-            allocate_string(&mut machine, EcmaString::from_utf8("accessor")).unwrap();
-        let inherited_pk = PropertyKey::Named(EcmaString::from_utf8("inherited"));
-        let accessor_pk = PropertyKey::Named(EcmaString::from_utf8("accessor"));
+            allocate_string(&mut machine, EcmaString::encode("accessor")).unwrap();
+        let inherited_pk = PropertyKey::Named(EcmaString::encode("inherited"));
+        let accessor_pk = PropertyKey::Named(EcmaString::encode("accessor"));
 
         machine
             .define_descriptor(
@@ -2452,8 +2452,8 @@ mod tests {
             })
             .expect("object allocation succeeds");
         let produced =
-            allocate_string(&mut machine, EcmaString::from_utf8("produced-key")).unwrap();
-        let produced_pk = PropertyKey::Named(EcmaString::from_utf8("produced-key"));
+            allocate_string(&mut machine, EcmaString::encode("produced-key")).unwrap();
+        let produced_pk = PropertyKey::Named(EcmaString::encode("produced-key"));
         machine
             .define_descriptor(
                 object,

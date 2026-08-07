@@ -37,7 +37,7 @@ pub(super) fn install<H: Host>(
         PropertyKey::Symbol(heap_index(builtins.symbol_iterator()) as u32),
         builtin_property(iterator),
     );
-    let tag = super::super::push(heap, HeapEntry::String(EcmaString::from_utf8("Uint8Array")));
+    let tag = super::super::push(heap, HeapEntry::String(EcmaString::encode("Uint8Array")));
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(prototype)] else {
         unreachable!("Uint8Array prototype is ordinary")
     };
@@ -45,7 +45,7 @@ pub(super) fn install<H: Host>(
         PropertyKey::Symbol(heap_index(builtins.symbol_to_string_tag()) as u32),
         builtin_property(tag),
     );
-    globals.insert(EcmaString::from_utf8("Uint8Array"), constructor);
+    globals.insert(EcmaString::encode("Uint8Array"), constructor);
 }
 
 fn constructor<H: Host>(
@@ -79,7 +79,7 @@ fn constructor<H: Host>(
     };
     let mut properties = PropertyMap::default();
     properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8("length")),
+        PropertyKey::Named(EcmaString::encode("length")),
         Property::Data {
             value: crate::number_value(length as f64),
             writable: false,
@@ -210,7 +210,7 @@ fn join<H: Host>(
         ));
     }
     let separator = match args.first().copied() {
-        None | Some(Value::UNDEFINED) => EcmaString::from_utf8(","),
+        None | Some(Value::UNDEFINED) => EcmaString::encode(","),
         Some(value) => machine.coerce_string_observable(value)?,
     };
     let HeapEntry::Uint8Array { bytes, .. } = &machine.heap[slot] else {
@@ -278,7 +278,7 @@ fn constructor_prototype<H: Host>(machine: &Machine<'_, H>) -> Result<Value, Eva
     let HeapEntry::NativeFunction { properties, .. } = &machine.heap[index] else {
         return Err(type_error("invalid Uint8Array constructor"));
     };
-    match properties.get(&PropertyKey::Named(EcmaString::from_utf8("prototype"))) {
+    match properties.get(&PropertyKey::Named(EcmaString::encode("prototype"))) {
         Some(Property::Data { value, .. }) => Ok(*value),
         _ => Err(type_error("missing Uint8Array prototype")),
     }
@@ -664,8 +664,8 @@ mod tests {
         // ToNumber. Node: U8(3.5)=3, U8(NaN)=0, U8(true)=1, U8(null)=0,
         // U8("3")=3, U8("abc")=0.
         with_machine(|machine| {
-            let s3 = allocate_string(machine, EcmaString::from_utf8("3")).unwrap();
-            let sabc = allocate_string(machine, EcmaString::from_utf8("abc")).unwrap();
+            let s3 = allocate_string(machine, EcmaString::encode("3")).unwrap();
+            let sabc = allocate_string(machine, EcmaString::encode("abc")).unwrap();
             let cases: &[(Value, u32)] = &[
                 (Value::int32(0), 0),
                 (Value::number(3.5), 3),

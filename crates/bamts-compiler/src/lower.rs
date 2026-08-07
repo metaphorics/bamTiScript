@@ -327,7 +327,7 @@ fn assemble_with_linkage_strings(
         functions: Vec::new(),
     };
     for value in linkage_strings {
-        builder.intern(Constant::String(EcmaString::from_utf8(value)), file.range())?;
+        builder.intern(Constant::String(EcmaString::encode(value)), file.range())?;
     }
     let entry = builder.reserve_function(file.range())?;
     let mut context = FunctionContext::new_top_level(
@@ -1027,7 +1027,7 @@ impl<'a> FunctionContext<'a> {
         declaration_scope: DeclarationScope,
     ) -> Result<(), LowerError> {
         if self.top_level && !matches!(declaration_scope, DeclarationScope::Iteration) {
-            let id = builder.intern(Constant::String(EcmaString::from_utf8(name)), range)?;
+            let id = builder.intern(Constant::String(EcmaString::encode(name)), range)?;
             self.emit(range, Instruction::StoreGlobal { name: id, value })?;
             return Ok(());
         }
@@ -1347,7 +1347,7 @@ impl<'a> FunctionContext<'a> {
         if objects.is_empty() {
             return Ok(None);
         }
-        let key = self.string_reg(builder, EcmaString::from_utf8(name), range)?;
+        let key = self.string_reg(builder, EcmaString::encode(name), range)?;
         let undef = self.undefined(builder, range)?;
         let fals = self.load_constant(builder, Constant::Boolean(false), range)?;
         let tru = self.load_constant(builder, Constant::Boolean(true), range)?;
@@ -1471,7 +1471,7 @@ impl<'a> FunctionContext<'a> {
         if name == "undefined" {
             return self.undefined(builder, range);
         }
-        let id = builder.intern(Constant::String(EcmaString::from_utf8(name)), range)?;
+        let id = builder.intern(Constant::String(EcmaString::encode(name)), range)?;
         let dst = self.alloc_register(range)?;
         self.emit(range, Instruction::LoadGlobal { dst, name: id })?;
         Ok(dst)
@@ -1498,7 +1498,7 @@ impl<'a> FunctionContext<'a> {
                 )),
             };
         }
-        let id = builder.intern(Constant::String(EcmaString::from_utf8(name)), range)?;
+        let id = builder.intern(Constant::String(EcmaString::encode(name)), range)?;
         self.emit(range, Instruction::StoreGlobal { name: id, value })?;
         Ok(())
     }
@@ -3384,8 +3384,7 @@ impl<'a> FunctionContext<'a> {
                             UnsupportedConstruct::NamespaceDeclaration,
                         )
                     })?;
-                let key =
-                    self.string_reg(builder, EcmaString::from_utf8(&name), statement.range())?;
+                let key = self.string_reg(builder, EcmaString::encode(&name), statement.range())?;
                 let object = self.alloc_register(statement.range())?;
                 self.emit(
                     statement.range(),
@@ -3803,8 +3802,7 @@ impl<'a> FunctionContext<'a> {
                     )?;
                     self.move_to(range, result, typed)?;
                 } else {
-                    let id =
-                        builder.intern(Constant::String(EcmaString::from_utf8(&name)), range)?;
+                    let id = builder.intern(Constant::String(EcmaString::encode(&name)), range)?;
                     let typed = self.alloc_register(range)?;
                     self.emit(
                         range,
@@ -3822,7 +3820,7 @@ impl<'a> FunctionContext<'a> {
                 || (name == "arguments" && !matches!(self.arguments_source, ArgumentsSource::None))
                 || name == "undefined";
             if !resolved {
-                let id = builder.intern(Constant::String(EcmaString::from_utf8(&name)), range)?;
+                let id = builder.intern(Constant::String(EcmaString::encode(&name)), range)?;
                 let dst = self.alloc_register(range)?;
                 self.emit(range, Instruction::TypeOfGlobal { dst, name: id })?;
                 return Ok(dst);
@@ -4912,7 +4910,7 @@ impl<'a> FunctionContext<'a> {
         name: &str,
         value: Register,
     ) -> Result<(), LowerError> {
-        let key = self.string_reg(builder, EcmaString::from_utf8(name), range)?;
+        let key = self.string_reg(builder, EcmaString::encode(name), range)?;
         self.emit(range, Instruction::SetProperty { object, key, value })?;
         Ok(())
     }
@@ -4976,7 +4974,7 @@ impl<'a> FunctionContext<'a> {
                 operand: returned,
             },
         )?;
-        let function_type = self.string_reg(builder, EcmaString::from_utf8("function"), range)?;
+        let function_type = self.string_reg(builder, EcmaString::encode("function"), range)?;
         let is_function = self.alloc_register(range)?;
         self.emit(
             range,
@@ -5043,7 +5041,7 @@ impl<'a> FunctionContext<'a> {
                 operand: returned,
             },
         )?;
-        let function_type = self.string_reg(builder, EcmaString::from_utf8("function"), range)?;
+        let function_type = self.string_reg(builder, EcmaString::encode("function"), range)?;
         let is_function = self.alloc_register(range)?;
         self.emit(
             range,
@@ -5187,7 +5185,7 @@ impl<'a> FunctionContext<'a> {
                     },
                 )?;
                 let function_type =
-                    inner.string_reg(builder, EcmaString::from_utf8("function"), range)?;
+                    inner.string_reg(builder, EcmaString::encode("function"), range)?;
                 let is_function = inner.alloc_register(range)?;
                 inner.emit(
                     range,
@@ -5232,7 +5230,7 @@ impl<'a> FunctionContext<'a> {
         match name {
             PropertyName::Identifier(identifier) => {
                 let text = self.identifier_text(identifier)?;
-                self.string_reg(builder, EcmaString::from_utf8(&text), identifier.range())
+                self.string_reg(builder, EcmaString::encode(&text), identifier.range())
             }
             PropertyName::String(string) => {
                 let value = self.string_literal_value(string)?;
@@ -5240,11 +5238,11 @@ impl<'a> FunctionContext<'a> {
             }
             PropertyName::Number(number) => {
                 let key = numeric_key_text(self, number)?;
-                self.string_reg(builder, EcmaString::from_utf8(&key), number.range())
+                self.string_reg(builder, EcmaString::encode(&key), number.range())
             }
             PropertyName::Private(private) => {
                 let text = self.private_text(private)?;
-                self.string_reg(builder, EcmaString::from_utf8(&text), private.range())
+                self.string_reg(builder, EcmaString::encode(&text), private.range())
             }
             PropertyName::Computed(_) => Ok(evaluated_key),
             PropertyName::Missing(missing) => Err(self.error(
@@ -5273,7 +5271,7 @@ impl<'a> FunctionContext<'a> {
         let context = self.alloc_register(range)?;
         self.emit(range, Instruction::CreateObject { dst: context })?;
         let kind_value =
-            self.string_reg(builder, EcmaString::from_utf8(kind.context_name()), range)?;
+            self.string_reg(builder, EcmaString::encode(kind.context_name()), range)?;
         self.set_named_entry(builder, range, context, "kind", kind_value)?;
         let name_value = self.member_context_name(builder, range, name, evaluated_key)?;
         self.set_named_entry(builder, range, context, "name", name_value)?;
@@ -5378,7 +5376,7 @@ impl<'a> FunctionContext<'a> {
                 },
             )?;
         }
-        let raw_key = self.string_reg(builder, EcmaString::from_utf8("raw"), range)?;
+        let raw_key = self.string_reg(builder, EcmaString::encode("raw"), range)?;
         self.emit(
             range,
             Instruction::SetProperty {
@@ -5454,7 +5452,7 @@ impl<'a> FunctionContext<'a> {
         if cook {
             Ok(cook_escapes(interior))
         } else {
-            Ok(EcmaString::from_utf8(interior))
+            Ok(EcmaString::encode(interior))
         }
     }
     fn lower_regex_literal(
@@ -5473,9 +5471,8 @@ impl<'a> FunctionContext<'a> {
             .ok_or_else(|| self.error(range, LowerErrorKind::InvalidRegexLiteral))?;
         let (pattern, flags) = split_regex(lexeme)
             .ok_or_else(|| self.error(range, LowerErrorKind::InvalidRegexLiteral))?;
-        let pattern_id =
-            builder.intern(Constant::String(EcmaString::from_utf8(&pattern)), range)?;
-        let flags_id = builder.intern(Constant::String(EcmaString::from_utf8(&flags)), range)?;
+        let pattern_id = builder.intern(Constant::String(EcmaString::encode(&pattern)), range)?;
+        let flags_id = builder.intern(Constant::String(EcmaString::encode(&flags)), range)?;
         let dst = self.alloc_register(range)?;
         self.emit(
             range,
@@ -5568,7 +5565,7 @@ impl<'a> FunctionContext<'a> {
         match property {
             MemberProperty::Named(identifier) => {
                 let name = self.identifier_text(identifier)?;
-                self.string_reg(builder, EcmaString::from_utf8(&name), identifier.range())
+                self.string_reg(builder, EcmaString::encode(&name), identifier.range())
             }
             MemberProperty::Computed(expression) => self.lower_expression(builder, expression),
             MemberProperty::Private(private) => {
@@ -5585,7 +5582,7 @@ impl<'a> FunctionContext<'a> {
         match name {
             PropertyName::Identifier(identifier) => {
                 let text = self.identifier_text(identifier)?;
-                self.string_reg(builder, EcmaString::from_utf8(&text), identifier.range())
+                self.string_reg(builder, EcmaString::encode(&text), identifier.range())
             }
             PropertyName::String(string) => {
                 let value = self.string_literal_value(string)?;
@@ -5593,7 +5590,7 @@ impl<'a> FunctionContext<'a> {
             }
             PropertyName::Number(number) => {
                 let key = numeric_key_text(self, number)?;
-                self.string_reg(builder, EcmaString::from_utf8(&key), number.range())
+                self.string_reg(builder, EcmaString::encode(&key), number.range())
             }
             PropertyName::Computed(expression) => self.lower_expression(builder, expression),
             PropertyName::Private(private) => {
@@ -5768,7 +5765,7 @@ impl<'a> FunctionContext<'a> {
         object: Register,
         name: &str,
     ) -> Result<Register, LowerError> {
-        let key = self.string_reg(builder, EcmaString::from_utf8(name), range)?;
+        let key = self.string_reg(builder, EcmaString::encode(name), range)?;
         let dst = self.alloc_register(range)?;
         self.emit(range, Instruction::GetProperty { dst, object, key })?;
         Ok(dst)
@@ -5821,7 +5818,7 @@ impl<'a> FunctionContext<'a> {
             return Ok(());
         }
         let src = self.read_name(builder, local, range)?;
-        let name = builder.intern(Constant::String(EcmaString::from_utf8(exported)), range)?;
+        let name = builder.intern(Constant::String(EcmaString::encode(exported)), range)?;
         self.emit(range, Instruction::Export { name, src })?;
         Ok(())
     }
@@ -5843,7 +5840,7 @@ impl<'a> FunctionContext<'a> {
                 DeclarationScope::Lexical,
             );
         }
-        let name = builder.intern(Constant::String(EcmaString::from_utf8(exported)), range)?;
+        let name = builder.intern(Constant::String(EcmaString::encode(exported)), range)?;
         self.emit(range, Instruction::Export { name, src })?;
         Ok(())
     }
@@ -6352,7 +6349,7 @@ impl<'a> FunctionContext<'a> {
             let prototype = self.alloc_register(range)?;
             self.emit(range, Instruction::CreateObject { dst: prototype })?;
             let constructor_key =
-                self.string_reg(builder, EcmaString::from_utf8("constructor"), range)?;
+                self.string_reg(builder, EcmaString::encode("constructor"), range)?;
             self.emit(
                 range,
                 Instruction::SetProperty {
@@ -6361,8 +6358,7 @@ impl<'a> FunctionContext<'a> {
                     value: closure,
                 },
             )?;
-            let prototype_key =
-                self.string_reg(builder, EcmaString::from_utf8("prototype"), range)?;
+            let prototype_key = self.string_reg(builder, EcmaString::encode("prototype"), range)?;
             self.emit(
                 range,
                 Instruction::SetProperty {
@@ -6524,9 +6520,7 @@ impl<'a> FunctionContext<'a> {
             }
         }
         let name_constant = match name {
-            Some(name) => {
-                Some(builder.intern(Constant::String(EcmaString::from_utf8(&name)), range)?)
-            }
+            Some(name) => Some(builder.intern(Constant::String(EcmaString::encode(&name)), range)?),
             None => None,
         };
         let assembled = inner.into_function(name_constant, flags);
@@ -6633,9 +6627,7 @@ impl<'a> FunctionContext<'a> {
         let value = emit_body(&mut inner, builder, &parameters)?;
         inner.emit(range, Instruction::Return { value })?;
         let name_constant = match name {
-            Some(name) => {
-                Some(builder.intern(Constant::String(EcmaString::from_utf8(&name)), range)?)
-            }
+            Some(name) => Some(builder.intern(Constant::String(EcmaString::encode(&name)), range)?),
             None => None,
         };
         let assembled = inner.into_function(name_constant, FunctionFlags::default());
@@ -6789,7 +6781,7 @@ impl<'a> FunctionContext<'a> {
                 operand: value,
             },
         )?;
-        let object_kind = self.string_reg(builder, EcmaString::from_utf8("object"), range)?;
+        let object_kind = self.string_reg(builder, EcmaString::encode("object"), range)?;
         let is_object = self.alloc_register(range)?;
         self.emit(
             range,
@@ -6827,7 +6819,7 @@ impl<'a> FunctionContext<'a> {
         )?;
         let object_selected = self.emit(range, Instruction::Jump { target: Pc::new(0) })?;
         self.patch_jump(to_function, self.next_pc());
-        let function_kind = self.string_reg(builder, EcmaString::from_utf8("function"), range)?;
+        let function_kind = self.string_reg(builder, EcmaString::encode("function"), range)?;
         let is_function = self.alloc_register(range)?;
         self.emit(
             range,
@@ -6845,7 +6837,7 @@ impl<'a> FunctionContext<'a> {
                 target: Pc::new(0),
             },
         )?;
-        let undefined_kind = self.string_reg(builder, EcmaString::from_utf8("undefined"), range)?;
+        let undefined_kind = self.string_reg(builder, EcmaString::encode("undefined"), range)?;
         let is_undefined = self.alloc_register(range)?;
         self.emit(
             range,
@@ -7452,7 +7444,7 @@ impl<'a> FunctionContext<'a> {
                 },
             )?;
         }
-        let prototype_key = self.string_reg(builder, EcmaString::from_utf8("prototype"), range)?;
+        let prototype_key = self.string_reg(builder, EcmaString::encode("prototype"), range)?;
         self.emit(
             range,
             Instruction::SetProperty {
@@ -7461,8 +7453,7 @@ impl<'a> FunctionContext<'a> {
                 value: prototype,
             },
         )?;
-        let constructor_key =
-            self.string_reg(builder, EcmaString::from_utf8("constructor"), range)?;
+        let constructor_key = self.string_reg(builder, EcmaString::encode("constructor"), range)?;
         self.emit(
             range,
             Instruction::DefineDataProperty {
@@ -7553,8 +7544,7 @@ impl<'a> FunctionContext<'a> {
                 }
                 None => {
                     debug_assert!(self.top_level);
-                    let id =
-                        builder.intern(Constant::String(EcmaString::from_utf8(name)), range)?;
+                    let id = builder.intern(Constant::String(EcmaString::encode(name)), range)?;
                     self.emit(
                         range,
                         Instruction::StoreGlobal {
@@ -7606,10 +7596,10 @@ impl<'a> FunctionContext<'a> {
     ) -> Result<Register, LowerError> {
         let context = self.alloc_register(range)?;
         self.emit(range, Instruction::CreateObject { dst: context })?;
-        let class_kind = self.string_reg(builder, EcmaString::from_utf8("class"), range)?;
+        let class_kind = self.string_reg(builder, EcmaString::encode("class"), range)?;
         self.set_named_entry(builder, range, context, "kind", class_kind)?;
         let name_value = match name {
-            Some(name) => self.string_reg(builder, EcmaString::from_utf8(name), range)?,
+            Some(name) => self.string_reg(builder, EcmaString::encode(name), range)?,
             None => self.undefined(builder, range)?,
         };
         self.set_named_entry(builder, range, context, "name", name_value)?;
@@ -7647,7 +7637,7 @@ impl<'a> FunctionContext<'a> {
                     continue;
                 }
                 let description =
-                    builder.intern(Constant::String(EcmaString::from_utf8(&text)), range)?;
+                    builder.intern(Constant::String(EcmaString::encode(&text)), range)?;
                 let value = self.alloc_register(range)?;
                 self.emit(
                     range,
@@ -7678,7 +7668,7 @@ impl<'a> FunctionContext<'a> {
         range: TextRange,
     ) -> Result<Register, LowerError> {
         let description =
-            builder.intern(Constant::String(EcmaString::from_utf8("#accessor")), range)?;
+            builder.intern(Constant::String(EcmaString::encode("#accessor")), range)?;
         let value = self.alloc_register(range)?;
         self.emit(
             range,
@@ -8137,9 +8127,7 @@ impl<'a> FunctionContext<'a> {
             inner.emit_return_undefined(builder, range)?;
         }
         let name_constant = match source_name {
-            Some(name) => {
-                Some(builder.intern(Constant::String(EcmaString::from_utf8(name)), range)?)
-            }
+            Some(name) => Some(builder.intern(Constant::String(EcmaString::encode(name)), range)?),
             None => None,
         };
         let assembled = inner.into_function(name_constant, FunctionFlags::default());
@@ -8297,7 +8285,7 @@ impl<'a> FunctionContext<'a> {
         let current_set = self.alloc_register(range)?;
         self.move_to(range, current_set, initial_set)?;
         let undefined = self.undefined(builder, range)?;
-        let object_type = self.string_reg(builder, EcmaString::from_utf8("object"), range)?;
+        let object_type = self.string_reg(builder, EcmaString::encode("object"), range)?;
         let mut collected_inits = Vec::new();
         for &decorator in decorators.iter().rev() {
             let collected = self.alloc_register(range)?;

@@ -88,7 +88,7 @@ pub fn compile_classic_script(
         &namespace_facts,
     )
     .map_err(|error| map_lower_error(&source, error))?;
-    let encoded_name = EcmaString::from_utf8(module_name);
+    let encoded_name = EcmaString::encode(module_name);
     let name = assembled
         .constants()
         .iter()

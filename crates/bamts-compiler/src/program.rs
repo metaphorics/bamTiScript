@@ -3297,7 +3297,7 @@ mod tests {
             .unwrap();
         assert!(matches!(export.source, ExportSource::Local(_)));
         assert!(matches!(
-            executable.wire().resolve_export(main_id, &EcmaString::from_utf8("observed")),
+            executable.wire().resolve_export(main_id, &EcmaString::encode("observed")),
             Some(ResolvedExport::Local { module, .. })
                 if module != main_id
         ));
@@ -3412,7 +3412,7 @@ mod tests {
         assert!(matches!(
             executable
                 .wire()
-                .resolve_export(executable.wire().entry(), &EcmaString::from_utf8("renamed")),
+                .resolve_export(executable.wire().entry(), &EcmaString::encode("renamed")),
             Some(ResolvedExport::Local { module, .. })
                 if module != executable.wire().entry()
         ));
@@ -3462,7 +3462,7 @@ mod tests {
         assert!(
             executable
                 .wire()
-                .resolve_export(executable.wire().entry(), &EcmaString::from_utf8("value"))
+                .resolve_export(executable.wire().entry(), &EcmaString::encode("value"))
                 .is_some()
         );
     }
@@ -3484,10 +3484,9 @@ mod tests {
             1
         );
         assert!(matches!(
-            executable.wire().resolve_export(
-                executable.wire().entry(),
-                &EcmaString::from_utf8("readFile")
-            ),
+            executable
+                .wire()
+                .resolve_export(executable.wire().entry(), &EcmaString::encode("readFile")),
             Some(ResolvedExport::External { .. })
         ));
     }
@@ -3509,7 +3508,7 @@ mod tests {
         assert!(matches!(export.source, ExportSource::Indirect { .. }));
         let resolved = executable
             .wire()
-            .resolve_export(executable.wire().entry(), &EcmaString::from_utf8("value"))
+            .resolve_export(executable.wire().entry(), &EcmaString::encode("value"))
             .expect("transitive star export must resolve");
         let ResolvedExport::Local {
             module: resolved, ..
@@ -3548,7 +3547,7 @@ mod tests {
         assert!(
             executable
                 .wire()
-                .resolve_export(executable.wire().entry(), &EcmaString::from_utf8("value"))
+                .resolve_export(executable.wire().entry(), &EcmaString::encode("value"))
                 .is_some()
         );
     }
@@ -3574,7 +3573,7 @@ mod tests {
         );
         let resolved = executable
             .wire()
-            .resolve_export(executable.wire().entry(), &EcmaString::from_utf8("value"))
+            .resolve_export(executable.wire().entry(), &EcmaString::encode("value"))
             .expect("downstream star must expose mid's explicit value unambiguously");
         let ResolvedExport::Local {
             module: resolved, ..
@@ -3605,7 +3604,7 @@ mod tests {
         assert!(
             executable
                 .wire()
-                .resolve_export(executable.wire().entry(), &EcmaString::from_utf8("default"))
+                .resolve_export(executable.wire().entry(), &EcmaString::encode("default"))
                 .is_none()
         );
     }
@@ -3628,7 +3627,7 @@ mod tests {
         for name in ["a", "b"] {
             let resolved = executable
                 .wire()
-                .resolve_export(executable.wire().entry(), &EcmaString::from_utf8(name))
+                .resolve_export(executable.wire().entry(), &EcmaString::encode(name))
                 .expect("cyclic star graph must resolve both direct exports");
             let ResolvedExport::Local {
                 module: resolved, ..
@@ -3669,7 +3668,7 @@ mod tests {
             .unwrap() as u32;
         let resolved = executable
             .wire()
-            .resolve_export(executable.wire().entry(), &EcmaString::from_utf8("value"))
+            .resolve_export(executable.wire().entry(), &EcmaString::encode("value"))
             .expect("live imported cell reexport must resolve");
         let ResolvedExport::Local { module, binding } = resolved else {
             panic!("live imported cell reexport must stay local");

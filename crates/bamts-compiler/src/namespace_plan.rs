@@ -443,7 +443,7 @@ fn add_export(
     let Some(symbol) = model.scope(binding.export_scope).value(name) else {
         return;
     };
-    let name = EcmaString::from_utf8(name);
+    let name = EcmaString::encode(name);
     exports.push(NamespaceExport {
         name: name.clone(),
         storage,

@@ -59,7 +59,7 @@ pub(super) fn install<H: Host>(
         unreachable!()
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8("description")),
+        PropertyKey::Named(EcmaString::encode("description")),
         Property::Accessor {
             getter: Some(description),
             setter: None,
@@ -72,20 +72,20 @@ pub(super) fn install<H: Host>(
         builtin_property(symbol_tag),
     );
 
-    globals.insert(EcmaString::from_utf8("Symbol"), constructor);
+    globals.insert(EcmaString::encode("Symbol"), constructor);
 }
 
 fn symbol(heap: &mut Vec<HeapEntry>, description: &str) -> Value {
     super::super::push(
         heap,
         HeapEntry::Symbol {
-            description: EcmaString::from_utf8(description),
+            description: EcmaString::encode(description),
         },
     )
 }
 
 fn allocate_literal_string(heap: &mut Vec<HeapEntry>, text: &str) -> Value {
-    super::super::push(heap, HeapEntry::String(EcmaString::from_utf8(text)))
+    super::super::push(heap, HeapEntry::String(EcmaString::encode(text)))
 }
 
 fn define_native_property(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) {
@@ -93,7 +93,7 @@ fn define_native_property(heap: &mut [HeapEntry], object: Value, name: &str, val
         unreachable!()
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8(name)),
+        PropertyKey::Named(EcmaString::encode(name)),
         builtin_property(value),
     );
 }
@@ -103,7 +103,7 @@ fn define_readonly_property(heap: &mut [HeapEntry], object: Value, name: &str, v
         unreachable!()
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8(name)),
+        PropertyKey::Named(EcmaString::encode(name)),
         Property::Data {
             value,
             writable: false,
@@ -270,7 +270,7 @@ mod tests {
             .intrinsics
             .global("Symbol")
             .expect("Symbol is installed");
-        let key = PropertyKey::Named(EcmaString::from_utf8("dispose"));
+        let key = PropertyKey::Named(EcmaString::encode("dispose"));
         let descriptor = machine
             .own_descriptor(symbol, &key)
             .expect("descriptor lookup succeeds")
@@ -332,7 +332,7 @@ mod tests {
             "Symbol.asyncDispose description must be 'Symbol.asyncDispose'"
         );
         assert_eq!(first, second, "Symbol.asyncDispose identity must be stable");
-        let key = PropertyKey::Named(EcmaString::from_utf8("asyncDispose"));
+        let key = PropertyKey::Named(EcmaString::encode("asyncDispose"));
         match machine
             .own_descriptor(symbol, &key)
             .expect("descriptor lookup succeeds")
@@ -373,10 +373,7 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first, machine.intrinsics.builtins.symbol_species());
         let descriptor = machine
-            .own_descriptor(
-                symbol,
-                &PropertyKey::Named(EcmaString::from_utf8("species")),
-            )
+            .own_descriptor(symbol, &PropertyKey::Named(EcmaString::encode("species")))
             .expect("descriptor lookup succeeds")
             .expect("Symbol.species is defined");
         assert!(matches!(
@@ -412,7 +409,7 @@ mod tests {
         );
         assert_eq!(first, second, "Symbol.unscopables identity must be stable");
         assert_eq!(first, machine.intrinsics.builtins.symbol_unscopables());
-        let key = PropertyKey::Named(EcmaString::from_utf8("unscopables"));
+        let key = PropertyKey::Named(EcmaString::encode("unscopables"));
         match machine
             .own_descriptor(symbol, &key)
             .expect("descriptor lookup succeeds")
@@ -445,7 +442,7 @@ mod tests {
             .get_named_property(symbol_constructor, "for")
             .expect("Symbol.for is installed");
         let key = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("key")))
+            .allocate(HeapEntry::String(EcmaString::encode("key")))
             .expect("registry key allocation succeeds");
         let before = (
             machine.heap.len(),
@@ -520,7 +517,7 @@ mod tests {
     fn constructor_with_prototype(machine: &mut Machine<'_, TestHost>, prototype: Value) -> Value {
         let mut properties = PropertyMap::default();
         properties.insert(
-            PropertyKey::Named(EcmaString::from_utf8("prototype")),
+            PropertyKey::Named(EcmaString::encode("prototype")),
             Property::Data {
                 value: prototype,
                 writable: true,

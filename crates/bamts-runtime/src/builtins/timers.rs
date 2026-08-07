@@ -17,9 +17,9 @@ pub(crate) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let set_timeout = install_function(heap, builtins, "setTimeout", 2, set_timeout::<H>);
-    globals.insert(EcmaString::from_utf8("setTimeout"), set_timeout);
+    globals.insert(EcmaString::encode("setTimeout"), set_timeout);
     let clear_timeout = install_function(heap, builtins, "clearTimeout", 1, clear_timeout::<H>);
-    globals.insert(EcmaString::from_utf8("clearTimeout"), clear_timeout);
+    globals.insert(EcmaString::encode("clearTimeout"), clear_timeout);
 }
 
 fn set_timeout<H: Host>(
