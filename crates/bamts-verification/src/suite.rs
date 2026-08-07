@@ -416,19 +416,27 @@ pub fn run_suite(
     // ShardPlan
     let planned = plan_cells(&verified.snapshot.ledger, filters)?;
 
-    // S2 check-cell context: the diagnostic code map is loaded once per run
-    // (U2.8), and only when an included diagnostics check cell is planned —
-    // parse-only and skip-class runs never touch it.
+    // S2 check-cell context: the diagnostic code map and baseline groups are
+    // loaded once per run (U2.8), and only when an included check cell is
+    // planned for a facet that needs them — parse-only and skip-class runs
+    // never touch them.
     let check_context = planned
         .iter()
         .any(|plan| {
             matches!(plan.entry.status, Status::Included)
                 && matches!(plan.backend, Backend::Check)
-                && matches!(plan.entry.facet, Facet::Diagnostics)
+                && matches!(
+                    plan.entry.facet,
+                    Facet::Diagnostics | Facet::Types | Facet::Symbols
+                )
         })
         .then(|| {
-            crate::facets::load_diagnostic_code_map(workspace_root)
-                .map(|code_map| crate::check_cells::CheckContext { code_map })
+            let code_map = crate::facets::load_diagnostic_code_map(workspace_root)?;
+            let baseline_groups = crate::check_cells::baseline_groups(&verified.snapshot.index);
+            Ok(crate::check_cells::CheckContext {
+                code_map,
+                baseline_groups,
+            })
         })
         .transpose()?;
 
@@ -621,9 +629,41 @@ fn execute_check_cell(
             crate::check_cells::execute_diagnostics_check(ctx, snapshot, plan, index_entry)
         }
         // U2.8 Phase B: the S2 `types` observation is wired.
-        Facet::Types => crate::check_cells::execute_types_check(snapshot, plan, index_entry),
+        Facet::Types => {
+            let Some(ctx) = ctx else {
+                return Ok(CellResult {
+                    entry_id: plan.entry.id.clone(),
+                    facet: plan.entry.facet,
+                    backend: plan.backend,
+                    class: FailureClass::HarnessError,
+                    detail: "types check context not loaded".to_owned(),
+                });
+            };
+            crate::check_cells::execute_types_check(
+                snapshot,
+                &ctx.baseline_groups,
+                plan,
+                index_entry,
+            )
+        }
         // U2.8 Phase C: the S2 `symbols` observation is wired.
-        Facet::Symbols => crate::check_cells::execute_symbols_check(snapshot, plan, index_entry),
+        Facet::Symbols => {
+            let Some(ctx) = ctx else {
+                return Ok(CellResult {
+                    entry_id: plan.entry.id.clone(),
+                    facet: plan.entry.facet,
+                    backend: plan.backend,
+                    class: FailureClass::HarnessError,
+                    detail: "symbols check context not loaded".to_owned(),
+                });
+            };
+            crate::check_cells::execute_symbols_check(
+                snapshot,
+                &ctx.baseline_groups,
+                plan,
+                index_entry,
+            )
+        }
         other => Ok(CellResult {
             entry_id: plan.entry.id.clone(),
             facet: plan.entry.facet,

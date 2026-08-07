@@ -202,6 +202,9 @@ pub struct SourcePosition {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct FacetDiagnostic {
+    /// Unit basename (`b.ts`) the diagnostic belongs to, so two diagnostics
+    /// at the same line/column in different files never compare equal.
+    pub unit: String,
     pub position: SourcePosition,
     pub category: DiagnosticCategory,
     pub severity: FacetSeverity,
@@ -396,7 +399,9 @@ fn is_well_formed_bamts_code(code: &str) -> bool {
     digits.len() == 3 && digits.chars().all(|ch| ch.is_ascii_digit())
 }
 
-/// Compares diagnostics on position, category, severity, and code correspondence.
+/// Compares diagnostics on unit, position, category, severity, and code
+/// correspondence. The unit basename is checked first so two diagnostics at
+/// the same line/column in different files never compare equal.
 pub fn compare_diagnostics(
     expected: &[FacetDiagnostic],
     actual: &[FacetDiagnostic],
@@ -404,8 +409,8 @@ pub fn compare_diagnostics(
 ) -> FacetVerdict {
     let mut expected_rows = expected.to_vec();
     let mut actual_rows = actual.to_vec();
-    // Sort by position/category/severity plus a correspondence-canonical code so
-    // BAMTS↔TS pairs still align when raw code strings reverse lexical order.
+    // Sort by unit/position/category/severity plus a correspondence-canonical
+    // code so BAMTS↔TS pairs still align when raw code strings reverse order.
     expected_rows.sort_by_key(|row| diagnostic_sort_key(row, code_map));
     actual_rows.sort_by_key(|row| diagnostic_sort_key(row, code_map));
 
@@ -420,6 +425,14 @@ pub fn compare_diagnostics(
     }
 
     for (index, (left, right)) in expected_rows.iter().zip(actual_rows.iter()).enumerate() {
+        if left.unit != right.unit {
+            return FacetVerdict::Fail {
+                reason: format!(
+                    "diagnostic[{index}] unit mismatch: expected {} actual {}",
+                    left.unit, right.unit
+                ),
+            };
+        }
         if left.position != right.position {
             return FacetVerdict::Fail {
                 reason: format!(
@@ -463,8 +476,15 @@ pub fn compare_diagnostics(
 fn diagnostic_sort_key(
     row: &FacetDiagnostic,
     code_map: &DiagnosticCodeMap,
-) -> (SourcePosition, DiagnosticCategory, FacetSeverity, String) {
+) -> (
+    String,
+    SourcePosition,
+    DiagnosticCategory,
+    FacetSeverity,
+    String,
+) {
     (
+        row.unit.clone(),
         row.position,
         row.category,
         row.severity,
@@ -1945,6 +1965,7 @@ mod tests {
         code: &str,
     ) -> FacetDiagnostic {
         FacetDiagnostic {
+            unit: String::new(),
             position: SourcePosition { line, character },
             category,
             severity,

@@ -48,6 +48,9 @@ const BASELINE_REFERENCE_PREFIX: &str = "tests/baselines/reference/";
 pub struct CheckContext {
     /// The validated BAMTS↔TS diagnostic correspondence table.
     pub code_map: DiagnosticCodeMap,
+    /// Stem/suffix baseline groups built once from the snapshot index, so the
+    /// per-cell executors do not rescan the entire index on every invocation.
+    pub baseline_groups: BaselineGroups,
 }
 
 /// One unit of a case blob: the split at each `// @filename:` directive.
@@ -842,15 +845,27 @@ pub fn entry_virtual_path(logical_path: &str, units: &[CaseUnit]) -> String {
         })
 }
 
+/// Basename of a virtual path (`foo/b.ts` ⇒ `b.ts`), matching the unit name a
+/// baseline prints so both sides of the diagnostics comparator agree.
+fn unit_basename(virtual_path: &str) -> String {
+    virtual_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(virtual_path)
+        .to_owned()
+}
+
 /// Flatten a checked case into the diagnostics comparator's actual side.
 ///
 /// Positions are 1-based line / 0-based UTF-16 character over the unit text;
 /// BAMTS codes carry their `BAMTS-*` spelling for the code map, category
 /// follows `error` vs `warning`, and severity mirrors the compiler's
-/// error/warning split.
+/// error/warning split. The unit basename is carried so a cross-unit position
+/// collision cannot pass the check.
 pub fn collect_facet_diagnostics(case: &CheckedCase) -> Vec<FacetDiagnostic> {
     let mut diagnostics = Vec::new();
     for (unit, output) in case.reached_units() {
+        let unit_name = unit_basename(&unit.virtual_path);
         let source = SourceText::new(unit.text.clone())
             .unwrap_or_else(|_| panic!("unit text was bound-checked before compile"));
         for diagnostic in output.diagnostics() {
@@ -867,6 +882,7 @@ pub fn collect_facet_diagnostics(case: &CheckedCase) -> Vec<FacetDiagnostic> {
                 DiagnosticSeverity::Warning => DiagnosticCategory::Warning,
             };
             diagnostics.push(FacetDiagnostic {
+                unit: unit_name.clone(),
                 position: SourcePosition { line, character },
                 category,
                 severity,
@@ -880,6 +896,8 @@ pub fn collect_facet_diagnostics(case: &CheckedCase) -> Vec<FacetDiagnostic> {
 /// Union the owned `.errors.txt` baselines into the comparator's expected
 /// side. File-less global rows stay out: the compiler has no global-diagnostic
 /// observation yet (they name option-deprecation semantics owned by S7/S5).
+/// The unit basename printed by the baseline is carried through so a
+/// cross-unit position collision cannot pass the check.
 pub fn expected_facet_diagnostics(
     snapshot: &SuiteSnapshot,
     baselines: &DiagnosticsBaselines,
@@ -906,6 +924,7 @@ pub fn expected_facet_diagnostics(
                 FacetSeverity::Error
             };
             expected.push(FacetDiagnostic {
+                unit: row.unit,
                 position: SourcePosition {
                     line: row.line,
                     character: row.character,
@@ -965,7 +984,7 @@ pub(crate) fn execute_diagnostics_check(
     let pragmas = parse_case_pragmas(&text);
     let units = split_case_units(&index_entry.logical_path, &text);
     let entry = entry_virtual_path(&index_entry.logical_path, &units);
-    let groups = baseline_groups(&snapshot.index);
+    let groups = &ctx.baseline_groups;
     let compile_options: Vec<(String, String)> = pragmas
         .options
         .iter()
@@ -973,7 +992,7 @@ pub(crate) fn execute_diagnostics_check(
         .collect();
     let baselines = resolve_errors_baselines(
         snapshot,
-        &groups,
+        groups,
         &index_entry.logical_path,
         &compile_options,
     );
@@ -1392,6 +1411,7 @@ pub fn check_types(
 /// classification/execution drift `HARNESS_ERROR`.
 pub(crate) fn execute_types_check(
     snapshot: &SuiteSnapshot,
+    groups: &BaselineGroups,
     plan: &PlannedCell,
     index_entry: &IndexEntry,
 ) -> Result<CellResult> {
@@ -1406,8 +1426,7 @@ pub(crate) fn execute_types_check(
     let pragmas = parse_case_pragmas(&text);
     let units = split_case_units(&index_entry.logical_path, &text);
     let entry = entry_virtual_path(&index_entry.logical_path, &units);
-    let groups = baseline_groups(&snapshot.index);
-    let baseline_path = resolve_types_baseline(&groups, &index_entry.logical_path);
+    let baseline_path = resolve_types_baseline(groups, &index_entry.logical_path);
 
     let (class, detail) = match compile_case_with_pragmas(&units, &entry, &pragmas) {
         Err(error) => {
@@ -1726,6 +1745,7 @@ pub fn check_symbols(
 /// drift `HARNESS_ERROR`.
 pub(crate) fn execute_symbols_check(
     snapshot: &SuiteSnapshot,
+    groups: &BaselineGroups,
     plan: &PlannedCell,
     index_entry: &IndexEntry,
 ) -> Result<CellResult> {
@@ -1740,8 +1760,7 @@ pub(crate) fn execute_symbols_check(
     let pragmas = parse_case_pragmas(&text);
     let units = split_case_units(&index_entry.logical_path, &text);
     let entry = entry_virtual_path(&index_entry.logical_path, &units);
-    let groups = baseline_groups(&snapshot.index);
-    let baseline_path = resolve_symbols_baseline(&groups, &index_entry.logical_path);
+    let baseline_path = resolve_symbols_baseline(groups, &index_entry.logical_path);
 
     let (class, detail) = match compile_case_with_pragmas(&units, &entry, &pragmas) {
         Err(error) => {
@@ -1822,6 +1841,7 @@ mod tests {
 
         // `undefinedName` starts at 0-based UTF-16 column 8 (TS prints 1:9).
         let expected = vec![FacetDiagnostic {
+            unit: "endToEndPin.ts".to_owned(),
             position: SourcePosition {
                 line: 1,
                 character: 8,
@@ -1870,6 +1890,7 @@ mod tests {
         );
 
         let expected = vec![FacetDiagnostic {
+            unit: "f2.ts".to_owned(),
             position: SourcePosition {
                 line: 1,
                 character: 8,
@@ -1896,6 +1917,44 @@ mod tests {
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let verdict = compare_diagnostics(&[], &actual, &code_map);
         assert_eq!(verdict, FacetVerdict::Pass);
+    }
+
+    /// Regression: two diagnostics at the same line/column in different files
+    /// must not compare equal. Before the unit field was carried through
+    /// `FacetDiagnostic`, the comparator keyed only on position/category/
+    /// severity/code and a cross-unit collision silently passed.
+    #[test]
+    fn diagnostics_cross_unit_position_collision_is_detected() {
+        let code_map = repo_code_map();
+        let expected = vec![FacetDiagnostic {
+            unit: "a.ts".to_owned(),
+            position: SourcePosition {
+                line: 3,
+                character: 5,
+            },
+            category: DiagnosticCategory::Error,
+            severity: FacetSeverity::Error,
+            code: "TS2304".to_owned(),
+        }];
+        let actual = vec![FacetDiagnostic {
+            unit: "b.ts".to_owned(),
+            position: SourcePosition {
+                line: 3,
+                character: 5,
+            },
+            category: DiagnosticCategory::Error,
+            severity: FacetSeverity::Error,
+            code: "TS2304".to_owned(),
+        }];
+        let verdict = compare_diagnostics(&expected, &actual, &code_map);
+        assert!(
+            verdict.is_fail(),
+            "same position in different files must fail, got {verdict:?}"
+        );
+        assert!(
+            format!("{verdict:?}").contains("unit mismatch"),
+            "failure must name the unit mismatch, got {verdict:?}"
+        );
     }
 
     const ANY_AS_CONSTRUCTOR_CASE: &str = "\
