@@ -5307,16 +5307,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 } => {
                     let pattern = self.constant_string(pattern).clone();
                     let flags = self.constant_string(flags).clone();
-                    let mut properties = PropertyMap::default();
-                    properties.insert(
-                        PropertyKey::Named(EcmaString::from_utf8("lastIndex")),
-                        Property::Data {
-                            value: Value::int32(0),
-                            writable: true,
-                            enumerable: false,
-                            configurable: false,
-                        },
-                    );
+                    let properties = intrinsics::builtins::initial_regexp_properties();
                     let value = self
                         .allocate(HeapEntry::RegExp {
                             pattern,

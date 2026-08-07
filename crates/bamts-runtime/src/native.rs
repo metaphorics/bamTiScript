@@ -67,9 +67,8 @@ use crate::intrinsics::BuiltinOutcome;
 use crate::{
     CalleeKind, EvalFailure, Execution, ExecutionOutcome, GeneratorResume, GeneratorStart,
     GeneratorState, GetOutcome, HeapEntry, Host, IteratorNextPrepared, Limits, Machine, Property,
-    PropertyKey, PropertyMap, RuntimeError, RuntimeErrorKind, SetOutcome, SuspendedActivation,
-    ThrowOrigin, accessor_from_selector, binary_from_selector, iterator_kind_from_selector,
-    unary_from_selector,
+    PropertyMap, RuntimeError, RuntimeErrorKind, SetOutcome, SuspendedActivation, ThrowOrigin,
+    accessor_from_selector, binary_from_selector, iterator_kind_from_selector, unary_from_selector,
 };
 
 // -- ABI selector encoders (inverse of the shared `*_from_selector` decoders) --
@@ -3328,16 +3327,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     let pattern = self.constant_text(module, pattern);
                     let flags = self.constant_text(module, flags);
                     let prototype = self.machine.borrow().intrinsics.regexp_prototype();
-                    let mut properties = PropertyMap::default();
-                    properties.insert(
-                        PropertyKey::Named(EcmaString::from_utf8("lastIndex")),
-                        Property::Data {
-                            value: Value::int32(0),
-                            writable: true,
-                            enumerable: false,
-                            configurable: false,
-                        },
-                    );
+                    let properties = crate::intrinsics::builtins::initial_regexp_properties();
                     self.allocated(HeapEntry::RegExp {
                         pattern,
                         flags,

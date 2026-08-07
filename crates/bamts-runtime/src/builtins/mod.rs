@@ -16,7 +16,7 @@ mod number;
 mod object;
 mod promise;
 mod regexp;
-pub(crate) use regexp::canonical_source;
+pub(crate) use regexp::{canonical_source, initial_regexp_properties};
 mod string;
 mod symbol;
 #[cfg(test)]
