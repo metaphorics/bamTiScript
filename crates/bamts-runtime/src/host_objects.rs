@@ -93,12 +93,7 @@ pub(crate) fn install<H: Host>(
         EcmaString::encode("globalThis"),
         global_this,
     );
-    define_global_data(
-        heap,
-        global_this,
-        EcmaString::encode("global"),
-        global_this,
-    );
+    define_global_data(heap, global_this, EcmaString::encode("global"), global_this);
     globals.insert(EcmaString::encode("global"), global_this);
     globals.insert(EcmaString::encode("globalThis"), global_this);
 }
@@ -310,6 +305,22 @@ fn process_next_tick<H: Host>(
         .call_value(callback, Value::UNDEFINED, rest)
         .map(BuiltinOutcome::Value)
 }
+/// Node's `util.inspect` default `maxArrayLength` — show at most this many
+/// elements of an Array or typed array, then append `... N more items`.
+/// A `Uint8Array` is a bulk buffer, so unbounded formatting turns a 10 MB
+/// log line into hundreds of megabytes of string allocation.
+const INSPECT_MAX_ITEMS: usize = 100;
+
+/// Joins formatted element strings, capping at [`INSPECT_MAX_ITEMS`] and
+/// appending a `... N more items` marker like Node's `util.inspect`.
+fn join_bounded(parts: Vec<String>, total: usize) -> String {
+    if total <= INSPECT_MAX_ITEMS {
+        parts.join(", ")
+    } else {
+        let remaining = total - INSPECT_MAX_ITEMS;
+        format!("{}, ... {remaining} more items", parts.join(", "))
+    }
+}
 
 impl<H: Host> Machine<'_, H> {
     fn console_format(
@@ -351,25 +362,29 @@ impl<H: Host> Machine<'_, H> {
                         if depth >= 2 {
                             return Ok("[Array]".to_owned());
                         }
-                        let mut parts = Vec::with_capacity(elements.len());
-                        for element in elements {
+                        let total = elements.len();
+                        let take = total.min(INSPECT_MAX_ITEMS);
+                        let mut parts = Vec::with_capacity(take);
+                        for element in &elements[..take] {
                             if *element == Value::HOLE {
                                 parts.push("<1 empty item>".to_owned());
                             } else {
                                 parts.push(self.console_format(*element, false, depth + 1)?);
                             }
                         }
-                        Ok(format!("[ {} ]", parts.join(", ")))
+                        Ok(format!("[ {} ]", join_bounded(parts, total)))
                     }
                     HeapEntry::Uint8Array { bytes, .. } => {
                         if depth >= 2 {
                             return Ok("[Uint8Array]".to_owned());
                         }
-                        let elements = bytes.iter().map(u8::to_string).collect::<Vec<_>>();
+                        let total = bytes.len();
+                        let take = total.min(INSPECT_MAX_ITEMS);
+                        let parts: Vec<String> = bytes[..take].iter().map(u8::to_string).collect();
                         Ok(format!(
                             "Uint8Array({}) [ {} ]",
-                            bytes.len(),
-                            elements.join(", ")
+                            total,
+                            join_bounded(parts, total)
                         ))
                     }
                     HeapEntry::Object { properties, .. }
@@ -450,4 +465,145 @@ pub(crate) fn text_bytes_lossy(text: &EcmaString) -> Vec<u8> {
 
 pub(crate) fn env_value_text_lossy(text: &EcmaString) -> String {
     String::from_utf8(text_bytes_lossy(text)).expect("lossy UTF-8 conversion is valid")
+}
+
+#[cfg(test)]
+mod tests {
+    use bamts_bytecode::{
+        Constant, ConstantId, EcmaString, Function, FunctionFlags, FunctionId, Instruction, Module,
+        ModuleId, Program, ProgramModule, Verified,
+    };
+    use bamts_native::Value;
+
+    use crate::{HeapEntry, Host, Limits, Machine, PropertyMap};
+
+    struct TestHost;
+    impl Host for TestHost {}
+
+    fn blank_program() -> Program<Verified> {
+        let code = Module::new(
+            vec![Constant::String(EcmaString::encode("test"))],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                1,
+                FunctionFlags::default(),
+                vec![Instruction::Halt],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("valid test module");
+        Program::link(
+            vec![ProgramModule {
+                name: ConstantId::new(0),
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect("valid test program")
+    }
+
+    fn make_uint8array(machine: &mut Machine<'_, TestHost>, bytes: Vec<u8>) -> Value {
+        machine
+            .allocate(HeapEntry::Uint8Array {
+                bytes,
+                properties: PropertyMap::default(),
+                prototype: None,
+                extensible: true,
+            })
+            .expect("allocation succeeds")
+    }
+
+    fn make_array(machine: &mut Machine<'_, TestHost>, elements: Vec<Value>) -> Value {
+        machine
+            .allocate(HeapEntry::Array {
+                elements,
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.array_prototype),
+                extensible: true,
+                length_writable: true,
+            })
+            .expect("allocation succeeds")
+    }
+
+    #[test]
+    fn small_uint8array_format_is_unchanged() {
+        let program = blank_program();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let value = make_uint8array(&mut machine, vec![10, 20, 30]);
+        assert_eq!(
+            machine.console_format(value, true, 0).unwrap(),
+            "Uint8Array(3) [ 10, 20, 30 ]"
+        );
+    }
+
+    #[test]
+    fn large_uint8array_format_is_bounded() {
+        let program = blank_program();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let value = make_uint8array(&mut machine, vec![0u8; 150]);
+        let formatted = machine.console_format(value, true, 0).unwrap();
+        assert!(
+            formatted.starts_with("Uint8Array(150) [ "),
+            "got: {formatted}"
+        );
+        assert!(
+            formatted.ends_with("... 50 more items ]"),
+            "got: {formatted}"
+        );
+        // 100 shown elements produce 99 inter-element commas plus 1 before the
+        // marker — proving only the prefix was formatted, not all 150.
+        assert_eq!(formatted.matches(',').count(), 100);
+    }
+
+    #[test]
+    fn small_array_format_is_unchanged() {
+        let program = blank_program();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let value = make_array(
+            &mut machine,
+            vec![Value::int32(1), Value::int32(2), Value::int32(3)],
+        );
+        assert_eq!(
+            machine.console_format(value, true, 0).unwrap(),
+            "[ 1, 2, 3 ]"
+        );
+    }
+
+    #[test]
+    fn large_array_format_is_bounded() {
+        let program = blank_program();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let elements: Vec<Value> = (0..150).map(|_| Value::int32(0)).collect();
+        let value = make_array(&mut machine, elements);
+        let formatted = machine.console_format(value, true, 0).unwrap();
+        assert!(formatted.starts_with("[ "), "got: {formatted}");
+        assert!(
+            formatted.ends_with("... 50 more items ]"),
+            "got: {formatted}"
+        );
+        assert_eq!(formatted.matches(',').count(), 100);
+    }
+
+    #[test]
+    fn exactly_cap_elements_are_not_truncated() {
+        let program = blank_program();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let bytes: Vec<u8> = (0..100u8).collect();
+        let value = make_uint8array(&mut machine, bytes);
+        let formatted = machine.console_format(value, true, 0).unwrap();
+        assert!(!formatted.contains("more items"));
+        assert!(formatted.starts_with("Uint8Array(100) [ "));
+    }
 }
