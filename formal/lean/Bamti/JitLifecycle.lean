@@ -341,10 +341,11 @@ def providerResultState : ProviderResult → ProviderPhase
   | .rejected next => next
 
 /-- W^X transitions for one provider. Allocation may repeat while writable.
-Finalization either publishes executable mappings or frees every mapping.
-Free changes a live phase to freed; later frees are accepted no-ops.
-Every action from a phase without an accepted rule is explicitly rejected,
-matching the totality pattern of `JitStep` above. -/
+Finalization from the writable phase either publishes executable mappings or
+frees every mapping. Finalization from any other phase is refused and leaves
+the phase unchanged. Free changes a live phase to freed; later frees are
+accepted no-ops. Every action from a phase without an accepted rule is
+explicitly rejected, matching the totality pattern of `JitStep` above. -/
 inductive ProviderStep : ProviderPhase → ProviderAction → ProviderResult → Prop where
   | allocateAccepted :
       ProviderStep .Writable .allocate (.accepted .Writable)
@@ -382,7 +383,11 @@ theorem provider_finalization_exactly_once (p q : ProviderPhase)
   cases h
   exact ⟨rfl, rfl, fun h2 => by cases h2⟩
 
-theorem provider_finalization_failure_reclaims (p q : ProviderPhase)
+/-- A refused finalization never yields a writable phase, and never enables a
+later allocation or finalization. It does not imply reclamation; see
+`provider_finalization_failure_frees` for the writable-phase failure case,
+which is the only refused-finalization branch that reclaims. -/
+theorem provider_finalization_failure_never_writable (p q : ProviderPhase)
     (h : ProviderStep p .finalize (.rejected q)) :
     q ≠ .Writable ∧
       (∀ next, ¬ ProviderStep q .allocate (.accepted next)) ∧
@@ -408,6 +413,18 @@ theorem provider_finalization_failure_reclaims (p q : ProviderPhase)
       · intro next h2
         cases h2
         exact hp rfl
+
+/-- Failed finalization of a writable provider frees every mapping: the only
+refused-finalization branch that starts from `.Writable` lands in `.Freed`.
+This is the reclamation claim; it holds only under the narrower hypothesis
+`p = .Writable`, whereas `provider_finalization_failure_never_writable` holds
+for any starting phase. -/
+theorem provider_finalization_failure_frees (q : ProviderPhase)
+    (h : ProviderStep .Writable .finalize (.rejected q)) :
+    q = .Freed := by
+  cases h with
+  | finalizeFailed => rfl
+  | finalizeRejected _ hp => exact absurd rfl hp
 
 theorem provider_free_is_idempotent (p q : ProviderPhase)
     (h : ProviderStep p .free (.accepted q)) :
