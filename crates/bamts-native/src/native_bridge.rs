@@ -1928,6 +1928,9 @@ const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u3
     bamts_require_close_result; // 35
 const _: unsafe extern "C" fn(*mut ShadowFrame, u64, *mut Completion) -> u32 = bamts_to_object; // 36
 const _: unsafe extern "C" fn(*mut ShadowFrame, u64, *mut Completion) -> u32 = bamts_import_dynamic; // 37
+const _: unsafe extern "C" fn(*mut ShadowFrame, *mut Completion) -> u32 = bamts_load_import_meta; // 38
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u32, u32, *mut Completion) -> u32 =
+    bamts_dispose_capture; // 39
 const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 =
     bamts_suppress_error; // 40
 const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, u64, *mut Completion) -> u32 =
@@ -1940,7 +1943,6 @@ const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, u64, u32, *mut Complet
     bamts_define_own_descriptor_slot; // 44
 const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 =
     bamts_with_has_binding; // 45
-const _: unsafe extern "C" fn(*mut ShadowFrame, *mut Completion) -> u32 = bamts_load_import_meta; // 38
 
 // -- Native entry invocation seam --------------------------------------------
 
