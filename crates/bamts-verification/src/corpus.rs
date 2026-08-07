@@ -876,79 +876,34 @@ impl BamtsRunner {
         }
     }
 
-    /// Runs one validated case through the bytecode interpreter in-process.
-    /// Runtime fuel is selected from the case's remaining wall-time budget.
+    /// Runs one validated case through the bytecode interpreter in a killable
+    /// worker process, so a stuck host call is wall-clock bounded just like
+    /// the JIT and AOT paths.  Fuel still bounds interpreted compute loops.
     fn run_interpreter(&self, spec: &CaseSpec) -> Result<OracleOutcome> {
-        let entrypoint = self.root.join(&spec.entrypoint);
         let started = Instant::now();
-        let args = cli_args(
-            Mode::Run,
-            ExecutionTarget::Jit,
-            entrypoint.clone(),
-            None,
-            case_requires_javascript_compatibility(spec),
-            &spec.compiler_args,
-        )?;
-        let executable = driver::compile_program(&args)
-            .map_err(|error| driver_error(spec, ExecutionMode::Interpreter, &error))?;
-        let remaining = spec.timeout().saturating_sub(started.elapsed());
-        if remaining.is_zero() {
+        let artifacts = ArtifactDirectory::create(&self.root, spec, ExecutionMode::Interpreter)
+            .map_err(|error| corpus_stage_error(CorpusStage::Spawn, error))?;
+        let Some(budget) = remaining_case_budget(spec.timeout(), started.elapsed()) else {
             return Ok(timeout_outcome(Vec::new(), self.max_output_bytes));
+        };
+        let request = WorkerRequest {
+            root: self.root.clone(),
+            spec: spec.clone(),
+            operation: WorkerOperation::Interpreter,
+            max_output_bytes: self.max_output_bytes,
+            executable: None,
+        };
+        match run_worker(&artifacts, &request, budget)? {
+            WorkerRun::TimedOut(outcome) => Ok(outcome),
+            WorkerRun::Completed(WorkerResponse::Outcome(outcome)) => Ok(outcome),
+            WorkerRun::Completed(WorkerResponse::Failure(failure)) => {
+                Err(mode_failure(spec, ExecutionMode::Interpreter, failure))
+            }
+            WorkerRun::Completed(WorkerResponse::Compile { .. }) => Err(VerificationError::new(
+                ErrorCode::ToolFailed,
+                "corpus interpreter worker returned a compile response",
+            )),
         }
-
-        let mut host = bamts_node::NodeHost::new();
-        host.set_script_compiler(Box::new(bamts_node::ScriptCompiler));
-        host.set_argv(["bamts".to_owned(), entrypoint.display().to_string()]);
-        let limits = interpreter_limits(remaining);
-        let outcome = match bamts_runtime::run(executable.wire(), &mut host, &limits) {
-            Ok(outcome) => outcome,
-            Err(error)
-                if matches!(
-                    &error.kind,
-                    bamts_runtime::RuntimeErrorKind::FuelExhausted { .. }
-                ) =>
-            {
-                return Ok(timeout_outcome(
-                    host.stderr().to_vec(),
-                    self.max_output_bytes,
-                ));
-            }
-            Err(error)
-                if matches!(
-                    &error.kind,
-                    bamts_runtime::RuntimeErrorKind::UncaughtThrow { .. }
-                ) =>
-            {
-                return Ok(process_rejection_outcome(
-                    host.stdout().to_vec(),
-                    host.stderr().to_vec(),
-                    self.max_output_bytes,
-                ));
-            }
-            Err(error) => {
-                return Err(facade_error(
-                    spec,
-                    ExecutionMode::Interpreter,
-                    &bamts::Error::from(error),
-                ));
-            }
-        };
-        let mut stdout = host.stdout().to_vec();
-        stdout.extend_from_slice(&outcome.stdout);
-        let exit_code = if host.exit_code() == 0 {
-            outcome.exit_code
-        } else {
-            host.exit_code()
-        };
-        Ok(driver_outcome(
-            driver::CommandOutcome {
-                stdout,
-                stderr: host.stderr().to_vec(),
-                exit_code,
-            },
-            started.elapsed() >= spec.timeout(),
-            self.max_output_bytes,
-        ))
     }
 
     fn run_jit(&self, spec: &CaseSpec) -> Result<OracleOutcome> {
@@ -1042,6 +997,7 @@ struct WorkerRequest {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 enum WorkerOperation {
+    Interpreter,
     Jit,
     AotCompile,
 }
@@ -1079,6 +1035,14 @@ pub fn run_corpus_worker_from_env() -> Result<()> {
 }
 
 fn execute_worker_request(request: &WorkerRequest) -> Result<WorkerResponse> {
+    match request.operation {
+        WorkerOperation::Interpreter => execute_interpreter_request(request),
+        WorkerOperation::Jit | WorkerOperation::AotCompile => execute_driver_request(request),
+    }
+}
+
+/// JIT/AOT worker: compiles and executes via the public driver in-process.
+fn execute_driver_request(request: &WorkerRequest) -> Result<WorkerResponse> {
     let (mode, target, output) = match request.operation {
         WorkerOperation::Jit => (Mode::Run, ExecutionTarget::Jit, None),
         WorkerOperation::AotCompile => (
@@ -1086,6 +1050,9 @@ fn execute_worker_request(request: &WorkerRequest) -> Result<WorkerResponse> {
             ExecutionTarget::Aot,
             request.executable.as_deref(),
         ),
+        WorkerOperation::Interpreter => {
+            unreachable!("interpreter requests are handled by execute_interpreter_request")
+        }
     };
     let args = cli_args(
         mode,
@@ -1105,6 +1072,9 @@ fn execute_worker_request(request: &WorkerRequest) -> Result<WorkerResponse> {
             WorkerOperation::AotCompile => Ok(WorkerResponse::Compile {
                 stderr: outcome.stderr,
             }),
+            WorkerOperation::Interpreter => {
+                unreachable!("interpreter requests are handled by execute_interpreter_request")
+            }
         },
         Err(error) if is_unhandled_driver_throw(&error) => {
             Ok(WorkerResponse::Outcome(process_rejection_outcome(
@@ -1117,6 +1087,89 @@ fn execute_worker_request(request: &WorkerRequest) -> Result<WorkerResponse> {
             &error,
         ))),
     }
+}
+
+/// Interpreter worker: compiles to bytecode and runs it in-process through
+/// `bamts_runtime::run` against a Node host.  Fuel bounds interpreted loops,
+/// while the enclosing worker process is wall-clock killable by `run_worker`.
+fn execute_interpreter_request(request: &WorkerRequest) -> Result<WorkerResponse> {
+    let entrypoint = request.root.join(&request.spec.entrypoint);
+    let started = Instant::now();
+    let args = cli_args(
+        Mode::Run,
+        ExecutionTarget::Jit,
+        entrypoint.clone(),
+        None,
+        case_requires_javascript_compatibility(&request.spec),
+        &request.spec.compiler_args,
+    )?;
+    let executable = match driver::compile_program(&args) {
+        Ok(executable) => executable,
+        Err(error) => {
+            return Ok(WorkerResponse::Failure(CorpusFailure::from_driver_error(
+                &error,
+            )));
+        }
+    };
+    let remaining = request.spec.timeout().saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Ok(WorkerResponse::Outcome(timeout_outcome(
+            Vec::new(),
+            request.max_output_bytes,
+        )));
+    }
+
+    let mut host = bamts_node::NodeHost::new();
+    host.set_script_compiler(Box::new(bamts_node::ScriptCompiler));
+    host.set_argv(["bamts".to_owned(), entrypoint.display().to_string()]);
+    let limits = interpreter_limits(remaining);
+    let outcome = match bamts_runtime::run(executable.wire(), &mut host, &limits) {
+        Ok(outcome) => outcome,
+        Err(error)
+            if matches!(
+                &error.kind,
+                bamts_runtime::RuntimeErrorKind::FuelExhausted { .. }
+            ) =>
+        {
+            return Ok(WorkerResponse::Outcome(timeout_outcome(
+                host.stderr().to_vec(),
+                request.max_output_bytes,
+            )));
+        }
+        Err(error)
+            if matches!(
+                &error.kind,
+                bamts_runtime::RuntimeErrorKind::UncaughtThrow { .. }
+            ) =>
+        {
+            return Ok(WorkerResponse::Outcome(process_rejection_outcome(
+                host.stdout().to_vec(),
+                host.stderr().to_vec(),
+                request.max_output_bytes,
+            )));
+        }
+        Err(error) => {
+            return Ok(WorkerResponse::Failure(CorpusFailure::from_facade_error(
+                &bamts::Error::from(error),
+            )));
+        }
+    };
+    let mut stdout = host.stdout().to_vec();
+    stdout.extend_from_slice(&outcome.stdout);
+    let exit_code = if host.exit_code() == 0 {
+        outcome.exit_code
+    } else {
+        host.exit_code()
+    };
+    Ok(WorkerResponse::Outcome(driver_outcome(
+        driver::CommandOutcome {
+            stdout,
+            stderr: host.stderr().to_vec(),
+            exit_code,
+        },
+        started.elapsed() >= request.spec.timeout(),
+        request.max_output_bytes,
+    )))
 }
 
 fn run_worker(
@@ -1355,18 +1408,6 @@ impl Drop for ArtifactDirectory {
     }
 }
 
-fn facade_error(spec: &CaseSpec, mode: ExecutionMode, error: &bamts::Error) -> VerificationError {
-    mode_failure(spec, mode, CorpusFailure::from_facade_error(error))
-}
-
-fn driver_error(
-    spec: &CaseSpec,
-    mode: ExecutionMode,
-    error: &driver::DriverError,
-) -> VerificationError {
-    mode_failure(spec, mode, CorpusFailure::from_driver_error(error))
-}
-
 fn mode_failure(spec: &CaseSpec, mode: ExecutionMode, failure: CorpusFailure) -> VerificationError {
     VerificationError::new(
         ErrorCode::ToolFailed,
@@ -1520,34 +1561,39 @@ pub(crate) fn run_process(
 
 #[cfg(unix)]
 fn terminate_process_group(child: &mut std::process::Child, label: &str) -> Result<()> {
-    let group = format!("-{}", child.id());
-    let status = Command::new("kill")
-        .args(["-KILL", "--", &group])
-        .status()
-        .map_err(|error| {
-            VerificationError::new(
-                ErrorCode::ToolFailed,
-                format!("cannot terminate {label} process group {group}: {error}"),
-            )
-        })?;
-    if status.success() {
-        return Ok(());
+    // In-process SIGKILL via the std Child handle — no PATH-dependent `kill`
+    // subprocess, no inherited stdout.  The child is the group leader because
+    // `process_group(0)` was set in `run_process` before spawning, so killing
+    // the leader delivers SIGKILL to the whole group.
+    match child.kill() {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            // The process already exited between `try_wait` and here — that
+            // is success, not a harness failure.
+            Ok(())
+        }
+        Err(error) => Err(VerificationError::new(
+            ErrorCode::ToolFailed,
+            format!(
+                "cannot terminate {label} process group {}: {error}",
+                child.id()
+            ),
+        )),
     }
-    let _ = child.kill();
-    Err(VerificationError::new(
-        ErrorCode::ToolFailed,
-        format!("cannot terminate {label} process group {group}: kill exited with {status}"),
-    ))
 }
 
 #[cfg(not(unix))]
 fn terminate_process_group(child: &mut std::process::Child, label: &str) -> Result<()> {
-    child.kill().map_err(|error| {
-        VerificationError::new(
+    match child.kill() {
+        Ok(()) => Ok(()),
+        // The process already exited between `try_wait` and here — that is
+        // success, not a harness failure.
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(VerificationError::new(
             ErrorCode::ToolFailed,
             format!("cannot terminate {label}: {error}"),
-        )
-    })
+        )),
+    }
 }
 
 pub(crate) fn drain_stream<R: Read + Send + 'static>(
