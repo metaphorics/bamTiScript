@@ -4,7 +4,7 @@
 //! There are deliberately no parent links or interior-mutable caches: a parsed
 //! [`SourceFile`] can be shared without changing the tree it describes.
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use crate::diagnostic::Diagnostic;
 use crate::source::{ScriptKind, SourceId, SourceText, TextRange};
@@ -33,6 +33,10 @@ pub enum TokenKind {
     BlockComment,
     Shebang,
     Identifier,
+    /// A reserved word spelled with escapes; valid only in IdentifierName contexts.
+    EscapedReservedWord,
+    /// An escaped `await` or `yield`, whose validity depends on parser context.
+    EscapedContextualKeyword,
     PrivateIdentifier,
     NumericLiteral,
     BigIntLiteral,
@@ -178,6 +182,56 @@ pub enum TokenKind {
     QuestionQuestionEq,
 }
 
+/// Returns the StringValue of an identifier token spelling.
+///
+/// The scanner validates identifier escapes before parser-owned tokens reach
+/// this layer. `None` keeps this helper total for synthetic tokens.
+pub(crate) fn cook_identifier_text(text: &str) -> Option<Cow<'_, str>> {
+    if !text.contains('\\') {
+        return Some(Cow::Borrowed(text));
+    }
+
+    let mut chars = text.chars();
+    let mut cooked = String::with_capacity(text.len());
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            cooked.push(character);
+            continue;
+        }
+        if chars.next()? != 'u' {
+            return None;
+        }
+
+        let first = chars.next()?;
+        let code_point = if first == '{' {
+            let mut value = 0_u32;
+            let mut has_digit = false;
+            loop {
+                let digit = chars.next()?;
+                if digit == '}' {
+                    break;
+                }
+                value = value.checked_mul(16)?.checked_add(digit.to_digit(16)?)?;
+                has_digit = true;
+            }
+            if !has_digit {
+                return None;
+            }
+            value
+        } else {
+            let mut value = first.to_digit(16)?;
+            for _ in 1..4 {
+                value = value
+                    .checked_mul(16)?
+                    .checked_add(chars.next()?.to_digit(16)?)?;
+            }
+            value
+        };
+        cooked.push(char::from_u32(code_point)?);
+    }
+    Some(Cow::Owned(cooked))
+}
+
 /// A grammar node kind. A value of this type can never name a token.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum NodeKind {
@@ -258,6 +312,16 @@ pub enum NodeKind {
     ImportExpression,
     MetaProperty,
     MissingExpression,
+    JsxElement,
+    JsxFragment,
+    JsxSelfClosingElement,
+    JsxOpeningElement,
+    JsxClosingElement,
+    JsxAttribute,
+    JsxSpreadAttribute,
+    JsxExpressionContainer,
+    JsxSpreadChild,
+    JsxText,
     BindingIdentifier,
     ObjectBindingPattern,
     ArrayBindingPattern,
@@ -489,6 +553,7 @@ token_leaf!(BooleanLiteral, BooleanLiteralNode, BooleanLiteral);
 token_leaf!(NullLiteral, NullLiteralNode, NullLiteral);
 token_leaf!(RegexLiteral, RegexLiteralNode, RegexLiteral);
 token_leaf!(TemplateElement, TemplateElementNode, TemplateElement);
+token_leaf!(JsxText, JsxTextNode, JsxText);
 
 /// Recovery payload for an omitted grammar node. Its enclosing [`Node`] still
 /// carries the insertion range and identity.
@@ -893,6 +958,7 @@ impl NodeData for VariableDeclarator {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VariableDeclaration {
+    pub range: TextRange,
     pub kind: VariableKind,
     pub declarations: Vec<VariableDeclaratorNode>,
 }
@@ -916,6 +982,16 @@ pub enum FunctionBody {
     Missing(MissingNode),
 }
 
+impl FunctionBody {
+    pub fn id(&self) -> Option<NodeId> {
+        match self {
+            Self::Block(block) => Some(block.id()),
+            Self::Expression(expression) => Some(expression.id()),
+            Self::Missing(_) => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FunctionDeclaration {
     pub function: FunctionLike,
@@ -937,6 +1013,7 @@ pub struct ArrowFunction {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConstructorDeclaration {
+    pub decorators: Vec<DecoratorNode>,
     pub modifiers: DeclarationModifiers,
     pub parameters: Vec<ParameterNode>,
     pub body: BlockNode,
@@ -953,6 +1030,7 @@ pub struct MethodDeclaration {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClassProperty {
+    pub decorators: Vec<DecoratorNode>,
     pub modifiers: DeclarationModifiers,
     pub name: PropertyName,
     pub optional: bool,
@@ -963,6 +1041,7 @@ pub struct ClassProperty {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AutoAccessor {
+    pub decorators: Vec<DecoratorNode>,
     pub modifiers: DeclarationModifiers,
     pub name: PropertyName,
     pub type_annotation: Option<TypeAnnotationNode>,
@@ -1049,9 +1128,67 @@ impl NodeData for EnumMember {
     }
 }
 
+/// Which keyword introduced an identifier-named namespace or module declaration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NamespaceKeyword {
+    Namespace,
+    Module,
+}
+
+impl NamespaceKeyword {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Namespace => "namespace",
+            Self::Module => "module",
+        }
+    }
+}
+
+/// The name of a namespace or ambient module declaration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NamespaceName {
+    /// `namespace A` / `module A` / dotted segments. Preserves the originating keyword.
+    Identifier {
+        name: IdentifierNode,
+        keyword: NamespaceKeyword,
+    },
+    /// `declare module "pkg"` — ambient external module, type-only.
+    StringLiteral(StringLiteralNode),
+    /// `declare global` — global augmentation, type-only.
+    Global { range: TextRange },
+}
+
+impl NamespaceName {
+    #[must_use]
+    pub fn range(&self) -> TextRange {
+        match self {
+            Self::Identifier { name, .. } => name.range(),
+            Self::StringLiteral(literal) => literal.range(),
+            Self::Global { range } => *range,
+        }
+    }
+
+    #[must_use]
+    pub fn as_identifier(&self) -> Option<&IdentifierNode> {
+        match self {
+            Self::Identifier { name, .. } => Some(name),
+            Self::StringLiteral(_) | Self::Global { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn keyword(&self) -> Option<NamespaceKeyword> {
+        match self {
+            Self::Identifier { keyword, .. } => Some(*keyword),
+            Self::StringLiteral(_) | Self::Global { .. } => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NamespaceDeclaration {
-    pub name: IdentifierNode,
+    pub name: NamespaceName,
     pub body: BlockNode,
 }
 
@@ -1144,6 +1281,7 @@ pub struct ExportAllDeclaration {
 pub enum ExportDefaultValue {
     Function(FunctionLike),
     Class(ClassDeclaration),
+    Interface(InterfaceDeclaration),
     Expression(Box<Expr>),
     Missing(MissingNode),
 }
@@ -1537,7 +1675,7 @@ pub struct SequenceExpression {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AsExpression {
     pub expression: Box<Expr>,
-    pub type_node: Box<Ty>,
+    pub type_node: Option<Box<Ty>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1567,6 +1705,174 @@ pub enum MetaProperty {
 pub struct ImportExpression {
     pub source: Box<Expr>,
     pub options: Option<Box<Expr>>,
+}
+
+// ---------------------------------------------------------------------------
+// JSX
+// ---------------------------------------------------------------------------
+
+/// A JSX element name: `Foo`, a dotted chain `Foo.Bar`, or a namespaced
+/// `ns:Foo`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JsxElementName {
+    Identifier(IdentifierNode),
+    Member(JsxMemberName),
+    Namespace(JsxNamespacedName),
+}
+
+/// A dotted JSX name `object.property`; `object` is itself a name so chains
+/// like `A.B.C` nest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsxMemberName {
+    pub object: Box<JsxElementName>,
+    pub property: IdentifierNode,
+}
+
+/// A namespaced JSX name `namespace:name`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsxNamespacedName {
+    pub namespace: IdentifierNode,
+    pub name: IdentifierNode,
+}
+
+/// A JSX attribute name: a bare identifier or a namespaced `ns:name`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JsxAttributeName {
+    Identifier(IdentifierNode),
+    Namespace(JsxNamespacedName),
+}
+
+/// The value bound to a JSX attribute after `=`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JsxAttributeInitializer {
+    String(StringLiteralNode),
+    Expression(JsxExpressionContainerNode),
+}
+
+/// A single JSX attribute: boolean `name`, `name="value"`, or `name={expr}`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsxAttribute {
+    pub name: JsxAttributeName,
+    pub initializer: Option<JsxAttributeInitializer>,
+}
+
+impl NodeData for JsxAttribute {
+    fn node_kind(&self) -> NodeKind {
+        NodeKind::JsxAttribute
+    }
+}
+
+pub type JsxAttributeNode = Node<JsxAttribute>;
+
+/// A spread attribute `{...expr}`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsxSpreadAttribute {
+    pub expression: Box<Expr>,
+}
+
+impl NodeData for JsxSpreadAttribute {
+    fn node_kind(&self) -> NodeKind {
+        NodeKind::JsxSpreadAttribute
+    }
+}
+
+pub type JsxSpreadAttributeNode = Node<JsxSpreadAttribute>;
+
+/// One item in a JSX opening tag's attribute list.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JsxAttributeItem {
+    Attribute(JsxAttributeNode),
+    Spread(JsxSpreadAttributeNode),
+}
+
+/// A JSX opening tag `<name attrs>`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsxOpeningElement {
+    pub name: JsxElementName,
+    pub attributes: Vec<JsxAttributeItem>,
+}
+
+impl NodeData for JsxOpeningElement {
+    fn node_kind(&self) -> NodeKind {
+        NodeKind::JsxOpeningElement
+    }
+}
+
+pub type JsxOpeningElementNode = Node<JsxOpeningElement>;
+
+/// A JSX closing tag `</name>`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsxClosingElement {
+    pub name: JsxElementName,
+}
+
+impl NodeData for JsxClosingElement {
+    fn node_kind(&self) -> NodeKind {
+        NodeKind::JsxClosingElement
+    }
+}
+
+pub type JsxClosingElementNode = Node<JsxClosingElement>;
+
+/// A `{expr}` expression container used for attribute values and children. The
+/// expression is absent for an empty `{}` container.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsxExpressionContainer {
+    pub expression: Option<Box<Expr>>,
+}
+
+impl NodeData for JsxExpressionContainer {
+    fn node_kind(&self) -> NodeKind {
+        NodeKind::JsxExpressionContainer
+    }
+}
+
+pub type JsxExpressionContainerNode = Node<JsxExpressionContainer>;
+
+/// A `{...expr}` spread child.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsxSpreadChild {
+    pub expression: Box<Expr>,
+}
+
+impl NodeData for JsxSpreadChild {
+    fn node_kind(&self) -> NodeKind {
+        NodeKind::JsxSpreadChild
+    }
+}
+
+pub type JsxSpreadChildNode = Node<JsxSpreadChild>;
+
+/// A child of a JSX element or fragment. `Element` carries a nested
+/// [`Expression::JsxElement`], [`Expression::JsxFragment`], or
+/// [`Expression::JsxSelfClosingElement`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JsxChild {
+    Text(JsxTextNode),
+    ExpressionContainer(JsxExpressionContainerNode),
+    Spread(JsxSpreadChildNode),
+    Element(Box<Expr>),
+}
+
+/// A balanced JSX element `<name>children</name>`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsxElement {
+    pub opening: JsxOpeningElementNode,
+    pub children: Vec<JsxChild>,
+    pub closing: JsxClosingElementNode,
+}
+
+/// A self-closing JSX element `<name attrs />`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsxSelfClosingElement {
+    pub name: JsxElementName,
+    pub attributes: Vec<JsxAttributeItem>,
+}
+
+/// A JSX fragment `<>children</>`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsxFragment {
+    pub children: Vec<JsxChild>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1601,6 +1907,9 @@ pub enum Expression {
     NonNull(NonNullExpression),
     Import(ImportExpression),
     Meta(MetaProperty),
+    JsxElement(JsxElement),
+    JsxFragment(JsxFragment),
+    JsxSelfClosingElement(JsxSelfClosingElement),
     Missing(MissingNode),
 }
 
@@ -1637,6 +1946,9 @@ impl NodeData for Expression {
             Self::NonNull(_) => NodeKind::NonNullExpression,
             Self::Import(_) => NodeKind::ImportExpression,
             Self::Meta(_) => NodeKind::MetaProperty,
+            Self::JsxElement(_) => NodeKind::JsxElement,
+            Self::JsxFragment(_) => NodeKind::JsxFragment,
+            Self::JsxSelfClosingElement(_) => NodeKind::JsxSelfClosingElement,
             Self::Missing(_) => NodeKind::MissingExpression,
         }
     }
@@ -1698,6 +2010,7 @@ pub struct FunctionType {
     pub type_parameters: Option<TypeParameterList>,
     pub parameters: Vec<FunctionTypeParameter>,
     pub return_type: Box<Ty>,
+    pub return_type_missing: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1963,6 +2276,11 @@ impl SourceFile {
         self.source.as_str().get(start..end)
     }
 
+    /// Returns the cooked identity of an identifier token.
+    pub fn identifier_text(&self, token: &Token) -> Option<Cow<'_, str>> {
+        cook_identifier_text(self.token_text(token)?)
+    }
+
     pub fn eof(&self) -> &Token {
         &self.eof
     }
@@ -1982,6 +2300,24 @@ mod tests {
 
     use super::*;
     use crate::source::Utf16Pos;
+
+    #[test]
+    fn identifier_text_borrows_plain_and_cooks_escaped_names() {
+        assert!(matches!(
+            cook_identifier_text("plain"),
+            Some(Cow::Borrowed("plain"))
+        ));
+        assert_eq!(
+            cook_identifier_text("\\u0061\\u{62}"),
+            Some(Cow::Owned("ab".to_owned()))
+        );
+        assert_eq!(
+            cook_identifier_text("\\u{00000061}"),
+            Some(Cow::Owned("a".to_owned()))
+        );
+        assert_eq!(cook_identifier_text("\\u{}"), None);
+        assert_eq!(cook_identifier_text("\\u{110000}"), None);
+    }
 
     fn range(start: usize, end: usize) -> TextRange {
         TextRange::new(Utf16Pos::new(start), Utf16Pos::new(end)).expect("ordered test range")
@@ -2038,6 +2374,7 @@ mod tests {
             NodeId::new(1),
             range(0, 9),
             Statement::Variable(VariableDeclaration {
+                range: range(0, 9),
                 kind: VariableKind::Let,
                 declarations: vec![declarator],
             }),
@@ -2062,7 +2399,9 @@ mod tests {
                 expression: Box::new(missing),
             }),
         );
-        let source = std::sync::Arc::new(SourceText::new("let ;"));
+        let source = std::sync::Arc::new(
+            SourceText::new("let ;").expect("test source fits the per-file budget"),
+        );
         let eof = Token::new(TokenKind::EndOfFile, range(5, 5));
         let file = SourceFile::new(
             NodeId::new(0),

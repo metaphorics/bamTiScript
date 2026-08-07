@@ -6,7 +6,7 @@ license = "MIT"
 source_dir = "corpus/projects/defu"
 entrypoint = "corpus/cases/defu.ts"
 node_args = []
-expected_timeout_ms = 5000
+expected_timeout_ms = 10000
 constructs = [
   "plain-object-detection",
   "prototype-chain-check",

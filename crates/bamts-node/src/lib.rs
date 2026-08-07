@@ -2,10 +2,82 @@
 
 #![deny(unsafe_code)]
 
+mod timers;
+
 use std::collections::BTreeMap;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "script-compiler")]
+use std::sync::Arc;
+
+#[cfg(feature = "script-compiler")]
+use bamts_bytecode::{Program, Verified};
 use bamts_runtime::Host;
+
+/// Parent-to-AOT-child transport for the logical source entrypoint.
+///
+/// `initialize_aot_process_context` consumes this before publishing
+/// `process.env`, so it is not observable to JavaScript. It supplies the
+/// logical `argv[1]` slot only when the launch proof matches.
+pub const AOT_ENTRYPOINT_ENV: &str = "BAMTS_AOT_ENTRYPOINT";
+/// Parent-to-AOT-child launch proof paired with the private process argument.
+///
+/// `initialize_aot_process_context` compares the token against
+/// `process_args[1]`; the executable path otherwise fills the logical
+/// `argv[1]` slot.
+pub const AOT_LAUNCH_TOKEN_ENV: &str = "BAMTS_AOT_LAUNCH_TOKEN";
+
+/// Classic-script compiler capability for Node hosts.
+#[cfg(feature = "script-compiler")]
+#[derive(Default)]
+pub struct ScriptCompiler;
+
+#[cfg(feature = "script-compiler")]
+impl bamts_runtime::CompileProvider for ScriptCompiler {
+    fn compile_script(
+        &mut self,
+        source: bamts_runtime::ScriptSource<'_>,
+    ) -> std::result::Result<Arc<Program<Verified>>, bamts_runtime::ScriptCompileError> {
+        bamts_compiler::compile_classic_script(
+            source.source,
+            &String::from_utf16_lossy(source.name),
+        )
+        .map(Arc::new)
+        .map_err(map_script_compile_error)
+    }
+}
+
+#[cfg(feature = "script-compiler")]
+fn map_script_compile_error(
+    error: bamts_compiler::ScriptCompileError,
+) -> bamts_runtime::ScriptCompileError {
+    match error {
+        bamts_compiler::ScriptCompileError::IllFormedSource { unit_offset } => {
+            bamts_runtime::ScriptCompileError::IllFormedSource { unit_offset }
+        }
+        bamts_compiler::ScriptCompileError::Syntax {
+            message,
+            line,
+            column,
+        } => bamts_runtime::ScriptCompileError::Syntax {
+            message,
+            line,
+            column,
+        },
+        bamts_compiler::ScriptCompileError::Unsupported {
+            message,
+            line,
+            column,
+        } => bamts_runtime::ScriptCompileError::Unsupported {
+            message,
+            line,
+            column,
+        },
+        bamts_compiler::ScriptCompileError::Capacity { message } => {
+            bamts_runtime::ScriptCompileError::Capacity { message }
+        }
+    }
+}
 
 /// Concrete Node-compatible capability state.
 ///
@@ -19,6 +91,8 @@ pub struct NodeHost {
     env: BTreeMap<String, String>,
     started: Instant,
     random_state: u64,
+    compiler: Option<Box<dyn bamts_runtime::CompileProvider>>,
+    timers: timers::NodeTimers,
 }
 
 impl Default for NodeHost {
@@ -38,6 +112,8 @@ impl NodeHost {
             env: BTreeMap::new(),
             started: Instant::now(),
             random_state: 0x6a09_e667_f3bc_c909,
+            compiler: None,
+            timers: timers::NodeTimers::new(),
         }
     }
 
@@ -76,6 +152,10 @@ impl NodeHost {
 
     pub fn delete_env(&mut self, name: &str) -> bool {
         self.env.remove(name).is_some()
+    }
+
+    pub fn set_script_compiler(&mut self, compiler: Box<dyn bamts_runtime::CompileProvider>) {
+        self.compiler = Some(compiler);
     }
 }
 
@@ -132,6 +212,14 @@ impl Host for NodeHost {
         self.random_state = state;
         let bits = state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11;
         (bits as f64) * (1.0 / ((1_u64 << 53) as f64))
+    }
+
+    fn script_compiler(&mut self) -> Option<&mut (dyn bamts_runtime::CompileProvider + 'static)> {
+        self.compiler.as_deref_mut()
+    }
+
+    fn timers(&mut self) -> Option<&mut (dyn bamts_runtime::TimerProvider + 'static)> {
+        Some(&mut self.timers)
     }
 
     fn hash(&mut self, algorithm: &str, data: &[u8]) -> Option<Vec<u8>> {
@@ -368,43 +456,121 @@ fn sha512(data: &[u8]) -> [u8; 64] {
 }
 
 #[cfg(feature = "aot-main")]
+fn decode_aot_program(
+    bytes: &[u8],
+) -> Result<bamts_bytecode::Program<bamts_bytecode::Verified>, bamts_bytecode::ProgramLoadError> {
+    bamts_bytecode::decode_verified_program(bytes, &bamts_bytecode::ProgramDecodeLimits::default())
+}
+
+#[cfg(all(feature = "aot-main", not(test)))]
 fn run_aot_main() -> i32 {
-    use std::io::Write;
-
-    use bamts_bytecode::{decode_verified, DecodeLimits};
     use bamts_native::linked_program;
-    use bamts_runtime::{run_linked_program, Limits};
+    use bamts_runtime::{Limits, run_linked_program};
 
+    let mut host = NodeHost::new();
+    #[cfg(feature = "script-compiler")]
+    host.set_script_compiler(Box::new(ScriptCompiler));
     let linked = match linked_program() {
         Ok(linked) => linked,
-        Err(_) => return 1,
+        Err(_) => return finish_aot_process(&host, AotCompletion::Failure(AotMainFailure::Link)),
     };
-    let module = match decode_verified(linked.bytecode(), &DecodeLimits::default()) {
-        Ok(module) => module,
-        Err(_) => return 1,
+    let program = match decode_aot_program(linked.bytecode()) {
+        Ok(program) => program,
+        Err(_) => return finish_aot_process(&host, AotCompletion::Failure(AotMainFailure::Decode)),
     };
-    let mut host = NodeHost::new();
-    if initialize_aot_process_context(&mut host, std::env::args_os(), std::env::vars_os()).is_err()
+    if let Err(error) =
+        initialize_aot_process_context(&mut host, std::env::args_os(), std::env::vars_os())
     {
-        return 1;
+        return finish_aot_process(
+            &host,
+            AotCompletion::Failure(AotMainFailure::Context(error)),
+        );
     }
-    let outcome = match run_linked_program(&module, &linked, &mut host, &Limits::default()) {
+    let outcome = match run_linked_program(&program, &linked, &mut host, &Limits::default()) {
         Ok(outcome) => outcome,
-        Err(_) => return 1,
+        Err(_) => {
+            return finish_aot_process(&host, AotCompletion::Failure(AotMainFailure::Runtime));
+        }
     };
-    let mut stdout = std::io::stdout().lock();
-    if stdout.write_all(host.stdout()).is_err() || stdout.write_all(&outcome.stdout).is_err() {
-        return 1;
-    }
-    if host.exit_code() == 0 {
-        outcome.exit_code
-    } else {
-        host.exit_code()
+    finish_aot_process(&host, AotCompletion::Success(&outcome))
+}
+
+#[cfg(any(feature = "aot-main", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AotMainFailure {
+    Link,
+    Decode,
+    Context(AotProcessContextError),
+    Runtime,
+}
+
+#[cfg(any(feature = "aot-main", test))]
+impl std::fmt::Display for AotMainFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Link => formatter.write_str("aot link"),
+            Self::Decode => formatter.write_str("aot decode"),
+            Self::Context(AotProcessContextError::Argument) => {
+                formatter.write_str("aot context argument")
+            }
+            Self::Context(AotProcessContextError::EnvironmentName) => {
+                formatter.write_str("aot context environment name")
+            }
+            Self::Context(AotProcessContextError::EnvironmentValue) => {
+                formatter.write_str("aot context environment value")
+            }
+            Self::Runtime => formatter.write_str("aot runtime"),
+        }
     }
 }
 
+#[cfg(any(feature = "aot-main", test))]
+enum AotCompletion<'a> {
+    Success(&'a bamts_runtime::ExecutionOutcome),
+    Failure(AotMainFailure),
+}
+
+/// Emits buffered host output for every completion and flushes both streams.
+#[cfg(any(feature = "aot-main", test))]
+fn write_aot_completion(
+    host: &NodeHost,
+    completion: AotCompletion<'_>,
+    stdout: &mut impl std::io::Write,
+    stderr: &mut impl std::io::Write,
+) -> std::io::Result<i32> {
+    stdout.write_all(host.stdout())?;
+    let (exit_code, failure) = match completion {
+        AotCompletion::Success(outcome) => {
+            stdout.write_all(&outcome.stdout)?;
+            (
+                if host.exit_code() == 0 {
+                    outcome.exit_code
+                } else {
+                    host.exit_code()
+                },
+                None,
+            )
+        }
+        AotCompletion::Failure(error) => (1, Some(error)),
+    };
+    stdout.flush()?;
+    stderr.write_all(host.stderr())?;
+    if let Some(error) = failure {
+        writeln!(stderr, "bamts: {error}")?;
+    }
+    stderr.flush()?;
+    Ok(exit_code)
+}
+
+#[cfg(all(feature = "aot-main", not(test)))]
+fn finish_aot_process(host: &NodeHost, completion: AotCompletion<'_>) -> i32 {
+    let mut stdout = std::io::stdout().lock();
+    let mut stderr = std::io::stderr().lock();
+    write_aot_completion(host, completion, &mut stdout, &mut stderr).unwrap_or(1)
+}
+
 /// C process entry for a linked BamTS AOT image.
-#[cfg(feature = "aot-main")]
+#[cfg(all(feature = "aot-main", not(test)))]
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i32 {
@@ -412,7 +578,7 @@ pub extern "C" fn main() -> i32 {
 }
 
 #[cfg(any(feature = "aot-main", test))]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AotProcessContextError {
     Argument,
     EnvironmentName,
@@ -421,18 +587,24 @@ enum AotProcessContextError {
 
 /// Populate an AOT host from an explicit process snapshot.
 ///
-/// The leading `bamts` mirrors the JIT driver's argv convention; the AOT
-/// executable path occupies the entrypoint slot. Conversion is all-or-nothing
-/// so an invalid OS string cannot leave a partially populated host.
+/// The leading `bamts` mirrors the JIT driver's argv convention, so the
+/// executable always maps to logical `argv[1]`. A matching launch token
+/// (compared against the private `process_args[1]`) authenticates a
+/// parent-launched child: the token slot is skipped and `AOT_ENTRYPOINT_ENV`
+/// fills that `argv[1]` position, falling back to the executable path when no
+/// entrypoint was transported. Without a match, direct execution keeps the
+/// executable at `argv[1]` and drops any inherited transport variables.
+/// Conversion is all-or-nothing so an invalid OS string cannot leave a
+/// partially populated host.
 #[cfg(any(feature = "aot-main", test))]
 fn initialize_aot_process_context(
     host: &mut NodeHost,
     args: impl IntoIterator<Item = std::ffi::OsString>,
     environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> Result<(), AotProcessContextError> {
-    let mut argv = vec!["bamts".to_owned()];
+    let mut process_args = Vec::new();
     for argument in args {
-        argv.push(
+        process_args.push(
             argument
                 .into_string()
                 .map_err(|_| AotProcessContextError::Argument)?,
@@ -450,6 +622,30 @@ fn initialize_aot_process_context(
         env.insert(name, value);
     }
 
+    let entrypoint_env = env.remove(AOT_ENTRYPOINT_ENV);
+    let launch_token_env = env.remove(AOT_LAUNCH_TOKEN_ENV);
+
+    // A matching launch token authenticates a parent-launched AOT child: the
+    // token is supplied both as `AOT_LAUNCH_TOKEN_ENV` and as the private
+    // `process_args[1]`. On a match the token slot is consumed so it never
+    // reaches JavaScript, regardless of whether an entrypoint was transported.
+    let launch_authenticated = match (launch_token_env.as_ref(), process_args.get(1)) {
+        (Some(token), Some(argument)) => argument == token,
+        _ => false,
+    };
+
+    let (entrypoint, first_program_argument) = if launch_authenticated {
+        let entrypoint = entrypoint_env.or_else(|| process_args.first().cloned());
+        (entrypoint, 2)
+    } else {
+        (process_args.first().cloned(), 1)
+    };
+    let mut argv = vec!["bamts".to_owned()];
+    if let Some(entrypoint) = entrypoint {
+        argv.push(entrypoint);
+    }
+    argv.extend(process_args.into_iter().skip(first_program_argument));
+
     host.argv = argv;
     host.env = env;
     Ok(())
@@ -458,6 +654,74 @@ fn initialize_aot_process_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FlushProbe {
+        bytes: Vec<u8>,
+        flushes: usize,
+        flush_error: Option<std::io::ErrorKind>,
+    }
+
+    impl std::io::Write for FlushProbe {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            match self.flush_error {
+                Some(kind) => Err(std::io::Error::from(kind)),
+                None => Ok(()),
+            }
+        }
+    }
+
+    #[cfg(feature = "aot-main")]
+    #[test]
+    fn linked_descriptor_decodes_whole_program_and_tuple_entry() {
+        use bamts_bytecode::{
+            Constant, ConstantId, EcmaString, Function, FunctionFlags, FunctionId, Instruction,
+            Module, ModuleId, Program, ProgramModule,
+        };
+
+        let module = |name: &str| ProgramModule {
+            name: ConstantId::new(0),
+            code: Module::new(
+                vec![Constant::String(EcmaString::from_utf8(name))],
+                vec![Function::new(
+                    None,
+                    0,
+                    0,
+                    0,
+                    FunctionFlags::default(),
+                    vec![Instruction::Halt],
+                    Vec::new(),
+                )],
+                FunctionId::new(0),
+            )
+            .verify()
+            .expect("descriptor test module verifies"),
+            edges: Vec::new(),
+            bindings: Vec::new(),
+            exports: Vec::new(),
+        };
+        let program = Program::link(
+            vec![module("dependency"), module("entry")],
+            ModuleId::new(1),
+        )
+        .expect("descriptor test program links");
+
+        let decoded = decode_aot_program(&program.encode()).expect("descriptor program decodes");
+
+        assert_eq!(decoded.entry(), ModuleId::new(1));
+        assert_eq!(decoded.modules().len(), 2);
+        assert!(
+            decoded
+                .modules()
+                .iter()
+                .all(|module| module.code().entry() == FunctionId::new(0))
+        );
+    }
 
     fn hex(bytes: &[u8]) -> String {
         const DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -527,6 +791,231 @@ mod tests {
         assert_eq!(host.env("ZED"), Some("last"));
     }
 
+    #[test]
+    fn aot_process_context_replaces_the_executable_with_a_private_entrypoint() {
+        let mut host = NodeHost::new();
+        initialize_aot_process_context(
+            &mut host,
+            [
+                std::ffi::OsString::from("/tmp/cache/aot-image"),
+                std::ffi::OsString::from("launch-7"),
+                std::ffi::OsString::from("--flag"),
+            ],
+            [
+                (
+                    std::ffi::OsString::from(AOT_ENTRYPOINT_ENV),
+                    std::ffi::OsString::from("src/main.ts"),
+                ),
+                (
+                    std::ffi::OsString::from(AOT_LAUNCH_TOKEN_ENV),
+                    std::ffi::OsString::from("launch-7"),
+                ),
+                (
+                    std::ffi::OsString::from("VISIBLE"),
+                    std::ffi::OsString::from("value"),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(host.argv(), ["bamts", "src/main.ts", "--flag"]);
+        assert_eq!(host.env("BAMTS_AOT_ENTRYPOINT"), None);
+        assert_eq!(host.env("VISIBLE"), Some("value"));
+    }
+
+    #[test]
+    fn aot_process_context_ignores_inherited_transport_without_launch_proof() {
+        let mut host = NodeHost::new();
+        initialize_aot_process_context(
+            &mut host,
+            [
+                std::ffi::OsString::from("/tmp/direct-aot-image"),
+                std::ffi::OsString::from("--flag"),
+            ],
+            [
+                (
+                    std::ffi::OsString::from(AOT_ENTRYPOINT_ENV),
+                    std::ffi::OsString::from("stale.ts"),
+                ),
+                (
+                    std::ffi::OsString::from(AOT_LAUNCH_TOKEN_ENV),
+                    std::ffi::OsString::from("stale-token"),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(host.argv(), ["bamts", "/tmp/direct-aot-image", "--flag"]);
+        assert_eq!(host.env(AOT_ENTRYPOINT_ENV), None);
+        assert_eq!(host.env(AOT_LAUNCH_TOKEN_ENV), None);
+    }
+
+    #[test]
+    fn aot_process_context_consumes_authenticated_token_without_entrypoint() {
+        let mut host = NodeHost::new();
+        initialize_aot_process_context(
+            &mut host,
+            [
+                std::ffi::OsString::from("/tmp/cache/aot-image"),
+                std::ffi::OsString::from("launch-7"),
+                std::ffi::OsString::from("--flag"),
+                std::ffi::OsString::from("extra.ts"),
+            ],
+            [
+                (
+                    std::ffi::OsString::from(AOT_LAUNCH_TOKEN_ENV),
+                    std::ffi::OsString::from("launch-7"),
+                ),
+                (
+                    std::ffi::OsString::from("VISIBLE"),
+                    std::ffi::OsString::from("value"),
+                ),
+            ],
+        )
+        .unwrap();
+
+        // A matching token still consumes the token slot (argv[1] stays the
+        // executable and the token never appears) even with no transported
+        // entrypoint; transport env keys remain hidden.
+        assert_eq!(
+            host.argv(),
+            ["bamts", "/tmp/cache/aot-image", "--flag", "extra.ts"]
+        );
+        assert_eq!(host.env(AOT_LAUNCH_TOKEN_ENV), None);
+        assert_eq!(host.env(AOT_ENTRYPOINT_ENV), None);
+        assert_eq!(host.env("VISIBLE"), Some("value"));
+    }
+
+    #[test]
+    fn aot_runtime_failure_emits_host_stderr_and_stable_error() {
+        let mut host = NodeHost::new();
+        Host::write_stdout(&mut host, b"before failure");
+        Host::write_stderr(&mut host, b"host diagnostic\n");
+        let mut stdout = FlushProbe {
+            bytes: Vec::new(),
+            flushes: 0,
+            flush_error: None,
+        };
+        let mut stderr = Vec::new();
+
+        let exit_code = write_aot_completion(
+            &host,
+            AotCompletion::Failure(AotMainFailure::Runtime),
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("completion writes");
+
+        assert_eq!(exit_code, 1);
+        assert_eq!(stdout.bytes, b"before failure");
+        assert_eq!(stdout.flushes, 1);
+        assert_eq!(stderr, b"host diagnostic\nbamts: aot runtime\n");
+    }
+
+    #[test]
+    fn aot_failure_labels_are_stable() {
+        assert_eq!(AotMainFailure::Link.to_string(), "aot link");
+        assert_eq!(AotMainFailure::Decode.to_string(), "aot decode");
+        assert_eq!(
+            AotMainFailure::Context(AotProcessContextError::Argument).to_string(),
+            "aot context argument"
+        );
+    }
+
+    #[test]
+    fn aot_success_preserves_host_and_runtime_output_and_exit_precedence() {
+        let mut host = NodeHost::new();
+        Host::write_stdout(&mut host, b"host stdout");
+        Host::write_stderr(&mut host, b"host stderr");
+        let outcome = bamts_runtime::ExecutionOutcome {
+            stdout: b"runtime stdout".to_vec(),
+            exit_code: 7,
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit_code = write_aot_completion(
+            &host,
+            AotCompletion::Success(&outcome),
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("completion writes");
+
+        assert_eq!(exit_code, 7);
+        assert_eq!(stdout, b"host stdoutruntime stdout");
+        assert_eq!(stderr, b"host stderr");
+
+        Host::set_exit_code(&mut host, 11);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit_code = write_aot_completion(
+            &host,
+            AotCompletion::Success(&outcome),
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("completion writes");
+
+        assert_eq!(exit_code, 11);
+        assert_eq!(stdout, b"host stdoutruntime stdout");
+        assert_eq!(stderr, b"host stderr");
+    }
+
+    #[test]
+    fn aot_completion_flushes_trailing_stdout_without_a_newline() {
+        let mut host = NodeHost::new();
+        Host::write_stdout(&mut host, b"trailing host output");
+        let outcome = bamts_runtime::ExecutionOutcome {
+            stdout: b" and runtime output".to_vec(),
+            exit_code: 0,
+        };
+        let mut stdout = FlushProbe {
+            bytes: Vec::new(),
+            flushes: 0,
+            flush_error: None,
+        };
+        let mut stderr = Vec::new();
+
+        let exit_code = write_aot_completion(
+            &host,
+            AotCompletion::Success(&outcome),
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("completion writes");
+
+        assert_eq!(exit_code, 0);
+        assert_eq!(stdout.bytes, b"trailing host output and runtime output");
+        assert_eq!(stdout.flushes, 1);
+    }
+
+    #[test]
+    fn aot_completion_propagates_stdout_flush_failure() {
+        let host = NodeHost::new();
+        let outcome = bamts_runtime::ExecutionOutcome {
+            stdout: Vec::new(),
+            exit_code: 0,
+        };
+        let mut stdout = FlushProbe {
+            bytes: Vec::new(),
+            flushes: 0,
+            flush_error: Some(std::io::ErrorKind::BrokenPipe),
+        };
+        let mut stderr = Vec::new();
+
+        let error = write_aot_completion(
+            &host,
+            AotCompletion::Success(&outcome),
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect_err("stdout flush failure is reported");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(stdout.flushes, 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn aot_process_context_rejects_non_unicode_without_mutating_host() {
@@ -578,5 +1067,134 @@ mod tests {
         assert_eq!(error, AotProcessContextError::EnvironmentValue);
         assert!(host.argv().is_empty());
         assert_eq!(host.env("SAFE"), None);
+    }
+}
+
+#[cfg(test)]
+mod timer_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn real_timers_expire_in_deadline_order_through_one_delay_queue() {
+        let mut host = NodeHost::new();
+        let timers = Host::timers(&mut host).expect("timer capability is always present");
+
+        // The later-deadline timer is scheduled first to prove ordering comes
+        // from the deadline, not insertion order.
+        let late = timers.schedule(1, 12).expect("schedule id 1");
+        let early = timers.schedule(2, 4).expect("schedule id 2");
+        assert!(early <= late, "smaller delay yields an earlier deadline");
+        assert!(timers.has_pending());
+
+        let first = timers.wait_expired().expect("wait").expect("a wakeup");
+        let second = timers.wait_expired().expect("wait").expect("a wakeup");
+        assert_eq!(first.id, 2, "the earlier deadline fires first");
+        assert_eq!(second.id, 1);
+        assert_eq!(first.deadline_ms, early);
+        assert_eq!(second.deadline_ms, late);
+
+        assert!(!timers.has_pending());
+        assert!(
+            timers.wait_expired().expect("wait").is_none(),
+            "an empty pending set never blocks"
+        );
+    }
+
+    #[test]
+    fn cancellation_removes_exactly_the_target_id() {
+        let mut host = NodeHost::new();
+        let timers = Host::timers(&mut host).unwrap();
+
+        timers.schedule(10, 20).expect("schedule id 10");
+        timers.schedule(11, 4).expect("schedule id 11");
+
+        assert!(timers.cancel(10).expect("cancel"), "an armed timer cancels");
+        assert!(
+            !timers.cancel(10).expect("cancel"),
+            "a second cancel of the same id is false"
+        );
+        assert!(
+            !timers.cancel(999).expect("cancel"),
+            "an unknown id cancels to false"
+        );
+
+        let wakeup = timers.wait_expired().expect("wait").expect("a wakeup");
+        assert_eq!(wakeup.id, 11, "only the surviving timer fires");
+        assert!(!timers.has_pending());
+        assert!(timers.wait_expired().expect("wait").is_none());
+    }
+
+    #[test]
+    fn expiry_that_races_a_cancel_is_dropped_as_stale() {
+        let mut host = NodeHost::new();
+        let timers = Host::timers(&mut host).unwrap();
+
+        timers.schedule(7, 1).expect("schedule id 7");
+        // Let the worker fire and queue the wakeup while the caller has not yet
+        // polled it, then cancel: the caller-side pending set is authoritative.
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            timers.cancel(7).expect("cancel"),
+            "still pending from the caller's view until polled"
+        );
+
+        let mut output = Vec::new();
+        timers.poll_expired(&mut output).expect("poll");
+        assert!(output.is_empty(), "a cancelled id is never delivered");
+        assert!(!timers.has_pending());
+        assert!(timers.wait_expired().expect("wait").is_none());
+    }
+
+    #[test]
+    fn worker_is_lazy_and_shuts_down_cleanly_on_drop() {
+        let mut host = NodeHost::new();
+        assert!(
+            !host.timers.worker_active(),
+            "no worker thread before the first schedule"
+        );
+
+        // Merely returning the capability must not spawn the worker.
+        let _ = Host::timers(&mut host);
+        assert!(
+            !host.timers.worker_active(),
+            "returning the capability is not a schedule"
+        );
+
+        Host::timers(&mut host)
+            .unwrap()
+            .schedule(1, 1)
+            .expect("schedule id 1");
+        assert!(
+            host.timers.worker_active(),
+            "the worker starts lazily on first schedule"
+        );
+
+        // Dropping the host drops the worker handle, which closes the command
+        // channel and joins the thread even with a still-armed timer. A hang or
+        // panic here fails the test.
+        drop(host);
+    }
+
+    #[test]
+    fn constructs_and_runs_inside_an_ambient_tokio_runtime_without_panic() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("ambient runtime builds");
+        let _guard = runtime.enter();
+
+        // With an ambient Tokio runtime on this thread, the provider must still
+        // spawn its own dedicated worker thread/runtime and never `block_on`
+        // here, so none of these operations panic.
+        let mut host = NodeHost::new();
+        let timers = Host::timers(&mut host).unwrap();
+        let deadline = timers
+            .schedule(1, 2)
+            .expect("schedule under ambient runtime");
+        assert!(deadline >= 2);
+        let wakeup = timers.wait_expired().expect("wait").expect("a wakeup");
+        assert_eq!(wakeup.id, 1);
+        assert!(!timers.has_pending());
     }
 }

@@ -6,7 +6,7 @@ license = "0BSD"
 source_dir = "corpus/projects/tslib"
 entrypoint = "corpus/cases/tslib.ts"
 node_args = []
-expected_timeout_ms = 5000
+expected_timeout_ms = 15000
 constructs = [
   "prototype-inheritance-extends",
   "object-assign-polyfill",

@@ -1,8 +1,12 @@
 [package]
 name = "bamts-node"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-publish.workspace = true
+publish = true
+license.workspace = true
+repository.workspace = true
+description = "Node.js host environment compatibility layer for BamTS"
 
 [lib]
 crate-type = ["rlib", "staticlib"]
@@ -10,6 +14,10 @@ crate-type = ["rlib", "staticlib"]
 [features]
 default = ["node-host"]
 node-host = ["bamts-native/node-host"]
+# The classic-script `CompileProvider`. Off by default: it is the only feature
+# that links the compiler frontend into a host, and `node:vm` is installed only
+# when a host supplies a provider.
+script-compiler = ["dep:bamts-compiler", "dep:bamts-bytecode"]
 aot-main = [
     "node-host",
     "dep:bamts-bytecode",
@@ -17,9 +25,12 @@ aot-main = [
 ]
 
 [dependencies]
-bamts-bytecode = { path = "../bamts-bytecode", optional = true }
-bamts-native = { path = "../bamts-native" }
-bamts-runtime = { path = "../bamts-runtime" }
+bamts-bytecode = { workspace = true, optional = true }
+bamts-compiler = { workspace = true, optional = true }
+bamts-native.workspace = true
+bamts-runtime.workspace = true
+tokio = { version = "1.53", features = ["rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["time"] }
 
 [lints.rust]
 # `unsafe_code` is downgraded from the workspace `forbid` to `deny` so that a

@@ -784,7 +784,7 @@ mod tests {
     };
 
     fn codes(source: &str) -> Vec<&'static str> {
-        let source = SourceText::new(source);
+        let source = SourceText::new(source).expect("test source fits the per-file budget");
         analyze_source_text(SourceId::new(0), &source)
             .iter()
             .map(|diagnostic| diagnostic.code().as_str())
@@ -869,9 +869,10 @@ mod tests {
         let parsed = parser::parse(scanner::scan(
             SourceId::new(0),
             ScriptKind::JavaScript,
-            Arc::new(SourceText::new(
-                "try {} catch (error) { error.message; } value === NaN;",
-            )),
+            Arc::new(
+                SourceText::new("try {} catch (error) { error.message; } value === NaN;")
+                    .expect("test source fits the per-file budget"),
+            ),
         ));
         let codes = analyze_hard_warnings(&parsed)
             .iter()

@@ -589,7 +589,7 @@ fn check_source(
     script_kind: ScriptKind,
     text: &str,
 ) -> ParseOutcome {
-    let source = Arc::new(SourceText::new(text));
+    let source = Arc::new(SourceText::new(text).expect("test source fits the per-file budget"));
     let scanned_recovered = scan(source_id, script_kind, Arc::clone(&source));
     let scanned = scanned_recovered.product().clone();
     let scanner_diagnostics = scanned_recovered.diagnostics().to_vec();

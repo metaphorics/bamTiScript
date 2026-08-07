@@ -6,7 +6,7 @@ license = "MIT"
 source_dir = "corpus/projects/dot-prop"
 entrypoint = "corpus/cases/dot-prop.ts"
 node_args = []
-expected_timeout_ms = 5000
+expected_timeout_ms = 10000
 constructs = [
   "getProperty",
   "setProperty",

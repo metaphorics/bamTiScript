@@ -66,6 +66,10 @@
     },
     {
       "file": "Bamti/Bytecode/Verify.lean",
+      "name": "Bamti.Bytecode.format_v4_createCell_tag"
+    },
+    {
+      "file": "Bamti/Bytecode/Verify.lean",
       "name": "Bamti.Bytecode.handlers_well_nested"
     },
     {
@@ -222,6 +226,30 @@
     },
     {
       "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.provider_allocation_only_writable"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.provider_finalization_exactly_once"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.provider_finalization_failure_reclaims"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.provider_free_is_idempotent"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.provider_never_writable_executable"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
+      "name": "Bamti.provider_trace_exclusivity"
+    },
+    {
+      "file": "Bamti/JitLifecycle.lean",
       "name": "Bamti.publication_after_finalization"
     },
     {
@@ -306,6 +334,6 @@
     }
   ],
   "schema": "bamti.lean-assumptions/v1",
-  "source_sha256": "cdf8f82ec8b8fe53999ebd09aa80625095f15bfaf2e03752477291b064dc3eeb",
+  "source_sha256": "41eaf14f0f359e4479793bd0af9c8754526d18a66b7405314b64f805f58f4d05",
   "user_axioms": []
 }

@@ -249,11 +249,11 @@ theorem no_publish_before_finalize (s s' : Artifact)
 
 theorem wx_before_publish (s s' : Artifact)
     (h : JitStep s .publish (.accepted s')) :
-    s.memory = .executable ∧ s'.memory = .executable := by
+    s.memory = .executable ∧ s.memory ≠ .writable ∧
+      s'.memory = .executable ∧ s'.memory ≠ .writable := by
   cases h with
   | publishAccepted hp =>
-      let hMem := hp.2.2.2.1
-      exact ⟨hMem, by simpa using hMem⟩
+      simp_all [canPublish]
 
 theorem cancelled_never_live (s s' : Artifact)
     (h : JitStep s .cancel (.accepted s')) :
@@ -315,5 +315,132 @@ theorem retirement_after_quiescence (s s' : Artifact)
   cases h with
   | retireAccepted hp =>
       exact ⟨hp.2.2, rfl, rfl, rfl⟩
+
+/-- Lifecycle phase shared by all mappings owned by one JIT provider. -/
+inductive ProviderPhase where
+  | Writable
+  | Executable
+  | Freed
+  deriving DecidableEq, Repr
+
+/-- Operations that can change or inspect the provider phase. -/
+inductive ProviderAction where
+  | allocate
+  | finalize
+  | free
+  deriving DecidableEq, Repr
+
+/-- Provider operation outcome and its resulting phase. -/
+inductive ProviderResult where
+  | accepted (next : ProviderPhase)
+  | rejected (next : ProviderPhase)
+  deriving DecidableEq, Repr
+
+def providerResultState : ProviderResult → ProviderPhase
+  | .accepted next => next
+  | .rejected next => next
+
+/-- W^X transitions for one provider. Allocation may repeat while writable.
+Finalization either publishes executable mappings or frees every mapping.
+Free changes a live phase to freed; later frees are accepted no-ops. -/
+inductive ProviderStep : ProviderPhase → ProviderAction → ProviderResult → Prop where
+  | allocateAccepted :
+      ProviderStep .Writable .allocate (.accepted .Writable)
+  | finalizeAccepted :
+      ProviderStep .Writable .finalize (.accepted .Executable)
+  | finalizeFailed :
+      ProviderStep .Writable .finalize (.rejected .Freed)
+  | freeAccepted (p : ProviderPhase) (h : p = .Writable ∨ p = .Executable) :
+      ProviderStep p .free (.accepted .Freed)
+  | freeIdempotent :
+      ProviderStep .Freed .free (.accepted .Freed)
+
+/-- Finite provider traces. -/
+inductive ProviderTrace : ProviderPhase → ProviderPhase → Prop where
+  | refl (s : ProviderPhase) : ProviderTrace s s
+  | step (s u : ProviderPhase) (action : ProviderAction) (result : ProviderResult)
+      (hs : ProviderStep s action result)
+      (ht : ProviderTrace (providerResultState result) u) :
+      ProviderTrace s u
+
+theorem provider_allocation_only_writable (s q : ProviderPhase)
+    (h : ProviderStep s .allocate (.accepted q)) :
+    s = .Writable ∧ q = .Writable := by
+  cases h
+  exact ⟨rfl, rfl⟩
+
+theorem provider_finalization_exactly_once (p q : ProviderPhase)
+    (h : ProviderStep p .finalize (.accepted q)) :
+    p = .Writable ∧ q = .Executable ∧
+      ¬ ProviderStep q .finalize (.accepted q) := by
+  cases h
+  exact ⟨rfl, rfl, fun h2 => by cases h2⟩
+
+theorem provider_finalization_failure_reclaims (p q : ProviderPhase)
+    (h : ProviderStep p .finalize (.rejected q)) :
+    q = .Freed ∧
+      (∀ next, ¬ ProviderStep q .allocate (.accepted next)) ∧
+      (∀ next, ¬ ProviderStep q .finalize (.accepted next)) := by
+  cases h
+  constructor
+  · rfl
+  constructor
+  · intro next h2
+    cases h2
+  · intro next h2
+    cases h2
+
+theorem provider_free_is_idempotent (p q : ProviderPhase)
+    (h : ProviderStep p .free (.accepted q)) :
+    q = .Freed ∧ ProviderStep q .free (.accepted q) := by
+  cases h with
+  | freeAccepted _ =>
+      exact ⟨rfl, ProviderStep.freeIdempotent⟩
+  | freeIdempotent =>
+      exact ⟨rfl, ProviderStep.freeIdempotent⟩
+
+/-- An executable provider can only remain executable or become freed along a
+reachable trace; once freed, it remains freed.  The second conjunct strengthens
+the induction enough to cover a `free` step from the executable phase. -/
+theorem provider_trace_exclusivity (s u : ProviderPhase)
+    (trace : ProviderTrace s u) :
+    (s = .Executable → u = .Executable ∨ u = .Freed) ∧
+      (s = .Freed → u = .Freed) := by
+  induction trace with
+  | refl s =>
+      exact ⟨fun h => Or.inl h, fun h => h⟩
+  | step s u action result hs ht ih =>
+      cases hs with
+      | allocateAccepted =>
+          constructor <;> intro h <;> cases h
+      | finalizeAccepted =>
+          constructor <;> intro h <;> cases h
+      | finalizeFailed =>
+          constructor <;> intro h <;> cases h
+      | freeAccepted p hp =>
+          rcases hp with rfl | rfl
+          · constructor <;> intro h <;> cases h
+          · constructor
+            · intro _
+              exact Or.inr (ih.2 rfl)
+            · intro h
+              cases h
+      | freeIdempotent =>
+          constructor
+          · intro h
+            cases h
+          · intro _
+            exact ih.2 rfl
+
+/-- No phase reachable from an executable provider is writable. -/
+theorem provider_never_writable_executable (s u : ProviderPhase)
+    (trace : ProviderTrace s u) :
+    s = .Executable → u ≠ .Writable := by
+  intro hs hu
+  rcases (provider_trace_exclusivity s u trace).1 hs with he | hf
+  · rw [hu] at he
+    exact ProviderPhase.noConfusion he
+  · rw [hu] at hf
+    exact ProviderPhase.noConfusion hf
 
 end Bamti

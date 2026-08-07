@@ -34,8 +34,13 @@
 //!   `Symbol` keys, and private names (via [`Instruction::CreatePrivateName`])
 //!   are one uniform operation. [`Instruction::DefineAccessor`] installs a
 //!   getter or setter descriptor under a register key.
-//! * **Calls are variadic.** [`Instruction::Call`] and
-//!   [`Instruction::Construct`] receive one *arguments-array* `Register`, so
+//!   [`Instruction::LoadOwnDescriptorSlot`] /
+//!   [`Instruction::DefineOwnDescriptorSlot`] address one own-descriptor slot
+//!   (`value` / `get` / `set`) without invoking accessors or walking the
+//!   prototype chain.
+//! * **Calls are variadic.** [`Instruction::Call`],
+//!   [`Instruction::Construct`], and [`Instruction::ConstructWithNewTarget`]
+//!   receive one *arguments-array* `Register`, so
 //!   spread (`f(...xs)`) and any arity -- far beyond 127 -- lower identically.
 //!   The runtime validates that the register holds a dynamic array.
 //! * **Closures capture explicitly.** [`Instruction::CreateClosure`] binds a
@@ -49,35 +54,46 @@
 //!   class prototype chains incrementally.
 //! * **Iteration protocol.** [`Instruction::GetIterator`] (with a closed
 //!   [`IteratorKind`]) and the two-write [`Instruction::IteratorNext`] model
-//!   `for`/`of`, `for`/`await`/`of`, `for`/`in`, destructuring, and array/call
-//!   spread against the ECMAScript iterator protocol.
+//!   `for`/`of`, `for`/`in`, destructuring, and array/call spread against the
+//!   ECMAScript iterator protocol. The two-write
+//!   [`Instruction::IteratorClose`] performs the abrupt-completion close step.
+//!   `for`/`await`/`of` splits each step across
+//!   [`Instruction::IteratorStep`] (acquire the raw, possibly-promised iterator
+//!   result), [`Instruction::Await`] (suspend until it settles), and the
+//!   two-write [`Instruction::IteratorResult`] (validate the settled object and
+//!   read `done`/`value`). [`Instruction::RequireCloseResult`] validates the
+//!   result of a callable `iterator.return` on non-throw exits.
 //! * **Environment access.** [`Instruction::LoadGlobal`],
 //!   [`Instruction::StoreGlobal`], [`Instruction::TypeOfGlobal`] (the last
 //!   models `typeof g` without throwing on an undeclared global),
 //!   [`Instruction::LoadThis`], [`Instruction::LoadArguments`], and
 //!   [`Instruction::LoadNewTarget`] name the ambient bindings a function body
 //!   observes.
-//! * **Modules.** [`Instruction::Import`] and [`Instruction::Export`] name a
-//!   module linkage entry by string constant.
+//! * **Modules.** [`Instruction::Import`] is dynamic and names a dependency by
+//!   string constant; static bindings and exports live in [`Program`] linkage
+//!   metadata so they identify live cells rather than activation registers.
 //! * **Regular expressions.** [`Instruction::CreateRegExp`] materializes a
 //!   `RegExp` from string-constant pattern and flags.
 //!
 //! ## Resume contract (async / generators)
 //!
-//! [`Instruction::Suspend`] `{ dst, src, resume }` is the single suspension
-//! primitive; [`FunctionFlags::is_async`] and [`FunctionFlags::is_generator`]
-//! select *how* a suspension is driven, but the wire form is identical:
+//! Two suspension primitives share one wire and CFG shape
+//! (`{ dst, src, resume }`): [`Instruction::Suspend`] is the `yield` form
+//! (including delegated `yield*`) and [`Instruction::Await`] is the `await`
+//! form, so an async-generator body can tell its two suspension kinds apart.
+//! [`FunctionFlags::is_async`] and [`FunctionFlags::is_generator`] select *how*
+//! a suspension is driven, but the contract is identical for both opcodes:
 //!
 //! 1. The activation yields the value in `src` (a produced item for a
-//!    generator; an awaited operand for an async function) to its driver.
+//!    generator `yield`; an awaited operand for `await`) to its driver.
 //! 2. When the driver resumes the activation, control continues at `resume`
 //!    with the resumed value written to `dst` (the argument of `.next(v)` for a
 //!    generator; the settled result of the awaited value for `await`).
-//! 3. `resume` is a normal CFG successor and the only successor of `Suspend`, so
-//!    the definite-initialization witness treats every register live across a
-//!    suspension as it would across any join: `dst` is initialized on the
-//!    resume edge, and registers not provably initialized before the suspension
-//!    are not assumed initialized after it.
+//! 3. `resume` is a normal CFG successor and the only successor of either
+//!    suspension opcode, so the definite-initialization witness treats every
+//!    register live across a suspension as it would across any join: `dst` is
+//!    initialized on the resume edge, and registers not provably initialized
+//!    before the suspension are not assumed initialized after it.
 //!
 //! A generator's completion is an ordinary [`Instruction::Return`]; an uncaught
 //! throw during drive routes to an enclosing [`ExceptionHandler`] exactly as in
@@ -102,7 +118,7 @@ use std::marker::PhantomData;
 /// `BMTBC\0\0\1`, matching `Bamti.Bytecode.magicBytes`.
 pub const MAGIC: [u8; 8] = [66, 77, 84, 66, 67, 0, 0, 1];
 /// The sole supported wire version.
-pub const FORMAT_VERSION: u8 = 1;
+pub const FORMAT_VERSION: u8 = 4;
 
 /// Structural verify-time ceiling on a function's register count. Generous
 /// enough for real code yet bounds definite-initialization bitset allocation.
@@ -115,6 +131,8 @@ pub const MAX_HANDLERS: u32 = 1 << 16;
 pub const MAX_CONSTANTS: u32 = 1 << 20;
 /// Structural verify-time ceiling on a module's function count.
 pub const MAX_FUNCTIONS: u32 = 1 << 20;
+/// Canonical decoder ceiling for one BigInt constant's decimal text.
+pub const MAX_BIGINT_BYTES: u32 = 1 << 20;
 
 /// Combined verify-time ceiling on the total definite-initialization fact
 /// storage a module may force the verifier to allocate, in 64-bit words. Each
@@ -167,6 +185,19 @@ index_type!(
     /// A program counter: an instruction index within a function's code.
     Pc
 );
+
+mod string;
+
+mod program;
+
+pub use string::{EcmaString, EcmaStringBuilder, IllFormedUtf16, InvalidCodePoint};
+
+pub use program::{
+    Binding, BindingId, BindingKind, Edge, EdgeId, EdgeKind, EdgeTarget, Export, ExportSource,
+    ModuleId, PROGRAM_MAGIC, PROGRAM_VERSION, Program, ProgramDecodeError, ProgramDecodeErrorKind,
+    ProgramDecodeLimits, ProgramLoadError, ProgramModule, ProgramVerifyError,
+    ProgramVerifyErrorKind, ResolvedExport, decode_program, decode_verified_program,
+};
 
 /// Canonical IEEE-754 bits. Every positive or negative NaN payload collapses
 /// to the unique arithmetic NaN from `Bamti.canonical_nan`.
@@ -262,7 +293,7 @@ fn is_canonical_bigint(text: &str) -> bool {
 pub enum Constant {
     Number(NumberBits),
     Int32(i32),
-    String(String),
+    String(EcmaString),
     Boolean(bool),
     Null,
     Undefined,
@@ -419,6 +450,58 @@ impl IteratorKind {
     }
 }
 
+/// Error handling policy for [`Instruction::IteratorClose`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum IteratorCloseMode {
+    /// Surface a close failure as the current throw completion.
+    Propagate,
+    /// Preserve an existing abrupt completion over a user close failure.
+    PreserveAbrupt,
+}
+
+impl IteratorCloseMode {
+    const fn to_u8(self) -> u8 {
+        match self {
+            Self::Propagate => 0,
+            Self::PreserveAbrupt => 1,
+        }
+    }
+
+    const fn from_u8(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::Propagate),
+            1 => Some(Self::PreserveAbrupt),
+            _ => None,
+        }
+    }
+}
+
+/// Hint selecting the well-known disposal method [`Instruction::DisposeCapture`] records.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum DisposeHint {
+    /// Require a callable `Symbol.dispose` method.
+    Sync,
+    /// Prefer `Symbol.asyncDispose`, falling back to `Symbol.dispose`.
+    Async,
+}
+
+impl DisposeHint {
+    const fn to_u8(self) -> u8 {
+        match self {
+            Self::Sync => 0,
+            Self::Async => 1,
+        }
+    }
+
+    const fn from_u8(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::Sync),
+            1 => Some(Self::Async),
+            _ => None,
+        }
+    }
+}
+
 /// Which half of an accessor descriptor [`Instruction::DefineAccessor`] installs.
 /// A property with both a getter and a setter is defined by two instructions on
 /// the same key.
@@ -445,7 +528,40 @@ impl AccessorKind {
     }
 }
 
-/// The production instruction algebra. Opcodes 0..=35 are stable wire tags.
+/// Which own-property descriptor slot
+/// [`Instruction::LoadOwnDescriptorSlot`] /
+/// [`Instruction::DefineOwnDescriptorSlot`] addresses.
+///
+/// Wire tags are `0` = value, `1` = getter, `2` = setter. These opcodes never
+/// invoke accessors and never walk the prototype chain.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum DescriptorSlot {
+    Value,
+    Getter,
+    Setter,
+}
+
+impl DescriptorSlot {
+    const fn to_u8(self) -> u8 {
+        match self {
+            Self::Value => 0,
+            Self::Getter => 1,
+            Self::Setter => 2,
+        }
+    }
+
+    const fn from_u8(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::Value),
+            1 => Some(Self::Getter),
+            2 => Some(Self::Setter),
+            _ => None,
+        }
+    }
+}
+
+/// The production instruction algebra. Existing opcodes 0..=50 retain stable
+/// wire tags; later instructions append new tags without reinterpreting them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Instruction {
     /// Load a constant into `dst` (refines the formal `Load`).
@@ -467,8 +583,20 @@ pub enum Instruction {
     },
     /// Create a fresh empty object in `dst`.
     CreateObject { dst: Register },
+    /// Apply ECMAScript `ToObject` to `src`, writing the object to `dst`.
+    ///
+    /// Null and undefined throw; objects preserve identity; primitives receive
+    /// their corresponding wrapper object. This is append-only wire tag 42.
+    ToObject { dst: Register, src: Register },
+    /// Load the current module's stable host-provided `import.meta` object.
+    ///
+    /// This is append-only wire tag 44 and has no static-edge operand.
+    LoadImportMeta { dst: Register },
     /// Create a fresh empty array in `dst`.
     CreateArray { dst: Register },
+    /// Create a compiler-private one-element array cell seeded with the
+    /// runtime-only uninitialized sentinel.
+    CreateCell { dst: Register },
     /// Materialize a closure over `function`, binding the captured cells held in
     /// the array register `captures`, into `dst`. The captured cells initialize
     /// the callee's leading `capture_count` registers.
@@ -502,6 +630,43 @@ pub enum Instruction {
         accessor: Register,
         kind: AccessorKind,
     },
+    /// Define `object[key]` as a data property with value from a register.
+    DefineDataProperty {
+        object: Register,
+        key: Register,
+        value: Register,
+    },
+    /// Read one own-descriptor slot of `object[key]` into `dst`.
+    ///
+    /// Own-only and non-invoking: never runs a getter and never walks the
+    /// prototype chain. Absent properties and mismatched descriptor shapes
+    /// yield `undefined` in `dst`. Append-only wire tag 49.
+    LoadOwnDescriptorSlot {
+        dst: Register,
+        object: Register,
+        key: Register,
+        slot: DescriptorSlot,
+    },
+    /// Write `src` into one own-descriptor slot of `object[key]`.
+    ///
+    /// Mutates the addressed slot in place, preserving the sibling accessor
+    /// half and the writable/enumerable/configurable bits. A descriptor-shape
+    /// mismatch is a runtime `TypeError`. Append-only wire tag 50.
+    DefineOwnDescriptorSlot {
+        object: Register,
+        key: Register,
+        src: Register,
+        slot: DescriptorSlot,
+    },
+    /// `dst = HasBinding(object, key)` for a `with` object environment record.
+    ///
+    /// Converts `key` to a property key, tests `HasProperty`, then consults
+    /// `object[@@unscopables]` via the realm intrinsic. Append-only wire tag 51.
+    WithHasBinding {
+        dst: Register,
+        object: Register,
+        key: Register,
+    },
     /// Call `callee` with receiver `this_value` and the dynamic argument array
     /// in `arguments`, writing the result to `dst`. Spread and any arity lower
     /// through the single arguments array.
@@ -516,6 +681,17 @@ pub enum Instruction {
     Construct {
         dst: Register,
         callee: Register,
+        arguments: Register,
+    },
+    /// Construct with `callee`, an explicit `new.target` in `new_target`, and
+    /// the dynamic argument array in `arguments`, writing the instance to `dst`.
+    ///
+    /// Operand order on the wire is `dst`, `callee`, `new_target`, `arguments`.
+    /// This is append-only wire tag 47.
+    ConstructWithNewTarget {
+        dst: Register,
+        callee: Register,
+        new_target: Register,
         arguments: Register,
     },
     /// `dst = globalThis[name]`, where `name` is a string constant. Throws a
@@ -570,6 +746,57 @@ pub enum Instruction {
         value: Register,
         iterator: Register,
     },
+    /// Advance `iterator` one step, writing the raw iterator result -- the
+    /// object its `next` method returns, possibly a promise for an async
+    /// iterator -- to `dst`. `for await` splits the step this way so it can
+    /// suspend on the raw result with [`Instruction::Await`] before reading
+    /// `done`/`value` via [`Instruction::IteratorResult`].
+    IteratorStep { dst: Register, iterator: Register },
+    /// Validate the iterator result object in `result`: write whether
+    /// iteration is done to `done` and the produced value to `value` (two
+    /// writes), exactly as [`Instruction::IteratorNext`] reports them.
+    IteratorResult {
+        done: Register,
+        value: Register,
+        result: Register,
+    },
+    /// Call `iterator.return`, writing its raw result to `result` and a boolean
+    /// to `called` that is true exactly when a callable return method was invoked.
+    ///
+    /// [`IteratorCloseMode::Propagate`] surfaces a close failure as a throw.
+    /// [`IteratorCloseMode::PreserveAbrupt`] swallows a user close throw and
+    /// writes `undefined`; engine failures remain fatal.
+    IteratorClose {
+        result: Register,
+        called: Register,
+        iterator: Register,
+        mode: IteratorCloseMode,
+    },
+    /// Require a callable `iterator.return` result to be an object.
+    ///
+    /// Falls through when the return method was absent or non-callable
+    /// (`called` is false), otherwise throws a `TypeError` with message
+    /// `iterator.return() returned a non-object` unless `result` is an object.
+    RequireCloseResult { result: Register, called: Register },
+    /// Capture a disposable resource's method and disposal kind.
+    ///
+    /// `method` and `kind` are distinct outputs. `kind` is `0` for a nullish
+    /// resource, `1` for a direct `@@dispose` or `@@asyncDispose` method, and
+    /// `2` when async disposal falls back to `@@dispose`.
+    DisposeCapture {
+        method: Register,
+        kind: Register,
+        src: Register,
+        hint: DisposeHint,
+    },
+    /// Construct an intrinsic `SuppressedError` with the disposal failure in
+    /// `error` and the prior body or disposal failure in `suppressed`.
+    /// Both fields are preserved as non-enumerable own data properties.
+    SuppressError {
+        dst: Register,
+        error: Register,
+        suppressed: Register,
+    },
     /// Unconditional control transfer (identical to the formal `Jump`).
     Jump { target: Pc },
     /// Branch to `target` when `condition` is truthy, else fall through.
@@ -580,9 +807,20 @@ pub enum Instruction {
     Return { value: Register },
     /// Throw `value` (terminator; caught by an enclosing handler if any).
     Throw { value: Register },
-    /// Yield `src` and resume at `resume`, receiving the resumed value in `dst`
-    /// (refines the formal `Suspend`). See the module-level resume contract.
+    /// Yield `src` (the `yield` form, including delegated `yield*`) and resume
+    /// at `resume`, receiving the resumed value in `dst` (refines the formal
+    /// `Suspend`). See the module-level resume contract.
     Suspend {
+        dst: Register,
+        src: Register,
+        resume: Pc,
+    },
+    /// Await the operand in `src` and resume at `resume`, receiving the
+    /// settled value in `dst`. Identical register and CFG shape to
+    /// [`Instruction::Suspend`], which remains the `yield` form; keeping the
+    /// opcodes distinct lets an async-generator body tell `await` from
+    /// `yield`. See the module-level resume contract.
+    Await {
         dst: Register,
         src: Register,
         resume: Pc,
@@ -592,6 +830,12 @@ pub enum Instruction {
         dst: Register,
         specifier: ConstantId,
     },
+    /// Evaluate `import(specifier)` using the runtime module resolver, writing
+    /// its Promise result to `dst`. Unlike [`Self::Import`], this has no
+    /// static-edge operand and is legal in a classic script.
+    ///
+    /// This is append-only wire tag 43.
+    ImportDynamic { dst: Register, specifier: Register },
     /// Export the local value in `src` under the string constant `name`.
     Export { name: ConstantId, src: Register },
     /// Terminate the current activation (identical to the formal `Halt`).
@@ -603,20 +847,35 @@ impl Instruction {
     fn visit_reads(self, mut visit: impl FnMut(Register)) {
         match self {
             Self::Move { src, .. } => visit(src),
+            Self::ToObject { src, .. } => visit(src),
             Self::Unary { operand, .. } => visit(operand),
             Self::Binary { left, right, .. } => {
                 visit(left);
                 visit(right);
             }
             Self::CreateClosure { captures, .. } => visit(captures),
-            Self::GetProperty { object, key, .. } | Self::DeleteProperty { object, key, .. } => {
+            Self::GetProperty { object, key, .. }
+            | Self::DeleteProperty { object, key, .. }
+            | Self::WithHasBinding { object, key, .. } => {
                 visit(object);
                 visit(key);
             }
-            Self::SetProperty { object, key, value } => {
+            Self::SetProperty { object, key, value }
+            | Self::DefineDataProperty { object, key, value } => {
                 visit(object);
                 visit(key);
                 visit(value);
+            }
+            Self::LoadOwnDescriptorSlot { object, key, .. } => {
+                visit(object);
+                visit(key);
+            }
+            Self::DefineOwnDescriptorSlot {
+                object, key, src, ..
+            } => {
+                visit(object);
+                visit(key);
+                visit(src);
             }
             Self::DefineAccessor {
                 object,
@@ -644,6 +903,16 @@ impl Instruction {
                 visit(callee);
                 visit(arguments);
             }
+            Self::ConstructWithNewTarget {
+                callee,
+                new_target,
+                arguments,
+                ..
+            } => {
+                visit(callee);
+                visit(new_target);
+                visit(arguments);
+            }
             Self::StoreGlobal { value, .. } => visit(value),
             Self::ArrayPush { array, value } => {
                 visit(array);
@@ -662,22 +931,39 @@ impl Instruction {
                 visit(prototype);
             }
             Self::GetIterator { src, .. } => visit(src),
-            Self::IteratorNext { iterator, .. } => visit(iterator),
+            Self::IteratorNext { iterator, .. }
+            | Self::IteratorStep { iterator, .. }
+            | Self::IteratorClose { iterator, .. } => visit(iterator),
+            Self::IteratorResult { result, .. } => visit(result),
+            Self::RequireCloseResult { result, called } => {
+                visit(result);
+                visit(called);
+            }
+            Self::DisposeCapture { src, .. } => visit(src),
+            Self::SuppressError {
+                error, suppressed, ..
+            } => {
+                visit(error);
+                visit(suppressed);
+            }
             Self::JumpIfTrue { condition, .. } | Self::JumpIfFalse { condition, .. } => {
                 visit(condition);
             }
             Self::Return { value } | Self::Throw { value } | Self::Export { src: value, .. } => {
                 visit(value);
             }
-            Self::Suspend { src, .. } => visit(src),
+            Self::Suspend { src, .. } | Self::Await { src, .. } => visit(src),
+            Self::ImportDynamic { specifier, .. } => visit(specifier),
             Self::LoadConst { .. }
             | Self::CreateObject { .. }
             | Self::CreateArray { .. }
+            | Self::CreateCell { .. }
             | Self::LoadGlobal { .. }
             | Self::TypeOfGlobal { .. }
             | Self::LoadThis { .. }
             | Self::LoadArguments { .. }
             | Self::LoadNewTarget { .. }
+            | Self::LoadImportMeta { .. }
             | Self::CreatePrivateName { .. }
             | Self::CreateRegExp { .. }
             | Self::Jump { .. }
@@ -687,7 +973,8 @@ impl Instruction {
     }
 
     /// Visits each register this instruction defines: zero, one, or two.
-    /// [`Instruction::IteratorNext`] is the sole two-write opcode.
+    /// [`Instruction::IteratorNext`], [`Instruction::IteratorResult`], and
+    /// [`Instruction::IteratorClose`] are the two-write opcodes.
     fn visit_writes(self, mut visit: impl FnMut(Register)) {
         match self {
             Self::LoadConst { dst, .. }
@@ -695,27 +982,47 @@ impl Instruction {
             | Self::Unary { dst, .. }
             | Self::Binary { dst, .. }
             | Self::CreateObject { dst }
+            | Self::ToObject { dst, .. }
             | Self::CreateArray { dst }
+            | Self::CreateCell { dst }
             | Self::CreateClosure { dst, .. }
             | Self::GetProperty { dst, .. }
             | Self::DeleteProperty { dst, .. }
+            | Self::WithHasBinding { dst, .. }
+            | Self::LoadOwnDescriptorSlot { dst, .. }
             | Self::Call { dst, .. }
             | Self::Construct { dst, .. }
+            | Self::ConstructWithNewTarget { dst, .. }
             | Self::LoadGlobal { dst, .. }
             | Self::TypeOfGlobal { dst, .. }
             | Self::LoadThis { dst }
             | Self::LoadArguments { dst }
             | Self::LoadNewTarget { dst }
+            | Self::LoadImportMeta { dst }
             | Self::CreatePrivateName { dst, .. }
             | Self::CreateRegExp { dst, .. }
             | Self::GetIterator { dst, .. }
+            | Self::IteratorStep { dst, .. }
             | Self::Suspend { dst, .. }
-            | Self::Import { dst, .. } => visit(dst),
-            Self::IteratorNext { done, value, .. } => {
+            | Self::Await { dst, .. }
+            | Self::Import { dst, .. }
+            | Self::ImportDynamic { dst, .. }
+            | Self::SuppressError { dst, .. } => visit(dst),
+            Self::IteratorNext { done, value, .. } | Self::IteratorResult { done, value, .. } => {
                 visit(done);
                 visit(value);
             }
+            Self::IteratorClose { result, called, .. } => {
+                visit(result);
+                visit(called);
+            }
+            Self::DisposeCapture { method, kind, .. } => {
+                visit(method);
+                visit(kind);
+            }
             Self::SetProperty { .. }
+            | Self::DefineDataProperty { .. }
+            | Self::DefineOwnDescriptorSlot { .. }
             | Self::DefineAccessor { .. }
             | Self::StoreGlobal { .. }
             | Self::ArrayPush { .. }
@@ -728,6 +1035,7 @@ impl Instruction {
             | Self::JumpIfFalse { .. }
             | Self::Return { .. }
             | Self::Throw { .. }
+            | Self::RequireCloseResult { .. }
             | Self::Halt => {}
         }
     }
@@ -742,27 +1050,35 @@ impl Instruction {
                 visit(target);
                 visit(Pc::new(pc + 1));
             }
-            Self::Suspend { resume, .. } => visit(resume),
+            Self::Suspend { resume, .. } | Self::Await { resume, .. } => visit(resume),
             Self::Return { .. } | Self::Throw { .. } | Self::Halt => {}
             Self::LoadConst { .. }
             | Self::Move { .. }
             | Self::Unary { .. }
             | Self::Binary { .. }
             | Self::CreateObject { .. }
+            | Self::ToObject { .. }
             | Self::CreateArray { .. }
+            | Self::CreateCell { .. }
             | Self::CreateClosure { .. }
             | Self::GetProperty { .. }
             | Self::SetProperty { .. }
+            | Self::DefineDataProperty { .. }
+            | Self::LoadOwnDescriptorSlot { .. }
+            | Self::DefineOwnDescriptorSlot { .. }
+            | Self::WithHasBinding { .. }
             | Self::DeleteProperty { .. }
             | Self::DefineAccessor { .. }
             | Self::Call { .. }
             | Self::Construct { .. }
+            | Self::ConstructWithNewTarget { .. }
             | Self::LoadGlobal { .. }
             | Self::StoreGlobal { .. }
             | Self::TypeOfGlobal { .. }
             | Self::LoadThis { .. }
             | Self::LoadArguments { .. }
             | Self::LoadNewTarget { .. }
+            | Self::LoadImportMeta { .. }
             | Self::ArrayPush { .. }
             | Self::ArrayExtend { .. }
             | Self::ObjectSpread { .. }
@@ -771,7 +1087,14 @@ impl Instruction {
             | Self::CreateRegExp { .. }
             | Self::GetIterator { .. }
             | Self::IteratorNext { .. }
+            | Self::IteratorStep { .. }
+            | Self::IteratorResult { .. }
+            | Self::IteratorClose { .. }
+            | Self::RequireCloseResult { .. }
+            | Self::DisposeCapture { .. }
+            | Self::SuppressError { .. }
             | Self::Import { .. }
+            | Self::ImportDynamic { .. }
             | Self::Export { .. } => visit(Pc::new(pc + 1)),
         }
     }
@@ -968,6 +1291,14 @@ impl Module<Verified> {
         self.certificates.get(function.get() as usize)
     }
 
+    /// Heap bytes retained by this module's verification certificates.
+    #[must_use]
+    pub fn verification_bytes(&self) -> usize {
+        self.certificates.iter().fold(0usize, |bytes, certificate| {
+            bytes.saturating_add(certificate.retained_bytes())
+        })
+    }
+
     /// Emits one deterministic canonical representation.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -996,6 +1327,19 @@ pub struct Certificate {
 }
 
 impl Certificate {
+    fn retained_bytes(&self) -> usize {
+        self.facts.iter().fold(
+            std::mem::size_of::<Self>().saturating_add(
+                self.facts
+                    .len()
+                    .saturating_mul(std::mem::size_of::<RegisterSet>()),
+            ),
+            |bytes, facts| {
+                bytes.saturating_add(facts.words.len().saturating_mul(std::mem::size_of::<u64>()))
+            },
+        )
+    }
+
     #[must_use]
     pub fn instruction_count(&self) -> usize {
         self.facts.len()
@@ -1131,6 +1475,12 @@ pub enum VerifyErrorKind {
         register: Register,
         register_count: u32,
     },
+    AliasedIteratorCloseOutputs {
+        register: Register,
+    },
+    AliasedDisposeCaptureOutputs {
+        register: Register,
+    },
     ConstantOutOfBounds {
         constant: ConstantId,
         constant_count: usize,
@@ -1245,6 +1595,16 @@ impl fmt::Display for VerifyError {
             } => write!(
                 formatter,
                 "register {} is outside register count {register_count}",
+                register.get()
+            ),
+            VerifyErrorKind::AliasedIteratorCloseOutputs { register } => write!(
+                formatter,
+                "iterator close result and called outputs alias register {}",
+                register.get()
+            ),
+            VerifyErrorKind::AliasedDisposeCaptureOutputs { register } => write!(
+                formatter,
+                "dispose capture method and kind outputs alias register {}",
                 register.get()
             ),
             VerifyErrorKind::ConstantOutOfBounds {
@@ -1618,6 +1978,10 @@ fn verify_instruction(
             check_register(dst)?;
             check_register(src)?;
         }
+        Instruction::ToObject { dst, src } => {
+            check_register(dst)?;
+            check_register(src)?;
+        }
         Instruction::Unary { dst, operand, .. } => {
             check_register(dst)?;
             check_register(operand)?;
@@ -1629,7 +1993,9 @@ fn verify_instruction(
             check_register(left)?;
             check_register(right)?;
         }
-        Instruction::CreateObject { dst } | Instruction::CreateArray { dst } => {
+        Instruction::CreateObject { dst }
+        | Instruction::CreateArray { dst }
+        | Instruction::CreateCell { dst } => {
             check_register(dst)?;
         }
         Instruction::CreateClosure {
@@ -1650,20 +2016,32 @@ fn verify_instruction(
                 ));
             }
         }
-        Instruction::GetProperty { dst, object, key } => {
+        Instruction::GetProperty { dst, object, key }
+        | Instruction::DeleteProperty { dst, object, key }
+        | Instruction::WithHasBinding { dst, object, key } => {
             check_register(dst)?;
             check_register(object)?;
             check_register(key)?;
         }
-        Instruction::SetProperty { object, key, value } => {
+        Instruction::SetProperty { object, key, value }
+        | Instruction::DefineDataProperty { object, key, value } => {
             check_register(object)?;
             check_register(key)?;
             check_register(value)?;
         }
-        Instruction::DeleteProperty { dst, object, key } => {
+        Instruction::LoadOwnDescriptorSlot {
+            dst, object, key, ..
+        } => {
             check_register(dst)?;
             check_register(object)?;
             check_register(key)?;
+        }
+        Instruction::DefineOwnDescriptorSlot {
+            object, key, src, ..
+        } => {
+            check_register(object)?;
+            check_register(key)?;
+            check_register(src)?;
         }
         Instruction::DefineAccessor {
             object,
@@ -1695,6 +2073,17 @@ fn verify_instruction(
             check_register(callee)?;
             check_register(arguments)?;
         }
+        Instruction::ConstructWithNewTarget {
+            dst,
+            callee,
+            new_target,
+            arguments,
+        } => {
+            check_register(dst)?;
+            check_register(callee)?;
+            check_register(new_target)?;
+            check_register(arguments)?;
+        }
         Instruction::LoadGlobal { dst, name } | Instruction::TypeOfGlobal { dst, name } => {
             check_register(dst)?;
             check_string_constant(name)?;
@@ -1705,7 +2094,8 @@ fn verify_instruction(
         }
         Instruction::LoadThis { dst }
         | Instruction::LoadArguments { dst }
-        | Instruction::LoadNewTarget { dst } => {
+        | Instruction::LoadNewTarget { dst }
+        | Instruction::LoadImportMeta { dst } => {
             check_register(dst)?;
         }
         Instruction::ArrayPush { array, value } => {
@@ -1750,6 +2140,63 @@ fn verify_instruction(
             check_register(value)?;
             check_register(iterator)?;
         }
+        Instruction::IteratorStep { dst, iterator } => {
+            check_register(dst)?;
+            check_register(iterator)?;
+        }
+        Instruction::IteratorResult {
+            done,
+            value,
+            result,
+        } => {
+            check_register(done)?;
+            check_register(value)?;
+            check_register(result)?;
+        }
+        Instruction::IteratorClose {
+            result,
+            called,
+            iterator,
+            ..
+        } => {
+            check_register(result)?;
+            check_register(called)?;
+            check_register(iterator)?;
+            if result == called {
+                return Err(instruction_error(
+                    function_index,
+                    pc,
+                    VerifyErrorKind::AliasedIteratorCloseOutputs { register: result },
+                ));
+            }
+        }
+        Instruction::RequireCloseResult { result, called } => {
+            check_register(result)?;
+            check_register(called)?;
+        }
+        Instruction::DisposeCapture {
+            method, kind, src, ..
+        } => {
+            check_register(method)?;
+            check_register(kind)?;
+            check_register(src)?;
+            if method == kind {
+                return Err(instruction_error(
+                    function_index,
+                    pc,
+                    VerifyErrorKind::AliasedDisposeCaptureOutputs { register: method },
+                ));
+            }
+        }
+        Instruction::SuppressError {
+            dst,
+            error,
+            suppressed,
+        } => {
+            check_register(dst)?;
+            check_register(error)?;
+            check_register(suppressed)?;
+        }
         Instruction::Jump { target } => verify_target(function_index, pc, target, code_len)?,
         Instruction::JumpIfTrue { condition, target }
         | Instruction::JumpIfFalse { condition, target } => {
@@ -1757,7 +2204,7 @@ fn verify_instruction(
             verify_target(function_index, pc, target, code_len)?;
         }
         Instruction::Return { value } | Instruction::Throw { value } => check_register(value)?,
-        Instruction::Suspend { dst, src, resume } => {
+        Instruction::Suspend { dst, src, resume } | Instruction::Await { dst, src, resume } => {
             check_register(dst)?;
             check_register(src)?;
             verify_target(function_index, pc, resume, code_len)?;
@@ -1765,6 +2212,10 @@ fn verify_instruction(
         Instruction::Import { dst, specifier } => {
             check_register(dst)?;
             check_string_constant(specifier)?;
+        }
+        Instruction::ImportDynamic { dst, specifier } => {
+            check_register(dst)?;
+            check_register(specifier)?;
         }
         Instruction::Export { name, src } => {
             check_string_constant(name)?;
@@ -1881,7 +2332,8 @@ pub struct DecodeLimits {
     pub max_instructions_per_function: u32,
     pub max_total_instructions: u64,
     pub max_handlers_per_function: u32,
-    pub max_string_bytes: u32,
+    pub max_string_units: u32,
+    pub max_bigint_bytes: u32,
 }
 
 impl Default for DecodeLimits {
@@ -1896,7 +2348,8 @@ impl Default for DecodeLimits {
             max_instructions_per_function: MAX_INSTRUCTIONS,
             max_total_instructions: 1 << 24,
             max_handlers_per_function: MAX_HANDLERS,
-            max_string_bytes: 1 << 20,
+            max_string_units: 1 << 20,
+            max_bigint_bytes: MAX_BIGINT_BYTES,
         }
     }
 }
@@ -1944,7 +2397,16 @@ pub enum DecodeErrorKind {
     InvalidIteratorKind {
         tag: u8,
     },
+    InvalidIteratorCloseMode {
+        tag: u8,
+    },
+    InvalidDisposeHint {
+        tag: u8,
+    },
     InvalidAccessorKind {
+        tag: u8,
+    },
+    InvalidDescriptorSlot {
         tag: u8,
     },
     InvalidOpcode {
@@ -1988,7 +2450,7 @@ impl fmt::Display for DecodeError {
             DecodeErrorKind::NonCanonicalNumber { bits } => {
                 write!(formatter, "noncanonical NaN bits {bits:#018x}")
             }
-            DecodeErrorKind::InvalidUtf8 => formatter.write_str("constant string is not UTF-8"),
+            DecodeErrorKind::InvalidUtf8 => formatter.write_str("bigint text is not UTF-8"),
             DecodeErrorKind::InvalidBigInt => {
                 formatter.write_str("bigint constant is not canonical decimal text")
             }
@@ -2004,8 +2466,17 @@ impl fmt::Display for DecodeError {
             DecodeErrorKind::InvalidIteratorKind { tag } => {
                 write!(formatter, "invalid iterator kind {tag}")
             }
+            DecodeErrorKind::InvalidIteratorCloseMode { tag } => {
+                write!(formatter, "invalid iterator close mode {tag}")
+            }
+            DecodeErrorKind::InvalidDisposeHint { tag } => {
+                write!(formatter, "invalid dispose hint {tag}")
+            }
             DecodeErrorKind::InvalidAccessorKind { tag } => {
                 write!(formatter, "invalid accessor kind {tag}")
+            }
+            DecodeErrorKind::InvalidDescriptorSlot { tag } => {
+                write!(formatter, "invalid descriptor slot {tag}")
             }
             DecodeErrorKind::InvalidOpcode { opcode } => {
                 write!(formatter, "invalid opcode {opcode}")
@@ -2142,7 +2613,7 @@ impl<'a> Decoder<'a> {
                     })
             }
             1 => Ok(Constant::Int32(i32::from_le_bytes(self.exact::<4>()?))),
-            2 => Ok(Constant::String(self.text()?)),
+            2 => Ok(Constant::String(self.string()?)),
             3 => Ok(Constant::Boolean(false)),
             4 => Ok(Constant::Boolean(true)),
             5 => Ok(Constant::Null),
@@ -2158,8 +2629,18 @@ impl<'a> Decoder<'a> {
         }
     }
 
+    fn string(&mut self) -> Result<EcmaString, DecodeError> {
+        let unit_count = self.bounded("string unit count", self.limits.max_string_units)?;
+        let byte_count = usize::try_from(unit_count)
+            .ok()
+            .and_then(|units| units.checked_mul(2))
+            .ok_or_else(|| self.error(self.offset, DecodeErrorKind::UnexpectedEof))?;
+        let bytes = self.slice(byte_count)?;
+        Ok(EcmaString::from_le_bytes(bytes))
+    }
+
     fn text(&mut self) -> Result<String, DecodeError> {
-        let length = self.bounded("string byte length", self.limits.max_string_bytes)?;
+        let length = self.bounded("bigint byte length", self.limits.max_bigint_bytes)?;
         let start = self.offset;
         let bytes = self.slice(length as usize)?;
         let value = std::str::from_utf8(bytes)
@@ -2377,6 +2858,83 @@ impl<'a> Decoder<'a> {
                 src: Register::new(self.leb128()?),
             }),
             35 => Ok(Instruction::Halt),
+            36 => Ok(Instruction::CreateCell {
+                dst: Register::new(self.leb128()?),
+            }),
+            37 => Ok(Instruction::Await {
+                dst: Register::new(self.leb128()?),
+                src: Register::new(self.leb128()?),
+                resume: Pc::new(self.leb128()?),
+            }),
+            38 => Ok(Instruction::IteratorStep {
+                dst: Register::new(self.leb128()?),
+                iterator: Register::new(self.leb128()?),
+            }),
+            39 => Ok(Instruction::IteratorResult {
+                done: Register::new(self.leb128()?),
+                value: Register::new(self.leb128()?),
+                result: Register::new(self.leb128()?),
+            }),
+            40 => Ok(Instruction::IteratorClose {
+                result: Register::new(self.leb128()?),
+                called: Register::new(self.leb128()?),
+                iterator: Register::new(self.leb128()?),
+                mode: self.iterator_close_mode()?,
+            }),
+            41 => Ok(Instruction::RequireCloseResult {
+                result: Register::new(self.leb128()?),
+                called: Register::new(self.leb128()?),
+            }),
+            42 => Ok(Instruction::ToObject {
+                dst: Register::new(self.leb128()?),
+                src: Register::new(self.leb128()?),
+            }),
+            43 => Ok(Instruction::ImportDynamic {
+                dst: Register::new(self.leb128()?),
+                specifier: Register::new(self.leb128()?),
+            }),
+            44 => Ok(Instruction::LoadImportMeta {
+                dst: Register::new(self.leb128()?),
+            }),
+            45 => Ok(Instruction::DisposeCapture {
+                method: Register::new(self.leb128()?),
+                kind: Register::new(self.leb128()?),
+                src: Register::new(self.leb128()?),
+                hint: self.dispose_hint()?,
+            }),
+            46 => Ok(Instruction::SuppressError {
+                dst: Register::new(self.leb128()?),
+                error: Register::new(self.leb128()?),
+                suppressed: Register::new(self.leb128()?),
+            }),
+            47 => Ok(Instruction::ConstructWithNewTarget {
+                dst: Register::new(self.leb128()?),
+                callee: Register::new(self.leb128()?),
+                new_target: Register::new(self.leb128()?),
+                arguments: Register::new(self.leb128()?),
+            }),
+            48 => Ok(Instruction::DefineDataProperty {
+                object: Register::new(self.leb128()?),
+                key: Register::new(self.leb128()?),
+                value: Register::new(self.leb128()?),
+            }),
+            49 => Ok(Instruction::LoadOwnDescriptorSlot {
+                dst: Register::new(self.leb128()?),
+                object: Register::new(self.leb128()?),
+                key: Register::new(self.leb128()?),
+                slot: self.descriptor_slot()?,
+            }),
+            50 => Ok(Instruction::DefineOwnDescriptorSlot {
+                object: Register::new(self.leb128()?),
+                key: Register::new(self.leb128()?),
+                src: Register::new(self.leb128()?),
+                slot: self.descriptor_slot()?,
+            }),
+            51 => Ok(Instruction::WithHasBinding {
+                dst: Register::new(self.leb128()?),
+                object: Register::new(self.leb128()?),
+                key: Register::new(self.leb128()?),
+            }),
             opcode => Err(self.error(opcode_at, DecodeErrorKind::InvalidOpcode { opcode })),
         }
     }
@@ -2401,11 +2959,32 @@ impl<'a> Decoder<'a> {
             .ok_or_else(|| self.error(at, DecodeErrorKind::InvalidIteratorKind { tag }))
     }
 
+    fn iterator_close_mode(&mut self) -> Result<IteratorCloseMode, DecodeError> {
+        let at = self.offset;
+        let tag = self.byte()?;
+        IteratorCloseMode::from_u8(tag)
+            .ok_or_else(|| self.error(at, DecodeErrorKind::InvalidIteratorCloseMode { tag }))
+    }
+
+    fn dispose_hint(&mut self) -> Result<DisposeHint, DecodeError> {
+        let at = self.offset;
+        let tag = self.byte()?;
+        DisposeHint::from_u8(tag)
+            .ok_or_else(|| self.error(at, DecodeErrorKind::InvalidDisposeHint { tag }))
+    }
+
     fn accessor_kind(&mut self) -> Result<AccessorKind, DecodeError> {
         let at = self.offset;
         let tag = self.byte()?;
         AccessorKind::from_u8(tag)
             .ok_or_else(|| self.error(at, DecodeErrorKind::InvalidAccessorKind { tag }))
+    }
+
+    fn descriptor_slot(&mut self) -> Result<DescriptorSlot, DecodeError> {
+        let at = self.offset;
+        let tag = self.byte()?;
+        DescriptorSlot::from_u8(tag)
+            .ok_or_else(|| self.error(at, DecodeErrorKind::InvalidDescriptorSlot { tag }))
     }
 
     fn bounded(&mut self, field: &'static str, limit: u32) -> Result<u32, DecodeError> {
@@ -2483,7 +3062,7 @@ impl<'a> Decoder<'a> {
             return Err(self.error(self.offset, DecodeErrorKind::UnexpectedEof));
         };
         let Some(bytes) = source.get(self.offset..end) else {
-            return Err(self.error(source.len(), DecodeErrorKind::UnexpectedEof));
+            return Err(self.error(self.offset, DecodeErrorKind::UnexpectedEof));
         };
         self.offset = end;
         Ok(bytes)
@@ -2519,7 +3098,7 @@ fn encode_constant(constant: &Constant, output: &mut Vec<u8>) {
         }
         Constant::String(value) => {
             output.push(2);
-            write_text(value, output);
+            write_string(value, output);
         }
         Constant::Boolean(false) => output.push(3),
         Constant::Boolean(true) => output.push(4),
@@ -2529,6 +3108,13 @@ fn encode_constant(constant: &Constant, output: &mut Vec<u8>) {
             output.push(7);
             write_text(value.as_str(), output);
         }
+    }
+}
+
+fn write_string(value: &EcmaString, output: &mut Vec<u8>) {
+    write_u32(value.len_units() as u32, output);
+    for unit in value.as_units() {
+        output.extend_from_slice(&unit.to_le_bytes());
     }
 }
 
@@ -2767,12 +3353,138 @@ fn encode_instruction(instruction: Instruction, output: &mut Vec<u8>) {
             write_u32(dst.get(), output);
             write_u32(specifier.get(), output);
         }
+        Instruction::ImportDynamic { dst, specifier } => {
+            output.push(43);
+            write_u32(dst.get(), output);
+            write_u32(specifier.get(), output);
+        }
         Instruction::Export { name, src } => {
             output.push(34);
             write_u32(name.get(), output);
             write_u32(src.get(), output);
         }
         Instruction::Halt => output.push(35),
+        Instruction::CreateCell { dst } => {
+            output.push(36);
+            write_u32(dst.get(), output);
+        }
+        Instruction::Await { dst, src, resume } => {
+            output.push(37);
+            write_u32(dst.get(), output);
+            write_u32(src.get(), output);
+            write_u32(resume.get(), output);
+        }
+        Instruction::IteratorStep { dst, iterator } => {
+            output.push(38);
+            write_u32(dst.get(), output);
+            write_u32(iterator.get(), output);
+        }
+        Instruction::IteratorResult {
+            done,
+            value,
+            result,
+        } => {
+            output.push(39);
+            write_u32(done.get(), output);
+            write_u32(value.get(), output);
+            write_u32(result.get(), output);
+        }
+        Instruction::IteratorClose {
+            result,
+            called,
+            iterator,
+            mode,
+        } => {
+            output.push(40);
+            write_u32(result.get(), output);
+            write_u32(called.get(), output);
+            write_u32(iterator.get(), output);
+            output.push(mode.to_u8());
+        }
+        Instruction::RequireCloseResult { result, called } => {
+            output.push(41);
+            write_u32(result.get(), output);
+            write_u32(called.get(), output);
+        }
+        Instruction::DisposeCapture {
+            method,
+            kind,
+            src,
+            hint,
+        } => {
+            output.push(45);
+            write_u32(method.get(), output);
+            write_u32(kind.get(), output);
+            write_u32(src.get(), output);
+            output.push(hint.to_u8());
+        }
+        Instruction::SuppressError {
+            dst,
+            error,
+            suppressed,
+        } => {
+            output.push(46);
+            write_u32(dst.get(), output);
+            write_u32(error.get(), output);
+            write_u32(suppressed.get(), output);
+        }
+        Instruction::ToObject { dst, src } => {
+            output.push(42);
+            write_u32(dst.get(), output);
+            write_u32(src.get(), output);
+        }
+        Instruction::LoadImportMeta { dst } => {
+            output.push(44);
+            write_u32(dst.get(), output);
+        }
+        Instruction::ConstructWithNewTarget {
+            dst,
+            callee,
+            new_target,
+            arguments,
+        } => {
+            output.push(47);
+            write_u32(dst.get(), output);
+            write_u32(callee.get(), output);
+            write_u32(new_target.get(), output);
+            write_u32(arguments.get(), output);
+        }
+        Instruction::DefineDataProperty { object, key, value } => {
+            output.push(48);
+            write_u32(object.get(), output);
+            write_u32(key.get(), output);
+            write_u32(value.get(), output);
+        }
+        Instruction::LoadOwnDescriptorSlot {
+            dst,
+            object,
+            key,
+            slot,
+        } => {
+            output.push(49);
+            write_u32(dst.get(), output);
+            write_u32(object.get(), output);
+            write_u32(key.get(), output);
+            output.push(slot.to_u8());
+        }
+        Instruction::DefineOwnDescriptorSlot {
+            object,
+            key,
+            src,
+            slot,
+        } => {
+            output.push(50);
+            write_u32(object.get(), output);
+            write_u32(key.get(), output);
+            write_u32(src.get(), output);
+            output.push(slot.to_u8());
+        }
+        Instruction::WithHasBinding { dst, object, key } => {
+            output.push(51);
+            write_u32(dst.get(), output);
+            write_u32(object.get(), output);
+            write_u32(key.get(), output);
+        }
     }
 }
 
@@ -2807,19 +3519,19 @@ mod tests {
     /// * handler over [0,34) catches into r25
     fn rich_module() -> Module<Unverified> {
         let constants = vec![
-            Constant::String("main".to_owned()), // 0: function name + key string
-            Constant::Int32(21),                 // 1
-            Constant::Number(NumberBits::from_f64(1.5)), // 2
+            Constant::String(EcmaString::from_utf8("main")), // 0: function name + key string
+            Constant::Int32(21),                             // 1
+            Constant::Number(NumberBits::from_f64(1.5)),     // 2
             Constant::BigInt(BigIntLiteral::new("-1234567890123".to_owned()).unwrap()), // 3
-            Constant::Boolean(true),             // 4
-            Constant::Null,                      // 5
-            Constant::Undefined,                 // 6
-            Constant::String("./dep".to_owned()), // 7: import specifier
-            Constant::String("g".to_owned()),    // 8: global name
-            Constant::String("#p".to_owned()),   // 9: private description
-            Constant::String("ab".to_owned()),   // 10: regexp pattern
-            Constant::String("gi".to_owned()),   // 11: regexp flags
-            Constant::String("x".to_owned()),    // 12: export name
+            Constant::Boolean(true),                         // 4
+            Constant::Null,                                  // 5
+            Constant::Undefined,                             // 6
+            Constant::String(EcmaString::from_utf8("./dep")), // 7: import specifier
+            Constant::String(EcmaString::from_utf8("g")),    // 8: global name
+            Constant::String(EcmaString::from_utf8("#p")),   // 9: private description
+            Constant::String(EcmaString::from_utf8("ab")),   // 10: regexp pattern
+            Constant::String(EcmaString::from_utf8("gi")),   // 11: regexp flags
+            Constant::String(EcmaString::from_utf8("x")),    // 12: export name
         ];
         let code = vec![
             Instruction::LoadConst {
@@ -3007,7 +3719,7 @@ mod tests {
 
     /// Every opcode variant survives an encode -> decode round-trip at the
     /// instruction level, independent of CFG/reference validity. This pins the
-    /// wire tag and field order for all 36 opcodes.
+    /// wire tag and field order for all opcodes.
     #[test]
     fn every_opcode_round_trips_on_the_wire() {
         let instructions = [
@@ -3160,8 +3872,85 @@ mod tests {
                 src: Register::new(74),
             },
             Instruction::Halt,
+            Instruction::CreateCell {
+                dst: Register::new(75),
+            },
+            Instruction::Await {
+                dst: Register::new(76),
+                src: Register::new(77),
+                resume: Pc::new(78),
+            },
+            Instruction::IteratorStep {
+                dst: Register::new(79),
+                iterator: Register::new(80),
+            },
+            Instruction::IteratorResult {
+                done: Register::new(81),
+                value: Register::new(82),
+                result: Register::new(83),
+            },
+            Instruction::IteratorClose {
+                result: Register::new(84),
+                called: Register::new(85),
+                iterator: Register::new(86),
+                mode: IteratorCloseMode::PreserveAbrupt,
+            },
+            Instruction::RequireCloseResult {
+                result: Register::new(87),
+                called: Register::new(88),
+            },
+            Instruction::ToObject {
+                dst: Register::new(89),
+                src: Register::new(90),
+            },
+            Instruction::ImportDynamic {
+                dst: Register::new(91),
+                specifier: Register::new(92),
+            },
+            Instruction::LoadImportMeta {
+                dst: Register::new(93),
+            },
+            Instruction::DisposeCapture {
+                method: Register::new(94),
+                kind: Register::new(95),
+                src: Register::new(96),
+                hint: DisposeHint::Async,
+            },
+            Instruction::SuppressError {
+                dst: Register::new(97),
+                error: Register::new(98),
+                suppressed: Register::new(99),
+            },
+            Instruction::ConstructWithNewTarget {
+                dst: Register::new(100),
+                callee: Register::new(101),
+                new_target: Register::new(102),
+                arguments: Register::new(103),
+            },
+            Instruction::DefineDataProperty {
+                object: Register::new(104),
+                key: Register::new(105),
+                value: Register::new(106),
+            },
+            Instruction::LoadOwnDescriptorSlot {
+                dst: Register::new(107),
+                object: Register::new(108),
+                key: Register::new(109),
+                slot: DescriptorSlot::Value,
+            },
+            Instruction::DefineOwnDescriptorSlot {
+                object: Register::new(110),
+                key: Register::new(111),
+                src: Register::new(112),
+                slot: DescriptorSlot::Setter,
+            },
+            Instruction::WithHasBinding {
+                dst: Register::new(113),
+                object: Register::new(114),
+                key: Register::new(115),
+            },
         ];
-        assert_eq!(instructions.len(), 36, "one case per opcode");
+        assert_eq!(instructions.len(), 52, "one case per opcode");
         let limits = DecodeLimits::default();
         for (opcode, instruction) in instructions.into_iter().enumerate() {
             let mut bytes = Vec::new();
@@ -3402,12 +4191,26 @@ mod tests {
             })
         );
         let mut bad_version = MAGIC.to_vec();
-        bad_version.push(2);
+        bad_version.push(3);
         assert_eq!(
             decode(&bad_version, &DecodeLimits::default()),
             Err(DecodeError {
                 offset: 8,
-                kind: DecodeErrorKind::UnsupportedVersion { version: 2 },
+                kind: DecodeErrorKind::UnsupportedVersion { version: 3 },
+            })
+        );
+    }
+
+    #[test]
+    fn truncated_string_reports_payload_start() {
+        let mut bytes = prefix();
+        bytes.extend_from_slice(&[1, 2, 2, b'a', 0]);
+
+        assert_eq!(
+            decode(&bytes, &DecodeLimits::default()),
+            Err(DecodeError {
+                offset: 12,
+                kind: DecodeErrorKind::UnexpectedEof,
             })
         );
     }
@@ -3434,10 +4237,10 @@ mod tests {
     }
 
     #[test]
-    fn decoder_rejects_invalid_utf8_without_recovery() {
+    fn decoder_rejects_invalid_bigint_utf8_without_recovery() {
         let mut bytes = prefix();
         write_u32(1, &mut bytes); // constant count
-        bytes.push(2); // string tag
+        bytes.push(7); // bigint tag
         write_u32(1, &mut bytes); // length
         bytes.push(0xff); // invalid UTF-8
         assert_eq!(
@@ -3447,6 +4250,76 @@ mod tests {
                 kind: DecodeErrorKind::InvalidUtf8,
             })
         );
+    }
+
+    #[test]
+    fn decoder_rejects_truncated_string_units() {
+        let mut bytes = prefix();
+        write_u32(1, &mut bytes);
+        bytes.push(2);
+        write_u32(2, &mut bytes);
+        bytes.extend_from_slice(&0xD800_u16.to_le_bytes());
+        assert!(matches!(
+            decode(&bytes, &DecodeLimits::default()),
+            Err(DecodeError {
+                kind: DecodeErrorKind::UnexpectedEof,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn decoder_rejects_string_over_unit_limit() {
+        let mut bytes = prefix();
+        write_u32(1, &mut bytes);
+        bytes.push(2);
+        write_u32(3, &mut bytes);
+        let limits = DecodeLimits {
+            max_string_units: 2,
+            ..DecodeLimits::default()
+        };
+        assert!(matches!(
+            decode(&bytes, &limits),
+            Err(DecodeError {
+                kind: DecodeErrorKind::LimitExceeded {
+                    field: "string unit count",
+                    limit: 2,
+                    actual: 3,
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn string_constants_round_trip_lone_surrogates() {
+        let encoded = Module::new(
+            vec![Constant::String(EcmaString::from_units(&[
+                0xD800, 0xDC00, 0xDFFF,
+            ]))],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                1,
+                flags(),
+                vec![Instruction::Halt],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("lone surrogates are valid literal constants")
+        .encode();
+        let module = decode(&encoded, &DecodeLimits::default())
+            .expect("valid UTF-16 units")
+            .verify()
+            .expect("the decoded module verifies");
+        assert!(matches!(
+            module.constants(),
+            [Constant::String(value)] if value.as_units() == [0xD800, 0xDC00, 0xDFFF]
+        ));
+        assert_eq!(module.encode(), encoded);
     }
 
     #[test]
@@ -3584,6 +4457,43 @@ mod tests {
                 ..
             })
         ));
+        // IteratorClose with a bad mode tag
+        // (opcode 40, result 0, called 0, iterator 0, mode 9).
+        assert!(matches!(
+            decode(
+                &one_function_bytes(&[40, 0, 0, 0, 9]),
+                &DecodeLimits::default()
+            ),
+            Err(DecodeError {
+                kind: DecodeErrorKind::InvalidIteratorCloseMode { tag: 9 },
+                ..
+            })
+        ));
+        // RequireCloseResult with a truncated called register is hostile input,
+        // not an implicit default.
+        assert!(decode(&one_function_bytes(&[41, 0]), &DecodeLimits::default()).is_err());
+        // DisposeCapture rejects unknown hints and truncated operands.
+        assert!(matches!(
+            decode(
+                &one_function_bytes(&[45, 0, 1, 2, 9]),
+                &DecodeLimits::default()
+            ),
+            Err(DecodeError {
+                kind: DecodeErrorKind::InvalidDisposeHint { tag: 9 },
+                ..
+            })
+        ));
+        assert!(decode(&one_function_bytes(&[45, 0, 1]), &DecodeLimits::default()).is_err());
+        // SuppressError requires all three register operands.
+        assert!(decode(&one_function_bytes(&[46, 0, 0]), &DecodeLimits::default()).is_err());
+        assert!(
+            decode(
+                &one_function_bytes(&[47, 0, 0, 0]),
+                &DecodeLimits::default()
+            )
+            .is_err()
+        );
+        assert!(decode(&one_function_bytes(&[48, 0, 0]), &DecodeLimits::default()).is_err());
         // DefineAccessor with a bad kind tag (opcode 10, obj 0, key 0, acc 0, kind 9).
         assert!(matches!(
             decode(
@@ -3595,6 +4505,32 @@ mod tests {
                 ..
             })
         ));
+        // LoadOwnDescriptorSlot / DefineOwnDescriptorSlot reject unknown slot tags
+        // and truncated operands.
+        assert!(matches!(
+            decode(
+                &one_function_bytes(&[49, 0, 0, 0, 9]),
+                &DecodeLimits::default()
+            ),
+            Err(DecodeError {
+                kind: DecodeErrorKind::InvalidDescriptorSlot { tag: 9 },
+                ..
+            })
+        ));
+        assert!(matches!(
+            decode(
+                &one_function_bytes(&[50, 0, 0, 0, 9]),
+                &DecodeLimits::default()
+            ),
+            Err(DecodeError {
+                kind: DecodeErrorKind::InvalidDescriptorSlot { tag: 9 },
+                ..
+            })
+        ));
+        assert!(decode(&one_function_bytes(&[49, 0, 0]), &DecodeLimits::default()).is_err());
+        assert!(decode(&one_function_bytes(&[50, 0, 0]), &DecodeLimits::default()).is_err());
+        // WithHasBinding requires dst, object, and key.
+        assert!(decode(&one_function_bytes(&[51, 0, 0]), &DecodeLimits::default()).is_err());
     }
 
     #[test]
@@ -4218,6 +5154,148 @@ mod tests {
         );
     }
 
+    /// `Await` shares `Suspend`'s CFG and definite-initialization shape:
+    /// `resume` is its only successor, `dst` is initialized on the resume
+    /// edge, and no other register gains initialization across the suspension.
+    #[test]
+    fn await_has_the_suspend_cfg_and_dataflow_shape() {
+        let module = Module::new(
+            vec![Constant::Int32(0)],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                3,
+                flags(),
+                vec![
+                    Instruction::LoadConst {
+                        dst: Register::new(0),
+                        constant: ConstantId::new(0),
+                    },
+                    Instruction::Await {
+                        dst: Register::new(1),
+                        src: Register::new(0),
+                        resume: Pc::new(2),
+                    },
+                    Instruction::Return {
+                        value: Register::new(1),
+                    },
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        let verified = module.verify().expect("await verifies like suspend");
+        let certificate = verified.certificate(FunctionId::new(0)).unwrap();
+        assert_eq!(
+            certificate.initialized_before(Pc::new(1), Register::new(1)),
+            Some(false),
+            "dst is not initialized before the await"
+        );
+        assert_eq!(
+            certificate.initialized_before(Pc::new(2), Register::new(1)),
+            Some(true),
+            "dst is initialized on the resume edge"
+        );
+        assert_eq!(
+            certificate.initialized_before(Pc::new(2), Register::new(2)),
+            Some(false),
+            "no other register gains initialization across the await"
+        );
+    }
+
+    /// An awaited operand must itself be definitely initialized: reading an
+    /// unwritten register as `src` is a read-before-write error.
+    #[test]
+    fn await_rejects_an_uninitialized_operand() {
+        let module = Module::new(
+            vec![],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                2,
+                flags(),
+                vec![
+                    Instruction::Await {
+                        dst: Register::new(1),
+                        src: Register::new(0),
+                        resume: Pc::new(1),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        assert!(module.verify().is_err());
+    }
+
+    /// The split async-iteration pair: `IteratorStep` initializes its raw
+    /// result register, and `IteratorResult` initializes both `done` and
+    /// `value`, so the settled object can be read between the two.
+    #[test]
+    fn iterator_step_and_result_initialize_their_writes() {
+        let module = Module::new(
+            vec![Constant::Int32(0)],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                6,
+                flags(),
+                vec![
+                    Instruction::LoadConst {
+                        dst: Register::new(0),
+                        constant: ConstantId::new(0),
+                    },
+                    Instruction::GetIterator {
+                        dst: Register::new(1),
+                        src: Register::new(0),
+                        kind: IteratorKind::Async,
+                    },
+                    Instruction::IteratorStep {
+                        dst: Register::new(2),
+                        iterator: Register::new(1),
+                    },
+                    Instruction::IteratorResult {
+                        done: Register::new(3),
+                        value: Register::new(4),
+                        result: Register::new(2),
+                    },
+                    // Read BOTH results: sound only because IteratorResult
+                    // defines two registers.
+                    Instruction::Binary {
+                        dst: Register::new(5),
+                        op: BinaryOp::StrictEqual,
+                        left: Register::new(3),
+                        right: Register::new(4),
+                    },
+                    Instruction::Return {
+                        value: Register::new(5),
+                    },
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        let verified = module.verify().expect("split-step dataflow verifies");
+        let certificate = verified.certificate(FunctionId::new(0)).unwrap();
+        assert_eq!(
+            certificate.initialized_before(Pc::new(3), Register::new(2)),
+            Some(true),
+            "the raw result is initialized before IteratorResult reads it"
+        );
+        assert_eq!(
+            certificate.initialized_before(Pc::new(4), Register::new(3)),
+            Some(true)
+        );
+        assert_eq!(
+            certificate.initialized_before(Pc::new(4), Register::new(4)),
+            Some(true)
+        );
+    }
+
     #[test]
     fn catch_register_is_observable_in_handler() {
         // The handler reads its catch register with no in-block write; this is
@@ -4571,10 +5649,961 @@ mod tests {
     }
 
     #[test]
+    fn verification_bytes_counts_certificate_storage() {
+        let instruction_count = 2usize;
+        let register_count = 130u32;
+        let module = Module::new(
+            vec![],
+            vec![Function::new(
+                None,
+                0,
+                1,
+                register_count,
+                flags(),
+                vec![
+                    Instruction::Move {
+                        dst: Register::new(129),
+                        src: Register::new(0),
+                    },
+                    Instruction::Return {
+                        value: Register::new(129),
+                    },
+                ],
+                vec![],
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("test module verifies");
+        let words = RegisterSet::words_for(register_count);
+        let expected = std::mem::size_of::<Certificate>()
+            + instruction_count * std::mem::size_of::<RegisterSet>()
+            + instruction_count * words * std::mem::size_of::<u64>();
+
+        assert_eq!(module.verification_bytes(), expected);
+    }
+
+    #[test]
     fn compact_scalar_layouts_are_preserved() {
         assert_eq!(std::mem::size_of::<Register>(), 4);
         assert_eq!(std::mem::size_of::<Pc>(), 4);
         assert_eq!(std::mem::size_of::<NumberBits>(), 8);
         assert_eq!(std::mem::size_of::<FunctionFlags>(), 2);
+    }
+
+    #[test]
+    fn iterator_close_initializes_both_results_for_close_validation() {
+        let module = Module::new(
+            vec![Constant::Int32(0)],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                4,
+                flags(),
+                vec![
+                    Instruction::LoadConst {
+                        dst: Register::new(0),
+                        constant: ConstantId::new(0),
+                    },
+                    Instruction::GetIterator {
+                        dst: Register::new(1),
+                        src: Register::new(0),
+                        kind: IteratorKind::Sync,
+                    },
+                    Instruction::IteratorClose {
+                        result: Register::new(2),
+                        called: Register::new(3),
+                        iterator: Register::new(1),
+                        mode: IteratorCloseMode::Propagate,
+                    },
+                    Instruction::RequireCloseResult {
+                        result: Register::new(2),
+                        called: Register::new(3),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        let verified = module.verify().expect("close result dataflow verifies");
+        let certificate = verified.certificate(FunctionId::new(0)).unwrap();
+        assert_eq!(
+            certificate.initialized_before(Pc::new(3), Register::new(2)),
+            Some(true),
+            "IteratorClose initializes result"
+        );
+        assert_eq!(
+            certificate.initialized_before(Pc::new(3), Register::new(3)),
+            Some(true),
+            "IteratorClose initializes called"
+        );
+    }
+
+    #[test]
+    fn require_close_result_reads_both_operands() {
+        for instruction in [
+            Instruction::RequireCloseResult {
+                result: Register::new(0),
+                called: Register::new(1),
+            },
+            Instruction::RequireCloseResult {
+                result: Register::new(1),
+                called: Register::new(0),
+            },
+        ] {
+            let module = Module::new(
+                vec![Constant::Int32(0)],
+                vec![Function::new(
+                    None,
+                    0,
+                    0,
+                    2,
+                    flags(),
+                    vec![
+                        Instruction::LoadConst {
+                            dst: Register::new(0),
+                            constant: ConstantId::new(0),
+                        },
+                        instruction,
+                        Instruction::Halt,
+                    ],
+                    Vec::new(),
+                )],
+                FunctionId::new(0),
+            );
+            assert!(
+                module.verify().is_err(),
+                "both operands must be initialized"
+            );
+        }
+    }
+    #[test]
+    fn suppress_error_reads_both_operands() {
+        for instruction in [
+            Instruction::SuppressError {
+                dst: Register::new(2),
+                error: Register::new(0),
+                suppressed: Register::new(1),
+            },
+            Instruction::SuppressError {
+                dst: Register::new(2),
+                error: Register::new(1),
+                suppressed: Register::new(0),
+            },
+        ] {
+            let module = Module::new(
+                vec![Constant::Int32(0)],
+                vec![Function::new(
+                    None,
+                    0,
+                    0,
+                    3,
+                    flags(),
+                    vec![
+                        Instruction::LoadConst {
+                            dst: Register::new(0),
+                            constant: ConstantId::new(0),
+                        },
+                        instruction,
+                        Instruction::Halt,
+                    ],
+                    Vec::new(),
+                )],
+                FunctionId::new(0),
+            );
+            assert!(
+                module.verify().is_err(),
+                "both SuppressError operands must be initialized"
+            );
+        }
+    }
+
+    #[test]
+    fn verifier_rejects_aliased_iterator_close_outputs() {
+        let register = Register::new(1);
+        let module = Module::new(
+            vec![],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                2,
+                flags(),
+                vec![
+                    Instruction::IteratorClose {
+                        result: register,
+                        called: register,
+                        iterator: Register::new(0),
+                        mode: IteratorCloseMode::Propagate,
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+
+        assert!(matches!(
+            module.verify(),
+            Err(VerifyError {
+                kind: VerifyErrorKind::AliasedIteratorCloseOutputs { register: found },
+                ..
+            }) if found == register
+        ));
+    }
+
+    #[test]
+    fn verifier_rejects_aliased_dispose_capture_outputs() {
+        let register = Register::new(1);
+        let module = Module::new(
+            vec![],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                2,
+                flags(),
+                vec![
+                    Instruction::DisposeCapture {
+                        method: register,
+                        kind: register,
+                        src: Register::new(0),
+                        hint: DisposeHint::Sync,
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        assert!(matches!(
+            module.verify(),
+            Err(VerifyError {
+                kind: VerifyErrorKind::AliasedDisposeCaptureOutputs { register: found },
+                ..
+            }) if found == register
+        ));
+    }
+
+    #[test]
+    fn to_object_reads_source_before_writing_destination() {
+        let valid = Module::new(
+            vec![Constant::Int32(7)],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                2,
+                flags(),
+                vec![
+                    Instruction::LoadConst {
+                        dst: Register::new(0),
+                        constant: ConstantId::new(0),
+                    },
+                    Instruction::ToObject {
+                        dst: Register::new(1),
+                        src: Register::new(0),
+                    },
+                    Instruction::Return {
+                        value: Register::new(1),
+                    },
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("ToObject source and destination verify");
+        assert_eq!(
+            valid
+                .certificate(FunctionId::new(0))
+                .expect("certificate")
+                .initialized_before(Pc::new(2), Register::new(1)),
+            Some(true),
+            "ToObject defines its destination"
+        );
+
+        let unread_source = Module::new(
+            Vec::new(),
+            vec![Function::new(
+                None,
+                0,
+                0,
+                2,
+                flags(),
+                vec![
+                    Instruction::ToObject {
+                        dst: Register::new(1),
+                        src: Register::new(0),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        assert!(unread_source.verify().is_err(), "ToObject reads its source");
+    }
+
+    #[test]
+    fn construct_with_new_target_rejects_out_of_bounds_registers() {
+        for instruction in [
+            Instruction::ConstructWithNewTarget {
+                dst: Register::new(4),
+                callee: Register::new(0),
+                new_target: Register::new(1),
+                arguments: Register::new(2),
+            },
+            Instruction::ConstructWithNewTarget {
+                dst: Register::new(0),
+                callee: Register::new(4),
+                new_target: Register::new(1),
+                arguments: Register::new(2),
+            },
+            Instruction::ConstructWithNewTarget {
+                dst: Register::new(0),
+                callee: Register::new(1),
+                new_target: Register::new(4),
+                arguments: Register::new(2),
+            },
+            Instruction::ConstructWithNewTarget {
+                dst: Register::new(0),
+                callee: Register::new(1),
+                new_target: Register::new(2),
+                arguments: Register::new(4),
+            },
+        ] {
+            let module = Module::new(
+                Vec::new(),
+                vec![Function::new(
+                    None,
+                    0,
+                    3,
+                    3,
+                    flags(),
+                    vec![instruction, Instruction::Halt],
+                    Vec::new(),
+                )],
+                FunctionId::new(0),
+            );
+            assert!(
+                matches!(
+                    module.verify(),
+                    Err(VerifyError {
+                        kind: VerifyErrorKind::RegisterOutOfBounds { .. },
+                        ..
+                    })
+                ),
+                "ConstructWithNewTarget must reject out-of-bounds registers"
+            );
+        }
+    }
+
+    #[test]
+    fn construct_with_new_target_round_trips_on_the_wire() {
+        let instruction = Instruction::ConstructWithNewTarget {
+            dst: Register::new(1),
+            callee: Register::new(2),
+            new_target: Register::new(3),
+            arguments: Register::new(4),
+        };
+        let mut bytes = Vec::new();
+        encode_instruction(instruction, &mut bytes);
+        assert_eq!(bytes.first().copied(), Some(47), "wire tag is 47");
+        let limits = DecodeLimits::default();
+        let mut decoder = Decoder {
+            bytes: &bytes,
+            offset: 0,
+            limits: &limits,
+            total_instructions: 0,
+        };
+        let decoded = decoder.instruction().expect("opcode decodes");
+        assert_eq!(decoded, instruction);
+        assert_eq!(decoder.offset, bytes.len());
+    }
+
+    #[test]
+    fn define_data_property_rejects_out_of_bounds_registers() {
+        for instruction in [
+            Instruction::DefineDataProperty {
+                object: Register::new(3),
+                key: Register::new(0),
+                value: Register::new(1),
+            },
+            Instruction::DefineDataProperty {
+                object: Register::new(0),
+                key: Register::new(3),
+                value: Register::new(1),
+            },
+            Instruction::DefineDataProperty {
+                object: Register::new(0),
+                key: Register::new(1),
+                value: Register::new(3),
+            },
+        ] {
+            let module = Module::new(
+                Vec::new(),
+                vec![Function::new(
+                    None,
+                    0,
+                    3,
+                    3,
+                    flags(),
+                    vec![instruction, Instruction::Halt],
+                    Vec::new(),
+                )],
+                FunctionId::new(0),
+            );
+            assert!(
+                matches!(
+                    module.verify(),
+                    Err(VerifyError {
+                        kind: VerifyErrorKind::RegisterOutOfBounds { .. },
+                        ..
+                    })
+                ),
+                "DefineDataProperty must reject out-of-bounds registers"
+            );
+        }
+    }
+
+    #[test]
+    fn define_data_property_round_trips_on_the_wire() {
+        let instruction = Instruction::DefineDataProperty {
+            object: Register::new(1),
+            key: Register::new(2),
+            value: Register::new(3),
+        };
+        let mut bytes = Vec::new();
+        encode_instruction(instruction, &mut bytes);
+        assert_eq!(bytes.first().copied(), Some(48), "wire tag is 48");
+        let limits = DecodeLimits::default();
+        let mut decoder = Decoder {
+            bytes: &bytes,
+            offset: 0,
+            limits: &limits,
+            total_instructions: 0,
+        };
+        let decoded = decoder.instruction().expect("opcode decodes");
+        assert_eq!(decoded, instruction);
+        assert_eq!(decoder.offset, bytes.len());
+    }
+
+    #[test]
+    fn own_descriptor_slot_opcodes_round_trip_exact_bytes() {
+        let cases = [
+            (
+                Instruction::LoadOwnDescriptorSlot {
+                    dst: Register::new(1),
+                    object: Register::new(2),
+                    key: Register::new(3),
+                    slot: DescriptorSlot::Value,
+                },
+                vec![49, 1, 2, 3, 0],
+            ),
+            (
+                Instruction::LoadOwnDescriptorSlot {
+                    dst: Register::new(4),
+                    object: Register::new(5),
+                    key: Register::new(6),
+                    slot: DescriptorSlot::Getter,
+                },
+                vec![49, 4, 5, 6, 1],
+            ),
+            (
+                Instruction::LoadOwnDescriptorSlot {
+                    dst: Register::new(7),
+                    object: Register::new(8),
+                    key: Register::new(9),
+                    slot: DescriptorSlot::Setter,
+                },
+                vec![49, 7, 8, 9, 2],
+            ),
+            (
+                Instruction::DefineOwnDescriptorSlot {
+                    object: Register::new(1),
+                    key: Register::new(2),
+                    src: Register::new(3),
+                    slot: DescriptorSlot::Value,
+                },
+                vec![50, 1, 2, 3, 0],
+            ),
+            (
+                Instruction::DefineOwnDescriptorSlot {
+                    object: Register::new(4),
+                    key: Register::new(5),
+                    src: Register::new(6),
+                    slot: DescriptorSlot::Getter,
+                },
+                vec![50, 4, 5, 6, 1],
+            ),
+            (
+                Instruction::DefineOwnDescriptorSlot {
+                    object: Register::new(7),
+                    key: Register::new(8),
+                    src: Register::new(9),
+                    slot: DescriptorSlot::Setter,
+                },
+                vec![50, 7, 8, 9, 2],
+            ),
+        ];
+        let limits = DecodeLimits::default();
+        for (instruction, expected) in cases {
+            let mut bytes = Vec::new();
+            encode_instruction(instruction, &mut bytes);
+            assert_eq!(bytes, expected, "{instruction:?} exact wire layout");
+            let mut decoder = Decoder {
+                bytes: &bytes,
+                offset: 0,
+                limits: &limits,
+                total_instructions: 0,
+            };
+            let decoded = decoder.instruction().expect("opcode decodes");
+            assert_eq!(decoded, instruction);
+            assert_eq!(decoder.offset, bytes.len());
+        }
+    }
+
+    #[test]
+    fn own_descriptor_slot_opcodes_scale_past_127_registers() {
+        let load = Instruction::LoadOwnDescriptorSlot {
+            dst: Register::new(200),
+            object: Register::new(201),
+            key: Register::new(202),
+            slot: DescriptorSlot::Getter,
+        };
+        let define = Instruction::DefineOwnDescriptorSlot {
+            object: Register::new(200),
+            key: Register::new(201),
+            src: Register::new(202),
+            slot: DescriptorSlot::Setter,
+        };
+        for instruction in [load, define] {
+            let mut bytes = Vec::new();
+            encode_instruction(instruction, &mut bytes);
+            assert!(
+                bytes.windows(2).any(|pair| pair == [0xc8, 0x01]),
+                "register 200 must use two-byte LEB128"
+            );
+            let limits = DecodeLimits::default();
+            let mut decoder = Decoder {
+                bytes: &bytes,
+                offset: 0,
+                limits: &limits,
+                total_instructions: 0,
+            };
+            assert_eq!(decoder.instruction().expect("decodes"), instruction);
+        }
+    }
+
+    #[test]
+    fn load_own_descriptor_slot_defines_dst_and_requires_operands() {
+        let verified = Module::new(
+            Vec::new(),
+            vec![Function::new(
+                None,
+                0,
+                2,
+                3,
+                flags(),
+                vec![
+                    Instruction::LoadOwnDescriptorSlot {
+                        dst: Register::new(2),
+                        object: Register::new(0),
+                        key: Register::new(1),
+                        slot: DescriptorSlot::Value,
+                    },
+                    Instruction::Return {
+                        value: Register::new(2),
+                    },
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("LoadOwnDescriptorSlot defines dst");
+        assert_eq!(
+            verified
+                .certificate(FunctionId::new(0))
+                .and_then(|cert| { cert.initialized_before(Pc::new(1), Register::new(2)) }),
+            Some(true),
+            "dst is defined after LoadOwnDescriptorSlot"
+        );
+
+        let unread_object = Module::new(
+            Vec::new(),
+            vec![Function::new(
+                None,
+                0,
+                1,
+                3,
+                flags(),
+                vec![
+                    Instruction::LoadOwnDescriptorSlot {
+                        dst: Register::new(2),
+                        object: Register::new(1),
+                        key: Register::new(0),
+                        slot: DescriptorSlot::Getter,
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        assert!(matches!(
+            unread_object.verify(),
+            Err(VerifyError {
+                kind: VerifyErrorKind::ReadBeforeWrite { .. },
+                ..
+            })
+        ));
+
+        let unread_key = Module::new(
+            Vec::new(),
+            vec![Function::new(
+                None,
+                0,
+                1,
+                3,
+                flags(),
+                vec![
+                    Instruction::LoadOwnDescriptorSlot {
+                        dst: Register::new(2),
+                        object: Register::new(0),
+                        key: Register::new(1),
+                        slot: DescriptorSlot::Setter,
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        assert!(matches!(
+            unread_key.verify(),
+            Err(VerifyError {
+                kind: VerifyErrorKind::ReadBeforeWrite { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn define_own_descriptor_slot_requires_all_operands_defined() {
+        let ok = Module::new(
+            Vec::new(),
+            vec![Function::new(
+                None,
+                0,
+                3,
+                3,
+                flags(),
+                vec![
+                    Instruction::DefineOwnDescriptorSlot {
+                        object: Register::new(0),
+                        key: Register::new(1),
+                        src: Register::new(2),
+                        slot: DescriptorSlot::Setter,
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        assert!(ok.verify().is_ok());
+
+        for (instruction, parameter_count) in [
+            (
+                Instruction::DefineOwnDescriptorSlot {
+                    object: Register::new(2),
+                    key: Register::new(0),
+                    src: Register::new(1),
+                    slot: DescriptorSlot::Value,
+                },
+                2,
+            ),
+            (
+                Instruction::DefineOwnDescriptorSlot {
+                    object: Register::new(0),
+                    key: Register::new(2),
+                    src: Register::new(1),
+                    slot: DescriptorSlot::Getter,
+                },
+                2,
+            ),
+            (
+                Instruction::DefineOwnDescriptorSlot {
+                    object: Register::new(0),
+                    key: Register::new(1),
+                    src: Register::new(2),
+                    slot: DescriptorSlot::Value,
+                },
+                2,
+            ),
+        ] {
+            let unread = Module::new(
+                Vec::new(),
+                vec![Function::new(
+                    None,
+                    0,
+                    parameter_count,
+                    3,
+                    flags(),
+                    vec![instruction, Instruction::Halt],
+                    Vec::new(),
+                )],
+                FunctionId::new(0),
+            );
+            assert!(
+                matches!(
+                    unread.verify(),
+                    Err(VerifyError {
+                        kind: VerifyErrorKind::ReadBeforeWrite { .. },
+                        ..
+                    })
+                ),
+                "DefineOwnDescriptorSlot requires object, key, and src initialized"
+            );
+        }
+    }
+
+    #[test]
+    fn own_descriptor_slot_opcodes_reject_out_of_bounds_registers() {
+        for instruction in [
+            Instruction::LoadOwnDescriptorSlot {
+                dst: Register::new(3),
+                object: Register::new(0),
+                key: Register::new(1),
+                slot: DescriptorSlot::Value,
+            },
+            Instruction::LoadOwnDescriptorSlot {
+                dst: Register::new(0),
+                object: Register::new(3),
+                key: Register::new(1),
+                slot: DescriptorSlot::Value,
+            },
+            Instruction::LoadOwnDescriptorSlot {
+                dst: Register::new(0),
+                object: Register::new(1),
+                key: Register::new(3),
+                slot: DescriptorSlot::Value,
+            },
+            Instruction::DefineOwnDescriptorSlot {
+                object: Register::new(3),
+                key: Register::new(0),
+                src: Register::new(1),
+                slot: DescriptorSlot::Getter,
+            },
+            Instruction::DefineOwnDescriptorSlot {
+                object: Register::new(0),
+                key: Register::new(3),
+                src: Register::new(1),
+                slot: DescriptorSlot::Getter,
+            },
+            Instruction::DefineOwnDescriptorSlot {
+                object: Register::new(0),
+                key: Register::new(1),
+                src: Register::new(3),
+                slot: DescriptorSlot::Getter,
+            },
+        ] {
+            let module = Module::new(
+                Vec::new(),
+                vec![Function::new(
+                    None,
+                    0,
+                    3,
+                    3,
+                    flags(),
+                    vec![instruction, Instruction::Halt],
+                    Vec::new(),
+                )],
+                FunctionId::new(0),
+            );
+            assert!(
+                matches!(
+                    module.verify(),
+                    Err(VerifyError {
+                        kind: VerifyErrorKind::RegisterOutOfBounds { .. },
+                        ..
+                    })
+                ),
+                "own-descriptor slot opcodes must reject out-of-bounds registers"
+            );
+        }
+    }
+
+    #[test]
+    fn with_has_binding_round_trips_on_the_wire() {
+        let instruction = Instruction::WithHasBinding {
+            dst: Register::new(1),
+            object: Register::new(2),
+            key: Register::new(3),
+        };
+        let mut bytes = Vec::new();
+        encode_instruction(instruction, &mut bytes);
+        assert_eq!(
+            bytes,
+            vec![51, 1, 2, 3],
+            "wire tag is 51 with dst/object/key"
+        );
+        let limits = DecodeLimits::default();
+        let mut decoder = Decoder {
+            bytes: &bytes,
+            offset: 0,
+            limits: &limits,
+            total_instructions: 0,
+        };
+        let decoded = decoder.instruction().expect("opcode decodes");
+        assert_eq!(decoded, instruction);
+        assert_eq!(decoder.offset, bytes.len());
+    }
+
+    #[test]
+    fn with_has_binding_rejects_truncated_decoding() {
+        assert!(decode(&one_function_bytes(&[51]), &DecodeLimits::default()).is_err());
+        assert!(decode(&one_function_bytes(&[51, 0]), &DecodeLimits::default()).is_err());
+        assert!(decode(&one_function_bytes(&[51, 0, 0]), &DecodeLimits::default()).is_err());
+    }
+
+    #[test]
+    fn with_has_binding_rejects_out_of_bounds_registers() {
+        for instruction in [
+            Instruction::WithHasBinding {
+                dst: Register::new(3),
+                object: Register::new(0),
+                key: Register::new(1),
+            },
+            Instruction::WithHasBinding {
+                dst: Register::new(0),
+                object: Register::new(3),
+                key: Register::new(1),
+            },
+            Instruction::WithHasBinding {
+                dst: Register::new(0),
+                object: Register::new(1),
+                key: Register::new(3),
+            },
+        ] {
+            let module = Module::new(
+                Vec::new(),
+                vec![Function::new(
+                    None,
+                    0,
+                    3,
+                    3,
+                    flags(),
+                    vec![instruction, Instruction::Halt],
+                    Vec::new(),
+                )],
+                FunctionId::new(0),
+            );
+            assert!(
+                matches!(
+                    module.verify(),
+                    Err(VerifyError {
+                        kind: VerifyErrorKind::RegisterOutOfBounds { .. },
+                        ..
+                    })
+                ),
+                "WithHasBinding must reject out-of-bounds registers"
+            );
+        }
+    }
+
+    #[test]
+    fn with_has_binding_defines_dst_and_requires_operands() {
+        let verified = Module::new(
+            Vec::new(),
+            vec![Function::new(
+                None,
+                0,
+                2,
+                3,
+                flags(),
+                vec![
+                    Instruction::WithHasBinding {
+                        dst: Register::new(2),
+                        object: Register::new(0),
+                        key: Register::new(1),
+                    },
+                    Instruction::Return {
+                        value: Register::new(2),
+                    },
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("WithHasBinding defines dst");
+        assert_eq!(
+            verified
+                .certificate(FunctionId::new(0))
+                .and_then(|cert| { cert.initialized_before(Pc::new(1), Register::new(2)) }),
+            Some(true),
+            "dst is defined after WithHasBinding"
+        );
+
+        let unread_object = Module::new(
+            Vec::new(),
+            vec![Function::new(
+                None,
+                0,
+                1,
+                3,
+                flags(),
+                vec![
+                    Instruction::WithHasBinding {
+                        dst: Register::new(2),
+                        object: Register::new(1),
+                        key: Register::new(0),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        assert!(matches!(
+            unread_object.verify(),
+            Err(VerifyError {
+                kind: VerifyErrorKind::ReadBeforeWrite { .. },
+                ..
+            })
+        ));
+
+        let unread_key = Module::new(
+            Vec::new(),
+            vec![Function::new(
+                None,
+                0,
+                1,
+                3,
+                flags(),
+                vec![
+                    Instruction::WithHasBinding {
+                        dst: Register::new(2),
+                        object: Register::new(0),
+                        key: Register::new(1),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        assert!(matches!(
+            unread_key.verify(),
+            Err(VerifyError {
+                kind: VerifyErrorKind::ReadBeforeWrite { .. },
+                ..
+            })
+        ));
     }
 }

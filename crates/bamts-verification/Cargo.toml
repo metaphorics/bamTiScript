@@ -1,23 +1,36 @@
 [package]
 name = "bamts-verification"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-publish.workspace = true
+publish = false
+license.workspace = true
+repository.workspace = true
+description = "Verification and compliance test suite for BamTS"
 
 [dependencies]
-bamts-bytecode = { path = "../bamts-bytecode" }
-bamts-cli = { path = "../bamts-cli" }
-bamts-codegen = { path = "../bamts-codegen" }
-bamts-compiler = { path = "../bamts-compiler" }
-bamts-native = { path = "../bamts-native" }
-bamts-node = { path = "../bamts-node" }
-bamts-runtime = { path = "../bamts-runtime" }
+bamts = { workspace = true, features = ["aot"] }
+bamts-bytecode.workspace = true
+bamts-cli.workspace = true
+bamts-codegen.workspace = true
+bamts-compiler.workspace = true
+bamts-native.workspace = true
+bamts-node = { workspace = true, features = ["script-compiler"] }
+bamts-runtime.workspace = true
 anyhow = "=1.0.104"
 quint-connect = "=0.1.2"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 sha2 = "=0.10.9"
 toml = "=0.9.12"
+
+[[bin]]
+name = "ts_conformance"
+path = "src/bin/ts_conformance.rs"
+
+[[bin]]
+name = "perf_budget"
+path = "src/bin/perf_budget.rs"
 
 [lints]
 workspace = true

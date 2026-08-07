@@ -7,33 +7,54 @@ use std::process::Command;
 
 fn main() {
     let out_dir = required_path("OUT_DIR");
-    let profile_dir = out_dir
-        .ancestors()
-        .nth(3)
-        .expect("OUT_DIR does not have Cargo's profile/build/package/out shape");
-    let dependencies = profile_dir.join("deps");
+    let cargo = cargo_build_context(
+        &env::current_exe().expect("could not locate the running Cargo build script"),
+    )
+    .unwrap_or_else(|error| panic!("could not locate Cargo build metadata: {error}"));
+    let dependencies = cargo.dependencies;
     let target = required("TARGET");
     let host = required("HOST");
-    let archive_name = if target.contains("windows-msvc") {
-        "bamts_node.lib"
-    } else {
-        "libbamts_node.a"
-    };
-    let archive = out_dir.join(archive_name);
-    let wrapper = out_dir.join("embedded_node.rs");
-    fs::write(&wrapper, wrapper_source()).expect("could not write bamts-node staticlib wrapper");
+    let archive = out_dir.join(staticlib_archive_name(&target));
 
-    let rustc = env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
-    match select_node_rlib(&rustc, &target, &dependencies, &wrapper, &out_dir) {
-        Some(node_rlib) => {
-            assemble_staticlib(&rustc, &target, &dependencies, &node_rlib, &archive, &wrapper);
+    match node_staticlib_action(&target, &host) {
+        NodeStaticlibAction::Assemble => {
+            let wrapper = out_dir.join("embedded_node.rs");
+            fs::write(&wrapper, wrapper_source())
+                .expect("could not write bamts-node staticlib wrapper");
+            let rustc = env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
+            let node_rlib_metadata = env::var_os("DEP_BAMTS_NODE_RLIB").map(PathBuf::from);
+            match select_node_rlib(
+                &rustc,
+                &target,
+                &dependencies,
+                &wrapper,
+                &out_dir,
+                node_rlib_metadata.as_deref(),
+                &cargo.fingerprint,
+            ) {
+                Some(node_rlib) => {
+                    assemble_staticlib(
+                        &rustc,
+                        &target,
+                        &dependencies,
+                        &node_rlib,
+                        &archive,
+                        &wrapper,
+                    );
+                }
+                None => write_check_placeholder(&dependencies, &archive),
+            }
         }
-        None => write_check_placeholder(&dependencies, &archive),
+        NodeStaticlibAction::WriteEmptyArchive => write_empty_archive(&archive),
     }
 
     cargo_line("rerun-if-changed=../bamts-node/src");
     cargo_line("rerun-if-changed=../bamts-node/Cargo.toml");
-    cargo_line(&format!("rustc-env=BAMTS_NODE_STATICLIB={}", archive.display()));
+    cargo_line("rerun-if-env-changed=DEP_BAMTS_NODE_RLIB");
+    cargo_line(&format!(
+        "rustc-env=BAMTS_NODE_STATICLIB={}",
+        archive.display()
+    ));
     cargo_line(&format!("rustc-env=BAMTS_HOST_TARGET={host}"));
     cargo_line(&format!("rustc-env=BAMTS_BUILD_TARGET={target}"));
 }
@@ -42,29 +63,308 @@ fn wrapper_source() -> &'static str {
     "extern crate bamts_node;\n#[used]\nstatic KEEP_NODE: fn() -> bamts_node::NodeHost = bamts_node::NodeHost::new;\n#[used]\nstatic KEEP_AOT_MAIN: extern \"C\" fn() -> i32 = bamts_node::main;\n"
 }
 
+struct CargoBuildContext {
+    dependencies: PathBuf,
+    fingerprint: PathBuf,
+}
+
+fn cargo_build_context(current_exe: &Path) -> Result<CargoBuildContext, String> {
+    let build_script_dir = current_exe
+        .parent()
+        .ok_or_else(|| format!("`{}` has no parent directory", current_exe.display()))?;
+    let build_dir = build_script_dir.parent().ok_or_else(|| {
+        format!(
+            "`{}` is not in Cargo's build directory",
+            current_exe.display()
+        )
+    })?;
+    let profile_dir = build_dir.parent().ok_or_else(|| {
+        format!(
+            "`{}` is not in Cargo's profile directory",
+            current_exe.display()
+        )
+    })?;
+    let build_name = build_script_dir
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| {
+            format!(
+                "`{}` has a non-UTF-8 build directory name",
+                build_script_dir.display()
+            )
+        })?;
+
+    Ok(CargoBuildContext {
+        dependencies: profile_dir.join("deps"),
+        fingerprint: profile_dir
+            .join(".fingerprint")
+            .join(build_name)
+            .join("build-script-build-script-build.json"),
+    })
+}
+
 fn select_node_rlib(
     rustc: &OsStr,
     target: &str,
     dependencies: &Path,
     wrapper: &Path,
     out_dir: &Path,
+    metadata_candidate: Option<&Path>,
+    build_fingerprint: &Path,
 ) -> Option<PathBuf> {
+    if let Some(candidate) = metadata_candidate {
+        if candidate.extension() != Some(OsStr::new("rlib")) || !candidate.is_file() {
+            panic!(
+                "Cargo provided invalid bamts-node rlib metadata `{}`",
+                candidate.display()
+            );
+        }
+        if !metadata_supports_aot_main(rustc, target, dependencies, candidate, wrapper, out_dir) {
+            panic!(
+                "Cargo-selected bamts-node rlib `{}` lacks the metadata required for the aot-main entrypoint",
+                candidate.display()
+            );
+        }
+        return Some(candidate.to_path_buf());
+    }
+
+    match node_rlib_from_fingerprint(build_fingerprint, dependencies) {
+        Ok(Some(candidate)) => return Some(candidate),
+        Ok(None) => {}
+        Err(error) => {
+            panic!("could not resolve bamts-node from Cargo fingerprint metadata: {error}")
+        }
+    }
+
     let candidates = artifacts(dependencies, "libbamts_node-", "rlib");
     if candidates.is_empty() {
         return None;
     }
     let compatible = candidates
         .iter()
-        .filter(|candidate| metadata_supports_aot_main(rustc, target, dependencies, candidate, wrapper, out_dir))
+        .filter(|candidate| {
+            metadata_supports_aot_main(rustc, target, dependencies, candidate, wrapper, out_dir)
+        })
         .cloned()
         .collect::<Vec<_>>();
-    Some(compatible.first().cloned().unwrap_or_else(|| {
+    choose_compatible_node_rlib(&compatible).or_else(|| {
         panic!(
             "no bamts-node rlib in `{}` has the metadata required for the aot-main entrypoint; candidates: {}",
             dependencies.display(),
             display_paths(&candidates)
         )
-    }))
+    })
+}
+
+fn node_rlib_from_fingerprint(
+    build_fingerprint: &Path,
+    dependencies: &Path,
+) -> Result<Option<PathBuf>, String> {
+    if !build_fingerprint.exists() {
+        return Ok(None);
+    }
+
+    let contents = fs::read_to_string(build_fingerprint)
+        .map_err(|error| format!("could not read `{}`: {error}", build_fingerprint.display()))?;
+    let fingerprint = parse_cargo_build_fingerprint(&contents)
+        .map_err(|error| format!("`{}` is malformed: {error}", build_fingerprint.display()))?;
+    let dependency_hash = fingerprint
+        .bamts_node_hash()
+        .map_err(|error| format!("`{}` {error}", build_fingerprint.display()))?;
+    let fingerprint_root = build_fingerprint
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            format!(
+                "`{}` is not below Cargo's .fingerprint directory",
+                build_fingerprint.display()
+            )
+        })?;
+
+    exact_node_rlib(fingerprint_root, dependencies, dependency_hash).map(Some)
+}
+
+struct CargoBuildFingerprint {
+    dependencies: Vec<CargoDependency>,
+}
+
+impl CargoBuildFingerprint {
+    fn bamts_node_hash(&self) -> Result<u64, String> {
+        let mut dependencies = self
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency.name == "bamts_node");
+        let Some(dependency) = dependencies.next() else {
+            return Err("has no `bamts_node` build dependency".to_owned());
+        };
+        if dependencies.next().is_some() {
+            return Err("has multiple `bamts_node` build dependencies".to_owned());
+        }
+        Ok(dependency.fingerprint)
+    }
+}
+
+struct CargoDependency {
+    _package_id_hash: u64,
+    name: String,
+    _is_public: bool,
+    fingerprint: u64,
+}
+
+fn parse_cargo_build_fingerprint(contents: &str) -> Result<CargoBuildFingerprint, String> {
+    let document: serde_json::Value =
+        serde_json::from_str(contents).map_err(|error| format!("invalid JSON: {error}"))?;
+    let dependencies = document
+        .as_object()
+        .ok_or_else(|| "top level is not an object".to_owned())?
+        .get("deps")
+        .ok_or_else(|| "missing `deps`".to_owned())?
+        .as_array()
+        .ok_or_else(|| "`deps` is not an array".to_owned())?
+        .iter()
+        .enumerate()
+        .map(|(index, dependency)| parse_cargo_dependency(index, dependency))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(CargoBuildFingerprint { dependencies })
+}
+
+fn parse_cargo_dependency(
+    index: usize,
+    dependency: &serde_json::Value,
+) -> Result<CargoDependency, String> {
+    let fields = dependency
+        .as_array()
+        .ok_or_else(|| format!("`deps[{index}]` is not a four-element array"))?;
+    if fields.len() != 4 {
+        return Err(format!("`deps[{index}]` is not a four-element array"));
+    }
+
+    let package_id_hash = fields[0]
+        .as_u64()
+        .ok_or_else(|| format!("`deps[{index}][0]` is not a u64"))?;
+    let name = fields[1]
+        .as_str()
+        .ok_or_else(|| format!("`deps[{index}][1]` is not a string"))?
+        .to_owned();
+    let is_public = fields[2]
+        .as_bool()
+        .ok_or_else(|| format!("`deps[{index}][2]` is not a bool"))?;
+    let fingerprint = fields[3]
+        .as_u64()
+        .ok_or_else(|| format!("`deps[{index}][3]` is not a u64"))?;
+
+    Ok(CargoDependency {
+        _package_id_hash: package_id_hash,
+        name,
+        _is_public: is_public,
+        fingerprint,
+    })
+}
+
+fn fingerprint_stamp(dependency_hash: u64) -> String {
+    format!("{:016x}", dependency_hash.swap_bytes())
+}
+
+fn exact_node_rlib(
+    fingerprint_root: &Path,
+    dependencies: &Path,
+    dependency_hash: u64,
+) -> Result<PathBuf, String> {
+    let wanted_stamp = fingerprint_stamp(dependency_hash);
+    let mut matches = Vec::new();
+    let entries = fs::read_dir(fingerprint_root).map_err(|error| {
+        format!(
+            "could not inspect `{}`: {error}",
+            fingerprint_root.display()
+        )
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "could not inspect `{}`: {error}",
+                fingerprint_root.display()
+            )
+        })?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("could not inspect `{}`: {error}", entry.path().display()))?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            format!(
+                "Cargo fingerprint directory `{}` has a non-UTF-8 name",
+                entry.path().display()
+            )
+        })?;
+        let Some(suffix) = name.strip_prefix("bamts-node-") else {
+            continue;
+        };
+        if suffix.is_empty() {
+            return Err(format!(
+                "Cargo fingerprint directory `{}` has no artifact suffix",
+                entry.path().display()
+            ));
+        }
+
+        let stamp_path = entry.path().join("lib-bamts_node");
+        let stamp = match fs::read_to_string(&stamp_path) {
+            Ok(stamp) => stamp,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "could not read Cargo fingerprint stamp `{}`: {error}",
+                    stamp_path.display()
+                ));
+            }
+        };
+        if stamp.len() != 16
+            || !stamp.bytes().all(|byte| {
+                byte.is_ascii_digit() || (byte.is_ascii_lowercase() && byte.is_ascii_hexdigit())
+            })
+        {
+            // Cargo may leave a partial sibling fingerprint while jobs run in parallel.
+            continue;
+        }
+        if stamp == wanted_stamp {
+            let rlib = dependencies.join(format!("libbamts_node-{suffix}.rlib"));
+            if !rlib.is_file() {
+                return Err(format!(
+                    "Cargo fingerprint stamp `{}` selected missing rlib `{}`",
+                    stamp_path.display(),
+                    rlib.display()
+                ));
+            }
+            matches.push(rlib);
+        }
+    }
+
+    match matches.as_slice() {
+        [candidate] => Ok(candidate.clone()),
+        [] => Err(format!(
+            "no `bamts-node-*` fingerprint stamp in `{}` matches `{wanted_stamp}`",
+            fingerprint_root.display()
+        )),
+        candidates => Err(format!(
+            "multiple `bamts-node-*` fingerprint stamps in `{}` match `{wanted_stamp}`: {}",
+            fingerprint_root.display(),
+            display_paths(candidates)
+        )),
+    }
+}
+
+fn choose_compatible_node_rlib(compatible: &[PathBuf]) -> Option<PathBuf> {
+    match compatible {
+        [] => None,
+        [candidate] => Some(candidate.clone()),
+        candidates => panic!(
+            "ambiguous compatible bamts-node rlibs; Cargo fingerprint metadata is unavailable: {}",
+            display_paths(candidates)
+        ),
+    }
 }
 
 fn metadata_supports_aot_main(
@@ -99,7 +399,9 @@ fn metadata_supports_aot_main(
         .arg(&probe)
         .arg(wrapper)
         .output()
-        .unwrap_or_else(|error| panic!("could not start `{}`: {error}", Path::new(rustc).display()));
+        .unwrap_or_else(|error| {
+            panic!("could not start `{}`: {error}", Path::new(rustc).display())
+        });
     let _ = fs::remove_file(probe);
     output.status.success()
 }
@@ -154,9 +456,13 @@ fn write_check_placeholder(dependencies: &Path, archive: &Path) {
             dependencies.display()
         );
     }
+    write_empty_archive(archive);
+}
+
+fn write_empty_archive(archive: &Path) {
     fs::write(archive, b"!<arch>\n").unwrap_or_else(|error| {
         panic!(
-            "could not create check-only runtime archive `{}`: {error}",
+            "could not create runtime archive `{}`: {error}",
             archive.display()
         )
     });
@@ -195,4 +501,176 @@ fn required_path(name: &str) -> PathBuf {
 
 fn cargo_line(directive: &str) {
     writeln!(io::stdout().lock(), "cargo:{directive}").expect("could not emit Cargo directive");
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum NodeStaticlibAction {
+    Assemble,
+    WriteEmptyArchive,
+}
+
+fn node_staticlib_action(target: &str, host: &str) -> NodeStaticlibAction {
+    if target == host {
+        NodeStaticlibAction::Assemble
+    } else {
+        NodeStaticlibAction::WriteEmptyArchive
+    }
+}
+
+fn staticlib_archive_name(target: &str) -> &'static str {
+    if target.contains("windows-msvc") {
+        "bamts_node.lib"
+    } else {
+        "libbamts_node.a"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_TEST_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
+    fn test_directory() -> PathBuf {
+        let directory = env::temp_dir().join(format!(
+            "bamts-cli-build-rs-{}-{}",
+            std::process::id(),
+            NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).expect("could not create test directory");
+        directory
+    }
+
+    fn fingerprint_json(dependency_hash: u64) -> String {
+        format!(r#"{{"deps":[[8623995201299226029,"bamts_node",false,{dependency_hash}]]}}"#)
+    }
+
+    #[test]
+    fn host_build_assembles_node_staticlib() {
+        assert_eq!(
+            node_staticlib_action("x86_64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"),
+            NodeStaticlibAction::Assemble
+        );
+    }
+
+    #[test]
+    fn cross_target_build_writes_empty_node_staticlib() {
+        assert_eq!(
+            node_staticlib_action("aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"),
+            NodeStaticlibAction::WriteEmptyArchive
+        );
+    }
+
+    #[test]
+    fn cross_target_windows_placeholder_is_a_valid_unused_archive() {
+        let directory = test_directory();
+        let archive = directory.join(staticlib_archive_name("x86_64-pc-windows-msvc"));
+
+        write_empty_archive(&archive);
+
+        assert_eq!(archive.file_name(), Some(OsStr::new("bamts_node.lib")));
+        assert!(archive.is_file());
+        assert_eq!(
+            fs::read(&archive).expect("could not read archive"),
+            b"!<arch>\n"
+        );
+        fs::remove_dir_all(directory).expect("could not remove test directory");
+    }
+
+    #[test]
+    fn fingerprint_stamp_uses_little_endian_bytes() {
+        assert_eq!(fingerprint_stamp(0x6c72_5109_f3a6_1984), "8419a6f30951726c");
+    }
+
+    #[test]
+    fn fingerprint_selects_exact_rlib_among_compatible_candidates() {
+        let directory = test_directory();
+        let fingerprint_root = directory.join(".fingerprint");
+        let dependencies = directory.join("deps");
+        fs::create_dir_all(&dependencies).expect("could not create deps directory");
+        let dependency_hash = 0x6c72_5109_f3a6_1984;
+        let exact_suffix = "f0a5527c30509477";
+        for (suffix, stamp) in [
+            ("normal-workspace", "409792dc5b64bb07"),
+            ("partial-parallel-build", "f046"),
+            (exact_suffix, "8419a6f30951726c"),
+        ] {
+            let artifact = fingerprint_root.join(format!("bamts-node-{suffix}"));
+            fs::create_dir_all(&artifact).expect("could not create fingerprint directory");
+            fs::write(artifact.join("lib-bamts_node"), stamp)
+                .expect("could not write fingerprint stamp");
+            fs::write(
+                dependencies.join(format!("libbamts_node-{suffix}.rlib")),
+                b"",
+            )
+            .expect("could not write rlib");
+        }
+        let build_fingerprint = fingerprint_root
+            .join("bamts-cli-current")
+            .join("build-script-build-script-build.json");
+        fs::create_dir_all(build_fingerprint.parent().expect("fingerprint parent"))
+            .expect("could not create build fingerprint directory");
+        fs::write(&build_fingerprint, fingerprint_json(dependency_hash))
+            .expect("could not write build fingerprint");
+
+        assert_eq!(
+            node_rlib_from_fingerprint(&build_fingerprint, &dependencies)
+                .expect("could not select exact fingerprint"),
+            Some(dependencies.join(format!("libbamts_node-{exact_suffix}.rlib")))
+        );
+        fs::remove_dir_all(directory).expect("could not remove test directory");
+    }
+
+    #[test]
+    fn malformed_fingerprint_metadata_is_rejected() {
+        let error = match parse_cargo_build_fingerprint("{\"deps\":[[1,\"bamts_node\",false]]}") {
+            Ok(_) => panic!("malformed metadata should fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("four-element array"));
+    }
+
+    #[test]
+    fn missing_metadata_allows_one_compatible_fallback() {
+        let directory = test_directory();
+        let missing = directory.join("missing.json");
+        assert_eq!(
+            node_rlib_from_fingerprint(&missing, Path::new("/unused"))
+                .expect("missing metadata should not be malformed"),
+            None
+        );
+        let candidate = PathBuf::from("/cache/libbamts_node-current.rlib");
+        assert_eq!(
+            choose_compatible_node_rlib(std::slice::from_ref(&candidate)),
+            Some(candidate)
+        );
+        fs::remove_dir_all(directory).expect("could not remove test directory");
+    }
+
+    #[test]
+    #[should_panic(expected = "ambiguous compatible bamts-node rlibs")]
+    fn multiple_compatible_artifacts_are_rejected_without_metadata() {
+        let compatible = [
+            PathBuf::from("/cache/libbamts_node-first.rlib"),
+            PathBuf::from("/cache/libbamts_node-second.rlib"),
+        ];
+
+        let _ = choose_compatible_node_rlib(&compatible);
+    }
+
+    #[test]
+    fn parser_preserves_large_dependency_hashes() {
+        let fingerprint =
+            parse_cargo_build_fingerprint(&fingerprint_json(7_814_397_406_625_536_388))
+                .expect("valid metadata should parse");
+
+        assert_eq!(
+            fingerprint
+                .bamts_node_hash()
+                .expect("bamts_node dependency should exist"),
+            7_814_397_406_625_536_388
+        );
+    }
 }

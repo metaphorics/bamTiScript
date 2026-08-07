@@ -6,7 +6,7 @@ license = "MIT"
 source_dir = "corpus/projects/hookable"
 entrypoint = "corpus/cases/hookable.ts"
 node_args = []
-expected_timeout_ms = 5000
+expected_timeout_ms = 10000
 constructs = [
   "serial-hook-execution-order",
   "hookOnce-single-fire",

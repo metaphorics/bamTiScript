@@ -1,4 +1,4 @@
-use std::{fmt, sync::Arc};
+use std::{fmt, path::Path, sync::Arc};
 
 /// Identifies one source file within a compilation.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -22,6 +22,31 @@ impl SourceId {
 impl From<u32> for SourceId {
     fn from(value: u32) -> Self {
         Self::new(value)
+    }
+}
+/// The canonical identity of one source in a resolved program.
+///
+/// The path is filesystem-canonical and the numeric id is assigned once by the
+/// compiler's program loader; consumers must not substitute mtimes or allocations.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SourceIdentity {
+    source_id: SourceId,
+    path: Arc<Path>,
+}
+
+impl SourceIdentity {
+    pub(crate) fn new(source_id: SourceId, path: Arc<Path>) -> Self {
+        Self { source_id, path }
+    }
+
+    #[must_use]
+    pub const fn source_id(&self) -> SourceId {
+        self.source_id
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -105,10 +130,18 @@ pub enum ScriptKind {
     Json,
 }
 
-/// A failed checked source-position operation.
+/// The per-file UTF-8 byte budget enforced before a source is indexed
+/// (16 MiB, the S1 frontend input bound).
+///
+/// A source at exactly this length is accepted; one byte more is rejected with
+/// [`SourcePositionError::SourceTooLarge`].
+pub const MAX_SOURCE_BYTES: usize = 16 * 1024 * 1024;
+
+/// A failed checked source operation.
 ///
 /// This enum is deliberately closed: callers can exhaustively distinguish an
-/// out-of-bounds coordinate from a coordinate that splits one encoded character.
+/// out-of-bounds coordinate, a coordinate that splits one encoded character,
+/// and an input that exceeds the frontend byte budget.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourcePositionError {
     ByteOffsetOutOfBounds { offset: usize, len: usize },
@@ -116,6 +149,7 @@ pub enum SourcePositionError {
     Utf16PositionOutOfBounds { position: Utf16Pos, len: Utf16Pos },
     Utf16PositionInsideSurrogatePair { position: Utf16Pos },
     RangeStartAfterEnd { start: Utf16Pos, end: Utf16Pos },
+    SourceTooLarge { len: usize, limit: usize },
 }
 
 impl fmt::Display for SourcePositionError {
@@ -147,6 +181,10 @@ impl fmt::Display for SourcePositionError {
                 start.get(),
                 end.get()
             ),
+            Self::SourceTooLarge { len, limit } => write!(
+                formatter,
+                "source text of {len} bytes exceeds the {limit}-byte per-file budget"
+            ),
         }
     }
 }
@@ -170,18 +208,31 @@ pub struct SourceText {
     checkpoints: Arc<[BoundaryCheckpoint]>,
     line_starts: Arc<[Utf16Pos]>,
     utf16_len: Utf16Pos,
+    /// Whether this source originated from a `.d.ts`/`.d.mts`/`.d.cts` file.
+    /// Ambient source files only allow declaration statements at the top level.
+    is_declaration_file: bool,
 }
 
 impl SourceText {
     /// Stores source text and precomputes its immutable position indexes.
-    #[must_use]
-    pub fn new(text: impl Into<Arc<str>>) -> Self {
+    ///
+    /// Rejects text longer than [`MAX_SOURCE_BYTES`] before any index storage
+    /// is allocated, so the 16 MiB per-file frontend bound is enforced at the
+    /// boundary rather than after the input has been buffered and indexed.
+    pub fn new(text: impl Into<Arc<str>>) -> Result<Self, SourcePositionError> {
         Self::from_arc(text.into())
     }
 
-    /// Stores an existing shared source allocation without copying its text.
-    #[must_use]
-    pub fn from_arc(text: Arc<str>) -> Self {
+    /// Stores an existing shared source allocation without copying its text,
+    /// under the same [`MAX_SOURCE_BYTES`] budget as [`SourceText::new`].
+    pub fn from_arc(text: Arc<str>) -> Result<Self, SourcePositionError> {
+        if text.len() > MAX_SOURCE_BYTES {
+            return Err(SourcePositionError::SourceTooLarge {
+                len: text.len(),
+                limit: MAX_SOURCE_BYTES,
+            });
+        }
+
         let mut checkpoints = vec![BoundaryCheckpoint {
             byte: 0,
             utf16: Utf16Pos::ZERO,
@@ -208,13 +259,25 @@ impl SourceText {
                 line_starts.push(Utf16Pos::new(utf16_offset));
             }
         }
-
-        Self {
+        Ok(Self {
             text,
             checkpoints: Arc::from(checkpoints),
             line_starts: Arc::from(line_starts),
             utf16_len: Utf16Pos::new(utf16_offset),
-        }
+            is_declaration_file: false,
+        })
+    }
+
+    /// Marks this source as originating from a `.d.ts`/`.d.mts`/`.d.cts` file.
+    pub fn with_declaration_file(mut self, value: bool) -> Self {
+        self.is_declaration_file = value;
+        self
+    }
+
+    /// Returns whether this source is a declaration file.
+    #[must_use]
+    pub const fn is_declaration_file(&self) -> bool {
+        self.is_declaration_file
     }
 
     /// Returns the original UTF-8 source text.
@@ -312,7 +375,7 @@ mod tests {
 
     #[test]
     fn ascii_boundaries_round_trip() {
-        let source = SourceText::new("hello");
+        let source = SourceText::new("hello").expect("test source fits the per-file budget");
 
         assert_eq!(source.len_utf16(), Utf16Pos::new(5));
         for offset in 0..=5 {
@@ -324,7 +387,7 @@ mod tests {
 
     #[test]
     fn bmp_code_points_preserve_utf16_width_but_not_byte_width() {
-        let source = SourceText::new("aé中");
+        let source = SourceText::new("aé中").expect("test source fits the per-file budget");
 
         assert_eq!(source.byte_to_utf16(0), Ok(Utf16Pos::new(0)));
         assert_eq!(source.byte_to_utf16(1), Ok(Utf16Pos::new(1)));
@@ -339,7 +402,7 @@ mod tests {
 
     #[test]
     fn astral_code_points_use_two_utf16_units() {
-        let source = SourceText::new("a😀b");
+        let source = SourceText::new("a😀b").expect("test source fits the per-file budget");
 
         assert_eq!(source.byte_to_utf16(1), Ok(Utf16Pos::new(1)));
         assert_eq!(source.byte_to_utf16(5), Ok(Utf16Pos::new(3)));
@@ -357,7 +420,7 @@ mod tests {
 
     #[test]
     fn combining_marks_each_advance_the_utf16_column() {
-        let source = SourceText::new("e\u{301}x");
+        let source = SourceText::new("e\u{301}x").expect("test source fits the per-file budget");
 
         assert_eq!(source.byte_to_utf16(1), Ok(Utf16Pos::new(1)));
         assert_eq!(source.byte_to_utf16(3), Ok(Utf16Pos::new(2)));
@@ -367,7 +430,7 @@ mod tests {
 
     #[test]
     fn crlf_is_one_line_break_and_columns_are_utf16_units() {
-        let source = SourceText::new("a\r\n😀\nb");
+        let source = SourceText::new("a\r\n😀\nb").expect("test source fits the per-file budget");
 
         assert_eq!(source.len_utf16(), Utf16Pos::new(7));
         assert_eq!(source.line_column(Utf16Pos::new(0)), Ok((0, 0)));
@@ -387,7 +450,8 @@ mod tests {
         // 2: 'b' (len_utf16 = 1)
         // 3: '\u{2029}' (len_utf16 = 1) -> line break after offset 3
         // 4: 'c' (len_utf16 = 1)
-        let source = SourceText::new("a\u{2028}b\u{2029}c");
+        let source =
+            SourceText::new("a\u{2028}b\u{2029}c").expect("test source fits the per-file budget");
 
         assert_eq!(source.len_utf16(), Utf16Pos::new(5));
 
@@ -408,20 +472,20 @@ mod tests {
 
     #[test]
     fn empty_and_end_positions_are_valid_boundaries() {
-        let empty = SourceText::new("");
+        let empty = SourceText::new("").expect("test source fits the per-file budget");
         assert!(empty.is_empty());
         assert_eq!(empty.byte_to_utf16(0), Ok(Utf16Pos::ZERO));
         assert_eq!(empty.utf16_to_byte(Utf16Pos::ZERO), Ok(0));
         assert_eq!(empty.line_column(Utf16Pos::ZERO), Ok((0, 0)));
 
-        let source = SourceText::new("😀");
+        let source = SourceText::new("😀").expect("test source fits the per-file budget");
         assert_eq!(source.byte_to_utf16(4), Ok(Utf16Pos::new(2)));
         assert_eq!(source.utf16_to_byte(Utf16Pos::new(2)), Ok(4));
     }
 
     #[test]
     fn invalid_byte_and_utf16_offsets_have_distinct_errors() {
-        let source = SourceText::new("😀");
+        let source = SourceText::new("😀").expect("test source fits the per-file budget");
 
         assert_eq!(
             source.byte_to_utf16(1),
@@ -456,7 +520,7 @@ mod tests {
             })
         );
 
-        let source = SourceText::new("a😀b");
+        let source = SourceText::new("a😀b").expect("test source fits the per-file budget");
         let range = source
             .range(Utf16Pos::new(1), Utf16Pos::new(3))
             .expect("the emoji's outer boundaries are valid");
@@ -475,6 +539,43 @@ mod tests {
             Err(SourcePositionError::Utf16PositionInsideSurrogatePair {
                 position: Utf16Pos::new(2),
             })
+        );
+    }
+
+    #[test]
+    fn source_text_file_size_limit() {
+        // The 16 MiB per-file budget admits the limit exactly and rejects one
+        // byte past it with a typed error, before any index storage is built.
+        let accepted_below = "a".repeat(super::MAX_SOURCE_BYTES - 1);
+        let accepted_at = "a".repeat(super::MAX_SOURCE_BYTES);
+        let rejected_above = "a".repeat(super::MAX_SOURCE_BYTES + 1);
+
+        let below = SourceText::new(accepted_below).expect("16 MiB - 1 is within budget");
+        assert_eq!(below.as_str().len(), super::MAX_SOURCE_BYTES - 1);
+        let at = SourceText::new(accepted_at).expect("16 MiB exactly is within budget");
+        assert_eq!(at.as_str().len(), super::MAX_SOURCE_BYTES);
+
+        let error =
+            SourceText::new(rejected_above).expect_err("16 MiB + 1 exceeds the per-file budget");
+        assert_eq!(
+            error,
+            SourcePositionError::SourceTooLarge {
+                len: super::MAX_SOURCE_BYTES + 1,
+                limit: super::MAX_SOURCE_BYTES,
+            }
+        );
+
+        // `from_arc` enforces the same budget on the shared-allocation path.
+        let oversized: std::sync::Arc<str> =
+            std::sync::Arc::from("a".repeat(super::MAX_SOURCE_BYTES + 1).as_str());
+        let error =
+            SourceText::from_arc(oversized).expect_err("from_arc rejects 16 MiB + 1 as well");
+        assert_eq!(
+            error,
+            SourcePositionError::SourceTooLarge {
+                len: super::MAX_SOURCE_BYTES + 1,
+                limit: super::MAX_SOURCE_BYTES,
+            }
         );
     }
 }

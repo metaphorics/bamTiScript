@@ -36,8 +36,8 @@
 //! [`ScriptKind`] drives the remaining decisions: TypeScript-only syntax in a
 //! JavaScript source parses (for recovery) but is diagnosed, `<T>expr` type
 //! assertions exist only in non-React TypeScript, and a `<` opening JSX in a
-//! React source is diagnosed as unsupported because the fixed [`NodeKind`]
-//! space has no JSX productions.
+//! React source (`.tsx`/`.jsx`) is parsed into JSX element, fragment, and
+//! self-closing-element nodes with `Missing*` recovery for malformed tags.
 
 use std::sync::Arc;
 
@@ -63,24 +63,28 @@ use crate::syntax::{
     IdentifierNode, IfStatement, ImportAttribute, ImportAttributes, ImportBinding, ImportClause,
     ImportDeclaration, ImportEqualsDeclaration, ImportExpression, ImportSpecifier,
     ImportSpecifierMode, ImportSpecifierNode, ImportType, IndexSignature, IndexedAccessType,
-    InferType, InterfaceDeclaration, JumpStatement, KeywordType, LabeledStatement, Literal,
-    LogicalExpression, LogicalOperator, MappedModifier, MappedType, MemberExpression,
+    InferType, InterfaceDeclaration, JsxAttribute, JsxAttributeInitializer, JsxAttributeItem,
+    JsxAttributeName, JsxChild, JsxClosingElement, JsxClosingElementNode, JsxElement,
+    JsxElementName, JsxExpressionContainer, JsxExpressionContainerNode, JsxFragment, JsxMemberName,
+    JsxNamespacedName, JsxOpeningElement, JsxSelfClosingElement, JsxSpreadAttribute,
+    JsxSpreadChild, JsxSpreadChildNode, JsxText, JumpStatement, KeywordType, LabeledStatement,
+    Literal, LogicalExpression, LogicalOperator, MappedModifier, MappedType, MemberExpression,
     MemberProperty, MetaProperty, MethodDeclaration, MissingNode, ModuleExportName,
-    NamespaceDeclaration, NewExpression, Node, NodeId, NodeKind, NonNullExpression, NullLiteral,
-    NumericLiteral, ObjectBindingPattern, ObjectBindingProperty, ObjectLiteral, ObjectMember,
-    ObjectMemberNode, ObjectMethod, ObjectProperty, ObjectType, Parameter, ParameterModifiers,
-    ParameterNode, Pattern, PrivateIdentifier, PropertyModifier, PropertyName, RegexLiteral,
-    RestBindingPattern, ReturnStatement, SatisfiesExpression, SequenceExpression, SourceFile,
-    SpreadElement, Statement, Stmt, StringLiteral, StringLiteralNode, SwitchCase, SwitchCaseNode,
-    SwitchStatement, TaggedTemplateExpression, TemplateElement, TemplateLiteral,
-    TemplateLiteralType, ThrowStatement, Token, TokenKind, TryStatement, TupleElement, TupleType,
-    Ty, TypeAliasDeclaration, TypeAnnotation, TypeAnnotationNode, TypeArgumentList,
-    TypeAssertionExpression, TypeIndexSignature, TypeLiteral, TypeMember, TypeMemberNode,
-    TypeMethodSignature, TypeNode, TypeOperator, TypeParameter, TypeParameterList,
-    TypeParameterNode, TypePredicate, TypePropertySignature, TypeQuery, TypeReference,
-    UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclaration,
-    VariableDeclarator, VariableDeclaratorNode, VariableKind, Variance, WhileStatement,
-    WithStatement, YieldExpression,
+    NamespaceDeclaration, NamespaceKeyword, NamespaceName, NewExpression, Node, NodeId, NodeKind,
+    NonNullExpression, NullLiteral, NumericLiteral, ObjectBindingPattern, ObjectBindingProperty,
+    ObjectLiteral, ObjectMember, ObjectMemberNode, ObjectMethod, ObjectProperty, ObjectType,
+    Parameter, ParameterModifiers, ParameterNode, Pattern, PrivateIdentifier, PropertyModifier,
+    PropertyName, RegexLiteral, RestBindingPattern, ReturnStatement, SatisfiesExpression,
+    SequenceExpression, SourceFile, SpreadElement, Statement, Stmt, StringLiteral,
+    StringLiteralNode, SwitchCase, SwitchCaseNode, SwitchStatement, TaggedTemplateExpression,
+    TemplateElement, TemplateLiteral, TemplateLiteralType, ThrowStatement, Token, TokenKind,
+    TryStatement, TupleElement, TupleType, Ty, TypeAliasDeclaration, TypeAnnotation,
+    TypeAnnotationNode, TypeArgumentList, TypeAssertionExpression, TypeIndexSignature, TypeLiteral,
+    TypeMember, TypeMemberNode, TypeMethodSignature, TypeNode, TypeOperator, TypeParameter,
+    TypeParameterList, TypeParameterNode, TypePredicate, TypePropertySignature, TypeQuery,
+    TypeReference, UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator,
+    VariableDeclaration, VariableDeclarator, VariableDeclaratorNode, VariableKind, Variance,
+    WhileStatement, WithStatement, YieldExpression, cook_identifier_text,
 };
 
 /// A token of one kind was required by the grammar but absent.
@@ -93,17 +97,22 @@ const EXPECTED_IDENTIFIER: DiagnosticCode = DiagnosticCode::new("BAMTS-P003");
 const EXPECTED_TYPE: DiagnosticCode = DiagnosticCode::new("BAMTS-P004");
 /// A token no grammar production could consume was skipped for recovery.
 const UNEXPECTED_TOKEN: DiagnosticCode = DiagnosticCode::new("BAMTS-P005");
-/// The left operand of an assignment or update is not a valid target.
-const INVALID_ASSIGNMENT_TARGET: DiagnosticCode = DiagnosticCode::new("BAMTS-P006");
 /// TypeScript-only syntax appeared in a JavaScript source.
 const TYPESCRIPT_SYNTAX_IN_JAVASCRIPT: DiagnosticCode = DiagnosticCode::new("BAMTS-P007");
-/// A syntax form the fixed node space cannot represent (JSX, `module "name"`).
-const UNSUPPORTED_SYNTAX: DiagnosticCode = DiagnosticCode::new("BAMTS-P008");
 /// A property name was required but the next token cannot begin one.
 const EXPECTED_PROPERTY_NAME: DiagnosticCode = DiagnosticCode::new("BAMTS-P009");
+/// A class member used the `export` keyword as a modifier.
+const EXPORT_MODIFIER_ON_CLASS_ELEMENT: DiagnosticCode = DiagnosticCode::new("BAMTS-C051");
 /// Nesting exceeded the recovery depth bound; the construct was abandoned.
 const NESTING_TOO_DEEP: DiagnosticCode = DiagnosticCode::new("BAMTS-P010");
-/// Unterminated regular-expression literal (shared with the scanner code).
+/// A `using` / `await using` declaration violated the resource grammar.
+/// A `using` / `await using` declaration binding was not an identifier, or the
+/// declaration appeared in a context the resource grammar forbids.
+pub const INVALID_USING_DECLARATION: DiagnosticCode = DiagnosticCode::new("BAMTS-P011");
+/// A `using` / `await using` declaration required an initializer but none was
+/// provided.
+pub const USING_DECLARATION_REQUIRES_INITIALIZER: DiagnosticCode =
+    DiagnosticCode::new("BAMTS-P012");
 const UNTERMINATED_REGEX: DiagnosticCode = DiagnosticCode::new("BAMTS-L004");
 
 /// The maximum expression/type nesting depth before recovery abandons a
@@ -151,12 +160,14 @@ pub fn parse(scanned: Recovered<ScannedSource>) -> Recovered<SourceFile> {
         .filter(|t| t.kind() == TokenKind::RegularExpressionLiteral)
         .map(|t| t.range())
         .collect();
+    // Spans reinterpreted as JSX likewise supersede the default pass's lexical
+    // diagnostics: character data and attribute strings were mis-lexed there.
+    let jsx_spans = &parser.jsx_spans;
     let mut diagnostics = lexical;
     diagnostics.retain(|diagnostic| {
         let start = diagnostic.range().start().get();
-        !regex_spans
-            .iter()
-            .any(|span| start >= span.start().get() && start < span.end().get())
+        let in_span = |span: &TextRange| start >= span.start().get() && start < span.end().get();
+        !regex_spans.iter().any(in_span) && !jsx_spans.iter().any(in_span)
     });
     diagnostics.extend(parser.diagnostics.iter().cloned());
     diagnostics.sort();
@@ -197,6 +208,28 @@ struct ParserCheckpoint {
     journal: usize,
 }
 
+#[derive(Clone, Copy, Default)]
+struct KeywordContext {
+    await_reserved: bool,
+    yield_reserved: bool,
+}
+
+/// Whether `global` / string-named module forms are recognized as ambient at
+/// the current statement level, matching the TypeScript ambient-context rules.
+///
+/// Names are ambient only directly under a `declare` keyword or directly
+/// inside the body of a string-named ambient module. A nested string module's
+/// own body is not ambient, and namespace / `global` bodies are never ambient.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AmbientContext {
+    /// Not an ambient name context.
+    None,
+    /// Parsing the statement directly under a `declare` keyword.
+    DeclareTarget,
+    /// Parsing the direct body of a string-named ambient module.
+    ModuleBody,
+}
+
 struct Parser {
     source_id: SourceId,
     script_kind: ScriptKind,
@@ -211,6 +244,13 @@ struct Parser {
     next_node_id: u32,
     journal: Vec<RescanEdit>,
     depth: u32,
+    keyword_context: KeywordContext,
+    /// Ambient name recognition context for the current statement level.
+    ambient: AmbientContext,
+    /// Source spans reinterpreted as JSX. Lexical diagnostics the default pass
+    /// recorded inside them reflect a non-JSX reading and are dropped, mirroring
+    /// the regex-rescan span handling.
+    jsx_spans: Vec<TextRange>,
 }
 
 fn is_trivia(kind: TokenKind) -> bool {
@@ -244,6 +284,7 @@ fn is_identifier_like(kind: TokenKind) -> bool {
     matches!(
         kind,
         TokenKind::Identifier
+            | TokenKind::EscapedContextualKeyword
             | TokenKind::KwAbstract
             | TokenKind::KwAccessor
             | TokenKind::KwAny
@@ -291,6 +332,7 @@ fn is_identifier_like(kind: TokenKind) -> bool {
 /// object literal, or as a class member name. Every keyword qualifies.
 fn is_any_word(kind: TokenKind) -> bool {
     is_identifier_like(kind)
+        || kind == TokenKind::EscapedReservedWord
         || matches!(
             kind,
             TokenKind::KwBreak
@@ -352,6 +394,9 @@ impl Parser {
             next_node_id: 0,
             journal: Vec::new(),
             depth: 0,
+            keyword_context: KeywordContext::default(),
+            ambient: AmbientContext::None,
+            jsx_spans: Vec::new(),
         };
         parser.cursor = parser.next_significant(0);
         parser
@@ -561,8 +606,46 @@ impl Parser {
         let range = token.range();
         self.node_at(range, Identifier::new(token))
     }
+    fn with_keyword_context<T>(
+        &mut self,
+        context: KeywordContext,
+        parse: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let previous = std::mem::replace(&mut self.keyword_context, context);
+        let result = parse(self);
+        self.keyword_context = previous;
+        result
+    }
+
+    fn escaped_identifier_is_reserved(&self, token: Token) -> bool {
+        match token.kind() {
+            TokenKind::EscapedReservedWord => true,
+            TokenKind::EscapedContextualKeyword => {
+                let cooked = cook_identifier_text(self.lexeme(token));
+                matches!(cooked.as_deref(), Some("await")) && self.keyword_context.await_reserved
+                    || matches!(cooked.as_deref(), Some("yield"))
+                        && self.keyword_context.yield_reserved
+            }
+            _ => false,
+        }
+    }
+
+    fn reject_reserved_identifier(&mut self, token: Token) {
+        if self.escaped_identifier_is_reserved(token) {
+            self.error_at(
+                EXPECTED_IDENTIFIER,
+                token.range(),
+                "an escaped reserved word cannot be used as an identifier",
+            );
+        }
+    }
 
     fn ident_from(&mut self, token: Token) -> IdentifierNode {
+        self.reject_reserved_identifier(token);
+        self.identifier_name_from(token)
+    }
+
+    fn identifier_name_from(&mut self, token: Token) -> IdentifierNode {
         let range = token.range();
         self.node_at(range, Identifier::new(token))
     }
@@ -772,9 +855,14 @@ impl Parser {
         ) else {
             return Vec::new();
         };
-        let fragment = Arc::new(SourceText::new(
-            self.source.as_str()[start_byte..end_byte].to_owned(),
-        ));
+        // The fragment is a strict substring of an already budget-checked
+        // source, so this can never breach the per-file cap; return no tokens
+        // rather than panic if that invariant is ever violated.
+        let Ok(fragment) =
+            SourceText::new(self.source.as_str()[start_byte..end_byte].to_owned()).map(Arc::new)
+        else {
+            return Vec::new();
+        };
         let recovered = crate::scanner::scan(self.source_id, self.script_kind, fragment);
         let (scanned, diagnostics) = recovered.into_parts();
         for diagnostic in diagnostics {
@@ -1053,15 +1141,26 @@ impl Parser {
                 let range = self.cur().range();
                 self.note_typescript_syntax(range);
                 self.bump();
-                let inner = self.parse_statement();
+                let inner =
+                    self.with_ambient(AmbientContext::DeclareTarget, |this| this.parse_statement());
                 self.node(start, Statement::Declare(Box::new(inner)))
             }
             TokenKind::Identifier
-                if matches!(self.cur_lexeme(), "global" | "module")
-                    && matches!(
+                if self.cur_lexeme() == "global" && self.nth_kind(1) == TokenKind::LBrace =>
+            {
+                self.parse_contextual_namespace(start)
+            }
+            TokenKind::Identifier
+                if self.cur_lexeme() == "module"
+                    && (matches!(
                         self.nth_kind(1),
                         TokenKind::LBrace | TokenKind::StringLiteral
-                    ) =>
+                    ) || (self.name_is_ambient()
+                        && is_identifier_like(self.nth_kind(1))
+                        && matches!(self.nth_kind(2), TokenKind::LBrace | TokenKind::Dot))
+                        || (self.name_is_ambient()
+                            && !is_identifier_like(self.nth_kind(1))
+                            && self.nth_kind(1) != TokenKind::Dot)) =>
             {
                 self.parse_contextual_namespace(start)
             }
@@ -1217,6 +1316,7 @@ impl Parser {
     /// Parses a `var`/`let`/`const`/`using` declaration. `allow_in` is false
     /// inside a `for (...)` head before the `in`/`of` decision.
     fn parse_variable_declaration(&mut self, allow_in: bool) -> VariableDeclaration {
+        let start = self.cur().range().start();
         let kind = self.variable_kind();
         let mut declarations = Vec::new();
         loop {
@@ -1226,7 +1326,12 @@ impl Parser {
                 break;
             }
         }
-        VariableDeclaration { kind, declarations }
+        let range = self.span_from(start);
+        VariableDeclaration {
+            range,
+            kind,
+            declarations,
+        }
     }
 
     fn parse_variable_declarator(&mut self, allow_in: bool) -> VariableDeclaratorNode {
@@ -1373,12 +1478,16 @@ impl Parser {
         ) && self.at_variable_declaration()
             || (self.at(TokenKind::Identifier)
                 && self.cur_lexeme() == "using"
-                && is_identifier_like(self.nth_kind(1)))
+                && (is_identifier_like(self.nth_kind(1))
+                    || matches!(self.nth_kind(1), TokenKind::LBracket | TokenKind::LBrace)))
             || (self.at(TokenKind::KwAwait)
                 && self.nth(1).kind() == TokenKind::Identifier
-                && self.lexeme(self.nth(1)) == "using");
+                && self.lexeme(self.nth(1)) == "using"
+                && (is_identifier_like(self.nth_kind(2))
+                    || matches!(self.nth_kind(2), TokenKind::LBracket | TokenKind::LBrace)));
 
         if decl_start {
+            let kind_start = self.cur().range().start();
             let kind = self.variable_kind();
             let first = self.parse_for_head_declarator();
             match self.kind() {
@@ -1386,7 +1495,10 @@ impl Parser {
                     self.bump();
                     let object = self.parse_expression(false);
                     let body = self.finish_for_body();
+                    let range = TextRange::new(kind_start, first.range().end())
+                        .expect("for-in head range is ordered");
                     let binding = ForBinding::Variable(VariableDeclaration {
+                        range,
                         kind,
                         declarations: vec![first],
                     });
@@ -1403,7 +1515,10 @@ impl Parser {
                     self.bump();
                     let iterable = self.parse_assignment_expression(false);
                     let body = self.finish_for_body();
+                    let range = TextRange::new(kind_start, first.range().end())
+                        .expect("for-of head range is ordered");
                     let binding = ForBinding::Variable(VariableDeclaration {
+                        range,
                         kind,
                         declarations: vec![first],
                     });
@@ -1430,7 +1545,14 @@ impl Parser {
                         declarations.push(self.parse_variable_declarator(false));
                     }
                     self.expect(TokenKind::Semicolon, "expected `;`");
+                    let end = declarations
+                        .last()
+                        .map(|declarator| declarator.range().end())
+                        .expect("classic for head has at least one declarator");
+                    let range =
+                        TextRange::new(kind_start, end).expect("classic for head range is ordered");
                     let initializer = Some(ForInitializer::Variable(VariableDeclaration {
+                        range,
                         kind,
                         declarations,
                     }));
@@ -1737,7 +1859,7 @@ impl Parser {
         while self.at(TokenKind::At) {
             let start = self.cur_start();
             self.bump();
-            let expression = self.parse_lhs_expression(false);
+            let expression = self.parse_lhs_expression(LhsContext::Decorator);
             let decorator: DecoratorNode = self.node(
                 start,
                 Decorator {
@@ -1778,7 +1900,7 @@ impl Parser {
         loop {
             if self.at(TokenKind::KwExtends) && extends.is_none() {
                 self.bump();
-                let expression = self.parse_lhs_expression(true);
+                let expression = self.parse_lhs_expression(LhsContext::Expression);
                 let type_arguments = self.try_parse_type_arguments_in_heritage();
                 extends = Some(ClassHeritage {
                     expression: Box::new(expression),
@@ -1880,6 +2002,14 @@ impl Parser {
                     typescript_modifier = Some(self.cur().range());
                     modifiers.is_declare = true;
                 }
+                TokenKind::KwExport if !self.has_newline_before_nth(1) => {
+                    let range = self.cur().range();
+                    self.error_at(
+                        EXPORT_MODIFIER_ON_CLASS_ELEMENT,
+                        range,
+                        "'export' modifier cannot appear on class elements.",
+                    );
+                }
                 TokenKind::KwAsync if !self.has_newline_before_nth(1) => is_async = true,
                 TokenKind::KwAccessor if !self.has_newline_before_nth(1) => is_accessor = true,
                 TokenKind::KwGet => property_modifier = PropertyModifier::Get,
@@ -1953,6 +2083,7 @@ impl Parser {
                 return self.node(
                     start,
                     ClassMember::Constructor(ConstructorDeclaration {
+                        decorators,
                         modifiers,
                         parameters,
                         body,
@@ -1985,11 +2116,18 @@ impl Parser {
 
         // Method, getter, or setter.
         if self.at(TokenKind::LParen) || self.at_less_like() || is_generator {
+            let keyword_context = KeywordContext {
+                await_reserved: is_async,
+                yield_reserved: is_generator,
+            };
             let type_parameters = self.parse_optional_type_parameters();
-            let parameters = self.parse_parameter_list();
+            let parameters =
+                self.with_keyword_context(keyword_context, |this| this.parse_parameter_list());
             let return_type = self.parse_optional_type_annotation();
             let body = if self.at(TokenKind::LBrace) {
-                Some(FunctionBody::Block(self.parse_block()))
+                Some(FunctionBody::Block(
+                    self.with_keyword_context(keyword_context, Self::parse_block),
+                ))
             } else {
                 self.expect_semicolon();
                 None
@@ -2027,6 +2165,7 @@ impl Parser {
             return self.node(
                 start,
                 ClassMember::AutoAccessor(AutoAccessor {
+                    decorators,
                     modifiers,
                     name,
                     type_annotation,
@@ -2037,6 +2176,7 @@ impl Parser {
         self.node(
             start,
             ClassMember::Property(ClassProperty {
+                decorators,
                 modifiers,
                 name,
                 optional,
@@ -2064,6 +2204,7 @@ impl Parser {
                 | TokenKind::KwAccessor
                 | TokenKind::KwGet
                 | TokenKind::KwSet
+                | TokenKind::KwExport
         ) {
             return false;
         }
@@ -2105,7 +2246,7 @@ impl Parser {
         )
     }
 
-    fn parse_interface_declaration(&mut self, start: Utf16Pos) -> Stmt {
+    fn parse_interface(&mut self) -> InterfaceDeclaration {
         let keyword_range = self.cur().range();
         self.note_typescript_syntax(keyword_range);
         self.bump();
@@ -2130,15 +2271,17 @@ impl Parser {
             }
         }
         let members = self.parse_type_members();
-        self.node(
-            start,
-            Statement::Interface(InterfaceDeclaration {
-                name,
-                type_parameters,
-                extends,
-                members,
-            }),
-        )
+        InterfaceDeclaration {
+            name,
+            type_parameters,
+            extends,
+            members,
+        }
+    }
+
+    fn parse_interface_declaration(&mut self, start: Utf16Pos) -> Stmt {
+        let interface = self.parse_interface();
+        self.node(start, Statement::Interface(interface))
     }
 
     fn parse_type_alias_declaration(&mut self, start: Utf16Pos) -> Stmt {
@@ -2201,70 +2344,125 @@ impl Parser {
         )
     }
 
+    /// Parses the body of a namespace / ambient module, desugaring a leading
+    /// dotted tail into a nested single-name declaration.
+    fn parse_namespace_body(&mut self, keyword: NamespaceKeyword) -> BlockNode {
+        if self.at(TokenKind::Dot) {
+            let inner_start = self.cur_start();
+            self.bump();
+            let inner = self.parse_namespace_tail(inner_start, keyword);
+            let statements = vec![inner];
+            self.node(inner_start, Block { statements })
+        } else {
+            self.parse_block()
+        }
+    }
+
+    /// Returns whether `global` / string-module names are ambient here.
+    fn name_is_ambient(&self) -> bool {
+        !matches!(self.ambient, AmbientContext::None)
+    }
+
+    /// Parses with the given ambient context, restoring the previous one.
+    fn with_ambient<T>(
+        &mut self,
+        context: AmbientContext,
+        parse: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let saved = self.ambient;
+        self.ambient = context;
+        let result = parse(self);
+        self.ambient = saved;
+        result
+    }
+
+    /// Parses a namespace/module/global body in a non-ambient name context, so
+    /// nested `global` / string-module forms are not treated as ambient.
+    fn parse_outside_declare<T>(&mut self, parse: impl FnOnce(&mut Self) -> T) -> T {
+        self.with_ambient(AmbientContext::None, parse)
+    }
+
+    fn identifier_namespace_name(
+        &mut self,
+        name: IdentifierNode,
+        keyword: NamespaceKeyword,
+    ) -> NamespaceName {
+        NamespaceName::Identifier { name, keyword }
+    }
+
     /// Parses `namespace A.B.C { ... }`, desugaring the dotted form into
     /// nested single-name declarations because the node carries one name.
     fn parse_namespace_declaration(&mut self, start: Utf16Pos) -> Stmt {
         let keyword_range = self.cur().range();
         self.note_typescript_syntax(keyword_range);
         self.bump();
-        let name = self.expect_identifier("expected a namespace name");
-        let body = if self.at(TokenKind::Dot) {
-            let inner_start = self.cur_start();
-            self.bump();
-            let inner = self.parse_namespace_tail(inner_start);
-            let statements = vec![inner];
-            self.node(inner_start, Block { statements })
-        } else {
-            self.parse_block()
-        };
+        let name_node = self.expect_identifier("expected a namespace name");
+        let name = self.identifier_namespace_name(name_node, NamespaceKeyword::Namespace);
+        let body = self
+            .parse_outside_declare(|this| this.parse_namespace_body(NamespaceKeyword::Namespace));
         self.node(
             start,
             Statement::Namespace(NamespaceDeclaration { name, body }),
         )
     }
 
-    fn parse_namespace_tail(&mut self, start: Utf16Pos) -> Stmt {
-        let name = self.expect_identifier("expected a namespace name");
-        let body = if self.at(TokenKind::Dot) {
-            let inner_start = self.cur_start();
-            self.bump();
-            let inner = self.parse_namespace_tail(inner_start);
-            let statements = vec![inner];
-            self.node(inner_start, Block { statements })
-        } else {
-            self.parse_block()
-        };
+    fn parse_namespace_tail(&mut self, start: Utf16Pos, keyword: NamespaceKeyword) -> Stmt {
+        let name_node = self.expect_identifier("expected a namespace name");
+        let name = self.identifier_namespace_name(name_node, keyword);
+        let body = self.parse_outside_declare(|this| this.parse_namespace_body(keyword));
         self.node(
             start,
             Statement::Namespace(NamespaceDeclaration { name, body }),
         )
     }
 
-    /// Parses ambient `global { ... }` and `module Name { ... }` forms after a
-    /// `declare` wrapper. A string-named module cannot be represented by the
-    /// namespace node's identifier field, so recovery records a stable
-    /// unsupported-syntax diagnostic and keeps a missing name.
+    /// Parses ambient `global { ... }` and `module Name { ... }` forms, including
+    /// string-named ambient modules under `declare`.
     fn parse_contextual_namespace(&mut self, start: Utf16Pos) -> Stmt {
         let keyword = self.bump();
         let is_global = self.lexeme(keyword) == "global";
-        let name = if is_global {
-            self.ident_from(keyword)
+        let ambient = self.name_is_ambient();
+        let name = if is_global && ambient {
+            NamespaceName::Global {
+                range: keyword.range(),
+            }
+        } else if is_global {
+            let name = self.ident_from(keyword);
+            self.identifier_namespace_name(name, NamespaceKeyword::Namespace)
         } else if is_identifier_like(self.kind()) {
-            self.expect_identifier("expected a module name")
+            let name = self.expect_identifier("expected a module name");
+            self.identifier_namespace_name(name, NamespaceKeyword::Module)
         } else if self.at(TokenKind::StringLiteral) {
-            let range = self.cur().range();
-            self.error_at(
-                UNSUPPORTED_SYNTAX,
-                range,
-                "a string-named module is not representable in this syntax tree",
-            );
-            self.bump();
-            self.missing_ident()
+            let lit = self.parse_string_literal();
+            if !ambient {
+                self.error_at(
+                    EXPECTED_IDENTIFIER,
+                    lit.range(),
+                    "a string-named module is only allowed in an ambient declaration",
+                );
+            }
+            NamespaceName::StringLiteral(lit)
         } else {
             self.error_here(EXPECTED_IDENTIFIER, "expected a module name");
-            self.missing_ident()
+            let name = self.missing_ident();
+            self.identifier_namespace_name(name, NamespaceKeyword::Module)
         };
-        let body = self.parse_block();
+
+        // Only the direct body of a string-named ambient module keeps ambient
+        // name recognition, and only when that module was itself the direct
+        // `declare` target. A nested string module's body is not ambient, so
+        // `declare module "a" { module "b" { module "c" {} } }` rejects the
+        // inner string module exactly like TypeScript (TS2435).
+        let body_context = match (&name, self.ambient) {
+            (NamespaceName::StringLiteral(_), AmbientContext::DeclareTarget) => {
+                AmbientContext::ModuleBody
+            }
+            _ => AmbientContext::None,
+        };
+        let body = self.with_ambient(body_context, |this| match &name {
+            NamespaceName::Identifier { keyword, .. } => this.parse_namespace_body(*keyword),
+            NamespaceName::StringLiteral(_) | NamespaceName::Global { .. } => this.parse_block(),
+        });
         self.node(
             start,
             Statement::Namespace(NamespaceDeclaration { name, body }),
@@ -2486,7 +2684,7 @@ impl Parser {
         }
         if is_any_word(self.kind()) {
             let token = self.bump();
-            return ModuleExportName::Identifier(self.ident_from(token));
+            return ModuleExportName::Identifier(self.identifier_name_from(token));
         }
         self.error_here(EXPECTED_IDENTIFIER, "expected a module export name");
         ModuleExportName::Missing(MissingNode::new(NodeKind::Identifier))
@@ -2703,6 +2901,7 @@ impl Parser {
                 let class = self.parse_class(Vec::new(), modifiers, false);
                 ExportDefaultValue::Class(class)
             }
+            TokenKind::KwInterface => ExportDefaultValue::Interface(self.parse_interface()),
             TokenKind::At => {
                 let decorators = self.parse_decorators();
                 if self.at(TokenKind::KwClass) {
@@ -2775,6 +2974,13 @@ impl Parser {
         } else {
             (None, None)
         };
+        if source.is_none() {
+            for specifier in &specifiers {
+                if let ModuleExportName::Identifier(local) = &specifier.data().local {
+                    self.reject_reserved_identifier(*local.data().token());
+                }
+            }
+        }
         self.expect_semicolon();
         self.node(
             start,
@@ -2833,6 +3039,18 @@ fn binary_precedence(kind: TokenKind) -> Option<(BinaryOrLogical, u8)> {
 enum BinaryOrLogical {
     Binary(BinaryOperator),
     Logical(LogicalOperator),
+}
+
+#[derive(Clone, Copy)]
+enum LhsContext {
+    Expression,
+    Decorator,
+}
+
+impl LhsContext {
+    fn allows_newline_computed_member(self) -> bool {
+        matches!(self, Self::Expression)
+    }
 }
 
 fn assignment_operator(kind: TokenKind) -> Option<AssignmentOperator> {
@@ -2997,40 +3215,31 @@ impl Parser {
                 let range = self.cur().range();
                 self.note_typescript_syntax(range);
                 self.bump();
-                let type_node = if !is_satisfies && self.at(TokenKind::KwConst) {
-                    // `as const`: represent the const assertion as a reference
-                    // to a `const` type name, since the type space has no
-                    // dedicated const-assertion node.
-                    let const_token = self.bump();
-                    let name = self.ident_from(const_token);
-                    let ref_start = name.range().start();
-                    self.node(
-                        ref_start,
-                        TypeNode::Reference(TypeReference {
-                            name: EntityName::Identifier(name),
-                            type_arguments: None,
-                        }),
-                    )
-                } else {
-                    self.parse_type()
-                };
-                left = if is_satisfies {
-                    self.node(
+                if is_satisfies {
+                    let type_node = self.parse_type();
+                    left = self.node(
                         start,
                         Expression::Satisfies(SatisfiesExpression {
                             expression: Box::new(left),
                             type_node: Box::new(type_node),
                         }),
-                    )
+                    );
                 } else {
-                    self.node(
+                    let type_node = if self.at(TokenKind::KwConst) {
+                        // `as const` is a language construct, not a type reference.
+                        self.bump();
+                        None
+                    } else {
+                        Some(Box::new(self.parse_type()))
+                    };
+                    left = self.node(
                         start,
                         Expression::As(AsExpression {
                             expression: Box::new(left),
-                            type_node: Box::new(type_node),
+                            type_node,
                         }),
-                    )
-                };
+                    );
+                }
                 continue;
             }
 
@@ -3178,6 +3387,19 @@ impl Parser {
         let range = self.cur().range();
         self.note_typescript_syntax(range);
         self.expect_type_open("expected `<`");
+        if self.at(TokenKind::KwConst) {
+            // `<const>expr` is the prefix spelling of `expr as const`.
+            self.bump();
+            self.expect_type_close("expected `>`");
+            let expression = self.parse_unary_expression();
+            return self.node(
+                start,
+                Expression::As(AsExpression {
+                    expression: Box::new(expression),
+                    type_node: None,
+                }),
+            );
+        }
         let type_node = self.parse_type();
         self.expect_type_close("expected `>`");
         let expression = self.parse_unary_expression();
@@ -3192,7 +3414,7 @@ impl Parser {
 
     fn parse_postfix_expression(&mut self) -> Expr {
         let start = self.cur_start();
-        let expr = self.parse_lhs_expression(false);
+        let expr = self.parse_lhs_expression(LhsContext::Expression);
         if matches!(self.kind(), TokenKind::PlusPlus | TokenKind::MinusMinus)
             && !self.has_newline_before()
         {
@@ -3217,19 +3439,19 @@ impl Parser {
 
     /// Parses a left-hand-side expression: a primary or `new` expression
     /// followed by member accesses, calls, non-null assertions, and template
-    /// tags. `no_call` suppresses call parsing for a heritage/decorator head.
-    fn parse_lhs_expression(&mut self, no_call: bool) -> Expr {
+    /// tags. Decorators stop before a newline-following computed class member.
+    fn parse_lhs_expression(&mut self, ctx: LhsContext) -> Expr {
         let start = self.cur_start();
         let mut expr = if self.at(TokenKind::KwNew) {
-            self.parse_new_expression()
+            self.parse_new_expression(ctx)
         } else {
             self.parse_primary_expression()
         };
-        expr = self.parse_call_and_member_tail(start, expr, no_call);
+        expr = self.parse_call_and_member_tail(start, expr, ctx);
         expr
     }
 
-    fn parse_new_expression(&mut self) -> Expr {
+    fn parse_new_expression(&mut self, ctx: LhsContext) -> Expr {
         let start = self.cur_start();
         self.bump();
         if self.at(TokenKind::Dot) {
@@ -3239,10 +3461,10 @@ impl Parser {
             return self.node(start, Expression::Meta(MetaProperty::NewTarget));
         }
         let callee = if self.at(TokenKind::KwNew) {
-            self.parse_new_expression()
+            self.parse_new_expression(ctx)
         } else {
             let primary = self.parse_primary_expression();
-            self.parse_member_tail(start, primary)
+            self.parse_member_tail(start, primary, ctx)
         };
         let type_arguments = self.try_parse_type_arguments_speculative();
         let arguments = if self.at(TokenKind::LParen) {
@@ -3261,7 +3483,7 @@ impl Parser {
     }
 
     /// Member-only tail (no calls): used for a `new` callee.
-    fn parse_member_tail(&mut self, start: Utf16Pos, mut expr: Expr) -> Expr {
+    fn parse_member_tail(&mut self, start: Utf16Pos, mut expr: Expr, ctx: LhsContext) -> Expr {
         loop {
             match self.kind() {
                 TokenKind::Dot => {
@@ -3276,7 +3498,9 @@ impl Parser {
                         }),
                     );
                 }
-                TokenKind::LBracket => {
+                TokenKind::LBracket
+                    if ctx.allows_newline_computed_member() || !self.has_newline_before() =>
+                {
                     self.bump();
                     let index = self.parse_expression(false);
                     self.expect(TokenKind::RBracket, "expected `]`");
@@ -3308,7 +3532,7 @@ impl Parser {
         &mut self,
         start: Utf16Pos,
         mut expr: Expr,
-        no_call: bool,
+        ctx: LhsContext,
     ) -> Expr {
         loop {
             match self.kind() {
@@ -3326,9 +3550,11 @@ impl Parser {
                 }
                 TokenKind::QuestionDot => {
                     self.bump();
-                    expr = self.parse_optional_chain_link(start, expr, no_call);
+                    expr = self.parse_optional_chain_link(start, expr, false);
                 }
-                TokenKind::LBracket => {
+                TokenKind::LBracket
+                    if ctx.allows_newline_computed_member() || !self.has_newline_before() =>
+                {
                     self.bump();
                     let index = self.parse_expression(false);
                     self.expect(TokenKind::RBracket, "expected `]`");
@@ -3341,7 +3567,7 @@ impl Parser {
                         }),
                     );
                 }
-                TokenKind::LParen if !no_call => {
+                TokenKind::LParen => {
                     let arguments = self.parse_arguments();
                     expr = self.node(
                         start,
@@ -3372,7 +3598,7 @@ impl Parser {
                         }),
                     );
                 }
-                _ if !no_call && self.at_less_like() => {
+                _ if self.at_less_like() => {
                     // `f<T>(...)` / `f<T>\`...\``: only a call/tagged-template
                     // if type arguments parse and are followed by `(` or a
                     // template. Otherwise this `<` is a comparison.
@@ -3486,7 +3712,7 @@ impl Parser {
         }
         if is_any_word(self.kind()) {
             let token = self.bump();
-            return MemberProperty::Named(self.ident_from(token));
+            return MemberProperty::Named(self.identifier_name_from(token));
         }
         self.error_here(EXPECTED_IDENTIFIER, "expected a property name");
         MemberProperty::Named(self.missing_ident())
@@ -3596,6 +3822,7 @@ impl Parser {
                 let class = self.parse_class(Vec::new(), DeclarationModifiers::default(), false);
                 self.node(start, Expression::Class(ClassExpression { class }))
             }
+            TokenKind::At => self.parse_decorated_class_expression(start),
             TokenKind::KwImport => self.parse_import_expression(start),
             TokenKind::PrivateIdentifier => {
                 // `#field in obj`: represent the private name as an identifier
@@ -3608,7 +3835,7 @@ impl Parser {
                 if matches!(self.script_kind, ScriptKind::TypeScriptReact)
                     || matches!(self.script_kind, ScriptKind::JavaScriptReact) =>
             {
-                self.parse_jsx_placeholder(start)
+                self.parse_jsx(start)
             }
             kind if is_identifier_like(kind) => {
                 let token = self.bump();
@@ -3620,6 +3847,24 @@ impl Parser {
                 self.missing_expr()
             }
         }
+    }
+
+    /// Expression-path `@decorator class`: a primary, so postfix member/call
+    /// and lower-precedence binary/assignment continuations apply exactly as
+    /// for an undecorated class expression. Malformed trailing material on the
+    /// same line is consumed through its assignment-expression boundary so it
+    /// cannot escape as a sibling statement.
+    fn parse_decorated_class_expression(&mut self, start: Utf16Pos) -> Expr {
+        let decorators = self.parse_decorators();
+        if !self.at(TokenKind::KwClass) {
+            self.error_here(EXPECTED_TOKEN, "decorators must precede a class");
+            if self.can_start_expression() && !self.has_newline_before() {
+                let _ = self.parse_assignment_expression(false);
+            }
+            return self.missing_expr();
+        }
+        let class = self.parse_class(decorators, DeclarationModifiers::default(), false);
+        self.node(start, Expression::Class(ClassExpression { class }))
     }
 
     fn parse_import_expression(&mut self, start: Utf16Pos) -> Expr {
@@ -3649,44 +3894,344 @@ impl Parser {
         )
     }
 
-    /// The fixed node space has no JSX productions. A `<` opening JSX in a
-    /// React source is diagnosed and its balanced element skipped so parsing
-    /// makes forward progress.
-    fn parse_jsx_placeholder(&mut self, start: Utf16Pos) -> Expr {
-        self.error_here(
-            UNSUPPORTED_SYNTAX,
-            "JSX is not representable in this syntax tree",
-        );
-        let mut depth = 0i32;
-        while !self.at_eof() {
-            match self.kind() {
-                TokenKind::LessThan => {
-                    depth += 1;
-                    self.bump();
-                }
-                TokenKind::GreaterThan | TokenKind::GreaterThanEq => {
-                    self.bump();
-                    depth -= 1;
-                    if depth <= 0 {
-                        break;
-                    }
-                }
-                TokenKind::GreaterGreater | TokenKind::GreaterGreaterGreater => {
-                    self.bump();
-                    depth -= 2;
-                    if depth <= 0 {
-                        break;
-                    }
-                }
-                _ => {
-                    self.bump();
-                }
+    /// Parses a JSX element or fragment. The whole construct is first re-lexed
+    /// from the source into JSX-aware tokens spliced over the default pass (see
+    /// [`Self::rescan_jsx_span`]), then reparsed structurally so nested
+    /// expression containers reuse the ordinary expression grammar.
+    fn parse_jsx(&mut self, start: Utf16Pos) -> Expr {
+        let _ = start;
+        self.rescan_jsx_span();
+        self.parse_jsx_element_or_fragment()
+    }
+
+    /// Re-lexes the JSX construct starting at the current `<` and splices the
+    /// JSX-aware tokens over the default pass's tokens for that span, keeping
+    /// the stored stream byte-exact. Mirrors the regex rescan's span handling.
+    fn rescan_jsx_span(&mut self) {
+        if !self.at(TokenKind::LessThan) || self.at_eof() {
+            return;
+        }
+        let index = self.cursor;
+        let start = self.tokens[index].range().start();
+        let Ok(start_byte) = self.source.utf16_to_byte(start) else {
+            return;
+        };
+        // Same budget invariant as `scan_shifted_fragment`: a tail of a
+        // budget-checked source cannot exceed the per-file cap; bail out
+        // instead of panicking if that ever changes.
+        let Ok(fragment) =
+            SourceText::new(self.source.as_str()[start_byte..].to_owned()).map(Arc::new)
+        else {
+            return;
+        };
+        let mut scanner = crate::scanner::Scanner::new(self.source_id, self.script_kind, &fragment);
+        let jsx_tokens = scanner.scan_jsx_span();
+        let consumed = jsx_tokens
+            .last()
+            .map_or(0, |token| token.range().end().get());
+        if consumed == 0 {
+            return;
+        }
+        let base = start.get();
+        let end = base + consumed;
+        let shift = |range: TextRange| {
+            TextRange::new(
+                Utf16Pos::new(base + range.start().get()),
+                Utf16Pos::new(base + range.end().get()),
+            )
+            .expect("shift preserves range ordering")
+        };
+        let mut replacement: Vec<Token> = jsx_tokens
+            .iter()
+            .map(|token| Token::new(token.kind(), shift(token.range())))
+            .collect();
+        for diagnostic in scanner.into_diagnostics() {
+            self.diagnostics.push(Diagnostic::new(
+                diagnostic.severity(),
+                diagnostic.code(),
+                diagnostic.source_id(),
+                shift(diagnostic.range()),
+                diagnostic.message(),
+            ));
+        }
+        // Absorb the pre-scanned tokens the span covers; a default token may
+        // straddle the JSX end, so re-lex only its trailing fragment.
+        let mut last = index;
+        while last + 1 < self.tokens.len() && self.tokens[last].range().end().get() < end {
+            last += 1;
+        }
+        let covered_end = self.tokens[last].range().end().get();
+        if covered_end > end {
+            replacement.extend(self.scan_shifted_fragment(end, covered_end));
+        }
+        self.replace_tokens(index, last, replacement);
+        self.jsx_spans
+            .push(TextRange::new(start, Utf16Pos::new(end)).expect("a JSX span grows forward"));
+    }
+
+    fn parse_jsx_element_or_fragment(&mut self) -> Expr {
+        let start = self.cur_start();
+        if !self.enter() {
+            if self.at(TokenKind::LessThan) {
+                self.bump();
             }
+            return self.node(
+                start,
+                Expression::Missing(MissingNode::new(NodeKind::MissingExpression)),
+            );
+        }
+        let result = self.parse_jsx_inner(start);
+        self.leave();
+        result
+    }
+
+    fn parse_jsx_inner(&mut self, start: Utf16Pos) -> Expr {
+        self.expect(TokenKind::LessThan, "expected `<`");
+        // Fragment `<>children</>`.
+        if self.at(TokenKind::GreaterThan) {
+            self.bump();
+            let children = self.parse_jsx_children();
+            self.expect(TokenKind::LessThan, "expected `</>`");
+            self.expect(TokenKind::Slash, "expected `/`");
+            self.expect(TokenKind::GreaterThan, "expected `>`");
+            return self.node(start, Expression::JsxFragment(JsxFragment { children }));
+        }
+        let name = self.parse_jsx_element_name();
+        let attributes = self.parse_jsx_attributes();
+        if self.at(TokenKind::Slash) {
+            self.bump();
+            self.expect(TokenKind::GreaterThan, "expected `>`");
+            return self.node(
+                start,
+                Expression::JsxSelfClosingElement(JsxSelfClosingElement { name, attributes }),
+            );
+        }
+        self.expect(TokenKind::GreaterThan, "expected `>`");
+        let opening = self.node(start, JsxOpeningElement { name, attributes });
+        let children = self.parse_jsx_children();
+        let closing = self.parse_jsx_closing_element();
+        let open_text = self.jsx_name_text(&opening.data().name);
+        let close_text = self.jsx_name_text(&closing.data().name);
+        if open_text != close_text {
+            self.error_at(
+                EXPECTED_TOKEN,
+                closing.range(),
+                "JSX closing tag does not match the opening tag",
+            );
         }
         self.node(
             start,
-            Expression::Missing(MissingNode::new(NodeKind::MissingExpression)),
+            Expression::JsxElement(JsxElement {
+                opening,
+                children,
+                closing,
+            }),
         )
+    }
+
+    fn parse_jsx_closing_element(&mut self) -> JsxClosingElementNode {
+        let start = self.cur_start();
+        self.expect(TokenKind::LessThan, "expected `</`");
+        self.expect(TokenKind::Slash, "expected `/`");
+        let name = self.parse_jsx_element_name();
+        self.expect(TokenKind::GreaterThan, "expected `>`");
+        self.node(start, JsxClosingElement { name })
+    }
+
+    /// Parses a JSX name identifier. JSX names are always lexed as
+    /// [`TokenKind::Identifier`], so reserved-word rejection does not apply.
+    fn parse_jsx_name_identifier(&mut self) -> IdentifierNode {
+        if self.at(TokenKind::Identifier) {
+            let token = self.bump();
+            return self.identifier_name_from(token);
+        }
+        self.error_here(EXPECTED_IDENTIFIER, "expected a JSX name");
+        self.missing_ident()
+    }
+
+    /// Element name: bare identifier, namespaced `ns:name`, or a dotted member
+    /// chain `A.B.C`.
+    fn parse_jsx_element_name(&mut self) -> JsxElementName {
+        let first = self.parse_jsx_name_identifier();
+        if self.at(TokenKind::Colon) {
+            self.bump();
+            let name = self.parse_jsx_name_identifier();
+            return JsxElementName::Namespace(JsxNamespacedName {
+                namespace: first,
+                name,
+            });
+        }
+        let mut current = JsxElementName::Identifier(first);
+        while self.at(TokenKind::Dot) {
+            self.bump();
+            let property = self.parse_jsx_name_identifier();
+            current = JsxElementName::Member(JsxMemberName {
+                object: Box::new(current),
+                property,
+            });
+        }
+        current
+    }
+
+    /// Attribute name: bare identifier or namespaced `ns:name`.
+    fn parse_jsx_attribute_name(&mut self) -> JsxAttributeName {
+        let first = self.parse_jsx_name_identifier();
+        if self.at(TokenKind::Colon) {
+            self.bump();
+            let name = self.parse_jsx_name_identifier();
+            return JsxAttributeName::Namespace(JsxNamespacedName {
+                namespace: first,
+                name,
+            });
+        }
+        JsxAttributeName::Identifier(first)
+    }
+
+    fn parse_jsx_attributes(&mut self) -> Vec<JsxAttributeItem> {
+        let mut items = Vec::new();
+        while !self.at_eof() && !self.at(TokenKind::GreaterThan) && !self.at(TokenKind::Slash) {
+            let before = self.cursor;
+            if self.at(TokenKind::LBrace) {
+                items.push(self.parse_jsx_spread_attribute());
+            } else if self.at(TokenKind::Identifier) {
+                items.push(self.parse_jsx_attribute());
+            } else {
+                let skipped = self.bump();
+                self.error_at(
+                    UNEXPECTED_TOKEN,
+                    skipped.range(),
+                    "this token was skipped inside a JSX tag",
+                );
+            }
+            if self.cursor == before {
+                break;
+            }
+        }
+        items
+    }
+
+    fn parse_jsx_attribute(&mut self) -> JsxAttributeItem {
+        let start = self.cur_start();
+        let name = self.parse_jsx_attribute_name();
+        let initializer = if self.eat(TokenKind::Eq).is_some() {
+            Some(self.parse_jsx_attribute_initializer())
+        } else {
+            None
+        };
+        let node = self.node(start, JsxAttribute { name, initializer });
+        JsxAttributeItem::Attribute(node)
+    }
+
+    fn parse_jsx_attribute_initializer(&mut self) -> JsxAttributeInitializer {
+        if self.at(TokenKind::LBrace) {
+            return JsxAttributeInitializer::Expression(self.parse_jsx_expression_container());
+        }
+        if self.at(TokenKind::StringLiteral) {
+            return JsxAttributeInitializer::String(self.parse_string_literal());
+        }
+        self.error_here(EXPECTED_EXPRESSION, "expected a JSX attribute value");
+        let start = self.cur_start();
+        let container = self.node(start, JsxExpressionContainer { expression: None });
+        JsxAttributeInitializer::Expression(container)
+    }
+
+    fn parse_jsx_spread_attribute(&mut self) -> JsxAttributeItem {
+        let start = self.cur_start();
+        self.expect(TokenKind::LBrace, "expected `{`");
+        self.expect(TokenKind::DotDotDot, "expected `...`");
+        let expression = self.parse_assignment_expression(false);
+        self.expect(TokenKind::RBrace, "expected `}`");
+        let node = self.node(
+            start,
+            JsxSpreadAttribute {
+                expression: Box::new(expression),
+            },
+        );
+        JsxAttributeItem::Spread(node)
+    }
+
+    fn parse_jsx_expression_container(&mut self) -> JsxExpressionContainerNode {
+        let start = self.cur_start();
+        self.expect(TokenKind::LBrace, "expected `{`");
+        let expression = if self.at(TokenKind::RBrace) {
+            None
+        } else {
+            Some(Box::new(self.parse_assignment_expression(false)))
+        };
+        self.expect(TokenKind::RBrace, "expected `}`");
+        self.node(start, JsxExpressionContainer { expression })
+    }
+
+    fn parse_jsx_spread_child(&mut self) -> JsxSpreadChildNode {
+        let start = self.cur_start();
+        self.expect(TokenKind::LBrace, "expected `{`");
+        self.expect(TokenKind::DotDotDot, "expected `...`");
+        let expression = self.parse_assignment_expression(false);
+        self.expect(TokenKind::RBrace, "expected `}`");
+        self.node(
+            start,
+            JsxSpreadChild {
+                expression: Box::new(expression),
+            },
+        )
+    }
+
+    /// Parses children until the parent's closing tag (`</`) or end of file.
+    fn parse_jsx_children(&mut self) -> Vec<JsxChild> {
+        let mut children = Vec::new();
+        while !self.at_eof() {
+            if self.at(TokenKind::LessThan) {
+                if self.nth_kind(1) == TokenKind::Slash {
+                    break;
+                }
+                let child = self.parse_jsx_element_or_fragment();
+                children.push(JsxChild::Element(Box::new(child)));
+                continue;
+            }
+            if self.at(TokenKind::LBrace) {
+                if self.nth_kind(1) == TokenKind::DotDotDot {
+                    children.push(JsxChild::Spread(self.parse_jsx_spread_child()));
+                } else {
+                    children.push(JsxChild::ExpressionContainer(
+                        self.parse_jsx_expression_container(),
+                    ));
+                }
+                continue;
+            }
+            if self.at(TokenKind::StringLiteral) {
+                let token = self.bump();
+                let range = token.range();
+                let node = self.node_at(range, JsxText::new(token));
+                children.push(JsxChild::Text(node));
+                continue;
+            }
+            let skipped = self.bump();
+            self.error_at(
+                UNEXPECTED_TOKEN,
+                skipped.range(),
+                "this token was skipped inside JSX children",
+            );
+        }
+        children
+    }
+
+    /// Renders a JSX name to its source text for opening/closing tag matching.
+    fn jsx_name_text(&self, name: &JsxElementName) -> String {
+        match name {
+            JsxElementName::Identifier(identifier) => {
+                self.lexeme(*identifier.data().token()).to_owned()
+            }
+            JsxElementName::Namespace(namespaced) => format!(
+                "{}:{}",
+                self.lexeme(*namespaced.namespace.data().token()),
+                self.lexeme(*namespaced.name.data().token())
+            ),
+            JsxElementName::Member(member) => format!(
+                "{}.{}",
+                self.jsx_name_text(&member.object),
+                self.lexeme(*member.property.data().token())
+            ),
+        }
     }
 
     fn parse_array_literal(&mut self) -> Expr {
@@ -3797,11 +4342,18 @@ impl Parser {
 
         // Method.
         if self.at(TokenKind::LParen) || self.at_less_like() {
+            let keyword_context = KeywordContext {
+                await_reserved: is_async,
+                yield_reserved: is_generator,
+            };
             let type_parameters = self.parse_optional_type_parameters();
-            let parameters = self.parse_parameter_list();
+            let parameters =
+                self.with_keyword_context(keyword_context, |this| this.parse_parameter_list());
             let return_type = self.parse_optional_type_annotation();
             let body = if self.at(TokenKind::LBrace) {
-                Some(FunctionBody::Block(self.parse_block()))
+                Some(FunctionBody::Block(
+                    self.with_keyword_context(keyword_context, Self::parse_block),
+                ))
             } else {
                 self.error_here(EXPECTED_TOKEN, "expected a method body");
                 None
@@ -3915,7 +4467,7 @@ impl Parser {
             }
             kind if is_any_word(kind) => {
                 let token = self.bump();
-                PropertyName::Identifier(self.ident_from(token))
+                PropertyName::Identifier(self.identifier_name_from(token))
             }
             _ => {
                 self.error_here(EXPECTED_PROPERTY_NAME, "expected a property name");
@@ -4174,11 +4726,18 @@ impl Parser {
             }
             None
         };
+        let keyword_context = KeywordContext {
+            await_reserved: is_async,
+            yield_reserved: is_generator,
+        };
         let type_parameters = self.parse_optional_type_parameters();
-        let parameters = self.parse_parameter_list();
+        let parameters =
+            self.with_keyword_context(keyword_context, |this| this.parse_parameter_list());
         let return_type = self.parse_optional_type_annotation();
         let body = if self.at(TokenKind::LBrace) {
-            Some(FunctionBody::Block(self.parse_block()))
+            Some(FunctionBody::Block(
+                self.with_keyword_context(keyword_context, Self::parse_block),
+            ))
         } else {
             self.expect_semicolon();
             None
@@ -4390,9 +4949,13 @@ impl Parser {
     }
 
     fn parse_simple_arrow(&mut self, start: Utf16Pos, is_async: bool, no_in: bool) -> Expr {
+        let keyword_context = KeywordContext {
+            await_reserved: is_async,
+            yield_reserved: false,
+        };
         let param_start = self.cur_start();
         let token = self.bump();
-        let name = self.ident_from(token);
+        let name = self.with_keyword_context(keyword_context, |this| this.ident_from(token));
         let binding = self.node(param_start, BindingPattern::Identifier(name));
         let parameter = self.node(
             param_start,
@@ -4406,7 +4969,7 @@ impl Parser {
             },
         );
         self.expect(TokenKind::Arrow, "expected `=>`");
-        let body = self.parse_arrow_body(no_in);
+        let body = self.parse_arrow_body(no_in, keyword_context);
         self.node(
             start,
             Expression::Arrow(ArrowFunction {
@@ -4420,10 +4983,15 @@ impl Parser {
     }
 
     fn parse_paren_arrow(&mut self, start: Utf16Pos, is_async: bool, no_in: bool) -> Expr {
-        let parameters = self.parse_parameter_list();
+        let keyword_context = KeywordContext {
+            await_reserved: is_async,
+            yield_reserved: false,
+        };
+        let parameters =
+            self.with_keyword_context(keyword_context, |this| this.parse_parameter_list());
         let return_type = self.parse_optional_type_annotation();
         self.expect(TokenKind::Arrow, "expected `=>`");
-        let body = self.parse_arrow_body(no_in);
+        let body = self.parse_arrow_body(no_in, keyword_context);
         self.node(
             start,
             Expression::Arrow(ArrowFunction {
@@ -4436,12 +5004,14 @@ impl Parser {
         )
     }
 
-    fn parse_arrow_body(&mut self, no_in: bool) -> FunctionBody {
-        if self.at(TokenKind::LBrace) {
-            FunctionBody::Block(self.parse_block())
-        } else {
-            FunctionBody::Expression(Box::new(self.parse_assignment_expression(no_in)))
-        }
+    fn parse_arrow_body(&mut self, no_in: bool, keyword_context: KeywordContext) -> FunctionBody {
+        self.with_keyword_context(keyword_context, |this| {
+            if this.at(TokenKind::LBrace) {
+                FunctionBody::Block(this.parse_block())
+            } else {
+                FunctionBody::Expression(Box::new(this.parse_assignment_expression(no_in)))
+            }
+        })
     }
 
     fn speculate_paren_arrow(
@@ -4451,14 +5021,19 @@ impl Parser {
         no_in: bool,
     ) -> Option<Expr> {
         let checkpoint = self.checkpoint();
-        let parameters = self.parse_parameter_list();
+        let keyword_context = KeywordContext {
+            await_reserved: is_async,
+            yield_reserved: false,
+        };
+        let parameters =
+            self.with_keyword_context(keyword_context, |this| this.parse_parameter_list());
         let return_type = self.parse_optional_type_annotation();
         if !self.at(TokenKind::Arrow) || self.has_newline_before() {
             self.rollback(checkpoint);
             return None;
         }
         self.bump();
-        let body = self.parse_arrow_body(no_in);
+        let body = self.parse_arrow_body(no_in, keyword_context);
         Some(self.node(
             start,
             Expression::Arrow(ArrowFunction {
@@ -4474,14 +5049,19 @@ impl Parser {
     fn speculate_async_paren_arrow(&mut self, start: Utf16Pos, no_in: bool) -> Option<Expr> {
         let checkpoint = self.checkpoint();
         self.bump(); // `async`
-        let parameters = self.parse_parameter_list();
+        let keyword_context = KeywordContext {
+            await_reserved: true,
+            yield_reserved: false,
+        };
+        let parameters =
+            self.with_keyword_context(keyword_context, |this| this.parse_parameter_list());
         let return_type = self.parse_optional_type_annotation();
         if !self.at(TokenKind::Arrow) || self.has_newline_before() {
             self.rollback(checkpoint);
             return None;
         }
         self.bump();
-        let body = self.parse_arrow_body(no_in);
+        let body = self.parse_arrow_body(no_in, keyword_context);
         Some(self.node(
             start,
             Expression::Arrow(ArrowFunction {
@@ -4509,14 +5089,19 @@ impl Parser {
             self.rollback(checkpoint);
             return None;
         }
-        let parameters = self.parse_parameter_list();
+        let keyword_context = KeywordContext {
+            await_reserved: is_async,
+            yield_reserved: false,
+        };
+        let parameters =
+            self.with_keyword_context(keyword_context, |this| this.parse_parameter_list());
         let return_type = self.parse_optional_type_annotation();
         if !self.at(TokenKind::Arrow) || self.has_newline_before() {
             self.rollback(checkpoint);
             return None;
         }
         self.bump();
-        let body = self.parse_arrow_body(no_in);
+        let body = self.parse_arrow_body(no_in, keyword_context);
         Some(self.node(
             start,
             Expression::Arrow(ArrowFunction {
@@ -4599,11 +5184,7 @@ impl Parser {
                 }
                 _ => {
                     let range = expr.range();
-                    self.error_at(
-                        INVALID_ASSIGNMENT_TARGET,
-                        range,
-                        "this expression is not a valid assignment target",
-                    );
+
                     self.node_at(
                         range,
                         AssignmentTarget::Missing(MissingNode::new(
@@ -4624,11 +5205,6 @@ impl Parser {
             }
             Expression::Member(member) => {
                 if member.optional {
-                    self.error_at(
-                        INVALID_ASSIGNMENT_TARGET,
-                        range,
-                        "an optional chain is not a valid assignment target",
-                    );
                     return Node::new(
                         id,
                         range,
@@ -4655,25 +5231,18 @@ impl Parser {
                 let target = self.object_literal_to_target(object, range);
                 Node::new(id, range, target)
             }
-            _ => {
-                self.error_at(
-                    INVALID_ASSIGNMENT_TARGET,
-                    range,
-                    "this expression is not a valid assignment target",
-                );
-                Node::new(
-                    id,
-                    range,
-                    AssignmentTarget::Missing(MissingNode::new(NodeKind::MissingAssignmentTarget)),
-                )
-            }
+            _ => Node::new(
+                id,
+                range,
+                AssignmentTarget::Missing(MissingNode::new(NodeKind::MissingAssignmentTarget)),
+            ),
         }
     }
 
     fn array_literal_to_target(
         &mut self,
         array: ArrayLiteral,
-        range: TextRange,
+        _range: TextRange,
     ) -> AssignmentTarget {
         let mut elements = Vec::new();
         for element in array.elements {
@@ -4686,11 +5255,7 @@ impl Parser {
                 ArrayElement::Spread(_) => {
                     // A rest element has no array-target slot; diagnose and
                     // record a missing element rather than dropping it.
-                    self.error_at(
-                        INVALID_ASSIGNMENT_TARGET,
-                        range,
-                        "a rest element is not representable in this assignment target",
-                    );
+
                     elements.push(AssignmentArrayElement::Missing(MissingNode::new(
                         NodeKind::MissingAssignmentTarget,
                     )));
@@ -4721,11 +5286,6 @@ impl Parser {
                     });
                 }
                 ObjectMember::Spread(_) | ObjectMember::Method(_) | ObjectMember::Missing(_) => {
-                    self.error_at(
-                        INVALID_ASSIGNMENT_TARGET,
-                        member_range,
-                        "this object member is not a valid assignment target",
-                    );
                     properties.push(AssignmentObjectProperty {
                         name: PropertyName::Missing(MissingNode::new(NodeKind::Identifier)),
                         target: self.node_at(
@@ -5172,6 +5732,7 @@ impl Parser {
                     type_parameters: None,
                     parameters,
                     return_type: Box::new(return_type),
+                    return_type_missing: false,
                 }),
             );
         }
@@ -5193,6 +5754,7 @@ impl Parser {
                 type_parameters,
                 parameters,
                 return_type: Box::new(return_type),
+                return_type_missing: false,
             }),
         )
     }
@@ -5212,6 +5774,7 @@ impl Parser {
                     type_parameters,
                     parameters,
                     return_type: Box::new(return_type),
+                    return_type_missing: false,
                 },
             }),
         )
@@ -5591,7 +6154,7 @@ impl Parser {
 
         // Call signature `<T>(...): R` / `(...): R`.
         if self.at(TokenKind::LParen) || self.at_less_like() {
-            let function = self.parse_function_type_signature(false);
+            let function = self.parse_function_type_signature(false, self.cur().range());
             return self.node(start, TypeMember::Call(CallSignature { function }));
         }
 
@@ -5600,7 +6163,7 @@ impl Parser {
             && matches!(self.nth_kind(1), TokenKind::LParen | TokenKind::LessThan)
         {
             self.bump();
-            let function = self.parse_function_type_signature(true);
+            let function = self.parse_function_type_signature(true, self.cur().range());
             return self.node(
                 start,
                 TypeMember::Construct(ConstructSignature {
@@ -5637,7 +6200,15 @@ impl Parser {
         let name = self.parse_property_name();
         let optional = self.eat(TokenKind::Question).is_some();
         if self.at(TokenKind::LParen) || self.at_less_like() {
-            let function = self.parse_function_type_signature(false);
+            let error_range = match &name {
+                PropertyName::Identifier(n) => n.range(),
+                PropertyName::Private(n) => n.range(),
+                PropertyName::String(n) => n.range(),
+                PropertyName::Number(n) => n.range(),
+                PropertyName::Computed(n) => n.range(),
+                PropertyName::Missing(_) => self.cur().range(),
+            };
+            let function = self.parse_function_type_signature(false, error_range);
             return self.node(
                 start,
                 TypeMember::Method(TypeMethodSignature {
@@ -5659,26 +6230,29 @@ impl Parser {
         )
     }
 
-    fn parse_function_type_signature(&mut self, constructor: bool) -> FunctionType {
+    fn parse_function_type_signature(
+        &mut self,
+        constructor: bool,
+        _error_range: TextRange,
+    ) -> FunctionType {
         let type_parameters = self.parse_optional_type_parameters();
         let parameters = self.parse_function_type_parameters();
-        let return_type = if constructor {
+        let (return_type, return_type_missing) = if constructor {
             if self.eat(TokenKind::Colon).is_some() {
-                self.parse_type()
+                (self.parse_type(), false)
             } else {
-                self.error_here(EXPECTED_TOKEN, "expected `:`");
-                self.missing_type()
+                (self.missing_type(), true)
             }
         } else if self.eat(TokenKind::Colon).is_some() || self.eat(TokenKind::Arrow).is_some() {
-            self.parse_type()
+            (self.parse_type(), false)
         } else {
-            self.error_here(EXPECTED_TOKEN, "expected a return type");
-            self.missing_type()
+            (self.missing_type(), true)
         };
         FunctionType {
             type_parameters,
             parameters,
             return_type: Box::new(return_type),
+            return_type_missing,
         }
     }
 
@@ -5715,7 +6289,7 @@ mod tests {
     use crate::scanner::scan;
 
     fn parse_text(text: &str, script_kind: ScriptKind) -> Recovered<SourceFile> {
-        let source = Arc::new(SourceText::new(text));
+        let source = Arc::new(SourceText::new(text).expect("test source fits the per-file budget"));
         let scanned = scan(SourceId::new(0), script_kind, source);
         parse(scanned)
     }
@@ -5788,7 +6362,7 @@ mod tests {
     #[test]
     fn preserves_all_scanner_tokens_and_eof() {
         let text = "let a = 1; // trailing\n";
-        let source = Arc::new(SourceText::new(text));
+        let source = Arc::new(SourceText::new(text).expect("test source fits the per-file budget"));
         let scanned = scan(SourceId::new(0), ScriptKind::TypeScript, source);
         let scanned_token_count = scanned.product().tokens().len();
         let recovered = parse(scanned);
@@ -5814,6 +6388,23 @@ mod tests {
         let mut sorted = diagnostics.to_vec();
         sorted.sort();
         assert_eq!(sorted.as_slice(), diagnostics);
+    }
+
+    #[test]
+    fn escaped_keywords_obey_identifier_context() {
+        assert!(!errors(&parse_ts("const \\u0069f = 1;")).is_empty());
+        assert!(!errors(&parse_ts("\\u0069f (true) {}")).is_empty());
+        assert!(!errors(&parse_ts("function* g() { \\u0079ield; }")).is_empty());
+        assert!(!errors(&parse_ts("async function f() { \\u0061wait; }")).is_empty());
+        assert!(!errors(&parse_ts("const value = { \\u0069f };")).is_empty());
+        assert!(!errors(&parse_ts("import { \\u0069f } from 'm';")).is_empty());
+        assert!(!errors(&parse_ts("export { \\u0069f };")).is_empty());
+
+        assert!(errors(&parse_ts("const \\u0061wait = 1; const \\u0079ield = 2;")).is_empty());
+        assert!(errors(&parse_ts("const value = { \\u0069f: 1 }; value.\\u0069f;")).is_empty());
+        assert!(errors(&parse_ts("import { \\u0069f as value } from 'm';")).is_empty());
+        assert!(errors(&parse_ts("const value = 1; export { value as \\u0069f };")).is_empty());
+        assert!(errors(&parse_ts("export { \\u0069f } from 'm';")).is_empty());
     }
 
     #[test]
@@ -6020,6 +6611,139 @@ mod tests {
     }
 
     #[test]
+    fn expression_path_decorated_class_expression_retains_decorator() {
+        let recovered = assert_clean("const C = @dec class Named {}");
+        let file = recovered.product();
+        let Statement::Variable(decl) = file.statements()[0].data() else {
+            panic!("expected a variable declaration");
+        };
+        let init = decl.declarations[0]
+            .data()
+            .initializer
+            .as_ref()
+            .expect("initializer");
+        let Expression::Class(class_expr) = init.data() else {
+            panic!("expected a class expression, got {:?}", init.kind());
+        };
+        assert_eq!(class_expr.class.decorators.len(), 1);
+        let decorator = &class_expr.class.decorators[0];
+        let Expression::Identifier(dec) = decorator.data().expression.data() else {
+            panic!("expected the decorator expression to be an identifier");
+        };
+        assert_eq!(file.token_text(dec.data().token()), Some("dec"));
+        let Some(name) = &class_expr.class.name else {
+            panic!("expected a named class expression");
+        };
+        assert_eq!(file.token_text(name.data().token()), Some("Named"));
+        assert!(
+            class_expr.class.decorators[0].range().start()
+                < class_expr.class.name.as_ref().unwrap().range().start()
+        );
+    }
+
+    #[test]
+    fn expression_path_malformed_decorator_recovers() {
+        let recovered = parse_ts("const x = @dec 1;");
+        assert!(
+            errors(&recovered)
+                .iter()
+                .any(|d| d.code() == EXPECTED_TOKEN
+                    && d.message() == "decorators must precede a class"),
+            "expected BAMTS-P001 for `@dec` not followed by `class`"
+        );
+        assert_eq!(
+            recovered.product().statements().len(),
+            1,
+            "malformed decorator recovery must yield one statement, not a trailing `1;`"
+        );
+        let Statement::Variable(decl) = recovered.product().statements()[0].data() else {
+            panic!("expected a variable declaration");
+        };
+        let init = decl.declarations[0]
+            .data()
+            .initializer
+            .as_ref()
+            .expect("initializer");
+        assert!(
+            matches!(
+                init.data(),
+                Expression::Missing(m) if m.expected() == NodeKind::MissingExpression
+            ),
+            "malformed decorator expression should yield a missing initializer"
+        );
+        assert_eq!(recovered.product().eof().kind(), TokenKind::EndOfFile);
+        assert_tokens_tile(&recovered);
+    }
+
+    #[test]
+    fn expression_path_decorated_class_expression_allows_postfix_member() {
+        let recovered = assert_clean("const name = @dec class {}.name;");
+        assert_eq!(
+            recovered.product().statements().len(),
+            1,
+            "decorated class postfix must stay one statement"
+        );
+        let file = recovered.product();
+        let Statement::Variable(decl) = file.statements()[0].data() else {
+            panic!("expected a variable declaration");
+        };
+        let init = decl.declarations[0]
+            .data()
+            .initializer
+            .as_ref()
+            .expect("initializer");
+        let Expression::Member(member) = init.data() else {
+            panic!("expected a member expression, got {:?}", init.kind());
+        };
+        let Expression::Class(class_expr) = member.object.data() else {
+            panic!(
+                "expected the member object to be a decorated class expression, got {:?}",
+                member.object.kind()
+            );
+        };
+        assert_eq!(class_expr.class.decorators.len(), 1);
+        let MemberProperty::Named(prop) = &member.property else {
+            panic!("expected a named member property");
+        };
+        assert_eq!(file.token_text(prop.data().token()), Some("name"));
+        assert!(!member.optional);
+    }
+
+    #[test]
+    fn expression_path_malformed_decorator_consumes_call() {
+        let recovered = parse_ts("const x = @dec foo();");
+        assert!(
+            errors(&recovered)
+                .iter()
+                .any(|d| d.code() == EXPECTED_TOKEN
+                    && d.message() == "decorators must precede a class"),
+            "expected BAMTS-P001 for `@dec` not followed by `class`"
+        );
+        assert_eq!(
+            recovered.product().statements().len(),
+            1,
+            "malformed decorator recovery must consume `foo()` and yield one statement"
+        );
+        let Statement::Variable(decl) = recovered.product().statements()[0].data() else {
+            panic!("expected a variable declaration");
+        };
+        let init = decl.declarations[0]
+            .data()
+            .initializer
+            .as_ref()
+            .expect("initializer");
+        assert!(
+            matches!(
+                init.data(),
+                Expression::Missing(m) if m.expected() == NodeKind::MissingExpression
+            ),
+            "malformed decorator call recovery should yield a missing initializer"
+        );
+        assert_eq!(recovered.product().eof().kind(), TokenKind::EndOfFile);
+        assert_tokens_tile(&recovered);
+    }
+
+    #[test]
     fn parses_interface_and_type_alias() {
         assert_clean(
             "interface Shape<T> extends Base {\n\
@@ -6110,6 +6834,8 @@ mod tests {
         assert_clean("const config = { a: 1 } as const;");
         assert_clean("const point = { x: 0 } satisfies Point;");
         assert_clean("const n = value as unknown as number;");
+        assert_clean("const q = <const>[1, 2, 3];");
+        assert_clean("const p = <const>{ x: 1 };");
     }
 
     #[test]
@@ -6140,17 +6866,191 @@ mod tests {
         assert_eq!(stmt_kind(&recovered, 0), NodeKind::VariableDeclaration);
     }
 
+    fn parse_tsx(text: &str) -> Recovered<SourceFile> {
+        parse_text(text, ScriptKind::TypeScriptReact)
+    }
+
+    fn jsx_initializer(recovered: &Recovered<SourceFile>) -> &Expr {
+        let Statement::Variable(declaration) = recovered.product().statements()[0].data() else {
+            panic!("expected a variable declaration");
+        };
+        declaration.declarations[0]
+            .data()
+            .initializer
+            .as_deref()
+            .expect("the declarator has an initializer")
+    }
+
     #[test]
-    fn jsx_in_react_source_is_diagnosed_not_panicking() {
-        let recovered = parse_text(
-            "const el = <div className=\"x\">hi</div>;",
-            ScriptKind::TypeScriptReact,
-        );
+    fn jsx_self_closing_element() {
+        let recovered = parse_tsx("const a = <Foo />;");
+        assert!(errors(&recovered).is_empty(), "{:?}", errors(&recovered));
+        let Expression::JsxSelfClosingElement(element) = jsx_initializer(&recovered).data() else {
+            panic!("expected a self-closing element");
+        };
+        assert!(matches!(element.name, JsxElementName::Identifier(_)));
+        assert!(element.attributes.is_empty());
+    }
+
+    #[test]
+    fn jsx_balanced_element_with_children() {
+        let recovered = parse_tsx("const a = <Foo attr={x}>text{expr}<Child />more</Foo>;");
+        assert!(errors(&recovered).is_empty(), "{:?}", errors(&recovered));
+        let Expression::JsxElement(element) = jsx_initializer(&recovered).data() else {
+            panic!("expected a balanced element");
+        };
+        assert_eq!(element.opening.data().attributes.len(), 1);
+        assert_eq!(element.children.len(), 4);
+        assert!(matches!(element.children[0], JsxChild::Text(_)));
+        assert!(matches!(
+            element.children[1],
+            JsxChild::ExpressionContainer(_)
+        ));
+        assert!(matches!(element.children[2], JsxChild::Element(_)));
+        assert!(matches!(element.children[3], JsxChild::Text(_)));
+        assert!(matches!(
+            element.closing.data().name,
+            JsxElementName::Identifier(_)
+        ));
+    }
+
+    #[test]
+    fn jsx_fragment() {
+        let recovered = parse_tsx("const a = <>{child}<Foo /></>;");
+        assert!(errors(&recovered).is_empty(), "{:?}", errors(&recovered));
+        let Expression::JsxFragment(fragment) = jsx_initializer(&recovered).data() else {
+            panic!("expected a fragment");
+        };
+        assert_eq!(fragment.children.len(), 2);
+        assert!(matches!(
+            fragment.children[0],
+            JsxChild::ExpressionContainer(_)
+        ));
+        assert!(matches!(fragment.children[1], JsxChild::Element(_)));
+
+        let empty = parse_tsx("const a = <></>;");
+        assert!(errors(&empty).is_empty(), "{:?}", errors(&empty));
+        let Expression::JsxFragment(fragment) = jsx_initializer(&empty).data() else {
+            panic!("expected an empty fragment");
+        };
+        assert!(fragment.children.is_empty());
+    }
+
+    #[test]
+    fn jsx_member_qualified_names() {
+        let recovered = parse_tsx("const a = <Foo.Bar.Baz />;\nconst b = <my:Card />;");
+        assert!(errors(&recovered).is_empty(), "{:?}", errors(&recovered));
+        let Statement::Variable(first) = recovered.product().statements()[0].data() else {
+            panic!("expected a variable declaration");
+        };
+        let Expression::JsxSelfClosingElement(member) = first.declarations[0]
+            .data()
+            .initializer
+            .as_deref()
+            .unwrap()
+            .data()
+        else {
+            panic!("expected a self-closing element");
+        };
+        let JsxElementName::Member(outer) = &member.name else {
+            panic!("expected a member name");
+        };
+        assert!(matches!(*outer.object, JsxElementName::Member(_)));
+
+        let Statement::Variable(second) = recovered.product().statements()[1].data() else {
+            panic!("expected a variable declaration");
+        };
+        let Expression::JsxSelfClosingElement(namespaced) = second.declarations[0]
+            .data()
+            .initializer
+            .as_deref()
+            .unwrap()
+            .data()
+        else {
+            panic!("expected a self-closing element");
+        };
+        assert!(matches!(namespaced.name, JsxElementName::Namespace(_)));
+    }
+
+    #[test]
+    fn jsx_attributes_all_forms() {
+        let recovered = parse_tsx("const a = <Foo bool str=\"s\" expr={x} {...rest} ns:name />;");
+        assert!(errors(&recovered).is_empty(), "{:?}", errors(&recovered));
+        let Expression::JsxSelfClosingElement(element) = jsx_initializer(&recovered).data() else {
+            panic!("expected a self-closing element");
+        };
+        assert_eq!(element.attributes.len(), 5);
+        assert!(matches!(
+            &element.attributes[0],
+            JsxAttributeItem::Attribute(attribute) if attribute.data().initializer.is_none()
+        ));
+        assert!(matches!(
+            &element.attributes[1],
+            JsxAttributeItem::Attribute(attribute)
+                if matches!(attribute.data().initializer, Some(JsxAttributeInitializer::String(_)))
+        ));
+        assert!(matches!(
+            &element.attributes[2],
+            JsxAttributeItem::Attribute(attribute)
+                if matches!(attribute.data().initializer, Some(JsxAttributeInitializer::Expression(_)))
+        ));
+        assert!(matches!(
+            &element.attributes[3],
+            JsxAttributeItem::Spread(_)
+        ));
+        assert!(matches!(
+            &element.attributes[4],
+            JsxAttributeItem::Attribute(attribute)
+                if matches!(attribute.data().name, JsxAttributeName::Namespace(_))
+        ));
+    }
+
+    #[test]
+    fn jsx_recovery_missing_closing_tag() {
+        // A truncated closing tag must recover into a `JsxElement` with
+        // diagnostics rather than panic.
+        let recovered = parse_tsx("const a = <Foo>hi</Foo");
+        assert!(!errors(&recovered).is_empty());
+        assert!(matches!(
+            jsx_initializer(&recovered).data(),
+            Expression::JsxElement(_)
+        ));
+        assert_eq!(recovered.product().eof().kind(), TokenKind::EndOfFile);
+
+        // A name mismatch is a diagnostic, not a panic.
+        let mismatch = parse_tsx("const a = <Foo>hi</Bar>;");
+        assert!(!errors(&mismatch).is_empty());
+        assert!(matches!(
+            jsx_initializer(&mismatch).data(),
+            Expression::JsxElement(_)
+        ));
+    }
+
+    #[test]
+    fn jsx_type_argument_disambiguation_in_ts_vs_tsx() {
+        // `.ts`: `<T>x` is a type assertion, never JSX.
+        let ts = parse_text("const a = <T>x;", ScriptKind::TypeScript);
+        let Statement::Variable(declaration) = ts.product().statements()[0].data() else {
+            panic!("expected a variable declaration");
+        };
+        let assertion = declaration.declarations[0]
+            .data()
+            .initializer
+            .as_deref()
+            .unwrap();
         assert!(
-            recovered
-                .diagnostics()
-                .iter()
-                .any(|d| d.code() == UNSUPPORTED_SYNTAX)
+            matches!(assertion.data(), Expression::TypeAssertion(_)),
+            "ts: {:?}",
+            assertion.data()
+        );
+
+        // `.tsx`: the same leading `<T>` opens a JSX element.
+        let tsx = parse_tsx("const a = <T>x</T>;");
+        assert!(errors(&tsx).is_empty(), "{:?}", errors(&tsx));
+        assert!(
+            matches!(jsx_initializer(&tsx).data(), Expression::JsxElement(_)),
+            "tsx: {:?}",
+            jsx_initializer(&tsx).data()
         );
     }
 
@@ -6177,6 +7077,80 @@ mod tests {
                 .diagnostics()
                 .iter()
                 .any(|d| d.code() == NESTING_TOO_DEEP)
+        );
+        assert_eq!(recovered.product().eof().kind(), TokenKind::EndOfFile);
+    }
+
+    #[test]
+    fn parser_max_depth_boundary() {
+        // Drive the depth guard directly: depths 1..=MAX_DEPTH are admitted,
+        // the (MAX_DEPTH + 1)-th enter is rejected with the typed BAMTS-P010
+        // diagnostic, and the guard unwinds without ever panicking.
+        let source = Arc::new(SourceText::new("1").expect("test source fits the per-file budget"));
+        let scanned = scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::clone(&source),
+        );
+        let tokens = scanned.product().tokens().to_vec();
+        let eof = *scanned.product().eof();
+        let mut parser = Parser::new(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            source,
+            tokens,
+            eof,
+        );
+
+        for depth in 1..MAX_DEPTH {
+            assert!(parser.enter(), "depth {depth} must be admitted");
+        }
+        assert!(parser.enter(), "depth {MAX_DEPTH} must be admitted");
+        let crossed = parser.enter();
+        assert!(!crossed, "the {}-th enter must be rejected", MAX_DEPTH + 1);
+        assert!(
+            parser
+                .diagnostics
+                .iter()
+                .any(|d| d.code() == NESTING_TOO_DEEP),
+            "the rejected enter records BAMTS-P010 NESTING_TOO_DEEP"
+        );
+
+        // Recovery: the rejected enter did not leak a frame, every admitted
+        // frame unwinds back to zero, and the parser still observes the real
+        // token stream and its end-of-file.
+        for _ in 0..MAX_DEPTH {
+            parser.leave();
+        }
+        assert_eq!(parser.depth, 0);
+        assert_eq!(parser.kind(), TokenKind::NumericLiteral);
+        parser.bump();
+        assert!(parser.at_eof());
+
+        // The same boundary holds end to end. A spaced prefix-minus chain
+        // spends one frame per operator on top of the four
+        // statement/expression frames, so 251 operators bottom out at exactly
+        // MAX_DEPTH live frames and parse cleanly, while 252 operators cross
+        // the budget and recover with the typed diagnostic instead of a stack
+        // overflow. (Unspaced runs would lex as `--` decrement pairs.)
+        let accepted = format!("const a = {}1;", "- ".repeat(251));
+        let recovered = parse_ts(&accepted);
+        assert!(
+            recovered
+                .diagnostics()
+                .iter()
+                .all(|d| d.code() != NESTING_TOO_DEEP),
+            "a chain bottoming out at {MAX_DEPTH} frames must parse cleanly"
+        );
+
+        let rejected = format!("const b = {}1;", "- ".repeat(252));
+        let recovered = parse_ts(&rejected);
+        assert!(
+            recovered
+                .diagnostics()
+                .iter()
+                .any(|d| d.code() == NESTING_TOO_DEEP),
+            "one operator past the budget must be diagnosed, not panicked on"
         );
         assert_eq!(recovered.product().eof().kind(), TokenKind::EndOfFile);
     }
@@ -6321,6 +7295,81 @@ mod tests {
     }
 
     #[test]
+    fn using_declaration_requires_initializer() {
+        // Missing initializers are reported by the checker (BAMTS-C035), not the parser.
+        let missing = parse_ts("{ using x; }");
+        assert!(
+            !errors(&missing)
+                .iter()
+                .any(|d| d.code().as_str().starts_with("BAMTS-P"))
+        );
+        let Statement::Block(block) = missing.product().statements()[0].data() else {
+            panic!("expected a block");
+        };
+        assert!(matches!(
+            block.data().statements[0].data(),
+            Statement::Variable(_)
+        ));
+
+        let awaited = parse_ts("async function f() { await using h; }");
+        assert!(
+            !errors(&awaited)
+                .iter()
+                .any(|d| d.code().as_str().starts_with("BAMTS-P"))
+        );
+    }
+    #[test]
+    fn using_declaration_accepts_pattern_binding_for_checker() {
+        // Pattern `using` bindings are reported by the checker (BAMTS-C034), not the parser.
+        let recovered = parse_ts("{ using a = acquire(), { b } = obj; }");
+        assert!(
+            !errors(&recovered)
+                .iter()
+                .any(|d| d.code().as_str().starts_with("BAMTS-P"))
+        );
+    }
+
+    #[test]
+    fn using_for_in_and_classic_heads_are_rejected() {
+        let for_in = parse_ts("for (using x in obj) {}");
+        assert_eq!(stmt_kind(&for_in, 0), NodeKind::ForInStatement);
+
+        let classic = parse_ts("for (using x = acquire(); false; ) {}");
+        assert_eq!(stmt_kind(&classic, 0), NodeKind::ForStatement);
+
+        let await_in = parse_ts("async function f() { for (await using x in obj) {} }");
+        assert_eq!(stmt_kind(&await_in, 0), NodeKind::FunctionDeclaration);
+    }
+
+    #[test]
+    fn using_for_of_heads_remain_parseable() {
+        let sync = assert_clean("for (using x of items) {}");
+        let Statement::ForOf(for_of) = sync.product().statements()[0].data() else {
+            panic!("expected for-of");
+        };
+        let ForBinding::Variable(decl) = &for_of.binding else {
+            panic!("expected a variable binding");
+        };
+        assert_eq!(decl.kind, VariableKind::Using);
+
+        let async_of = assert_clean("async function f() { for await (await using x of items) {} }");
+        let Statement::Function(func) = async_of.product().statements()[0].data() else {
+            panic!("expected a function");
+        };
+        let Some(FunctionBody::Block(body)) = func.function.body.as_ref() else {
+            panic!("expected a block body");
+        };
+        let Statement::ForOf(for_of) = body.data().statements[0].data() else {
+            panic!("expected for-of inside async function");
+        };
+        let ForBinding::Variable(decl) = &for_of.binding else {
+            panic!("expected a variable binding");
+        };
+        assert_eq!(decl.kind, VariableKind::AwaitUsing);
+        assert_eq!(for_of.mode, ForOfMode::Async);
+    }
+
+    #[test]
     fn arrow_requires_no_newline_before_fat_arrow() {
         // Same line is a valid arrow, including the typed and generic forms.
         assert_clean("const f = (a) => a;");
@@ -6390,5 +7439,376 @@ mod tests {
             "the depth budget must fire on combined hostile nesting"
         );
         assert_eq!(rc.product().eof().kind(), TokenKind::EndOfFile);
+    }
+
+    #[test]
+    fn parses_ambient_string_module_with_exact_name_range() {
+        let recovered = assert_clean("declare module \"express\" { export interface X {} }");
+        let Statement::Declare(inner) = recovered.product().statements()[0].data() else {
+            panic!("expected declare wrapper");
+        };
+        let Statement::Namespace(namespace) = inner.data() else {
+            panic!("expected namespace");
+        };
+        let NamespaceName::StringLiteral(name) = &namespace.name else {
+            panic!("expected string literal name");
+        };
+        let text = recovered
+            .product()
+            .token_text(name.data().token())
+            .expect("literal text");
+        assert_eq!(text, "\"express\"");
+        assert_eq!(
+            name.range().start().get(),
+            text_start(recovered.product(), "\"express\"")
+        );
+        assert_eq!(
+            name.range().end().get(),
+            text_start(recovered.product(), "\"express\"") + "\"express\"".encode_utf16().count()
+        );
+    }
+
+    #[test]
+    fn parses_declare_global_with_keyword_range() {
+        let recovered = assert_clean("declare global { interface Window { x: number } }");
+        let Statement::Declare(inner) = recovered.product().statements()[0].data() else {
+            panic!("expected declare wrapper");
+        };
+        let Statement::Namespace(namespace) = inner.data() else {
+            panic!("expected namespace");
+        };
+        let NamespaceName::Global { range } = &namespace.name else {
+            panic!("expected global name");
+        };
+        assert_eq!(
+            range.start().get(),
+            text_start(recovered.product(), "global")
+        );
+        assert_eq!(
+            range.end().get(),
+            text_start(recovered.product(), "global") + "global".encode_utf16().count()
+        );
+    }
+
+    #[test]
+    fn parses_declare_module_identifier_and_dotted() {
+        let ident = assert_clean("declare module Foo {}");
+        let Statement::Declare(inner) = ident.product().statements()[0].data() else {
+            panic!("expected declare");
+        };
+        let Statement::Namespace(namespace) = inner.data() else {
+            panic!("expected namespace");
+        };
+        assert!(matches!(
+            namespace.name,
+            NamespaceName::Identifier {
+                keyword: NamespaceKeyword::Module,
+                ..
+            }
+        ));
+
+        let dotted = assert_clean("declare module A.B {}");
+        let Statement::Declare(inner) = dotted.product().statements()[0].data() else {
+            panic!("expected declare");
+        };
+        let Statement::Namespace(outer) = inner.data() else {
+            panic!("expected namespace");
+        };
+        let NamespaceName::Identifier { name, keyword } = &outer.name else {
+            panic!("expected identifier name");
+        };
+        assert_eq!(*keyword, NamespaceKeyword::Module);
+        assert_eq!(
+            dotted.product().token_text(name.data().token()).unwrap(),
+            "A"
+        );
+        assert!(matches!(
+            outer.body.data().statements[0].data(),
+            Statement::Namespace(_)
+        ));
+    }
+
+    #[test]
+    fn parses_deep_identifier_namespace() {
+        let recovered = assert_clean("namespace A.B.C {}");
+        assert_eq!(stmt_kind(&recovered, 0), NodeKind::NamespaceDeclaration);
+        let Statement::Namespace(outer) = recovered.product().statements()[0].data() else {
+            panic!("expected namespace");
+        };
+        let Statement::Namespace(mid) = outer.body.data().statements[0].data() else {
+            panic!("expected nested namespace");
+        };
+        assert!(matches!(
+            mid.body.data().statements[0].data(),
+            Statement::Namespace(_)
+        ));
+    }
+
+    #[test]
+    fn declare_module_non_name_recovers_with_missing_identifier() {
+        let recovered = parse_ts("declare module 123 {}");
+        assert!(
+            errors(&recovered)
+                .iter()
+                .any(|d| d.code() == EXPECTED_IDENTIFIER)
+        );
+        assert_tokens_tile(&recovered);
+        let Statement::Declare(inner) = recovered.product().statements()[0].data() else {
+            panic!("expected declare");
+        };
+        let Statement::Namespace(namespace) = inner.data() else {
+            panic!("expected namespace");
+        };
+        let NamespaceName::Identifier { name, .. } = &namespace.name else {
+            panic!("expected missing identifier recovery");
+        };
+        assert!(name.data().token().is_missing());
+    }
+
+    #[test]
+    fn bare_string_module_is_p003() {
+        let recovered = parse_ts("module \"pkg\" {}");
+        let errs = errors(&recovered);
+        assert!(
+            errs.iter().any(|d| {
+                d.code() == EXPECTED_IDENTIFIER
+                    && d.message()
+                        .contains("only allowed in an ambient declaration")
+            }),
+            "expected P003 ambient-only message, got: {:?}",
+            errs.iter()
+                .map(|d| (d.code().as_str(), d.message()))
+                .collect::<Vec<_>>()
+        );
+        let Statement::Namespace(namespace) = recovered.product().statements()[0].data() else {
+            panic!("expected namespace");
+        };
+        assert!(matches!(namespace.name, NamespaceName::StringLiteral(_)));
+    }
+
+    #[test]
+    fn bare_global_remains_identifier_namespace() {
+        let recovered = assert_clean("global {}");
+        let Statement::Namespace(namespace) = recovered.product().statements()[0].data() else {
+            panic!("expected namespace");
+        };
+        let NamespaceName::Identifier { name, .. } = &namespace.name else {
+            panic!("expected identifier global");
+        };
+        assert_eq!(
+            recovered.product().token_text(name.data().token()).unwrap(),
+            "global"
+        );
+    }
+
+    #[test]
+    fn ambient_string_module_preserves_single_quotes() {
+        let recovered = assert_clean("declare module 'lib' {}");
+        let Statement::Declare(inner) = recovered.product().statements()[0].data() else {
+            panic!("expected declare");
+        };
+        let Statement::Namespace(namespace) = inner.data() else {
+            panic!("expected namespace");
+        };
+        let NamespaceName::StringLiteral(name) = &namespace.name else {
+            panic!("expected string literal");
+        };
+        assert_eq!(
+            recovered.product().token_text(name.data().token()).unwrap(),
+            "'lib'"
+        );
+    }
+
+    #[test]
+    fn ambient_module_in_javascript_is_still_typescript_syntax() {
+        let recovered = parse_text("declare module \"x\" {}", ScriptKind::JavaScript);
+        assert!(
+            recovered
+                .diagnostics()
+                .iter()
+                .any(|d| d.code() == TYPESCRIPT_SYNTAX_IN_JAVASCRIPT)
+        );
+    }
+
+    #[test]
+    fn nested_global_inside_declare_namespace_is_identifier_not_augmentation() {
+        let recovered = assert_clean("declare namespace N { global { interface Leaked {} } }");
+        let Statement::Declare(inner) = recovered.product().statements()[0].data() else {
+            panic!("expected declare");
+        };
+        let Statement::Namespace(outer) = inner.data() else {
+            panic!("expected namespace");
+        };
+        assert!(matches!(
+            outer.name,
+            NamespaceName::Identifier {
+                keyword: NamespaceKeyword::Namespace,
+                ..
+            }
+        ));
+        let Statement::Namespace(nested) = outer.body.data().statements[0].data() else {
+            panic!("expected nested namespace");
+        };
+        assert!(
+            matches!(
+                nested.name,
+                NamespaceName::Identifier {
+                    keyword: NamespaceKeyword::Namespace,
+                    ..
+                }
+            ),
+            "nested global must not become Global augmentation under body-scoped declare"
+        );
+    }
+
+    #[test]
+    fn nested_string_module_inside_declare_namespace_is_p003() {
+        let recovered = parse_ts("declare namespace N { module \"x\" {} }");
+        let errs = errors(&recovered);
+        assert!(
+            errs.iter().any(|d| {
+                d.code() == EXPECTED_IDENTIFIER
+                    && d.message()
+                        .contains("only allowed in an ambient declaration")
+            }),
+            "nested string module must not inherit declare: {:?}",
+            errs.iter()
+                .map(|d| (d.code().as_str(), d.message()))
+                .collect::<Vec<_>>()
+        );
+        let Statement::Declare(inner) = recovered.product().statements()[0].data() else {
+            panic!("expected declare");
+        };
+        let Statement::Namespace(outer) = inner.data() else {
+            panic!("expected namespace");
+        };
+        let Statement::Namespace(nested) = outer.body.data().statements[0].data() else {
+            panic!("expected nested module");
+        };
+        assert!(matches!(nested.name, NamespaceName::StringLiteral(_)));
+    }
+
+    #[test]
+    fn namespace_keyword_is_preserved_on_identifier_names() {
+        let recovered = assert_clean("namespace Foo {}");
+        let Statement::Namespace(namespace) = recovered.product().statements()[0].data() else {
+            panic!("expected namespace");
+        };
+        assert!(matches!(
+            namespace.name,
+            NamespaceName::Identifier {
+                keyword: NamespaceKeyword::Namespace,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ambient_module_body_allows_nested_string_module() {
+        // tsc 7.0.2 accepts `declare module "y" { module "x" {} }`.
+        let recovered =
+            assert_clean("declare module \"y\" { module \"x\" { export interface I {} } }");
+        let Statement::Declare(inner) = recovered.product().statements()[0].data() else {
+            panic!("expected declare");
+        };
+        let Statement::Namespace(outer) = inner.data() else {
+            panic!("expected namespace");
+        };
+        assert!(matches!(outer.name, NamespaceName::StringLiteral(_)));
+        let Statement::Namespace(nested) = outer.body.data().statements[0].data() else {
+            panic!("expected nested module");
+        };
+        assert!(matches!(nested.name, NamespaceName::StringLiteral(_)));
+    }
+
+    #[test]
+    fn ambient_module_body_allows_nested_global_augmentation() {
+        // tsc 7.0.2 accepts `declare module "y" { global { ... } }` (TS2669
+        // allows global augmentations directly nested in ambient modules).
+        let recovered = assert_clean("declare module \"y\" { global { interface G {} } }");
+        let Statement::Declare(inner) = recovered.product().statements()[0].data() else {
+            panic!("expected declare");
+        };
+        let Statement::Namespace(outer) = inner.data() else {
+            panic!("expected namespace");
+        };
+        assert!(matches!(outer.name, NamespaceName::StringLiteral(_)));
+        let Statement::Namespace(nested) = outer.body.data().statements[0].data() else {
+            panic!("expected nested global");
+        };
+        assert!(matches!(nested.name, NamespaceName::Global { .. }));
+    }
+
+    #[test]
+    fn nested_string_module_body_is_not_ambient() {
+        // tsc 7.0.2 rejects `declare module "y" { module "x" { module "z" {} } }`
+        // with TS2435; the innermost string module must not be accepted.
+        let recovered = parse_ts("declare module \"y\" { module \"x\" { module \"z\" {} } }");
+        let errs = errors(&recovered);
+        assert!(
+            errs.iter().any(|d| {
+                d.code() == EXPECTED_IDENTIFIER
+                    && d.message()
+                        .contains("only allowed in an ambient declaration")
+            }),
+            "a module nested inside a nested ambient module body must be rejected: {:?}",
+            errs.iter()
+                .map(|d| (d.code().as_str(), d.message()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn nested_global_inside_nested_string_module_is_identifier() {
+        // tsc 7.0.2 rejects `declare module "y" { module "x" { global {} } }`
+        // (TS2669); the global must not become an augmentation.
+        let recovered = assert_clean("declare module \"y\" { module \"x\" { global {} } }");
+        let Statement::Declare(inner) = recovered.product().statements()[0].data() else {
+            panic!("expected declare");
+        };
+        let Statement::Namespace(outer) = inner.data() else {
+            panic!("expected namespace");
+        };
+        let Statement::Namespace(mid) = outer.body.data().statements[0].data() else {
+            panic!("expected nested module");
+        };
+        let Statement::Namespace(nested) = mid.body.data().statements[0].data() else {
+            panic!("expected nested global namespace");
+        };
+        assert!(
+            matches!(
+                nested.name,
+                NamespaceName::Identifier {
+                    keyword: NamespaceKeyword::Namespace,
+                    ..
+                }
+            ),
+            "nested global must not become an augmentation"
+        );
+    }
+
+    #[test]
+    fn global_body_is_not_ambient_for_nested_string_module() {
+        // tsc 7.0.2 rejects `declare global { module "x" {} }`; the string
+        // module inside the global body must not be accepted.
+        let recovered = parse_ts("declare global { module \"x\" {} }");
+        let errs = errors(&recovered);
+        assert!(
+            errs.iter().any(|d| {
+                d.code() == EXPECTED_IDENTIFIER
+                    && d.message()
+                        .contains("only allowed in an ambient declaration")
+            }),
+            "a string module inside a global body must be rejected: {:?}",
+            errs.iter()
+                .map(|d| (d.code().as_str(), d.message()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn text_start(file: &SourceFile, needle: &str) -> usize {
+        let source = file.source_text().as_str();
+        let byte = source.find(needle).expect("needle present");
+        source[..byte].encode_utf16().count()
     }
 }

@@ -1,0 +1,129 @@
+# Benchmark manifest (U0.8 / PB-1).
+#
+# One entry per vertical slice. Each entry names the workload the slice's
+# performance gate measures. `input` is relative to the materialized suite root
+# `verification/ts-suite`; `expected` is the baseline-artifact path (populated by
+# U0.10, PB-3). `repeats` defaults to 3. Only the `s0` entry is exercised in this
+# unit; later slices are placeholders wired to representative case inputs and are
+# filled with real fixtures as each slice lands.
+schema = 1
+
+[[benchmark]]
+id = "s0-conformance-foundation"
+slice = "s0"
+input = "index.json"
+facets = ["harness"]
+backends = ["check"]
+expected = "perf/baselines/s0.json"
+repeats = 3
+timeout_ms = 30000
+
+[[benchmark]]
+id = "s1-grammar-completeness"
+slice = "s1"
+input = "tests/cases/compiler/2dArrays.ts"
+facets = ["parse"]
+backends = ["check"]
+expected = "perf/baselines/s1.json"
+repeats = 3
+timeout_ms = 30000
+
+[[benchmark]]
+id = "s2-core-checker-depth"
+slice = "s2"
+input = "tests/cases/compiler/2dArrays.ts"
+facets = ["types", "symbols", "diagnostics"]
+backends = ["check"]
+expected = "perf/baselines/s2.json"
+repeats = 3
+timeout_ms = 30000
+
+[[benchmark]]
+id = "s3-declaration-constructs"
+slice = "s3"
+input = "tests/cases/compiler/2dArrays.ts"
+facets = ["jsEmit"]
+backends = ["interpreter", "jit", "aot"]
+expected = "perf/baselines/s3.json"
+repeats = 3
+timeout_ms = 60000
+
+[[benchmark]]
+id = "s4-emit-and-declarations"
+slice = "s4"
+input = "tests/cases/compiler/2dArrays.ts"
+facets = ["jsEmit", "dtsEmit"]
+backends = ["check"]
+expected = "perf/baselines/s4.json"
+repeats = 3
+timeout_ms = 30000
+
+[[benchmark]]
+id = "s5-module-resolution"
+slice = "s5"
+input = "tests/cases/compiler/2dArrays.ts"
+facets = ["moduleResolution"]
+backends = ["check"]
+expected = "perf/baselines/s5.json"
+repeats = 3
+timeout_ms = 30000
+
+[[benchmark]]
+id = "s6-node-host-runtime"
+slice = "s6"
+input = "tests/cases/compiler/2dArrays.ts"
+facets = ["jsEmit"]
+backends = ["interpreter", "jit", "aot"]
+expected = "perf/baselines/s6.json"
+repeats = 3
+timeout_ms = 60000
+
+[[benchmark]]
+id = "s7-cli-and-config"
+slice = "s7"
+input = "tests/cases/compiler/2dArrays.ts"
+facets = ["cli", "config"]
+backends = ["check"]
+expected = "perf/baselines/s7.json"
+repeats = 3
+timeout_ms = 30000
+
+[[benchmark]]
+id = "s8-project-references-build"
+slice = "s8"
+input = "tests/cases/compiler/2dArrays.ts"
+facets = ["build"]
+backends = ["check"]
+expected = "perf/baselines/s8.json"
+repeats = 3
+timeout_ms = 60000
+
+[[benchmark]]
+id = "s9-watch-mode"
+slice = "s9"
+input = "tests/cases/compiler/2dArrays.ts"
+facets = ["watch"]
+backends = ["check"]
+expected = "perf/baselines/s9.json"
+repeats = 3
+timeout_ms = 60000
+
+[[benchmark]]
+id = "s10-node-api-shim"
+slice = "s10"
+input = "tests/cases/compiler/2dArrays.ts"
+facets = ["nodeApi"]
+backends = ["check"]
+expected = "perf/baselines/s10.json"
+repeats = 3
+timeout_ms = 30000
+
+[[benchmark]]
+id = "s11-language-service"
+slice = "s11"
+input = "tests/cases/compiler/2dArrays.ts"
+facets = ["languageService"]
+backends = ["check"]
+expected = "perf/baselines/s11.json"
+repeats = 3
+timeout_ms = 30000

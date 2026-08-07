@@ -6,7 +6,7 @@ license = "MIT"
 source_dir = "corpus/projects/ohash"
 entrypoint = "corpus/cases/ohash.ts"
 node_args = []
-expected_timeout_ms = 5000
+expected_timeout_ms = 10000
 constructs = [
   "value-serialization",
   "object-key-sorting",

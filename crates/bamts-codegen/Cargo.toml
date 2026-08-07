@@ -1,25 +1,38 @@
 [package]
 name = "bamts-codegen"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-publish.workspace = true
+publish = true
+license.workspace = true
+repository.workspace = true
+description = "Code generation (JIT/AOT) backend for BamTS"
 
 [dependencies]
-bamts-bytecode = { path = "../bamts-bytecode" }
-bamts-native = { path = "../bamts-native", optional = true, features = ["jit-entry"] }
+bamts-bytecode.workspace = true
+bamts-native = { workspace = true, optional = true, features = ["jit-entry"] }
 cranelift-codegen = { version = "=0.134.2", default-features = false, features = ["std", "unwind", "all-native-arch"] }
 cranelift-frontend = "=0.134.2"
 cranelift-module = "=0.134.2"
 cranelift-object = { version = "=0.134.2", optional = true }
 cranelift-jit = { version = "=0.134.2", optional = true }
+region = { version = "=3.0.2", optional = true }
+wasmtime-internal-jit-icache-coherence = { version = "=47.0.2", optional = true }
+
+[target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
+libc = { version = "=0.2.189", optional = true }
 
 [dev-dependencies]
-bamts-runtime = { path = "../bamts-runtime" }
+bamts-runtime.workspace = true
 
 [features]
 default = []
 aot = ["dep:cranelift-object"]
-host-jit = ["dep:cranelift-jit", "dep:bamts-native"]
+host-jit = ["dep:cranelift-jit", "dep:bamts-native", "dep:region", "dep:wasmtime-internal-jit-icache-coherence", "dep:libc"]
 
-[lints]
-workspace = true
+[lints.rust]
+# `unsafe_code` is downgraded from the workspace `forbid` to `deny` so a single
+# `#[allow(unsafe_code)]` may cover the one module that requires it: the W^X
+# host-JIT memory provider (`jit_memory`), which owns the OS mapping syscalls.
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"

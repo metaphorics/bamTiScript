@@ -1,13 +1,21 @@
 pub mod checker;
 pub mod diagnostic;
 pub mod emitter;
+pub mod enum_plan;
 pub mod lint;
+mod literal;
 pub mod lower;
+pub mod namespace_plan;
 pub mod parser;
 pub mod pipeline;
+pub mod program;
 pub mod project;
 pub mod rules;
 pub mod scanner;
+pub mod script;
 pub mod source;
 pub mod syntax;
+pub mod telemetry;
 pub mod warning;
+
+pub use script::{ScriptCompileError, compile_classic_script};

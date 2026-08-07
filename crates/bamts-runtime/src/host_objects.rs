@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
 use crate::intrinsics::{self, BuiltinDef, BuiltinOutcome, BuiltinTable};
@@ -7,7 +8,7 @@ use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, Proper
 
 pub(crate) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
-    globals: &mut BTreeMap<String, Value>,
+    globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let object_prototype = builtins.object_prototype();
@@ -51,10 +52,11 @@ pub(crate) fn install<H: Host>(
             properties: PropertyMap::default(),
             prototype: Some(builtins.array_prototype()),
             extensible: true,
+            length_writable: true,
         },
     );
     let versions = object(heap, object_prototype);
-    put_text(heap, versions, "node", "22.0.0");
+    put_text(heap, versions, "node", "24.18.0");
 
     let process = object(heap, object_prototype);
     put(heap, process, "stdout", stdout);
@@ -62,7 +64,7 @@ pub(crate) fn install<H: Host>(
     put(heap, process, "env", env);
     put(heap, process, "argv", argv);
     put_text(heap, process, "platform", std::env::consts::OS);
-    put_text(heap, process, "version", "v22.0.0");
+    put_text(heap, process, "version", "v24.18.0");
     put(heap, process, "versions", versions);
     for (name, length, handler) in [
         ("exit", 1, process_exit::<H> as _),
@@ -72,15 +74,33 @@ pub(crate) fn install<H: Host>(
         put(heap, process, name, function);
     }
 
-    globals.insert("console".to_owned(), console);
-    globals.insert("process".to_owned(), process);
+    globals.insert(EcmaString::from_utf8("console"), console);
+    globals.insert(EcmaString::from_utf8("process"), process);
 
     let global_this = object(heap, object_prototype);
     for (name, value) in globals.iter() {
-        put(heap, global_this, name, *value);
+        if name.eq_ascii("Infinity") {
+            crate::intrinsics::builtins::define_frozen_data(heap, global_this, "Infinity", *value);
+        } else if name.eq_ascii("NaN") {
+            crate::intrinsics::builtins::define_frozen_data(heap, global_this, "NaN", *value);
+        } else {
+            define_global_data(heap, global_this, name.clone(), *value);
+        }
     }
-    put(heap, global_this, "globalThis", global_this);
-    globals.insert("globalThis".to_owned(), global_this);
+    define_global_data(
+        heap,
+        global_this,
+        EcmaString::from_utf8("globalThis"),
+        global_this,
+    );
+    define_global_data(
+        heap,
+        global_this,
+        EcmaString::from_utf8("global"),
+        global_this,
+    );
+    globals.insert(EcmaString::from_utf8("global"), global_this);
+    globals.insert(EcmaString::from_utf8("globalThis"), global_this);
 }
 
 fn stream<H: Host>(
@@ -125,6 +145,10 @@ fn object(heap: &mut Vec<HeapEntry>, prototype: Value) -> Value {
 }
 
 fn put(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) {
+    put_ecma(heap, object, EcmaString::from_utf8(name), value);
+}
+
+fn put_ecma(heap: &mut [HeapEntry], object: Value, name: EcmaString, value: Value) {
     let index = heap_index(object);
     let properties = match &mut heap[index] {
         HeapEntry::Object { properties, .. }
@@ -133,7 +157,7 @@ fn put(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) {
         _ => unreachable!("host object installation target owns properties"),
     };
     properties.insert(
-        PropertyKey::Named(name.to_owned()),
+        PropertyKey::Named(name),
         Property::Data {
             value,
             writable: true,
@@ -142,9 +166,27 @@ fn put(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) {
         },
     );
 }
+fn define_global_data(heap: &mut [HeapEntry], object: Value, name: EcmaString, value: Value) {
+    let index = heap_index(object);
+    let properties = match &mut heap[index] {
+        HeapEntry::Object { properties, .. }
+        | HeapEntry::Array { properties, .. }
+        | HeapEntry::NativeFunction { properties, .. } => properties,
+        _ => unreachable!("host object installation target owns properties"),
+    };
+    properties.insert(
+        PropertyKey::Named(name),
+        Property::Data {
+            value,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        },
+    );
+}
 
 fn put_text(heap: &mut Vec<HeapEntry>, object: Value, name: &str, text: &str) {
-    let value = intrinsics::push(heap, HeapEntry::String(text.to_owned()));
+    let value = intrinsics::push(heap, HeapEntry::String(EcmaString::from_utf8(text)));
     put(heap, object, name, value);
 }
 
@@ -213,10 +255,11 @@ fn console_write<H: Host>(
         line.push_str(&machine.console_format(value, true, 0)?);
     }
     line.push('\n');
+    let line = EcmaString::from_utf8(&line);
     if stderr {
-        machine.host.write_stderr(line.as_bytes());
+        machine.host.write_stderr(&text_bytes_lossy(&line));
     } else {
-        machine.host.write_stdout(line.as_bytes());
+        machine.host.write_stdout(&text_bytes_lossy(&line));
     }
     Ok(BuiltinOutcome::Value(Value::UNDEFINED))
 }
@@ -228,7 +271,7 @@ fn stdout_write<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let text = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-    machine.host.write_stdout(text.as_bytes());
+    machine.host.write_stdout(&text_bytes_lossy(&text));
     Ok(BuiltinOutcome::Value(Value::TRUE))
 }
 
@@ -239,7 +282,7 @@ fn stderr_write<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let text = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-    machine.host.write_stderr(text.as_bytes());
+    machine.host.write_stderr(&text_bytes_lossy(&text));
     Ok(BuiltinOutcome::Value(Value::TRUE))
 }
 
@@ -295,10 +338,19 @@ impl<H: Host> Machine<'_, H> {
                         crate::RuntimeErrorKind::InvalidValue { value },
                     ))?;
                 match &self.heap[index] {
-                    HeapEntry::String(text) if top_level => Ok(text.clone()),
+                    HeapEntry::Vacant => {
+                        unreachable!("runtime_slot rejects vacant heap entries")
+                    }
+                    HeapEntry::String(text) if top_level => Ok(env_value_text_lossy(text)),
                     HeapEntry::String(text) => Ok(quote(text)),
                     HeapEntry::BigInt(text) => Ok(format!("{text}n")),
-                    HeapEntry::PrivateName { description } => Ok(format!("Symbol({description})")),
+                    HeapEntry::Symbol { description } => {
+                        Ok(format!("Symbol({})", env_value_text_lossy(description)))
+                    }
+                    HeapEntry::PrivateName { description } => Ok(format!(
+                        "PrivateName({})",
+                        env_value_text_lossy(description)
+                    )),
                     HeapEntry::Array { elements, .. } => {
                         if depth >= 2 {
                             return Ok("[Array]".to_owned());
@@ -313,7 +365,26 @@ impl<H: Host> Machine<'_, H> {
                         }
                         Ok(format!("[ {} ]", parts.join(", ")))
                     }
-                    HeapEntry::Object { properties, .. } => {
+                    HeapEntry::Uint8Array { bytes, .. } => {
+                        if depth >= 2 {
+                            return Ok("[Uint8Array]".to_owned());
+                        }
+                        let elements = bytes.iter().map(u8::to_string).collect::<Vec<_>>();
+                        Ok(format!(
+                            "Uint8Array({}) [ {} ]",
+                            bytes.len(),
+                            elements.join(", ")
+                        ))
+                    }
+                    HeapEntry::Object { properties, .. }
+                    | HeapEntry::Script { properties, .. }
+                    | HeapEntry::Date { properties, .. }
+                    | HeapEntry::BuiltinIterator { properties, .. }
+                    | HeapEntry::Collection { properties, .. }
+                    | HeapEntry::Generator { properties, .. }
+                    | HeapEntry::AsyncGenerator { properties, .. }
+                    | HeapEntry::Promise { properties, .. }
+                    | HeapEntry::Timeout { properties, .. } => {
                         if depth >= 2 {
                             return Ok("[Object]".to_owned());
                         }
@@ -341,30 +412,46 @@ impl<H: Host> Machine<'_, H> {
                     HeapEntry::NativeFunction { .. } | HeapEntry::Function { .. } => {
                         Ok("[Function]".to_owned())
                     }
-                    HeapEntry::RegExp { pattern, flags, .. } => Ok(format!("/{pattern}/{flags}")),
-                    HeapEntry::Iterator { .. } | HeapEntry::ProcessEnv { .. } => {
-                        Ok("{}".to_owned())
-                    }
+                    HeapEntry::RegExp { pattern, flags, .. } => Ok(format!(
+                        "/{}/{}",
+                        env_value_text_lossy(pattern),
+                        env_value_text_lossy(flags),
+                    )),
+                    HeapEntry::Iterator { .. }
+                    | HeapEntry::ProcessEnv { .. }
+                    | HeapEntry::ModuleNamespace { .. }
+                    | HeapEntry::ExternalModuleNamespace { .. }
+                    | HeapEntry::HashState { .. }
+                    | HeapEntry::PromiseResolver { .. }
+                    | HeapEntry::PromiseAll { .. }
+                    | HeapEntry::AsyncActivation { .. }
+                    | HeapEntry::PromiseAllElement { .. } => Ok("{}".to_owned()),
                 }
             }
         }
     }
 }
 
-fn quote(text: &str) -> String {
+fn quote(text: &EcmaString) -> String {
+    let text = env_value_text_lossy(text);
     let escaped = text.replace('\\', "\\\\").replace('\'', "\\'");
     format!("'{escaped}'")
 }
 
-fn inspect_key(key: &str) -> String {
-    let mut chars = key.chars();
+fn inspect_key(key: &EcmaString) -> String {
+    let text = env_value_text_lossy(key);
+    let mut chars = text.chars();
     let identifier = chars
         .next()
         .is_some_and(|first| first == '_' || first == '$' || first.is_ascii_alphabetic())
         && chars.all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric());
-    if identifier {
-        key.to_owned()
-    } else {
-        quote(key)
-    }
+    if identifier { text } else { quote(key) }
+}
+
+pub(crate) fn text_bytes_lossy(text: &EcmaString) -> Vec<u8> {
+    text.to_utf8_lossy().into_bytes()
+}
+
+pub(crate) fn env_value_text_lossy(text: &EcmaString) -> String {
+    String::from_utf8(text_bytes_lossy(text)).expect("lossy UTF-8 conversion is valid")
 }

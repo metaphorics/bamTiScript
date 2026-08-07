@@ -11,13 +11,167 @@
 
 use std::sync::Arc;
 
-use crate::checker::{self, SemanticModel};
-use crate::diagnostic::Diagnostic;
+use crate::checker::{
+    self, ProgramCheckInput, ProgramCheckOptions, ResolvedModuleEdge, SemanticModel,
+};
+use crate::diagnostic::{Diagnostic, Recovered};
 use crate::emitter::{self, EmitOptions, EmitOutput};
+use crate::lint::{LintProfile, LintTable};
 use crate::parser;
+use crate::program::{ModuleTarget, ResolvedProgram};
 use crate::scanner;
 use crate::source::{ScriptKind, SourceId, SourceText};
-use crate::syntax::SourceFile;
+use crate::syntax::{ExportDeclaration, ExportNamedDeclaration, SourceFile};
+use crate::telemetry::{Phase, Telemetry};
+
+struct EdgeNode {
+    id: crate::syntax::NodeId,
+    range: crate::source::TextRange,
+    children: Vec<Self>,
+}
+
+struct SourceEdgeNodeIndex {
+    exact: std::collections::HashMap<crate::source::TextRange, crate::syntax::NodeId>,
+    roots: Vec<EdgeNode>,
+}
+
+impl SourceEdgeNodeIndex {
+    fn new(source: &SourceFile) -> Self {
+        let mut exact = std::collections::HashMap::new();
+        let roots = Self::statements(source.statements(), &mut exact);
+        Self { exact, roots }
+    }
+
+    fn statements(
+        statements: &[crate::syntax::Stmt],
+        exact: &mut std::collections::HashMap<crate::source::TextRange, crate::syntax::NodeId>,
+    ) -> Vec<EdgeNode> {
+        statements
+            .iter()
+            .map(|statement| Self::statement(statement, exact))
+            .collect()
+    }
+
+    fn statement(
+        statement: &crate::syntax::Stmt,
+        exact: &mut std::collections::HashMap<crate::source::TextRange, crate::syntax::NodeId>,
+    ) -> EdgeNode {
+        use crate::syntax::{ExportDefaultValue, ExternalModuleReference, FunctionBody, Statement};
+
+        let id = statement.id();
+        match statement.data() {
+            Statement::Import(import) => {
+                exact.insert(import.source.range(), id);
+            }
+            Statement::ImportEquals(import) => {
+                if let ExternalModuleReference::Require(source) = &import.reference {
+                    exact.insert(source.range(), id);
+                }
+            }
+            Statement::Export(ExportDeclaration::All(export)) => {
+                exact.insert(export.source.range(), id);
+            }
+            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
+                source: Some(source),
+                ..
+            })) => {
+                exact.insert(source.range(), id);
+            }
+            _ => {}
+        }
+
+        let children = match statement.data() {
+            Statement::Function(function) => match &function.function.body {
+                Some(FunctionBody::Block(block)) => {
+                    Self::statements(&block.data().statements, exact)
+                }
+                _ => Vec::new(),
+            },
+            Statement::Namespace(namespace) => {
+                Self::statements(&namespace.body.data().statements, exact)
+            }
+            Statement::Declare(inner)
+            | Statement::Labeled(crate::syntax::LabeledStatement { body: inner, .. }) => {
+                vec![Self::statement(inner, exact)]
+            }
+            Statement::Block(block) => Self::statements(&block.data().statements, exact),
+            Statement::If(branch) => {
+                let mut children = vec![Self::statement(&branch.consequent, exact)];
+                if let Some(alternate) = &branch.alternate {
+                    children.push(Self::statement(alternate, exact));
+                }
+                children
+            }
+            Statement::Switch(switch) => switch
+                .cases
+                .iter()
+                .flat_map(|case| Self::statements(&case.data().consequent, exact))
+                .collect(),
+            Statement::For(statement) => vec![Self::statement(&statement.body, exact)],
+            Statement::ForIn(statement) => vec![Self::statement(&statement.body, exact)],
+            Statement::ForOf(statement) => vec![Self::statement(&statement.body, exact)],
+            Statement::While(statement) => vec![Self::statement(&statement.body, exact)],
+            Statement::DoWhile(statement) => vec![Self::statement(&statement.body, exact)],
+            Statement::Try(statement) => {
+                let mut children = Self::statements(&statement.block.data().statements, exact);
+                if let Some(handler) = &statement.handler {
+                    children.extend(Self::statements(
+                        &handler.data().body.data().statements,
+                        exact,
+                    ));
+                }
+                if let Some(finalizer) = &statement.finalizer {
+                    children.extend(Self::statements(&finalizer.data().statements, exact));
+                }
+                children
+            }
+            Statement::With(statement) => vec![Self::statement(&statement.body, exact)],
+            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
+                inner,
+            ))) => vec![Self::statement(inner, exact)],
+            Statement::Export(ExportDeclaration::Default(default)) => match &default.value {
+                ExportDefaultValue::Function(function) => match &function.body {
+                    Some(FunctionBody::Block(block)) => {
+                        Self::statements(&block.data().statements, exact)
+                    }
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+
+        debug_assert!(
+            children
+                .windows(2)
+                .all(|pair| pair[0].range.end() <= pair[1].range.start()),
+            "edge node children must be source-ordered and non-overlapping"
+        );
+
+        EdgeNode {
+            id,
+            range: statement.range(),
+            children,
+        }
+    }
+
+    fn node_for(&self, range: crate::source::TextRange) -> Option<crate::syntax::NodeId> {
+        self.exact
+            .get(&range)
+            .copied()
+            .or_else(|| Self::smallest_containing(&self.roots, range))
+    }
+
+    fn smallest_containing(
+        nodes: &[EdgeNode],
+        range: crate::source::TextRange,
+    ) -> Option<crate::syntax::NodeId> {
+        let index = nodes.partition_point(|node| node.range.start() <= range.start());
+        let node = nodes.get(index.checked_sub(1)?)?;
+        (node.range.end() >= range.end())
+            .then(|| Self::smallest_containing(&node.children, range).unwrap_or(node.id))
+    }
+}
 
 /// The frontend product a caller wants produced for one source.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -127,7 +281,163 @@ impl FrontendOutput {
     }
 }
 
-/// Runs the fixed scan -> parse -> check -> optional emit frontend pipeline.
+/// Frontend products for every module of one canonical resolved program.
+pub struct ProgramFrontendOutput {
+    entrypoint: SourceId,
+    modules: Vec<FrontendOutput>,
+}
+
+impl ProgramFrontendOutput {
+    #[must_use]
+    pub const fn entrypoint_id(&self) -> SourceId {
+        self.entrypoint
+    }
+
+    /// Products in the same dependency-first order as the resolved program.
+    #[must_use]
+    pub fn modules(&self) -> &[FrontendOutput] {
+        &self.modules
+    }
+
+    #[must_use]
+    pub fn module(&self, source_id: SourceId) -> Option<&FrontendOutput> {
+        self.modules
+            .iter()
+            .find(|output| output.source_file().source_id() == source_id)
+    }
+}
+
+/// Runs the frontend for every module while preserving the graph's canonical identities.
+#[must_use]
+pub fn compile_program_frontend(
+    program: &ResolvedProgram,
+    mode: FrontendMode,
+) -> ProgramFrontendOutput {
+    compile_program_frontend_with_lints(program, mode, &LintTable::new(LintProfile::Default))
+}
+
+/// Runs the frontend for every module with caller-resolved lint levels.
+#[must_use]
+pub fn compile_program_frontend_with_lints(
+    program: &ResolvedProgram,
+    mode: FrontendMode,
+    levels: &LintTable,
+) -> ProgramFrontendOutput {
+    Telemetry::measure(Phase::Total, || {
+        let parsed = program
+            .modules()
+            .iter()
+            .map(|module| {
+                let source_id = module.source_id();
+                let script_kind = module.script_kind();
+                let source = Arc::clone(module.source());
+                let scanned = Telemetry::measure(Phase::Scan, || {
+                    scanner::scan(source_id, script_kind, source)
+                });
+                Telemetry::measure(Phase::Parse, || parser::parse(scanned))
+            })
+            .collect::<Vec<_>>();
+        let edges = resolved_checker_edges(program, &parsed);
+        let checked = Telemetry::measure(Phase::Check, || {
+            let options = if program.is_commonjs() {
+                ProgramCheckOptions::commonjs()
+            } else {
+                ProgramCheckOptions::standard()
+            }
+            .with_strict_null_checks(program.is_strict_null_checks())
+            .with_no_implicit_any(program.is_no_implicit_any())
+            .with_always_strict(program.is_always_strict())
+            .with_target(if program.is_target_es5() {
+                Some("es5")
+            } else {
+                None
+            });
+            checker::check_program_with_options(
+                ProgramCheckInput {
+                    files: &parsed,
+                    edges: &edges,
+                },
+                levels,
+                options,
+            )
+        });
+        let program_diagnostics = checked.diagnostics();
+        let modules = parsed
+            .into_iter()
+            .map(|parsed| {
+                let source_id = parsed.product().source_id();
+                let semantic_model = checked
+                    .product()
+                    .file(source_id)
+                    .expect("whole-program checker returns every parsed module")
+                    .clone();
+                let emit = mode.emit_options().map(|options| {
+                    Telemetry::measure(Phase::Emit, || {
+                        emitter::emit_checked(parsed.product(), &semantic_model, options)
+                    })
+                });
+                let (source_file, mut diagnostics) = parsed.into_parts();
+                diagnostics.extend(
+                    program_diagnostics
+                        .iter()
+                        .filter(|diagnostic| diagnostic.source_id() == source_id)
+                        .cloned(),
+                );
+                if let Some(output) = &emit {
+                    diagnostics.extend(output.diagnostics.iter().cloned());
+                }
+                FrontendOutput {
+                    mode,
+                    source_file,
+                    semantic_model,
+                    emit,
+                    diagnostics: canonicalize(diagnostics),
+                }
+            })
+            .collect();
+        ProgramFrontendOutput {
+            entrypoint: program.entrypoint_id(),
+            modules,
+        }
+    })
+}
+
+fn resolved_checker_edges(
+    program: &ResolvedProgram,
+    files: &[Recovered<SourceFile>],
+) -> Vec<ResolvedModuleEdge> {
+    program
+        .modules()
+        .iter()
+        .flat_map(|module| {
+            let source = files
+                .iter()
+                .find(|file| file.product().source_id() == module.source_id())
+                .expect("resolved module has one parsed source")
+                .product();
+            let nodes = SourceEdgeNodeIndex::new(source);
+            module.dependencies().iter().filter_map(move |edge| {
+                let ModuleTarget::Local(to) = edge.target() else {
+                    return None;
+                };
+                Some(ResolvedModuleEdge {
+                    from: module.source_id(),
+                    specifier: nodes.node_for(edge.range())?,
+                    to: *to,
+                })
+            })
+        })
+        .collect()
+}
+
+/// Runs the fixed frontend pipeline with settled default lint levels.
+#[must_use]
+pub fn compile_frontend(request: FrontendRequest) -> FrontendOutput {
+    compile_frontend_with_lints(request, &LintTable::new(LintProfile::Default))
+}
+
+/// Runs the fixed scan -> parse -> check -> optional emit frontend pipeline
+/// using the caller's resolved lint table.
 ///
 /// Every stage runs regardless of the diagnostics its predecessor produced, so
 /// the returned [`FrontendOutput`] always carries a recovered `SourceFile` and
@@ -135,40 +445,48 @@ impl FrontendOutput {
 /// stages reported errors. All stage diagnostics are merged, canonically
 /// ordered, and de-duplicated into one vector.
 #[must_use]
-pub fn compile_frontend(request: FrontendRequest) -> FrontendOutput {
-    let FrontendRequest {
-        source_id,
-        script_kind,
-        source,
-        mode,
-    } = request;
+pub fn compile_frontend_with_lints(request: FrontendRequest, levels: &LintTable) -> FrontendOutput {
+    Telemetry::measure(Phase::Total, || {
+        let FrontendRequest {
+            source_id,
+            script_kind,
+            source,
+            mode,
+        } = request;
 
-    let scanned = scanner::scan(source_id, script_kind, source);
-    let parsed = parser::parse(scanned);
-    let checked = checker::check(&parsed);
+        let scanned = Telemetry::measure(Phase::Scan, || {
+            scanner::scan(source_id, script_kind, source)
+        });
+        let parsed = Telemetry::measure(Phase::Parse, || parser::parse(scanned));
+        let checked =
+            Telemetry::measure(Phase::Check, || checker::check_with_lints(&parsed, levels));
 
-    // Emit runs against the recovered tree; it never gates on prior diagnostics.
-    let emit = mode
-        .emit_options()
-        .map(|options| emitter::emit(parsed.product(), options));
+        // Emit consumes the recovered tree and this pass's semantic model; it never
+        // gates on prior diagnostics.
+        let emit = mode.emit_options().map(|options| {
+            Telemetry::measure(Phase::Emit, || {
+                emitter::emit_checked(parsed.product(), checked.product(), options)
+            })
+        });
 
-    let (source_file, parse_diagnostics) = parsed.into_parts();
-    let (semantic_model, check_diagnostics) = checked.into_parts();
+        let (source_file, parse_diagnostics) = parsed.into_parts();
+        let (semantic_model, check_diagnostics) = checked.into_parts();
 
-    let mut diagnostics = parse_diagnostics;
-    diagnostics.extend(check_diagnostics);
-    if let Some(output) = &emit {
-        diagnostics.extend(output.diagnostics.iter().cloned());
-    }
-    let diagnostics = canonicalize(diagnostics);
+        let mut diagnostics = parse_diagnostics;
+        diagnostics.extend(check_diagnostics);
+        if let Some(output) = &emit {
+            diagnostics.extend(output.diagnostics.iter().cloned());
+        }
+        let diagnostics = canonicalize(diagnostics);
 
-    FrontendOutput {
-        mode,
-        source_file,
-        semantic_model,
-        emit,
-        diagnostics,
-    }
+        FrontendOutput {
+            mode,
+            source_file,
+            semantic_model,
+            emit,
+            diagnostics,
+        }
+    })
 }
 
 /// Orders diagnostics by the canonical [`Diagnostic`] key and removes exact
@@ -195,7 +513,9 @@ mod tests {
         FrontendRequest {
             source_id: SourceId::new(0),
             script_kind: ScriptKind::TypeScript,
-            source: Arc::new(SourceText::new(source)),
+            source: Arc::new(
+                SourceText::new(source).expect("test source fits the per-file budget"),
+            ),
             mode,
         }
     }
@@ -325,5 +645,133 @@ mod tests {
             "try {} catch (e) { e.message }\nconst n: number = \"oops\";\nconst bad: number =";
         let output = compile_frontend(request(source, FrontendMode::JavaScript));
         assert!(is_sorted_unique(output.diagnostics()));
+    }
+
+    #[test]
+    fn resolved_edges_keep_static_and_find_import_equals_and_nested_dynamic_imports() {
+        use std::{
+            fs,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+
+        use crate::{
+            parser,
+            program::ProgramLoader,
+            project::{ProjectConfig, ProjectRoot},
+            scanner,
+            syntax::{Expression, FunctionBody, Statement},
+        };
+
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let root_path = std::env::temp_dir().join(format!(
+            "bamts-pipeline-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root_path).unwrap();
+        let write = |name: &str, source: &str| fs::write(root_path.join(name), source).unwrap();
+        write(
+            "main.ts",
+            "import value from \"./static\"; import equal = require(\"./equal\"); async function nested() { return import(\"./dynamic\"); }",
+        );
+        write("static.ts", "export default 1;");
+        write("equal.ts", "export = 1;");
+        write("dynamic.ts", "export default 1;");
+
+        let root = ProjectRoot::new(fs::canonicalize(&root_path).unwrap()).unwrap();
+        let config = ProjectConfig::parse(&root, root_path.join("tsconfig.json"), "{}").unwrap();
+        let program = ProgramLoader::new(&root, config.options())
+            .unwrap()
+            .load("main.ts")
+            .unwrap();
+        let files = program
+            .modules()
+            .iter()
+            .map(|module| {
+                parser::parse(scanner::scan(
+                    module.source_id(),
+                    module.script_kind(),
+                    Arc::clone(module.source()),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let edges = super::resolved_checker_edges(&program, &files);
+        let source = files
+            .iter()
+            .find(|file| file.product().source_id() == program.entrypoint_id())
+            .unwrap()
+            .product();
+        let statements = source.statements();
+        let Statement::Function(function) = statements[2].data() else {
+            panic!("expected nested function declaration");
+        };
+        let Some(FunctionBody::Block(body)) = &function.function.body else {
+            panic!("expected function block");
+        };
+        let Statement::Return(return_statement) = body.data().statements[0].data() else {
+            panic!("expected return statement");
+        };
+        let dynamic_import = return_statement.argument.as_ref().unwrap();
+        assert!(matches!(dynamic_import.data(), Expression::Import(_)));
+
+        assert_eq!(edges.len(), 3);
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.specifier == statements[0].id())
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.specifier == statements[1].id())
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.specifier == body.data().statements[0].id())
+        );
+
+        fs::remove_dir_all(root_path).unwrap();
+    }
+
+    #[test]
+    fn telemetry_records_frontend_phases_when_a_collector_is_active() {
+        use crate::telemetry::{Phase, Telemetry, TelemetryCollector};
+
+        // Disabled path: no collector, so nothing is timed and nothing panics.
+        assert!(!Telemetry::enabled());
+        let _ = compile_frontend(request("const n: number = 1;", FrontendMode::JavaScript));
+
+        // Enabled path: a collector on this thread captures per-phase wall time.
+        let collector = TelemetryCollector::start();
+        let _ = compile_frontend(request(
+            "const n: number = 1;\nfunction f(x: number): number { return x + 1; }",
+            FrontendMode::JavaScript,
+        ));
+        let totals = collector.snapshot();
+        drop(collector);
+
+        assert!(
+            totals.total > std::time::Duration::ZERO,
+            "total wall recorded"
+        );
+        assert!(
+            totals.get(Phase::Scan) > std::time::Duration::ZERO,
+            "scan recorded"
+        );
+        assert!(
+            totals.get(Phase::Parse) > std::time::Duration::ZERO,
+            "parse recorded"
+        );
+        assert!(
+            totals.get(Phase::Check) > std::time::Duration::ZERO,
+            "check recorded"
+        );
+        // JavaScript mode emits, so the emit phase is timed too.
+        assert!(
+            totals.get(Phase::Emit) > std::time::Duration::ZERO,
+            "emit recorded"
+        );
+        assert!(!Telemetry::enabled());
     }
 }

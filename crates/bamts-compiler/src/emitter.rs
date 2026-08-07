@@ -1,9 +1,9 @@
 //! Deterministic AST-to-JavaScript and declaration emit.
 //!
-//! The emitter walks an immutable [`SourceFile`] and prints either runtime
-//! JavaScript ([`EmitMode::JavaScript`]) or a TypeScript declaration file
-//! ([`EmitMode::Declaration`]). It is a pure printer: it never parses source,
-//! reads files, mutates the tree, or performs semantic analysis.
+//! The checked [`emit_checked`] path walks an immutable [`SourceFile`] and
+//! [`SemanticModel`] and prints either runtime JavaScript ([`EmitMode::JavaScript`])
+//! or a TypeScript declaration file ([`EmitMode::Declaration`]). The compatibility
+//! [`emit`] entry point performs that semantic pass before delegating.
 //!
 //! # Guarantees
 //! * **Deterministic.** The same tree and [`EmitOptions`] always produce byte-
@@ -20,14 +20,18 @@
 //!   printed grouping always matches the tree.
 //! * **Stable recovery diagnostics.** Nodes the parser could only recover as a
 //!   [`MissingNode`], and constructs that cannot be lowered without the checker
-//!   (`namespace` runtime lowering, decorator lowering), yield ordered typed
-//!   [`Diagnostic`] values while a best-effort product is still returned.
+//!   (`namespace` runtime lowering), yield ordered typed [`Diagnostic`] values
+//!   while a best-effort product is still returned.
 //!
 //! Constant folding, type inference for un-annotated declarations, and lexical
 //! reference rewriting are the checker's responsibility and are intentionally
 //! out of scope here.
 
-use crate::diagnostic::{Diagnostic, DiagnosticCode};
+use std::{fmt::Write as _, sync::Arc};
+
+use crate::checker::{self, SemanticModel};
+use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
+use crate::enum_plan::{EnumFacts, EnumMemberPlan, EnumScalar};
 use crate::source::{SourceId, SourceText, TextRange};
 use crate::syntax::*;
 
@@ -57,10 +61,8 @@ pub mod codes {
     pub const UNRESOLVED_TOKEN: DiagnosticCode = DiagnosticCode::new("TS-EMIT-1010");
     /// `namespace` runtime lowering needs semantic analysis unavailable here.
     pub const NAMESPACE_UNLOWERED: DiagnosticCode = DiagnosticCode::new("TS-EMIT-1011");
-    /// Decorator runtime lowering needs semantic analysis unavailable here.
-    pub const DECORATOR_UNLOWERED: DiagnosticCode = DiagnosticCode::new("TS-EMIT-1012");
-    /// A non-first `enum` member without an initializer needs a constant value.
-    pub const ENUM_MEMBER_INITIALIZER: DiagnosticCode = DiagnosticCode::new("TS-EMIT-1013");
+    /// A runtime enum declaration has no matching checked enum plan.
+    pub const ENUM_FACTS_UNAVAILABLE: DiagnosticCode = DiagnosticCode::new("TS-EMIT-1013");
 }
 
 /// Which surface the emitter prints.
@@ -167,16 +169,35 @@ impl EmitOutput {
 /// Prints `file` to JavaScript or a declaration file per `options`.
 #[must_use]
 pub fn emit(file: &SourceFile, options: EmitOptions) -> EmitOutput {
+    let checked_file = Recovered::clean(SourceFile::new(
+        file.id(),
+        file.source_id(),
+        file.script_kind(),
+        file.range(),
+        Arc::new(file.source_text().clone()),
+        file.tokens().to_vec(),
+        file.statements().to_vec(),
+        *file.eof(),
+        file.diagnostics().to_vec(),
+    ));
+    let checked = checker::check(&checked_file);
+    emit_checked(file, checked.product(), options)
+}
+
+/// Prints `file` using the semantic model produced by its checker pass.
+#[must_use]
+pub fn emit_checked(file: &SourceFile, model: &SemanticModel, options: EmitOptions) -> EmitOutput {
     let mut emitter = Emitter {
         source: file.source_text(),
         source_id: file.source_id(),
+        model,
+        enum_facts: model.enum_facts(),
         options,
         out: String::new(),
         indent: 0,
         pending_indent: false,
         anchor: file.range(),
         diagnostics: Vec::new(),
-        enum_context: None,
         decl_ambient: false,
         decl_in_export: false,
     };
@@ -212,21 +233,17 @@ const P_POSTFIX: u8 = 16;
 const P_CALL_MEMBER: u8 = 17;
 const P_PRIMARY: u8 = 18;
 
-struct EnumContext {
-    object: String,
-    members: Vec<String>,
-}
-
 struct Emitter<'a> {
     source: &'a SourceText,
     source_id: SourceId,
+    model: &'a SemanticModel,
+    enum_facts: &'a EnumFacts,
     options: EmitOptions,
     out: String,
     indent: usize,
     pending_indent: bool,
     anchor: TextRange,
     diagnostics: Vec<Diagnostic>,
-    enum_context: Option<EnumContext>,
     decl_ambient: bool,
     decl_in_export: bool,
 }
@@ -352,7 +369,7 @@ impl<'a> Emitter<'a> {
                 true
             }
             Statement::Interface(_) | Statement::TypeAlias(_) | Statement::Declare(_) => false,
-            Statement::Enum(declaration) => self.emit_enum_js(declaration),
+            Statement::Enum(declaration) => self.emit_enum_js(statement.id(), declaration),
             Statement::Namespace(_) => {
                 self.diag_here(
                     codes::NAMESPACE_UNLOWERED,
@@ -798,6 +815,12 @@ impl<'a> Emitter<'a> {
                     self.emit_statement(inner);
                     return false;
                 }
+                if let Statement::Class(class) = inner.data() {
+                    self.emit_decorators_block(&class.decorators);
+                    self.raw("export ");
+                    self.emit_class_core_js(class);
+                    return true;
+                }
                 self.raw("export ");
                 self.emit_statement(inner)
             }
@@ -860,6 +883,7 @@ impl<'a> Emitter<'a> {
                     true
                 }
                 ExportDefaultValue::Class(class) => {
+                    self.emit_decorators_block(&class.decorators);
                     self.raw("export default ");
                     self.emit_class_core_js(class);
                     true
@@ -877,9 +901,10 @@ impl<'a> Emitter<'a> {
                     );
                     false
                 }
+                ExportDefaultValue::Interface(_) => false,
             },
             ExportDeclaration::Assignment(expression) => {
-                self.raw("module.exports = ");
+                self.raw("export default ");
                 self.emit_expression_prec(expression, P_ASSIGN);
                 self.raw(";");
                 true
@@ -909,6 +934,7 @@ impl<'a> Emitter<'a> {
             | Statement::Empty => false,
             Statement::Function(function) => function.function.body.is_some(),
             Statement::Import(import) => !import.type_only,
+            Statement::Enum(declaration) => !declaration.is_const,
             _ => true,
         }
     }
@@ -917,7 +943,7 @@ impl<'a> Emitter<'a> {
     // enum lowering (JavaScript)
     // =======================================================================
 
-    fn emit_enum_js(&mut self, declaration: &EnumDeclaration) -> bool {
+    fn emit_enum_js(&mut self, declaration_id: NodeId, declaration: &EnumDeclaration) -> bool {
         let Some(name) = self
             .text(declaration.name.data().token())
             .map(str::to_owned)
@@ -929,20 +955,23 @@ impl<'a> Emitter<'a> {
             );
             return false;
         };
-        if name.is_empty() {
+        if name.is_empty() || declaration.is_const {
             return false;
         }
-
-        let members: Vec<String> = declaration
-            .members
-            .iter()
-            .filter_map(|member| match &member.data().name {
-                PropertyName::Identifier(ident) => {
-                    self.text(ident.data().token()).map(str::to_owned)
-                }
-                _ => None,
-            })
-            .collect();
+        let Some(plan) = self.enum_facts.declaration(declaration_id) else {
+            self.diag_here(
+                codes::ENUM_FACTS_UNAVAILABLE,
+                "runtime enum lowering requires checked enum facts",
+            );
+            return false;
+        };
+        if plan.members().len() != declaration.members.len() {
+            self.diag_here(
+                codes::ENUM_FACTS_UNAVAILABLE,
+                "runtime enum lowering requires a complete checked enum plan",
+            );
+            return false;
+        }
 
         self.raw("var ");
         self.raw(&name);
@@ -953,18 +982,11 @@ impl<'a> Emitter<'a> {
         self.raw(") {");
         self.newline();
         self.indent += 1;
-
-        self.enum_context = Some(EnumContext {
-            object: name.clone(),
-            members,
-        });
-        let mut auto: Option<i64> = Some(0);
-        for member in &declaration.members {
-            self.emit_enum_member(&name, member.data(), &mut auto);
-            self.newline();
+        for (member, plan_member) in declaration.members.iter().zip(plan.members()) {
+            if self.emit_enum_member(&name, member.data(), plan_member) {
+                self.newline();
+            }
         }
-        self.enum_context = None;
-
         self.indent -= 1;
         self.raw("})(");
         self.raw(&name);
@@ -974,78 +996,77 @@ impl<'a> Emitter<'a> {
         true
     }
 
-    fn emit_enum_member(&mut self, object: &str, member: &EnumMember, auto: &mut Option<i64>) {
-        let Some(key) = self.enum_member_key(&member.name) else {
-            self.diag_here(
-                codes::MISSING_PROPERTY_NAME,
-                "cannot emit an enum member with this name",
-            );
-            return;
+    fn emit_enum_member(
+        &mut self,
+        object: &str,
+        member: &EnumMember,
+        plan_member: &EnumMemberPlan,
+    ) -> bool {
+        let (Some(key), Some(value)) = (plan_member.name(), plan_member.value()) else {
+            return false;
         };
+        let initializer = member.initializer.as_deref();
+        if value.constant().is_none() && initializer.is_none() {
+            return false;
+        }
 
-        match &member.initializer {
-            None => match *auto {
-                Some(value) => {
-                    self.raw(object);
-                    self.raw("[");
-                    self.raw(object);
-                    self.raw("[");
-                    self.raw(&key);
-                    self.raw("] = ");
-                    self.raw(&value.to_string());
-                    self.raw("] = ");
-                    self.raw(&key);
-                    self.raw(";");
-                    *auto = value.checked_add(1);
-                }
-                None => {
-                    self.diag_here(
-                        codes::ENUM_MEMBER_INITIALIZER,
-                        "enum member without initializer requires a constant predecessor",
-                    );
-                    self.raw(object);
-                    self.raw("[");
-                    self.raw(&key);
-                    self.raw("] = void 0;");
-                }
-            },
-            Some(initializer) => {
-                if let Some(value) = numeric_literal_value(initializer) {
-                    self.raw(object);
-                    self.raw("[");
-                    self.raw(object);
-                    self.raw("[");
-                    self.raw(&key);
-                    self.raw("] = ");
-                    self.emit_expression_prec(initializer, P_ASSIGN);
-                    self.raw("] = ");
-                    self.raw(&key);
-                    self.raw(";");
-                    *auto = value.and_then(|v| v.checked_add(1));
+        self.raw(object);
+        self.raw("[");
+        if plan_member.reverse() {
+            self.raw(object);
+            self.raw("[");
+        }
+        self.emit_enum_string(key);
+        self.raw("] = ");
+        if let Some(constant) = value.constant() {
+            self.emit_enum_scalar(constant);
+        } else if let Some(initializer) = initializer {
+            self.emit_expression_prec(initializer, P_ASSIGN);
+        }
+        if plan_member.reverse() {
+            self.raw("] = ");
+            self.emit_enum_string(key);
+        }
+        self.raw(";");
+        true
+    }
+
+    fn emit_enum_scalar(&mut self, scalar: &EnumScalar) {
+        match scalar {
+            EnumScalar::Number(value) => {
+                let value = value.to_f64();
+                if value.is_nan() {
+                    self.raw("NaN");
+                } else if value == f64::INFINITY {
+                    self.raw("Infinity");
+                } else if value == f64::NEG_INFINITY {
+                    self.raw("-Infinity");
                 } else {
-                    self.raw(object);
-                    self.raw("[");
-                    self.raw(&key);
-                    self.raw("] = ");
-                    self.emit_expression_prec(initializer, P_ASSIGN);
-                    self.raw(";");
-                    *auto = None;
+                    write!(self.out, "{value}").expect("writing to a String cannot fail");
                 }
             }
+            EnumScalar::String(value) => self.emit_enum_string(value),
         }
     }
 
-    fn enum_member_key(&self, name: &PropertyName) -> Option<String> {
-        match name {
-            PropertyName::Identifier(ident) => {
-                self.text(ident.data().token()).map(|s| format!("\"{s}\""))
+    fn emit_enum_string(&mut self, value: &bamts_bytecode::EcmaString) {
+        self.raw("\"");
+        for &unit in value.as_units() {
+            match unit {
+                0x08 => self.raw("\\b"),
+                0x09 => self.raw("\\t"),
+                0x0A => self.raw("\\n"),
+                0x0C => self.raw("\\f"),
+                0x0D => self.raw("\\r"),
+                0x22 => self.raw("\\\""),
+                0x5C => self.raw("\\\\"),
+                0x20..=0x7E => self
+                    .out
+                    .push(char::from_u32(u32::from(unit)).expect("ASCII unit")),
+                _ => write!(self.out, "\\u{unit:04X}").expect("writing to a String cannot fail"),
             }
-            PropertyName::String(string) => self.text(string.data().token()).map(str::to_owned),
-            PropertyName::Number(number) => {
-                self.text(number.data().token()).map(|s| format!("\"{s}\""))
-            }
-            PropertyName::Private(_) | PropertyName::Computed(_) | PropertyName::Missing(_) => None,
         }
+        self.raw("\"");
     }
 
     // =======================================================================
@@ -1139,13 +1160,11 @@ impl<'a> Emitter<'a> {
             if self.is_this_parameter(parameter) {
                 continue;
             }
-            for decorator in &parameter.decorators {
-                self.emit_decorator_diag(decorator);
-            }
             if !first {
                 self.raw(", ");
             }
             first = false;
+            self.emit_decorators_inline(&parameter.decorators);
             self.emit_pattern(&parameter.binding);
             if let Some(initializer) = &parameter.initializer {
                 self.raw(" = ");
@@ -1163,23 +1182,31 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn emit_decorator_diag(&mut self, decorator: &DecoratorNode) {
-        let range = decorator.range();
-        self.diag(
-            codes::DECORATOR_UNLOWERED,
-            "decorator runtime lowering requires semantic analysis",
-            range,
-        );
+    fn emit_decorator(&mut self, decorator: &DecoratorNode) {
+        self.raw("@");
+        self.emit_expression_prec(&decorator.data().expression, P_ASSIGN);
+    }
+
+    fn emit_decorators_inline(&mut self, decorators: &[DecoratorNode]) {
+        for decorator in decorators {
+            self.emit_decorator(decorator);
+            self.raw(" ");
+        }
+    }
+
+    fn emit_decorators_block(&mut self, decorators: &[DecoratorNode]) {
+        for decorator in decorators {
+            self.emit_decorator(decorator);
+            self.newline();
+        }
     }
 
     fn emit_class_js(&mut self, class: &ClassDeclaration) {
+        self.emit_decorators_block(&class.decorators);
         self.emit_class_core_js(class);
     }
 
     fn emit_class_core_js(&mut self, class: &ClassDeclaration) {
-        for decorator in &class.decorators {
-            self.emit_decorator_diag(decorator);
-        }
         self.raw("class");
         if let Some(name) = &class.name {
             self.raw(" ");
@@ -1232,6 +1259,7 @@ impl<'a> Emitter<'a> {
     fn emit_class_member_js(&mut self, member: &ClassMember) -> bool {
         match member {
             ClassMember::Constructor(constructor) => {
+                self.emit_decorators_block(&constructor.decorators);
                 self.emit_constructor_js(constructor);
                 true
             }
@@ -1239,6 +1267,7 @@ impl<'a> Emitter<'a> {
                 if method.function.body.is_none() || method.modifiers.is_abstract {
                     return false;
                 }
+                self.emit_decorators_block(&method.function.decorators);
                 self.emit_method_js(method);
                 true
             }
@@ -1246,6 +1275,7 @@ impl<'a> Emitter<'a> {
                 if property.modifiers.is_abstract || property.modifiers.is_declare {
                     return false;
                 }
+                self.emit_decorators_block(&property.decorators);
                 if property.modifiers.is_static {
                     self.raw("static ");
                 }
@@ -1261,6 +1291,7 @@ impl<'a> Emitter<'a> {
                 if accessor.modifiers.is_abstract || accessor.modifiers.is_declare {
                     return false;
                 }
+                self.emit_decorators_block(&accessor.decorators);
                 if accessor.modifiers.is_static {
                     self.raw("static ");
                 }
@@ -1375,6 +1406,12 @@ impl<'a> Emitter<'a> {
     }
 
     fn expression_prec(&self, expression: &Expr) -> u8 {
+        if let Some(value) = self.enum_facts.const_use(expression.id()) {
+            return match value.number() {
+                Some(number) if number.to_f64().is_sign_negative() => P_UNARY,
+                _ => P_PRIMARY,
+            };
+        }
         match expression.data() {
             Expression::Sequence(_) => P_SEQUENCE,
             Expression::Assignment(_) | Expression::Arrow(_) | Expression::Yield(_) => P_ASSIGN,
@@ -1408,7 +1445,20 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_expression_inner(&mut self, expression: &Expr) {
+        if let Some(value) = self.enum_facts.const_use(expression.id()) {
+            self.emit_enum_scalar(value);
+            return;
+        }
         match expression.data() {
+            Expression::JsxElement(_)
+            | Expression::JsxFragment(_)
+            | Expression::JsxSelfClosingElement(_) => {
+                self.diag_here(
+                    codes::MISSING_EXPRESSION,
+                    "cannot emit a JSX expression node",
+                );
+                self.raw("void 0");
+            }
             Expression::Identifier(ident) => self.emit_ident_expression(ident),
             Expression::This => self.raw("this"),
             Expression::Super => self.raw("super"),
@@ -1421,7 +1471,7 @@ impl<'a> Emitter<'a> {
             Expression::Array(array) => self.emit_array(array),
             Expression::Object(object) => self.emit_object(object),
             Expression::Function(function) => self.emit_function_expression_js(&function.function),
-            Expression::Class(class) => self.emit_class_core_js(&class.class),
+            Expression::Class(class) => self.emit_class_js(&class.class),
             Expression::Arrow(arrow) => self.emit_arrow_js(arrow),
             Expression::Call(call) => self.emit_call(call),
             Expression::Member(member) => self.emit_member(member),
@@ -1480,14 +1530,13 @@ impl<'a> Emitter<'a> {
             );
             return;
         };
-        let qualified = self
-            .enum_context
-            .as_ref()
-            .filter(|context| context.members.iter().any(|member| member == text))
-            .map(|context| context.object.clone());
-        if let Some(object) = qualified {
-            self.raw(&object);
-            self.raw(".");
+        if let Some(member) = self.enum_facts.member_use(ident.id()) {
+            let enum_name = self.model.symbol(member.enum_symbol()).name().to_owned();
+            self.raw(&enum_name);
+            self.raw("[");
+            self.emit_enum_string(member.name());
+            self.raw("]");
+            return;
         }
         self.raw(text);
     }
@@ -2368,6 +2417,11 @@ impl<'a> Emitter<'a> {
                     );
                     false
                 }
+                ExportDefaultValue::Interface(interface) => {
+                    self.raw("export default ");
+                    self.emit_interface_decl(interface);
+                    true
+                }
             },
             ExportDeclaration::Assignment(expression) => {
                 self.raw("export = ");
@@ -2657,8 +2711,20 @@ impl<'a> Emitter<'a> {
 
     fn emit_namespace_decl(&mut self, namespace: &NamespaceDeclaration) {
         self.emit_declare_prefix();
-        self.raw("namespace ");
-        self.emit_ident(&namespace.name);
+        match &namespace.name {
+            NamespaceName::Identifier { name, keyword } => {
+                self.raw(keyword.as_str());
+                self.raw(" ");
+                self.emit_ident(name);
+            }
+            NamespaceName::StringLiteral(literal) => {
+                self.raw("module ");
+                self.emit_string(literal);
+            }
+            NamespaceName::Global { .. } => {
+                self.raw("global");
+            }
+        }
         self.raw(" {");
         let body = namespace.body.data();
         if body.statements.is_empty() {
@@ -3110,25 +3176,6 @@ fn is_parameter_property(parameter: &Parameter) -> bool {
         || parameter.modifiers.is_override
 }
 
-/// Returns `Some` when `expression` is a numeric literal (optionally behind a
-/// unary `+`/`-`), with the integer value when it is an exact integer.
-fn numeric_literal_value(expression: &Expr) -> Option<Option<i64>> {
-    match expression.data() {
-        Expression::Literal(Literal::Number(_)) => Some(None),
-        Expression::Unary(unary)
-            if matches!(unary.operator, UnaryOperator::Plus | UnaryOperator::Minus)
-                && matches!(
-                    unary.argument.data(),
-                    Expression::Literal(Literal::Number(_))
-                ) =>
-        {
-            Some(None)
-        }
-        Expression::Parenthesized(inner) => numeric_literal_value(inner),
-        _ => None,
-    }
-}
-
 const fn variable_kind_str(kind: VariableKind) -> &'static str {
     match kind {
         VariableKind::Var => "var",
@@ -3280,7 +3327,7 @@ fn is_low_precedence_type(ty: &Ty) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::{ScriptKind, Utf16Pos};
+    use crate::source::{ScriptKind, SourceId, SourceText, Utf16Pos};
     use std::sync::Arc;
 
     /// Builds an AST with token ranges that point into a real source string, so
@@ -3338,7 +3385,8 @@ mod tests {
         }
 
         fn finish(self, statements: Vec<Stmt>) -> SourceFile {
-            let source = Arc::new(SourceText::new(self.text));
+            let source =
+                Arc::new(SourceText::new(self.text).expect("test source fits the per-file budget"));
             let len = source.len_utf16();
             let full = TextRange::new(Utf16Pos::ZERO, len).expect("range");
             let eof = Token::new(
@@ -3531,6 +3579,7 @@ mod tests {
             },
         );
         let declaration = stmt(Statement::Variable(VariableDeclaration {
+            range: dummy(),
             kind: VariableKind::Let,
             declarations: vec![declarator],
         }));
@@ -3547,11 +3596,11 @@ mod tests {
         // (a + b as T) * c erases to (a + b) * c.
         let as_expr = expr(Expression::As(AsExpression {
             expression: Box::new(binary(BinaryOperator::Add, a, bb)),
-            type_node: Box::new(Node::new(
+            type_node: Some(Box::new(Node::new(
                 NodeId::new(0),
                 dummy(),
                 TypeNode::Keyword(KeywordType::Any),
-            )),
+            ))),
         }));
         let tree = binary(BinaryOperator::Multiply, as_expr, c);
         let file = b.finish(vec![expr_stmt(tree)]);
@@ -3587,7 +3636,7 @@ mod tests {
         let mut b = Builder::new();
         let enum_name = b.ident("E");
         let member_a = Node::new(
-            NodeId::new(0),
+            NodeId::new(1),
             dummy(),
             EnumMember {
                 name: PropertyName::Identifier(b.ident("A")),
@@ -3595,18 +3644,22 @@ mod tests {
             },
         );
         let member_b = Node::new(
-            NodeId::new(0),
+            NodeId::new(2),
             dummy(),
             EnumMember {
                 name: PropertyName::Identifier(b.ident("B")),
                 initializer: None,
             },
         );
-        let declaration = stmt(Statement::Enum(EnumDeclaration {
-            is_const: false,
-            name: enum_name,
-            members: vec![member_a, member_b],
-        }));
+        let declaration = Node::new(
+            NodeId::new(3),
+            dummy(),
+            Statement::Enum(EnumDeclaration {
+                is_const: false,
+                name: enum_name,
+                members: vec![member_a, member_b],
+            }),
+        );
         let file = b.finish(vec![declaration]);
         let expected = "var E;\n(function (E) {\n    E[E[\"A\"] = 0] = \"A\";\n    E[E[\"B\"] = 1] = \"B\";\n})(E || (E = {}));\n";
         assert_eq!(emit_js(&file).code, expected);
@@ -3618,18 +3671,22 @@ mod tests {
         let enum_name = b.ident("E");
         let value = b.string("\"hi\"");
         let member = Node::new(
-            NodeId::new(0),
+            NodeId::new(1),
             dummy(),
             EnumMember {
                 name: PropertyName::Identifier(b.ident("A")),
                 initializer: Some(Box::new(expr(Expression::Literal(Literal::String(value))))),
             },
         );
-        let declaration = stmt(Statement::Enum(EnumDeclaration {
-            is_const: false,
-            name: enum_name,
-            members: vec![member],
-        }));
+        let declaration = Node::new(
+            NodeId::new(2),
+            dummy(),
+            Statement::Enum(EnumDeclaration {
+                is_const: false,
+                name: enum_name,
+                members: vec![member],
+            }),
+        );
         let file = b.finish(vec![declaration]);
         let expected = "var E;\n(function (E) {\n    E[\"A\"] = \"hi\";\n})(E || (E = {}));\n";
         assert_eq!(emit_js(&file).code, expected);
@@ -3646,7 +3703,13 @@ mod tests {
                 statements: Vec::new(),
             },
         );
-        let declaration = stmt(Statement::Namespace(NamespaceDeclaration { name, body }));
+        let declaration = stmt(Statement::Namespace(NamespaceDeclaration {
+            name: NamespaceName::Identifier {
+                name,
+                keyword: NamespaceKeyword::Namespace,
+            },
+            body,
+        }));
         let file = b.finish(vec![declaration]);
         let output = emit_js(&file);
         assert_eq!(output.code, "");
@@ -3684,6 +3747,7 @@ mod tests {
             NodeId::new(0),
             dummy(),
             ClassMember::Constructor(ConstructorDeclaration {
+                decorators: Vec::new(),
                 modifiers: DeclarationModifiers::default(),
                 parameters: vec![parameter],
                 body: Node::new(
@@ -3773,6 +3837,7 @@ mod tests {
                     dummy(),
                     TypeNode::Keyword(KeywordType::Void),
                 )),
+                return_type_missing: false,
             }),
         );
         let number = Node::new(
@@ -3894,5 +3959,225 @@ mod tests {
         )));
         let file = b.finish(vec![export_stmt]);
         assert_eq!(emit_js(&file).code, "export { B } from \"./mod\";\n");
+    }
+
+    #[test]
+    fn export_assignment_emits_default_export_in_javascript_mode() {
+        let input = "const answer = 42;
+export = answer;";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+
+        let output = emit_js(parsed.product());
+        assert!(!output.has_errors());
+        assert_eq!(
+            output.code,
+            "const answer = 42;
+export default answer;
+"
+        );
+
+        let reparsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(
+                SourceText::new(output.code.as_str())
+                    .expect("test source fits the per-file budget"),
+            ),
+        ));
+        assert!(reparsed.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn decorators_round_trip_through_javascript_emit() {
+        let input = "@classFirst @classSecond class C {\n\
+                     @constructorFirst @constructorSecond\n\
+                     constructor(@constructorParameterFirst @constructorParameterSecond parameter) {}\n\
+                     @methodFirst @methodSecond\n\
+                     method(@methodParameterFirst @methodParameterSecond parameter) {}\n\
+                     @propertyFirst @propertySecond\n\
+                     property = 1;\n\
+                     @accessorFirst @accessorSecond\n\
+                     accessor value = 2;\n\
+                     }";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+
+        let output = emit_js(parsed.product());
+        assert!(!output.has_errors());
+        assert_eq!(
+            output.code,
+            concat!(
+                "@classFirst\n",
+                "@classSecond\n",
+                "class C {\n",
+                "    @constructorFirst\n",
+                "    @constructorSecond\n",
+                "    constructor(@constructorParameterFirst @constructorParameterSecond parameter) {}\n",
+                "    @methodFirst\n",
+                "    @methodSecond\n",
+                "    method(@methodParameterFirst @methodParameterSecond parameter) {}\n",
+                "    @propertyFirst\n",
+                "    @propertySecond\n",
+                "    property = 1;\n",
+                "    @accessorFirst\n",
+                "    @accessorSecond\n",
+                "    accessor value = 2;\n",
+                "}\n",
+            ),
+        );
+
+        let reparsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(
+                SourceText::new(output.code.as_str())
+                    .expect("test source fits the per-file budget"),
+            ),
+        ));
+        assert!(reparsed.diagnostics().is_empty());
+        let file = reparsed.product();
+        let source = file.source_text();
+        let decorator_texts = |decorators: &[DecoratorNode]| {
+            decorators
+                .iter()
+                .map(|decorator| {
+                    let range = decorator.range();
+                    let start = source
+                        .utf16_to_byte(range.start())
+                        .expect("decorator range starts on a source boundary");
+                    let end = source
+                        .utf16_to_byte(range.end())
+                        .expect("decorator range ends on a source boundary");
+                    &source.as_str()[start..end]
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let Statement::Class(class) = file.statements()[0].data() else {
+            panic!("expected a class declaration");
+        };
+        assert_eq!(
+            decorator_texts(&class.decorators),
+            ["@classFirst", "@classSecond"]
+        );
+
+        let ClassMember::Constructor(constructor) = class.members[0].data() else {
+            panic!("expected a constructor");
+        };
+        assert_eq!(
+            decorator_texts(&constructor.decorators),
+            ["@constructorFirst", "@constructorSecond"]
+        );
+        assert_eq!(
+            decorator_texts(&constructor.parameters[0].data().decorators),
+            ["@constructorParameterFirst", "@constructorParameterSecond"]
+        );
+
+        let ClassMember::Method(method) = class.members[1].data() else {
+            panic!("expected a method");
+        };
+        assert_eq!(
+            decorator_texts(&method.function.decorators),
+            ["@methodFirst", "@methodSecond"]
+        );
+        assert_eq!(
+            decorator_texts(&method.function.parameters[0].data().decorators),
+            ["@methodParameterFirst", "@methodParameterSecond"]
+        );
+
+        let ClassMember::Property(property) = class.members[2].data() else {
+            panic!("expected a property");
+        };
+        assert_eq!(
+            decorator_texts(&property.decorators),
+            ["@propertyFirst", "@propertySecond"]
+        );
+
+        let ClassMember::AutoAccessor(accessor) = class.members[3].data() else {
+            panic!("expected an auto-accessor");
+        };
+        assert_eq!(
+            decorator_texts(&accessor.decorators),
+            ["@accessorFirst", "@accessorSecond"]
+        );
+    }
+
+    #[test]
+    fn declaration_mode_emits_ambient_module_forms() {
+        let source = Arc::new(SourceText::new(
+            "declare module \"pkg\" { export interface X {} }\ndeclare global { interface Window { x: number } }\ndeclare namespace Foo {}\ndeclare module Bar {}",
+        ).expect("test source fits the per-file budget"));
+        let scanned = crate::scanner::scan(SourceId::new(0), ScriptKind::TypeScript, source);
+        let parsed = crate::parser::parse(scanned);
+        let output = emit(parsed.product(), EmitOptions::declaration());
+        assert!(
+            output.code.contains("declare module \"pkg\""),
+            "got: {}",
+            output.code
+        );
+        assert!(
+            output.code.contains("declare global"),
+            "got: {}",
+            output.code
+        );
+        assert!(
+            output.code.contains("declare namespace Foo"),
+            "got: {}",
+            output.code
+        );
+        assert!(
+            output.code.contains("declare module Bar"),
+            "identifier-named module must round-trip module keyword, got: {}",
+            output.code
+        );
+        assert!(
+            !output.code.contains("declare namespace Bar"),
+            "module Bar must not be rewritten to namespace, got: {}",
+            output.code
+        );
+    }
+
+    #[test]
+    fn javascript_mode_reports_unlowered_for_string_and_global_namespaces() {
+        let source = Arc::new(
+            SourceText::new("module \"pkg\" {}").expect("test source fits the per-file budget"),
+        );
+        let scanned = crate::scanner::scan(SourceId::new(0), ScriptKind::TypeScript, source);
+        let parsed = crate::parser::parse(scanned);
+        let string_out = emit_js(parsed.product());
+        assert_eq!(string_out.code, "");
+        assert!(
+            string_out
+                .diagnostics
+                .iter()
+                .any(|d| d.code() == codes::NAMESPACE_UNLOWERED)
+        );
+
+        let b = Builder::new();
+        let body = Node::new(
+            NodeId::new(0),
+            dummy(),
+            Block {
+                statements: Vec::new(),
+            },
+        );
+        let declaration = stmt(Statement::Namespace(NamespaceDeclaration {
+            name: NamespaceName::Global { range: dummy() },
+            body,
+        }));
+        let global_file = b.finish(vec![declaration]);
+        let global_out = emit_js(&global_file);
+        assert_eq!(global_out.code, "");
+        assert_eq!(global_out.diagnostics.len(), 1);
+        assert_eq!(global_out.diagnostics[0].code(), codes::NAMESPACE_UNLOWERED);
     }
 }

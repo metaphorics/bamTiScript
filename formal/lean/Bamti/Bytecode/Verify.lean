@@ -76,6 +76,14 @@ noncomputable def verify (program : Program) : VerifyResult := by
   classical
   exact if verifies program then .accepted else .rejected
 
+/-- The model is pinned to the production v4 envelope, module blob, and `CreateCell` tag. -/
+theorem format_v4_createCell_tag :
+    formatVersion = 4 ∧
+      programMagicBytes = [66, 77, 84, 80, 67, 0, 0, 1] ∧
+      moduleMagicBytes = [66, 77, 84, 66, 67, 0, 0, 1] ∧
+      encodeOpcode .createCell = encodeField 36 := by
+  decide
+
 theorem decode_total (wire : Wire) :
     (∃ program, decode wire = .accepted program) ∨
       ∃ error, decode wire = .rejected error := by
@@ -83,15 +91,15 @@ theorem decode_total (wire : Wire) :
   | accepted program => exact Or.inl ⟨program, rfl⟩
   | rejected error => exact Or.inr ⟨error, rfl⟩
 
-theorem decode_encode_canonical (program : Program) (h : programCanonical program) :
+theorem decode_encode_canonical (program : ProgramEnvelope) (h : envelopeCanonical program) :
     decode (encode program) = .accepted program := by
-  rcases h with ⟨codeCanonical, handlersCanonical⟩
-  have versionBound : formatVersion < 128 := by decide
-  simp [decode, encode, decodeField, encodeField, FieldLimit, versionBound,
-    decodeInstructions_encodeInstructions program.code codeCanonical,
-    decodeHandlers_encodeHandlers program.handlers handlersCanonical]
+  rcases h with ⟨entryCanonical, modulesCanonical⟩
+  have versionBound : formatVersion < FieldLimit := by decide
+  simp [decode, encode, decodeField_encodeField formatVersion versionBound,
+    decodeField_encodeField program.entry entryCanonical,
+    decodeProgramModules_encodeProgramModules program.modules modulesCanonical]
 
-theorem encode_decode_identity (wire : Wire) (program : Program)
+theorem encode_decode_identity (wire : Wire) (program : ProgramEnvelope)
     (hdecode : decode wire = .accepted program) (hcanonical : wireCanonical wire) :
     encode program = wire := by
   rcases hcanonical with ⟨canonicalProgram, canonicalProgramCanonical, hwire⟩

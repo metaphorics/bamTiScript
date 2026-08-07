@@ -1,8 +1,36 @@
+pub mod check_cells;
 pub mod corpus;
+pub mod facets;
 pub mod formal_bridge;
 pub mod formal_gates;
 pub mod ledger;
+pub mod oracle_pins;
+pub mod perf;
+pub mod suite;
+pub mod ts_ledger;
 pub mod workspace_guard;
+
+pub use facets::{
+    DiagnosticCodeMap, FacetDiagnostic, FacetVerdict, VerifiedJsOutcome, compare_diagnostics,
+    compare_dts, compare_js, compare_js_cases, compare_symbols, compare_types,
+    load_diagnostic_code_map, parse_diagnostic_code_map,
+};
+pub use oracle_pins::{OraclePins, verify_oracle_pins};
+pub use perf::{
+    ArtifactPolicy, Baseline, Benchmark, BenchmarkManifest, BudgetPolicy, HostConditions,
+    HostFingerprint, HostManifest, MachineFingerprint, MeasureOptions, MeasureResult,
+    ObservedConditions, PerfError, PerfErrorCode, Quantiles, ReleaseBaseline, ReleasePolicy,
+    RssPolicy, WallRatioPolicy, compare as compare_perf, evaluate_budgets, load_host,
+    load_manifest as load_perf_manifest, load_policy, load_result, measure, nearest_rank,
+    read_machine_fingerprint,
+};
+pub use suite::{
+    AssetKind, BackendFilter, CellResult, CiMode, CiOptions, FailureClass, IndexEntry,
+    RunFilterOptions, RunState, StatusFilter, SuiteIndex, SuiteRunReport, SuiteSnapshot,
+    SyncOptions, VerifiedSuite, audit_ledger, run_ci, run_suite, run_suite_with_telemetry,
+    sync_suite, write_suite_ledger,
+};
+pub use ts_ledger::{TsLedger, TsLedgerReader, TsLedgerWriter};
 
 use std::fmt;
 
@@ -62,6 +90,7 @@ pub enum ErrorCode {
     ToolMissing,
     ToolFailed,
     Replay,
+    ProvenanceMismatch,
 }
 
 impl ErrorCode {
@@ -81,6 +110,7 @@ impl ErrorCode {
             Self::ToolMissing => "E_TOOL_MISSING",
             Self::ToolFailed => "E_TOOL_FAILED",
             Self::Replay => "E_REPLAY",
+            Self::ProvenanceMismatch => "PROVENANCE_MISMATCH",
         }
     }
 }

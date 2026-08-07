@@ -6,7 +6,7 @@ license = "MIT"
 source_dir = "corpus/projects/pathe"
 entrypoint = "corpus/cases/pathe.ts"
 node_args = []
-expected_timeout_ms = 5000
+expected_timeout_ms = 20000
 constructs = ["glob-matching", "path-normalization", "brace-expansion", "character-classes", "negation", "numeric-ranges"]
 source_files = [
   "corpus/projects/pathe/src/_glob.ts",

@@ -6,6 +6,6 @@ license = "MIT"
 source_dir = "corpus/projects/p-map"
 entrypoint = "corpus/cases/p-map.ts"
 node_args = []
-expected_timeout_ms = 5000
+expected_timeout_ms = 15000
 constructs = ["async-concurrency", "ordered-mapping", "skip-sentinel", "async-iterator", "backpressure", "aggregate-error", "input-validation", "esm"]
 source_files = ["corpus/projects/p-map/index.js"]

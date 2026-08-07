@@ -1,0 +1,479 @@
+{
+  "schemaVersion": 1,
+  "entries": [
+    {
+      "bamtsCode": "BAMTS-C001",
+      "evidence": "Block-scoped redeclaration -> TS2451 via tsc --noEmit on \"let x = 1; let x = 2;\".",
+      "status": "mapped",
+      "tsCode": 2451
+    },
+    {
+      "bamtsCode": "BAMTS-C002",
+      "evidence": "Unresolved value reference -> TS2304 via tsc --noEmit on \"y = 1;\".",
+      "status": "mapped",
+      "tsCode": 2304
+    },
+    {
+      "bamtsCode": "BAMTS-C003",
+      "evidence": "Unresolved type reference -> TS2304 via tsc --noEmit on \"let x: Foo;\" (type positions share TS2304 with value positions).",
+      "status": "mapped",
+      "tsCode": 2304
+    },
+    {
+      "bamtsCode": "BAMTS-C004",
+      "evidence": "Initializer not assignable to its annotation -> TS2322 via tsc --noEmit on \"const n: number = \\\"oops\\\";\".",
+      "status": "mapped",
+      "tsCode": 2322
+    },
+    {
+      "bamtsCode": "BAMTS-C005",
+      "evidence": "Enum member name that is not an identifier, string literal, or numeric literal -> TS1164 via tsc --noEmit on \"const k = \\\"a\\\"; enum E { [k] = 1 }\".",
+      "status": "mapped",
+      "tsCode": 1164
+    },
+    {
+      "bamtsCode": "BAMTS-C006",
+      "evidence": "Enum member without initializer after a non-numeric member -> TS1061 via tsc --noEmit on \"enum E { A = \\\"x\\\", B }\".",
+      "status": "mapped",
+      "tsCode": 1061
+    },
+    {
+      "bamtsCode": "BAMTS-C007",
+      "evidence": "Const enum member with a non-constant initializer -> TS2474 via tsc --noEmit on \"const enum E { A = f() }\"; ambient enum declarations report the same condition as TS1066.",
+      "status": "mapped",
+      "tsCode": 2474
+    },
+    {
+      "bamtsCode": "BAMTS-C008",
+      "evidence": "Const enum member initializer evaluating to NaN or Infinity -> TS2477 via tsc --noEmit on \"const enum E { A = 1/0 }\".",
+      "status": "mapped",
+      "tsCode": 2477
+    },
+    {
+      "bamtsCode": "BAMTS-C009",
+      "evidence": "Enum member initializer referencing itself through a later member -> TS2651 via tsc --noEmit on \"enum E { A = B, B = A }\"; a direct self-reference surfaces as TS2565.",
+      "status": "mapped",
+      "tsCode": 2651
+    },
+    {
+      "bamtsCode": "BAMTS-C010",
+      "evidence": "Merged enum declarations disagreeing on constness -> TS2567 via tsc --noEmit on \"const enum E { A = 1 } enum E { B = 2 }\" (either declaration order).",
+      "status": "mapped",
+      "tsCode": 2567
+    },
+    {
+      "bamtsCode": "BAMTS-C011",
+      "evidence": "Two declarations of a merged enum both omitting the first member initializer -> TS2432 via tsc --noEmit on \"enum E { A } enum E { B }\".",
+      "status": "mapped",
+      "tsCode": 2432
+    },
+    {
+      "bamtsCode": "BAMTS-C012",
+      "evidence": "Imported const-enum member that cannot be resolved -> TS2339 via tsc --noEmit on \"import { E } from \\\"./a\\\"; const x = E.Missing;\" with a.ts exporting const enum E.",
+      "status": "mapped",
+      "tsCode": 2339
+    },
+    {
+      "bamtsCode": "BAMTS-C013",
+      "evidence": "Qualified type name whose left side is not a namespace -> TS2503 via tsc --noEmit on \"let x: A.B;\".",
+      "status": "mapped",
+      "tsCode": 2503
+    },
+    {
+      "bamtsCode": "BAMTS-C014",
+      "evidence": "Cyclic const-enum re-export chain -> TS2303 via tsc --noEmit on a.ts and b.ts re-exporting E from each other, imported by main.ts.",
+      "status": "mapped",
+      "tsCode": 2303
+    },
+    {
+      "bamtsCode": "BAMTS-C015",
+      "evidence": "Imported const-enum member whose initializer is not constant -> TS2474 via tsc --noEmit on \"export const enum E { A = f() }\" imported from main.ts.",
+      "status": "mapped",
+      "tsCode": 2474
+    },
+    {
+      "bamtsCode": "BAMTS-C016",
+      "evidence": "Const-enum export-star lookup with multiple candidates -> TS2308 via tsc --noEmit on \"export * from \\\"./a\\\"; export * from \\\"./b\\\";\" where both export E.",
+      "status": "mapped",
+      "tsCode": 2308
+    },
+    {
+      "bamtsCode": "BAMTS-C017",
+      "evidence": "Export assignment mixed with other exported elements -> TS2309 via tsc --noEmit --module commonjs on \"export = 1; export const x = 2;\" (ESM targets additionally report TS1203).",
+      "status": "mapped",
+      "tsCode": 2309
+    },
+    {
+      "bamtsCode": "BAMTS-C018",
+      "evidence": "Parameter decorator -> TS1206 via tsc --noEmit on \"class A { m(@d x: number) {} }\" in the default decorator mode; the legacy --experimentalDecorators mode accepts parameter decorators.",
+      "status": "mapped",
+      "tsCode": 1206
+    },
+    {
+      "bamtsCode": "BAMTS-C019",
+      "evidence": "Constructor decorator -> TS1206 via tsc --noEmit on \"class A { @d constructor() {} }\" in both default and --experimentalDecorators modes.",
+      "status": "mapped",
+      "tsCode": 1206
+    },
+    {
+      "bamtsCode": "BAMTS-L001",
+      "evidence": "Unterminated string literal -> TS1002 via tsc --noEmit on \"\\n.",
+      "status": "mapped",
+      "tsCode": 1002
+    },
+    {
+      "bamtsCode": "BAMTS-L002",
+      "evidence": "Unterminated block comment -> TS1010 via tsc --noEmit on /* nope.",
+      "status": "mapped",
+      "tsCode": 1010
+    },
+    {
+      "bamtsCode": "BAMTS-L003",
+      "evidence": "Unterminated template literal -> TS1160 via tsc --noEmit on `open.",
+      "status": "mapped",
+      "tsCode": 1160
+    },
+    {
+      "bamtsCode": "BAMTS-L004",
+      "evidence": "Unterminated regular expression literal -> TS1161 via tsc --noEmit on /open.",
+      "status": "mapped",
+      "tsCode": 1161
+    },
+    {
+      "bamtsCode": "BAMTS-L005",
+      "evidence": "Unexpected / invalid character -> TS1127 via tsc --noEmit on \\u0007a.",
+      "status": "mapped",
+      "tsCode": 1127
+    },
+    {
+      "bamtsCode": "BAMTS-L006",
+      "evidence": "Invalid escape sequence -> TS1488 via tsc --noEmit on \"\\8\".",
+      "status": "mapped",
+      "tsCode": 1488
+    },
+    {
+      "bamtsCode": "BAMTS-L007",
+      "evidence": "Invalid unicode escape -> TS1125 via tsc --noEmit on \"\\u{G}\".",
+      "status": "mapped",
+      "tsCode": 1125
+    },
+    {
+      "bamtsCode": "BAMTS-L008",
+      "evidence": "Multiple consecutive numeric separators -> TS6189 via tsc --noEmit on 1__2.",
+      "status": "mapped",
+      "tsCode": 6189
+    },
+    {
+      "bamtsCode": "BAMTS-L009",
+      "evidence": "Numeric literal missing digits (exponent) -> TS1124 via tsc --noEmit on 1e.",
+      "status": "mapped",
+      "tsCode": 1124
+    },
+    {
+      "bamtsCode": "BAMTS-L010",
+      "evidence": "BigInt literal must be integer -> TS1353 via tsc --noEmit on 1.5n.",
+      "status": "mapped",
+      "tsCode": 1353
+    },
+    {
+      "bamtsCode": "BAMTS-L011",
+      "evidence": "Invalid private identifier / hash not followed by identifier -> TS1127 via tsc --noEmit on \"# \".",
+      "status": "mapped",
+      "tsCode": 1127
+    },
+    {
+      "bamtsCode": "BAMTS-P001",
+      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P002",
+      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P003",
+      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P004",
+      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P005",
+      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P006",
+      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P007",
+      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P009",
+      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P010",
+      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P011",
+      "evidence": "Reserved for parser-side `using` declaration grammar recovery.",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P012",
+      "evidence": "Reserved for parser-side `using` declaration grammar recovery.",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-C020",
+      "evidence": "Intrinsic JSX tag absent from JSX.IntrinsicElements -> TS2339 via tsc --noEmit --jsx preserve on \"<bar />\" in a .tsx file where IntrinsicElements declares only foo.",
+      "status": "mapped",
+      "tsCode": 2339
+    },
+    {
+      "bamtsCode": "BAMTS-C021",
+      "evidence": "JSX element type with neither call nor construct signatures -> TS2604 via tsc --noEmit --jsx preserve on \"const X: number = 5; const y = <X />;\" in a .tsx file.",
+      "status": "mapped",
+      "tsCode": 2604
+    },
+    {
+      "bamtsCode": "BAMTS-C022",
+      "evidence": "JSX attributes not assignable to the element's props type -> TS2322 via tsc --noEmit --jsx preserve on \"<foo a=\\\"s\\\" />\" in a .tsx file with props { a: number } (a missing required prop surfaces as TS2741).",
+      "status": "mapped",
+      "tsCode": 2322
+    },
+    {
+      "bamtsCode": "BAMTS-C023",
+      "evidence": "with statement in TypeScript source -> TS1101 via tsc --noEmit on \"with ({}) {}\"; TypeScript 7.0.2 reports TS1101 in strict, module, and non-strict .ts files alike (and TS2410 in every mode).",
+      "status": "mapped",
+      "tsCode": 1101
+    },
+    {
+      "bamtsCode": "BAMTS-C024",
+      "evidence": "Bare super expression not followed by an argument list or member access -> TS1034 via tsc --noEmit on \"let x = super;\" (also on \"super;\", \"(super)()\", and \"super`x`\").",
+      "status": "mapped",
+      "tsCode": 1034
+    },
+    {
+      "bamtsCode": "BAMTS-C025",
+      "evidence": "super call in a class with no base class -> TS2335 via tsc --noEmit on \"class A { constructor() { super(); } }\" and on base-constructor parameter initializers \"class A { constructor(x = super()) {} }\".",
+      "status": "mapped",
+      "tsCode": 2335
+    },
+    {
+      "bamtsCode": "BAMTS-C026",
+      "evidence": "super call outside a constructor or in a function nested inside one -> TS2337 via tsc --noEmit on \"function f() { super(); }\", and likewise at top level, in object-literal methods, class methods, field initializers, and static blocks.",
+      "status": "mapped",
+      "tsCode": 2337
+    },
+    {
+      "bamtsCode": "BAMTS-C027",
+      "evidence": "super call in derived-constructor parameter initializers -> TS2336 via tsc --noEmit on \"class A extends Object { constructor(x = super()) { super(); } }\".",
+      "status": "mapped",
+      "tsCode": 2336
+    },
+    {
+      "bamtsCode": "BAMTS-C028",
+      "evidence": "Class property with no initializer and no constructor assignment -> TS2564 via tsc --noEmit on \"class C { x: number; }\".",
+      "status": "mapped",
+      "tsCode": 2564
+    },
+    {
+      "bamtsCode": "BAMTS-C029",
+      "evidence": "Assignment to a function identifier -> TS2630 via tsc --noEmit on \"function f() {} f = 1;\".",
+      "status": "mapped",
+      "tsCode": 2630
+    },
+    {
+      "bamtsCode": "BAMTS-C030",
+      "evidence": "Assignment to a namespace identifier -> TS2631 via tsc --noEmit on \"namespace N {} N = 1;\".",
+      "status": "mapped",
+      "tsCode": 2631
+    },
+    {
+      "bamtsCode": "BAMTS-C031",
+      "evidence": "Invalid left-hand side in a for-in statement -> TS2406 via tsc --noEmit on \"for (new foo() in b) {}\".",
+      "status": "mapped",
+      "tsCode": 2406
+    },
+    {
+      "bamtsCode": "BAMTS-C032",
+      "evidence": "'using' declaration as the left-hand side of a 'for...in' statement -> TS1493 via tsc --noEmit on \"for (using x in {}) {}\".",
+      "status": "mapped",
+      "tsCode": 1493
+    },
+    {
+      "bamtsCode": "BAMTS-C033",
+      "evidence": "'await using' declaration as the left-hand side of a 'for...in' statement -> TS1494 via tsc --noEmit on \"async function f() { for (await using x in {}) {} }\".",
+      "status": "mapped",
+      "tsCode": 1494
+    },
+    {
+      "bamtsCode": "BAMTS-C034",
+      "evidence": "`using` or `await using` declaration with a binding pattern -> TS1492 via tsc --noEmit on \"for (using {} of []) {}\".",
+      "status": "mapped",
+      "tsCode": 1492
+    },
+    {
+      "bamtsCode": "BAMTS-C035",
+      "evidence": "`using` or `await using` declaration missing an initializer -> TS1155 via tsc --noEmit on \"for (using of;;) break;\".",
+      "status": "mapped",
+      "tsCode": 1155
+    },
+    {
+      "bamtsCode": "BAMTS-C036",
+      "evidence": "Invalid assignment target -> TS2364 via tsc --noEmit on \"new foo() = 1;\".",
+      "status": "mapped",
+      "tsCode": 2364
+    },
+    {
+      "bamtsCode": "BAMTS-C037",
+      "evidence": "Method, call, or construct signature missing return type -> TS7010 via tsc --noEmit on \"interface I { foo(n: string); }\".",
+      "status": "mapped",
+      "tsCode": 7010
+    },
+    {
+      "bamtsCode": "BAMTS-C038",
+      "evidence": "Variable used before being assigned -> TS2454 via tsc --noEmit on \"let x: number; console.log(x);\".",
+      "status": "mapped",
+      "tsCode": 2454
+    },
+    {
+      "bamtsCode": "BAMTS-C039",
+      "evidence": "Function overload signature missing an immediately following implementation -> TS2391 via tsc --noEmit on \"function foo(); 1+1; function foo() {}\".",
+      "status": "mapped",
+      "tsCode": 2391
+    },
+    {
+      "bamtsCode": "BAMTS-C040",
+      "evidence": "Function declaration inside a block in strict mode when targeting ES5 -> TS1250 via tsc --noEmit on \"for(;;) { function f() {} }\".",
+      "status": "mapped",
+      "tsCode": 1250
+    },
+    {
+      "bamtsCode": "BAMTS-C041",
+      "evidence": "Import declaration conflicts with a local declaration -> TS2440 via tsc --noEmit on \"import {f} from \"./f1\"; function f() {}\".",
+      "status": "mapped",
+      "tsCode": 2440
+    },
+    {
+      "bamtsCode": "BAMTS-C044",
+      "evidence": "new.target outside function/constructor body -> TS17013 via tsc --noEmit on \"new.target\".",
+      "status": "mapped",
+      "tsCode": 17013
+    },
+    {
+      "bamtsCode": "BAMTS-C042",
+      "evidence": "The left-hand side of an arithmetic operation must be numeric -> TS2362 via tsc --noEmit on \"enum E { a = `1` - `1` }\".",
+      "status": "mapped",
+      "tsCode": 2362
+    },
+    {
+      "bamtsCode": "BAMTS-C043",
+      "evidence": "The right-hand side of an arithmetic operation must be numeric -> TS2363 via tsc --noEmit on \"enum E { a = `1` - `1` }\".",
+      "status": "mapped",
+      "tsCode": 2363
+    }
+    ,
+    {
+      "bamtsCode": "BAMTS-C045",
+      "evidence": "A 'set' accessor parameter cannot have an initializer -> TS1052 via tsc --noEmit on \"class C { set foo(x = 1) {} }\".",
+      "status": "mapped",
+      "tsCode": 1052
+    }
+    ,
+    {
+      "bamtsCode": "BAMTS-C046",
+      "evidence": "An implementation cannot be declared in ambient contexts -> TS1183 via tsc --noEmit on \"declare class C { get foo() {} }\".",
+      "status": "mapped",
+      "tsCode": 1183
+    }
+    ,
+    {
+      "bamtsCode": "BAMTS-C047",
+      "evidence": "A 'get' accessor cannot have parameters -> TS1054 via tsc --noEmit on \"var v = { get foo(v: number) { } };\".",
+      "status": "mapped",
+      "tsCode": 1054
+    },
+    {
+      "bamtsCode": "BAMTS-C048",
+      "evidence": "A 'get' accessor must return a value -> TS2378 via tsc --noEmit on \"var v = { get foo(v: number) { } };\".",
+      "status": "mapped",
+      "tsCode": 2378
+    }
+    ,
+    {
+      "bamtsCode": "BAMTS-C049",
+      "evidence": "Function implementation name must match overload signature -> TS2389 via tsc --noEmit on \"class C { foo(); bar() {} }\".",
+      "status": "mapped",
+      "tsCode": 2389
+    }
+    ,
+    {
+      "bamtsCode": "BAMTS-C050",
+      "evidence": "Type parameters cannot appear on a constructor declaration -> TS1092 via tsc --noEmit on \"class C { constructor<T>() { } }\".",
+      "status": "mapped",
+      "tsCode": 1092
+    }
+    ,
+    {
+      "bamtsCode": "BAMTS-C051",
+      "evidence": "'export' modifier cannot appear on class elements -> TS1031 via tsc --noEmit on \"class C { export get Foo() { } }\".",
+      "status": "mapped",
+      "tsCode": 1031
+    },
+    {
+      "bamtsCode": "BAMTS-C052",
+      "evidence": "Statements are not allowed in ambient contexts -> TS1036 via tsc --noEmit on a .d.ts file containing 'try { } catch (e) { }'.",
+      "status": "mapped",
+      "tsCode": 1036
+    },
+    {
+      "bamtsCode": "BAMTS-C053",
+      "evidence": "Argument type is not assignable to parameter type -> TS2345 via tsc --noEmit on 'function foo(a: string) {}; foo(2);'.",
+      "status": "mapped",
+      "tsCode": 2345
+    },
+    {
+      "bamtsCode": "BAMTS-C054",
+      "evidence": "Supplied arguments do not match the expected parameter count -> TS2554 via tsc --noEmit on 'function foo(a: string) {}; foo(); foo(\"x\", \"y\");'.",
+      "status": "mapped",
+      "tsCode": 2554
+    },
+    {
+      "bamtsCode": "BAMTS-C055",
+      "evidence": "Expression with no call signatures is invoked -> TS2349 via tsc --noEmit on 'const x = 1; x();'.",
+      "status": "mapped",
+      "tsCode": 2349
+    },
+    {
+      "bamtsCode": "BAMTS-C057",
+      "evidence": "Property does not exist on this type -> TS2339 via tsc --noEmit on 'interface I { a: string; } declare var x: I; x.b;'.",
+      "status": "mapped",
+      "tsCode": 2339
+    }
+  ]
+}

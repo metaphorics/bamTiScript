@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
 use crate::source::{ScriptKind, SourceId, SourceText, TextRange, Utf16Pos};
-use crate::syntax::{Token, TokenKind};
+use crate::syntax::{Token, TokenKind, cook_identifier_text};
 
 /// Unterminated string literal.
 const UNTERMINATED_STRING: DiagnosticCode = DiagnosticCode::new("BAMTS-L001");
@@ -166,6 +166,16 @@ enum PendingBrace {
     Normal,
     /// A `${` template substitution; its closing `}` continues the template.
     Template,
+}
+
+/// How a JSX tag scanned by [`Scanner::scan_jsx_span`] relates to element
+/// nesting: an opening tag (or fragment `<>`) increases depth, a closing tag
+/// (or `</>`) decreases it, and a self-closing tag `<Foo />` leaves it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JsxTagKind {
+    Opening,
+    Closing,
+    SelfClosing,
 }
 
 /// A stateful lexical cursor over one immutable source text.
@@ -406,6 +416,195 @@ impl<'a> Scanner<'a> {
             }
         }
         self.make(TokenKind::StringLiteral, start_u)
+    }
+
+    /// Scans one complete JSX element or fragment beginning at the current
+    /// position, returning the tokens that tile it. The scanner is left
+    /// positioned immediately after the construct.
+    ///
+    /// The stream is JSX-aware where the default pass is not: element and
+    /// attribute names admit interior hyphens, character data between tags is a
+    /// single [`TokenKind::StringLiteral`] run that ignores comment and string
+    /// syntax, and expression containers are lexed as ordinary ECMAScript so
+    /// the parser can reparse them. Every produced token is emitted so the run
+    /// stays contiguous, and malformed input ends the scan without panicking.
+    #[must_use]
+    pub fn scan_jsx_span(&mut self) -> Vec<Token> {
+        let mut out = Vec::new();
+        // Elements and fragments whose children are still open.
+        let mut depth: usize = 0;
+        loop {
+            if depth > 0 {
+                let text = self.scan_jsx_text();
+                if !text.range().is_empty() {
+                    out.push(text);
+                }
+            }
+            match self.first() {
+                None => break,
+                Some('{') => self.scan_jsx_expression_tokens(&mut out),
+                Some('<') => match self.scan_jsx_tag(&mut out) {
+                    JsxTagKind::Opening => depth += 1,
+                    JsxTagKind::SelfClosing => {
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    JsxTagKind::Closing => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                },
+                Some(_) => break,
+            }
+        }
+        out
+    }
+
+    /// Scans one JSX tag (`<name ...>`, `<name ... />`, `</name>`, `<>`, or
+    /// `</>`) starting at `<`, classifying it for [`Self::scan_jsx_span`].
+    fn scan_jsx_tag(&mut self, out: &mut Vec<Token>) -> JsxTagKind {
+        out.push(self.next_token()); // `<`
+        self.push_jsx_trivia(out);
+        if self.first() == Some('/') {
+            out.push(self.next_token()); // `/`
+            self.push_jsx_trivia(out);
+            if self.first() != Some('>') {
+                self.scan_jsx_name(out);
+                self.push_jsx_trivia(out);
+            }
+            self.push_jsx_gt(out);
+            return JsxTagKind::Closing;
+        }
+        if self.first() == Some('>') {
+            self.push_jsx_gt(out); // `<>` fragment
+            return JsxTagKind::Opening;
+        }
+        self.scan_jsx_name(out);
+        loop {
+            self.push_jsx_trivia(out);
+            match self.first() {
+                None => return JsxTagKind::Opening,
+                Some('>') => {
+                    self.push_jsx_gt(out);
+                    return JsxTagKind::Opening;
+                }
+                Some('/') => {
+                    out.push(self.next_token()); // `/`
+                    self.push_jsx_trivia(out);
+                    if self.first() == Some('>') {
+                        self.push_jsx_gt(out);
+                    }
+                    return JsxTagKind::SelfClosing;
+                }
+                Some('{') => self.scan_jsx_expression_tokens(out),
+                Some(c) if is_id_start(c) => self.scan_jsx_attribute(out),
+                Some(_) => out.push(self.next_token()),
+            }
+        }
+    }
+
+    /// Emits an element or attribute name, following `.` and `:` separators so
+    /// `Foo.Bar` and `ns:Foo` scan into their component identifier tokens.
+    fn scan_jsx_name(&mut self, out: &mut Vec<Token>) {
+        let name = self.scan_jsx_identifier();
+        if name.range().is_empty() {
+            return;
+        }
+        out.push(name);
+        while matches!(self.first(), Some('.') | Some(':')) {
+            out.push(self.next_token()); // `.` or `:`
+            let part = self.scan_jsx_identifier();
+            if part.range().is_empty() {
+                break;
+            }
+            out.push(part);
+        }
+    }
+
+    /// Emits one attribute: a name (with optional `:namespace`) and an
+    /// optional `=` initializer that is a quoted string or `{expr}`.
+    fn scan_jsx_attribute(&mut self, out: &mut Vec<Token>) {
+        let name = self.scan_jsx_identifier();
+        if name.range().is_empty() {
+            out.push(self.next_token());
+            return;
+        }
+        out.push(name);
+        if self.first() == Some(':') {
+            out.push(self.next_token()); // `:`
+            let part = self.scan_jsx_identifier();
+            if !part.range().is_empty() {
+                out.push(part);
+            }
+        }
+        self.push_jsx_trivia(out);
+        if self.first() == Some('=') {
+            out.push(self.next_token()); // `=`
+            self.push_jsx_trivia(out);
+            match self.first() {
+                Some('"') | Some('\'') => out.push(self.scan_jsx_attribute_string()),
+                Some('{') => self.scan_jsx_expression_tokens(out),
+                _ => {}
+            }
+        }
+    }
+
+    /// Emits a `{ ... }` region as ordinary ECMAScript tokens, balancing braces
+    /// so the container's own closing `}` ends the run. Template substitution
+    /// braces are absorbed by the template tokens and never counted here.
+    fn scan_jsx_expression_tokens(&mut self, out: &mut Vec<Token>) {
+        out.push(self.next_token()); // `{`
+        let mut depth: usize = 1;
+        loop {
+            let token = self.next_token();
+            match token.kind() {
+                TokenKind::EndOfFile => break,
+                TokenKind::LBrace => {
+                    depth += 1;
+                    out.push(token);
+                }
+                TokenKind::RBrace => {
+                    depth -= 1;
+                    out.push(token);
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => out.push(token),
+            }
+        }
+    }
+
+    /// Emits whitespace and comment trivia so a JSX tag stays contiguous.
+    fn push_jsx_trivia(&mut self, out: &mut Vec<Token>) {
+        loop {
+            match self.first() {
+                Some(c) if is_whitespace(c) => out.push(self.next_token()),
+                Some('/') if matches!(self.second(), Some('/') | Some('*')) => {
+                    out.push(self.next_token());
+                }
+                _ => break,
+            }
+        }
+    }
+
+    /// Emits a single `>` that closes a JSX tag, narrowing a greedily formed
+    /// `>>`/`>=`-family operator when the source packed one.
+    fn push_jsx_gt(&mut self, out: &mut Vec<Token>) {
+        let token = self.next_token();
+        match token.kind() {
+            TokenKind::GreaterThan => out.push(token),
+            TokenKind::GreaterGreater
+            | TokenKind::GreaterGreaterGreater
+            | TokenKind::GreaterThanEq
+            | TokenKind::GreaterGreaterEq
+            | TokenKind::GreaterGreaterGreaterEq => out.push(self.rescan_greater_than()),
+            TokenKind::EndOfFile => {}
+            _ => out.push(token),
+        }
     }
 
     fn scan_whitespace(&mut self) -> TokenKind {
@@ -738,12 +937,19 @@ impl<'a> Scanner<'a> {
             }
         }
 
-        // Escaped identifiers are never keywords, matching the ECMAScript rule
-        // that a reserved word spelled with escapes is an ordinary identifier.
+        let word = &self.text[start_b..self.byte_pos];
         if had_escape {
+            let Some(cooked) = cook_identifier_text(word) else {
+                return TokenKind::Identifier;
+            };
+            if is_unconditional_reserved_word(&cooked) {
+                return TokenKind::EscapedReservedWord;
+            }
+            if matches!(cooked.as_ref(), "await" | "yield") {
+                return TokenKind::EscapedContextualKeyword;
+            }
             return TokenKind::Identifier;
         }
-        let word = &self.text[start_b..self.byte_pos];
         keyword_kind(word).unwrap_or(TokenKind::Identifier)
     }
 
@@ -761,11 +967,13 @@ impl<'a> Scanner<'a> {
         }
         self.bump();
         if let Some(code_point) = self.read_hex_code_point(esc_start) {
-            let valid = if is_start {
-                is_id_start(code_point)
-            } else {
-                is_id_continue(code_point)
-            };
+            let valid = char::try_from(code_point).ok().is_some_and(|character| {
+                if is_start {
+                    is_id_start(character)
+                } else {
+                    is_id_continue(character)
+                }
+            });
             if !valid {
                 self.error(
                     INVALID_UNICODE_ESCAPE,
@@ -860,7 +1068,7 @@ impl<'a> Scanner<'a> {
 
     /// Reads a `\u`-style code point after the `u` has been consumed, handling
     /// both the fixed four-digit and braced forms and reporting malformations.
-    fn read_hex_code_point(&mut self, esc_start: usize) -> Option<char> {
+    fn read_hex_code_point(&mut self, esc_start: usize) -> Option<u32> {
         if self.first() == Some('{') {
             self.bump();
             let mut value: u32 = 0;
@@ -903,7 +1111,7 @@ impl<'a> Scanner<'a> {
                 );
                 return None;
             }
-            char::from_u32(value)
+            Some(value)
         } else {
             let mut value: u32 = 0;
             let mut count = 0;
@@ -926,7 +1134,7 @@ impl<'a> Scanner<'a> {
                 );
                 return None;
             }
-            char::from_u32(value)
+            Some(value)
         }
     }
 
@@ -1196,6 +1404,49 @@ fn is_id_continue(c: char) -> bool {
     c == '$' || c == '_' || c == '\u{200C}' || c == '\u{200D}' || c.is_alphanumeric()
 }
 
+/// Returns whether an escaped identifier spells an unconditional reserved word.
+fn is_unconditional_reserved_word(word: &str) -> bool {
+    matches!(
+        word,
+        "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "const"
+            | "continue"
+            | "debugger"
+            | "default"
+            | "delete"
+            | "do"
+            | "else"
+            | "enum"
+            | "export"
+            | "extends"
+            | "false"
+            | "finally"
+            | "for"
+            | "function"
+            | "if"
+            | "import"
+            | "in"
+            | "instanceof"
+            | "new"
+            | "null"
+            | "return"
+            | "super"
+            | "switch"
+            | "this"
+            | "throw"
+            | "true"
+            | "try"
+            | "typeof"
+            | "var"
+            | "void"
+            | "while"
+            | "with"
+    )
+}
+
 /// Maps a raw, escape-free identifier lexeme to its reserved or contextual
 /// keyword token, if any. The parser decides where contextual keywords are used
 /// as ordinary identifiers.
@@ -1287,7 +1538,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn scan_text(text: &str) -> Recovered<ScannedSource> {
-        let source = Arc::new(SourceText::new(text));
+        let source = Arc::new(SourceText::new(text).expect("test source fits the per-file budget"));
         scan(SourceId::new(0), ScriptKind::TypeScript, source)
     }
 
@@ -1350,6 +1601,35 @@ mod tests {
     }
 
     #[test]
+    fn scanner_accepts_lone_surrogate_escape() {
+        let recovered = scan_text("'\\uD800'");
+        assert!(recovered.diagnostics().is_empty());
+        assert_eq!(kinds("'\\uD800'"), vec![TokenKind::StringLiteral]);
+    }
+
+    #[test]
+    fn escaped_reserved_word_keeps_identifier_name_context() {
+        let recovered = scan_text("\\u0069f");
+        assert!(recovered.diagnostics().is_empty());
+        assert_eq!(
+            recovered.product().tokens()[0].kind(),
+            TokenKind::EscapedReservedWord
+        );
+    }
+
+    #[test]
+    fn escaped_await_and_yield_retain_parser_context() {
+        assert_eq!(
+            kinds("aw\\u0061it"),
+            vec![TokenKind::EscapedContextualKeyword]
+        );
+        assert_eq!(
+            kinds("yi\\u0065ld"),
+            vec![TokenKind::EscapedContextualKeyword]
+        );
+    }
+
+    #[test]
     fn empty_source_has_only_eof() {
         let product = scan_text("").into_product();
         assert!(product.tokens().is_empty());
@@ -1408,11 +1688,10 @@ mod tests {
     }
 
     #[test]
-    fn escaped_keyword_is_an_identifier() {
-        // `\u{69}f` spells `if` but escapes disqualify it from being a keyword.
+    fn escaped_keyword_preserves_identifier_name_context() {
         let tokens = significant(r"\u{69}f");
         assert_eq!(tokens.len(), 1);
-        assert_eq!(tokens[0].0, TokenKind::Identifier);
+        assert_eq!(tokens[0].0, TokenKind::EscapedReservedWord);
     }
 
     #[test]
@@ -1612,7 +1891,9 @@ mod tests {
 
     #[test]
     fn rescan_regex_reinterprets_slash() {
-        let source = Arc::new(SourceText::new(r"/ab[/]c/gi;"));
+        let source = Arc::new(
+            SourceText::new(r"/ab[/]c/gi;").expect("test source fits the per-file budget"),
+        );
         let mut scanner = Scanner::new(SourceId::new(0), ScriptKind::JavaScript, &source);
         let slash = scanner.next_token();
         assert_eq!(slash.kind(), TokenKind::Slash);
@@ -1627,7 +1908,8 @@ mod tests {
 
     #[test]
     fn rescan_regex_reports_unterminated() {
-        let source = Arc::new(SourceText::new("/ab\nc"));
+        let source =
+            Arc::new(SourceText::new("/ab\nc").expect("test source fits the per-file budget"));
         let mut scanner = Scanner::new(SourceId::new(0), ScriptKind::JavaScript, &source);
         scanner.next_token();
         let regex = scanner.rescan_regex();
@@ -1637,7 +1919,7 @@ mod tests {
 
     #[test]
     fn rescan_greater_than_splits_operator() {
-        let source = Arc::new(SourceText::new(">>"));
+        let source = Arc::new(SourceText::new(">>").expect("test source fits the per-file budget"));
         let mut scanner = Scanner::new(SourceId::new(0), ScriptKind::TypeScript, &source);
         let shift = scanner.next_token();
         assert_eq!(shift.kind(), TokenKind::GreaterGreater);
@@ -1650,20 +1932,24 @@ mod tests {
 
     #[test]
     fn jsx_operations_scan_text_names_and_attribute_strings() {
-        let source = Arc::new(SourceText::new("hello world<"));
+        let source = Arc::new(
+            SourceText::new("hello world<").expect("test source fits the per-file budget"),
+        );
         let mut scanner = Scanner::new(SourceId::new(0), ScriptKind::TypeScriptReact, &source);
         let text = scanner.scan_jsx_text();
         assert_eq!(text.kind(), TokenKind::StringLiteral);
         assert_eq!(text.range().end().get(), "hello world".len());
         assert_eq!(scanner.next_token().kind(), TokenKind::LessThan);
 
-        let names = Arc::new(SourceText::new("data-role="));
+        let names =
+            Arc::new(SourceText::new("data-role=").expect("test source fits the per-file budget"));
         let mut scanner = Scanner::new(SourceId::new(0), ScriptKind::TypeScriptReact, &names);
         let name = scanner.scan_jsx_identifier();
         assert_eq!(name.kind(), TokenKind::Identifier);
         assert_eq!(name.range().end().get(), "data-role".len());
 
-        let attr = Arc::new(SourceText::new("'a\"b'"));
+        let attr =
+            Arc::new(SourceText::new("'a\"b'").expect("test source fits the per-file budget"));
         let mut scanner = Scanner::new(SourceId::new(0), ScriptKind::TypeScriptReact, &attr);
         let value = scanner.scan_jsx_attribute_string();
         assert_eq!(value.kind(), TokenKind::StringLiteral);
@@ -1734,7 +2020,9 @@ mod tests {
                 .unwrap_or_default()
                 .to_string();
             let text = std::fs::read_to_string(&path).expect("corpus case is UTF-8");
-            let source = Arc::new(SourceText::new(text.clone()));
+            let source = Arc::new(
+                SourceText::new(text.clone()).expect("test source fits the per-file budget"),
+            );
             let recovered = scan(SourceId::new(0), ScriptKind::TypeScript, source);
             let product = recovered.product();
 

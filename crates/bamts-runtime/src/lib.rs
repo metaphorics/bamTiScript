@@ -19,20 +19,28 @@
 
 #![forbid(unsafe_code)]
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use bamts_bytecode::{
-    AccessorKind, BinaryOp, Constant, ConstantId, Function, FunctionId, Instruction, IteratorKind,
-    Module, Pc, UnaryOp, Verified,
+    AccessorKind, BinaryOp, BindingId, BindingKind, Constant, ConstantId, DisposeHint, EcmaString,
+    EcmaStringBuilder, EdgeId, EdgeTarget, Function, FunctionId, Instruction, IteratorCloseMode,
+    IteratorKind, Module, ModuleId, Pc, Program, ProgramModule, ResolvedExport, UnaryOp, Verified,
 };
 use bamts_native::{Decoded, SlotId, Value};
 
+mod external_modules;
+mod gc;
 mod host_objects;
 mod intrinsics;
 mod native;
+mod vm;
 
 pub use native::{NativeEngine, NativeError, run_linked_program};
 
@@ -67,8 +75,15 @@ pub struct Limits {
     /// Ceiling on the length of a single call's arguments array.
     pub max_argument_count: u32,
     pub max_heap_slots: usize,
-    /// Cumulative bytes admitted for heap payloads and property/element growth.
     pub max_heap_bytes: usize,
+    /// Ceiling on engine-owned module binding cells.
+    pub max_module_cells: usize,
+    /// Ceiling on host-compiled scripts retained by one machine.
+    pub max_dynamic_modules: usize,
+    /// Ceiling on queued microtasks.
+    pub max_microtasks: usize,
+    /// Ceiling on live timers armed at once.
+    pub max_timers: usize,
 }
 
 impl Default for Limits {
@@ -80,8 +95,48 @@ impl Default for Limits {
             max_argument_count: 1 << 16,
             max_heap_slots: 1 << 20,
             max_heap_bytes: 64 << 20,
+            max_module_cells: 1 << 20,
+            max_dynamic_modules: 1 << 10,
+            max_microtasks: 1 << 20,
+            max_timers: 1 << 20,
         }
     }
+}
+
+/// The exact source of one classic script. Source and resource name preserve
+/// UTF-16 code units verbatim, including unpaired surrogates.
+pub struct ScriptSource<'a> {
+    pub source: &'a [u16],
+    pub name: &'a [u16],
+}
+
+/// Why a host compiler refused a classic script.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ScriptCompileError {
+    IllFormedSource {
+        unit_offset: usize,
+    },
+    Syntax {
+        message: String,
+        line: u32,
+        column: u32,
+    },
+    Unsupported {
+        message: String,
+        line: u32,
+        column: u32,
+    },
+    Capacity {
+        message: String,
+    },
+}
+
+/// A host capability for compiling a classic script without observing machine state.
+pub trait CompileProvider {
+    fn compile_script(
+        &mut self,
+        source: ScriptSource<'_>,
+    ) -> Result<Arc<Program<Verified>>, ScriptCompileError>;
 }
 
 /// External capabilities available to the JavaScript runtime.
@@ -113,6 +168,12 @@ pub trait Host {
         false
     }
 
+    /// Supplies the URL exposed by this module's stable `import.meta` object.
+    /// The runtime calls this at most once per instantiated module.
+    fn import_meta_url(&mut self, module_name: &EcmaString) -> EcmaString {
+        module_name.clone()
+    }
+
     fn now_ms(&mut self) -> u64 {
         0
     }
@@ -128,6 +189,85 @@ pub trait Host {
     fn hash(&mut self, _algorithm: &str, _data: &[u8]) -> Option<Vec<u8>> {
         None
     }
+
+    /// This host's script compiler, or `None` when it provides none.
+    ///
+    /// Presence MUST remain stable for the lifetime of one machine because it
+    /// determines whether `node:vm` is installed during construction.
+    fn script_compiler(&mut self) -> Option<&mut (dyn CompileProvider + 'static)> {
+        None
+    }
+
+    /// This host's timer scheduler, or `None` when it provides none.
+    ///
+    /// Presence MUST remain stable for the lifetime of one machine because it
+    /// determines whether `setTimeout`/`clearTimeout` are installed during
+    /// construction.
+    fn timers(&mut self) -> Option<&mut (dyn TimerProvider + 'static)> {
+        None
+    }
+}
+
+/// A single expired timer reported by a [`TimerProvider`].
+///
+/// `id` echoes the machine-owned JavaScript identifier passed to
+/// [`TimerProvider::schedule`]; `deadline_ms` is the provider's monotonic
+/// absolute-millisecond deadline used as the promotion watermark.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TimerWakeup {
+    pub id: u64,
+    pub deadline_ms: u64,
+}
+
+/// An owned failure message produced by a [`TimerProvider`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimerError {
+    message: String,
+}
+
+impl TimerError {
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for TimerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for TimerError {}
+
+/// A host capability that schedules real time without observing machine state.
+///
+/// The provider owns only opaque `u64` identifiers and monotonic millisecond
+/// deadlines; it never stores a JavaScript `Value`. The machine owns visible
+/// ordering and every callback identity.
+pub trait TimerProvider {
+    /// Arms a timer for `id` after at least `delay_ms` milliseconds, returning
+    /// the provider-monotonic absolute-millisecond deadline.
+    fn schedule(&mut self, id: u64, delay_ms: u32) -> Result<u64, TimerError>;
+
+    /// Cancels the armed timer for `id`, returning whether one was removed.
+    fn cancel(&mut self, id: u64) -> Result<bool, TimerError>;
+
+    /// Drains every currently expired timer into `output` without blocking.
+    fn poll_expired(&mut self, output: &mut Vec<TimerWakeup>) -> Result<(), TimerError>;
+
+    /// Blocks until the next timer expires, or returns `None` when none pend.
+    fn wait_expired(&mut self) -> Result<Option<TimerWakeup>, TimerError>;
+
+    /// Reports whether the provider has any armed timer.
+    fn has_pending(&self) -> bool;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,12 +276,13 @@ pub enum ThrowOrigin {
     TypeError { operation: &'static str },
     RangeError { operation: &'static str },
     ReferenceError { operation: &'static str },
+    UriError { operation: &'static str },
 }
 
 /// Source metadata attached to every machine failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeSource {
-    pub function_name: Option<String>,
+    pub function_name: Option<EcmaString>,
     pub instruction: Instruction,
 }
 
@@ -155,15 +296,74 @@ pub struct RuntimeError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeErrorKind {
-    UncaughtThrow { value: Value, origin: ThrowOrigin },
-    FuelExhausted { limit: u64 },
-    CallDepthExceeded { limit: usize },
-    RegisterLimitExceeded { limit: usize },
-    ArgumentLimitExceeded { limit: u32, requested: u32 },
-    HeapSlotLimitExceeded { limit: usize },
-    HeapByteLimitExceeded { limit: usize },
-    InvalidValue { value: Value },
-    InvalidRuntimeHeapReference { slot: u32 },
+    UncaughtThrow {
+        value: Value,
+        origin: ThrowOrigin,
+    },
+    FuelExhausted {
+        limit: u64,
+    },
+    CallDepthExceeded {
+        limit: usize,
+    },
+    RegisterLimitExceeded {
+        limit: usize,
+    },
+    ArgumentLimitExceeded {
+        limit: u32,
+        requested: u32,
+    },
+    HeapSlotLimitExceeded {
+        limit: usize,
+    },
+    HeapByteLimitExceeded {
+        limit: usize,
+    },
+    ModuleCellLimitExceeded {
+        limit: usize,
+    },
+    DynamicModuleLimitExceeded {
+        limit: usize,
+    },
+    MicrotaskQueueLimitExceeded {
+        limit: usize,
+    },
+    MicrotaskDrainReentry,
+    TimerProviderFailure {
+        message: String,
+    },
+    TimerCapacityExceeded {
+        limit: usize,
+    },
+    TimerCheckpointReentry,
+    InvalidDynamicScript {
+        reason: &'static str,
+    },
+    TemporalDeadZone {
+        module: ModuleId,
+        binding: BindingId,
+    },
+    ExternalModuleUnavailable {
+        module: ModuleId,
+        edge: EdgeId,
+    },
+    DynamicImportEdgeMissing {
+        module: ModuleId,
+        specifier: ConstantId,
+    },
+    InvalidVerifiedProgram {
+        module: ModuleId,
+        instruction: Instruction,
+    },
+    InvalidValue {
+        value: Value,
+    },
+    InvalidRuntimeHeapReference {
+        slot: u32,
+    },
+    ModuleEvaluationStalled {
+        module: ModuleId,
+    },
 }
 
 impl fmt::Display for RuntimeError {
@@ -175,7 +375,7 @@ impl fmt::Display for RuntimeError {
             self.pc.get()
         )?;
         if let Some(name) = &self.source.function_name {
-            write!(formatter, " ({name})")?;
+            write!(formatter, " ({})", name.to_utf8_lossy())?;
         }
         write!(formatter, ": ")?;
         match &self.kind {
@@ -203,6 +403,56 @@ impl fmt::Display for RuntimeError {
             RuntimeErrorKind::HeapByteLimitExceeded { limit } => {
                 write!(formatter, "heap byte limit {limit} exceeded")
             }
+            RuntimeErrorKind::ModuleCellLimitExceeded { limit } => {
+                write!(formatter, "module cell limit {limit} exceeded")
+            }
+            RuntimeErrorKind::DynamicModuleLimitExceeded { limit } => {
+                write!(formatter, "dynamic module limit {limit} exceeded")
+            }
+            RuntimeErrorKind::MicrotaskQueueLimitExceeded { limit } => {
+                write!(formatter, "microtask queue limit {limit} exceeded")
+            }
+            RuntimeErrorKind::MicrotaskDrainReentry => {
+                write!(formatter, "microtask drain is already active")
+            }
+            RuntimeErrorKind::TimerProviderFailure { message } => {
+                write!(formatter, "timer provider failure: {message}")
+            }
+            RuntimeErrorKind::TimerCapacityExceeded { limit } => {
+                write!(formatter, "timer capacity {limit} exceeded")
+            }
+            RuntimeErrorKind::TimerCheckpointReentry => {
+                write!(formatter, "timer checkpoint is already active")
+            }
+            RuntimeErrorKind::InvalidDynamicScript { reason } => {
+                write!(formatter, "invalid dynamic script: {reason}")
+            }
+            RuntimeErrorKind::TemporalDeadZone { module, binding } => write!(
+                formatter,
+                "module {} binding {} read before initialization",
+                module.get(),
+                binding.get()
+            ),
+            RuntimeErrorKind::ExternalModuleUnavailable { module, edge } => write!(
+                formatter,
+                "external module at module {} edge {} is unavailable",
+                module.get(),
+                edge.get()
+            ),
+            RuntimeErrorKind::DynamicImportEdgeMissing { module, specifier } => write!(
+                formatter,
+                "verified module {} has no dynamic edge for constant {}",
+                module.get(),
+                specifier.get()
+            ),
+            RuntimeErrorKind::InvalidVerifiedProgram {
+                module,
+                instruction,
+            } => write!(
+                formatter,
+                "verified module {} contains impossible instruction {instruction:?}",
+                module.get()
+            ),
             RuntimeErrorKind::InvalidValue { value } => {
                 write!(
                     formatter,
@@ -213,6 +463,11 @@ impl fmt::Display for RuntimeError {
             RuntimeErrorKind::InvalidRuntimeHeapReference { slot } => {
                 write!(formatter, "runtime heap slot {slot} does not exist")
             }
+            RuntimeErrorKind::ModuleEvaluationStalled { module } => write!(
+                formatter,
+                "module {} evaluation cannot complete: no pending microtask or live timer",
+                module.get()
+            ),
         }
     }
 }
@@ -233,28 +488,32 @@ pub fn constant_value(constant: &Constant) -> Option<Value> {
     }
 }
 
-/// A normalized property key: a string name (which may parse as an array index)
-/// or a private name identified by its heap slot. Two `CreatePrivateName`
-/// instructions with the same description yield distinct slots, hence distinct
-/// keys, matching private-name identity.
+/// A normalized property key: a string name (which may parse as an array index),
+/// a public symbol, or a language private name, each identified by its heap slot.
+/// Two identity-bearing allocations with the same description remain distinct keys.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum PropertyKey {
-    Named(String),
+    Named(EcmaString),
+    Symbol(u32),
     Private(u32),
 }
 
 impl PropertyKey {
-    fn as_str(&self) -> Option<&str> {
+    fn as_string(&self) -> Option<&EcmaString> {
         match self {
             PropertyKey::Named(text) => Some(text),
-            PropertyKey::Private(_) => None,
+            PropertyKey::Symbol(_) | PropertyKey::Private(_) => None,
         }
+    }
+
+    fn eq_ascii(&self, ascii: &str) -> bool {
+        matches!(self, PropertyKey::Named(text) if text.eq_ascii(ascii))
     }
 
     fn charge_bytes(&self) -> usize {
         match self {
-            PropertyKey::Named(text) => text.len() + 8,
-            PropertyKey::Private(_) => 16,
+            PropertyKey::Named(text) => text.len_units().saturating_mul(2).saturating_add(8),
+            PropertyKey::Symbol(_) | PropertyKey::Private(_) => 16,
         }
     }
 }
@@ -287,6 +546,13 @@ impl Property {
             Self::Data { configurable, .. } | Self::Accessor { configurable, .. } => *configurable,
         }
     }
+
+    fn charge_bytes(&self) -> usize {
+        match self {
+            Self::Data { .. } => 0,
+            Self::Accessor { .. } => std::mem::size_of::<Value>(),
+        }
+    }
 }
 
 /// Own properties in creation order. ECMAScript enumerates array-index keys
@@ -311,6 +577,13 @@ impl PropertyMap {
         self.get(key).is_some()
     }
 
+    fn get_ascii(&self, ascii: &str) -> Option<&Property> {
+        debug_assert!(ascii.is_ascii());
+        self.0
+            .iter()
+            .find_map(|(key, property)| key.eq_ascii(ascii).then_some(property))
+    }
+
     fn insert(&mut self, key: PropertyKey, property: Property) -> Option<Property> {
         if let Some(existing) = self.get_mut(&key) {
             return Some(std::mem::replace(existing, property));
@@ -326,6 +599,13 @@ impl PropertyMap {
 
     fn iter(&self) -> impl Iterator<Item = (&PropertyKey, &Property)> {
         self.0.iter().map(|(key, property)| (key, property))
+    }
+    fn charge_bytes(&self) -> usize {
+        self.0.iter().fold(0, |bytes, (key, property)| {
+            bytes
+                .saturating_add(key.charge_bytes())
+                .saturating_add(property.charge_bytes())
+        })
     }
 }
 
@@ -344,9 +624,462 @@ impl<'a> IntoIterator for &'a PropertyMap {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IterationKind {
+    Key,
+    Value,
+    Entry,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CollectionEntry {
+    order: u64,
+    key: Value,
+    value: Value,
+    live: bool,
+}
+
+impl CollectionEntry {
+    const BYTES: usize = std::mem::size_of::<Self>();
+}
+
+#[derive(Clone, Debug, Default)]
+struct CollectionIndex {
+    buckets: std::collections::HashMap<u64, Vec<usize>>,
+}
+
+impl CollectionIndex {
+    const ENTRY_BYTES: usize = std::mem::size_of::<usize>();
+
+    fn get<H: Host>(
+        &self,
+        machine: &Machine<'_, H>,
+        entries: &[CollectionEntry],
+        key: Value,
+    ) -> Option<usize> {
+        self.buckets
+            .get(&collection_key_hash(machine, key))?
+            .iter()
+            .copied()
+            .find(|&index| {
+                entries
+                    .get(index)
+                    .is_some_and(|entry| entry.live && machine.same_value_zero(entry.key, key))
+            })
+    }
+
+    fn insert(&mut self, hash: u64, index: usize) {
+        self.buckets.entry(hash).or_default().push(index);
+    }
+
+    fn clear(&mut self) {
+        self.buckets.clear();
+    }
+}
+
+fn collection_key_hash<H: Host>(machine: &Machine<'_, H>, key: Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match key.decode() {
+        Some(Decoded::Number(number)) => {
+            0_u8.hash(&mut hasher);
+            let normalized = if number.is_nan() {
+                Value::CANON_NAN
+            } else if number == 0.0 {
+                0
+            } else {
+                number.to_bits()
+            };
+            normalized.hash(&mut hasher);
+        }
+        Some(Decoded::Int32(raw)) => {
+            0_u8.hash(&mut hasher);
+            f64::from(raw as i32).to_bits().hash(&mut hasher);
+        }
+        Some(Decoded::HeapRef(_)) => {
+            if let Some(text) = machine.string_value(key) {
+                1_u8.hash(&mut hasher);
+                text.hash(&mut hasher);
+            } else if let Ok(Some(index)) = machine.runtime_slot(key) {
+                if let HeapEntry::BigInt(text) = &machine.heap[index] {
+                    2_u8.hash(&mut hasher);
+                    text.hash(&mut hasher);
+                } else {
+                    3_u8.hash(&mut hasher);
+                    key.to_bits().hash(&mut hasher);
+                }
+            } else {
+                3_u8.hash(&mut hasher);
+                key.to_bits().hash(&mut hasher);
+            }
+        }
+        _ => {
+            4_u8.hash(&mut hasher);
+            key.to_bits().hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum IteratorNextPrepared {
+    Ready {
+        done: bool,
+        value: Value,
+    },
+    Call {
+        callee: Value,
+        this_value: Value,
+    },
+    /// Calls the sync `next` method of an async-from-sync wrapper; the raw
+    /// result must flow through the adapter continuation (ECMA-262 27.1.5)
+    /// before it may be awaited.
+    AsyncFromSyncCall {
+        callee: Value,
+        this_value: Value,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum IteratorState {
+    Keys {
+        index: usize,
+        keys: Vec<EcmaString>,
+    },
+    Protocol {
+        iterator: Value,
+        next: Value,
+    },
+    /// Async-from-sync adapter record (ECMA-262 27.1.5): created when an
+    /// async iterator lookup falls back to `Symbol.iterator`. Holds the sync
+    /// iterator and its `next` method.
+    AsyncFromSync {
+        iterator: Value,
+        next: Value,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GeneratorStart {
+    pub(crate) target: RuntimeFunction,
+    pub(crate) captures: Vec<Value>,
+    pub(crate) this_value: Value,
+    pub(crate) new_target: Value,
+    pub(crate) args: Vec<Value>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SuspendedActivation {
+    pub(crate) target: RuntimeFunction,
+    pub(crate) registers: Vec<Value>,
+    pub(crate) this_value: Value,
+    pub(crate) new_target: Value,
+    pub(crate) args: Vec<Value>,
+    pub(crate) arguments_object: Option<Value>,
+    pub(crate) resume_token: u32,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum GeneratorState {
+    SuspendedStart(GeneratorStart),
+    Executing,
+    Suspended(SuspendedActivation),
+    Completed,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum GeneratorResume {
+    Yield {
+        value: Value,
+        activation: SuspendedActivation,
+    },
+    Return(Value),
+    Throw {
+        value: Value,
+        origin: ThrowOrigin,
+    },
+}
+
+/// One `.next()` request on an async generator: the value sent into the body
+/// plus the Promise handed back to the caller that the request settles.
+#[derive(Clone, Debug)]
+pub(crate) struct AsyncGeneratorRequest {
+    pub(crate) resume_value: Value,
+    pub(crate) capability: Value,
+}
+
+/// Lifecycle of a `HeapEntry::AsyncGenerator`. `AwaitingOperand` parks on an
+/// `Await` inside the body; `AwaitingYield` parks awaiting a `yield` operand.
+/// While `Executing` or in either `Awaiting*` state the body is owned by one
+/// in-flight request and further `.next()` calls only enqueue.
+#[derive(Clone, Debug)]
+pub(crate) enum AsyncGeneratorState {
+    SuspendedStart(GeneratorStart),
+    SuspendedYield(SuspendedActivation),
+    Executing,
+    AwaitingOperand(SuspendedActivation),
+    AwaitingYield(SuspendedActivation),
+    /// The body returned; its return value is being awaited before the front
+    /// request settles `done: true`. No activation is held.
+    AwaitingReturn,
+    Completed,
+}
+
+/// One step of driving an async-generator activation: it hit an `Await`, it
+/// reached a `yield`, it returned, or it threw an uncaught value. This is the
+/// union of `AsyncStep` and `GeneratorResume` produced by one drive call.
+#[derive(Clone, Debug)]
+pub(crate) enum AsyncGeneratorStep {
+    Await {
+        awaited: Value,
+        activation: SuspendedActivation,
+    },
+    Yield {
+        value: Value,
+        activation: SuspendedActivation,
+    },
+    Return(Value),
+    Throw {
+        value: Value,
+        origin: ThrowOrigin,
+    },
+}
+
+/// Collapses a drive helper's `EvalFailure` into the fatal channel of a
+/// Promise reaction job: runtime failures keep their kind; a throw-class
+/// failure here is an invariant violation, since settling paths only reject
+/// or resolve Promises rather than run user code.
+fn async_generator_kind(generator: Value, failure: EvalFailure) -> RuntimeErrorKind {
+    match failure {
+        EvalFailure::Runtime(kind) => kind,
+        _ => RuntimeErrorKind::InvalidValue { value: generator },
+    }
+}
+
+/// One step of driving a detached async-function activation: it awaited a
+/// value (and must suspend), it returned, or it threw an uncaught value.
+#[derive(Clone, Debug)]
+enum AsyncStep {
+    Suspend {
+        awaited: Value,
+        activation: SuspendedActivation,
+    },
+    Return {
+        value: Value,
+        execution: Option<Execution>,
+    },
+    Throw(RuntimeError),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PromiseState {
+    Pending {
+        fulfill_reactions: Vec<PromiseReaction>,
+        reject_reactions: Vec<PromiseReaction>,
+    },
+    Fulfilled {
+        value: Value,
+    },
+    Rejected {
+        reason: Value,
+        origin: ThrowOrigin,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PromiseCompletion {
+    Fulfilled,
+    Rejected,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PromiseReaction {
+    Fulfilled {
+        handler: Value,
+        derived: Value,
+        context: Option<Value>,
+    },
+    Rejected {
+        handler: Value,
+        derived: Value,
+        context: Option<Value>,
+    },
+    /// Resumes a suspended async activation on fulfillment. Carries only the
+    /// heap `AsyncActivation` record handle; the awaited value arrives as the
+    /// reaction value.
+    AsyncFulfill {
+        activation: Value,
+        context: Option<Value>,
+    },
+    /// Resumes a suspended async activation on rejection. Carries only the
+    /// heap `AsyncActivation` record handle; the rejection reason arrives as
+    /// the reaction value.
+    AsyncReject {
+        activation: Value,
+        context: Option<Value>,
+    },
+    /// Resumes a parked async generator on fulfillment of its awaited value.
+    /// Carries only the `HeapEntry::AsyncGenerator` handle; the parked
+    /// activation lives in the generator's own state.
+    AsyncGeneratorFulfill {
+        generator: Value,
+        context: Option<Value>,
+    },
+    /// Resumes a parked async generator on rejection of its awaited value.
+    AsyncGeneratorReject {
+        generator: Value,
+        context: Option<Value>,
+    },
+    /// Counts one fulfilled static dependency of an async-pending module.
+    /// The last fulfillment starts the parent entry inline inside the
+    /// reaction job.
+    ModuleDepFulfill {
+        parent: ModuleId,
+        context: Option<Value>,
+    },
+    /// Propagates one rejected static dependency into its async-pending
+    /// parent: the parent entry never runs and the parent settles with the
+    /// same uncaught throw.
+    ModuleDepReject {
+        parent: ModuleId,
+        context: Option<Value>,
+    },
+    /// Rebuilds the iterator result of an async-from-sync step: the reaction
+    /// value is the already-unwrapped `value`; `done` was read from the sync
+    /// result before any await.
+    AsyncFromSyncFulfill {
+        derived: Value,
+        done: bool,
+        context: Option<Value>,
+    },
+    /// Rejects the derived step promise of an async-from-sync step. Closes
+    /// the underlying sync iterator first when the step was not done; a done
+    /// step propagates the rejection without closing.
+    AsyncFromSyncReject {
+        derived: Value,
+        sync_iterator: Value,
+        done: bool,
+        context: Option<Value>,
+    },
+    /// Resolves an `import()` promise when a local module evaluation fulfills.
+    DynamicImportFulfill {
+        promise: Value,
+        target: ModuleId,
+        context: Option<Value>,
+    },
+    /// Propagates a local module evaluation rejection to an `import()` promise.
+    DynamicImportReject {
+        promise: Value,
+        context: Option<Value>,
+    },
+}
+
+impl PromiseReaction {
+    fn context(&self) -> Option<Value> {
+        match self {
+            Self::Fulfilled { context, .. }
+            | Self::Rejected { context, .. }
+            | Self::AsyncFulfill { context, .. }
+            | Self::AsyncReject { context, .. }
+            | Self::AsyncGeneratorFulfill { context, .. }
+            | Self::AsyncGeneratorReject { context, .. }
+            | Self::ModuleDepFulfill { context, .. }
+            | Self::ModuleDepReject { context, .. }
+            | Self::AsyncFromSyncFulfill { context, .. }
+            | Self::AsyncFromSyncReject { context, .. }
+            | Self::DynamicImportFulfill { context, .. }
+            | Self::DynamicImportReject { context, .. } => *context,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum MicrotaskJob {
+    Reaction {
+        reaction: PromiseReaction,
+        value: Value,
+        origin: ThrowOrigin,
+    },
+    Thenable {
+        promise: Value,
+        thenable: Value,
+        then: Value,
+        context: Option<Value>,
+    },
+    Callback {
+        callback: Value,
+        context: Option<Value>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct QueuedMicrotask {
+    job: MicrotaskJob,
+    retained_bytes: usize,
+}
+
+impl QueuedMicrotask {
+    fn uncharged(job: MicrotaskJob) -> Self {
+        Self {
+            job,
+            retained_bytes: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MicrotaskExceptionPolicy {
+    CollectAndContinue,
+    StopAtFirst,
+}
+
+/// An exception reported by a microtask or timer callback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CallbackException {
+    /// The value thrown by the callback.
+    pub value: Value,
+    /// The operation that produced the throw.
+    pub origin: ThrowOrigin,
+}
+
+/// The result of one explicit microtask checkpoint.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MicrotaskDrain {
+    /// The number of jobs removed from the queue and run.
+    pub executed: usize,
+    /// Callback exceptions, in FIFO execution order.
+    pub uncaught: Vec<CallbackException>,
+}
+
+/// The result of one explicit timer checkpoint. At most one callback runs.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TimerRun {
+    /// The number of timer callbacks run: `0` or `1`.
+    pub executed: usize,
+    /// Callback exceptions from the run callback, if it threw.
+    pub uncaught: Vec<CallbackException>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimerWait {
+    Ready,
+    Stale,
+    Idle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CollectionKind {
+    Map,
+    Set,
+    WeakMap,
+    WeakSet,
+}
+
 #[derive(Clone, Debug)]
 enum HeapEntry {
-    String(String),
+    Vacant,
+    String(EcmaString),
     BigInt(String),
     Object {
         properties: PropertyMap,
@@ -359,53 +1092,251 @@ enum HeapEntry {
         properties: PropertyMap,
         prototype: Option<Value>,
         extensible: bool,
+        length_writable: bool,
     },
     Function {
+        module: ModuleId,
         function: FunctionId,
         captures: Vec<Value>,
         properties: PropertyMap,
         prototype: Option<Value>,
         extensible: bool,
     },
+    /// A `vm.Script` whose entry function retains its machine-owned dynamic module.
+    Script {
+        entry: Value,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+        extensible: bool,
+    },
+    ModuleNamespace {
+        module: ModuleId,
+    },
+    ExternalModuleNamespace {
+        specifier: EcmaString,
+    },
+    HashState {
+        algorithm: String,
+        data: Vec<u8>,
+        digested: bool,
+        update: Value,
+        digest: Value,
+    },
+    Symbol {
+        description: EcmaString,
+    },
     PrivateName {
-        description: String,
+        description: EcmaString,
     },
     RegExp {
-        pattern: String,
-        flags: String,
+        pattern: EcmaString,
+        flags: EcmaString,
         properties: PropertyMap,
+        prototype: Option<Value>,
+        extensible: bool,
+    },
+    Date {
+        time: f64,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+        extensible: bool,
+    },
+    /// Entries retain insertion positions. Deletion tombstones an entry so
+    /// live iterators keep a stable order cursor; the index retains only
+    /// integer positions and therefore introduces no GC roots.
+    Collection {
+        kind: CollectionKind,
+        entries: Vec<CollectionEntry>,
+        index: CollectionIndex,
+        size: usize,
+        next_order: u64,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+        extensible: bool,
+    },
+    Uint8Array {
+        bytes: Vec<u8>,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+        extensible: bool,
+    },
+    BuiltinIterator {
+        source: Value,
+        kind: IterationKind,
+        position: Option<u64>,
+        properties: PropertyMap,
+        prototype: Option<Value>,
         extensible: bool,
     },
     Iterator {
-        source: Value,
-        index: usize,
-        keys: Option<Vec<String>>,
+        state: IteratorState,
+    },
+    Generator {
+        state: GeneratorState,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+        extensible: bool,
+    },
+    /// An `async function*` object: a FIFO of `.next()` requests plus a state
+    /// machine that lets exactly the front request drive the body at a time.
+    AsyncGenerator {
+        state: AsyncGeneratorState,
+        queue: VecDeque<AsyncGeneratorRequest>,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+        extensible: bool,
     },
     ProcessEnv {
         prototype: Option<Value>,
         extensible: bool,
     },
-    NativeFunction {
-        id: intrinsics::BuiltinId,
+    Promise {
+        state: PromiseState,
         properties: PropertyMap,
-        bound_this: Option<Value>,
+        prototype: Option<Value>,
         extensible: bool,
     },
+    /// A Node-compatible `Timeout` handle carrying its monotonic timer id and
+    /// ordinary object property/prototype fields.
+    Timeout {
+        id: u64,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+        extensible: bool,
+    },
+    PromiseResolver {
+        promise: Value,
+        used: bool,
+    },
+    PromiseAll {
+        promise: Value,
+        values: Vec<Value>,
+        remaining: usize,
+        settled: bool,
+    },
+    PromiseAllElement {
+        aggregate: Value,
+        index: usize,
+        called: bool,
+    },
+    /// One suspended async activation together with the implicit result Promise
+    /// it settles. Module entries also retain their terminal execution so
+    /// evaluation does not publish before top-level await completes.
+    AsyncActivation {
+        activation: Option<SuspendedActivation>,
+        promise: Value,
+        module: Option<ModuleId>,
+        completion: Option<Result<Execution, RuntimeError>>,
+    },
+    NativeFunction {
+        callable: NativeCallable,
+        properties: PropertyMap,
+        extensible: bool,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum NativeCallable {
+    Builtin(intrinsics::BuiltinId),
+    Bound(Box<BoundCallable>),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BoundCallable {
+    pub(crate) target: Value,
+    pub(crate) this_value: Value,
+    pub(crate) arguments: Vec<Value>,
 }
 
 impl HeapEntry {
     fn initial_bytes(&self) -> usize {
         match self {
-            Self::String(text) | Self::BigInt(text) | Self::PrivateName { description: text } => {
-                text.len()
+            Self::Vacant => 0,
+            Self::String(text)
+            | Self::Symbol { description: text }
+            | Self::PrivateName { description: text } => text.len_units().saturating_mul(2),
+            Self::BigInt(text) => text.len(),
+            Self::RegExp { pattern, flags, .. } => pattern
+                .len_units()
+                .saturating_add(flags.len_units())
+                .saturating_mul(2),
+            Self::HashState {
+                algorithm, data, ..
+            } => algorithm.len() + data.len(),
+            Self::Collection { size, .. } => size
+                .saturating_mul(CollectionEntry::BYTES.saturating_add(CollectionIndex::ENTRY_BYTES))
+                .saturating_add(1),
+            Self::Uint8Array {
+                bytes, properties, ..
+            } => bytes
+                .len()
+                .saturating_add(properties.charge_bytes())
+                .saturating_add(1),
+            Self::NativeFunction { callable, .. } => match callable {
+                NativeCallable::Builtin(_) => 1,
+                NativeCallable::Bound(bound) => bound.arguments.len().saturating_add(1),
+            },
+            Self::Generator { state, .. } => match state {
+                GeneratorState::SuspendedStart(start) => start
+                    .captures
+                    .len()
+                    .saturating_add(start.args.len())
+                    .saturating_add(1),
+                GeneratorState::Suspended(activation) => activation
+                    .registers
+                    .len()
+                    .saturating_add(activation.args.len())
+                    .saturating_add(1),
+                GeneratorState::Executing | GeneratorState::Completed => 1,
+            },
+            Self::AsyncGenerator { state, queue, .. } => {
+                let queued = queue
+                    .len()
+                    .saturating_mul(std::mem::size_of::<AsyncGeneratorRequest>());
+                let state_bytes = match state {
+                    AsyncGeneratorState::SuspendedStart(start) => start
+                        .captures
+                        .len()
+                        .saturating_add(start.args.len())
+                        .saturating_add(1),
+                    AsyncGeneratorState::SuspendedYield(activation)
+                    | AsyncGeneratorState::AwaitingOperand(activation)
+                    | AsyncGeneratorState::AwaitingYield(activation) => activation
+                        .registers
+                        .len()
+                        .saturating_add(activation.args.len())
+                        .saturating_add(1),
+                    AsyncGeneratorState::Executing
+                    | AsyncGeneratorState::AwaitingReturn
+                    | AsyncGeneratorState::Completed => 1,
+                };
+                state_bytes.saturating_add(queued)
             }
-            Self::RegExp { pattern, flags, .. } => pattern.len() + flags.len(),
-            Self::Object { .. }
-            | Self::Array { .. }
-            | Self::Function { .. }
-            | Self::NativeFunction { .. }
+            Self::Object { properties, .. } | Self::Timeout { properties, .. } => {
+                properties.charge_bytes().saturating_add(1)
+            }
+            Self::Array {
+                elements,
+                properties,
+                ..
+            } => elements
+                .len()
+                .saturating_mul(std::mem::size_of::<Value>())
+                .saturating_add(properties.charge_bytes())
+                .saturating_add(1),
+            Self::Function { .. }
+            | Self::Script { .. }
+            | Self::ModuleNamespace { .. }
+            | Self::ExternalModuleNamespace { .. }
             | Self::ProcessEnv { .. }
-            | Self::Iterator { .. } => 1,
+            | Self::Date { .. }
+            | Self::BuiltinIterator { .. }
+            | Self::Iterator { .. }
+            | Self::Promise { .. }
+            | Self::PromiseResolver { .. }
+            | Self::PromiseAll { .. }
+            | Self::AsyncActivation { .. }
+            | Self::PromiseAllElement { .. } => 1,
         }
     }
 }
@@ -429,8 +1360,22 @@ struct CallRequest<'a> {
     new_target: Value,
 }
 
+pub(crate) struct BoundCall {
+    pub(crate) target: Value,
+    pub(crate) this_value: Value,
+    pub(crate) arguments: Vec<Value>,
+    pub(crate) new_target: Value,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RuntimeFunction {
+    pub(crate) module: ModuleId,
+    pub(crate) function: FunctionId,
+}
+
 #[derive(Clone, Debug)]
 struct Frame {
+    module: ModuleId,
     function: usize,
     pc: usize,
     registers: Vec<Value>,
@@ -443,7 +1388,7 @@ struct Frame {
 
 impl Frame {
     fn new(
-        function: usize,
+        target: RuntimeFunction,
         metadata: &Function,
         captures: &[Value],
         this_value: Value,
@@ -465,7 +1410,8 @@ impl Frame {
             *slot = arguments.get(index).copied().unwrap_or(Value::UNDEFINED);
         }
         Self {
-            function,
+            module: target.module,
+            function: target.function.get() as usize,
             pc: 0,
             registers,
             return_to,
@@ -478,10 +1424,81 @@ impl Frame {
 }
 
 #[derive(Clone, Debug)]
-enum EvalFailure {
+pub(crate) enum EvalFailure {
     Throw(ThrowOrigin),
     ThrowValue(Value),
     Runtime(RuntimeErrorKind),
+    ThrowValueOrigin { value: Value, origin: ThrowOrigin },
+}
+
+pub(crate) fn import_failure(error: &RuntimeError) -> EvalFailure {
+    match &error.kind {
+        RuntimeErrorKind::UncaughtThrow { value, origin } => EvalFailure::ThrowValueOrigin {
+            value: *value,
+            origin: *origin,
+        },
+        kind => EvalFailure::Runtime(kind.clone()),
+    }
+}
+
+/// Returns whether `specifier` uses a relative module-path prefix.
+fn is_relative_module_specifier(specifier: &EcmaString) -> bool {
+    let units = specifier.as_units();
+    units.starts_with(&[u16::from(b'.'), u16::from(b'/')])
+        || units.starts_with(&[u16::from(b'.'), u16::from(b'.'), u16::from(b'/')])
+}
+
+/// Totally normalizes a POSIX-like relative module-name path by collapsing empty,
+/// `.`, and `..` components. Parent escapes past the first component are dropped
+/// rather than rejected, so every input yields a name.
+fn normalize_relative_module_name(name: &EcmaString) -> EcmaString {
+    let slash = u16::from(b'/');
+    let mut stack = Vec::new();
+    for part in name.as_units().split(|&unit| unit == slash) {
+        if part.is_empty() || part == [u16::from(b'.')] {
+            continue;
+        }
+        if part == [u16::from(b'.'), u16::from(b'.')] {
+            let _ = stack.pop();
+            continue;
+        }
+        stack.push(part);
+    }
+    if stack.is_empty() {
+        return EcmaString::default();
+    }
+    let mut units = Vec::with_capacity(name.len_units());
+    for (index, part) in stack.into_iter().enumerate() {
+        if index > 0 {
+            units.push(slash);
+        }
+        units.extend_from_slice(part);
+    }
+    EcmaString::from_units(&units)
+}
+
+/// Resolves a relative specifier against the requester module's canonical directory.
+fn resolve_relative_against_module_name(
+    requester_name: &EcmaString,
+    specifier: &EcmaString,
+) -> EcmaString {
+    let units = requester_name.as_units();
+    let directory = match units.iter().rposition(|&unit| unit == u16::from(b'/')) {
+        Some(index) => &units[..index],
+        None => &[][..],
+    };
+    let mut joined = Vec::with_capacity(
+        directory
+            .len()
+            .saturating_add(1)
+            .saturating_add(specifier.len_units()),
+    );
+    if !directory.is_empty() {
+        joined.extend_from_slice(directory);
+        joined.push(u16::from(b'/'));
+    }
+    joined.extend_from_slice(specifier.as_units());
+    normalize_relative_module_name(&EcmaString::from_units(&joined))
 }
 
 /// The outcome of resolving a property read.
@@ -490,7 +1507,7 @@ enum GetOutcome {
     /// A ready ABI value.
     Value(Value),
     /// Text that must be interned as a fresh heap string.
-    Text(String),
+    Text(EcmaString),
     /// An accessor getter to invoke with the receiver as `this`.
     Getter(Value),
 }
@@ -508,8 +1525,9 @@ enum SetOutcome {
 #[derive(Clone, Debug)]
 enum Found {
     Value(Value),
-    Text(String),
+    Text(EcmaString),
     Getter(Value),
+    Failure(RuntimeErrorKind),
     /// An accessor property with no getter resolves to `undefined`.
     NoGetter,
 }
@@ -520,49 +1538,272 @@ enum Found {
 #[derive(Clone, Debug)]
 enum CalleeKind {
     Runtime {
-        function: FunctionId,
+        target: RuntimeFunction,
         captures: Vec<Value>,
     },
     Builtin {
         id: intrinsics::BuiltinId,
-        bound_this: Option<Value>,
     },
+    Bound,
     NotCallable,
+}
+
+#[derive(Clone, Debug)]
+struct TimerRecord {
+    callback: Value,
+    arguments: Vec<Value>,
+    handle: Value,
+    context: Option<Value>,
+    deadline_ms: u64,
+    sequence: u64,
 }
 
 /// The production bytecode interpreter.
 pub struct Machine<'a, H: Host> {
+    program: Option<&'a Program<Verified>>,
     module: &'a Module<Verified>,
     host: &'a mut H,
     limits: Limits,
+    gc: gc::GcState,
+    native_roots: Vec<Vec<Value>>,
     frames: Vec<Frame>,
     heap: Vec<HeapEntry>,
+    slot_bytes: Vec<usize>,
+    machine_bytes: usize,
     intrinsic_slots: usize,
+    vacant_count: usize,
     heap_bytes: usize,
     live_registers: usize,
+    native_depth: usize,
     fuel: u64,
-    globals: BTreeMap<String, Value>,
+    globals: BTreeMap<EcmaString, Value>,
+    /// The contextified global used only while executing `node:vm` code.
+    context_global: Option<Value>,
     last_completion: Option<Value>,
+    /// Frame depths owned by native-to-runtime callback evaluations. A throw
+    /// crossing this boundary returns to the native caller so the enclosing
+    /// bytecode instruction resolves it at its own program counter.
+    callback_boundaries: Vec<usize>,
+    generator_boundaries: Vec<usize>,
+    pending_generator_resume: Option<GeneratorResume>,
+    async_boundaries: Vec<usize>,
+    pending_async_suspend: Option<(Value, SuspendedActivation)>,
+    microtasks: VecDeque<QueuedMicrotask>,
+    microtask_drain_active: bool,
+    next_timer_id: Option<u64>,
+    next_timer_sequence: Option<u64>,
+    timers: BTreeMap<u64, TimerRecord>,
+    ready_timers: BTreeSet<(u64, u64)>,
+    timer_watermark: Option<u64>,
+    timer_checkpoint_active: bool,
     intrinsics: intrinsics::Intrinsics<H>,
     current_builtin_id: Option<intrinsics::BuiltinId>,
+    current_new_target: Value,
+    registry: ModuleRegistry,
+    /// First machine-wide module ID reserved for host-compiled script modules.
+    dynamic_base: usize,
+    /// Host-compiled programs retained for the machine lifetime so their
+    /// closures remain executable after the originating Script object dies.
+    dynamic: Vec<DynamicModule>,
+}
+
+#[derive(Clone, Debug)]
+struct DynamicModule {
+    program: Arc<Program<Verified>>,
+    bytes: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ModuleRegistry {
+    modules: Vec<ModuleInstance>,
+    cells: Vec<Cell>,
+    external: BTreeMap<EcmaString, ExternalModuleInstance>,
+    /// Canonical program module-name → [`ModuleId`] for bundled-local dynamic
+    /// resolution. Keys are owned [`EcmaString`] values from program constants,
+    /// so this table is rebuilt per instantiation and is not a GC root set.
+    local_modules: BTreeMap<EcmaString, ModuleId>,
+}
+
+#[derive(Clone, Debug)]
+struct ExternalModuleInstance {
+    namespace: Value,
+    exports: BTreeMap<EcmaString, ExternalExport>,
+    internals: BTreeMap<&'static str, Value>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExternalExport {
+    value: Value,
+    cell: Option<CellId>,
+}
+
+#[derive(Clone, Debug)]
+struct ModuleInstance {
+    binding_cells: Vec<Option<CellId>>,
+    constant_cells: Vec<Option<CellId>>,
+    namespace: Option<Value>,
+    state: ModuleState,
+    import_meta: Option<Value>,
+}
+
+#[derive(Clone, Debug)]
+enum ModuleState {
+    Unevaluated,
+    /// On the current synchronous module-DFS stack; re-entering it is a
+    /// static cycle back-edge and never waits.
+    Evaluating,
+    /// Awaiting asynchronous progress off-stack: one shared evaluation record
+    /// and Promise exist for the module's lifetime, and `pending_deps` counts
+    /// static dependencies whose attached reactions have not fired yet. The
+    /// record and Promise are allocated lazily, only when the entry suspends
+    /// or a static dependency is already pending.
+    EvaluatingAsync {
+        record: Value,
+        promise: Value,
+        pending_deps: usize,
+    },
+    Evaluated(Result<(), RuntimeError>),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ModuleEvaluation {
+    Cycle,
+    Evaluated(Result<(), RuntimeError>),
+    Ready(Vec<ModuleId>),
+}
+
+/// The outcome of starting one module entry function.
+#[derive(Clone, Debug)]
+enum ModuleStart {
+    /// The entry settled synchronously (fully sync entry, or an async entry
+    /// whose first turn already reached Return/Throw).
+    Settled(Result<Execution, RuntimeError>),
+    /// The entry suspended (or its static dependencies are still pending);
+    /// completion arrives through the shared evaluation record.
+    Pending(ModulePending),
+    /// The module was already evaluated, or re-entered on the same DFS stack
+    /// (a static cycle back-edge); nothing ran and nothing is owed.
+    Cached,
+}
+
+/// One module's lazily created evaluation record and shared Promise. The
+/// record drives the activation; the Promise is handed to every pure dynamic
+/// import executed while the module is in flight, so concurrent importers
+/// observe the identical Promise object.
+#[derive(Clone, Copy, Debug)]
+struct ModulePending {
+    record: Value,
+    promise: Value,
+}
+
+/// The outcome of a pure dynamic `import()` edge: the raw namespace for a
+/// settled or same-stack cyclic target, the shared evaluation Promise for an
+/// in-flight async target, or the target's stored failure to rethrow at this
+/// import site.
+enum DynamicImport {
+    Ready(Value),
+    Pending(Value),
+    Failed(RuntimeError),
+}
+
+/// Runtime-only dynamic import resolution deliberately retains the external
+/// specifier rather than an edge id, because expression imports need no edge.
+enum DynamicImportTarget {
+    Local(ModuleId),
+    External(EcmaString),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ImportTarget {
+    Local(ModuleId),
+    External(EdgeId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CellId(usize);
+
+#[derive(Clone, Copy, Debug)]
+struct Cell {
+    value: Value,
 }
 
 pub fn run<H: Host>(
-    module: &Module<Verified>,
+    program: &Program<Verified>,
     host: &mut H,
     limits: &Limits,
 ) -> Result<ExecutionOutcome, RuntimeError> {
-    Machine::new(module, host, limits.clone())
+    Machine::new(program, host, limits.clone())
         .run()
         .map(|execution| execution.outcome)
 }
 
+/// Wall time and process peak memory observed while running a program.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RunTelemetry {
+    /// Interpreter execution wall time, in fractional milliseconds.
+    pub interpreter_wall_ms: f64,
+    /// Process peak resident set size in KiB (`/proc/self/status` `VmHWM`);
+    /// `0` when the platform does not expose it.
+    pub rss_kb: u64,
+}
+
+/// Runs a program and reports interpreter wall time plus process peak RSS.
+///
+/// This is the telemetry seam over [`run`]: it times only the interpreter call,
+/// then reads best-effort process peak RSS. The returned [`ExecutionOutcome`]
+/// and every observable effect are exactly those of [`run`].
+pub fn run_with_telemetry<H: Host>(
+    program: &Program<Verified>,
+    host: &mut H,
+    limits: &Limits,
+) -> (Result<ExecutionOutcome, RuntimeError>, RunTelemetry) {
+    let started = std::time::Instant::now();
+    let outcome = run(program, host, limits);
+    let interpreter_wall_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let telemetry = RunTelemetry {
+        interpreter_wall_ms,
+        rss_kb: peak_rss_kb().unwrap_or(0),
+    };
+    (outcome, telemetry)
+}
+
+/// Best-effort process peak resident set size, in KiB, from
+/// `/proc/self/status` `VmHWM`. Returns `None` when the file or field is
+/// unavailable (non-Linux hosts, sandboxes).
+fn peak_rss_kb() -> Option<u64> {
+    let content = std::fs::read_to_string("/proc/self/status").ok()?;
+    content.lines().find_map(|line| {
+        line.strip_prefix("VmHWM:")?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    })
+}
+
 impl<'a, H: Host> Machine<'a, H> {
     #[must_use]
-    pub fn new(module: &'a Module<Verified>, host: &'a mut H, limits: Limits) -> Self {
+    pub fn new(program: &'a Program<Verified>, host: &'a mut H, limits: Limits) -> Self {
+        let module = &program
+            .module(program.entry())
+            .expect("verified program entry exists")
+            .code;
+        Self::build(Some(program), module, host, limits)
+    }
+
+    fn build(
+        program: Option<&'a Program<Verified>>,
+        module: &'a Module<Verified>,
+        host: &'a mut H,
+        limits: Limits,
+    ) -> Self {
         let entry = module.entry().get() as usize;
+        let module_id = program.map_or(ModuleId::new(0), Program::entry);
         let frame = Frame::new(
-            entry,
+            RuntimeFunction {
+                module: module_id,
+                function: FunctionId::new(entry as u32),
+            },
             &module.functions()[entry],
             &[],
             Value::UNDEFINED,
@@ -572,11 +1813,21 @@ impl<'a, H: Host> Machine<'a, H> {
         );
         let live_registers = frame.registers.len();
         let mut heap = Vec::new();
-        let intrinsics = intrinsics::Intrinsics::<H>::initialize(&mut heap);
+        let timers_available = host.timers().is_some();
+        let mut intrinsics = intrinsics::Intrinsics::<H>::initialize(&mut heap, timers_available);
+        let script_compiler = host.script_compiler().is_some();
+        let installed_external = external_modules::install(
+            &mut heap,
+            &mut intrinsics.builtins,
+            intrinsics.object_prototype,
+            script_compiler,
+        );
         let argv_text = host.argv().to_vec();
         let argv_values: Vec<Value> = argv_text
             .into_iter()
-            .map(|text| intrinsics::push(&mut heap, HeapEntry::String(text)))
+            .map(|text| {
+                intrinsics::push(&mut heap, HeapEntry::String(EcmaString::from_utf8(&text)))
+            })
             .collect();
         let process = intrinsics
             .global("process")
@@ -588,9 +1839,7 @@ impl<'a, H: Host> Machine<'a, H> {
         let HeapEntry::Object { properties, .. } = &heap[process_index] else {
             unreachable!("process is an ordinary object");
         };
-        let Some(Property::Data { value: argv, .. }) =
-            properties.get(&PropertyKey::Named("argv".to_owned()))
-        else {
+        let Some(Property::Data { value: argv, .. }) = properties.get_ascii("argv") else {
             unreachable!("process owns argv");
         };
         let Some(Decoded::HeapRef(argv_id)) = argv.decode() else {
@@ -602,31 +1851,3014 @@ impl<'a, H: Host> Machine<'a, H> {
         };
         *elements = argv_values;
         let intrinsic_slots = heap.len();
+        let slot_bytes = vec![0; intrinsic_slots];
+        let fuel = limits.fuel;
         Self {
-            fuel: limits.fuel,
+            program,
             module,
             host,
+            gc: gc::GcState::new(&limits),
             limits,
+            native_roots: Vec::new(),
+            fuel,
             frames: vec![frame],
             heap,
-            heap_bytes: 0,
+            slot_bytes,
+            machine_bytes: 0,
             intrinsic_slots,
+            vacant_count: 0,
+            heap_bytes: 0,
             live_registers,
+            native_depth: 0,
             last_completion: None,
+            callback_boundaries: Vec::new(),
+            generator_boundaries: Vec::new(),
+            pending_generator_resume: None,
+            async_boundaries: Vec::new(),
+            pending_async_suspend: None,
+            microtasks: VecDeque::new(),
+            microtask_drain_active: false,
+            next_timer_id: Some(1),
+            next_timer_sequence: Some(0),
+            timers: BTreeMap::new(),
+            ready_timers: BTreeSet::new(),
+            timer_watermark: None,
+            timer_checkpoint_active: false,
             globals: BTreeMap::new(),
+            context_global: None,
+            registry: ModuleRegistry {
+                external: installed_external
+                    .into_iter()
+                    .map(|module| {
+                        let mut exports: BTreeMap<_, _> = module
+                            .exports
+                            .into_iter()
+                            .map(|(name, value)| (name, ExternalExport { value, cell: None }))
+                            .collect();
+                        exports.insert(
+                            EcmaString::from_utf8("default"),
+                            ExternalExport {
+                                value: module.namespace,
+                                cell: None,
+                            },
+                        );
+                        (
+                            module.specifier,
+                            ExternalModuleInstance {
+                                namespace: module.namespace,
+                                exports,
+                                internals: module.internals,
+                            },
+                        )
+                    })
+                    .collect(),
+                ..ModuleRegistry::default()
+            },
+            dynamic_base: program.map_or(1, |program| program.modules().len()),
+            dynamic: Vec::new(),
             current_builtin_id: None,
+            current_new_target: Value::UNDEFINED,
             intrinsics,
         }
     }
 
+    /// Evaluates the program, drives the automatic event loop to quiescence,
+    /// and returns the synchronous [`Execution`] snapshot taken right after
+    /// evaluation. Callbacks may mutate globals and append host output, but
+    /// the returned value and entry register snapshot stay those of the
+    /// synchronous evaluation.
     pub fn run(mut self) -> Result<Execution, RuntimeError> {
+        let execution = self.evaluate()?;
+        self.run_to_quiescence()?;
+        Ok(execution)
+    }
+
+    /// Evaluates the program without draining queued microtasks.
+    ///
+    /// When the entry module suspends on top-level await, this drives the
+    /// automatic event loop — microtask checkpoints first, then one timer
+    /// turn at a time — only until the entry's evaluation Promise settles,
+    /// and returns the entry [`Execution`] before any unrelated later timer.
+    /// Timers still live at settlement stay queued for [`Self::run_to_quiescence`].
+    /// An entry whose awaited work enqueues nothing and leaves no live timer
+    /// fails with [`RuntimeErrorKind::ModuleEvaluationStalled`].
+    ///
+    /// Otherwise the machine remains available for an explicit
+    /// [`Self::drain_microtasks`] checkpoint.
+    pub fn evaluate(&mut self) -> Result<Execution, RuntimeError> {
+        if let Some(program) = self.program {
+            let entry = program.entry();
+            self.frames.clear();
+            self.live_registers = 0;
+            self.instantiate_modules()?;
+            return self.evaluate_instantiated_module(entry);
+        }
         Ok(self
             .run_loop(0)?
             .expect("the entry frame completes before the run loop stops"))
     }
 
+    /// Evaluates one module of an already-instantiated program and returns
+    /// its entry [`Execution`]. Runs the module DFS (synchronous fast paths
+    /// stay synchronous) and, only when the entry suspends on top-level
+    /// await, drives the bounded outer loop until the entry's evaluation
+    /// Promise settles. Never calls `instantiate_modules` or
+    /// `run_to_quiescence`: the native backend delegates whole async static
+    /// graphs here, and `run` drains to quiescence afterwards.
+    pub(crate) fn evaluate_instantiated_module(
+        &mut self,
+        module: ModuleId,
+    ) -> Result<Execution, RuntimeError> {
+        match self.evaluate_module(module)? {
+            ModuleStart::Settled(result) => result,
+            ModuleStart::Pending(pending) => self.drive_entry_to_settlement(pending, module),
+            ModuleStart::Cached => Err(self.program_error(
+                module,
+                RuntimeErrorKind::InvalidVerifiedProgram {
+                    module,
+                    instruction: Instruction::Halt,
+                },
+            )),
+        }
+    }
+
+    /// Drives the outer event loop for one pending root entry: microtasks run
+    /// to emptiness, then one expired timer per turn, until the entry's
+    /// evaluation Promise settles. The settlement check runs after every full
+    /// microtask checkpoint and before any timer wait, so no wakeup is lost
+    /// and no timer beyond the settling turn fires here. A never-settling
+    /// entry with no live timer is a stall, not a hang.
+    fn drive_entry_to_settlement(
+        &mut self,
+        pending: ModulePending,
+        entry: ModuleId,
+    ) -> Result<Execution, RuntimeError> {
+        loop {
+            self.drain_microtasks_automatic()?;
+            if self
+                .promise_is_settled(pending.promise)
+                .map_err(|kind| self.program_error(entry, kind))?
+            {
+                break;
+            }
+            if !self.has_pending_timers() {
+                return Err(self.program_error(
+                    entry,
+                    RuntimeErrorKind::ModuleEvaluationStalled { module: entry },
+                ));
+            }
+            match self.wait_for_timer_expiry_state()? {
+                TimerWait::Ready => {}
+                TimerWait::Stale => continue,
+                TimerWait::Idle => {
+                    return Err(
+                        self.checkpoint_error(RuntimeErrorKind::TimerProviderFailure {
+                            message: "the timer provider lost a live machine timer".to_owned(),
+                        }),
+                    );
+                }
+            }
+            let run = self.run_one_expired_timer()?;
+            if let Some(exception) = run.uncaught.into_iter().next() {
+                return Err(self.checkpoint_error(RuntimeErrorKind::UncaughtThrow {
+                    value: exception.value,
+                    origin: exception.origin,
+                }));
+            }
+        }
+        self.take_async_module_completion(pending.record, entry)
+            .map_err(|kind| self.program_error(entry, kind))?
+    }
+
+    /// Runs at most one expired live timer callback.
+    ///
+    /// This explicit checkpoint never drains microtasks. Expiry reports only
+    /// advance a monotonic watermark; visible delivery is ordered by the
+    /// machine-owned `(deadline, sequence)` key.
+    pub fn run_one_expired_timer(&mut self) -> Result<TimerRun, RuntimeError> {
+        if self.timer_checkpoint_active {
+            return Err(self.checkpoint_error(RuntimeErrorKind::TimerCheckpointReentry));
+        }
+        self.timer_checkpoint_active = true;
+        let result = (|| {
+            self.poll_timer_expiries()
+                .map_err(|kind| self.checkpoint_error(kind))?;
+            let Some(order) = self.ready_timers.first().copied() else {
+                return Ok(TimerRun::default());
+            };
+            let Some(id) = self.timers.iter().find_map(|(id, timer)| {
+                ((timer.deadline_ms, timer.sequence) == order).then_some(*id)
+            }) else {
+                return Err(self.checkpoint_error(RuntimeErrorKind::InvalidValue {
+                    value: Value::UNDEFINED,
+                }));
+            };
+            // Preserve both the ready key and live record when fuel is empty.
+            self.consume_fuel(1)
+                .map_err(|kind| self.checkpoint_error(kind))?;
+            self.collect_if_pending();
+            self.ready_timers.remove(&order);
+            let timer = self
+                .timers
+                .remove(&id)
+                .expect("ready timer remains live until after fuel charging");
+            let mut report = TimerRun {
+                executed: 1,
+                uncaught: Vec::new(),
+            };
+            let callback_result = self.with_active_context(timer.context, |machine| {
+                machine.call_value(timer.callback, timer.handle, &timer.arguments)
+            });
+            match callback_result {
+                Ok(_) => {}
+                Err(EvalFailure::Runtime(kind)) => {
+                    return Err(self.checkpoint_error(kind));
+                }
+                Err(failure) => {
+                    let (value, origin) =
+                        self.promise_rejection_value(failure)
+                            .map_err(|failure| match failure {
+                                EvalFailure::Runtime(kind) => self.checkpoint_error(kind),
+                                _ => self.checkpoint_error(RuntimeErrorKind::InvalidValue {
+                                    value: timer.callback,
+                                }),
+                            })?;
+                    report.uncaught.try_reserve(1).map_err(|_| {
+                        self.checkpoint_error(RuntimeErrorKind::HeapByteLimitExceeded {
+                            limit: self.limits.max_heap_bytes,
+                        })
+                    })?;
+                    report.uncaught.push(CallbackException { value, origin });
+                }
+            }
+            Ok(report)
+        })();
+        self.timer_checkpoint_active = false;
+        result
+    }
+
+    /// Blocks in the host provider until an expiry report is available.
+    /// Returns whether at least one live timer became ready.
+    pub fn wait_for_timer_expiry(&mut self) -> Result<bool, RuntimeError> {
+        Ok(self.wait_for_timer_expiry_state()? == TimerWait::Ready)
+    }
+
+    fn wait_for_timer_expiry_state(&mut self) -> Result<TimerWait, RuntimeError> {
+        if self.timer_checkpoint_active {
+            return Err(self.checkpoint_error(RuntimeErrorKind::TimerCheckpointReentry));
+        }
+        if !self.ready_timers.is_empty() {
+            return Ok(TimerWait::Ready);
+        }
+        self.timer_checkpoint_active = true;
+        let result = (|| {
+            let wakeup = match self.host.timers() {
+                Some(provider) => provider.wait_expired(),
+                None => return Ok(TimerWait::Idle),
+            }
+            .map_err(|error| {
+                self.checkpoint_error(RuntimeErrorKind::TimerProviderFailure {
+                    message: error.to_string(),
+                })
+            })?;
+            let Some(wakeup) = wakeup else {
+                return Ok(TimerWait::Idle);
+            };
+            self.promote_timer_wakeup(wakeup);
+            Ok(if self.ready_timers.is_empty() {
+                TimerWait::Stale
+            } else {
+                TimerWait::Ready
+            })
+        })();
+        self.timer_checkpoint_active = false;
+        result
+    }
+
+    /// Returns whether any machine-owned live timer remains.
+    #[must_use]
+    pub fn has_pending_timers(&self) -> bool {
+        !self.timers.is_empty()
+    }
+
+    /// Drives the automatic event loop to quiescence after synchronous
+    /// evaluation.
+    ///
+    /// Drains every queued microtask first. While a live machine timer
+    /// remains, waits for one deadline to become ready, runs exactly one
+    /// timer callback, and drains microtasks again. A timer created by a
+    /// callback therefore waits for a later timer turn. The first uncaught
+    /// `queueMicrotask` or timer callback exception stops the loop and becomes
+    /// [`RuntimeErrorKind::UncaughtThrow`]; a timer exception is converted
+    /// before any later drain, so its queued microtasks and later timers stay
+    /// pending. Promise handler throws settle their derived promises and never
+    /// abort the loop. Fatal runtime failures propagate unchanged.
+    ///
+    /// A stale report retries. A missing report or timer capability while a
+    /// machine timer remains fails with [`RuntimeErrorKind::TimerProviderFailure`]
+    /// instead of spinning. Existing fuel bounds recursive jobs and timers;
+    /// exhausted work fails with [`RuntimeErrorKind::FuelExhausted`].
+    pub(crate) fn run_to_quiescence(&mut self) -> Result<(), RuntimeError> {
+        self.drain_microtasks_automatic()?;
+        while self.has_pending_timers() {
+            match self.wait_for_timer_expiry_state()? {
+                TimerWait::Ready => {}
+                TimerWait::Stale => continue,
+                TimerWait::Idle => {
+                    return Err(
+                        self.checkpoint_error(RuntimeErrorKind::TimerProviderFailure {
+                            message: "the timer provider lost a live machine timer".to_owned(),
+                        }),
+                    );
+                }
+            }
+            let run = self.run_one_expired_timer()?;
+            if let Some(exception) = run.uncaught.into_iter().next() {
+                return Err(self.checkpoint_error(RuntimeErrorKind::UncaughtThrow {
+                    value: exception.value,
+                    origin: exception.origin,
+                }));
+            }
+            self.drain_microtasks_automatic()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn schedule_timeout(
+        &mut self,
+        callback: Value,
+        delay_ms: u32,
+        arguments: Vec<Value>,
+    ) -> Result<Value, EvalFailure> {
+        if self.timers.len() >= self.limits.max_timers {
+            return Err(EvalFailure::Runtime(
+                RuntimeErrorKind::TimerCapacityExceeded {
+                    limit: self.limits.max_timers,
+                },
+            ));
+        }
+        let id = self.next_timer_id.take().ok_or(EvalFailure::Runtime(
+            RuntimeErrorKind::TimerCapacityExceeded {
+                limit: self.limits.max_timers,
+            },
+        ))?;
+        self.next_timer_id = id.checked_add(1);
+        let sequence = self.next_timer_sequence.take().ok_or(EvalFailure::Runtime(
+            RuntimeErrorKind::TimerCapacityExceeded {
+                limit: self.limits.max_timers,
+            },
+        ))?;
+        self.next_timer_sequence = sequence.checked_add(1);
+        let deadline_ms = self
+            .host
+            .timers()
+            .ok_or(EvalFailure::Runtime(
+                RuntimeErrorKind::TimerProviderFailure {
+                    message: "timer capability is unavailable".to_owned(),
+                },
+            ))?
+            .schedule(id, delay_ms)
+            .map_err(|error| {
+                EvalFailure::Runtime(RuntimeErrorKind::TimerProviderFailure {
+                    message: error.to_string(),
+                })
+            })?;
+        let handle = match self.allocate(HeapEntry::Timeout {
+            id,
+            properties: PropertyMap::default(),
+            prototype: Some(self.intrinsics.object_prototype),
+            extensible: true,
+        }) {
+            Ok(handle) => handle,
+            Err(kind) => {
+                if let Some(provider) = self.host.timers() {
+                    let _ = provider.cancel(id);
+                }
+                return Err(EvalFailure::Runtime(kind));
+            }
+        };
+        self.timers.insert(
+            id,
+            TimerRecord {
+                callback,
+                arguments,
+                handle,
+                context: self.context_global,
+                deadline_ms,
+                sequence,
+            },
+        );
+        Ok(handle)
+    }
+
+    pub(crate) fn clear_timeout(&mut self, handle: Value) -> Result<(), EvalFailure> {
+        let id = match handle.decode() {
+            Some(Decoded::Int32(raw)) if (raw as i32) > 0 => Some(u64::from(raw)),
+            Some(Decoded::Number(number))
+                if number.is_finite()
+                    && number > 0.0
+                    && number.fract() == 0.0
+                    && number < u64::MAX as f64 =>
+            {
+                Some(number as u64)
+            }
+            Some(Decoded::HeapRef(_)) => {
+                self.runtime_slot(handle)
+                    .ok()
+                    .flatten()
+                    .and_then(|index| match &self.heap[index] {
+                        HeapEntry::Timeout { id, .. } => Some(*id),
+                        _ => None,
+                    })
+            }
+            _ => None,
+        };
+        let Some(id) = id else {
+            return Ok(());
+        };
+        let Some(timer) = self.timers.remove(&id) else {
+            return Ok(());
+        };
+        self.ready_timers
+            .remove(&(timer.deadline_ms, timer.sequence));
+        if let Some(provider) = self.host.timers() {
+            provider.cancel(id).map_err(|error| {
+                EvalFailure::Runtime(RuntimeErrorKind::TimerProviderFailure {
+                    message: error.to_string(),
+                })
+            })?;
+        }
+        Ok(())
+    }
+
+    fn poll_timer_expiries(&mut self) -> Result<(), RuntimeErrorKind> {
+        let mut wakeups = Vec::new();
+        let Some(provider) = self.host.timers() else {
+            return Ok(());
+        };
+        provider.poll_expired(&mut wakeups).map_err(|error| {
+            RuntimeErrorKind::TimerProviderFailure {
+                message: error.to_string(),
+            }
+        })?;
+        // One live report authorizes every earlier deadline. Collapse a host
+        // batch to one watermark instead of rescanning all live timers per report.
+        if let Some(wakeup) = wakeups
+            .into_iter()
+            .filter(|wakeup| self.timers.contains_key(&wakeup.id))
+            .max_by_key(|wakeup| wakeup.deadline_ms)
+        {
+            self.promote_timer_wakeup(wakeup);
+        }
+        Ok(())
+    }
+
+    fn promote_timer_wakeup(&mut self, wakeup: TimerWakeup) {
+        // Unknown IDs are stale cancellation races and carry no authority to
+        // advance the watermark.
+        if !self.timers.contains_key(&wakeup.id) {
+            return;
+        }
+        let watermark = self.timer_watermark.map_or(wakeup.deadline_ms, |current| {
+            current.max(wakeup.deadline_ms)
+        });
+        self.timer_watermark = Some(watermark);
+        for timer in self.timers.values() {
+            if timer.deadline_ms <= watermark {
+                self.ready_timers
+                    .insert((timer.deadline_ms, timer.sequence));
+            }
+        }
+    }
+
+    /// Runs queued microtasks in FIFO order until the queue is empty.
+    ///
+    /// Jobs queued by another job run in the same checkpoint. Promise callback
+    /// throws settle their derived promises. Throws from `queueMicrotask`
+    /// callbacks are returned in [`MicrotaskDrain::uncaught`].
+    pub fn drain_microtasks(&mut self) -> Result<MicrotaskDrain, RuntimeError> {
+        self.drain_microtasks_core(MicrotaskExceptionPolicy::CollectAndContinue)
+    }
+
+    /// Automatic drain for the event loop: the first uncaught `queueMicrotask`
+    /// callback exception stops the checkpoint and becomes
+    /// [`RuntimeErrorKind::UncaughtThrow`], leaving later jobs queued. All
+    /// other semantics match the public manual checkpoint.
+    fn drain_microtasks_automatic(&mut self) -> Result<(), RuntimeError> {
+        let report = self.drain_microtasks_core(MicrotaskExceptionPolicy::StopAtFirst)?;
+        let Some(exception) = report.uncaught.into_iter().next() else {
+            return Ok(());
+        };
+        Err(self.checkpoint_error(RuntimeErrorKind::UncaughtThrow {
+            value: exception.value,
+            origin: exception.origin,
+        }))
+    }
+
+    /// Shared microtask checkpoint. Both drains share the reentry guard,
+    /// fuel-before-pop charging, FIFO execution, Promise reaction semantics,
+    /// fatal-error propagation, and flag cleanup. Manual drains collect every
+    /// callback exception and continue; automatic drains stop after the first,
+    /// leaving the rest of the queue untouched. The exceptionless path performs
+    /// no allocation.
+    fn drain_microtasks_core(
+        &mut self,
+        exception_policy: MicrotaskExceptionPolicy,
+    ) -> Result<MicrotaskDrain, RuntimeError> {
+        if self.microtask_drain_active {
+            return Err(self.checkpoint_error(RuntimeErrorKind::MicrotaskDrainReentry));
+        }
+        self.microtask_drain_active = true;
+        let result = (|| {
+            let mut report = MicrotaskDrain::default();
+            while self.microtasks.front().is_some() {
+                self.consume_fuel(1)
+                    .map_err(|kind| self.checkpoint_error(kind))?;
+                self.collect_if_pending();
+                let queued = self
+                    .microtasks
+                    .pop_front()
+                    .expect("the queued microtask remains present after fuel charging");
+                self.refund_machine(queued.retained_bytes);
+                report.executed = report.executed.saturating_add(1);
+                let Some(exception) = self
+                    .execute_microtask_job(queued.job)
+                    .map_err(|kind| self.checkpoint_error(kind))?
+                else {
+                    continue;
+                };
+                report.uncaught.try_reserve(1).map_err(|_| {
+                    self.checkpoint_error(RuntimeErrorKind::HeapByteLimitExceeded {
+                        limit: self.limits.max_heap_bytes,
+                    })
+                })?;
+                report.uncaught.push(exception);
+                if exception_policy == MicrotaskExceptionPolicy::StopAtFirst {
+                    break;
+                }
+            }
+            Ok(report)
+        })();
+        self.microtask_drain_active = false;
+        result
+    }
+
+    fn checkpoint_error(&self, kind: RuntimeErrorKind) -> RuntimeError {
+        let function = self.module.entry();
+        let instruction = self.module.functions()[function.get() as usize]
+            .code()
+            .first()
+            .copied()
+            .unwrap_or(Instruction::Halt);
+        RuntimeError {
+            kind,
+            function,
+            pc: Pc::new(0),
+            source: RuntimeSource {
+                function_name: None,
+                instruction,
+            },
+        }
+    }
+
+    /// Runs one popped microtask job. Promise reaction and thenable jobs
+    /// settle their derived promises and never surface a callback exception;
+    /// a `queueMicrotask` callback throw is classified and returned for the
+    /// checkpoint to collect or stop on.
+    fn execute_microtask_job(
+        &mut self,
+        job: MicrotaskJob,
+    ) -> Result<Option<CallbackException>, RuntimeErrorKind> {
+        match job {
+            MicrotaskJob::Reaction {
+                reaction,
+                value,
+                origin,
+            } => {
+                let context = reaction.context();
+                self.with_active_context(context, |machine| {
+                    machine.execute_promise_reaction(reaction, value, origin)
+                })
+                .map(|()| None)
+            }
+            MicrotaskJob::Thenable {
+                promise,
+                thenable,
+                then,
+                context,
+            } => self
+                .with_active_context(context, |machine| {
+                    machine.execute_thenable_job(promise, thenable, then)
+                })
+                .map(|()| None),
+            MicrotaskJob::Callback { callback, context } => self
+                .with_active_context(context, |machine| {
+                    machine.execute_callback_microtask(callback)
+                }),
+        }
+    }
+
+    fn with_active_context<T>(
+        &mut self,
+        context: Option<Value>,
+        operation: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let previous = std::mem::replace(&mut self.context_global, context);
+        let result = operation(self);
+        self.context_global = previous;
+        result
+    }
+
+    fn execute_callback_microtask(
+        &mut self,
+        callback: Value,
+    ) -> Result<Option<CallbackException>, RuntimeErrorKind> {
+        match self.call_value(callback, Value::UNDEFINED, &[]) {
+            Ok(_) => Ok(None),
+            Err(EvalFailure::Runtime(kind)) => Err(kind),
+            Err(failure) => {
+                let (value, origin) =
+                    self.promise_rejection_value(failure)
+                        .map_err(|failure| match failure {
+                            EvalFailure::Runtime(kind) => kind,
+                            _ => RuntimeErrorKind::InvalidValue { value: callback },
+                        })?;
+                Ok(Some(CallbackException { value, origin }))
+            }
+        }
+    }
+
+    fn execute_thenable_job(
+        &mut self,
+        promise: Value,
+        thenable: Value,
+        then: Value,
+    ) -> Result<(), RuntimeErrorKind> {
+        let record = self
+            .create_promise_resolver(promise)
+            .map_err(|failure| match failure {
+                EvalFailure::Runtime(kind) => kind,
+                _ => RuntimeErrorKind::InvalidValue { value: promise },
+            })?;
+        let (resolve_target, reject_target) = self.intrinsics.builtins.promise_resolver_targets();
+        let resolve = self
+            .create_promise_resolver_function(resolve_target, record)
+            .map_err(|failure| match failure {
+                EvalFailure::Runtime(kind) => kind,
+                _ => RuntimeErrorKind::InvalidValue { value: record },
+            })?;
+        let reject = self
+            .create_promise_resolver_function(reject_target, record)
+            .map_err(|failure| match failure {
+                EvalFailure::Runtime(kind) => kind,
+                _ => RuntimeErrorKind::InvalidValue { value: record },
+            })?;
+        match self.call_value(then, thenable, &[resolve, reject]) {
+            Ok(_) => Ok(()),
+            Err(EvalFailure::Runtime(kind)) => Err(kind),
+            Err(failure) => self
+                .reject_promise_resolver_failure(record, failure)
+                .map_err(|failure| match failure {
+                    EvalFailure::Runtime(kind) => kind,
+                    _ => RuntimeErrorKind::InvalidValue { value: record },
+                }),
+        }
+    }
+
+    fn execute_promise_reaction(
+        &mut self,
+        reaction: PromiseReaction,
+        value: Value,
+        origin: ThrowOrigin,
+    ) -> Result<(), RuntimeErrorKind> {
+        match reaction {
+            PromiseReaction::Fulfilled {
+                handler, derived, ..
+            } => self.execute_promise_handler(
+                handler,
+                derived,
+                value,
+                origin,
+                PromiseCompletion::Fulfilled,
+            ),
+            PromiseReaction::Rejected {
+                handler, derived, ..
+            } => self.execute_promise_handler(
+                handler,
+                derived,
+                value,
+                origin,
+                PromiseCompletion::Rejected,
+            ),
+            PromiseReaction::AsyncFulfill { activation, .. } => {
+                self.resume_async(activation, value, None)
+            }
+            PromiseReaction::AsyncReject { activation, .. } => {
+                self.resume_async(activation, value, Some(origin))
+            }
+            PromiseReaction::AsyncGeneratorFulfill { generator, .. } => {
+                self.resume_async_generator(generator, value, None)
+            }
+            PromiseReaction::AsyncGeneratorReject { generator, .. } => {
+                self.resume_async_generator(generator, value, Some(origin))
+            }
+            PromiseReaction::ModuleDepFulfill { parent, .. } => {
+                self.on_module_dep_fulfilled(parent)
+            }
+            PromiseReaction::ModuleDepReject { parent, .. } => {
+                self.on_module_dep_rejected(parent, value, origin)
+            }
+            PromiseReaction::AsyncFromSyncFulfill { derived, done, .. } => {
+                match self.iterator_result(value, done) {
+                    Ok(result) => self.fulfill_promise(derived, result),
+                    Err(EvalFailure::Runtime(kind)) => Err(kind),
+                    Err(failure) => {
+                        self.reject_promise_failure(derived, failure)
+                            .map_err(|failure| match failure {
+                                EvalFailure::Runtime(kind) => kind,
+                                _ => RuntimeErrorKind::InvalidValue { value: derived },
+                            })
+                    }
+                }
+            }
+            PromiseReaction::AsyncFromSyncReject {
+                derived,
+                sync_iterator,
+                done,
+                ..
+            } => {
+                if !done {
+                    self.close_protocol_iterator_preserving_abrupt(sync_iterator)?;
+                }
+                self.reject_promise(derived, value, origin)
+            }
+            PromiseReaction::DynamicImportFulfill {
+                promise, target, ..
+            } => {
+                let namespace = self
+                    .module_namespace(target, target)
+                    .map_err(|error| error.kind)?;
+                self.resolve_promise(promise, namespace)
+            }
+            PromiseReaction::DynamicImportReject { promise, .. } => {
+                self.reject_promise(promise, value, origin)
+            }
+        }
+    }
+
+    fn execute_promise_handler(
+        &mut self,
+        handler: Value,
+        derived: Value,
+        value: Value,
+        origin: ThrowOrigin,
+        completion: PromiseCompletion,
+    ) -> Result<(), RuntimeErrorKind> {
+        if !self.is_callable(handler).map_err(|failure| match failure {
+            EvalFailure::Runtime(kind) => kind,
+            _ => RuntimeErrorKind::InvalidValue { value: handler },
+        })? {
+            return match completion {
+                PromiseCompletion::Fulfilled => self.resolve_promise(derived, value),
+                PromiseCompletion::Rejected => self.reject_promise(derived, value, origin),
+            };
+        }
+        match self.call_value(handler, Value::UNDEFINED, &[value]) {
+            Ok(result) => self.resolve_promise(derived, result),
+            Err(EvalFailure::Runtime(kind)) => Err(kind),
+            Err(failure) => self
+                .reject_promise_failure(derived, failure)
+                .map_err(|failure| match failure {
+                    EvalFailure::Runtime(kind) => kind,
+                    _ => RuntimeErrorKind::InvalidValue { value: derived },
+                }),
+        }
+    }
+
+    /// Counts down one fulfilled static dependency of an async-pending
+    /// module. At zero the parent entry starts inline inside this reaction
+    /// job; this is ordinary callback-shaped async execution (the same shape
+    /// `resume_async` uses), never a nested event-loop checkpoint. A
+    /// suspended entry keeps its shared pair in `state`; a settled entry
+    /// writes [`ModuleState::Evaluated`] (its pair's Promise was already
+    /// settled by `settle_async_step`); a fatal failure aborts the parent
+    /// back to [`ModuleState::Unevaluated`] and stays fatal.
+    fn on_module_dep_fulfilled(&mut self, parent: ModuleId) -> Result<(), RuntimeErrorKind> {
+        let Some(pair) = self.take_module_async_pending(parent)? else {
+            return Ok(());
+        };
+        match self.start_ready_entry(parent, Some(pair)) {
+            ModuleStart::Settled(result) => {
+                let step = match result {
+                    Ok(execution) => Ok(AsyncStep::Return {
+                        value: execution.value,
+                        execution: Some(execution),
+                    }),
+                    Err(error) if matches!(error.kind, RuntimeErrorKind::UncaughtThrow { .. }) => {
+                        Ok(AsyncStep::Throw(error))
+                    }
+                    Err(error) => {
+                        self.abort_module_evaluation(parent);
+                        return Err(error.kind);
+                    }
+                };
+                self.settle_async_step(pair.record, pair.promise, step)
+                    .map_err(|failure| self.module_eval_failure(parent, failure).kind)
+            }
+            ModuleStart::Pending(_) => Ok(()),
+            ModuleStart::Cached => unreachable!("a started entry is never cached"),
+        }
+    }
+
+    /// Fails the parent without running its entry: the identical dependency
+    /// throw is cached as the parent's stored failure, and the parent's
+    /// shared evaluation Promise rejects with the same value.
+    fn on_module_dep_rejected(
+        &mut self,
+        parent: ModuleId,
+        value: Value,
+        origin: ThrowOrigin,
+    ) -> Result<(), RuntimeErrorKind> {
+        let pending = match &self.registry.modules[parent.get() as usize].state {
+            ModuleState::EvaluatingAsync {
+                record, promise, ..
+            } => ModulePending {
+                record: *record,
+                promise: *promise,
+            },
+            // The first rejection already settled or aborted the parent.
+            _ => return Ok(()),
+        };
+        let error = self.program_error(parent, RuntimeErrorKind::UncaughtThrow { value, origin });
+        self.store_async_module_completion(pending.record, Some(Err(error.clone())))
+            .map_err(|failure| self.module_eval_failure(parent, failure).kind)?;
+        self.settle_module_evaluation(parent, Err(error));
+        self.reject_promise(pending.promise, value, origin)
+    }
+
+    /// Detaches an async-pending module's record/promise pair after
+    /// decrementing its dependency count; `None` means a dependency already
+    /// rejected the parent or its count has not reached zero.
+    fn take_module_async_pending(
+        &mut self,
+        parent: ModuleId,
+    ) -> Result<Option<ModulePending>, RuntimeErrorKind> {
+        let ModuleState::EvaluatingAsync {
+            record,
+            promise,
+            pending_deps,
+        } = &mut self.registry.modules[parent.get() as usize].state
+        else {
+            // A sibling rejection already settled or aborted the parent.
+            return Ok(None);
+        };
+        *pending_deps -= 1;
+        let (record, promise) = (*record, *promise);
+        if *pending_deps > 0 {
+            return Ok(None);
+        }
+        Ok(Some(ModulePending { record, promise }))
+    }
+
+    /// Attaches the module dependency fulfill/reject pair to a dependency's
+    /// evaluation Promise. Mirrors `await_promise`: an already-settled Promise
+    /// enqueues the reaction directly at exactly one microtask tick, and the
+    /// pending path charges and pushes without re-reading state, so no
+    /// check-then-attach window exists.
+    fn attach_module_reactions(
+        &mut self,
+        parent: ModuleId,
+        promise: Value,
+    ) -> Result<(), EvalFailure> {
+        let index = self
+            .runtime_slot(promise)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: promise,
+            }))?;
+        let settled = match &self.heap[index] {
+            HeapEntry::Promise {
+                state: PromiseState::Pending { .. },
+                ..
+            } => None,
+            HeapEntry::Promise {
+                state: PromiseState::Fulfilled { value },
+                ..
+            } => Some((true, *value, ThrowOrigin::Bytecode)),
+            HeapEntry::Promise {
+                state: PromiseState::Rejected { reason, origin },
+                ..
+            } => Some((false, *reason, *origin)),
+            _ => {
+                return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                    value: promise,
+                }));
+            }
+        };
+        if let Some((fulfilled, value, origin)) = settled {
+            self.ensure_microtask_capacity(1)
+                .map_err(EvalFailure::Runtime)?;
+            let reaction = if fulfilled {
+                PromiseReaction::ModuleDepFulfill {
+                    parent,
+                    context: self.context_global,
+                }
+            } else {
+                PromiseReaction::ModuleDepReject {
+                    parent,
+                    context: self.context_global,
+                }
+            };
+            self.microtasks
+                .push_back(QueuedMicrotask::uncharged(MicrotaskJob::Reaction {
+                    reaction,
+                    value,
+                    origin,
+                }));
+            return Ok(());
+        }
+        self.charge_promise_reactions(index, 2)?;
+        let context = self.context_global;
+        let HeapEntry::Promise {
+            state:
+                PromiseState::Pending {
+                    fulfill_reactions,
+                    reject_reactions,
+                },
+            ..
+        } = &mut self.heap[index]
+        else {
+            unreachable!("pending Promise state was checked before reaction registration");
+        };
+        fulfill_reactions.push(PromiseReaction::ModuleDepFulfill { parent, context });
+        reject_reactions.push(PromiseReaction::ModuleDepReject { parent, context });
+        Ok(())
+    }
+
+    /// Reports whether a Promise reached a terminal state. Used by the root
+    /// drive loop after every full microtask checkpoint and before any timer
+    /// wait, so settlement is never observed late.
+    fn promise_is_settled(&self, promise: Value) -> Result<bool, RuntimeErrorKind> {
+        let index = self
+            .runtime_slot(promise)?
+            .ok_or(RuntimeErrorKind::InvalidValue { value: promise })?;
+        match &self.heap[index] {
+            HeapEntry::Promise { state, .. } => Ok(!matches!(state, PromiseState::Pending { .. })),
+            _ => Err(RuntimeErrorKind::InvalidValue { value: promise }),
+        }
+    }
+
+    pub(crate) fn enqueue_microtask_callback(
+        &mut self,
+        callback: Value,
+    ) -> Result<(), EvalFailure> {
+        self.ensure_microtask_capacity(1)
+            .map_err(EvalFailure::Runtime)?;
+        self.microtasks
+            .push_back(QueuedMicrotask::uncharged(MicrotaskJob::Callback {
+                callback,
+                context: self.context_global,
+            }));
+        Ok(())
+    }
+
+    fn ensure_microtask_capacity(&mut self, additional: usize) -> Result<(), RuntimeErrorKind> {
+        if self
+            .microtasks
+            .len()
+            .checked_add(additional)
+            .is_none_or(|length| length > self.limits.max_microtasks)
+        {
+            return Err(RuntimeErrorKind::MicrotaskQueueLimitExceeded {
+                limit: self.limits.max_microtasks,
+            });
+        }
+        self.microtasks.try_reserve(additional).map_err(|_| {
+            RuntimeErrorKind::HeapByteLimitExceeded {
+                limit: self.limits.max_heap_bytes,
+            }
+        })
+    }
+
+    pub(crate) fn create_promise(&mut self) -> Result<Value, EvalFailure> {
+        self.allocate(HeapEntry::Promise {
+            state: PromiseState::Pending {
+                fulfill_reactions: Vec::new(),
+                reject_reactions: Vec::new(),
+            },
+            properties: PropertyMap::default(),
+            prototype: Some(self.intrinsics.builtins.promise_prototype()),
+            extensible: true,
+        })
+        .map_err(EvalFailure::Runtime)
+    }
+
+    pub(crate) fn create_promise_resolver(&mut self, promise: Value) -> Result<Value, EvalFailure> {
+        self.allocate(HeapEntry::PromiseResolver {
+            promise,
+            used: false,
+        })
+        .map_err(EvalFailure::Runtime)
+    }
+
+    pub(crate) fn create_promise_resolver_function(
+        &mut self,
+        target: Value,
+        record: Value,
+    ) -> Result<Value, EvalFailure> {
+        self.allocate(HeapEntry::NativeFunction {
+            callable: NativeCallable::Bound(Box::new(BoundCallable {
+                target,
+                this_value: Value::UNDEFINED,
+                arguments: vec![record],
+            })),
+            properties: PropertyMap::default(),
+            extensible: true,
+        })
+        .map_err(EvalFailure::Runtime)
+    }
+
+    pub(crate) fn resolve_promise_resolver(
+        &mut self,
+        record: Value,
+        value: Value,
+    ) -> Result<(), EvalFailure> {
+        if let Some(promise) = self.use_promise_resolver(record)? {
+            self.resolve_promise(promise, value)
+                .map_err(EvalFailure::Runtime)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reject_promise_resolver(
+        &mut self,
+        record: Value,
+        reason: Value,
+    ) -> Result<(), EvalFailure> {
+        if let Some(promise) = self.use_promise_resolver(record)? {
+            self.reject_promise(promise, reason, ThrowOrigin::Bytecode)
+                .map_err(EvalFailure::Runtime)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reject_promise_resolver_failure(
+        &mut self,
+        record: Value,
+        failure: EvalFailure,
+    ) -> Result<(), EvalFailure> {
+        if let Some(promise) = self.use_promise_resolver(record)? {
+            self.reject_promise_failure(promise, failure)?;
+        }
+        Ok(())
+    }
+
+    fn use_promise_resolver(&mut self, record: Value) -> Result<Option<Value>, EvalFailure> {
+        let index = self
+            .runtime_slot(record)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise resolver",
+            }))?;
+        let HeapEntry::PromiseResolver { promise, used } = &mut self.heap[index] else {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise resolver",
+            }));
+        };
+        if *used {
+            return Ok(None);
+        }
+        *used = true;
+        Ok(Some(*promise))
+    }
+
+    fn charge_promise_reactions(&mut self, index: usize, count: usize) -> Result<(), EvalFailure> {
+        let bytes = std::mem::size_of::<PromiseReaction>()
+            .checked_mul(count)
+            .ok_or(EvalFailure::Runtime(
+                RuntimeErrorKind::HeapByteLimitExceeded {
+                    limit: self.limits.max_heap_bytes,
+                },
+            ))?;
+        self.charge_slot(index, bytes).map_err(EvalFailure::Runtime)
+    }
+
+    pub(crate) fn promise_then(
+        &mut self,
+        promise: Value,
+        on_fulfilled: Value,
+        on_rejected: Value,
+    ) -> Result<Value, EvalFailure> {
+        let index = self
+            .runtime_slot(promise)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.prototype.then",
+            }))?;
+        let settled = match &self.heap[index] {
+            HeapEntry::Promise {
+                state: PromiseState::Pending { .. },
+                ..
+            } => None,
+            HeapEntry::Promise {
+                state: PromiseState::Fulfilled { value },
+                ..
+            } => Some((true, *value, ThrowOrigin::Bytecode)),
+            HeapEntry::Promise {
+                state: PromiseState::Rejected { reason, origin },
+                ..
+            } => Some((false, *reason, *origin)),
+            _ => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "Promise.prototype.then",
+                }));
+            }
+        };
+        let derived = self.create_promise()?;
+        if let Some((fulfilled, value, origin)) = settled {
+            self.ensure_microtask_capacity(1)
+                .map_err(EvalFailure::Runtime)?;
+            let reaction = if fulfilled {
+                PromiseReaction::Fulfilled {
+                    handler: on_fulfilled,
+                    derived,
+                    context: self.context_global,
+                }
+            } else {
+                PromiseReaction::Rejected {
+                    handler: on_rejected,
+                    derived,
+                    context: self.context_global,
+                }
+            };
+            self.microtasks
+                .push_back(QueuedMicrotask::uncharged(MicrotaskJob::Reaction {
+                    reaction,
+                    value,
+                    origin,
+                }));
+            return Ok(derived);
+        }
+        self.charge_promise_reactions(index, 2)?;
+        let context = self.context_global;
+        let HeapEntry::Promise {
+            state:
+                PromiseState::Pending {
+                    fulfill_reactions,
+                    reject_reactions,
+                },
+            ..
+        } = &mut self.heap[index]
+        else {
+            unreachable!("pending Promise state was checked before derived allocation");
+        };
+        fulfill_reactions.push(PromiseReaction::Fulfilled {
+            handler: on_fulfilled,
+            derived,
+            context,
+        });
+        reject_reactions.push(PromiseReaction::Rejected {
+            handler: on_rejected,
+            derived,
+            context,
+        });
+        Ok(derived)
+    }
+
+    pub(crate) fn promise_resolve(&mut self, value: Value) -> Result<Value, EvalFailure> {
+        if matches!(self.runtime_slot(value).map_err(EvalFailure::Runtime)?, Some(index) if matches!(self.heap[index], HeapEntry::Promise { .. }))
+        {
+            return Ok(value);
+        }
+        let promise = self.create_promise()?;
+        self.resolve_promise(promise, value)
+            .map_err(EvalFailure::Runtime)?;
+        Ok(promise)
+    }
+
+    pub(crate) fn promise_all_with_resolve(
+        &mut self,
+        iterable: Value,
+        resolve: Value,
+        receiver: Value,
+    ) -> Result<Value, EvalFailure> {
+        let promise = self.create_promise()?;
+        let aggregate = self
+            .allocate(HeapEntry::PromiseAll {
+                promise,
+                values: Vec::new(),
+                remaining: 1,
+                settled: false,
+            })
+            .map_err(EvalFailure::Runtime)?;
+        let iterator = match self.create_iterator(iterable, IteratorKind::Sync) {
+            Ok(iterator) => iterator,
+            Err(failure) => {
+                self.mark_promise_all_settled(aggregate)?;
+                self.reject_promise_failure(promise, failure)?;
+                return Ok(promise);
+            }
+        };
+        loop {
+            let value = match self.iterator_next(iterator) {
+                Ok((true, _)) => break,
+                Ok((false, value)) => value,
+                Err(failure) => {
+                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                }
+            };
+            let index = match self.add_promise_all_element(aggregate) {
+                Ok(index) => index,
+                Err(failure) => {
+                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                }
+            };
+            let element = match self
+                .allocate(HeapEntry::PromiseAllElement {
+                    aggregate,
+                    index,
+                    called: false,
+                })
+                .map_err(EvalFailure::Runtime)
+            {
+                Ok(element) => element,
+                Err(failure) => {
+                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                }
+            };
+            let (fulfill_target, reject_target) = self.intrinsics.builtins.promise_all_targets();
+            let on_fulfilled = match self.create_promise_resolver_function(fulfill_target, element)
+            {
+                Ok(callback) => callback,
+                Err(failure) => {
+                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                }
+            };
+            let on_rejected = match self.create_promise_resolver_function(reject_target, element) {
+                Ok(callback) => callback,
+                Err(failure) => {
+                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                }
+            };
+            let resolved = match self.call_value(resolve, receiver, &[value]) {
+                Ok(resolved) => resolved,
+                Err(failure) => {
+                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                }
+            };
+            let then = match self.get_named_property(resolved, "then") {
+                Ok(then) => then,
+                Err(failure) => {
+                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                }
+            };
+            if let Err(failure) = self.call_value(then, resolved, &[on_fulfilled, on_rejected]) {
+                return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+            }
+        }
+        if self.finish_promise_all(aggregate)? {
+            let array = self.move_promise_all_values_to_array(aggregate)?;
+            self.fulfill_promise(promise, array)
+                .map_err(EvalFailure::Runtime)?;
+        }
+        Ok(promise)
+    }
+
+    fn reject_promise_all_abrupt(
+        &mut self,
+        aggregate: Value,
+        promise: Value,
+        iterator: Value,
+        failure: EvalFailure,
+    ) -> Result<Value, EvalFailure> {
+        self.mark_promise_all_settled(aggregate)?;
+        if let Err(EvalFailure::Runtime(kind)) = self.close_iterator(iterator) {
+            return Err(EvalFailure::Runtime(kind));
+        }
+        self.reject_promise_failure(promise, failure)?;
+        Ok(promise)
+    }
+
+    pub(crate) fn iterator_close_target(
+        &mut self,
+        iterator: Value,
+    ) -> Result<Option<Value>, EvalFailure> {
+        let Some(index) = self.runtime_slot(iterator).map_err(EvalFailure::Runtime)? else {
+            return Ok(None);
+        };
+        match &self.heap[index] {
+            HeapEntry::Iterator {
+                state:
+                    IteratorState::Protocol { iterator, .. }
+                    | IteratorState::AsyncFromSync { iterator, .. },
+            } => Ok(Some(*iterator)),
+            _ => Ok(None),
+        }
+    }
+
+    pub(crate) fn close_iterator_raw(
+        &mut self,
+        iterator: Value,
+    ) -> (Result<Value, EvalFailure>, bool) {
+        let target = match self.iterator_close_target(iterator) {
+            Ok(Some(target)) => target,
+            Ok(None) => return (Ok(Value::UNDEFINED), false),
+            Err(failure) => return (Err(failure), false),
+        };
+        let close = match self.get_named_property(target, "return") {
+            Ok(close) => close,
+            Err(failure) => return (Err(failure), false),
+        };
+        match self.is_callable(close) {
+            Ok(true) => (self.call_value(close, target, &[]), true),
+            Ok(false) => (Ok(Value::UNDEFINED), false),
+            Err(failure) => (Err(failure), false),
+        }
+    }
+
+    pub(crate) fn dispose_capture_raw(
+        &mut self,
+        src: Value,
+        hint: DisposeHint,
+    ) -> Result<(Value, u32), EvalFailure> {
+        if matches!(src.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+            return Ok((Value::UNDEFINED, 0));
+        }
+        if !self.is_object(src) {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "disposable resource is not an object",
+            }));
+        }
+
+        let key = match hint {
+            DisposeHint::Sync => self.to_property_key(self.intrinsics.builtins.symbol_dispose())?,
+            DisposeHint::Async => {
+                self.to_property_key(self.intrinsics.builtins.symbol_async_dispose())?
+            }
+        };
+        let method = self.get_property_key(src, &key)?;
+        if !matches!(method.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+            if self.is_callable(method)? {
+                return Ok((method, 1));
+            }
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "disposal method is not callable",
+            }));
+        }
+        if hint == DisposeHint::Sync {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "disposal method is not callable",
+            }));
+        }
+
+        let key = self.to_property_key(self.intrinsics.builtins.symbol_dispose())?;
+        let method = self.get_property_key(src, &key)?;
+        if self.is_callable(method)? {
+            Ok((method, 2))
+        } else {
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "disposal method is not callable",
+            }))
+        }
+    }
+
+    /// Object Environment Record `HasBinding` for a `with` binding object.
+    ///
+    /// Uses the realm-owned `%Symbol.unscopables%` intrinsic (never a user-global
+    /// `Symbol` lookup), performs ordinary `Get`s with the correct receivers, and
+    /// never caches the unscopables object or its named entry.
+    pub(crate) fn with_has_binding(
+        &mut self,
+        object: Value,
+        key: Value,
+    ) -> Result<bool, EvalFailure> {
+        let key = self.to_property_key(key)?;
+        if !self.has_property(object, &key)? {
+            return Ok(false);
+        }
+        let unscopables_key =
+            self.to_property_key(self.intrinsics.builtins.symbol_unscopables())?;
+        let unscopables = self.get_property_key(object, &unscopables_key)?;
+        if !self.is_object(unscopables) {
+            return Ok(true);
+        }
+        let blocked = self.get_property_key(unscopables, &key)?;
+        Ok(!self.truthy(blocked))
+    }
+
+    pub(crate) fn make_suppressed_error(
+        &mut self,
+        error: Value,
+        suppressed: Value,
+    ) -> Result<Value, EvalFailure> {
+        let id = self
+            .intrinsics
+            .builtins
+            .id_named("SuppressedError")
+            .expect("SuppressedError builtin installs first");
+        let mut properties = PropertyMap::default();
+        for (name, value) in [("error", error), ("suppressed", suppressed)] {
+            properties.insert(
+                PropertyKey::Named(EcmaString::from_utf8(name)),
+                Property::Data {
+                    value,
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+        }
+        self.allocate(HeapEntry::Object {
+            properties,
+            prototype: Some(self.intrinsics.error_prototype(id)),
+            boxed_primitive: None,
+            extensible: true,
+        })
+        .map_err(EvalFailure::Runtime)
+    }
+
+    fn close_iterator(&mut self, iterator: Value) -> Result<(), EvalFailure> {
+        let (result, _) = self.close_iterator_raw(iterator);
+        result.map(|_| ())
+    }
+
+    fn close_protocol_iterator(&mut self, iterator: Value) -> Result<(), EvalFailure> {
+        let close = self.get_named_property(iterator, "return")?;
+        if self.is_callable(close)? {
+            let _ = self.call_value(close, iterator, &[])?;
+        }
+        Ok(())
+    }
+
+    /// A user's close throw cannot replace an existing abrupt completion.
+    /// Engine failures remain fatal because execution cannot resume safely.
+    fn close_protocol_iterator_preserving_abrupt(
+        &mut self,
+        iterator: Value,
+    ) -> Result<(), RuntimeErrorKind> {
+        match self.close_protocol_iterator(iterator) {
+            Err(EvalFailure::Runtime(kind)) => Err(kind),
+            Ok(())
+            | Err(
+                EvalFailure::Throw(_)
+                | EvalFailure::ThrowValue(_)
+                | EvalFailure::ThrowValueOrigin { .. },
+            ) => Ok(()),
+        }
+    }
+
+    fn mark_promise_all_settled(&mut self, aggregate: Value) -> Result<bool, EvalFailure> {
+        let index = self
+            .runtime_slot(aggregate)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.all target",
+            }))?;
+        let HeapEntry::PromiseAll { settled, .. } = &mut self.heap[index] else {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.all target",
+            }));
+        };
+        let changed = !*settled;
+        *settled = true;
+        Ok(changed)
+    }
+
+    fn add_promise_all_element(&mut self, aggregate: Value) -> Result<usize, EvalFailure> {
+        let index = self
+            .runtime_slot(aggregate)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.all target",
+            }))?;
+        let next_remaining = match &self.heap[index] {
+            HeapEntry::PromiseAll {
+                remaining,
+                settled: false,
+                ..
+            } => remaining.checked_add(1).ok_or(EvalFailure::Runtime(
+                RuntimeErrorKind::HeapByteLimitExceeded {
+                    limit: self.limits.max_heap_bytes,
+                },
+            ))?,
+            HeapEntry::PromiseAll { .. } => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "Promise.all target",
+                }));
+            }
+            _ => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "Promise.all target",
+                }));
+            }
+        };
+        self.ensure_allocation_capacity(0, std::mem::size_of::<Value>())
+            .map_err(EvalFailure::Runtime)?;
+        let HeapEntry::PromiseAll { values, .. } = &mut self.heap[index] else {
+            unreachable!("Promise.all aggregate was checked before reserving value storage");
+        };
+        values.try_reserve(1).map_err(|_| {
+            EvalFailure::Runtime(RuntimeErrorKind::HeapByteLimitExceeded {
+                limit: self.limits.max_heap_bytes,
+            })
+        })?;
+        self.charge_slot(index, std::mem::size_of::<Value>())
+            .map_err(EvalFailure::Runtime)?;
+        let HeapEntry::PromiseAll {
+            values, remaining, ..
+        } = &mut self.heap[index]
+        else {
+            unreachable!("Promise.all aggregate was checked before its heap charge");
+        };
+        let index = values.len();
+        values.push(Value::UNDEFINED);
+        *remaining = next_remaining;
+        Ok(index)
+    }
+
+    fn finish_promise_all(&mut self, aggregate: Value) -> Result<bool, EvalFailure> {
+        let index = self
+            .runtime_slot(aggregate)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.all target",
+            }))?;
+        let HeapEntry::PromiseAll {
+            remaining, settled, ..
+        } = &mut self.heap[index]
+        else {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.all target",
+            }));
+        };
+        if *settled {
+            return Ok(false);
+        }
+        *remaining -= 1;
+        if *remaining != 0 {
+            return Ok(false);
+        }
+        *settled = true;
+        Ok(true)
+    }
+
+    fn move_promise_all_values_to_array(&mut self, aggregate: Value) -> Result<Value, EvalFailure> {
+        let aggregate_index = self
+            .runtime_slot(aggregate)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.all target",
+            }))?;
+        if !matches!(self.heap[aggregate_index], HeapEntry::PromiseAll { .. }) {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.all target",
+            }));
+        }
+        let array = self.create_array(Vec::new())?;
+        let array_index = self
+            .runtime_slot(array)
+            .map_err(EvalFailure::Runtime)?
+            .expect("new runtime array has a runtime slot");
+        let values = match &mut self.heap[aggregate_index] {
+            HeapEntry::PromiseAll { values, .. } => std::mem::take(values),
+            _ => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "Promise.all target",
+                }));
+            }
+        };
+        let bytes = values.len().saturating_mul(std::mem::size_of::<Value>());
+        let HeapEntry::Array { elements, .. } = &mut self.heap[array_index] else {
+            unreachable!("create_array returned a non-array");
+        };
+        *elements = values;
+        self.transfer_slot_charge(aggregate_index, array_index, bytes);
+        Ok(array)
+    }
+
+    pub(crate) fn resolve_promise_all_element(
+        &mut self,
+        element: Value,
+        value: Value,
+    ) -> Result<(), EvalFailure> {
+        let index = self
+            .runtime_slot(element)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.all target",
+            }))?;
+        let (aggregate, output_index) = {
+            let HeapEntry::PromiseAllElement {
+                aggregate,
+                index: output_index,
+                called,
+            } = &mut self.heap[index]
+            else {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "Promise.all target",
+                }));
+            };
+            if *called {
+                return Ok(());
+            }
+            *called = true;
+            (*aggregate, *output_index)
+        };
+        let aggregate_index = self
+            .runtime_slot(aggregate)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.all target",
+            }))?;
+        let (promise, completed) = {
+            let HeapEntry::PromiseAll {
+                promise,
+                values,
+                remaining,
+                settled,
+            } = &mut self.heap[aggregate_index]
+            else {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "Promise.all target",
+                }));
+            };
+            if *settled {
+                return Ok(());
+            }
+            values[output_index] = value;
+            *remaining -= 1;
+            let completed = *remaining == 0;
+            if completed {
+                *settled = true;
+            }
+            (*promise, completed)
+        };
+        if completed {
+            let array = self.move_promise_all_values_to_array(aggregate)?;
+            self.fulfill_promise(promise, array)
+                .map_err(EvalFailure::Runtime)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reject_promise_all_element(
+        &mut self,
+        element: Value,
+        reason: Value,
+    ) -> Result<(), EvalFailure> {
+        let index = self
+            .runtime_slot(element)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.all target",
+            }))?;
+        let aggregate = {
+            let HeapEntry::PromiseAllElement {
+                aggregate, called, ..
+            } = &mut self.heap[index]
+            else {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "Promise.all target",
+                }));
+            };
+            if *called {
+                return Ok(());
+            }
+            *called = true;
+            *aggregate
+        };
+        let aggregate_index = self
+            .runtime_slot(aggregate)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.all target",
+            }))?;
+        let HeapEntry::PromiseAll { promise, .. } = &self.heap[aggregate_index] else {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise.all target",
+            }));
+        };
+        let promise = *promise;
+        if !self.mark_promise_all_settled(aggregate)? {
+            return Ok(());
+        }
+        self.reject_promise(promise, reason, ThrowOrigin::Bytecode)
+            .map_err(EvalFailure::Runtime)
+    }
+
+    fn create_array(&mut self, elements: Vec<Value>) -> Result<Value, EvalFailure> {
+        self.allocate(HeapEntry::Array {
+            elements,
+            properties: PropertyMap::default(),
+            prototype: Some(self.intrinsics.array_prototype),
+            extensible: true,
+            length_writable: true,
+        })
+        .map_err(EvalFailure::Runtime)
+    }
+
+    fn resolve_promise(&mut self, promise: Value, value: Value) -> Result<(), RuntimeErrorKind> {
+        if promise == value {
+            return self
+                .reject_promise_failure(
+                    promise,
+                    EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "Promise cannot resolve itself",
+                    }),
+                )
+                .map_err(|failure| match failure {
+                    EvalFailure::Runtime(kind) => kind,
+                    _ => RuntimeErrorKind::InvalidValue { value: promise },
+                });
+        }
+        if !self.is_object(value) {
+            return self.fulfill_promise(promise, value);
+        }
+        let then = match self.get_named_property(value, "then") {
+            Ok(then) => then,
+            Err(EvalFailure::Runtime(kind)) => return Err(kind),
+            Err(failure) => {
+                return self.reject_promise_failure(promise, failure).map_err(
+                    |failure| match failure {
+                        EvalFailure::Runtime(kind) => kind,
+                        _ => RuntimeErrorKind::InvalidValue { value: promise },
+                    },
+                );
+            }
+        };
+        if !self.is_callable(then).map_err(|failure| match failure {
+            EvalFailure::Runtime(kind) => kind,
+            _ => RuntimeErrorKind::InvalidValue { value: then },
+        })? {
+            return self.fulfill_promise(promise, value);
+        }
+        self.ensure_microtask_capacity(1)?;
+        self.microtasks
+            .push_back(QueuedMicrotask::uncharged(MicrotaskJob::Thenable {
+                promise,
+                thenable: value,
+                then,
+                context: self.context_global,
+            }));
+        Ok(())
+    }
+
+    /// Rejects `promise` with `reason`. Lazy engine-origin reasons
+    /// (`UNDEFINED` + non-Bytecode origin) are materialized once here into a
+    /// realm-intrinsic Error before settlement, so every rejection path
+    /// (async functions, async generators, incompatible receivers, failed
+    /// imports, reaction forwarding) stores an observable error object.
+    /// Already-materialized and Bytecode-origin reasons retain identity.
+    /// Already-settled promises are no-ops and do not allocate a reason.
+    fn reject_promise(
+        &mut self,
+        promise: Value,
+        reason: Value,
+        origin: ThrowOrigin,
+    ) -> Result<(), RuntimeErrorKind> {
+        if catch_value_needs_materialization(reason, origin) {
+            let index = self
+                .runtime_slot(promise)?
+                .ok_or(RuntimeErrorKind::InvalidValue { value: promise })?;
+            match &self.heap[index] {
+                HeapEntry::Promise {
+                    state: PromiseState::Pending { .. },
+                    ..
+                } => {}
+                HeapEntry::Promise { .. } => return Ok(()),
+                _ => return Err(RuntimeErrorKind::InvalidValue { value: promise }),
+            }
+            let reason = self.materialize_engine_origin(origin)?;
+            return self.settle_promise(promise, PromiseState::Rejected { reason, origin });
+        }
+        self.settle_promise(promise, PromiseState::Rejected { reason, origin })
+    }
+
+    fn fulfill_promise(&mut self, promise: Value, value: Value) -> Result<(), RuntimeErrorKind> {
+        self.settle_promise(promise, PromiseState::Fulfilled { value })
+    }
+
+    fn settle_promise(
+        &mut self,
+        promise: Value,
+        terminal: PromiseState,
+    ) -> Result<(), RuntimeErrorKind> {
+        let index = self
+            .runtime_slot(promise)?
+            .ok_or(RuntimeErrorKind::InvalidValue { value: promise })?;
+        let (reaction_count, pending_charge) = match &self.heap[index] {
+            HeapEntry::Promise {
+                state:
+                    PromiseState::Pending {
+                        fulfill_reactions,
+                        reject_reactions,
+                    },
+                ..
+            } => {
+                let reaction_count = match &terminal {
+                    PromiseState::Fulfilled { .. } => fulfill_reactions.len(),
+                    PromiseState::Rejected { .. } => reject_reactions.len(),
+                    PromiseState::Pending { .. } => unreachable!("Promise settlement is terminal"),
+                };
+                let pending_count = fulfill_reactions
+                    .len()
+                    .saturating_add(reject_reactions.len());
+                (
+                    reaction_count,
+                    pending_count.saturating_mul(std::mem::size_of::<PromiseReaction>()),
+                )
+            }
+            HeapEntry::Promise { .. } => return Ok(()),
+            _ => return Err(RuntimeErrorKind::InvalidValue { value: promise }),
+        };
+        self.ensure_microtask_capacity(reaction_count)?;
+        let reactions = match &mut self.heap[index] {
+            HeapEntry::Promise { state, .. } => {
+                let reactions = match state {
+                    PromiseState::Pending {
+                        fulfill_reactions,
+                        reject_reactions,
+                    } => match &terminal {
+                        PromiseState::Fulfilled { .. } => std::mem::take(fulfill_reactions),
+                        PromiseState::Rejected { .. } => std::mem::take(reject_reactions),
+                        PromiseState::Pending { .. } => {
+                            unreachable!("Promise settlement is terminal")
+                        }
+                    },
+                    _ => return Ok(()),
+                };
+                *state = terminal.clone();
+                reactions
+            }
+            _ => return Err(RuntimeErrorKind::InvalidValue { value: promise }),
+        };
+        let (value, origin) = match terminal {
+            PromiseState::Fulfilled { value } => (value, ThrowOrigin::Bytecode),
+            PromiseState::Rejected { reason, origin } => (reason, origin),
+            PromiseState::Pending { .. } => unreachable!("Promise settlement is terminal"),
+        };
+        let queued_charge = reactions
+            .len()
+            .saturating_mul(std::mem::size_of::<PromiseReaction>());
+        self.transfer_slot_to_machine(index, queued_charge);
+        self.refund_slot(index, pending_charge.saturating_sub(queued_charge));
+        for reaction in reactions {
+            self.microtasks.push_back(QueuedMicrotask {
+                job: MicrotaskJob::Reaction {
+                    reaction,
+                    value,
+                    origin,
+                },
+                retained_bytes: std::mem::size_of::<PromiseReaction>(),
+            });
+        }
+        Ok(())
+    }
+
+    fn reject_promise_failure(
+        &mut self,
+        promise: Value,
+        failure: EvalFailure,
+    ) -> Result<(), EvalFailure> {
+        let (reason, origin) = self.promise_rejection_value(failure)?;
+        self.reject_promise(promise, reason, origin)
+            .map_err(EvalFailure::Runtime)
+    }
+
+    fn promise_rejection_value(
+        &mut self,
+        failure: EvalFailure,
+    ) -> Result<(Value, ThrowOrigin), EvalFailure> {
+        match failure {
+            EvalFailure::ThrowValue(value) => Ok((value, ThrowOrigin::Bytecode)),
+            EvalFailure::ThrowValueOrigin { value, origin } => Ok((value, origin)),
+            EvalFailure::Throw(ThrowOrigin::Bytecode) => {
+                Ok((Value::UNDEFINED, ThrowOrigin::Bytecode))
+            }
+            EvalFailure::Throw(origin) => {
+                let value = self
+                    .materialize_engine_origin(origin)
+                    .map_err(EvalFailure::Runtime)?;
+                Ok((value, origin))
+            }
+            EvalFailure::Runtime(kind) => Err(EvalFailure::Runtime(kind)),
+        }
+    }
+
+    /// Builds a realm error object for a non-bytecode engine throw origin via
+    /// installed error-constructor intrinsics (not user-global lookup).
+    pub(crate) fn materialize_engine_origin(
+        &mut self,
+        origin: ThrowOrigin,
+    ) -> Result<Value, RuntimeErrorKind> {
+        let (name, message) = match origin {
+            ThrowOrigin::TypeError { operation } => ("TypeError", operation),
+            ThrowOrigin::RangeError { operation } => ("RangeError", operation),
+            ThrowOrigin::ReferenceError { operation } => ("ReferenceError", operation),
+            ThrowOrigin::UriError { operation } => ("URIError", operation),
+            ThrowOrigin::Bytecode => {
+                unreachable!("bytecode throws retain their original value")
+            }
+        };
+        let id = self
+            .intrinsics
+            .builtins
+            .id_named(name)
+            .expect("error constructor is installed");
+        match self.throw_error(id, message.to_owned()) {
+            EvalFailure::ThrowValue(value) => Ok(value),
+            EvalFailure::Runtime(kind) => Err(kind),
+            _ => unreachable!("error materialization returns a thrown value"),
+        }
+    }
+
+    fn program(&self) -> &Program<Verified> {
+        self.program
+            .expect("module registry operations require a whole program")
+    }
+
+    fn module_code(&self, module: ModuleId) -> &Module<Verified> {
+        let index = module.get() as usize;
+        if index >= self.dynamic_base {
+            return &self.dynamic[index - self.dynamic_base].program.modules()[0].code;
+        }
+        match self.program {
+            Some(program) => {
+                &program
+                    .module(module)
+                    .expect("verified module id remains in bounds")
+                    .code
+            }
+            None => self.module,
+        }
+    }
+
+    fn program_module(&self, module: ModuleId) -> &ProgramModule<Verified> {
+        let index = module.get() as usize;
+        if index >= self.dynamic_base {
+            return &self.dynamic[index - self.dynamic_base].program.modules()[0];
+        }
+        self.program
+            .and_then(|program| program.module(module))
+            .expect("verified module id remains in bounds")
+    }
+
+    /// Validates host-provided code against this machine's classic-script realm.
+    fn validate_dynamic_script(program: &Program<Verified>) -> Result<(), &'static str> {
+        if program.modules().len() != 1 {
+            return Err("script program must contain exactly one module");
+        }
+        if program.entry() != ModuleId::new(0) {
+            return Err("script program entry must be module zero");
+        }
+        let module = &program.modules()[0];
+        if !module.edges.is_empty() || !module.bindings.is_empty() || !module.exports.is_empty() {
+            return Err("script program must not contain linkage metadata");
+        }
+        if module
+            .code
+            .functions()
+            .iter()
+            .flat_map(|function| function.code())
+            .any(|instruction| {
+                matches!(
+                    instruction,
+                    Instruction::Import { .. } | Instruction::Export { .. }
+                )
+            })
+        {
+            return Err("script program must not contain import or export instructions");
+        }
+        Ok(())
+    }
+
+    fn script_heap_cost(program: &Program<Verified>) -> usize {
+        const MODULE_BYTES: usize = 64;
+        const FUNCTION_BYTES: usize = 32;
+        program.modules().iter().fold(0usize, |total, module| {
+            let constant_bytes = module
+                .code
+                .constants()
+                .iter()
+                .fold(0usize, |bytes, constant| {
+                    let payload = match constant {
+                        Constant::String(text) => text.len_units().saturating_mul(2),
+                        Constant::BigInt(value) => value.as_str().len(),
+                        Constant::Number(_)
+                        | Constant::Int32(_)
+                        | Constant::Boolean(_)
+                        | Constant::Null
+                        | Constant::Undefined => 0,
+                    };
+                    bytes
+                        .saturating_add(std::mem::size_of::<Constant>())
+                        .saturating_add(payload)
+                });
+            let function_bytes =
+                module
+                    .code
+                    .functions()
+                    .iter()
+                    .fold(0usize, |bytes, function| {
+                        bytes
+                            .saturating_add(FUNCTION_BYTES)
+                            .saturating_add(
+                                function
+                                    .code()
+                                    .len()
+                                    .saturating_mul(std::mem::size_of::<Instruction>()),
+                            )
+                            .saturating_add(function.handlers().len().saturating_mul(
+                                std::mem::size_of::<bamts_bytecode::ExceptionHandler>(),
+                            ))
+                    });
+            total
+                .saturating_add(MODULE_BYTES)
+                .saturating_add(constant_bytes)
+                .saturating_add(function_bytes)
+                .saturating_add(module.code.verification_bytes())
+        })
+    }
+
+    fn install_script_reserving(
+        &mut self,
+        program: Arc<Program<Verified>>,
+        reserved_slots: usize,
+        reserved_bytes: usize,
+    ) -> Result<ModuleId, RuntimeErrorKind> {
+        Self::validate_dynamic_script(&program)
+            .map_err(|reason| RuntimeErrorKind::InvalidDynamicScript { reason })?;
+        if self.dynamic.len() >= self.limits.max_dynamic_modules {
+            return Err(RuntimeErrorKind::DynamicModuleLimitExceeded {
+                limit: self.limits.max_dynamic_modules,
+            });
+        }
+        let bytes = Self::script_heap_cost(&program);
+        let retained_bytes =
+            bytes
+                .checked_add(reserved_bytes)
+                .ok_or(RuntimeErrorKind::HeapByteLimitExceeded {
+                    limit: self.limits.max_heap_bytes,
+                })?;
+        self.ensure_allocation_capacity(reserved_slots, retained_bytes)?;
+        self.charge_machine(bytes)?;
+        let index = self.dynamic_base.checked_add(self.dynamic.len()).ok_or(
+            RuntimeErrorKind::DynamicModuleLimitExceeded {
+                limit: self.limits.max_dynamic_modules,
+            },
+        )?;
+        let module = ModuleId::new(u32::try_from(index).map_err(|_| {
+            RuntimeErrorKind::DynamicModuleLimitExceeded {
+                limit: self.limits.max_dynamic_modules,
+            }
+        })?);
+        self.dynamic.push(DynamicModule { program, bytes });
+        self.registry.modules.push(ModuleInstance {
+            binding_cells: Vec::new(),
+            constant_cells: Vec::new(),
+            namespace: None,
+            import_meta: None,
+            state: ModuleState::Unevaluated,
+        });
+        debug_assert_eq!(
+            self.dynamic
+                .last()
+                .expect("installed script remains retained")
+                .bytes,
+            bytes
+        );
+        debug_assert_eq!(
+            self.registry.modules.len(),
+            self.dynamic_base + self.dynamic.len()
+        );
+        Ok(module)
+    }
+
+    fn allocate_cell(&mut self, value: Value, module: ModuleId) -> Result<CellId, RuntimeError> {
+        if self.registry.cells.len() >= self.limits.max_module_cells {
+            return Err(self.program_error(
+                module,
+                RuntimeErrorKind::ModuleCellLimitExceeded {
+                    limit: self.limits.max_module_cells,
+                },
+            ));
+        }
+        let id = CellId(self.registry.cells.len());
+        self.registry.cells.push(Cell { value });
+        Ok(id)
+    }
+
+    pub(crate) fn instantiate_modules(&mut self) -> Result<(), RuntimeError> {
+        debug_assert!(
+            self.dynamic.is_empty(),
+            "module instantiation precedes dynamic script installation"
+        );
+        let program = self
+            .program
+            .expect("module registry operations require a whole program");
+        self.registry.modules = program
+            .modules()
+            .iter()
+            .map(|module| ModuleInstance {
+                binding_cells: vec![None; module.bindings.len()],
+                constant_cells: vec![None; module.code.constants().len()],
+                namespace: None,
+                import_meta: None,
+                state: ModuleState::Unevaluated,
+            })
+            .collect();
+        self.registry.local_modules = program
+            .modules()
+            .iter()
+            .enumerate()
+            .map(|(module_index, module)| {
+                let name = match module.code.constants().get(module.name.get() as usize) {
+                    Some(Constant::String(name)) => name.clone(),
+                    _ => unreachable!("verified program module names are strings"),
+                };
+                (name, ModuleId::new(module_index as u32))
+            })
+            .collect();
+
+        for module_index in 0..program.modules().len() {
+            let module_id = ModuleId::new(module_index as u32);
+            let bindings = program.modules()[module_index].bindings.clone();
+            for (binding_index, binding) in bindings.into_iter().enumerate() {
+                let initial = match binding.kind {
+                    BindingKind::Hoisted => Some(Value::UNDEFINED),
+                    BindingKind::Lexical => Some(Value::UNINITIALIZED),
+                    BindingKind::Imported { .. } | BindingKind::Namespace { .. } => None,
+                };
+                if let Some(value) = initial {
+                    let cell = self.allocate_cell(value, module_id)?;
+                    self.registry.modules[module_index].binding_cells[binding_index] = Some(cell);
+                }
+            }
+        }
+
+        for module_index in 0..program.modules().len() {
+            let module_id = ModuleId::new(module_index as u32);
+            let bindings = program.modules()[module_index].bindings.clone();
+            for (binding_index, binding) in bindings.into_iter().enumerate() {
+                let cell = match binding.kind {
+                    BindingKind::Hoisted | BindingKind::Lexical => continue,
+                    BindingKind::Imported { edge, name } => {
+                        let dependency = program.modules()[module_index].edges[edge.get() as usize];
+                        match dependency.target {
+                            EdgeTarget::External => {
+                                let name = self.constant_text(module_id, name).clone();
+                                self.external_export_cell(module_id, edge, &name)?
+                            }
+                            EdgeTarget::Local(target) => match program
+                                .resolve_export(target, self.constant_text(module_id, name))
+                            {
+                                Some(ResolvedExport::Local { module, binding }) => {
+                                    self.registry.modules[module.get() as usize].binding_cells
+                                        [binding.get() as usize]
+                                        .expect("own cells are allocated before aliases link")
+                                }
+                                Some(ResolvedExport::External { module, edge, name }) => {
+                                    let name = self.constant_text(module, name).clone();
+                                    self.external_export_cell(module, edge, &name)?
+                                }
+                                None => {
+                                    return Err(self.program_error(
+                                        module_id,
+                                        RuntimeErrorKind::InvalidVerifiedProgram {
+                                            module: module_id,
+                                            instruction: Instruction::Import {
+                                                dst: bamts_bytecode::Register::new(0),
+                                                specifier: name,
+                                            },
+                                        },
+                                    ));
+                                }
+                            },
+                        }
+                    }
+                    BindingKind::Namespace { edge } => {
+                        let dependency = program.modules()[module_index].edges[edge.get() as usize];
+                        let namespace = match dependency.target {
+                            EdgeTarget::Local(target) => {
+                                self.module_namespace(target, module_id)?
+                            }
+                            EdgeTarget::External => self.external_namespace(module_id, edge)?,
+                        };
+                        self.allocate_cell(namespace, module_id)?
+                    }
+                };
+                self.registry.modules[module_index].binding_cells[binding_index] = Some(cell);
+            }
+        }
+
+        for module_index in 0..program.modules().len() {
+            let bindings = &program.modules()[module_index].bindings;
+            let constants = program.modules()[module_index].code.constants();
+            for (constant_index, constant) in constants.iter().enumerate() {
+                let Constant::String(name) = constant else {
+                    continue;
+                };
+                if let Some((binding_index, _)) =
+                    bindings.iter().enumerate().find(|(_, binding)| {
+                        self.constant_text(ModuleId::new(module_index as u32), binding.name) == name
+                    })
+                {
+                    self.registry.modules[module_index].constant_cells[constant_index] =
+                        self.registry.modules[module_index].binding_cells[binding_index];
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn load_import_meta(&mut self, module: ModuleId) -> Result<Value, RuntimeErrorKind> {
+        let module_index = module.get() as usize;
+        if let Some(value) = self.registry.modules[module_index].import_meta {
+            return Ok(value);
+        }
+        let module_name = self
+            .constant_text(module, self.program_module(module).name)
+            .clone();
+        let url = self.host.import_meta_url(&module_name);
+        let url_key = PropertyKey::Named(EcmaString::from_utf8("url"));
+        let bytes = url
+            .len_units()
+            .saturating_mul(2)
+            .saturating_add(url_key.charge_bytes().saturating_add(1));
+        self.ensure_allocation_capacity(2, bytes)?;
+        let url_value = self.allocate(HeapEntry::String(url))?;
+        let mut properties = PropertyMap::default();
+        properties.insert(
+            url_key,
+            Property::Data {
+                value: url_value,
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            },
+        );
+        let value = self.allocate(HeapEntry::Object {
+            properties,
+            prototype: Some(self.intrinsics.object_prototype),
+            boxed_primitive: None,
+            extensible: true,
+        })?;
+        self.registry.modules[module_index].import_meta = Some(value);
+        Ok(value)
+    }
+
+    fn module_namespace(
+        &mut self,
+        target: ModuleId,
+        requester: ModuleId,
+    ) -> Result<Value, RuntimeError> {
+        if let Some(value) = self.registry.modules[target.get() as usize].namespace {
+            return Ok(value);
+        }
+        let exported_names: Vec<EcmaString> = self
+            .program_module(target)
+            .exports
+            .iter()
+            .map(|export| self.constant_text(target, export.name).clone())
+            .collect();
+        for exported_name in exported_names {
+            if let Some(ResolvedExport::External { module, edge, name }) =
+                self.program().resolve_export(target, &exported_name)
+            {
+                let name = self.constant_text(module, name).clone();
+                self.external_export_cell(module, edge, &name)?;
+            }
+        }
+        let value = self
+            .allocate(HeapEntry::ModuleNamespace { module: target })
+            .map_err(|kind| self.program_error(requester, kind))?;
+        self.registry.modules[target.get() as usize].namespace = Some(value);
+        Ok(value)
+    }
+
+    fn external_specifier(&self, module: ModuleId, edge: EdgeId) -> Option<EcmaString> {
+        let dependency = self.program_module(module).edges[edge.get() as usize];
+        let specifier = self.constant_text(module, dependency.specifier);
+        self.registry
+            .external
+            .contains_key(specifier)
+            .then(|| specifier.clone())
+    }
+
+    fn external_namespace(
+        &mut self,
+        module: ModuleId,
+        edge: EdgeId,
+    ) -> Result<Value, RuntimeError> {
+        let Some(specifier) = self.external_specifier(module, edge) else {
+            return Err(self.program_error(
+                module,
+                RuntimeErrorKind::ExternalModuleUnavailable { module, edge },
+            ));
+        };
+        let export_names: Vec<EcmaString> = self.registry.external[&specifier]
+            .exports
+            .keys()
+            .cloned()
+            .collect();
+        for name in export_names {
+            self.external_export_cell(module, edge, &name)?;
+        }
+        Ok(self.registry.external[&specifier].namespace)
+    }
+
+    fn external_export_cell(
+        &mut self,
+        module: ModuleId,
+        edge: EdgeId,
+        name: &EcmaString,
+    ) -> Result<CellId, RuntimeError> {
+        let Some(specifier) = self.external_specifier(module, edge) else {
+            return Err(self.program_error(
+                module,
+                RuntimeErrorKind::ExternalModuleUnavailable { module, edge },
+            ));
+        };
+        let Some(export) = self.registry.external[&specifier]
+            .exports
+            .get(name)
+            .copied()
+        else {
+            return Err(self.program_error(
+                module,
+                RuntimeErrorKind::ExternalModuleUnavailable { module, edge },
+            ));
+        };
+        if let Some(cell) = export.cell {
+            return Ok(cell);
+        }
+        let cell = self.allocate_cell(export.value, module)?;
+        self.registry
+            .external
+            .get_mut(&specifier)
+            .expect("external module remains registered")
+            .exports
+            .get_mut(name)
+            .expect("external export remains registered")
+            .cell = Some(cell);
+        Ok(cell)
+    }
+
+    pub(crate) fn resolve_import(
+        &self,
+        module: ModuleId,
+        specifier: ConstantId,
+    ) -> Result<ImportTarget, RuntimeErrorKind> {
+        let name = self.constant_text(module, specifier);
+        self.program_module(module)
+            .edges
+            .iter()
+            .enumerate()
+            .find(|(_, edge)| {
+                edge.kind.has_dynamic() && self.constant_text(module, edge.specifier) == name
+            })
+            .map(|(index, edge)| match edge.target {
+                EdgeTarget::Local(target) => ImportTarget::Local(target),
+                EdgeTarget::External => ImportTarget::External(EdgeId::new(index as u32)),
+            })
+            .ok_or(RuntimeErrorKind::DynamicImportEdgeMissing { module, specifier })
+    }
+
+    pub(crate) fn imported_namespace(
+        &mut self,
+        requester: ModuleId,
+        target: ImportTarget,
+    ) -> Result<Value, RuntimeErrorKind> {
+        match target {
+            ImportTarget::Local(target) => self.module_namespace(target, requester),
+            ImportTarget::External(edge) => self.external_namespace(requester, edge),
+        }
+        .map_err(|error| error.kind)
+    }
+
+    pub(crate) fn module_entry_suspends(&self, module: ModuleId) -> bool {
+        let code = self.module_code(module);
+        code.functions()[code.entry().get() as usize]
+            .code()
+            .iter()
+            .any(|instruction| matches!(instruction, Instruction::Await { .. }))
+    }
+
+    /// Returns whether any module reachable from `module` through static
+    /// local edges has a top-level-await entry. The native backend uses this
+    /// to delegate whole async static graphs to the interpreter while keeping
+    /// fully synchronous graphs native.
+    pub(crate) fn module_graph_suspends(&self, module: ModuleId) -> bool {
+        let mut seen = Vec::new();
+        let mut stack = vec![module];
+        while let Some(next) = stack.pop() {
+            let index = next.get() as usize;
+            if index >= seen.len() {
+                seen.resize(index + 1, false);
+            }
+            if seen[index] {
+                continue;
+            }
+            seen[index] = true;
+            if self.module_entry_suspends(next) {
+                return true;
+            }
+            for edge in self.program_module(next).edges.iter() {
+                if !edge.kind.has_static() {
+                    continue;
+                }
+                if let EdgeTarget::Local(dependency) = edge.target {
+                    stack.push(dependency);
+                }
+            }
+        }
+        false
+    }
+
+    /// Runs a module entry whose static dependencies have all settled. A
+    /// fully synchronous entry completes inline; an async entry runs its
+    /// first turn and either settles (its terminal turn owns module-state
+    /// settlement through `settle_async_step`) or suspends into
+    /// [`ModuleState::EvaluatingAsync`]. Never drains the event loop:
+    /// driving belongs to the root `evaluate` machine.
+    fn start_ready_entry(&mut self, module: ModuleId, pair: Option<ModulePending>) -> ModuleStart {
+        if !self.module_entry_suspends(module) {
+            return ModuleStart::Settled(self.run_sync_module_entry(module));
+        }
+        let pair = match pair {
+            Some(pair) => pair,
+            None => match self.create_module_async_pair(module) {
+                Ok(pair) => pair,
+                Err(failure) => {
+                    return ModuleStart::Settled(Err(self.module_eval_failure(module, failure)));
+                }
+            },
+        };
+        let function = self.module_code(module).entry();
+        let stop_depth = self.frames.len();
+        if let Err(error) = self.push_frame(
+            RuntimeFunction { module, function },
+            &[],
+            Value::UNDEFINED,
+            Value::UNDEFINED,
+            &[],
+            None,
+        ) {
+            return ModuleStart::Settled(Err(error));
+        }
+        let step = self.drive_async_activation(stop_depth, None);
+        if let Err(failure) = self.settle_async_step(pair.record, pair.promise, step) {
+            let error = self.module_eval_failure(module, failure);
+            if !matches!(error.kind, RuntimeErrorKind::UncaughtThrow { .. }) {
+                // A fatal failure before settlement leaves the module
+                // retryable; throws are cached by the caller's settle.
+                self.abort_module_evaluation(module);
+            }
+            return ModuleStart::Settled(Err(error));
+        }
+        match self.finish_module_start(module, pair) {
+            Ok(start) => start,
+            Err(error) => ModuleStart::Settled(Err(error)),
+        }
+    }
+
+    /// Native-backend adapter: starts one module entry and, when it suspends,
+    /// drives the bounded outer loop until the entry settles. Callers settle
+    /// module state through `finish_module_evaluation`; only root evaluation
+    /// contexts may reach this (no checkpoint may be active).
+    pub(crate) fn run_module_entry(&mut self, module: ModuleId) -> Result<Execution, RuntimeError> {
+        match self.start_ready_entry(module, None) {
+            ModuleStart::Settled(result) => result,
+            ModuleStart::Pending(pair) => self.drive_entry_to_settlement(pair, module),
+            ModuleStart::Cached => unreachable!("a started entry is never cached"),
+        }
+    }
+
+    /// Reads the terminal effect of one async entry's first turn: a recorded
+    /// completion means the entry settled synchronously; otherwise it
+    /// suspended and the module becomes async-pending on the shared pair.
+    fn finish_module_start(
+        &mut self,
+        module: ModuleId,
+        pair: ModulePending,
+    ) -> Result<ModuleStart, RuntimeError> {
+        if self
+            .async_module_completion_stored(pair.record)
+            .map_err(|kind| self.program_error(module, kind))?
+        {
+            let completion = self
+                .take_async_module_completion(pair.record, module)
+                .map_err(|kind| self.program_error(module, kind))?;
+            return Ok(ModuleStart::Settled(completion));
+        }
+        self.registry.modules[module.get() as usize].state = ModuleState::EvaluatingAsync {
+            record: pair.record,
+            promise: pair.promise,
+            pending_deps: 0,
+        };
+        Ok(ModuleStart::Pending(pair))
+    }
+
+    /// Allocates the one shared evaluation record/promise pair for a module.
+    /// When the DFS tail already classified pending static dependencies, the
+    /// pair lives in `state` and this only clones it.
+    fn create_module_async_pair(&mut self, module: ModuleId) -> Result<ModulePending, EvalFailure> {
+        if let ModuleState::EvaluatingAsync {
+            record, promise, ..
+        } = &self.registry.modules[module.get() as usize].state
+        {
+            return Ok(ModulePending {
+                record: *record,
+                promise: *promise,
+            });
+        }
+        let promise = self.create_promise()?;
+        let record = self.create_async_activation(promise, Some(module))?;
+        Ok(ModulePending { record, promise })
+    }
+
+    /// Returns whether the entry's first turn already recorded a completion.
+    fn async_module_completion_stored(&self, record: Value) -> Result<bool, RuntimeErrorKind> {
+        let index = self
+            .runtime_slot(record)?
+            .ok_or(RuntimeErrorKind::InvalidValue { value: record })?;
+        let HeapEntry::AsyncActivation { completion, .. } = &self.heap[index] else {
+            return Err(RuntimeErrorKind::InvalidValue { value: record });
+        };
+        Ok(completion.is_some())
+    }
+
+    fn run_sync_module_entry(&mut self, module: ModuleId) -> Result<Execution, RuntimeError> {
+        let function = self.module_code(module).entry();
+        let stop_depth = self.frames.len();
+        self.push_frame(
+            RuntimeFunction { module, function },
+            &[],
+            Value::UNDEFINED,
+            Value::UNDEFINED,
+            &[],
+            None,
+        )?;
+        let result = self.run_loop(stop_depth).and_then(|execution| {
+            execution.ok_or_else(|| {
+                self.program_error(
+                    module,
+                    RuntimeErrorKind::InvalidVerifiedProgram {
+                        module,
+                        instruction: Instruction::Halt,
+                    },
+                )
+            })
+        });
+        if result.is_err() {
+            self.unwind_frames_to(stop_depth);
+        }
+        result
+    }
+
+    fn module_eval_failure(&mut self, module: ModuleId, failure: EvalFailure) -> RuntimeError {
+        match self.promise_rejection_value(failure) {
+            Ok((value, origin)) => {
+                self.program_error(module, RuntimeErrorKind::UncaughtThrow { value, origin })
+            }
+            Err(EvalFailure::Runtime(kind)) => self.program_error(module, kind),
+            Err(_) => unreachable!("failure materialization only fails at a runtime boundary"),
+        }
+    }
+
+    fn evaluate_import(&mut self, module: ModuleId) -> Result<(), RuntimeError> {
+        // A pending dependency hands the raw (possibly partial) namespace to
+        // the executing entry; the shared evaluation Promise already carries
+        // completion to any pure dynamic importer.
+        self.evaluate_module(module).map(|_| ())
+    }
+
+    fn import_namespace(
+        &mut self,
+        requester: ModuleId,
+        specifier: ConstantId,
+    ) -> Result<Value, EvalFailure> {
+        let target = self
+            .resolve_import(requester, specifier)
+            .map_err(EvalFailure::Runtime)?;
+        let ImportTarget::Local(module) = target else {
+            return self
+                .imported_namespace(requester, target)
+                .map_err(EvalFailure::Runtime);
+        };
+        if self.import_edge_has_static(requester, specifier) {
+            // A static (or coalesced static+dynamic) edge always yields the
+            // raw namespace: settled dependencies finished before this entry
+            // ran, pending ones hand over the partial cycle namespace, and
+            // stored failures rethrow at this site.
+            self.evaluate_import(module)
+                .map_err(|error| import_failure(&error))?;
+            return self
+                .imported_namespace(requester, target)
+                .map_err(EvalFailure::Runtime);
+        }
+        match self.import_dynamic(requester, module)? {
+            DynamicImport::Ready(value) | DynamicImport::Pending(value) => Ok(value),
+            DynamicImport::Failed(error) => Err(import_failure(&error)),
+        }
+    }
+
+    /// Pure dynamic import of a local module. Only an in-flight
+    /// [`ModuleState::EvaluatingAsync`] target hands out its shared
+    /// evaluation Promise, so every concurrent `import()` observes the
+    /// identical Promise object; every other state yields the raw namespace
+    /// or the stored failure.
+    fn import_dynamic(
+        &mut self,
+        requester: ModuleId,
+        target: ModuleId,
+    ) -> Result<DynamicImport, EvalFailure> {
+        match self.registry.modules[target.get() as usize].state.clone() {
+            ModuleState::EvaluatingAsync { promise, .. } => Ok(DynamicImport::Pending(promise)),
+            ModuleState::Evaluating | ModuleState::Evaluated(Ok(())) => self
+                .imported_namespace(requester, ImportTarget::Local(target))
+                .map(DynamicImport::Ready)
+                .map_err(EvalFailure::Runtime),
+            ModuleState::Evaluated(Err(error)) => Ok(DynamicImport::Failed(error)),
+            ModuleState::Unevaluated => match self.evaluate_module(target) {
+                Ok(ModuleStart::Settled(_)) | Ok(ModuleStart::Cached) => self
+                    .imported_namespace(requester, ImportTarget::Local(target))
+                    .map(DynamicImport::Ready)
+                    .map_err(EvalFailure::Runtime),
+                Ok(ModuleStart::Pending(pair)) => Ok(DynamicImport::Pending(pair.promise)),
+                Err(error) => Ok(DynamicImport::Failed(error)),
+            },
+        }
+    }
+
+    /// Resolves a runtime `import()` specifier without requiring an edge.
+    /// Declared requester edges take precedence, then exact external lookup.
+    /// Relative `./` and `../` specifiers then resolve against the requester's
+    /// canonical module directory through the bundled-local name map. Absolute
+    /// and other opaque strings are never treated as local paths.
+    fn resolve_dynamic_specifier(
+        &self,
+        requester: ModuleId,
+        specifier: &EcmaString,
+    ) -> Option<DynamicImportTarget> {
+        if let Some(edge) = self
+            .program_module(requester)
+            .edges
+            .iter()
+            .find(|edge| self.constant_text(requester, edge.specifier) == specifier)
+        {
+            match edge.target {
+                EdgeTarget::Local(target) => return Some(DynamicImportTarget::Local(target)),
+                EdgeTarget::External if self.registry.external.contains_key(specifier) => {
+                    return Some(DynamicImportTarget::External(specifier.clone()));
+                }
+                EdgeTarget::External => return None,
+            }
+        }
+        if self.registry.external.contains_key(specifier) {
+            return Some(DynamicImportTarget::External(specifier.clone()));
+        }
+        if !is_relative_module_specifier(specifier) {
+            return None;
+        }
+        let requester_name = self.constant_text(requester, self.program_module(requester).name);
+        let resolved = resolve_relative_against_module_name(requester_name, specifier);
+        self.registry
+            .local_modules
+            .get(&resolved)
+            .copied()
+            .map(DynamicImportTarget::Local)
+    }
+
+    fn attach_dynamic_import_reactions(
+        &mut self,
+        evaluation: Value,
+        promise: Value,
+        target: ModuleId,
+    ) -> Result<(), EvalFailure> {
+        let index = self
+            .runtime_slot(evaluation)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "dynamic import evaluation promise",
+            }))?;
+        let state = match &self.heap[index] {
+            HeapEntry::Promise { state, .. } => state.clone(),
+            _ => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "dynamic import evaluation promise",
+                }));
+            }
+        };
+        let context = self.context_global;
+        match state {
+            PromiseState::Pending { .. } => {
+                self.charge_promise_reactions(index, 2)?;
+                let HeapEntry::Promise {
+                    state:
+                        PromiseState::Pending {
+                            fulfill_reactions,
+                            reject_reactions,
+                        },
+                    ..
+                } = &mut self.heap[index]
+                else {
+                    unreachable!("promise state was cloned from pending");
+                };
+                fulfill_reactions.push(PromiseReaction::DynamicImportFulfill {
+                    promise,
+                    target,
+                    context,
+                });
+                reject_reactions.push(PromiseReaction::DynamicImportReject { promise, context });
+                Ok(())
+            }
+            PromiseState::Fulfilled { .. } => {
+                let namespace = self
+                    .module_namespace(target, target)
+                    .map_err(|error| EvalFailure::Runtime(error.kind))?;
+                self.resolve_promise(promise, namespace)
+                    .map_err(EvalFailure::Runtime)
+            }
+            PromiseState::Rejected { reason, origin } => self
+                .reject_promise(promise, reason, origin)
+                .map_err(EvalFailure::Runtime),
+        }
+    }
+
+    /// Evaluates `import(specifier)` in the runtime plane. It always returns a
+    /// promise for ordinary resolution and coercion failures rather than
+    /// throwing those failures synchronously.
+    fn import_dynamic_expression(
+        &mut self,
+        requester: ModuleId,
+        specifier: Value,
+    ) -> Result<Value, EvalFailure> {
+        let specifier = match self.coerce_string_observable(specifier) {
+            Ok(specifier) => specifier,
+            Err(EvalFailure::Runtime(kind)) => return Err(EvalFailure::Runtime(kind)),
+            Err(failure) => {
+                let promise = self.create_promise()?;
+                self.reject_promise_failure(promise, failure)?;
+                return Ok(promise);
+            }
+        };
+        let Some(target) = self.resolve_dynamic_specifier(requester, &specifier) else {
+            let promise = self.create_promise()?;
+            self.reject_promise_failure(
+                promise,
+                EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "resolve dynamic module specifier",
+                }),
+            )?;
+            return Ok(promise);
+        };
+        match target {
+            DynamicImportTarget::External(specifier) => {
+                let namespace = self.registry.external[&specifier].namespace;
+                let promise = self.create_promise()?;
+                self.resolve_promise(promise, namespace)
+                    .map_err(EvalFailure::Runtime)?;
+                Ok(promise)
+            }
+            DynamicImportTarget::Local(target) => match self.import_dynamic(requester, target)? {
+                DynamicImport::Ready(namespace) => {
+                    let promise = self.create_promise()?;
+                    self.resolve_promise(promise, namespace)
+                        .map_err(EvalFailure::Runtime)?;
+                    Ok(promise)
+                }
+                DynamicImport::Pending(evaluation) => {
+                    let promise = self.create_promise()?;
+                    self.attach_dynamic_import_reactions(evaluation, promise, target)?;
+                    Ok(promise)
+                }
+                DynamicImport::Failed(error) => {
+                    let promise = self.create_promise()?;
+                    self.reject_promise_failure(promise, import_failure(&error))?;
+                    Ok(promise)
+                }
+            },
+        }
+    }
+
+    /// Reports whether the resolved dynamic edge also carries a static
+    /// component; coalesced edges follow static namespace semantics.
+    fn import_edge_has_static(&self, module: ModuleId, specifier: ConstantId) -> bool {
+        let name = self.constant_text(module, specifier);
+        self.program_module(module).edges.iter().any(|edge| {
+            edge.kind.has_dynamic()
+                && edge.kind.has_static()
+                && self.constant_text(module, edge.specifier) == name
+        })
+    }
+
+    /// Evaluates one module's static dependency graph and starts its entry.
+    /// The DFS never drains the event loop: a dependency already in flight
+    /// contributes one attached reaction per parent, and the module parks in
+    /// [`ModuleState::EvaluatingAsync`] until the last dependency fulfills.
+    /// Entry failures settle the module and propagate as `Err` exactly as
+    /// before; [`ModuleStart::Pending`] replaces the old blocking wait.
+    fn evaluate_module(&mut self, module: ModuleId) -> Result<ModuleStart, RuntimeError> {
+        if let ModuleState::EvaluatingAsync {
+            record, promise, ..
+        } = &self.registry.modules[module.get() as usize].state
+        {
+            return Ok(ModuleStart::Pending(ModulePending {
+                record: *record,
+                promise: *promise,
+            }));
+        }
+        let dependencies = match self.begin_module_evaluation(module)? {
+            ModuleEvaluation::Cycle => return Ok(ModuleStart::Cached),
+            ModuleEvaluation::Evaluated(result) => return result.map(|()| ModuleStart::Cached),
+            ModuleEvaluation::Ready(dependencies) => dependencies,
+        };
+        let mut pending_deps = 0usize;
+        let mut pending_pair: Option<ModulePending> = None;
+        for dependency in dependencies {
+            match self.evaluate_module(dependency) {
+                Ok(ModuleStart::Settled(_)) | Ok(ModuleStart::Cached) => {}
+                Ok(ModuleStart::Pending(pair)) => {
+                    if pending_pair.is_none() {
+                        pending_pair = Some(match self.create_module_async_pair(module) {
+                            Ok(pair) => pair,
+                            Err(failure) => {
+                                return Err(self.module_alloc_failure(module, failure));
+                            }
+                        });
+                    }
+                    if let Err(failure) = self.attach_module_reactions(module, pair.promise) {
+                        return Err(self.module_alloc_failure(module, failure));
+                    }
+                    pending_deps += 1;
+                }
+                Err(error) => {
+                    // A dependency's failure becomes this module's stored
+                    // failure without running its entry.
+                    match self.finish_module_evaluation(module, Err(error)) {
+                        Err(error) => return Err(error),
+                        Ok(_) => unreachable!("a dependency failure stays an error"),
+                    }
+                }
+            }
+        }
+        if pending_deps > 0 {
+            let pair = pending_pair.expect("pending dependencies forced the shared pair");
+            self.registry.modules[module.get() as usize].state = ModuleState::EvaluatingAsync {
+                record: pair.record,
+                promise: pair.promise,
+                pending_deps,
+            };
+            return Ok(ModuleStart::Pending(pair));
+        }
+        let start = self.start_ready_entry(module, None);
+        if let ModuleStart::Settled(result) = &start {
+            // The async terminal turn already settled module state through
+            // `settle_async_step`; `finish_module_evaluation` remains the
+            // single state writer for synchronous entries.
+            self.finish_module_evaluation(module, result.clone())?;
+        }
+        Ok(start)
+    }
+
+    /// Settles an allocation failure while starting or awaiting module
+    /// evaluation: fatal kinds abort back to retryable [`ModuleState::Unevaluated`].
+    fn module_alloc_failure(&mut self, module: ModuleId, failure: EvalFailure) -> RuntimeError {
+        let error = self.module_eval_failure(module, failure);
+        match self.finish_module_evaluation(module, Err(error)) {
+            Err(error) => error,
+            Ok(_) => unreachable!("an allocation failure stays an error"),
+        }
+    }
+
+    pub(crate) fn begin_module_evaluation(
+        &mut self,
+        module: ModuleId,
+    ) -> Result<ModuleEvaluation, RuntimeError> {
+        match self.registry.modules[module.get() as usize].state.clone() {
+            ModuleState::Evaluating | ModuleState::EvaluatingAsync { .. } => {
+                return Ok(ModuleEvaluation::Cycle);
+            }
+            ModuleState::Evaluated(result) => return Ok(ModuleEvaluation::Evaluated(result)),
+            ModuleState::Unevaluated => {}
+        }
+        self.registry.modules[module.get() as usize].state = ModuleState::Evaluating;
+
+        let mut dependencies = Vec::new();
+        for (edge_index, edge) in self
+            .program_module(module)
+            .edges
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            if !edge.kind.has_static() {
+                continue;
+            }
+            match edge.target {
+                EdgeTarget::Local(dependency) => dependencies.push(dependency),
+                EdgeTarget::External
+                    if self
+                        .external_specifier(module, EdgeId::new(edge_index as u32))
+                        .is_some() => {}
+                EdgeTarget::External => {
+                    let error = self.program_error(
+                        module,
+                        RuntimeErrorKind::ExternalModuleUnavailable {
+                            module,
+                            edge: EdgeId::new(edge_index as u32),
+                        },
+                    );
+                    self.settle_module_evaluation(module, Err(error.clone()));
+                    return Err(error);
+                }
+            }
+        }
+        Ok(ModuleEvaluation::Ready(dependencies))
+    }
+
+    pub(crate) fn finish_module_evaluation(
+        &mut self,
+        module: ModuleId,
+        result: Result<Execution, RuntimeError>,
+    ) -> Result<Execution, RuntimeError> {
+        let stored = result.as_ref().map(|_| ()).map_err(Clone::clone);
+        self.settle_module_evaluation(module, stored);
+        result
+    }
+
+    pub(crate) fn settle_module_evaluation(
+        &mut self,
+        module: ModuleId,
+        result: Result<(), RuntimeError>,
+    ) {
+        // Settled exactly once: an async terminal turn writes the terminal
+        // state itself, and a later duplicate write (for example a native
+        // caller's `finish_module_evaluation` after `run_module_entry`)
+        // carries the identical stored result.
+        if matches!(
+            self.registry.modules[module.get() as usize].state,
+            ModuleState::Evaluated(_)
+        ) {
+            return;
+        }
+        debug_assert!(
+            matches!(
+                self.registry.modules[module.get() as usize].state,
+                ModuleState::Evaluating | ModuleState::EvaluatingAsync { .. }
+            ),
+            "only an in-flight module settles"
+        );
+        match result {
+            Ok(()) => {
+                self.registry.modules[module.get() as usize].state = ModuleState::Evaluated(Ok(()));
+            }
+            Err(error) if matches!(error.kind, RuntimeErrorKind::UncaughtThrow { .. }) => {
+                self.registry.modules[module.get() as usize].state =
+                    ModuleState::Evaluated(Err(error));
+            }
+            Err(_) => self.abort_module_evaluation(module),
+        }
+    }
+
+    pub(crate) fn abort_module_evaluation(&mut self, module: ModuleId) {
+        if matches!(
+            self.registry.modules[module.get() as usize].state,
+            ModuleState::Evaluating | ModuleState::EvaluatingAsync { .. }
+        ) {
+            self.registry.modules[module.get() as usize].state = ModuleState::Unevaluated;
+        }
+    }
+
+    pub(crate) fn constant_text(&self, module: ModuleId, id: ConstantId) -> &EcmaString {
+        match &self.module_code(module).constants()[id.get() as usize] {
+            Constant::String(text) => text,
+            _ => unreachable!("verified module names are strings"),
+        }
+    }
+
+    fn program_error(&self, module: ModuleId, kind: RuntimeErrorKind) -> RuntimeError {
+        let code = self.module_code(module);
+        let function = code.entry().get() as usize;
+        let instruction = code.functions()[function]
+            .code()
+            .first()
+            .copied()
+            .unwrap_or(Instruction::Halt);
+        RuntimeError {
+            kind,
+            function: FunctionId::new(function as u32),
+            pc: Pc::new(0),
+            source: RuntimeSource {
+                function_name: None,
+                instruction,
+            },
+        }
+    }
+
     fn run_loop(&mut self, stop_depth: usize) -> Result<Option<Execution>, RuntimeError> {
-        if self.frames.len() > self.limits.max_call_depth {
+        if self.frames.len().saturating_add(self.native_depth) > self.limits.max_call_depth {
             return Err(self.error_here(RuntimeErrorKind::CallDepthExceeded {
                 limit: self.limits.max_call_depth,
             }));
@@ -639,21 +4871,15 @@ impl<'a, H: Host> Machine<'a, H> {
 
         loop {
             let frame_index = self.frames.len() - 1;
-            let (function_index, pc) = {
+            let (module_id, function_index, pc) = {
                 let frame = &self.frames[frame_index];
-                (frame.function, frame.pc)
+                (frame.module, frame.function, frame.pc)
             };
-            if self.fuel == 0 {
-                return Err(self.error_at(
-                    RuntimeErrorKind::FuelExhausted {
-                        limit: self.limits.fuel,
-                    },
-                    function_index,
-                    pc,
-                ));
+            if let Err(kind) = self.consume_fuel(1) {
+                return Err(self.error_at(kind, function_index, pc));
             }
-            self.fuel -= 1;
-            let instruction = self.module.functions()[function_index].code()[pc];
+            self.collect_if_pending();
+            let instruction = self.module_code(module_id).functions()[function_index].code()[pc];
 
             match instruction {
                 Instruction::LoadConst { dst, constant } => {
@@ -704,6 +4930,16 @@ impl<'a, H: Host> Machine<'a, H> {
                     self.write_register(frame_index, dst.get(), value);
                     self.frames[frame_index].pc = pc + 1;
                 }
+                Instruction::ToObject { dst, src } => {
+                    let source = self.read_register(frame_index, src.get());
+                    match self.value_to_object(source) {
+                        Ok(value) => {
+                            self.write_register(frame_index, dst.get(), value);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
                 Instruction::CreateArray { dst } => {
                     let value = self
                         .allocate(HeapEntry::Array {
@@ -711,6 +4947,20 @@ impl<'a, H: Host> Machine<'a, H> {
                             properties: PropertyMap::default(),
                             prototype: Some(self.intrinsics.array_prototype),
                             extensible: true,
+                            length_writable: true,
+                        })
+                        .map_err(|kind| self.error_at(kind, function_index, pc))?;
+                    self.write_register(frame_index, dst.get(), value);
+                    self.frames[frame_index].pc = pc + 1;
+                }
+                Instruction::CreateCell { dst } => {
+                    let value = self
+                        .allocate(HeapEntry::Array {
+                            elements: vec![Value::UNINITIALIZED],
+                            properties: PropertyMap::default(),
+                            prototype: Some(self.intrinsics.array_prototype),
+                            extensible: true,
+                            length_writable: true,
                         })
                         .map_err(|kind| self.error_at(kind, function_index, pc))?;
                     self.write_register(frame_index, dst.get(), value);
@@ -724,6 +4974,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     Ok(captures) => {
                         let value = self
                             .allocate(HeapEntry::Function {
+                                module: module_id,
                                 function,
                                 captures,
                                 properties: PropertyMap::default(),
@@ -840,6 +5091,61 @@ impl<'a, H: Host> Machine<'a, H> {
                         Err(failure) => self.resolve_failure(failure, pc)?,
                     }
                 }
+                Instruction::DefineDataProperty { object, key, value } => {
+                    let object = self.read_register(frame_index, object.get());
+                    let value = self.read_register(frame_index, value.get());
+                    let key_value = self.read_register(frame_index, key.get());
+                    let key = match self.to_property_key(key_value) {
+                        Ok(key) => key,
+                        Err(failure) => {
+                            self.resolve_failure(failure, pc)?;
+                            continue;
+                        }
+                    };
+                    match self.define_descriptor(
+                        object,
+                        key,
+                        Property::Data {
+                            value,
+                            writable: true,
+                            enumerable: false,
+                            configurable: true,
+                        },
+                    ) {
+                        Ok(()) => self.frames[frame_index].pc = pc + 1,
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::LoadOwnDescriptorSlot {
+                    dst,
+                    object,
+                    key,
+                    slot,
+                } => {
+                    let object = self.read_register(frame_index, object.get());
+                    let key = self.read_register(frame_index, key.get());
+                    match self.load_own_descriptor_slot(object, key, slot) {
+                        Ok(value) => {
+                            self.write_register(frame_index, dst.get(), value);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::DefineOwnDescriptorSlot {
+                    object,
+                    key,
+                    src,
+                    slot,
+                } => {
+                    let object = self.read_register(frame_index, object.get());
+                    let key = self.read_register(frame_index, key.get());
+                    let src = self.read_register(frame_index, src.get());
+                    match self.define_own_descriptor_slot(object, key, src, slot) {
+                        Ok(()) => self.frames[frame_index].pc = pc + 1,
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
                 Instruction::Call {
                     dst,
                     callee,
@@ -873,44 +5179,60 @@ impl<'a, H: Host> Machine<'a, H> {
                     match self.read_arguments(frame_index, arguments.get()) {
                         Ok(arguments) => {
                             self.frames[frame_index].pc = pc + 1;
-                            self.execute_construct(callee, &arguments, dst.get(), pc)?;
+                            self.execute_construct(callee, callee, &arguments, dst.get(), pc)?;
                         }
                         Err(failure) => self.resolve_failure(failure, pc)?,
                     }
                 }
-                Instruction::LoadGlobal { dst, name } => {
-                    let name = self.constant_string(name).to_owned();
-                    match self.resolve_global_binding(&name) {
-                        Some(value) => {
+                Instruction::ConstructWithNewTarget {
+                    dst,
+                    callee,
+                    new_target,
+                    arguments,
+                } => {
+                    let callee = self.read_register(frame_index, callee.get());
+                    let new_target = self.read_register(frame_index, new_target.get());
+                    match self.read_arguments(frame_index, arguments.get()) {
+                        Ok(arguments) => {
+                            self.frames[frame_index].pc = pc + 1;
+                            self.execute_construct(callee, new_target, &arguments, dst.get(), pc)?;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::LoadGlobal { dst, name } => match self.load_global(module_id, name) {
+                    Ok(Some(value)) => {
+                        self.write_register(frame_index, dst.get(), value);
+                        self.frames[frame_index].pc = pc + 1;
+                    }
+                    Ok(None) => self.throw(
+                        Value::UNDEFINED,
+                        ThrowOrigin::ReferenceError {
+                            operation: "global is not defined",
+                        },
+                        pc,
+                    )?,
+                    Err(failure) => self.resolve_failure(failure, pc)?,
+                },
+                Instruction::StoreGlobal { name, value } => {
+                    let value = self.read_register(frame_index, value.get());
+                    match self.store_global(module_id, name, value) {
+                        Ok(()) => self.frames[frame_index].pc = pc + 1,
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::TypeOfGlobal { dst, name } => {
+                    match self.load_global(module_id, name) {
+                        Ok(value) => {
+                            let text = value.map_or("undefined", |value| self.type_of(value));
+                            let value = self
+                                .allocate(HeapEntry::String(EcmaString::from_utf8(text)))
+                                .map_err(|kind| self.error_at(kind, function_index, pc))?;
                             self.write_register(frame_index, dst.get(), value);
                             self.frames[frame_index].pc = pc + 1;
                         }
-                        None => self.throw(
-                            Value::UNDEFINED,
-                            ThrowOrigin::ReferenceError {
-                                operation: "global is not defined",
-                            },
-                            pc,
-                        )?,
+                        Err(failure) => self.resolve_failure(failure, pc)?,
                     }
-                }
-                Instruction::StoreGlobal { name, value } => {
-                    let value = self.read_register(frame_index, value.get());
-                    let name = self.constant_string(name).to_owned();
-                    self.globals.insert(name, value);
-                    self.frames[frame_index].pc = pc + 1;
-                }
-                Instruction::TypeOfGlobal { dst, name } => {
-                    let name = self.constant_string(name).to_owned();
-                    let text = self
-                        .resolve_global_binding(&name)
-                        .map_or("undefined", |value| self.type_of(value))
-                        .to_owned();
-                    let value = self
-                        .allocate(HeapEntry::String(text))
-                        .map_err(|kind| self.error_at(kind, function_index, pc))?;
-                    self.write_register(frame_index, dst.get(), value);
-                    self.frames[frame_index].pc = pc + 1;
                 }
                 Instruction::LoadThis { dst } => {
                     let value = self.frames[frame_index].this_value;
@@ -924,6 +5246,13 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 Instruction::LoadNewTarget { dst } => {
                     let value = self.frames[frame_index].new_target;
+                    self.write_register(frame_index, dst.get(), value);
+                    self.frames[frame_index].pc = pc + 1;
+                }
+                Instruction::LoadImportMeta { dst } => {
+                    let value = self
+                        .load_import_meta(module_id)
+                        .map_err(|kind| self.error_at(kind, function_index, pc))?;
                     self.write_register(frame_index, dst.get(), value);
                     self.frames[frame_index].pc = pc + 1;
                 }
@@ -960,7 +5289,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     }
                 }
                 Instruction::CreatePrivateName { dst, description } => {
-                    let description = self.constant_string(description).to_owned();
+                    let description = self.constant_string(description).clone();
                     let value = self
                         .allocate(HeapEntry::PrivateName { description })
                         .map_err(|kind| self.error_at(kind, function_index, pc))?;
@@ -972,13 +5301,14 @@ impl<'a, H: Host> Machine<'a, H> {
                     pattern,
                     flags,
                 } => {
-                    let pattern = self.constant_string(pattern).to_owned();
-                    let flags = self.constant_string(flags).to_owned();
+                    let pattern = self.constant_string(pattern).clone();
+                    let flags = self.constant_string(flags).clone();
                     let value = self
                         .allocate(HeapEntry::RegExp {
                             pattern,
                             flags,
                             properties: PropertyMap::default(),
+                            prototype: Some(self.intrinsics.regexp_prototype()),
                             extensible: true,
                         })
                         .map_err(|kind| self.error_at(kind, function_index, pc))?;
@@ -1005,6 +5335,126 @@ impl<'a, H: Host> Machine<'a, H> {
                         Ok((is_done, produced)) => {
                             self.write_register(frame_index, done.get(), Value::boolean(is_done));
                             self.write_register(frame_index, value.get(), produced);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::IteratorStep { dst, iterator } => {
+                    let iterator = self.read_register(frame_index, iterator.get());
+                    match self.iterator_step(iterator) {
+                        Ok(result) => {
+                            self.write_register(frame_index, dst.get(), result);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::IteratorResult {
+                    done,
+                    value,
+                    result,
+                } => {
+                    let result = self.read_register(frame_index, result.get());
+                    match self.iterator_result_parts(result) {
+                        Ok((is_done, produced)) => {
+                            self.write_register(frame_index, done.get(), Value::boolean(is_done));
+                            self.write_register(frame_index, value.get(), produced);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::IteratorClose {
+                    result,
+                    called,
+                    iterator,
+                    mode,
+                } => {
+                    let iterator = self.read_register(frame_index, iterator.get());
+                    let (close, was_called) = self.close_iterator_raw(iterator);
+                    match (close, mode) {
+                        (Ok(value), _) => {
+                            self.write_register(
+                                frame_index,
+                                called.get(),
+                                Value::boolean(was_called),
+                            );
+                            self.write_register(frame_index, result.get(), value);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        (Err(EvalFailure::Runtime(kind)), _) => {
+                            return Err(self.error_here_at(kind, pc));
+                        }
+                        (Err(failure), IteratorCloseMode::Propagate) => {
+                            self.resolve_failure(failure, pc)?;
+                        }
+                        (Err(_), IteratorCloseMode::PreserveAbrupt) => {
+                            self.write_register(
+                                frame_index,
+                                called.get(),
+                                Value::boolean(was_called),
+                            );
+                            self.write_register(frame_index, result.get(), Value::UNDEFINED);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                    }
+                }
+                Instruction::RequireCloseResult { result, called } => {
+                    let result = self.read_register(frame_index, result.get());
+                    let called = self.read_register(frame_index, called.get());
+                    if called == Value::TRUE && !self.is_object(result) {
+                        self.resolve_failure(
+                            EvalFailure::Throw(ThrowOrigin::TypeError {
+                                operation: "iterator.return() returned a non-object",
+                            }),
+                            pc,
+                        )?;
+                    } else {
+                        self.frames[frame_index].pc = pc + 1;
+                    }
+                }
+                Instruction::DisposeCapture {
+                    method,
+                    kind,
+                    src,
+                    hint,
+                } => {
+                    let src = self.read_register(frame_index, src.get());
+                    match self.dispose_capture_raw(src, hint) {
+                        Ok((captured_method, captured_kind)) => {
+                            self.write_register(frame_index, method.get(), captured_method);
+                            self.write_register(
+                                frame_index,
+                                kind.get(),
+                                Value::int32(captured_kind),
+                            );
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::SuppressError {
+                    dst,
+                    error,
+                    suppressed,
+                } => {
+                    let error = self.read_register(frame_index, error.get());
+                    let suppressed = self.read_register(frame_index, suppressed.get());
+                    match self.make_suppressed_error(error, suppressed) {
+                        Ok(value) => {
+                            self.write_register(frame_index, dst.get(), value);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::WithHasBinding { dst, object, key } => {
+                    let object = self.read_register(frame_index, object.get());
+                    let key = self.read_register(frame_index, key.get());
+                    match self.with_has_binding(object, key) {
+                        Ok(found) => {
+                            self.write_register(frame_index, dst.get(), Value::boolean(found));
                             self.frames[frame_index].pc = pc + 1;
                         }
                         Err(failure) => self.resolve_failure(failure, pc)?,
@@ -1042,14 +5492,92 @@ impl<'a, H: Host> Machine<'a, H> {
                     let value = self.read_register(frame_index, value.get());
                     self.throw(value, ThrowOrigin::Bytecode, pc)?;
                 }
+                Instruction::Await { src, .. }
+                    if self
+                        .async_boundaries
+                        .last()
+                        .is_some_and(|boundary| *boundary == frame_index) =>
+                {
+                    let awaited = self.read_register(frame_index, src.get());
+                    let frame = self.frames.pop().expect("async activation is executing");
+                    self.pending_async_suspend = Some((
+                        awaited,
+                        SuspendedActivation {
+                            target: RuntimeFunction {
+                                module: frame.module,
+                                function: FunctionId::new(frame.function as u32),
+                            },
+                            registers: frame.registers,
+                            this_value: frame.this_value,
+                            new_target: frame.new_target,
+                            args: frame.args,
+                            arguments_object: frame.arguments_object,
+                            resume_token: pc as u32 + 1,
+                        },
+                    ));
+                    return Ok(None);
+                }
+                Instruction::Suspend { src, .. }
+                    if self
+                        .generator_boundaries
+                        .last()
+                        .is_some_and(|boundary| *boundary == frame_index) =>
+                {
+                    let value = self.read_register(frame_index, src.get());
+                    let frame = self
+                        .frames
+                        .pop()
+                        .expect("generator activation is executing");
+                    self.pending_generator_resume = Some(GeneratorResume::Yield {
+                        value,
+                        activation: SuspendedActivation {
+                            target: RuntimeFunction {
+                                module: frame.module,
+                                function: FunctionId::new(frame.function as u32),
+                            },
+                            registers: frame.registers,
+                            this_value: frame.this_value,
+                            new_target: frame.new_target,
+                            args: frame.args,
+                            arguments_object: frame.arguments_object,
+                            resume_token: pc as u32 + 1,
+                        },
+                    });
+                    return Ok(None);
+                }
                 Instruction::Suspend { .. } => {
                     self.throw_type("suspend outside an engine-owned event loop", pc)?;
                 }
-                Instruction::Import { .. } => {
-                    self.throw_type("import outside an engine-owned module registry", pc)?;
+                Instruction::Await { .. } => {
+                    self.throw_type("await outside an engine-owned event loop", pc)?;
+                }
+                Instruction::Import { dst, specifier } => {
+                    match self.import_namespace(module_id, specifier) {
+                        Ok(namespace) => {
+                            self.write_register(frame_index, dst.get(), namespace);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::ImportDynamic { dst, specifier } => {
+                    let specifier = self.read_register(frame_index, specifier.get());
+                    match self.import_dynamic_expression(module_id, specifier) {
+                        Ok(promise) => {
+                            self.write_register(frame_index, dst.get(), promise);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
                 }
                 Instruction::Export { .. } => {
-                    self.throw_type("export outside an engine-owned module registry", pc)?;
+                    return Err(self.error_here_at(
+                        RuntimeErrorKind::InvalidVerifiedProgram {
+                            module: module_id,
+                            instruction,
+                        },
+                        pc,
+                    ));
                 }
                 Instruction::Halt => {
                     if let Some(execution) = self.complete_frame(Value::UNDEFINED) {
@@ -1071,11 +5599,8 @@ impl<'a, H: Host> Machine<'a, H> {
         self.frames[frame].registers[register as usize] = value;
     }
 
-    fn constant_string(&self, id: ConstantId) -> &str {
-        match &self.module.constants()[id.get() as usize] {
-            Constant::String(text) => text,
-            _ => unreachable!("verified name/specifier/pattern constants are strings"),
-        }
+    fn constant_string(&self, id: ConstantId) -> &EcmaString {
+        self.constant_text(self.active_module_id(), id)
     }
 
     fn load_constant(
@@ -1084,39 +5609,156 @@ impl<'a, H: Host> Machine<'a, H> {
         function: usize,
         pc: usize,
     ) -> Result<Value, RuntimeError> {
-        self.load_constant_value(id)
+        self.load_constant_value(self.active_module_id(), id)
             .map_err(|kind| self.error_at(kind, function, pc))
     }
 
     fn allocate(&mut self, entry: HeapEntry) -> Result<Value, RuntimeErrorKind> {
-        if self.heap.len().saturating_sub(self.intrinsic_slots) >= self.limits.max_heap_slots
-            || self.heap.len() == u32::MAX as usize
-        {
+        let bytes = entry.initial_bytes();
+        self.ensure_allocation_capacity(1, bytes)?;
+        self.sync_slot_ledger();
+        let slot = self.heap.len() as u32 + 1;
+        self.heap.push(entry);
+        self.slot_bytes.push(bytes);
+        self.heap_bytes += bytes;
+        let id = SlotId::from_parts(RUNTIME_HEAP_SEGMENT, slot)
+            .expect("runtime segment and one-based slot are nonzero");
+        self.request_garbage_collection();
+        Ok(Value::heap_ref(id))
+    }
+
+    fn live_runtime_slots(&self) -> usize {
+        self.heap.len() - self.intrinsic_slots - self.vacant_count
+    }
+
+    fn request_garbage_collection(&mut self) {
+        self.gc
+            .request_collection(self.heap_bytes, self.live_runtime_slots());
+    }
+
+    fn ensure_allocation_capacity(
+        &self,
+        additional_slots: usize,
+        additional_bytes: usize,
+    ) -> Result<(), RuntimeErrorKind> {
+        let used_slots = self.live_runtime_slots();
+        let slots_fit_limit = used_slots
+            .checked_add(additional_slots)
+            .is_some_and(|total| total <= self.limits.max_heap_slots);
+        let slots_fit_value = self
+            .heap
+            .len()
+            .checked_add(additional_slots)
+            .is_some_and(|total| total <= u32::MAX as usize);
+        if !slots_fit_limit || !slots_fit_value {
             return Err(RuntimeErrorKind::HeapSlotLimitExceeded {
                 limit: self.limits.max_heap_slots,
             });
         }
-        self.charge_heap(entry.initial_bytes())?;
-        let slot = self.heap.len() as u32 + 1;
-        self.heap.push(entry);
-        let id = SlotId::from_parts(RUNTIME_HEAP_SEGMENT, slot)
-            .expect("runtime segment and one-based slot are nonzero");
-        Ok(Value::heap_ref(id))
-    }
-
-    fn charge_heap(&mut self, bytes: usize) -> Result<(), RuntimeErrorKind> {
-        let Some(total) = self.heap_bytes.checked_add(bytes) else {
-            return Err(RuntimeErrorKind::HeapByteLimitExceeded {
-                limit: self.limits.max_heap_bytes,
-            });
-        };
-        if total > self.limits.max_heap_bytes {
+        let bytes_fit = self
+            .heap_bytes
+            .checked_add(additional_bytes)
+            .is_some_and(|total| total <= self.limits.max_heap_bytes);
+        if !bytes_fit {
             return Err(RuntimeErrorKind::HeapByteLimitExceeded {
                 limit: self.limits.max_heap_bytes,
             });
         }
-        self.heap_bytes = total;
         Ok(())
+    }
+
+    fn ensure_object_property_capacity(
+        &self,
+        property_bytes: usize,
+    ) -> Result<(), RuntimeErrorKind> {
+        let bytes =
+            property_bytes
+                .checked_add(1)
+                .ok_or(RuntimeErrorKind::HeapByteLimitExceeded {
+                    limit: self.limits.max_heap_bytes,
+                })?;
+        self.ensure_allocation_capacity(1, bytes)
+    }
+    pub(crate) fn charge_slot(
+        &mut self,
+        index: usize,
+        bytes: usize,
+    ) -> Result<(), RuntimeErrorKind> {
+        self.sync_slot_ledger();
+        self.ensure_allocation_capacity(0, bytes)?;
+        self.slot_bytes[index] += bytes;
+        self.heap_bytes += bytes;
+        self.request_garbage_collection();
+        Ok(())
+    }
+
+    pub(crate) fn refund_slot(&mut self, index: usize, bytes: usize) {
+        self.sync_slot_ledger();
+        debug_assert!(self.slot_bytes[index] >= bytes);
+        debug_assert!(self.heap_bytes >= bytes);
+        self.slot_bytes[index] = self.slot_bytes[index]
+            .checked_sub(bytes)
+            .expect("slot refund cannot exceed its charge");
+        self.heap_bytes = self
+            .heap_bytes
+            .checked_sub(bytes)
+            .expect("slot refund cannot exceed heap charge");
+    }
+
+    fn transfer_slot_to_machine(&mut self, index: usize, bytes: usize) {
+        self.sync_slot_ledger();
+        self.slot_bytes[index] = self.slot_bytes[index]
+            .checked_sub(bytes)
+            .expect("slot transfer cannot exceed its charge");
+        self.machine_bytes = self
+            .machine_bytes
+            .checked_add(bytes)
+            .expect("machine charge cannot overflow");
+    }
+
+    fn transfer_slot_charge(&mut self, from: usize, to: usize, bytes: usize) {
+        self.sync_slot_ledger();
+        self.slot_bytes[from] = self.slot_bytes[from]
+            .checked_sub(bytes)
+            .expect("slot transfer cannot exceed its charge");
+        self.slot_bytes[to] = self.slot_bytes[to]
+            .checked_add(bytes)
+            .expect("slot charge cannot overflow");
+    }
+
+    fn sync_slot_ledger(&mut self) {
+        debug_assert!(self.slot_bytes.len() <= self.heap.len());
+        self.slot_bytes.resize(self.heap.len(), 0);
+    }
+
+    pub(crate) fn charge_machine(&mut self, bytes: usize) -> Result<(), RuntimeErrorKind> {
+        self.ensure_allocation_capacity(0, bytes)?;
+        self.machine_bytes += bytes;
+        self.heap_bytes += bytes;
+        self.request_garbage_collection();
+        Ok(())
+    }
+
+    fn refund_machine(&mut self, bytes: usize) {
+        debug_assert!(self.machine_bytes >= bytes);
+        debug_assert!(self.heap_bytes >= bytes);
+        self.machine_bytes = self
+            .machine_bytes
+            .checked_sub(bytes)
+            .expect("machine refund cannot exceed its charge");
+        self.heap_bytes = self
+            .heap_bytes
+            .checked_sub(bytes)
+            .expect("machine refund cannot exceed heap charge");
+    }
+
+    #[cfg(test)]
+    fn assert_heap_ledger(&self) {
+        assert_eq!(self.slot_bytes.len(), self.heap.len());
+        assert_eq!(
+            self.heap_bytes,
+            self.machine_bytes + self.slot_bytes.iter().sum::<usize>()
+        );
     }
 
     fn runtime_slot(&self, value: Value) -> Result<Option<usize>, RuntimeErrorKind> {
@@ -1130,18 +5772,129 @@ impl<'a, H: Host> Machine<'a, H> {
             return Err(RuntimeErrorKind::InvalidValue { value });
         }
         let index = id.slot() as usize - 1;
-        if index >= self.heap.len() {
+        if index >= self.heap.len() || matches!(self.heap[index], HeapEntry::Vacant) {
             return Err(RuntimeErrorKind::InvalidRuntimeHeapReference { slot: id.slot() });
         }
         Ok(Some(index))
     }
 
-    /// Resolves a declared runtime global before the realm's intrinsic globals.
-    fn resolve_global_binding(&self, name: &str) -> Option<Value> {
-        self.globals
-            .get(name)
+    fn active_module_id(&self) -> ModuleId {
+        self.frames
+            .last()
+            .map_or(ModuleId::new(0), |frame| frame.module)
+    }
+
+    pub(crate) fn load_global(
+        &mut self,
+        module: ModuleId,
+        name: ConstantId,
+    ) -> Result<Option<Value>, EvalFailure> {
+        if let Some(cell) = self
+            .registry
+            .modules
+            .get(module.get() as usize)
+            .and_then(|instance| instance.constant_cells.get(name.get() as usize))
             .copied()
-            .or_else(|| self.intrinsics.global(name))
+            .flatten()
+        {
+            let value = self.registry.cells[cell.0].value;
+            if value.is_uninitialized() {
+                let binding = self.registry.modules[module.get() as usize]
+                    .binding_cells
+                    .iter()
+                    .position(|candidate| *candidate == Some(cell))
+                    .map(|index| BindingId::new(index as u32))
+                    .expect("linked cell belongs to a binding");
+                return Err(EvalFailure::Runtime(RuntimeErrorKind::TemporalDeadZone {
+                    module,
+                    binding,
+                }));
+            }
+            return Ok(Some(value));
+        }
+        let name = self.constant_text(module, name).to_owned();
+        if let Some(context) = self.context_global {
+            if name.eq_ascii("globalThis") {
+                return Ok(Some(context));
+            }
+            let key = PropertyKey::Named(name.clone());
+            if self.own_descriptor(context, &key)?.is_some() {
+                return self.get_property_key(context, &key).map(Some);
+            }
+            return Ok(self
+                .intrinsics
+                .globals
+                .iter()
+                .find_map(|(candidate, value)| {
+                    (candidate == &name && !candidate.eq_ascii("globalThis")).then_some(*value)
+                }));
+        }
+        Ok(self.resolve_global_binding(&name))
+    }
+
+    pub(crate) fn store_global(
+        &mut self,
+        module: ModuleId,
+        name: ConstantId,
+        value: Value,
+    ) -> Result<(), EvalFailure> {
+        let cell = self
+            .registry
+            .modules
+            .get(module.get() as usize)
+            .and_then(|instance| instance.constant_cells.get(name.get() as usize))
+            .copied()
+            .flatten();
+        if let Some(cell) = cell {
+            let binding = self.registry.modules[module.get() as usize]
+                .binding_cells
+                .iter()
+                .position(|candidate| *candidate == Some(cell))
+                .expect("mapped module cell belongs to a binding");
+            if matches!(
+                self.program_module(module).bindings[binding].kind,
+                BindingKind::Imported { .. } | BindingKind::Namespace { .. }
+            ) {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "assign to immutable module binding",
+                }));
+            }
+            self.registry.cells[cell.0].value = value;
+        } else {
+            let name = self.constant_text(module, name).to_owned();
+            if let Some(context) = self.context_global {
+                self.set_data_property_key(context, PropertyKey::Named(name), value)?;
+                return Ok(());
+            }
+            if let Some(global_this) = self.intrinsics.global("globalThis") {
+                let key = PropertyKey::Named(name.clone());
+                if matches!(
+                    self.own_descriptor(global_this, &key)?,
+                    Some(
+                        Property::Data {
+                            writable: false,
+                            ..
+                        } | Property::Accessor { setter: None, .. }
+                    )
+                ) {
+                    return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "assign to non-writable global property",
+                    }));
+                }
+            }
+            self.globals.insert(name, value);
+        }
+        Ok(())
+    }
+
+    /// Resolves a true realm global after module bindings have been considered.
+    fn resolve_global_binding(&self, name: &EcmaString) -> Option<Value> {
+        self.globals.get(name).copied().or_else(|| {
+            self.intrinsics
+                .globals
+                .iter()
+                .find_map(|(candidate, value)| (candidate == name).then_some(*value))
+        })
     }
 
     /// Classifies a callee into the shared dispatch categories.
@@ -1149,25 +5902,104 @@ impl<'a, H: Host> Machine<'a, H> {
         match self.runtime_slot(callee)? {
             Some(index) => match &self.heap[index] {
                 HeapEntry::Function {
-                    function, captures, ..
+                    module,
+                    function,
+                    captures,
+                    ..
                 } => Ok(CalleeKind::Runtime {
-                    function: *function,
+                    target: RuntimeFunction {
+                        module: *module,
+                        function: *function,
+                    },
                     captures: captures.clone(),
                 }),
-                HeapEntry::NativeFunction { id, bound_this, .. } => Ok(CalleeKind::Builtin {
-                    id: *id,
-                    bound_this: *bound_this,
-                }),
+                HeapEntry::NativeFunction { callable, .. } => match callable {
+                    NativeCallable::Builtin(id) => Ok(CalleeKind::Builtin { id: *id }),
+                    NativeCallable::Bound(_) => Ok(CalleeKind::Bound),
+                },
                 _ => Ok(CalleeKind::NotCallable),
             },
             None => Ok(CalleeKind::NotCallable),
         }
     }
 
+    pub(crate) fn flatten_bound(
+        &self,
+        callee: Value,
+        this_value: Value,
+        arguments: &[Value],
+        mut new_target: Value,
+    ) -> Result<BoundCall, RuntimeErrorKind> {
+        let mut target = callee;
+        let mut receiver = this_value;
+        let mut segments = Vec::new();
+        let mut total = arguments.len();
+        while let Some(index) = self.runtime_slot(target)? {
+            let HeapEntry::NativeFunction {
+                callable: NativeCallable::Bound(bound),
+                ..
+            } = &self.heap[index]
+            else {
+                break;
+            };
+            total = total.checked_add(bound.arguments.len()).ok_or(
+                RuntimeErrorKind::ArgumentLimitExceeded {
+                    limit: self.limits.max_argument_count,
+                    requested: u32::MAX,
+                },
+            )?;
+            if total > self.limits.max_argument_count as usize {
+                return Err(RuntimeErrorKind::ArgumentLimitExceeded {
+                    limit: self.limits.max_argument_count,
+                    requested: u32::try_from(total).unwrap_or(u32::MAX),
+                });
+            }
+            segments.push(bound.arguments.as_slice());
+            receiver = bound.this_value;
+            // BoundFunction [[Construct]]: each wrapper forwards newTarget to its
+            // [[BoundTargetFunction]] only when newTarget is the wrapper itself.
+            if new_target == target {
+                new_target = bound.target;
+            }
+            target = bound.target;
+        }
+        let mut flattened = Vec::with_capacity(total);
+        for segment in segments.iter().rev() {
+            flattened.extend_from_slice(segment);
+        }
+        flattened.extend_from_slice(arguments);
+        Ok(BoundCall {
+            target,
+            this_value: receiver,
+            arguments: flattened,
+            new_target,
+        })
+    }
+
+    fn bound_target(&self, mut value: Value) -> Result<Value, RuntimeErrorKind> {
+        loop {
+            let Some(index) = self.runtime_slot(value)? else {
+                return Ok(value);
+            };
+            let HeapEntry::NativeFunction {
+                callable: NativeCallable::Bound(bound),
+                ..
+            } = &self.heap[index]
+            else {
+                return Ok(value);
+            };
+            value = bound.target;
+        }
+    }
+
     /// Materializes a constant into an ABI value, interning strings and bigints
     /// into the slot heap. Shared with the native engine.
-    fn load_constant_value(&mut self, id: ConstantId) -> Result<Value, RuntimeErrorKind> {
-        match &self.module.constants()[id.get() as usize] {
+    pub(crate) fn load_constant_value(
+        &mut self,
+        module: ModuleId,
+        id: ConstantId,
+    ) -> Result<Value, RuntimeErrorKind> {
+        match &self.module_code(module).constants()[id.get() as usize] {
             Constant::String(text) => self.allocate(HeapEntry::String(text.clone())),
             Constant::BigInt(value) => self.allocate(HeapEntry::BigInt(value.as_str().to_owned())),
             constant => Ok(constant_value(constant).expect("non-heap constant")),
@@ -1226,18 +6058,20 @@ impl<'a, H: Host> Machine<'a, H> {
         function: FunctionId,
     ) -> Result<Vec<Value>, EvalFailure> {
         let value = self.read_register(frame, register);
-        self.captures_from_array(value, function)
+        self.captures_from_array(self.active_module_id(), value, function)
     }
 
     /// Validates a `CreateClosure` captures array value: it must be a runtime
     /// array whose length matches the target function's capture count, with
     /// holes read as `undefined`. Shared with the native engine.
-    fn captures_from_array(
+    pub(crate) fn captures_from_array(
         &self,
+        module: ModuleId,
         captures: Value,
         function: FunctionId,
     ) -> Result<Vec<Value>, EvalFailure> {
-        let expected = self.module.functions()[function.get() as usize].capture_count() as usize;
+        let expected =
+            self.module_code(module).functions()[function.get() as usize].capture_count() as usize;
         match self.runtime_slot(captures).map_err(EvalFailure::Runtime)? {
             Some(index) => match &self.heap[index] {
                 HeapEntry::Array { elements, .. } => {
@@ -1267,7 +6101,7 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    fn materialize_arguments(
+    pub(crate) fn materialize_arguments(
         &mut self,
         frame: usize,
         function: usize,
@@ -1283,6 +6117,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 properties: PropertyMap::default(),
                 prototype: Some(self.intrinsics.array_prototype),
                 extensible: true,
+                length_writable: true,
             })
             .map_err(|kind| self.error_at(kind, function, pc))?;
         self.frames[frame].arguments_object = Some(value);
@@ -1291,47 +6126,108 @@ impl<'a, H: Host> Machine<'a, H> {
 
     fn push_frame(
         &mut self,
-        function: FunctionId,
+        target: RuntimeFunction,
         captures: &[Value],
         this_value: Value,
         new_target: Value,
         arguments: &[Value],
-        return_to: ReturnTo,
+        return_to: Option<ReturnTo>,
     ) -> Result<(), RuntimeError> {
-        let function_index = function.get() as usize;
-        let metadata = &self.module.functions()[function_index];
-        if self.frames.len() >= self.limits.max_call_depth {
-            return Err(self.error_here_at(
-                RuntimeErrorKind::CallDepthExceeded {
-                    limit: self.limits.max_call_depth,
-                },
-                return_to.call_pc,
-            ));
+        let function_index = target.function.get() as usize;
+        let metadata = &self.module_code(target.module).functions()[function_index];
+        let limit_error = |kind| match (self.frames.last(), return_to) {
+            (Some(caller), Some(return_to)) => {
+                self.error_at_in_module(kind, caller.module, caller.function, return_to.call_pc)
+            }
+            (_, None) => self.error_at_in_module(kind, target.module, function_index, 0),
+            (None, Some(_)) => unreachable!("a returning frame has a caller"),
+        };
+        if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
+            return Err(limit_error(RuntimeErrorKind::CallDepthExceeded {
+                limit: self.limits.max_call_depth,
+            }));
         }
         let next_registers = metadata.register_count() as usize;
         if self.live_registers.saturating_add(next_registers) > self.limits.max_total_registers {
-            return Err(self.error_here_at(
-                RuntimeErrorKind::RegisterLimitExceeded {
-                    limit: self.limits.max_total_registers,
-                },
-                return_to.call_pc,
-            ));
+            return Err(limit_error(RuntimeErrorKind::RegisterLimitExceeded {
+                limit: self.limits.max_total_registers,
+            }));
         }
         let frame = Frame::new(
-            function_index,
-            metadata,
-            captures,
-            this_value,
-            new_target,
-            arguments,
-            Some(return_to),
+            target, metadata, captures, this_value, new_target, arguments, return_to,
         );
         self.live_registers += next_registers;
         self.frames.push(frame);
         Ok(())
     }
 
-    fn execute_call(&mut self, request: CallRequest) -> Result<(), RuntimeError> {
+    pub(crate) fn consume_fuel(&mut self, amount: u64) -> Result<(), RuntimeErrorKind> {
+        if self.fuel < amount {
+            self.fuel = 0;
+            return Err(RuntimeErrorKind::FuelExhausted {
+                limit: self.limits.fuel,
+            });
+        }
+        self.fuel -= amount;
+        Ok(())
+    }
+
+    pub(crate) fn reserve_native_activation(
+        &mut self,
+        register_count: usize,
+    ) -> Result<(), RuntimeErrorKind> {
+        if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
+            return Err(RuntimeErrorKind::CallDepthExceeded {
+                limit: self.limits.max_call_depth,
+            });
+        }
+        if self.live_registers.saturating_add(register_count) > self.limits.max_total_registers {
+            return Err(RuntimeErrorKind::RegisterLimitExceeded {
+                limit: self.limits.max_total_registers,
+            });
+        }
+        self.native_depth += 1;
+        self.live_registers += register_count;
+        Ok(())
+    }
+
+    pub(crate) fn release_native_activation(&mut self, register_count: usize) {
+        self.native_depth -= 1;
+        self.live_registers -= register_count;
+    }
+
+    pub(crate) fn reserve_suspended_activation_registers(
+        &mut self,
+        register_count: usize,
+    ) -> Result<(), RuntimeErrorKind> {
+        if self.live_registers.saturating_add(register_count) > self.limits.max_total_registers {
+            return Err(RuntimeErrorKind::RegisterLimitExceeded {
+                limit: self.limits.max_total_registers,
+            });
+        }
+        self.live_registers += register_count;
+        Ok(())
+    }
+
+    pub(crate) fn release_suspended_activation_registers(&mut self, register_count: usize) {
+        self.live_registers -= register_count;
+    }
+
+    pub(crate) fn enter_native_generator(&mut self) -> Result<(), RuntimeErrorKind> {
+        if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
+            return Err(RuntimeErrorKind::CallDepthExceeded {
+                limit: self.limits.max_call_depth,
+            });
+        }
+        self.native_depth += 1;
+        Ok(())
+    }
+
+    pub(crate) fn leave_native_generator(&mut self) {
+        self.native_depth -= 1;
+    }
+
+    fn execute_call(&mut self, request: CallRequest<'_>) -> Result<(), RuntimeError> {
         let CallRequest {
             callee,
             this_value,
@@ -1341,103 +6237,240 @@ impl<'a, H: Host> Machine<'a, H> {
             constructed,
             new_target,
         } = request;
-        match self.callee_kind(callee) {
-            Ok(CalleeKind::Runtime { function, captures }) => self.push_frame(
-                function,
-                &captures,
-                this_value,
-                new_target,
-                arguments,
-                ReturnTo {
-                    destination: destination.map(|register| register as usize),
-                    call_pc,
-                    constructed,
-                },
-            ),
-            Ok(CalleeKind::Builtin { id, bound_this }) => {
-                let this_value = bound_this.unwrap_or(this_value);
-                match self.call_builtin(id, this_value, arguments, false) {
-                    Ok(intrinsics::BuiltinOutcome::Value(value)) => {
+        let mut callee = callee;
+        let mut this_value = this_value;
+        let mut arguments = Cow::Borrowed(arguments);
+        loop {
+            match self.callee_kind(callee) {
+                Ok(CalleeKind::Runtime { target, captures }) => {
+                    let flags = self.module_code(target.module).functions()
+                        [target.function.get() as usize]
+                        .flags();
+                    if flags.is_async && flags.is_generator {
+                        let generator = self
+                            .create_async_generator(GeneratorStart {
+                                target,
+                                captures,
+                                this_value,
+                                new_target,
+                                args: arguments.as_ref().to_vec(),
+                            })
+                            .map_err(|kind| self.error_here_at(kind, call_pc))?;
                         if let Some(register) = destination {
-                            self.write_register(self.frames.len() - 1, register, value);
+                            self.write_register(self.frames.len() - 1, register, generator);
                         }
-                        Ok(())
+                        return Ok(());
                     }
-                    Ok(intrinsics::BuiltinOutcome::Call {
-                        callee,
+                    if flags.is_generator && !flags.is_async {
+                        let generator = self
+                            .create_generator(GeneratorStart {
+                                target,
+                                captures,
+                                this_value,
+                                new_target,
+                                args: arguments.as_ref().to_vec(),
+                            })
+                            .map_err(|kind| self.error_here_at(kind, call_pc))?;
+                        if let Some(register) = destination {
+                            self.write_register(self.frames.len() - 1, register, generator);
+                        }
+                        return Ok(());
+                    }
+                    if flags.is_async && !flags.is_generator {
+                        return match self.start_async_call(
+                            target,
+                            &captures,
+                            this_value,
+                            new_target,
+                            arguments.as_ref(),
+                        ) {
+                            Ok(promise) => {
+                                if let Some(register) = destination {
+                                    self.write_register(self.frames.len() - 1, register, promise);
+                                }
+                                Ok(())
+                            }
+                            Err(failure) => self.resolve_failure(failure, call_pc),
+                        };
+                    }
+                    return self.push_frame(
+                        target,
+                        &captures,
                         this_value,
-                        argument_start,
-                    }) => self.execute_call(CallRequest {
-                        callee,
-                        this_value,
-                        arguments: &arguments[argument_start..],
-                        destination,
-                        call_pc,
-                        constructed,
                         new_target,
-                    }),
-                    Err(failure) => self.resolve_failure(failure, call_pc),
+                        arguments.as_ref(),
+                        Some(ReturnTo {
+                            destination: destination.map(|register| register as usize),
+                            call_pc,
+                            constructed,
+                        }),
+                    );
                 }
+                Ok(CalleeKind::Builtin { id }) => {
+                    match self.call_builtin(id, this_value, arguments.as_ref(), false) {
+                        Ok(intrinsics::BuiltinOutcome::Value(value)) => {
+                            if let Some(register) = destination {
+                                self.write_register(self.frames.len() - 1, register, value);
+                            }
+                            return Ok(());
+                        }
+                        Ok(intrinsics::BuiltinOutcome::Call {
+                            callee: next,
+                            this_value: next_this,
+                            arguments: next_arguments,
+                        }) => {
+                            callee = next;
+                            this_value = next_this;
+                            arguments = Cow::Owned(next_arguments);
+                        }
+                        Ok(intrinsics::BuiltinOutcome::GeneratorNext {
+                            generator,
+                            resume_value,
+                        }) => match self.resume_generator(generator, resume_value) {
+                            Ok(value) => {
+                                if let Some(register) = destination {
+                                    self.write_register(self.frames.len() - 1, register, value);
+                                }
+                                return Ok(());
+                            }
+                            Err(failure) => return self.resolve_failure(failure, call_pc),
+                        },
+                        Ok(intrinsics::BuiltinOutcome::AsyncGeneratorNext {
+                            generator,
+                            resume_value,
+                        }) => match self.enqueue_async_generator_next(generator, resume_value) {
+                            Ok(value) => {
+                                if let Some(register) = destination {
+                                    self.write_register(self.frames.len() - 1, register, value);
+                                }
+                                return Ok(());
+                            }
+                            Err(failure) => return self.resolve_failure(failure, call_pc),
+                        },
+                        Err(failure) => return self.resolve_failure(failure, call_pc),
+                    }
+                }
+                Ok(CalleeKind::Bound) => {
+                    let bound = self
+                        .flatten_bound(callee, this_value, arguments.as_ref(), Value::UNDEFINED)
+                        .map_err(|kind| self.error_here_at(kind, call_pc))?;
+                    callee = bound.target;
+                    if constructed.is_none() {
+                        this_value = bound.this_value;
+                    }
+                    arguments = Cow::Owned(bound.arguments);
+                }
+                Ok(CalleeKind::NotCallable) => return self.throw_type("call", call_pc),
+                Err(kind) => return Err(self.error_here_at(kind, call_pc)),
             }
-            Ok(CalleeKind::NotCallable) => self.throw_type("call", call_pc),
-            Err(kind) => Err(self.error_here_at(kind, call_pc)),
         }
     }
 
     fn execute_construct(
         &mut self,
         callee: Value,
+        new_target: Value,
         arguments: &[Value],
         destination: u32,
         call_pc: usize,
     ) -> Result<(), RuntimeError> {
-        match self.runtime_slot(callee) {
-            Ok(Some(index)) => {
-                if let HeapEntry::NativeFunction { id, .. } = self.heap[index] {
-                    match self.call_builtin(id, Value::UNDEFINED, arguments, true) {
-                        Ok(intrinsics::BuiltinOutcome::Value(value)) => {
-                            self.write_register(self.frames.len() - 1, destination, value);
-                            return Ok(());
-                        }
-                        Ok(intrinsics::BuiltinOutcome::Call { .. }) => {
-                            return self.throw_type("construct", call_pc);
-                        }
-                        Err(failure) => return self.resolve_failure(failure, call_pc),
-                    }
-                }
-                if !matches!(
-                    self.heap[index],
-                    HeapEntry::Function { .. } | HeapEntry::NativeFunction { .. }
-                ) {
-                    return self.throw_type("construct", call_pc);
-                }
-                // The instance's [[Prototype]] is the constructor's own
-                // `prototype` data property when it is an object.
-                let instance_prototype = match self.own_data_property(index, "prototype") {
-                    Some(value) if self.is_object(value) => Some(value),
-                    _ => Some(self.intrinsics.object_prototype),
-                };
-                let object = self
-                    .allocate(HeapEntry::Object {
-                        properties: PropertyMap::default(),
-                        prototype: instance_prototype,
-                        boxed_primitive: None,
-                        extensible: true,
-                    })
-                    .map_err(|kind| self.error_here_at(kind, call_pc))?;
-                self.execute_call(CallRequest {
-                    callee,
-                    this_value: object,
-                    arguments,
-                    destination: Some(destination),
-                    call_pc,
-                    constructed: Some(object),
-                    new_target: callee,
-                })
-            }
-            Ok(None) => self.throw_type("construct", call_pc),
-            Err(kind) => Err(self.error_here_at(kind, call_pc)),
+        let mut callee = callee;
+        let mut new_target = new_target;
+        let mut arguments = Cow::Borrowed(arguments);
+        if matches!(self.callee_kind(callee), Ok(CalleeKind::Bound)) {
+            let bound = self
+                .flatten_bound(callee, Value::UNDEFINED, arguments.as_ref(), new_target)
+                .map_err(|kind| self.error_here_at(kind, call_pc))?;
+            new_target = bound.new_target;
+            callee = bound.target;
+            arguments = Cow::Owned(bound.arguments);
         }
+        let index = match self.runtime_slot(callee) {
+            Ok(Some(index)) => index,
+            Ok(None) => return self.throw_type("construct", call_pc),
+            Err(kind) => return Err(self.error_here_at(kind, call_pc)),
+        };
+        let builtin = match &self.heap[index] {
+            HeapEntry::NativeFunction {
+                callable: NativeCallable::Builtin(id),
+                ..
+            } => Some(*id),
+            _ => None,
+        };
+        if let Some(id) = builtin {
+            return match self.call_builtin_with_new_target(
+                id,
+                Value::UNDEFINED,
+                arguments.as_ref(),
+                true,
+                new_target,
+            ) {
+                Ok(intrinsics::BuiltinOutcome::Value(value)) => {
+                    self.write_register(self.frames.len() - 1, destination, value);
+                    Ok(())
+                }
+                Ok(
+                    intrinsics::BuiltinOutcome::Call { .. }
+                    | intrinsics::BuiltinOutcome::GeneratorNext { .. }
+                    | intrinsics::BuiltinOutcome::AsyncGeneratorNext { .. },
+                ) => self.throw_type("construct", call_pc),
+                Err(failure) => self.resolve_failure(failure, call_pc),
+            };
+        }
+        if !matches!(
+            self.heap[index],
+            HeapEntry::Function { .. } | HeapEntry::NativeFunction { .. }
+        ) {
+            return self.throw_type("construct", call_pc);
+        }
+        if let HeapEntry::Function {
+            module, function, ..
+        } = self.heap[index]
+            && self.module_code(module).functions()[function.get() as usize]
+                .flags()
+                .is_async
+        {
+            return self.throw_type("construct", call_pc);
+        }
+        let object = self
+            .allocate_constructed_receiver(new_target)
+            .map_err(|kind| self.error_here_at(kind, call_pc))?;
+        self.execute_call(CallRequest {
+            callee,
+            this_value: object,
+            arguments: arguments.as_ref(),
+            destination: Some(destination),
+            call_pc,
+            constructed: Some(object),
+            new_target,
+        })
+    }
+
+    pub(crate) fn constructed_prototype(&self, callee: Value) -> Result<Value, RuntimeErrorKind> {
+        let index = self
+            .runtime_slot(callee)?
+            .ok_or(RuntimeErrorKind::InvalidValue { value: callee })?;
+        Ok(match self.own_data_property(index, "prototype") {
+            Some(value) if self.is_object(value) => value,
+            _ => self.intrinsics.object_prototype,
+        })
+    }
+
+    fn allocate_constructed_receiver(&mut self, callee: Value) -> Result<Value, RuntimeErrorKind> {
+        let prototype = self.constructed_prototype(callee)?;
+        self.allocate_constructed_receiver_with(prototype)
+    }
+
+    pub(crate) fn allocate_constructed_receiver_with(
+        &mut self,
+        prototype: Value,
+    ) -> Result<Value, RuntimeErrorKind> {
+        self.allocate(HeapEntry::Object {
+            properties: PropertyMap::default(),
+            prototype: Some(prototype),
+            boxed_primitive: None,
+            extensible: true,
+        })
     }
 
     pub(crate) fn array_elements(&self, value: Value) -> Result<Option<Vec<Value>>, EvalFailure> {
@@ -1468,19 +6501,36 @@ impl<'a, H: Host> Machine<'a, H> {
                 operation: "array method called on incompatible receiver",
             }));
         };
+        let old_length = match &self.heap[index] {
+            HeapEntry::Array { elements, .. } => elements.len(),
+            _ => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "array method called on incompatible receiver",
+                }));
+            }
+        };
+        let element_bytes = std::mem::size_of::<Value>();
+        let growth = elements
+            .len()
+            .saturating_sub(old_length)
+            .saturating_mul(element_bytes);
+        self.charge_slot(index, growth)
+            .map_err(EvalFailure::Runtime)?;
+        let released = old_length
+            .saturating_sub(elements.len())
+            .saturating_mul(element_bytes);
         let HeapEntry::Array {
             elements: current, ..
         } = &mut self.heap[index]
         else {
-            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "array method called on incompatible receiver",
-            }));
+            unreachable!("array brand was checked before its heap charge");
         };
         *current = elements;
+        self.refund_slot(index, released);
         Ok(())
     }
 
-    pub(crate) fn string_value(&self, value: Value) -> Option<String> {
+    pub(crate) fn string_value(&self, value: Value) -> Option<EcmaString> {
         let index = self.runtime_slot(value).ok().flatten()?;
         match &self.heap[index] {
             HeapEntry::String(text) => Some(text.clone()),
@@ -1493,7 +6543,26 @@ impl<'a, H: Host> Machine<'a, H> {
         object: Value,
         name: &str,
     ) -> Result<Value, EvalFailure> {
-        match self.resolve_get(object, &PropertyKey::Named(name.to_owned()))? {
+        self.get_property_ascii(object, name)
+    }
+
+    fn get_property_ascii(&mut self, object: Value, name: &str) -> Result<Value, EvalFailure> {
+        debug_assert!(name.is_ascii());
+        match self.resolve_get_ascii(object, name)? {
+            GetOutcome::Value(value) => Ok(value),
+            GetOutcome::Text(text) => self
+                .allocate(HeapEntry::String(text))
+                .map_err(EvalFailure::Runtime),
+            GetOutcome::Getter(getter) => self.call_value(getter, object, &[]),
+        }
+    }
+
+    pub(crate) fn get_property_key(
+        &mut self,
+        object: Value,
+        key: &PropertyKey,
+    ) -> Result<Value, EvalFailure> {
+        match self.resolve_get(object, key)? {
             GetOutcome::Value(value) => Ok(value),
             GetOutcome::Text(text) => self
                 .allocate(HeapEntry::String(text))
@@ -1508,21 +6577,26 @@ impl<'a, H: Host> Machine<'a, H> {
         name: &str,
         value: Value,
     ) -> Result<(), EvalFailure> {
-        match self.resolve_set(object, PropertyKey::Named(name.to_owned()), value)? {
+        self.set_data_property_key(
+            object,
+            PropertyKey::Named(EcmaString::from_utf8(name)),
+            value,
+        )
+    }
+
+    pub(crate) fn set_data_property_key(
+        &mut self,
+        object: Value,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<(), EvalFailure> {
+        match self.resolve_set(object, key, value)? {
             SetOutcome::Done => Ok(()),
             SetOutcome::Setter(setter) => {
                 self.call_value(setter, object, &[value])?;
                 Ok(())
             }
         }
-    }
-
-    pub(crate) fn delete_named_property(
-        &mut self,
-        object: Value,
-        name: &str,
-    ) -> Result<bool, EvalFailure> {
-        self.delete_property(object, &PropertyKey::Named(name.to_owned()))
     }
 
     pub(crate) fn is_callable(&self, value: Value) -> Result<bool, EvalFailure> {
@@ -1536,9 +6610,15 @@ impl<'a, H: Host> Machine<'a, H> {
         let prototype = match value.decode() {
             Some(Decoded::Boolean(_)) => self.intrinsics.boolean_prototype,
             Some(Decoded::Number(_) | Decoded::Int32(_)) => self.intrinsics.number_prototype,
-            Some(Decoded::HeapRef(_)) if self.string_value(value).is_some() => {
-                self.intrinsics.string_prototype
-            }
+            Some(Decoded::HeapRef(_)) => match self
+                .runtime_slot(value)
+                .map_err(EvalFailure::Runtime)?
+                .map(|index| &self.heap[index])
+            {
+                Some(HeapEntry::String(_)) => self.intrinsics.string_prototype,
+                Some(HeapEntry::Symbol { .. }) => self.intrinsics.builtins.symbol_prototype(),
+                _ => self.intrinsics.object_prototype,
+            },
             _ => self.intrinsics.object_prototype,
         };
         self.allocate(HeapEntry::Object {
@@ -1548,6 +6628,37 @@ impl<'a, H: Host> Machine<'a, H> {
             extensible: true,
         })
         .map_err(EvalFailure::Runtime)
+    }
+
+    pub(crate) fn value_to_object(&mut self, value: Value) -> Result<Value, EvalFailure> {
+        if matches!(
+            value.decode(),
+            Some(Decoded::Undefined | Decoded::Null | Decoded::Hole | Decoded::Uninitialized)
+                | None
+        ) {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "convert nullish value to object",
+            }));
+        }
+        let heap_primitive = self
+            .runtime_slot(value)
+            .map_err(EvalFailure::Runtime)?
+            .is_some_and(|index| {
+                matches!(
+                    self.heap[index],
+                    HeapEntry::String(_)
+                        | HeapEntry::BigInt(_)
+                        | HeapEntry::Symbol { .. }
+                        | HeapEntry::PrivateName { .. }
+                )
+            });
+        if heap_primitive {
+            return self.box_primitive(value);
+        }
+        if self.is_object(value) {
+            return Ok(value);
+        }
+        self.box_primitive(value)
     }
 
     pub(crate) fn unbox_primitive_or_self(&self, value: Value) -> Result<Value, EvalFailure> {
@@ -1580,18 +6691,24 @@ impl<'a, H: Host> Machine<'a, H> {
         self.current_builtin_id
     }
 
+    /// The `new.target` value scoped to the currently executing builtin
+    /// constructor, or `Value::UNDEFINED` outside builtin construction.
+    pub(crate) fn current_new_target(&self) -> Value {
+        self.current_new_target
+    }
+
     pub(crate) fn throw_error(
         &mut self,
         id: intrinsics::BuiltinId,
         message: String,
     ) -> EvalFailure {
-        let message = match self.allocate(HeapEntry::String(message)) {
+        let message = match self.allocate(HeapEntry::String(EcmaString::from_utf8(&message))) {
             Ok(value) => value,
             Err(kind) => return EvalFailure::Runtime(kind),
         };
         let mut properties = PropertyMap::default();
         properties.insert(
-            PropertyKey::Named("message".to_owned()),
+            PropertyKey::Named(EcmaString::from_utf8("message")),
             Property::Data {
                 value: message,
                 writable: true,
@@ -1610,17 +6727,88 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    pub(crate) fn has_own_named_property(
+    pub(crate) fn has_own_property_key(
         &self,
         object: Value,
-        name: &str,
+        key: &PropertyKey,
     ) -> Result<bool, EvalFailure> {
         let Some(index) = self.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
             return Ok(false);
         };
-        Ok(self
-            .own_get(index, &PropertyKey::Named(name.to_owned()))
-            .is_some())
+        Ok(self.own_get(index, key).is_some())
+    }
+
+    pub(crate) fn construct_value(
+        &mut self,
+        callee: Value,
+        arguments: &[Value],
+    ) -> Result<Value, EvalFailure> {
+        match self.callee_kind(callee).map_err(EvalFailure::Runtime)? {
+            CalleeKind::Builtin { id } => {
+                match self.call_builtin_with_new_target(
+                    id,
+                    Value::UNDEFINED,
+                    arguments,
+                    true,
+                    callee,
+                )? {
+                    intrinsics::BuiltinOutcome::Value(value) => Ok(value),
+                    _ => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "construct",
+                    })),
+                }
+            }
+            CalleeKind::Runtime { target, captures } => {
+                let flags = self.module_code(target.module).functions()
+                    [target.function.get() as usize]
+                    .flags();
+                if flags.is_async || flags.is_generator {
+                    return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "construct",
+                    }));
+                }
+                let object = self
+                    .allocate_constructed_receiver(callee)
+                    .map_err(EvalFailure::Runtime)?;
+                let stop_depth = self.frames.len();
+                let return_to = self.frames.last().map(|frame| ReturnTo {
+                    destination: None,
+                    call_pc: frame.pc,
+                    constructed: Some(object),
+                });
+                self.push_frame(target, &captures, object, callee, arguments, return_to)
+                    .map_err(|error| EvalFailure::Runtime(error.kind))?;
+                self.callback_boundaries.push(stop_depth);
+                let result = self.run_loop(stop_depth);
+                self.callback_boundaries
+                    .pop()
+                    .expect("nested constructor callback owns its unwind boundary");
+                match result {
+                    Ok(None) => self.last_completion.take().ok_or(EvalFailure::Runtime(
+                        RuntimeErrorKind::InvalidValue { value: object },
+                    )),
+                    Ok(Some(execution)) => Ok(execution.value),
+                    Err(error) => {
+                        self.unwind_frames_to(stop_depth);
+                        match error.kind {
+                            RuntimeErrorKind::UncaughtThrow { value, origin } => {
+                                Err(EvalFailure::ThrowValueOrigin { value, origin })
+                            }
+                            kind => Err(EvalFailure::Runtime(kind)),
+                        }
+                    }
+                }
+            }
+            CalleeKind::Bound => {
+                let bound = self
+                    .flatten_bound(callee, Value::UNDEFINED, arguments, Value::UNDEFINED)
+                    .map_err(EvalFailure::Runtime)?;
+                self.construct_value(bound.target, &bound.arguments)
+            }
+            CalleeKind::NotCallable => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "construct",
+            })),
+        }
     }
 
     pub(crate) fn call_value(
@@ -1629,52 +6817,127 @@ impl<'a, H: Host> Machine<'a, H> {
         this_value: Value,
         arguments: &[Value],
     ) -> Result<Value, EvalFailure> {
-        match self.callee_kind(callee).map_err(EvalFailure::Runtime)? {
-            CalleeKind::Builtin { id, bound_this } => {
-                let receiver = bound_this.unwrap_or(this_value);
-                match self.call_builtin(id, receiver, arguments, false)? {
-                    intrinsics::BuiltinOutcome::Value(value) => Ok(value),
-                    intrinsics::BuiltinOutcome::Call {
-                        callee,
-                        this_value,
-                        argument_start,
-                    } => self.call_value(callee, this_value, &arguments[argument_start..]),
-                }
-            }
-            CalleeKind::Runtime { function, captures } => {
-                let stop_depth = self.frames.len();
-                let call_pc = self.frames.last().map_or(0, |frame| frame.pc);
-                self.push_frame(
-                    function,
-                    &captures,
-                    this_value,
-                    Value::UNDEFINED,
-                    arguments,
-                    ReturnTo {
-                        destination: None,
-                        call_pc,
-                        constructed: None,
-                    },
-                )
-                .map_err(|error| EvalFailure::Runtime(error.kind))?;
-                match self.run_loop(stop_depth) {
-                    Ok(None) => self.last_completion.take().ok_or(EvalFailure::Runtime(
-                        RuntimeErrorKind::InvalidValue {
-                            value: Value::UNDEFINED,
-                        },
-                    )),
-                    Ok(Some(_)) => unreachable!("a nested call cannot complete the entry frame"),
-                    Err(error) => match error.kind {
-                        RuntimeErrorKind::UncaughtThrow { value, .. } => {
-                            Err(EvalFailure::ThrowValue(value))
+        let mut callee = callee;
+        let mut this_value = this_value;
+        let mut arguments = Cow::Borrowed(arguments);
+        loop {
+            match self.callee_kind(callee).map_err(EvalFailure::Runtime)? {
+                CalleeKind::Builtin { id } => {
+                    match self.call_builtin(id, this_value, arguments.as_ref(), false)? {
+                        intrinsics::BuiltinOutcome::Value(value) => return Ok(value),
+                        intrinsics::BuiltinOutcome::Call {
+                            callee: next,
+                            this_value: next_this,
+                            arguments: next_arguments,
+                        } => {
+                            callee = next;
+                            this_value = next_this;
+                            arguments = Cow::Owned(next_arguments);
                         }
-                        kind => Err(EvalFailure::Runtime(kind)),
-                    },
+                        intrinsics::BuiltinOutcome::GeneratorNext {
+                            generator,
+                            resume_value,
+                        } => return self.resume_generator(generator, resume_value),
+                        intrinsics::BuiltinOutcome::AsyncGeneratorNext {
+                            generator,
+                            resume_value,
+                        } => return self.enqueue_async_generator_next(generator, resume_value),
+                    }
+                }
+                CalleeKind::Runtime { target, captures } => {
+                    let flags = self.module_code(target.module).functions()
+                        [target.function.get() as usize]
+                        .flags();
+                    if flags.is_async && flags.is_generator {
+                        return self
+                            .create_async_generator(GeneratorStart {
+                                target,
+                                captures,
+                                this_value,
+                                new_target: Value::UNDEFINED,
+                                args: arguments.as_ref().to_vec(),
+                            })
+                            .map_err(EvalFailure::Runtime);
+                    }
+                    if flags.is_generator && !flags.is_async {
+                        return self
+                            .create_generator(GeneratorStart {
+                                target,
+                                captures,
+                                this_value,
+                                new_target: Value::UNDEFINED,
+                                args: arguments.as_ref().to_vec(),
+                            })
+                            .map_err(EvalFailure::Runtime);
+                    }
+                    if flags.is_async && !flags.is_generator {
+                        return self.start_async_call(
+                            target,
+                            &captures,
+                            this_value,
+                            Value::UNDEFINED,
+                            arguments.as_ref(),
+                        );
+                    }
+                    let stop_depth = self.frames.len();
+                    let return_to = self.frames.last().map(|frame| ReturnTo {
+                        destination: None,
+                        call_pc: frame.pc,
+                        constructed: None,
+                    });
+                    self.push_frame(
+                        target,
+                        &captures,
+                        this_value,
+                        Value::UNDEFINED,
+                        arguments.as_ref(),
+                        return_to,
+                    )
+                    .map_err(|error| EvalFailure::Runtime(error.kind))?;
+                    self.callback_boundaries.push(stop_depth);
+                    let result = self.run_loop(stop_depth);
+                    self.callback_boundaries
+                        .pop()
+                        .expect("nested runtime callback owns its unwind boundary");
+                    return match result {
+                        Ok(None) => self.last_completion.take().ok_or(EvalFailure::Runtime(
+                            RuntimeErrorKind::InvalidValue {
+                                value: Value::UNDEFINED,
+                            },
+                        )),
+                        Ok(Some(execution)) => Ok(execution.value),
+                        Err(error) => {
+                            self.unwind_frames_to(stop_depth);
+                            match error.kind {
+                                RuntimeErrorKind::UncaughtThrow { value, origin } => {
+                                    Err(EvalFailure::ThrowValueOrigin { value, origin })
+                                }
+                                kind => Err(EvalFailure::Runtime(kind)),
+                            }
+                        }
+                    };
+                }
+                CalleeKind::Bound => {
+                    let bound = self
+                        .flatten_bound(callee, this_value, arguments.as_ref(), Value::UNDEFINED)
+                        .map_err(EvalFailure::Runtime)?;
+                    callee = bound.target;
+                    this_value = bound.this_value;
+                    arguments = Cow::Owned(bound.arguments);
+                }
+                CalleeKind::NotCallable => {
+                    return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "call",
+                    }));
                 }
             }
-            CalleeKind::NotCallable => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "call",
-            })),
+        }
+    }
+
+    fn unwind_frames_to(&mut self, depth: usize) {
+        while self.frames.len() > depth {
+            let frame = self.frames.pop().expect("frame depth was checked");
+            self.live_registers -= frame.registers.len();
         }
     }
 
@@ -1714,6 +6977,7 @@ impl<'a, H: Host> Machine<'a, H> {
         match failure {
             EvalFailure::Throw(origin) => self.throw(Value::UNDEFINED, origin, pc),
             EvalFailure::ThrowValue(value) => self.throw(value, ThrowOrigin::Bytecode, pc),
+            EvalFailure::ThrowValueOrigin { value, origin } => self.throw(value, origin, pc),
             EvalFailure::Runtime(kind) => Err(self.error_here_at(kind, pc)),
         }
     }
@@ -1728,6 +6992,11 @@ impl<'a, H: Host> Machine<'a, H> {
         origin: ThrowOrigin,
         faulting_pc: usize,
     ) -> Result<(), RuntimeError> {
+        let site_module = self
+            .frames
+            .last()
+            .expect("an activation is executing")
+            .module;
         let site_function = self
             .frames
             .last()
@@ -1735,12 +7004,35 @@ impl<'a, H: Host> Machine<'a, H> {
             .function;
         let mut search_pc = faulting_pc;
         loop {
+            if self
+                .callback_boundaries
+                .last()
+                .is_some_and(|boundary| self.frames.len() == *boundary)
+            {
+                return Err(self.error_at_in_module(
+                    RuntimeErrorKind::UncaughtThrow { value, origin },
+                    site_module,
+                    site_function,
+                    faulting_pc,
+                ));
+            }
             let frame_index = self.frames.len() - 1;
             let function_index = self.frames[frame_index].function;
-            let function = &self.module.functions()[function_index];
+            let module = self.frames[frame_index].module;
+            let function = &self.module_code(module).functions()[function_index];
             if let Some(handler) = innermost_handler(function, search_pc) {
+                // Bytecode throws and already-materialized engine errors keep
+                // their supplied value. Only an unmaterialized (UNDEFINED)
+                // non-Bytecode origin allocates an intrinsic error object.
+                let catch_value = if catch_value_needs_materialization(value, origin) {
+                    self.materialize_engine_origin(origin).map_err(|kind| {
+                        self.error_at_in_module(kind, site_module, site_function, faulting_pc)
+                    })?
+                } else {
+                    value
+                };
                 let frame = &mut self.frames[frame_index];
-                frame.registers[handler.catch_register.get() as usize] = value;
+                frame.registers[handler.catch_register.get() as usize] = catch_value;
                 frame.pc = handler.handler.get() as usize;
                 return Ok(());
             }
@@ -1749,8 +7041,9 @@ impl<'a, H: Host> Machine<'a, H> {
             match frame.return_to {
                 Some(return_to) => search_pc = return_to.call_pc,
                 None => {
-                    return Err(self.error_at(
+                    return Err(self.error_at_in_module(
                         RuntimeErrorKind::UncaughtThrow { value, origin },
+                        site_module,
                         site_function,
                         faulting_pc,
                     ));
@@ -1774,11 +7067,22 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn error_at(&self, kind: RuntimeErrorKind, function: usize, pc: usize) -> RuntimeError {
-        let metadata = &self.module.functions()[function];
+        self.error_at_in_module(kind, self.active_module_id(), function, pc)
+    }
+
+    pub(crate) fn error_at_in_module(
+        &self,
+        kind: RuntimeErrorKind,
+        module: ModuleId,
+        function: usize,
+        pc: usize,
+    ) -> RuntimeError {
+        let code = self.module_code(module);
+        let metadata = &code.functions()[function];
         let function_name =
             metadata
                 .name()
-                .and_then(|id| match &self.module.constants()[id.get() as usize] {
+                .and_then(|id| match &code.constants()[id.get() as usize] {
                     Constant::String(name) => Some(name.clone()),
                     _ => None,
                 });
@@ -1802,6 +7106,7 @@ impl<'a, H: Host> Machine<'a, H> {
         match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
             Some(index) => match &self.heap[index] {
                 HeapEntry::String(text) => Ok(PropertyKey::Named(text.clone())),
+                HeapEntry::Symbol { .. } => Ok(PropertyKey::Symbol(index as u32)),
                 HeapEntry::PrivateName { .. } => Ok(PropertyKey::Private(index as u32)),
                 _ => Ok(PropertyKey::Named(self.value_to_string(value, 0)?)),
             },
@@ -1819,7 +7124,11 @@ impl<'a, H: Host> Machine<'a, H> {
                     let PropertyKey::Named(name) = key else {
                         return Ok(GetOutcome::Value(Value::UNDEFINED));
                     };
-                    let text = self.host.env(name).map(str::to_owned);
+                    let text = name
+                        .to_utf8_strict()
+                        .ok()
+                        .and_then(|name| self.host.env(&name))
+                        .map(EcmaString::from_utf8);
                     return match text {
                         Some(text) => self
                             .allocate(HeapEntry::String(text))
@@ -1829,7 +7138,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     };
                 }
                 if let Some(found) = self.primitive_get(index, key) {
-                    return Ok(Self::found_outcome(found));
+                    return self.found_outcome(found);
                 }
                 match self.heap[index] {
                     HeapEntry::String(_) => self
@@ -1837,6 +7146,9 @@ impl<'a, H: Host> Machine<'a, H> {
                         .map_err(EvalFailure::Runtime)?,
                     HeapEntry::BigInt(_) | HeapEntry::PrivateName { .. } => self
                         .runtime_slot(self.intrinsics.object_prototype)
+                        .map_err(EvalFailure::Runtime)?,
+                    HeapEntry::Symbol { .. } => self
+                        .runtime_slot(self.intrinsics.builtins.symbol_prototype())
                         .map_err(EvalFailure::Runtime)?,
                     _ => Some(index),
                 }
@@ -1857,7 +7169,7 @@ impl<'a, H: Host> Machine<'a, H> {
         };
         for _ in 0..=self.heap.len() {
             if let Some(found) = self.own_get(node, key) {
-                return Ok(Self::found_outcome(found));
+                return self.found_outcome(found);
             }
             match self.prototype_index(node)? {
                 Some(next) => node = next,
@@ -1867,29 +7179,256 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(GetOutcome::Value(Value::UNDEFINED))
     }
 
-    fn found_outcome(found: Found) -> GetOutcome {
+    fn resolve_get_ascii(&mut self, object: Value, name: &str) -> Result<GetOutcome, EvalFailure> {
+        debug_assert!(name.is_ascii());
+        let slot = self.runtime_slot(object).map_err(EvalFailure::Runtime)?;
+        let start = match slot {
+            Some(index) => {
+                if matches!(self.heap[index], HeapEntry::ProcessEnv { .. }) {
+                    return match self.host.env(name).map(EcmaString::from_utf8) {
+                        Some(text) => self
+                            .allocate(HeapEntry::String(text))
+                            .map(GetOutcome::Value)
+                            .map_err(EvalFailure::Runtime),
+                        None => Ok(GetOutcome::Value(Value::UNDEFINED)),
+                    };
+                }
+                if let HeapEntry::String(text) = &self.heap[index] {
+                    if name == "length" {
+                        return Ok(GetOutcome::Value(number_value(text.len_units() as f64)));
+                    }
+                    if let Some(offset) = array_index_ascii(name)
+                        && let Some(unit) = text.unit_at(offset as usize)
+                    {
+                        return Ok(GetOutcome::Text(EcmaString::from_units(&[unit])));
+                    }
+                }
+                match self.heap[index] {
+                    HeapEntry::String(_) => self
+                        .runtime_slot(self.intrinsics.string_prototype)
+                        .map_err(EvalFailure::Runtime)?,
+                    HeapEntry::BigInt(_) | HeapEntry::PrivateName { .. } => self
+                        .runtime_slot(self.intrinsics.object_prototype)
+                        .map_err(EvalFailure::Runtime)?,
+                    HeapEntry::Symbol { .. } => self
+                        .runtime_slot(self.intrinsics.builtins.symbol_prototype())
+                        .map_err(EvalFailure::Runtime)?,
+                    _ => Some(index),
+                }
+            }
+            None => {
+                let prototype = match object.decode() {
+                    Some(Decoded::Boolean(_)) => self.intrinsics.boolean_prototype,
+                    Some(Decoded::Number(_) | Decoded::Int32(_)) => {
+                        self.intrinsics.number_prototype
+                    }
+                    _ => return Ok(GetOutcome::Value(Value::UNDEFINED)),
+                };
+                self.runtime_slot(prototype).map_err(EvalFailure::Runtime)?
+            }
+        };
+        let Some(mut node) = start else {
+            return Ok(GetOutcome::Value(Value::UNDEFINED));
+        };
+        for _ in 0..=self.heap.len() {
+            if let Some(found) = self.own_get_ascii(node, name) {
+                return self.found_outcome(found);
+            }
+            match self.prototype_index(node)? {
+                Some(next) => node = next,
+                None => return Ok(GetOutcome::Value(Value::UNDEFINED)),
+            }
+        }
+        Ok(GetOutcome::Value(Value::UNDEFINED))
+    }
+
+    fn found_outcome(&mut self, found: Found) -> Result<GetOutcome, EvalFailure> {
         match found {
-            Found::Value(value) => GetOutcome::Value(value),
-            Found::Text(text) => GetOutcome::Text(text),
-            Found::Getter(getter) => GetOutcome::Getter(getter),
-            Found::NoGetter => GetOutcome::Value(Value::UNDEFINED),
+            Found::Value(Value::UNINITIALIZED) => {
+                let id = self
+                    .intrinsics
+                    .builtins
+                    .id_named("ReferenceError")
+                    .expect("ReferenceError intrinsic is installed");
+                match self.throw_error(
+                    id,
+                    "Cannot access lexical binding before initialization".into(),
+                ) {
+                    EvalFailure::ThrowValue(value) => Err(EvalFailure::ThrowValueOrigin {
+                        value,
+                        origin: ThrowOrigin::ReferenceError {
+                            operation: "lexical binding is uninitialized",
+                        },
+                    }),
+                    failure => Err(failure),
+                }
+            }
+            Found::Value(value) => Ok(GetOutcome::Value(value)),
+            Found::Text(text) => Ok(GetOutcome::Text(text)),
+            Found::Getter(getter) => Ok(GetOutcome::Getter(getter)),
+            Found::Failure(kind) => Err(EvalFailure::Runtime(kind)),
+            Found::NoGetter => Ok(GetOutcome::Value(Value::UNDEFINED)),
         }
     }
 
     fn primitive_get(&self, index: usize, key: &PropertyKey) -> Option<Found> {
-        if let HeapEntry::String(text) = &self.heap[index]
-            && let PropertyKey::Named(name) = key
-        {
-            if name == "length" {
-                return Some(Found::Value(number_value(text.chars().count() as f64)));
-            }
-            if let Some(offset) = array_index(name)
-                && let Some(character) = text.chars().nth(offset as usize)
-            {
-                return Some(Found::Text(character.to_string()));
-            }
+        match &self.heap[index] {
+            HeapEntry::String(text) => string_own_get(text, key),
+            _ => None,
         }
-        None
+    }
+    fn own_get_ascii(&self, index: usize, name: &str) -> Option<Found> {
+        debug_assert!(name.is_ascii());
+        let slot = |value| self.runtime_slot(value).ok().flatten();
+        if slot(self.intrinsics.object_prototype) == Some(index) && name == "toString" {
+            return Some(Found::Value(self.intrinsics.object_to_string()));
+        }
+        match &self.heap[index] {
+            HeapEntry::Object {
+                properties,
+                boxed_primitive,
+                ..
+            } => {
+                if let Some(found) = property_lookup_ascii(properties, name) {
+                    return Some(found);
+                }
+                if let Some(primitive) = boxed_primitive
+                    && let Some(slot) = self.runtime_slot(*primitive).ok().flatten()
+                    && let HeapEntry::String(text) = &self.heap[slot]
+                {
+                    return string_own_get_ascii(text, name);
+                }
+                None
+            }
+            HeapEntry::Generator { properties, .. }
+            | HeapEntry::AsyncGenerator { properties, .. }
+            | HeapEntry::Script { properties, .. }
+            | HeapEntry::NativeFunction { properties, .. }
+            | HeapEntry::Date { properties, .. }
+            | HeapEntry::BuiltinIterator { properties, .. }
+            | HeapEntry::Collection { properties, .. }
+            | HeapEntry::Promise { properties, .. }
+            | HeapEntry::Timeout { properties, .. } => property_lookup_ascii(properties, name),
+            HeapEntry::Array {
+                elements,
+                properties,
+                ..
+            } => {
+                if name == "length" {
+                    return Some(Found::Value(number_value(elements.len() as f64)));
+                }
+                if let Some(offset) = array_index_ascii(name)
+                    && let Some(element) = elements.get(offset as usize)
+                    && *element != Value::HOLE
+                {
+                    return Some(Found::Value(*element));
+                }
+                property_lookup_ascii(properties, name)
+            }
+            HeapEntry::Uint8Array {
+                bytes, properties, ..
+            } => {
+                if let Some(index) = uint8array_index_ascii(name) {
+                    let value = index
+                        .and_then(|offset| bytes.get(offset))
+                        .map_or(Value::UNDEFINED, |byte| Value::int32(u32::from(*byte)));
+                    return Some(Found::Value(value));
+                }
+                property_lookup_ascii(properties, name)
+            }
+            HeapEntry::Function {
+                module,
+                function,
+                properties,
+                ..
+            } => {
+                if let Some(found) = property_lookup_ascii(properties, name) {
+                    return Some(found);
+                }
+                let metadata = &self.module_code(*module).functions()[function.get() as usize];
+                if name == "length" {
+                    return Some(Found::Value(
+                        number_value(metadata.parameter_count() as f64),
+                    ));
+                }
+                if name == "name" {
+                    return Some(Found::Text(
+                        metadata
+                            .name()
+                            .map(|id| self.constant_text(*module, id).clone())
+                            .unwrap_or_default(),
+                    ));
+                }
+                None
+            }
+            HeapEntry::ModuleNamespace { module } => {
+                let key = self
+                    .program_module(*module)
+                    .exports
+                    .iter()
+                    .map(|export| self.constant_text(*module, export.name))
+                    .find(|candidate| candidate.eq_ascii(name))?
+                    .clone();
+                match self.namespace_export(*module, &key) {
+                    Ok(Some(value)) => Some(Found::Value(value)),
+                    Ok(None) => None,
+                    Err(kind) => Some(Found::Failure(kind)),
+                }
+            }
+            HeapEntry::ExternalModuleNamespace { specifier } => {
+                let export = self.registry.external[specifier]
+                    .exports
+                    .iter()
+                    .find_map(|(candidate, export)| candidate.eq_ascii(name).then_some(export))?;
+                let cell = export
+                    .cell
+                    .expect("external namespace exports link before evaluation");
+                Some(Found::Value(self.registry.cells[cell.0].value))
+            }
+            HeapEntry::RegExp {
+                pattern,
+                flags,
+                properties,
+                ..
+            } => {
+                if let Some(found) = property_lookup_ascii(properties, name) {
+                    return Some(found);
+                }
+                let flag = |unit| {
+                    Found::Value(Value::boolean(flags.as_units().contains(&u16::from(unit))))
+                };
+                match name {
+                    "source" => Some(Found::Text(crate::intrinsics::builtins::canonical_source(
+                        pattern,
+                    ))),
+                    "flags" => Some(Found::Text(flags.clone())),
+                    "global" => Some(flag(b'g')),
+                    "ignoreCase" => Some(flag(b'i')),
+                    "multiline" => Some(flag(b'm')),
+                    "sticky" => Some(flag(b'y')),
+                    "unicode" => Some(flag(b'u')),
+                    "dotAll" => Some(flag(b's')),
+                    "lastIndex" => Some(Found::Value(Value::int32(0))),
+                    _ => None,
+                }
+            }
+            HeapEntry::HashState { update, digest, .. } => match name {
+                "update" => Some(Found::Value(*update)),
+                "digest" => Some(Found::Value(*digest)),
+                _ => None,
+            },
+            HeapEntry::ProcessEnv { .. }
+            | HeapEntry::String(_)
+            | HeapEntry::BigInt(_)
+            | HeapEntry::Symbol { .. }
+            | HeapEntry::PrivateName { .. }
+            | HeapEntry::Iterator { .. }
+            | HeapEntry::PromiseResolver { .. }
+            | HeapEntry::PromiseAll { .. }
+            | HeapEntry::AsyncActivation { .. }
+            | HeapEntry::PromiseAllElement { .. } => None,
+            HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
+        }
     }
 
     /// Looks up an own property of the heap entry at `index`, returning `None`
@@ -1897,29 +7436,42 @@ impl<'a, H: Host> Machine<'a, H> {
     fn own_get(&self, index: usize, key: &PropertyKey) -> Option<Found> {
         if let PropertyKey::Named(name) = key {
             let slot = |value| self.runtime_slot(value).ok().flatten();
-            if slot(self.intrinsics.object_prototype) == Some(index) && name == "toString" {
+            if slot(self.intrinsics.object_prototype) == Some(index) && name.eq_ascii("toString") {
                 return Some(Found::Value(self.intrinsics.object_to_string()));
-            }
-            if slot(self.intrinsics.function_prototype) == Some(index) && name == "call" {
-                return Some(Found::Value(self.intrinsics.function_call()));
-            }
-            if matches!(
-                self.heap[index],
-                HeapEntry::Function { .. } | HeapEntry::NativeFunction { .. }
-            ) && name == "call"
-            {
-                return Some(Found::Value(self.intrinsics.function_call()));
             }
         }
         match &self.heap[index] {
-            HeapEntry::Object { properties, .. } => property_lookup(properties, key),
+            HeapEntry::Object {
+                properties,
+                boxed_primitive,
+                ..
+            } => {
+                if let Some(found) = property_lookup(properties, key) {
+                    return Some(found);
+                }
+                if let Some(primitive) = boxed_primitive
+                    && let Some(slot) = self.runtime_slot(*primitive).ok().flatten()
+                    && let HeapEntry::String(text) = &self.heap[slot]
+                {
+                    return string_own_get(text, key);
+                }
+                None
+            }
+            HeapEntry::Generator { properties, .. }
+            | HeapEntry::AsyncGenerator { properties, .. }
+            | HeapEntry::Script { properties, .. }
+            | HeapEntry::Date { properties, .. }
+            | HeapEntry::BuiltinIterator { properties, .. }
+            | HeapEntry::Collection { properties, .. }
+            | HeapEntry::Promise { properties, .. }
+            | HeapEntry::Timeout { properties, .. } => property_lookup(properties, key),
             HeapEntry::Array {
                 elements,
                 properties,
                 ..
             } => {
                 if let PropertyKey::Named(name) = key {
-                    if name == "length" {
+                    if name.eq_ascii("length") {
                         return Some(Found::Value(number_value(elements.len() as f64)));
                     }
                     if let Some(offset) = array_index(name)
@@ -1931,7 +7483,21 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 property_lookup(properties, key)
             }
+            HeapEntry::Uint8Array {
+                bytes, properties, ..
+            } => {
+                if let PropertyKey::Named(name) = key
+                    && let Some(index) = uint8array_index(name)
+                {
+                    let value = index
+                        .and_then(|offset| bytes.get(offset))
+                        .map_or(Value::UNDEFINED, |byte| Value::int32(u32::from(*byte)));
+                    return Some(Found::Value(value));
+                }
+                property_lookup(properties, key)
+            }
             HeapEntry::Function {
+                module,
                 function,
                 properties,
                 ..
@@ -1940,25 +7506,41 @@ impl<'a, H: Host> Machine<'a, H> {
                     return Some(found);
                 }
                 if let PropertyKey::Named(name) = key {
-                    let metadata = &self.module.functions()[function.get() as usize];
-                    match name.as_str() {
-                        "length" => {
-                            return Some(Found::Value(number_value(
-                                metadata.parameter_count() as f64
-                            )));
-                        }
-                        "name" => {
-                            return Some(Found::Text(
-                                metadata
-                                    .name()
-                                    .map(|id| self.constant_string(id).to_owned())
-                                    .unwrap_or_default(),
-                            ));
-                        }
-                        _ => {}
+                    let metadata = &self.module_code(*module).functions()[function.get() as usize];
+                    if name.eq_ascii("length") {
+                        return Some(Found::Value(
+                            number_value(metadata.parameter_count() as f64),
+                        ));
+                    }
+                    if name.eq_ascii("name") {
+                        return Some(Found::Text(
+                            metadata
+                                .name()
+                                .map(|id| self.constant_text(*module, id).clone())
+                                .unwrap_or_default(),
+                        ));
                     }
                 }
                 None
+            }
+            HeapEntry::ModuleNamespace { module } => {
+                let PropertyKey::Named(name) = key else {
+                    return None;
+                };
+                match self.namespace_export(*module, name) {
+                    Ok(Some(value)) => Some(Found::Value(value)),
+                    Ok(None) => None,
+                    Err(kind) => Some(Found::Failure(kind)),
+                }
+            }
+            HeapEntry::ExternalModuleNamespace { specifier } => {
+                let PropertyKey::Named(name) = key else {
+                    return None;
+                };
+                let export = self.registry.external[specifier].exports.get(name)?;
+                Some(Found::Value(export.cell.map_or(export.value, |cell| {
+                    self.registry.cells[cell.0].value
+                })))
             }
             HeapEntry::NativeFunction { properties, .. } => property_lookup(properties, key),
             HeapEntry::RegExp {
@@ -1971,40 +7553,125 @@ impl<'a, H: Host> Machine<'a, H> {
                     return Some(found);
                 }
                 if let PropertyKey::Named(name) = key {
-                    let flag = |ch: char| Found::Value(Value::boolean(flags.contains(ch)));
-                    match name.as_str() {
-                        "source" => return Some(Found::Text(pattern.clone())),
-                        "flags" => return Some(Found::Text(flags.clone())),
-                        "global" => return Some(flag('g')),
-                        "ignoreCase" => return Some(flag('i')),
-                        "multiline" => return Some(flag('m')),
-                        "sticky" => return Some(flag('y')),
-                        "unicode" => return Some(flag('u')),
-                        "dotAll" => return Some(flag('s')),
-                        "lastIndex" => return Some(Found::Value(Value::int32(0))),
-                        _ => {}
+                    let flag = |ascii: &str| {
+                        Found::Value(Value::boolean(
+                            flags.as_units().contains(&u16::from(ascii.as_bytes()[0])),
+                        ))
+                    };
+                    if name.eq_ascii("source") {
+                        return Some(Found::Text(crate::intrinsics::builtins::canonical_source(
+                            pattern,
+                        )));
+                    }
+                    if name.eq_ascii("flags") {
+                        return Some(Found::Text(flags.clone()));
+                    }
+                    if name.eq_ascii("global") {
+                        return Some(flag("g"));
+                    }
+                    if name.eq_ascii("ignoreCase") {
+                        return Some(flag("i"));
+                    }
+                    if name.eq_ascii("multiline") {
+                        return Some(flag("m"));
+                    }
+                    if name.eq_ascii("sticky") {
+                        return Some(flag("y"));
+                    }
+                    if name.eq_ascii("unicode") {
+                        return Some(flag("u"));
+                    }
+                    if name.eq_ascii("dotAll") {
+                        return Some(flag("s"));
+                    }
+                    if name.eq_ascii("lastIndex") {
+                        return Some(Found::Value(Value::int32(0)));
                     }
                 }
                 None
             }
+            HeapEntry::HashState { update, digest, .. } => {
+                let PropertyKey::Named(name) = key else {
+                    return None;
+                };
+                if name.eq_ascii("update") {
+                    Some(Found::Value(*update))
+                } else if name.eq_ascii("digest") {
+                    Some(Found::Value(*digest))
+                } else {
+                    None
+                }
+            }
+            HeapEntry::String(text) => string_own_get(text, key),
             HeapEntry::ProcessEnv { .. }
-            | HeapEntry::String(_)
             | HeapEntry::BigInt(_)
+            | HeapEntry::Symbol { .. }
             | HeapEntry::PrivateName { .. }
-            | HeapEntry::Iterator { .. } => None,
+            | HeapEntry::Iterator { .. }
+            | HeapEntry::PromiseResolver { .. }
+            | HeapEntry::PromiseAll { .. }
+            | HeapEntry::AsyncActivation { .. }
+            | HeapEntry::PromiseAllElement { .. } => None,
+            HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
+        }
+    }
+
+    fn namespace_export(
+        &self,
+        module: ModuleId,
+        name: &EcmaString,
+    ) -> Result<Option<Value>, RuntimeErrorKind> {
+        if module.get() as usize >= self.dynamic_base {
+            return Ok(None);
+        }
+        match self.program().resolve_export(module, name) {
+            Some(ResolvedExport::Local { module, binding }) => {
+                let cell = self.registry.modules[module.get() as usize].binding_cells
+                    [binding.get() as usize]
+                    .expect("verified export resolves to a linked cell");
+                let value = self.registry.cells[cell.0].value;
+                if value.is_uninitialized() {
+                    Err(RuntimeErrorKind::TemporalDeadZone { module, binding })
+                } else {
+                    Ok(Some(value))
+                }
+            }
+            Some(ResolvedExport::External { module, edge, name }) => {
+                let Some(specifier) = self.external_specifier(module, edge) else {
+                    return Err(RuntimeErrorKind::ExternalModuleUnavailable { module, edge });
+                };
+                let name = self.constant_text(module, name);
+                let Some(export) = self.registry.external[&specifier].exports.get(name) else {
+                    return Err(RuntimeErrorKind::ExternalModuleUnavailable { module, edge });
+                };
+                let Some(cell) = export.cell else {
+                    return Err(RuntimeErrorKind::ExternalModuleUnavailable { module, edge });
+                };
+                Ok(Some(self.registry.cells[cell.0].value))
+            }
+            None => Ok(None),
         }
     }
 
     fn own_data_property(&self, index: usize, name: &str) -> Option<Value> {
         let properties = match &self.heap[index] {
             HeapEntry::Object { properties, .. }
+            | HeapEntry::Generator { properties, .. }
+            | HeapEntry::AsyncGenerator { properties, .. }
+            | HeapEntry::Script { properties, .. }
             | HeapEntry::Array { properties, .. }
             | HeapEntry::Function { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
-            | HeapEntry::RegExp { properties, .. } => properties,
+            | HeapEntry::RegExp { properties, .. }
+            | HeapEntry::Date { properties, .. }
+            | HeapEntry::BuiltinIterator { properties, .. }
+            | HeapEntry::Collection { properties, .. }
+            | HeapEntry::Uint8Array { properties, .. }
+            | HeapEntry::Promise { properties, .. }
+            | HeapEntry::Timeout { properties, .. } => properties,
             _ => return None,
         };
-        match properties.get(&PropertyKey::Named(name.to_owned())) {
+        match properties.get_ascii(name) {
             Some(Property::Data { value, .. }) => Some(*value),
             _ => None,
         }
@@ -2013,17 +7680,51 @@ impl<'a, H: Host> Machine<'a, H> {
     fn prototype_index(&self, index: usize) -> Result<Option<usize>, EvalFailure> {
         let prototype = match &self.heap[index] {
             HeapEntry::Object { prototype, .. }
+            | HeapEntry::Generator { prototype, .. }
+            | HeapEntry::AsyncGenerator { prototype, .. }
+            | HeapEntry::Script { prototype, .. }
             | HeapEntry::Array { prototype, .. }
             | HeapEntry::Function { prototype, .. }
+            | HeapEntry::RegExp { prototype, .. }
+            | HeapEntry::Date { prototype, .. }
+            | HeapEntry::BuiltinIterator { prototype, .. }
+            | HeapEntry::Collection { prototype, .. }
+            | HeapEntry::Uint8Array { prototype, .. }
+            | HeapEntry::Promise { prototype, .. }
+            | HeapEntry::Timeout { prototype, .. }
             | HeapEntry::ProcessEnv { prototype, .. } => *prototype,
             HeapEntry::NativeFunction { .. } => Some(self.intrinsics.function_prototype),
-            HeapEntry::RegExp { .. } => Some(self.intrinsics.object_prototype),
             _ => None,
         };
         match prototype {
             Some(value) => self.runtime_slot(value).map_err(EvalFailure::Runtime),
             None => Ok(None),
         }
+    }
+
+    pub(crate) fn inherits_from_prototype(
+        &self,
+        value: Value,
+        prototype: Value,
+    ) -> Result<bool, EvalFailure> {
+        let Some(mut current) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
+            return Ok(false);
+        };
+        let Some(target) = self.runtime_slot(prototype).map_err(EvalFailure::Runtime)? else {
+            return Ok(false);
+        };
+        let mut traversed = 0;
+        while let Some(next) = self.prototype_index(current)? {
+            if next == target {
+                return Ok(true);
+            }
+            current = next;
+            traversed += 1;
+            if traversed > self.heap.len() {
+                return Ok(false);
+            }
+        }
+        Ok(false)
     }
 
     // ---- property set ------------------------------------------------------
@@ -2036,12 +7737,27 @@ impl<'a, H: Host> Machine<'a, H> {
     ) -> Result<SetOutcome, EvalFailure> {
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => {
+                if matches!(self.heap[index], HeapEntry::ModuleNamespace { .. }) {
+                    return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "assign to module namespace",
+                    }));
+                }
                 if matches!(self.heap[index], HeapEntry::ProcessEnv { .. }) {
                     let PropertyKey::Named(name) = &key else {
                         return Ok(SetOutcome::Done);
                     };
+                    let Ok(name) = name.to_utf8_strict() else {
+                        return Ok(SetOutcome::Done);
+                    };
                     let text = self.to_string(value)?;
-                    self.host.set_env(name, &text);
+                    let text = crate::host_objects::env_value_text_lossy(&text);
+                    self.host.set_env(&name, &text);
+                    return Ok(SetOutcome::Done);
+                }
+                if matches!(self.heap[index], HeapEntry::Uint8Array { .. })
+                    && matches!(&key, PropertyKey::Named(name) if uint8array_index(name).is_some())
+                {
+                    self.set_own_data(index, key, value)?;
                     return Ok(SetOutcome::Done);
                 }
                 if let Some(setter) = self.find_setter(index, &key)? {
@@ -2072,10 +7788,19 @@ impl<'a, H: Host> Machine<'a, H> {
         loop {
             let accessor = match &self.heap[node] {
                 HeapEntry::Object { properties, .. }
+                | HeapEntry::Generator { properties, .. }
+                | HeapEntry::AsyncGenerator { properties, .. }
+                | HeapEntry::Script { properties, .. }
                 | HeapEntry::Array { properties, .. }
                 | HeapEntry::Function { properties, .. }
                 | HeapEntry::NativeFunction { properties, .. }
-                | HeapEntry::RegExp { properties, .. } => match properties.get(key) {
+                | HeapEntry::RegExp { properties, .. }
+                | HeapEntry::Date { properties, .. }
+                | HeapEntry::BuiltinIterator { properties, .. }
+                | HeapEntry::Collection { properties, .. }
+                | HeapEntry::Uint8Array { properties, .. }
+                | HeapEntry::Promise { properties, .. }
+                | HeapEntry::Timeout { properties, .. } => match properties.get(key) {
                     Some(Property::Accessor { setter, .. }) => Some(Some(*setter)),
                     Some(Property::Data { .. }) => Some(None),
                     None => None,
@@ -2104,7 +7829,7 @@ impl<'a, H: Host> Machine<'a, H> {
         match &self.heap[index] {
             HeapEntry::Array { elements, .. } => {
                 if let PropertyKey::Named(name) = key {
-                    if name == "length" {
+                    if name.eq_ascii("length") {
                         return true;
                     }
                     if let Some(offset) = array_index(name) {
@@ -2115,11 +7840,20 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 false
             }
+            HeapEntry::Uint8Array { bytes, .. } => key
+                .as_string()
+                .and_then(uint8array_index)
+                .flatten()
+                .is_some_and(|offset| offset < bytes.len()),
             HeapEntry::Function { .. } => {
-                matches!(key.as_str(), Some("length") | Some("name"))
-                    && self
-                        .own_data_property(index, key.as_str().unwrap())
-                        .is_none()
+                (key.eq_ascii("length") || key.eq_ascii("name"))
+                    && match key {
+                        PropertyKey::Named(name) if name.eq_ascii("length") => {
+                            self.own_data_property(index, "length").is_none()
+                        }
+                        PropertyKey::Named(_) => self.own_data_property(index, "name").is_none(),
+                        _ => false,
+                    }
             }
             _ => false,
         }
@@ -2131,8 +7865,109 @@ impl<'a, H: Host> Machine<'a, H> {
         key: PropertyKey,
         value: Value,
     ) -> Result<(), EvalFailure> {
+        if let PropertyKey::Named(name) = &key
+            && let Some(typed_index) = uint8array_index(name)
+            && matches!(self.heap[index], HeapEntry::Uint8Array { .. })
+        {
+            let Some(offset) = typed_index else {
+                return Ok(());
+            };
+            let in_bounds = matches!(
+                &self.heap[index],
+                HeapEntry::Uint8Array { bytes, .. } if offset < bytes.len()
+            );
+            if !in_bounds {
+                return Ok(());
+            }
+            let byte = crate::intrinsics::builtins::to_uint8(self, value)?;
+            let HeapEntry::Uint8Array { bytes, .. } = &mut self.heap[index] else {
+                unreachable!("Uint8Array brand was checked")
+            };
+            bytes[offset] = byte;
+            return Ok(());
+        }
+        if matches!(&key, PropertyKey::Named(name) if name.eq_ascii("length"))
+            && matches!(self.heap[index], HeapEntry::Array { .. })
+        {
+            let length =
+                exact_array_length(value).ok_or(EvalFailure::Throw(ThrowOrigin::RangeError {
+                    operation: "set array length",
+                }))?;
+            let (old_length, old_property_bytes, length_writable) = match &self.heap[index] {
+                HeapEntry::Array {
+                    elements,
+                    properties,
+                    length_writable,
+                    ..
+                } => (elements.len(), properties.charge_bytes(), *length_writable),
+                _ => unreachable!("array checked above"),
+            };
+            if !length_writable {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "set array length",
+                }));
+            }
+            let growth = length
+                .saturating_sub(old_length)
+                .saturating_mul(std::mem::size_of::<Value>());
+            self.charge_slot(index, growth)
+                .map_err(EvalFailure::Runtime)?;
+            let result = {
+                let HeapEntry::Array {
+                    elements,
+                    properties,
+                    ..
+                } = &mut self.heap[index]
+                else {
+                    unreachable!("array checked above");
+                };
+                apply_array_length(elements, properties, length, "set array length")
+            };
+            let (new_length, new_property_bytes) = match &self.heap[index] {
+                HeapEntry::Array {
+                    elements,
+                    properties,
+                    ..
+                } => (elements.len(), properties.charge_bytes()),
+                _ => unreachable!("array checked above"),
+            };
+            let released = old_length
+                .saturating_sub(new_length)
+                .saturating_mul(std::mem::size_of::<Value>())
+                .saturating_add(old_property_bytes.saturating_sub(new_property_bytes));
+            self.refund_slot(index, released);
+            return result;
+        }
+        if let HeapEntry::Array {
+            elements,
+            length_writable,
+            ..
+        } = &self.heap[index]
+            && let Some(offset) = key.as_string().and_then(array_index)
+            && offset as usize >= elements.len()
+            && !*length_writable
+        {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "add index beyond non-writable array length",
+            }));
+        }
         let (properties, extensible, virtual_exists) = match &self.heap[index] {
             HeapEntry::Object {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::Generator {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::AsyncGenerator {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::Script {
                 properties,
                 extensible,
                 ..
@@ -2151,6 +7986,31 @@ impl<'a, H: Host> Machine<'a, H> {
                 properties,
                 extensible,
                 ..
+            }
+            | HeapEntry::Date {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::BuiltinIterator {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::Collection {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::Uint8Array {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::Promise {
+                properties,
+                extensible,
+                ..
             } => (Some(properties), *extensible, false),
             HeapEntry::Array {
                 elements,
@@ -2158,8 +8018,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 extensible,
                 ..
             } => {
-                let virtual_exists = key.as_str().is_some_and(|name| {
-                    name == "length"
+                let virtual_exists = key.as_string().is_some_and(|name| {
+                    name.eq_ascii("length")
                         || array_index(name).is_some_and(|offset| {
                             elements
                                 .get(offset as usize)
@@ -2190,9 +8050,18 @@ impl<'a, H: Host> Machine<'a, H> {
 
         let growth = match &self.heap[index] {
             HeapEntry::Object { properties, .. }
+            | HeapEntry::Generator { properties, .. }
+            | HeapEntry::AsyncGenerator { properties, .. }
+            | HeapEntry::Script { properties, .. }
             | HeapEntry::Function { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
-            | HeapEntry::RegExp { properties, .. } => {
+            | HeapEntry::RegExp { properties, .. }
+            | HeapEntry::Date { properties, .. }
+            | HeapEntry::BuiltinIterator { properties, .. }
+            | HeapEntry::Collection { properties, .. }
+            | HeapEntry::Uint8Array { properties, .. }
+            | HeapEntry::Promise { properties, .. }
+            | HeapEntry::Timeout { properties, .. } => {
                 usize::from(!properties.contains_key(&key)) * key.charge_bytes()
             }
             HeapEntry::Array {
@@ -2200,15 +8069,17 @@ impl<'a, H: Host> Machine<'a, H> {
                 properties,
                 ..
             } => match &key {
-                PropertyKey::Named(name) if name == "length" => 0,
+                PropertyKey::Named(name) if name.eq_ascii("length") => 0,
                 PropertyKey::Named(name) => {
                     if let Some(offset) = array_index(name) {
-                        (offset as usize + 1).saturating_sub(elements.len()) * 8
+                        (offset as usize + 1)
+                            .saturating_sub(elements.len())
+                            .saturating_mul(std::mem::size_of::<Value>())
                     } else {
                         usize::from(!properties.contains_key(&key)) * key.charge_bytes()
                     }
                 }
-                PropertyKey::Private(_) => {
+                PropertyKey::Symbol(_) | PropertyKey::Private(_) => {
                     usize::from(!properties.contains_key(&key)) * key.charge_bytes()
                 }
             },
@@ -2217,7 +8088,13 @@ impl<'a, H: Host> Machine<'a, H> {
                     operation: "set property on primitive",
                 }));
             }
-            HeapEntry::PrivateName { .. } | HeapEntry::Iterator { .. } => {
+            HeapEntry::Symbol { .. }
+            | HeapEntry::PrivateName { .. }
+            | HeapEntry::Iterator { .. }
+            | HeapEntry::PromiseResolver { .. }
+            | HeapEntry::PromiseAll { .. }
+            | HeapEntry::AsyncActivation { .. }
+            | HeapEntry::PromiseAllElement { .. } => {
                 return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                     operation: "set property on non-object",
                 }));
@@ -2227,13 +8104,34 @@ impl<'a, H: Host> Machine<'a, H> {
                     operation: "set internal process environment",
                 }));
             }
+            HeapEntry::ModuleNamespace { .. } | HeapEntry::ExternalModuleNamespace { .. } => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "assign to module namespace",
+                }));
+            }
+            HeapEntry::HashState { .. } => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "assign to hash state",
+                }));
+            }
+            HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
         };
-        self.charge_heap(growth).map_err(EvalFailure::Runtime)?;
+        self.charge_slot(index, growth)
+            .map_err(EvalFailure::Runtime)?;
         match &mut self.heap[index] {
             HeapEntry::Object { properties, .. }
+            | HeapEntry::Generator { properties, .. }
+            | HeapEntry::AsyncGenerator { properties, .. }
+            | HeapEntry::Script { properties, .. }
             | HeapEntry::Function { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
-            | HeapEntry::RegExp { properties, .. } => {
+            | HeapEntry::RegExp { properties, .. }
+            | HeapEntry::Date { properties, .. }
+            | HeapEntry::BuiltinIterator { properties, .. }
+            | HeapEntry::Collection { properties, .. }
+            | HeapEntry::Uint8Array { properties, .. }
+            | HeapEntry::Promise { properties, .. }
+            | HeapEntry::Timeout { properties, .. } => {
                 properties.insert(
                     key,
                     Property::Data {
@@ -2248,22 +8146,21 @@ impl<'a, H: Host> Machine<'a, H> {
             HeapEntry::Array {
                 elements,
                 properties,
+                length_writable,
                 ..
             } => {
                 match key {
-                    PropertyKey::Named(name) if name == "length" => {
-                        let length = exact_array_length(value).ok_or(EvalFailure::Throw(
-                            ThrowOrigin::RangeError {
-                                operation: "set array length",
-                            },
-                        ))?;
-                        elements.resize(length, Value::HOLE);
-                    }
                     PropertyKey::Named(name) => {
                         if let Some(offset) = array_index(&name) {
                             let offset = offset as usize;
                             if elements.len() <= offset {
-                                elements.resize(offset + 1, Value::HOLE);
+                                array_set_length(
+                                    elements,
+                                    properties,
+                                    *length_writable,
+                                    number_value((offset + 1) as f64),
+                                    "set array index",
+                                )?;
                             }
                             elements[offset] = value;
                         } else {
@@ -2278,9 +8175,9 @@ impl<'a, H: Host> Machine<'a, H> {
                             );
                         }
                     }
-                    private @ PropertyKey::Private(_) => {
+                    identity @ (PropertyKey::Symbol(_) | PropertyKey::Private(_)) => {
                         properties.insert(
-                            private,
+                            identity,
                             Property::Data {
                                 value,
                                 writable: true,
@@ -2308,10 +8205,31 @@ impl<'a, H: Host> Machine<'a, H> {
     ) -> Result<(), EvalFailure> {
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => {
-                self.charge_heap(key.charge_bytes() + 8)
-                    .map_err(EvalFailure::Runtime)?;
-                let (properties, extensible) = match &mut self.heap[index] {
+                if let PropertyKey::Named(name) = &key
+                    && uint8array_index(name).is_some()
+                    && matches!(self.heap[index], HeapEntry::Uint8Array { .. })
+                {
+                    return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "define accessor on typed array index",
+                    }));
+                }
+                let growth = match &self.heap[index] {
                     HeapEntry::Object {
+                        properties,
+                        extensible,
+                        ..
+                    }
+                    | HeapEntry::Generator {
+                        properties,
+                        extensible,
+                        ..
+                    }
+                    | HeapEntry::AsyncGenerator {
+                        properties,
+                        extensible,
+                        ..
+                    }
+                    | HeapEntry::Script {
                         properties,
                         extensible,
                         ..
@@ -2335,24 +8253,73 @@ impl<'a, H: Host> Machine<'a, H> {
                         properties,
                         extensible,
                         ..
-                    } => (properties, *extensible),
+                    }
+                    | HeapEntry::Date {
+                        properties,
+                        extensible,
+                        ..
+                    }
+                    | HeapEntry::BuiltinIterator {
+                        properties,
+                        extensible,
+                        ..
+                    }
+                    | HeapEntry::Collection {
+                        properties,
+                        extensible,
+                        ..
+                    }
+                    | HeapEntry::Uint8Array {
+                        properties,
+                        extensible,
+                        ..
+                    }
+                    | HeapEntry::Promise {
+                        properties,
+                        extensible,
+                        ..
+                    } => {
+                        let existing = properties.get(&key);
+                        if existing.is_some_and(|property| !property.configurable())
+                            || (existing.is_none() && !extensible)
+                        {
+                            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                                operation: "define accessor on non-configurable object",
+                            }));
+                        }
+                        match existing {
+                            None => key
+                                .charge_bytes()
+                                .saturating_add(std::mem::size_of::<Value>()),
+                            Some(Property::Data { .. }) => std::mem::size_of::<Value>(),
+                            Some(Property::Accessor { .. }) => 0,
+                        }
+                    }
                     _ => {
                         return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                             operation: "define accessor on primitive",
                         }));
                     }
                 };
-                if properties
-                    .get(&key)
-                    .is_some_and(|property| !property.configurable())
-                    || (!properties.contains_key(&key) && !extensible)
-                {
-                    return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                        operation: "define accessor on non-configurable object",
-                    }));
-                }
-                let property = properties.get_mut(&key);
-                match property {
+                self.charge_slot(index, growth)
+                    .map_err(EvalFailure::Runtime)?;
+                let properties = match &mut self.heap[index] {
+                    HeapEntry::Object { properties, .. }
+                    | HeapEntry::Generator { properties, .. }
+                    | HeapEntry::AsyncGenerator { properties, .. }
+                    | HeapEntry::Script { properties, .. }
+                    | HeapEntry::Array { properties, .. }
+                    | HeapEntry::Function { properties, .. }
+                    | HeapEntry::NativeFunction { properties, .. }
+                    | HeapEntry::RegExp { properties, .. }
+                    | HeapEntry::Date { properties, .. }
+                    | HeapEntry::BuiltinIterator { properties, .. }
+                    | HeapEntry::Collection { properties, .. }
+                    | HeapEntry::Uint8Array { properties, .. }
+                    | HeapEntry::Promise { properties, .. } => properties,
+                    _ => unreachable!("validated object cannot change heap entry kind"),
+                };
+                match properties.get_mut(&key) {
                     Some(Property::Accessor { getter, setter, .. }) => match kind {
                         AccessorKind::Getter => *getter = Some(accessor),
                         AccessorKind::Setter => *setter = Some(accessor),
@@ -2383,56 +8350,89 @@ impl<'a, H: Host> Machine<'a, H> {
 
     fn delete_property(&mut self, object: Value, key: &PropertyKey) -> Result<bool, EvalFailure> {
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
-            Some(index) => match &mut self.heap[index] {
-                HeapEntry::Object { properties, .. }
-                | HeapEntry::Function { properties, .. }
-                | HeapEntry::NativeFunction { properties, .. }
-                | HeapEntry::RegExp { properties, .. } => {
-                    if properties
-                        .get(key)
-                        .is_some_and(|property| !property.configurable())
-                    {
-                        return Ok(false);
-                    }
-                    properties.remove(key);
-                    Ok(true)
+            Some(index) => {
+                if let PropertyKey::Named(name) = key
+                    && let Some(typed_index) = uint8array_index(name)
+                    && let HeapEntry::Uint8Array { bytes, .. } = &self.heap[index]
+                {
+                    return Ok(typed_index.is_none_or(|offset| offset >= bytes.len()));
                 }
-                HeapEntry::Array {
-                    elements,
-                    properties,
-                    ..
-                } => {
-                    if let PropertyKey::Named(name) = key {
-                        if name == "length" {
+                let released = match &mut self.heap[index] {
+                    HeapEntry::Object { properties, .. }
+                    | HeapEntry::Generator { properties, .. }
+                    | HeapEntry::AsyncGenerator { properties, .. }
+                    | HeapEntry::Script { properties, .. }
+                    | HeapEntry::Function { properties, .. }
+                    | HeapEntry::NativeFunction { properties, .. }
+                    | HeapEntry::RegExp { properties, .. }
+                    | HeapEntry::Date { properties, .. }
+                    | HeapEntry::BuiltinIterator { properties, .. }
+                    | HeapEntry::Collection { properties, .. }
+                    | HeapEntry::Uint8Array { properties, .. }
+                    | HeapEntry::Promise { properties, .. }
+                    | HeapEntry::Timeout { properties, .. } => {
+                        let Some(property) = properties.get(key) else {
+                            return Ok(true);
+                        };
+                        if !property.configurable() {
                             return Ok(false);
                         }
-                        if let Some(offset) = array_index(name) {
-                            if let Some(element) = elements.get_mut(offset as usize) {
-                                *element = Value::HOLE;
+                        let released = key.charge_bytes().saturating_add(property.charge_bytes());
+                        properties.remove(key);
+                        released
+                    }
+                    HeapEntry::Array {
+                        elements,
+                        properties,
+                        ..
+                    } => {
+                        if let Some(property) = properties.get(key) {
+                            if !property.configurable() {
+                                return Ok(false);
                             }
-                            return Ok(true);
+                            let released =
+                                key.charge_bytes().saturating_add(property.charge_bytes());
+                            properties.remove(key);
+                            released
+                        } else {
+                            if let PropertyKey::Named(name) = key {
+                                if name.eq_ascii("length") {
+                                    return Ok(false);
+                                }
+                                if let Some(offset) = array_index(name)
+                                    && let Some(element) = elements.get_mut(offset as usize)
+                                {
+                                    *element = Value::HOLE;
+                                }
+                            }
+                            0
                         }
                     }
-                    if properties
-                        .get(key)
-                        .is_some_and(|property| !property.configurable())
-                    {
-                        return Ok(false);
+                    HeapEntry::ProcessEnv { .. } => {
+                        let PropertyKey::Named(name) = key else {
+                            return Ok(true);
+                        };
+                        return Ok(name
+                            .to_utf8_strict()
+                            .is_ok_and(|name| self.host.delete_env(&name)));
                     }
-                    properties.remove(key);
-                    Ok(true)
-                }
-                HeapEntry::ProcessEnv { .. } => {
-                    let PropertyKey::Named(name) = key else {
-                        return Ok(true);
-                    };
-                    Ok(self.host.delete_env(name))
-                }
-                HeapEntry::String(_)
-                | HeapEntry::BigInt(_)
-                | HeapEntry::PrivateName { .. }
-                | HeapEntry::Iterator { .. } => Ok(true),
-            },
+                    HeapEntry::String(_)
+                    | HeapEntry::BigInt(_)
+                    | HeapEntry::Symbol { .. }
+                    | HeapEntry::PrivateName { .. }
+                    | HeapEntry::Iterator { .. }
+                    | HeapEntry::PromiseResolver { .. }
+                    | HeapEntry::PromiseAll { .. }
+                    | HeapEntry::AsyncActivation { .. }
+                    | HeapEntry::PromiseAllElement { .. }
+                    | HeapEntry::HashState { .. } => return Ok(true),
+                    HeapEntry::ModuleNamespace { .. }
+                    | HeapEntry::ExternalModuleNamespace { .. } => return Ok(false),
+                    HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
+                };
+                self.refund_slot(index, released);
+                Ok(true)
+            }
             None => Ok(true),
         }
     }
@@ -2444,7 +8444,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     let PropertyKey::Named(name) = key else {
                         return Ok(false);
                     };
-                    return Ok(self.host.env(name).is_some());
+                    return Ok(name
+                        .to_utf8_strict()
+                        .is_ok_and(|name| self.host.env(&name).is_some()));
                 }
                 if matches!(key, PropertyKey::Private(_)) {
                     return Ok(self.own_get(index, key).is_some());
@@ -2475,18 +8477,45 @@ impl<'a, H: Host> Machine<'a, H> {
 
     // ---- aggregates & prototypes ------------------------------------------
 
-    fn array_push(&mut self, array: Value, value: Value) -> Result<(), EvalFailure> {
+    pub(crate) fn array_push(&mut self, array: Value, value: Value) -> Result<(), EvalFailure> {
         match self.runtime_slot(array).map_err(EvalFailure::Runtime)? {
             Some(index) => {
-                if !matches!(self.heap[index], HeapEntry::Array { .. }) {
+                let (offset, extensible, length_writable) = match &self.heap[index] {
+                    HeapEntry::Array {
+                        elements,
+                        extensible,
+                        length_writable,
+                        ..
+                    } => (elements.len(), *extensible, *length_writable),
+                    _ => {
+                        return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                            operation: "push on non-array",
+                        }));
+                    }
+                };
+                if !length_writable {
                     return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                        operation: "push on non-array",
+                        operation: "push beyond non-writable array length",
                     }));
                 }
-                self.charge_heap(8).map_err(EvalFailure::Runtime)?;
-                if let HeapEntry::Array { elements, .. } = &mut self.heap[index] {
-                    elements.push(value);
+                if !extensible {
+                    return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "add property to non-extensible object",
+                    }));
                 }
+                let next_length = offset
+                    .checked_add(1)
+                    .filter(|length| *length <= u32::MAX as usize)
+                    .ok_or(EvalFailure::Throw(ThrowOrigin::RangeError {
+                        operation: "push beyond maximum array length",
+                    }))?;
+                self.charge_slot(index, std::mem::size_of::<Value>())
+                    .map_err(EvalFailure::Runtime)?;
+                let HeapEntry::Array { elements, .. } = &mut self.heap[index] else {
+                    unreachable!("array checked before its heap charge");
+                };
+                elements.resize(next_length, Value::HOLE);
+                elements[offset] = value;
                 Ok(())
             }
             None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
@@ -2496,60 +8525,13 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn array_extend(&mut self, array: Value, iterable: Value) -> Result<(), EvalFailure> {
-        let values = self.iterate_values(iterable)?;
-        match self.runtime_slot(array).map_err(EvalFailure::Runtime)? {
-            Some(index) => {
-                if !matches!(self.heap[index], HeapEntry::Array { .. }) {
-                    return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                        operation: "spread into non-array",
-                    }));
-                }
-                self.charge_heap(8usize.saturating_mul(values.len()))
-                    .map_err(EvalFailure::Runtime)?;
-                if let HeapEntry::Array { elements, .. } = &mut self.heap[index] {
-                    elements.extend(values);
-                }
-                Ok(())
+        let iterator = self.create_iterator(iterable, IteratorKind::Sync)?;
+        loop {
+            let (done, value) = self.iterator_next(iterator)?;
+            if done {
+                return Ok(());
             }
-            None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "spread into non-array",
-            })),
-        }
-    }
-
-    /// Collects every value produced by iterating `value` (arrays and strings
-    /// are the local iterables; anything else is not iterable).
-    fn iterate_values(&mut self, value: Value) -> Result<Vec<Value>, EvalFailure> {
-        match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
-            Some(index) => match &self.heap[index] {
-                HeapEntry::Array { elements, .. } => Ok(elements
-                    .iter()
-                    .map(|element| {
-                        if *element == Value::HOLE {
-                            Value::UNDEFINED
-                        } else {
-                            *element
-                        }
-                    })
-                    .collect()),
-                HeapEntry::String(text) => {
-                    let chars: Vec<char> = text.chars().collect();
-                    let mut values = Vec::with_capacity(chars.len());
-                    for ch in chars {
-                        values.push(
-                            self.allocate(HeapEntry::String(ch.to_string()))
-                                .map_err(EvalFailure::Runtime)?,
-                        );
-                    }
-                    Ok(values)
-                }
-                _ => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                    operation: "value is not iterable",
-                })),
-            },
-            None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "value is not iterable",
-            })),
+            self.array_push(array, value)?;
         }
     }
 
@@ -2558,7 +8540,12 @@ impl<'a, H: Host> Machine<'a, H> {
             Some(index)
                 if matches!(
                     self.heap[index],
-                    HeapEntry::Object { .. } | HeapEntry::Array { .. }
+                    HeapEntry::Object { .. }
+                        | HeapEntry::Generator { .. }
+                        | HeapEntry::AsyncGenerator { .. }
+                        | HeapEntry::Script { .. }
+                        | HeapEntry::Array { .. }
+                        | HeapEntry::Promise { .. }
                 ) =>
             {
                 index
@@ -2569,67 +8556,12 @@ impl<'a, H: Host> Machine<'a, H> {
                 }));
             }
         };
-        // Own enumerable data properties of the source are copied. `null` and
-        // `undefined` sources are a no-op, matching `{ ...null }`.
-        let mut pairs: Vec<(PropertyKey, Value)> = Vec::new();
-        let mut char_pairs: Vec<(String, char)> = Vec::new();
-        if let Some(index) = self.runtime_slot(source).map_err(EvalFailure::Runtime)? {
-            match &self.heap[index] {
-                HeapEntry::Object { properties, .. } => {
-                    for (key, property) in properties {
-                        if let (
-                            PropertyKey::Named(_),
-                            Property::Data {
-                                value,
-                                enumerable: true,
-                                ..
-                            },
-                        ) = (key, property)
-                        {
-                            pairs.push((key.clone(), *value));
-                        }
-                    }
-                }
-                HeapEntry::Array {
-                    elements,
-                    properties,
-                    ..
-                } => {
-                    for (offset, element) in elements.iter().enumerate() {
-                        if *element != Value::HOLE {
-                            pairs.push((PropertyKey::Named(offset.to_string()), *element));
-                        }
-                    }
-                    for (key, property) in properties {
-                        if let (
-                            PropertyKey::Named(name),
-                            Property::Data {
-                                value,
-                                enumerable: true,
-                                ..
-                            },
-                        ) = (key, property)
-                            && array_index(name).is_none()
-                        {
-                            pairs.push((key.clone(), *value));
-                        }
-                    }
-                }
-                HeapEntry::String(text) => {
-                    for (offset, ch) in text.chars().enumerate() {
-                        char_pairs.push((offset.to_string(), ch));
-                    }
-                }
-                _ => {}
+        let keys = self.own_property_keys(source)?;
+        for key in keys {
+            if !self.own_property_is_enumerable(source, &key)? {
+                continue;
             }
-        }
-        for (name, ch) in char_pairs {
-            let value = self
-                .allocate(HeapEntry::String(ch.to_string()))
-                .map_err(EvalFailure::Runtime)?;
-            pairs.push((PropertyKey::Named(name), value));
-        }
-        for (key, value) in pairs {
+            let value = self.get_property_key(source, &key)?;
             self.set_own_data(target_index, key, value)?;
         }
         Ok(())
@@ -2653,10 +8585,37 @@ impl<'a, H: Host> Machine<'a, H> {
                 HeapEntry::Object {
                     prototype: slot, ..
                 }
+                | HeapEntry::Generator {
+                    prototype: slot, ..
+                }
+                | HeapEntry::AsyncGenerator {
+                    prototype: slot, ..
+                }
+                | HeapEntry::Script {
+                    prototype: slot, ..
+                }
                 | HeapEntry::Array {
                     prototype: slot, ..
                 }
                 | HeapEntry::Function {
+                    prototype: slot, ..
+                }
+                | HeapEntry::RegExp {
+                    prototype: slot, ..
+                }
+                | HeapEntry::Date {
+                    prototype: slot, ..
+                }
+                | HeapEntry::BuiltinIterator {
+                    prototype: slot, ..
+                }
+                | HeapEntry::Collection {
+                    prototype: slot, ..
+                }
+                | HeapEntry::Uint8Array {
+                    prototype: slot, ..
+                }
+                | HeapEntry::Promise {
                     prototype: slot, ..
                 } => {
                     *slot = prototype;
@@ -2672,193 +8631,1756 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    // ---- iterators ---------------------------------------------------------
+    pub(crate) fn create_generator(
+        &mut self,
+        start: GeneratorStart,
+    ) -> Result<Value, RuntimeErrorKind> {
+        self.allocate(HeapEntry::Generator {
+            state: GeneratorState::SuspendedStart(start),
+            properties: PropertyMap::default(),
+            prototype: Some(self.intrinsics.builtins.generator_prototype()),
+            extensible: true,
+        })
+    }
 
-    fn create_iterator(&mut self, src: Value, kind: IteratorKind) -> Result<Value, EvalFailure> {
-        match kind {
-            IteratorKind::Keys => {
-                let keys = self.enumerable_keys(src)?;
-                self.allocate(HeapEntry::Iterator {
-                    source: src,
-                    index: 0,
-                    keys: Some(keys),
-                })
-                .map_err(EvalFailure::Runtime)
+    fn resume_generator(
+        &mut self,
+        generator: Value,
+        resume_value: Value,
+    ) -> Result<Value, EvalFailure> {
+        let state = self.take_generator_state(generator)?;
+        if matches!(&state, GeneratorState::Completed) {
+            return self.iterator_result(Value::UNDEFINED, true);
+        }
+
+        let stop_depth = self.frames.len();
+        let return_to = self.frames.last().map(|frame| ReturnTo {
+            destination: None,
+            call_pc: frame.pc,
+            constructed: None,
+        });
+        let prepared = match state {
+            GeneratorState::SuspendedStart(start) => self
+                .push_frame(
+                    start.target,
+                    &start.captures,
+                    start.this_value,
+                    start.new_target,
+                    &start.args,
+                    return_to,
+                )
+                .map_err(|error| EvalFailure::Runtime(error.kind)),
+            GeneratorState::Suspended(activation) => {
+                self.push_resumed_generator_frame(activation, resume_value, return_to)
             }
-            IteratorKind::Sync | IteratorKind::Async => {
-                match self.runtime_slot(src).map_err(EvalFailure::Runtime)? {
-                    Some(index)
-                        if matches!(
-                            self.heap[index],
-                            HeapEntry::Array { .. } | HeapEntry::String(_)
-                        ) =>
-                    {
-                        self.allocate(HeapEntry::Iterator {
-                            source: src,
-                            index: 0,
-                            keys: None,
-                        })
-                        .map_err(EvalFailure::Runtime)
+            GeneratorState::Executing | GeneratorState::Completed => unreachable!(),
+        };
+        if let Err(failure) = prepared {
+            self.settle_generator_completed(generator)?;
+            return Err(failure);
+        }
+
+        let resumed = self.run_generator_activation(stop_depth);
+        match resumed {
+            Ok(GeneratorResume::Yield { value, activation }) => {
+                self.settle_generator_yield(generator, value, activation)
+            }
+            Ok(GeneratorResume::Return(value)) => {
+                self.settle_generator_completed(generator)?;
+                self.iterator_result(value, true)
+            }
+            Ok(GeneratorResume::Throw { value, origin }) => {
+                self.settle_generator_completed(generator)?;
+                Err(EvalFailure::ThrowValueOrigin { value, origin })
+            }
+            Err(failure) => {
+                self.settle_generator_completed(generator)?;
+                Err(failure)
+            }
+        }
+    }
+
+    fn push_resumed_generator_frame(
+        &mut self,
+        activation: SuspendedActivation,
+        resume_value: Value,
+        return_to: Option<ReturnTo>,
+    ) -> Result<(), EvalFailure> {
+        if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
+            self.release_suspended_activation_registers(activation.registers.len());
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::CallDepthExceeded {
+                limit: self.limits.max_call_depth,
+            }));
+        }
+        let suspend_pc = activation
+            .resume_token
+            .checked_sub(1)
+            .expect("suspended generator token is nonzero") as usize;
+        let instruction = self.module_code(activation.target.module).functions()
+            [activation.target.function.get() as usize]
+            .code()[suspend_pc];
+        let (Instruction::Suspend { dst, resume, .. } | Instruction::Await { dst, resume, .. }) =
+            instruction
+        else {
+            unreachable!("generator resume token names a suspension instruction");
+        };
+        let mut frame = Frame {
+            module: activation.target.module,
+            function: activation.target.function.get() as usize,
+            pc: resume.get() as usize,
+            registers: activation.registers,
+            return_to,
+            this_value: activation.this_value,
+            new_target: activation.new_target,
+            args: activation.args,
+            arguments_object: activation.arguments_object,
+        };
+        frame.registers[dst.get() as usize] = resume_value;
+        self.frames.push(frame);
+        Ok(())
+    }
+
+    fn run_generator_activation(
+        &mut self,
+        stop_depth: usize,
+    ) -> Result<GeneratorResume, EvalFailure> {
+        self.last_completion = None;
+        self.pending_generator_resume = None;
+        self.callback_boundaries.push(stop_depth);
+        self.generator_boundaries.push(stop_depth);
+        let result = self.run_loop(stop_depth);
+        self.generator_boundaries
+            .pop()
+            .expect("generator execution owns its suspend boundary");
+        self.callback_boundaries
+            .pop()
+            .expect("generator execution owns its unwind boundary");
+
+        match result {
+            Ok(Some(execution)) => Ok(GeneratorResume::Return(execution.value)),
+            Ok(None) => {
+                if let Some(resume) = self.pending_generator_resume.take() {
+                    return Ok(resume);
+                }
+                let value = self.last_completion.take().unwrap_or(Value::UNDEFINED);
+                Ok(GeneratorResume::Return(value))
+            }
+            Err(error) => {
+                self.unwind_frames_to(stop_depth);
+                match error.kind {
+                    RuntimeErrorKind::UncaughtThrow { value, origin } => {
+                        Ok(GeneratorResume::Throw { value, origin })
                     }
-                    _ => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                        operation: "value is not iterable",
-                    })),
+                    kind => Err(EvalFailure::Runtime(kind)),
                 }
             }
         }
+    }
+
+    pub(crate) fn take_generator_state(
+        &mut self,
+        generator: Value,
+    ) -> Result<GeneratorState, EvalFailure> {
+        let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)? else {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Generator.prototype.next called on incompatible receiver",
+            }));
+        };
+        let HeapEntry::Generator { state, .. } = &mut self.heap[index] else {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Generator.prototype.next called on incompatible receiver",
+            }));
+        };
+        match std::mem::replace(state, GeneratorState::Executing) {
+            GeneratorState::Executing => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "generator is already running",
+            })),
+            GeneratorState::Completed => {
+                *state = GeneratorState::Completed;
+                Ok(GeneratorState::Completed)
+            }
+            state => Ok(state),
+        }
+    }
+
+    pub(crate) fn settle_generator_yield(
+        &mut self,
+        generator: Value,
+        value: Value,
+        activation: SuspendedActivation,
+    ) -> Result<Value, EvalFailure> {
+        let register_count = activation.registers.len();
+        let result = match self.iterator_result(value, false) {
+            Ok(result) => result,
+            Err(failure) => {
+                self.release_suspended_activation_registers(register_count);
+                self.replace_executing_generator(generator, GeneratorState::Completed)?;
+                return Err(failure);
+            }
+        };
+        if let Err(failure) =
+            self.replace_executing_generator(generator, GeneratorState::Suspended(activation))
+        {
+            self.release_suspended_activation_registers(register_count);
+            return Err(failure);
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn settle_generator_completed(
+        &mut self,
+        generator: Value,
+    ) -> Result<(), EvalFailure> {
+        self.replace_executing_generator(generator, GeneratorState::Completed)
+    }
+
+    fn replace_executing_generator(
+        &mut self,
+        generator: Value,
+        next: GeneratorState,
+    ) -> Result<(), EvalFailure> {
+        let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)? else {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: generator,
+            }));
+        };
+        let HeapEntry::Generator { state, .. } = &mut self.heap[index] else {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: generator,
+            }));
+        };
+        if !matches!(state, GeneratorState::Executing) {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: generator,
+            }));
+        }
+        *state = next;
+        Ok(())
+    }
+
+    /// Starts an ordinary async function: creates the implicit result Promise,
+    /// drives the body synchronously to its first `await` or completion under a
+    /// detached suspend boundary, and returns the Promise. A `return` resolves
+    /// it and an escaping throw rejects it; a runtime limit failure stays fatal.
+    pub(crate) fn start_async_call(
+        &mut self,
+        target: RuntimeFunction,
+        captures: &[Value],
+        this_value: Value,
+        new_target: Value,
+        arguments: &[Value],
+    ) -> Result<Value, EvalFailure> {
+        let promise = self.create_promise()?;
+        let record = self.create_async_activation(promise, None)?;
+        let stop_depth = self.frames.len();
+        let return_to = self.frames.last().map(|frame| ReturnTo {
+            destination: None,
+            call_pc: frame.pc,
+            constructed: None,
+        });
+        self.push_frame(
+            target, captures, this_value, new_target, arguments, return_to,
+        )
+        .map_err(|error| EvalFailure::Runtime(error.kind))?;
+        let step = self.drive_async_activation(stop_depth, None);
+        self.settle_async_step(record, promise, step)?;
+        Ok(promise)
+    }
+
+    /// Resumes a suspended async activation inside its Promise reaction job. On
+    /// fulfillment the awaited value is written to `Suspend.dst`; on rejection
+    /// the reason is thrown at the `Suspend` pc so a covering `try`/`catch`
+    /// runs. The activation is one-shot; a second resume is a hard error.
+    fn resume_async(
+        &mut self,
+        record: Value,
+        value: Value,
+        rejection: Option<ThrowOrigin>,
+    ) -> Result<(), RuntimeErrorKind> {
+        let promise = self.async_activation_promise(record)?;
+        let module_entry = self.async_activation_module(record)?.is_some();
+        let activation = self.take_async_activation(record)?;
+        let register_count = activation.registers.len();
+        if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
+            self.release_suspended_activation_registers(register_count);
+            return Err(RuntimeErrorKind::CallDepthExceeded {
+                limit: self.limits.max_call_depth,
+            });
+        }
+        let suspend_pc = activation
+            .resume_token
+            .checked_sub(1)
+            .expect("suspended async token is nonzero") as usize;
+        let instruction = self.module_code(activation.target.module).functions()
+            [activation.target.function.get() as usize]
+            .code()[suspend_pc];
+        let (Instruction::Suspend { dst, resume, .. } | Instruction::Await { dst, resume, .. }) =
+            instruction
+        else {
+            unreachable!("async resume token names a suspension instruction");
+        };
+        let stop_depth = self.frames.len();
+        let return_to = if module_entry {
+            None
+        } else {
+            self.frames.last().map(|frame| ReturnTo {
+                destination: None,
+                call_pc: frame.pc,
+                constructed: None,
+            })
+        };
+        let mut frame = Frame {
+            module: activation.target.module,
+            function: activation.target.function.get() as usize,
+            pc: resume.get() as usize,
+            registers: activation.registers,
+            return_to,
+            this_value: activation.this_value,
+            new_target: activation.new_target,
+            args: activation.args,
+            arguments_object: activation.arguments_object,
+        };
+        let inject = match rejection {
+            None => {
+                frame.registers[dst.get() as usize] = value;
+                None
+            }
+            Some(origin) => Some((value, origin, suspend_pc)),
+        };
+        self.frames.push(frame);
+        let step = self.drive_async_activation(stop_depth, inject);
+        match self.settle_async_step(record, promise, step) {
+            Ok(()) => Ok(()),
+            Err(EvalFailure::Runtime(kind)) => {
+                // A fatal failure during a module entry's resume leaves the
+                // module retryable instead of stuck in flight.
+                if let Ok(Some(module)) = self.async_activation_module(record) {
+                    self.abort_module_evaluation(module);
+                }
+                Err(kind)
+            }
+            Err(_) => Err(RuntimeErrorKind::InvalidValue { value: record }),
+        }
+    }
+
+    /// Runs the interpreter loop for a detached async activation under one
+    /// suspend and one unwind boundary, optionally injecting a rejection at the
+    /// resumed `Suspend` pc first. It reports the awaited value on suspension,
+    /// the returned value on completion, or an uncaught throw; runtime limit
+    /// failures propagate as fatal `EvalFailure::Runtime`.
+    fn drive_async_activation(
+        &mut self,
+        stop_depth: usize,
+        inject: Option<(Value, ThrowOrigin, usize)>,
+    ) -> Result<AsyncStep, EvalFailure> {
+        self.last_completion = None;
+        self.pending_async_suspend = None;
+        self.callback_boundaries.push(stop_depth);
+        self.async_boundaries.push(stop_depth);
+        let result = match inject {
+            None => self.run_loop(stop_depth),
+            Some((value, origin, faulting_pc)) => match self.throw(value, origin, faulting_pc) {
+                Ok(()) => self.run_loop(stop_depth),
+                Err(error) => Err(error),
+            },
+        };
+        self.async_boundaries
+            .pop()
+            .expect("async execution owns its suspend boundary");
+        self.callback_boundaries
+            .pop()
+            .expect("async execution owns its unwind boundary");
+        match result {
+            Ok(Some(execution)) => Ok(AsyncStep::Return {
+                value: execution.value,
+                execution: Some(execution),
+            }),
+            Ok(None) => {
+                if let Some((awaited, activation)) = self.pending_async_suspend.take() {
+                    Ok(AsyncStep::Suspend {
+                        awaited,
+                        activation,
+                    })
+                } else {
+                    Ok(AsyncStep::Return {
+                        value: self.last_completion.take().unwrap_or(Value::UNDEFINED),
+                        execution: None,
+                    })
+                }
+            }
+            Err(error) => {
+                self.unwind_frames_to(stop_depth);
+                match &error.kind {
+                    RuntimeErrorKind::UncaughtThrow { .. } => Ok(AsyncStep::Throw(error)),
+                    _ => Err(EvalFailure::Runtime(error.kind)),
+                }
+            }
+        }
+    }
+
+    /// Settles the result Promise (or arms the next await) for one async step.
+    fn settle_async_step(
+        &mut self,
+        record: Value,
+        promise: Value,
+        step: Result<AsyncStep, EvalFailure>,
+    ) -> Result<(), EvalFailure> {
+        match step {
+            Ok(AsyncStep::Suspend {
+                awaited,
+                activation,
+            }) => {
+                let register_count = activation.registers.len();
+                let result = self
+                    .store_async_activation(record, activation)
+                    .and_then(|()| self.await_promise(awaited, record));
+                if result.is_err() {
+                    let released = self
+                        .take_async_activation(record)
+                        .map_or(register_count, |stored| stored.registers.len());
+                    self.release_suspended_activation_registers(released);
+                }
+                result
+            }
+            Ok(AsyncStep::Return { value, execution }) => {
+                self.store_async_module_completion(record, execution.map(Ok))?;
+                let module = self
+                    .async_activation_module(record)
+                    .map_err(EvalFailure::Runtime)?;
+                let Some(module) = module else {
+                    return self
+                        .resolve_promise(promise, value)
+                        .map_err(EvalFailure::Runtime);
+                };
+                // Module terminal settlement: the shared evaluation Promise
+                // fulfills with the namespace (so every in-flight dynamic
+                // importer unwraps it through `await`), and the module state
+                // stores the success — exactly once, before any reaction
+                // observing the settlement can run.
+                let namespace = self
+                    .module_namespace(module, module)
+                    .map_err(|error| EvalFailure::Runtime(error.kind))?;
+                self.fulfill_promise(promise, namespace)
+                    .map_err(EvalFailure::Runtime)?;
+                self.settle_module_evaluation(module, Ok(()));
+                Ok(())
+            }
+            Ok(AsyncStep::Throw(error)) => {
+                let RuntimeErrorKind::UncaughtThrow { value, origin } = error.kind.clone() else {
+                    unreachable!("async throws retain an uncaught-throw error");
+                };
+                self.store_async_module_completion(record, Some(Err(error.clone())))?;
+                let module = self
+                    .async_activation_module(record)
+                    .map_err(EvalFailure::Runtime)?;
+                if let Some(module) = module {
+                    // The identical uncaught throw is cached as the module's
+                    // stored failure and rejects the shared evaluation
+                    // Promise once.
+                    self.settle_module_evaluation(module, Err(error));
+                }
+                // Normalize through promise_rejection_value: engine-origin
+                // Throw(origin) materializes once; ThrowValue /
+                // ThrowValueOrigin keep their supplied values.
+                let failure = if catch_value_needs_materialization(value, origin) {
+                    EvalFailure::Throw(origin)
+                } else if matches!(origin, ThrowOrigin::Bytecode) {
+                    EvalFailure::ThrowValue(value)
+                } else {
+                    EvalFailure::ThrowValueOrigin { value, origin }
+                };
+                self.reject_promise_failure(promise, failure)
+            }
+            Err(failure) => Err(failure),
+        }
+    }
+
+    /// Creates a lazy `async function*` object. Calling the function runs no
+    /// body code; the first `.next()` starts the activation.
+    pub(crate) fn create_async_generator(
+        &mut self,
+        start: GeneratorStart,
+    ) -> Result<Value, RuntimeErrorKind> {
+        self.allocate(HeapEntry::AsyncGenerator {
+            state: AsyncGeneratorState::SuspendedStart(start),
+            queue: VecDeque::new(),
+            properties: PropertyMap::default(),
+            prototype: Some(self.intrinsics.builtins.async_generator_prototype()),
+            extensible: true,
+        })
+    }
+
+    /// `%AsyncGeneratorPrototype%.next`: never throws synchronously. An
+    /// incompatible receiver rejects the returned Promise; otherwise the
+    /// request joins the FIFO and the front request drives the body when the
+    /// generator is idle.
+    pub(crate) fn enqueue_async_generator_next(
+        &mut self,
+        generator: Value,
+        resume_value: Value,
+    ) -> Result<Value, EvalFailure> {
+        let capability = self.create_promise()?;
+        let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)? else {
+            self.reject_promise(
+                capability,
+                Value::UNDEFINED,
+                ThrowOrigin::TypeError {
+                    operation: "AsyncGenerator.prototype.next called on incompatible receiver",
+                },
+            )
+            .map_err(EvalFailure::Runtime)?;
+            return Ok(capability);
+        };
+        let HeapEntry::AsyncGenerator { state, queue, .. } = &mut self.heap[index] else {
+            self.reject_promise(
+                capability,
+                Value::UNDEFINED,
+                ThrowOrigin::TypeError {
+                    operation: "AsyncGenerator.prototype.next called on incompatible receiver",
+                },
+            )
+            .map_err(EvalFailure::Runtime)?;
+            return Ok(capability);
+        };
+        queue.push_back(AsyncGeneratorRequest {
+            resume_value,
+            capability,
+        });
+        let idle = !matches!(
+            state,
+            AsyncGeneratorState::Executing
+                | AsyncGeneratorState::AwaitingOperand(_)
+                | AsyncGeneratorState::AwaitingYield(_)
+                | AsyncGeneratorState::AwaitingReturn
+        );
+        if idle {
+            self.drive_async_generator(generator)?;
+        }
+        Ok(capability)
+    }
+
+    /// Iteratively serves the request queue. At most one request drives the
+    /// body at a time: a drive either parks the generator in `AwaitingOperand`
+    /// or `AwaitingYield` (returning until a Promise reaction resumes it), or
+    /// settles the front request and loops to serve the next one. A completed
+    /// generator drains every queued request with `{value: undefined,
+    /// done: true}`.
+    pub(crate) fn drive_async_generator(&mut self, generator: Value) -> Result<(), EvalFailure> {
+        loop {
+            let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)? else {
+                return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                    value: generator,
+                }));
+            };
+            let HeapEntry::AsyncGenerator { state, queue, .. } = &mut self.heap[index] else {
+                return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                    value: generator,
+                }));
+            };
+            if matches!(
+                state,
+                AsyncGeneratorState::Executing
+                    | AsyncGeneratorState::AwaitingOperand(_)
+                    | AsyncGeneratorState::AwaitingYield(_)
+                    | AsyncGeneratorState::AwaitingReturn
+            ) {
+                return Ok(());
+            }
+            if queue.is_empty() {
+                return Ok(());
+            }
+            if matches!(state, AsyncGeneratorState::Completed) {
+                let request = queue.pop_front().expect("queue emptiness checked");
+                let result = self.iterator_result(Value::UNDEFINED, true)?;
+                self.resolve_promise(request.capability, result)
+                    .map_err(EvalFailure::Runtime)?;
+                continue;
+            }
+            let resume_value = queue.front().expect("queue emptiness checked").resume_value;
+            let taken = std::mem::replace(state, AsyncGeneratorState::Executing);
+            let stop_depth = self.frames.len();
+            let return_to = self.frames.last().map(|frame| ReturnTo {
+                destination: None,
+                call_pc: frame.pc,
+                constructed: None,
+            });
+            let pushed = match taken {
+                AsyncGeneratorState::SuspendedStart(start) => self
+                    .push_frame(
+                        start.target,
+                        &start.captures,
+                        start.this_value,
+                        start.new_target,
+                        &start.args,
+                        return_to,
+                    )
+                    .map_err(|error| EvalFailure::Runtime(error.kind)),
+                AsyncGeneratorState::SuspendedYield(activation) => {
+                    self.push_resumed_generator_frame(activation, resume_value, return_to)
+                }
+                AsyncGeneratorState::Executing
+                | AsyncGeneratorState::AwaitingOperand(_)
+                | AsyncGeneratorState::AwaitingYield(_)
+                | AsyncGeneratorState::AwaitingReturn
+                | AsyncGeneratorState::Completed => unreachable!(),
+            };
+            let step = match pushed {
+                Ok(()) => self.drive_async_generator_activation(stop_depth, None),
+                Err(failure) => Err(failure),
+            };
+            self.settle_async_generator_step(generator, step)?;
+        }
+    }
+
+    /// Runs the body of an async generator from the current frame top under
+    /// callback, async, AND generator boundaries at one depth. The `Await`
+    /// opcode routes itself to the async suspension slot and `Suspend` (yield)
+    /// to the generator slot, so one frame can be driven by both stacks.
+    fn drive_async_generator_activation(
+        &mut self,
+        stop_depth: usize,
+        inject: Option<(Value, ThrowOrigin, usize)>,
+    ) -> Result<AsyncGeneratorStep, EvalFailure> {
+        self.last_completion = None;
+        self.pending_async_suspend = None;
+        self.pending_generator_resume = None;
+        self.callback_boundaries.push(stop_depth);
+        self.async_boundaries.push(stop_depth);
+        self.generator_boundaries.push(stop_depth);
+        let result = match inject {
+            None => self.run_loop(stop_depth),
+            Some((value, origin, faulting_pc)) => match self.throw(value, origin, faulting_pc) {
+                Ok(()) => self.run_loop(stop_depth),
+                Err(error) => Err(error),
+            },
+        };
+        self.generator_boundaries
+            .pop()
+            .expect("async generator execution owns its yield boundary");
+        self.async_boundaries
+            .pop()
+            .expect("async generator execution owns its await boundary");
+        self.callback_boundaries
+            .pop()
+            .expect("async generator execution owns its unwind boundary");
+        match result {
+            Ok(Some(execution)) => Ok(AsyncGeneratorStep::Return(execution.value)),
+            Ok(None) => {
+                if let Some((awaited, activation)) = self.pending_async_suspend.take() {
+                    return Ok(AsyncGeneratorStep::Await {
+                        awaited,
+                        activation,
+                    });
+                }
+                if let Some(GeneratorResume::Yield { value, activation }) =
+                    self.pending_generator_resume.take()
+                {
+                    return Ok(AsyncGeneratorStep::Yield { value, activation });
+                }
+                let value = self.last_completion.take().unwrap_or(Value::UNDEFINED);
+                Ok(AsyncGeneratorStep::Return(value))
+            }
+            Err(error) => {
+                self.unwind_frames_to(stop_depth);
+                match error.kind {
+                    RuntimeErrorKind::UncaughtThrow { value, origin } => {
+                        Ok(AsyncGeneratorStep::Throw { value, origin })
+                    }
+                    kind => Err(EvalFailure::Runtime(kind)),
+                }
+            }
+        }
+    }
+
+    /// Settles one drive step. `Await` and `Yield` park the generator and arm
+    /// Promise reactions without touching the queue; a return parks in
+    /// `AwaitingReturn` and awaits the return value before the front request
+    /// settles; a throw pops the front request, rejects it, and completes the
+    /// generator so the drive loop drains the remainder. Every failure path
+    /// releases the suspended registers and completes the generator.
+    fn settle_async_generator_step(
+        &mut self,
+        generator: Value,
+        step: Result<AsyncGeneratorStep, EvalFailure>,
+    ) -> Result<(), EvalFailure> {
+        match step {
+            Ok(AsyncGeneratorStep::Await {
+                awaited,
+                activation,
+            }) => {
+                let register_count = activation.registers.len();
+                let result = self
+                    .replace_async_generator_state(
+                        generator,
+                        AsyncGeneratorState::AwaitingOperand(activation),
+                    )
+                    .map_err(EvalFailure::Runtime)
+                    .and_then(|()| self.await_promise_for_generator(awaited, generator));
+                if result.is_err() {
+                    self.release_suspended_activation_registers(register_count);
+                    self.complete_async_generator(generator)?;
+                }
+                result
+            }
+            Ok(AsyncGeneratorStep::Yield { value, activation }) => {
+                let register_count = activation.registers.len();
+                let result = self
+                    .replace_async_generator_state(
+                        generator,
+                        AsyncGeneratorState::AwaitingYield(activation),
+                    )
+                    .map_err(EvalFailure::Runtime)
+                    .and_then(|()| self.await_promise_for_generator(value, generator));
+                if result.is_err() {
+                    self.release_suspended_activation_registers(register_count);
+                    self.complete_async_generator(generator)?;
+                }
+                result
+            }
+            Ok(AsyncGeneratorStep::Return(value)) => {
+                // AsyncGeneratorAwaitReturn: the return value is awaited
+                // before the front request settles `done: true`; the body is
+                // gone, so no activation registers stay charged. The queue is
+                // untouched until the awaited value settles the front request.
+                let result = self
+                    .replace_async_generator_state(generator, AsyncGeneratorState::AwaitingReturn)
+                    .map_err(EvalFailure::Runtime)
+                    .and_then(|()| self.await_promise_for_generator(value, generator));
+                if result.is_err() {
+                    self.complete_async_generator(generator)?;
+                }
+                result
+            }
+            Ok(AsyncGeneratorStep::Throw { value, origin }) => {
+                let request = self.pop_async_generator_front(generator)?;
+                self.complete_async_generator(generator)?;
+                self.reject_promise(request.capability, value, origin)
+                    .map_err(EvalFailure::Runtime)
+            }
+            Err(failure) => {
+                self.complete_async_generator(generator)?;
+                Err(failure)
+            }
+        }
+    }
+
+    /// Resolves the awaited (or yielded) value through Promise resolution and
+    /// attaches the two generator resume reactions. An already-settled Promise
+    /// costs exactly one microtask tick, mirroring `await_promise`.
+    fn await_promise_for_generator(
+        &mut self,
+        awaited: Value,
+        generator: Value,
+    ) -> Result<(), EvalFailure> {
+        let promise = self.promise_resolve(awaited)?;
+        let index = self
+            .runtime_slot(promise)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: promise,
+            }))?;
+        let settled = match &self.heap[index] {
+            HeapEntry::Promise {
+                state: PromiseState::Pending { .. },
+                ..
+            } => None,
+            HeapEntry::Promise {
+                state: PromiseState::Fulfilled { value },
+                ..
+            } => Some((true, *value, ThrowOrigin::Bytecode)),
+            HeapEntry::Promise {
+                state: PromiseState::Rejected { reason, origin },
+                ..
+            } => Some((false, *reason, *origin)),
+            _ => {
+                return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                    value: promise,
+                }));
+            }
+        };
+        if let Some((fulfilled, value, origin)) = settled {
+            self.ensure_microtask_capacity(1)
+                .map_err(EvalFailure::Runtime)?;
+            let reaction = if fulfilled {
+                PromiseReaction::AsyncGeneratorFulfill {
+                    generator,
+                    context: self.context_global,
+                }
+            } else {
+                PromiseReaction::AsyncGeneratorReject {
+                    generator,
+                    context: self.context_global,
+                }
+            };
+            self.microtasks
+                .push_back(QueuedMicrotask::uncharged(MicrotaskJob::Reaction {
+                    reaction,
+                    value,
+                    origin,
+                }));
+            return Ok(());
+        }
+        self.charge_promise_reactions(index, 2)?;
+        let context = self.context_global;
+        let HeapEntry::Promise {
+            state:
+                PromiseState::Pending {
+                    fulfill_reactions,
+                    reject_reactions,
+                },
+            ..
+        } = &mut self.heap[index]
+        else {
+            unreachable!("pending Promise state was checked before reaction registration");
+        };
+        fulfill_reactions.push(PromiseReaction::AsyncGeneratorFulfill { generator, context });
+        reject_reactions.push(PromiseReaction::AsyncGeneratorReject { generator, context });
+        Ok(())
+    }
+
+    /// Resumes a parked async generator inside its Promise reaction job.
+    /// Fulfillment of an `Await` operand writes the value to `Await.dst`;
+    /// fulfillment of a `yield` operand settles the front request with
+    /// `{value, done: false}`; fulfillment of a returned value settles the
+    /// front request with `{value, done: true}` and drains the queue. Either
+    /// rejection injects the throw at the suspension pc so a covering
+    /// `try`/`catch` runs, except a rejected return value, which rejects the
+    /// front request and drains the queue. Any other state is a hard
+    /// invariant violation.
+    fn resume_async_generator(
+        &mut self,
+        generator: Value,
+        value: Value,
+        rejection: Option<ThrowOrigin>,
+    ) -> Result<(), RuntimeErrorKind> {
+        let state = self
+            .take_async_generator_state(generator)
+            .map_err(|failure| async_generator_kind(generator, failure))?;
+        match (state, rejection) {
+            (AsyncGeneratorState::AwaitingYield(activation), None) => {
+                let request = self
+                    .pop_async_generator_front(generator)
+                    .map_err(|failure| async_generator_kind(generator, failure))?;
+                let register_count = activation.registers.len();
+                match self.iterator_result(value, false) {
+                    Err(failure) => {
+                        self.release_suspended_activation_registers(register_count);
+                        self.complete_async_generator(generator)
+                            .map_err(|failure| async_generator_kind(generator, failure))?;
+                        self.reject_promise_failure(request.capability, failure)
+                            .map_err(|failure| async_generator_kind(generator, failure))
+                    }
+                    Ok(result) => {
+                        if let Err(kind) = self.replace_async_generator_state(
+                            generator,
+                            AsyncGeneratorState::SuspendedYield(activation),
+                        ) {
+                            self.release_suspended_activation_registers(register_count);
+                            return Err(kind);
+                        }
+                        self.resolve_promise(request.capability, result)?;
+                        self.drive_async_generator(generator)
+                            .map_err(|failure| async_generator_kind(generator, failure))
+                    }
+                }
+            }
+            (AsyncGeneratorState::AwaitingReturn, rejection) => {
+                let request = self
+                    .pop_async_generator_front(generator)
+                    .map_err(|failure| async_generator_kind(generator, failure))?;
+                self.complete_async_generator(generator)
+                    .map_err(|failure| async_generator_kind(generator, failure))?;
+                match rejection {
+                    Some(origin) => self.reject_promise(request.capability, value, origin)?,
+                    None => {
+                        let result = self
+                            .iterator_result(value, true)
+                            .map_err(|failure| async_generator_kind(generator, failure))?;
+                        self.resolve_promise(request.capability, result)?;
+                    }
+                }
+                self.drive_async_generator(generator)
+                    .map_err(|failure| async_generator_kind(generator, failure))
+            }
+            (AsyncGeneratorState::AwaitingOperand(activation), None) => {
+                self.drive_resumed_async_generator(generator, activation, value, None)
+            }
+            (AsyncGeneratorState::AwaitingOperand(activation), Some(origin))
+            | (AsyncGeneratorState::AwaitingYield(activation), Some(origin)) => {
+                let suspend_pc = activation
+                    .resume_token
+                    .checked_sub(1)
+                    .expect("suspended async generator token is nonzero")
+                    as usize;
+                self.drive_resumed_async_generator(
+                    generator,
+                    activation,
+                    Value::UNDEFINED,
+                    Some((value, origin, suspend_pc)),
+                )
+            }
+            (
+                state @ (AsyncGeneratorState::SuspendedStart(_)
+                | AsyncGeneratorState::SuspendedYield(_)
+                | AsyncGeneratorState::Completed),
+                _,
+            ) => {
+                let register_count = match &state {
+                    AsyncGeneratorState::SuspendedYield(activation) => activation.registers.len(),
+                    _ => 0,
+                };
+                self.release_suspended_activation_registers(register_count);
+                self.complete_async_generator(generator)
+                    .map_err(|failure| async_generator_kind(generator, failure))?;
+                Err(RuntimeErrorKind::InvalidValue { value: generator })
+            }
+            (AsyncGeneratorState::Executing, _) => {
+                unreachable!("take_async_generator_state rejects an executing generator")
+            }
+        }
+    }
+
+    /// Pushes a parked activation back on the frame stack and drives it under
+    /// the three-boundary activation runner, then settles the step against
+    /// the request queue. On fulfillment the awaited value lands in the
+    /// suspension's `dst`; on rejection the throw is injected at the
+    /// suspension pc and `dst` stays undefined, mirroring `resume_async`.
+    fn drive_resumed_async_generator(
+        &mut self,
+        generator: Value,
+        activation: SuspendedActivation,
+        resume_value: Value,
+        inject: Option<(Value, ThrowOrigin, usize)>,
+    ) -> Result<(), RuntimeErrorKind> {
+        let stop_depth = self.frames.len();
+        let return_to = self.frames.last().map(|frame| ReturnTo {
+            destination: None,
+            call_pc: frame.pc,
+            constructed: None,
+        });
+        let step = self
+            .push_resumed_generator_frame(activation, resume_value, return_to)
+            .and_then(|()| self.drive_async_generator_activation(stop_depth, inject));
+        match self.settle_async_generator_step(generator, step) {
+            // A completing step (throw) leaves the queue for the drain loop;
+            // a parking step makes the drain loop return immediately.
+            Ok(()) => self
+                .drive_async_generator(generator)
+                .map_err(|failure| async_generator_kind(generator, failure)),
+            Err(EvalFailure::Runtime(kind)) => Err(kind),
+            Err(_) => Err(RuntimeErrorKind::InvalidValue { value: generator }),
+        }
+    }
+
+    /// Takes the generator state out of an `Awaiting*` park (or any resumable
+    /// state), leaving `Executing` behind. A resume in a non-resumable state
+    /// is a hard invalid-state error, mirroring `take_async_activation`.
+    fn take_async_generator_state(
+        &mut self,
+        generator: Value,
+    ) -> Result<AsyncGeneratorState, EvalFailure> {
+        let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)? else {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: generator,
+            }));
+        };
+        let HeapEntry::AsyncGenerator { state, .. } = &mut self.heap[index] else {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: generator,
+            }));
+        };
+        match std::mem::replace(state, AsyncGeneratorState::Executing) {
+            AsyncGeneratorState::Executing => {
+                Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                    value: generator,
+                }))
+            }
+            taken => Ok(taken),
+        }
+    }
+
+    /// Pops the front `.next()` request, which the current drive settles
+    /// exactly once. The queue is never popped by await/yield parking.
+    fn pop_async_generator_front(
+        &mut self,
+        generator: Value,
+    ) -> Result<AsyncGeneratorRequest, EvalFailure> {
+        let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)? else {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: generator,
+            }));
+        };
+        let HeapEntry::AsyncGenerator { queue, .. } = &mut self.heap[index] else {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: generator,
+            }));
+        };
+        queue
+            .pop_front()
+            .ok_or(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: generator,
+            }))
+    }
+
+    fn replace_async_generator_state(
+        &mut self,
+        generator: Value,
+        next: AsyncGeneratorState,
+    ) -> Result<(), RuntimeErrorKind> {
+        let Some(index) = self.runtime_slot(generator)? else {
+            return Err(RuntimeErrorKind::InvalidValue { value: generator });
+        };
+        let HeapEntry::AsyncGenerator { state, .. } = &mut self.heap[index] else {
+            return Err(RuntimeErrorKind::InvalidValue { value: generator });
+        };
+        if !matches!(state, AsyncGeneratorState::Executing) {
+            return Err(RuntimeErrorKind::InvalidValue { value: generator });
+        }
+        *state = next;
+        Ok(())
+    }
+
+    fn complete_async_generator(&mut self, generator: Value) -> Result<(), EvalFailure> {
+        let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)? else {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: generator,
+            }));
+        };
+        let HeapEntry::AsyncGenerator { state, .. } = &mut self.heap[index] else {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: generator,
+            }));
+        };
+        *state = AsyncGeneratorState::Completed;
+        Ok(())
+    }
+
+    /// Resolves the awaited value through Promise resolution and attaches the
+    /// two direct resume reactions that point only at the activation record. An
+    /// already-settled Promise costs exactly one microtask tick.
+    fn await_promise(&mut self, awaited: Value, record: Value) -> Result<(), EvalFailure> {
+        let promise = self.promise_resolve(awaited)?;
+        let index = self
+            .runtime_slot(promise)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: promise,
+            }))?;
+        let settled = match &self.heap[index] {
+            HeapEntry::Promise {
+                state: PromiseState::Pending { .. },
+                ..
+            } => None,
+            HeapEntry::Promise {
+                state: PromiseState::Fulfilled { value },
+                ..
+            } => Some((true, *value, ThrowOrigin::Bytecode)),
+            HeapEntry::Promise {
+                state: PromiseState::Rejected { reason, origin },
+                ..
+            } => Some((false, *reason, *origin)),
+            _ => {
+                return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                    value: promise,
+                }));
+            }
+        };
+        if let Some((fulfilled, value, origin)) = settled {
+            self.ensure_microtask_capacity(1)
+                .map_err(EvalFailure::Runtime)?;
+            let reaction = if fulfilled {
+                PromiseReaction::AsyncFulfill {
+                    activation: record,
+                    context: self.context_global,
+                }
+            } else {
+                PromiseReaction::AsyncReject {
+                    activation: record,
+                    context: self.context_global,
+                }
+            };
+            self.microtasks
+                .push_back(QueuedMicrotask::uncharged(MicrotaskJob::Reaction {
+                    reaction,
+                    value,
+                    origin,
+                }));
+            return Ok(());
+        }
+        self.charge_promise_reactions(index, 2)?;
+        let context = self.context_global;
+        let HeapEntry::Promise {
+            state:
+                PromiseState::Pending {
+                    fulfill_reactions,
+                    reject_reactions,
+                },
+            ..
+        } = &mut self.heap[index]
+        else {
+            unreachable!("pending Promise state was checked before reaction registration");
+        };
+        fulfill_reactions.push(PromiseReaction::AsyncFulfill {
+            activation: record,
+            context,
+        });
+        reject_reactions.push(PromiseReaction::AsyncReject {
+            activation: record,
+            context,
+        });
+        Ok(())
+    }
+
+    fn create_async_activation(
+        &mut self,
+        promise: Value,
+        module: Option<ModuleId>,
+    ) -> Result<Value, EvalFailure> {
+        self.allocate(HeapEntry::AsyncActivation {
+            activation: None,
+            promise,
+            module,
+            completion: None,
+        })
+        .map_err(EvalFailure::Runtime)
+    }
+
+    fn store_async_module_completion(
+        &mut self,
+        record: Value,
+        completed: Option<Result<Execution, RuntimeError>>,
+    ) -> Result<(), EvalFailure> {
+        let index = self
+            .runtime_slot(record)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: record,
+            }))?;
+        let HeapEntry::AsyncActivation {
+            module, completion, ..
+        } = &mut self.heap[index]
+        else {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: record,
+            }));
+        };
+        if module.is_none() {
+            return Ok(());
+        }
+        let completed = completed.ok_or(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+            value: record,
+        }))?;
+        if completion.is_some() {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: record,
+            }));
+        }
+        *completion = Some(completed);
+        Ok(())
+    }
+
+    fn store_async_activation(
+        &mut self,
+        record: Value,
+        activation: SuspendedActivation,
+    ) -> Result<(), EvalFailure> {
+        let index = self
+            .runtime_slot(record)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: record,
+            }))?;
+        let HeapEntry::AsyncActivation {
+            activation: slot, ..
+        } = &mut self.heap[index]
+        else {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: record,
+            }));
+        };
+        *slot = Some(activation);
+        Ok(())
+    }
+
+    /// Takes the one suspended activation out of the record, making resume
+    /// one-shot. A second take (a second resume) is a hard invalid-state error.
+    fn take_async_activation(
+        &mut self,
+        record: Value,
+    ) -> Result<SuspendedActivation, RuntimeErrorKind> {
+        let index = self
+            .runtime_slot(record)?
+            .ok_or(RuntimeErrorKind::InvalidValue { value: record })?;
+        let HeapEntry::AsyncActivation {
+            activation: slot, ..
+        } = &mut self.heap[index]
+        else {
+            return Err(RuntimeErrorKind::InvalidValue { value: record });
+        };
+        slot.take()
+            .ok_or(RuntimeErrorKind::InvalidValue { value: record })
+    }
+
+    fn async_activation_promise(&self, record: Value) -> Result<Value, RuntimeErrorKind> {
+        let index = self
+            .runtime_slot(record)?
+            .ok_or(RuntimeErrorKind::InvalidValue { value: record })?;
+        let HeapEntry::AsyncActivation { promise, .. } = &self.heap[index] else {
+            return Err(RuntimeErrorKind::InvalidValue { value: record });
+        };
+        Ok(*promise)
+    }
+
+    fn async_activation_module(&self, record: Value) -> Result<Option<ModuleId>, RuntimeErrorKind> {
+        let index = self
+            .runtime_slot(record)?
+            .ok_or(RuntimeErrorKind::InvalidValue { value: record })?;
+        let HeapEntry::AsyncActivation { module, .. } = &self.heap[index] else {
+            return Err(RuntimeErrorKind::InvalidValue { value: record });
+        };
+        Ok(*module)
+    }
+
+    fn take_async_module_completion(
+        &mut self,
+        record: Value,
+        module: ModuleId,
+    ) -> Result<Result<Execution, RuntimeError>, RuntimeErrorKind> {
+        let index = self
+            .runtime_slot(record)?
+            .ok_or(RuntimeErrorKind::InvalidValue { value: record })?;
+        let HeapEntry::AsyncActivation {
+            module: owner,
+            completion,
+            ..
+        } = &mut self.heap[index]
+        else {
+            return Err(RuntimeErrorKind::InvalidValue { value: record });
+        };
+        if *owner != Some(module) {
+            return Err(RuntimeErrorKind::InvalidValue { value: record });
+        }
+        completion
+            .take()
+            .ok_or(RuntimeErrorKind::InvalidValue { value: record })
+    }
+
+    pub(crate) fn iterator_result(
+        &mut self,
+        value: Value,
+        done: bool,
+    ) -> Result<Value, EvalFailure> {
+        let result = self
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(self.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .map_err(EvalFailure::Runtime)?;
+        self.set_data_property(result, "value", value)?;
+        self.set_data_property(result, "done", Value::boolean(done))?;
+        Ok(result)
+    }
+
+    // ---- iterators ---------------------------------------------------------
+
+    fn create_iterator(&mut self, src: Value, kind: IteratorKind) -> Result<Value, EvalFailure> {
+        if kind == IteratorKind::Keys {
+            let keys = self.enumerable_keys(src)?;
+            return self
+                .allocate(HeapEntry::Iterator {
+                    state: IteratorState::Keys { index: 0, keys },
+                })
+                .map_err(EvalFailure::Runtime);
+        }
+
+        let (method, from_sync) = match kind {
+            IteratorKind::Async => {
+                let key = self.to_property_key(self.intrinsics.builtins.symbol_async_iterator())?;
+                let method = self.get_property_key(src, &key)?;
+                if matches!(method.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+                    let key = self.to_property_key(self.intrinsics.builtins.symbol_iterator())?;
+                    (self.get_property_key(src, &key)?, true)
+                } else {
+                    (method, false)
+                }
+            }
+            IteratorKind::Sync => {
+                let key = self.to_property_key(self.intrinsics.builtins.symbol_iterator())?;
+                (self.get_property_key(src, &key)?, false)
+            }
+            IteratorKind::Keys => unreachable!("key iteration returns before method lookup"),
+        };
+        if !self.is_callable(method)? {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "value is not iterable",
+            }));
+        }
+        let iterator = self.call_value(method, src, &[])?;
+        if !self.is_object(iterator) {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "iterator method returned a non-object",
+            }));
+        }
+        let next = self.get_named_property(iterator, "next")?;
+        if from_sync {
+            self.create_async_from_sync_iterator(iterator, next)
+        } else {
+            self.create_protocol_iterator(iterator, next)
+        }
+    }
+
+    pub(crate) fn create_protocol_iterator(
+        &mut self,
+        iterator: Value,
+        next: Value,
+    ) -> Result<Value, EvalFailure> {
+        self.allocate(HeapEntry::Iterator {
+            state: IteratorState::Protocol { iterator, next },
+        })
+        .map_err(EvalFailure::Runtime)
+    }
+
+    /// Allocates the async-from-sync adapter record (ECMA-262 27.1.5) for an
+    /// async iterator lookup that fell back to `Symbol.iterator`.
+    pub(crate) fn create_async_from_sync_iterator(
+        &mut self,
+        iterator: Value,
+        next: Value,
+    ) -> Result<Value, EvalFailure> {
+        self.allocate(HeapEntry::Iterator {
+            state: IteratorState::AsyncFromSync { iterator, next },
+        })
+        .map_err(EvalFailure::Runtime)
     }
 
     fn own_property_keys(&self, src: Value) -> Result<Vec<PropertyKey>, EvalFailure> {
         match self.runtime_slot(src).map_err(EvalFailure::Runtime)? {
             Some(index) => match &self.heap[index] {
+                HeapEntry::Uint8Array {
+                    bytes, properties, ..
+                } => Ok((0..bytes.len())
+                    .map(|index| PropertyKey::Named(EcmaString::from_utf8(&index.to_string())))
+                    .chain(ordered_property_keys(properties).into_iter().filter(|key| {
+                        key.as_string()
+                            .is_none_or(|name| uint8array_index(name).is_none())
+                    }))
+                    .collect()),
                 HeapEntry::Object { properties, .. }
+                | HeapEntry::Generator { properties, .. }
+                | HeapEntry::AsyncGenerator { properties, .. }
+                | HeapEntry::Script { properties, .. }
                 | HeapEntry::Function { properties, .. }
                 | HeapEntry::NativeFunction { properties, .. }
-                | HeapEntry::RegExp { properties, .. } => Ok(ordered_property_keys(properties)),
+                | HeapEntry::RegExp { properties, .. }
+                | HeapEntry::Date { properties, .. }
+                | HeapEntry::BuiltinIterator { properties, .. }
+                | HeapEntry::Collection { properties, .. }
+                | HeapEntry::Promise { properties, .. }
+                | HeapEntry::Timeout { properties, .. } => Ok(ordered_property_keys(properties)),
                 HeapEntry::Array {
                     elements,
                     properties,
                     ..
                 } => {
-                    let mut keys: Vec<PropertyKey> = (0..elements.len())
-                        .filter(|offset| elements[*offset] != Value::HOLE)
-                        .map(|offset| PropertyKey::Named(offset.to_string()))
+                    let mut indices: Vec<(usize, PropertyKey)> = elements
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, element)| **element != Value::HOLE)
+                        .map(|(offset, _)| {
+                            (
+                                offset,
+                                PropertyKey::Named(EcmaString::from_utf8(&offset.to_string())),
+                            )
+                        })
                         .collect();
-                    keys.extend(
-                        ordered_property_keys(properties)
-                            .into_iter()
-                            .filter(|key| key.as_str().and_then(array_index).is_none()),
-                    );
-                    Ok(keys)
+                    let mut suffix = Vec::new();
+                    for key in ordered_property_keys(properties) {
+                        let Some(offset) = key.as_string().and_then(array_index) else {
+                            suffix.push(key);
+                            continue;
+                        };
+                        let offset = offset as usize;
+                        if elements
+                            .get(offset)
+                            .is_some_and(|element| *element != Value::HOLE)
+                        {
+                            continue;
+                        }
+                        indices.push((offset, key));
+                    }
+                    indices.sort_unstable_by_key(|(offset, _)| *offset);
+                    Ok(indices
+                        .into_iter()
+                        .map(|(_, key)| key)
+                        .chain(suffix)
+                        .collect())
                 }
-                HeapEntry::String(text) => Ok((0..text.chars().count())
-                    .map(|index| PropertyKey::Named(index.to_string()))
+                HeapEntry::String(text) => Ok((0..text.len_units())
+                    .map(|index| PropertyKey::Named(EcmaString::from_utf8(&index.to_string())))
+                    .collect()),
+                HeapEntry::ModuleNamespace { module } => {
+                    let mut names: Vec<EcmaString> = self
+                        .program_module(*module)
+                        .exports
+                        .iter()
+                        .map(|export| self.constant_text(*module, export.name).clone())
+                        .collect();
+                    names.sort();
+                    Ok(names.into_iter().map(PropertyKey::Named).collect())
+                }
+                HeapEntry::ExternalModuleNamespace { specifier } => Ok(self.registry.external
+                    [specifier]
+                    .exports
+                    .keys()
+                    .cloned()
+                    .map(PropertyKey::Named)
                     .collect()),
                 HeapEntry::ProcessEnv { .. }
                 | HeapEntry::BigInt(_)
+                | HeapEntry::Symbol { .. }
                 | HeapEntry::PrivateName { .. }
-                | HeapEntry::Iterator { .. } => Ok(Vec::new()),
+                | HeapEntry::HashState { .. }
+                | HeapEntry::Iterator { .. }
+                | HeapEntry::PromiseResolver { .. }
+                | HeapEntry::PromiseAll { .. }
+                | HeapEntry::AsyncActivation { .. }
+                | HeapEntry::PromiseAllElement { .. } => Ok(Vec::new()),
+                HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
             },
             None => Ok(Vec::new()),
         }
     }
 
-    fn enumerable_keys(&self, src: Value) -> Result<Vec<String>, EvalFailure> {
-        let keys = self.own_property_keys(src)?;
+    fn own_property_is_enumerable(
+        &self,
+        src: Value,
+        key: &PropertyKey,
+    ) -> Result<bool, EvalFailure> {
         let Some(index) = self.runtime_slot(src).map_err(EvalFailure::Runtime)? else {
-            return Ok(Vec::new());
+            return Ok(false);
         };
-        Ok(keys
-            .into_iter()
-            .filter_map(|key| {
-                let PropertyKey::Named(name) = &key else {
-                    return None;
-                };
-                let enumerable = match &self.heap[index] {
-                    HeapEntry::Array {
-                        elements,
-                        properties,
-                        ..
-                    } => array_index(name).map_or_else(
-                        || properties.get(&key).is_some_and(Property::enumerable),
-                        |offset| {
+        Ok(match &self.heap[index] {
+            HeapEntry::Array {
+                elements,
+                properties,
+                ..
+            } => properties.get(key).map_or_else(
+                || {
+                    key.as_string().is_some_and(|name| {
+                        array_index(name).is_some_and(|offset| {
                             elements
                                 .get(offset as usize)
                                 .is_some_and(|element| *element != Value::HOLE)
-                        },
-                    ),
-                    HeapEntry::String(text) => array_index(name)
-                        .is_some_and(|offset| (offset as usize) < text.chars().count()),
-                    HeapEntry::Object { properties, .. }
-                    | HeapEntry::Function { properties, .. }
-                    | HeapEntry::NativeFunction { properties, .. }
-                    | HeapEntry::RegExp { properties, .. } => {
-                        properties.get(&key).is_some_and(Property::enumerable)
-                    }
-                    _ => false,
-                };
-                enumerable.then_some(name.clone())
-            })
-            .collect())
+                        })
+                    })
+                },
+                Property::enumerable,
+            ),
+            HeapEntry::String(text) => key.as_string().is_some_and(|name| {
+                array_index(name).is_some_and(|offset| (offset as usize) < text.len_units())
+            }),
+            HeapEntry::Uint8Array {
+                bytes, properties, ..
+            } => properties.get(key).map_or_else(
+                || {
+                    key.as_string()
+                        .and_then(uint8array_index)
+                        .flatten()
+                        .is_some_and(|offset| offset < bytes.len())
+                },
+                Property::enumerable,
+            ),
+            HeapEntry::ModuleNamespace { .. } | HeapEntry::ExternalModuleNamespace { .. } => {
+                matches!(key, PropertyKey::Named(_))
+            }
+            HeapEntry::Object { properties, .. }
+            | HeapEntry::Generator { properties, .. }
+            | HeapEntry::AsyncGenerator { properties, .. }
+            | HeapEntry::Script { properties, .. }
+            | HeapEntry::Function { properties, .. }
+            | HeapEntry::NativeFunction { properties, .. }
+            | HeapEntry::RegExp { properties, .. }
+            | HeapEntry::Date { properties, .. }
+            | HeapEntry::BuiltinIterator { properties, .. }
+            | HeapEntry::Collection { properties, .. }
+            | HeapEntry::Promise { properties, .. }
+            | HeapEntry::Timeout { properties, .. } => {
+                properties.get(key).is_some_and(Property::enumerable)
+            }
+            _ => false,
+        })
+    }
+
+    fn enumerable_keys(&self, src: Value) -> Result<Vec<EcmaString>, EvalFailure> {
+        let mut names = Vec::new();
+        for key in self.own_property_keys(src)? {
+            if !self.own_property_is_enumerable(src, &key)? {
+                continue;
+            }
+            if let PropertyKey::Named(name) = key {
+                names.push(name);
+            }
+        }
+        Ok(names)
     }
 
     fn iterator_next(&mut self, iterator: Value) -> Result<(bool, Value), EvalFailure> {
+        // Fused sync consumption reads the raw result directly; the
+        // async-from-sync adapter wraps only the `for await` step path.
+        let result = match self.prepare_iterator_next(iterator)? {
+            IteratorNextPrepared::Ready { done, value } => self.iterator_result(value, done)?,
+            IteratorNextPrepared::Call { callee, this_value }
+            | IteratorNextPrepared::AsyncFromSyncCall { callee, this_value } => {
+                self.call_value(callee, this_value, &[])?
+            }
+        };
+        self.iterator_result_parts(result)
+    }
+
+    /// Spec `IteratorNext`: performs the `next()` call (or takes the recorded
+    /// key of a Keys iterator) and returns the raw result with NO object
+    /// check. `for await` needs the raw Promise before awaiting it.
+    pub(crate) fn iterator_step(&mut self, iterator: Value) -> Result<Value, EvalFailure> {
+        match self.prepare_iterator_next(iterator)? {
+            IteratorNextPrepared::Ready { done, value } => self.iterator_result(value, done),
+            IteratorNextPrepared::Call { callee, this_value } => {
+                self.call_value(callee, this_value, &[])
+            }
+            IteratorNextPrepared::AsyncFromSyncCall { callee, this_value } => {
+                let result = self.call_value(callee, this_value, &[]);
+                self.async_from_sync_continuation(this_value, result)
+            }
+        }
+    }
+
+    /// Spec `IteratorComplete` + `IteratorValue`: an iterator result that is
+    /// not an Object is a TypeError, otherwise reads `done` (truthiness) and
+    /// `value`. A done result carries `undefined` for the value, matching the
+    /// fused sync path's behaviour.
+    pub(crate) fn iterator_result_parts(
+        &mut self,
+        result: Value,
+    ) -> Result<(bool, Value), EvalFailure> {
+        if !self.is_object(result) {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "iterator result is not an object",
+            }));
+        }
+        let done = self.get_named_property(result, "done")?;
+        if self.truthy(done) {
+            return Ok((true, Value::UNDEFINED));
+        }
+        let value = self.get_named_property(result, "value")?;
+        Ok((false, value))
+    }
+
+    /// ECMA-262 27.1.5.2.2 `AsyncFromSyncIteratorContinuation`: parses the
+    /// raw sync iterator-result object before any await, PromiseResolves only
+    /// its `value`, and settles a derived step promise with a freshly built
+    /// `{ value: unwrapped, done }` result. The raw result object itself is
+    /// never assimilated. A failed step and a rejected non-done value close
+    /// the sync iterator; a done step propagates a value rejection without
+    /// closing. Shared by the interpreter and the native helper path so every
+    /// backend observes the same semantics.
+    pub(crate) fn async_from_sync_continuation(
+        &mut self,
+        sync_iterator: Value,
+        result: Result<Value, EvalFailure>,
+    ) -> Result<Value, EvalFailure> {
+        let derived = self.create_promise()?;
+        match result.and_then(|result| self.async_from_sync_result_parts(result)) {
+            Err(failure) => {
+                self.close_protocol_iterator_preserving_abrupt(sync_iterator)
+                    .map_err(EvalFailure::Runtime)?;
+                self.reject_promise_failure(derived, failure)?;
+            }
+            Ok((done, value)) => {
+                let resolved = self.promise_resolve(value)?;
+                self.attach_async_from_sync_reactions(sync_iterator, derived, resolved, done)?;
+            }
+        }
+        Ok(derived)
+    }
+
+    /// `IteratorComplete` + `IteratorValue` for the async-from-sync adapter:
+    /// unlike the fused sync path, `value` is read even when the result is
+    /// done, matching the spec continuation.
+    fn async_from_sync_result_parts(
+        &mut self,
+        result: Value,
+    ) -> Result<(bool, Value), EvalFailure> {
+        if !self.is_object(result) {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "iterator result is not an object",
+            }));
+        }
+        let done = self.get_named_property(result, "done")?;
+        let done = self.truthy(done);
+        let value = self.get_named_property(result, "value")?;
+        Ok((done, value))
+    }
+
+    /// Attaches the two adapter reactions to the PromiseResolved step value,
+    /// mirroring `promise_then`'s settled/pending split and its reaction and
+    /// microtask charging.
+    fn attach_async_from_sync_reactions(
+        &mut self,
+        sync_iterator: Value,
+        derived: Value,
+        resolved: Value,
+        done: bool,
+    ) -> Result<(), EvalFailure> {
+        let index = self
+            .runtime_slot(resolved)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: resolved,
+            }))?;
+        let settled = match &self.heap[index] {
+            HeapEntry::Promise {
+                state: PromiseState::Pending { .. },
+                ..
+            } => None,
+            HeapEntry::Promise {
+                state: PromiseState::Fulfilled { value },
+                ..
+            } => Some((true, *value, ThrowOrigin::Bytecode)),
+            HeapEntry::Promise {
+                state: PromiseState::Rejected { reason, origin },
+                ..
+            } => Some((false, *reason, *origin)),
+            _ => {
+                return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                    value: resolved,
+                }));
+            }
+        };
+        if let Some((fulfilled, value, origin)) = settled {
+            self.ensure_microtask_capacity(1)
+                .map_err(EvalFailure::Runtime)?;
+            let reaction = if fulfilled {
+                PromiseReaction::AsyncFromSyncFulfill {
+                    derived,
+                    done,
+                    context: self.context_global,
+                }
+            } else {
+                PromiseReaction::AsyncFromSyncReject {
+                    derived,
+                    sync_iterator,
+                    done,
+                    context: self.context_global,
+                }
+            };
+            self.microtasks
+                .push_back(QueuedMicrotask::uncharged(MicrotaskJob::Reaction {
+                    reaction,
+                    value,
+                    origin,
+                }));
+            return Ok(());
+        }
+        self.charge_promise_reactions(index, 2)?;
+        let context = self.context_global;
+        let HeapEntry::Promise {
+            state:
+                PromiseState::Pending {
+                    fulfill_reactions,
+                    reject_reactions,
+                },
+            ..
+        } = &mut self.heap[index]
+        else {
+            unreachable!("pending Promise state was checked before reaction registration");
+        };
+        fulfill_reactions.push(PromiseReaction::AsyncFromSyncFulfill {
+            derived,
+            done,
+            context,
+        });
+        reject_reactions.push(PromiseReaction::AsyncFromSyncReject {
+            derived,
+            sync_iterator,
+            done,
+            context,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn prepare_iterator_next(
+        &mut self,
+        iterator: Value,
+    ) -> Result<IteratorNextPrepared, EvalFailure> {
         let iterator_index = self
             .runtime_slot(iterator)
             .map_err(EvalFailure::Runtime)?
             .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
                 operation: "iterator next on non-iterator",
             }))?;
-        let (source, current, keys_len, key_at) = match &self.heap[iterator_index] {
+        match &self.heap[iterator_index] {
             HeapEntry::Iterator {
-                source,
-                index,
-                keys,
-                ..
-            } => (
-                *source,
-                *index,
-                keys.as_ref().map(Vec::len),
-                keys.as_ref().and_then(|keys| keys.get(*index).cloned()),
-            ),
-            _ => {
-                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                    operation: "iterator next on non-iterator",
-                }));
-            }
-        };
-
-        if let Some(length) = keys_len {
-            if current >= length {
-                return Ok((true, Value::UNDEFINED));
-            }
-            let text = key_at.expect("current < length has a key");
-            let value = self
-                .allocate(HeapEntry::String(text))
-                .map_err(EvalFailure::Runtime)?;
-            self.advance_iterator(iterator_index);
-            return Ok((false, value));
-        }
-
-        enum Step {
-            Element(Option<Value>),
-            Char(Option<char>),
-        }
-        let step = match self.runtime_slot(source).map_err(EvalFailure::Runtime)? {
-            Some(source_index) => match &self.heap[source_index] {
-                HeapEntry::Array { elements, .. } => {
-                    Step::Element(elements.get(current).map(|element| {
-                        if *element == Value::HOLE {
-                            Value::UNDEFINED
-                        } else {
-                            *element
-                        }
-                    }))
-                }
-                HeapEntry::String(text) => Step::Char(text.chars().nth(current)),
-                _ => return Ok((true, Value::UNDEFINED)),
-            },
-            None => return Ok((true, Value::UNDEFINED)),
-        };
-        match step {
-            Step::Element(Some(value)) => {
-                self.advance_iterator(iterator_index);
-                Ok((false, value))
-            }
-            Step::Element(None) => Ok((true, Value::UNDEFINED)),
-            Step::Char(Some(ch)) => {
+                state: IteratorState::Keys { index, keys },
+            } => {
+                let Some(text) = keys.get(*index).cloned() else {
+                    return Ok(IteratorNextPrepared::Ready {
+                        done: true,
+                        value: Value::UNDEFINED,
+                    });
+                };
                 let value = self
-                    .allocate(HeapEntry::String(ch.to_string()))
+                    .allocate(HeapEntry::String(text))
                     .map_err(EvalFailure::Runtime)?;
                 self.advance_iterator(iterator_index);
-                Ok((false, value))
+                Ok(IteratorNextPrepared::Ready { done: false, value })
             }
-            Step::Char(None) => Ok((true, Value::UNDEFINED)),
+            HeapEntry::Iterator {
+                state: IteratorState::Protocol { iterator, next },
+            } => Ok(IteratorNextPrepared::Call {
+                callee: *next,
+                this_value: *iterator,
+            }),
+            HeapEntry::Iterator {
+                state: IteratorState::AsyncFromSync { iterator, next },
+            } => Ok(IteratorNextPrepared::AsyncFromSyncCall {
+                callee: *next,
+                this_value: *iterator,
+            }),
+            _ => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "iterator next on non-iterator",
+            })),
+        }
+    }
+
+    pub(crate) fn iterable_values(&mut self, source: Value) -> Result<Vec<Value>, EvalFailure> {
+        let iterator = self.create_iterator(source, IteratorKind::Sync)?;
+        let mut values = Vec::new();
+        loop {
+            let (done, value) = self.iterator_next(iterator)?;
+            if done {
+                return Ok(values);
+            }
+            let bytes = values
+                .len()
+                .checked_add(1)
+                .and_then(|length| length.checked_mul(std::mem::size_of::<Value>()))
+                .ok_or(EvalFailure::Runtime(
+                    RuntimeErrorKind::HeapByteLimitExceeded {
+                        limit: self.limits.max_heap_bytes,
+                    },
+                ))?;
+            self.ensure_allocation_capacity(1, bytes)
+                .map_err(EvalFailure::Runtime)?;
+            values.push(value);
         }
     }
 
     fn advance_iterator(&mut self, iterator_index: usize) {
-        if let HeapEntry::Iterator { index, .. } = &mut self.heap[iterator_index] {
+        if let HeapEntry::Iterator {
+            state: IteratorState::Keys { index, .. },
+        } = &mut self.heap[iterator_index]
+        {
             *index += 1;
         }
     }
@@ -2869,7 +10391,7 @@ impl<'a, H: Host> Machine<'a, H> {
         match op {
             UnaryOp::Void => Ok(Value::UNDEFINED),
             UnaryOp::TypeOf => {
-                let text = self.type_of(operand).to_owned();
+                let text = EcmaString::from_utf8(self.type_of(operand));
                 self.allocate(HeapEntry::String(text))
                     .map_err(EvalFailure::Runtime)
             }
@@ -2963,19 +10485,30 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn add(&mut self, left: Value, right: Value) -> Result<Value, EvalFailure> {
-        let left_string = self.add_string_primitive(left)?;
-        let right_string = self.add_string_primitive(right)?;
+        let left = self.coerce_primitive_default(left)?;
+        let right = self.coerce_primitive_default(right)?;
+        let left_string = self.string_text(left).cloned();
+        let right_string = self.string_text(right).cloned();
         if left_string.is_some() || right_string.is_some() {
-            let mut text = match left_string {
+            let left = match left_string {
                 Some(text) => text,
-                None => self.value_to_string(left, 0)?,
+                None => self.to_string(left)?,
             };
-            match right_string {
-                Some(right) => text.push_str(&right),
-                None => text.push_str(&self.value_to_string(right, 0)?),
+            let right = match right_string {
+                Some(text) => text,
+                None => self.to_string(right)?,
+            };
+            let mut builder = EcmaStringBuilder::with_capacity(
+                left.len_units().saturating_add(right.len_units()),
+            );
+            for &unit in left.as_units() {
+                builder.push_unit(unit);
+            }
+            for &unit in right.as_units() {
+                builder.push_unit(unit);
             }
             return self
-                .allocate(HeapEntry::String(text))
+                .allocate(HeapEntry::String(builder.finish()))
                 .map_err(EvalFailure::Runtime);
         }
         let left_bigint = self.bigint_text(left).map(str::to_owned);
@@ -3047,6 +10580,68 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(value)
     }
 
+    fn coercion_is_primitive(&self, value: Value) -> Result<bool, EvalFailure> {
+        let Some(index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
+            return Ok(true);
+        };
+        Ok(matches!(
+            self.heap[index],
+            HeapEntry::String(_)
+                | HeapEntry::BigInt(_)
+                | HeapEntry::Symbol { .. }
+                | HeapEntry::PrivateName { .. }
+        ))
+    }
+
+    fn coerce_primitive_default(&mut self, value: Value) -> Result<Value, EvalFailure> {
+        let prefer_string = self
+            .runtime_slot(value)
+            .map_err(EvalFailure::Runtime)?
+            .is_some_and(|index| matches!(self.heap[index], HeapEntry::Date { .. }));
+        self.coerce_primitive_observable(value, prefer_string)
+    }
+
+    pub(crate) fn coerce_primitive_observable(
+        &mut self,
+        value: Value,
+        prefer_string: bool,
+    ) -> Result<Value, EvalFailure> {
+        if self.coercion_is_primitive(value)? {
+            return Ok(value);
+        }
+        let methods = if prefer_string {
+            ["toString", "valueOf"]
+        } else {
+            ["valueOf", "toString"]
+        };
+        for name in methods {
+            let method = self.get_named_property(value, name)?;
+            if !self.is_callable(method)? {
+                continue;
+            }
+            let primitive = self.call_value(method, value, &[])?;
+            if self.coercion_is_primitive(primitive)? {
+                return Ok(primitive);
+            }
+        }
+        Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+            operation: "cannot convert object to primitive",
+        }))
+    }
+
+    pub(crate) fn coerce_string_observable(
+        &mut self,
+        value: Value,
+    ) -> Result<EcmaString, EvalFailure> {
+        let primitive = self.coerce_primitive_observable(value, true)?;
+        self.to_string(primitive)
+    }
+
+    pub(crate) fn coerce_number_observable(&mut self, value: Value) -> Result<Value, EvalFailure> {
+        let primitive = self.coerce_primitive_observable(value, false)?;
+        self.to_number(primitive)
+    }
+
     fn to_number(&self, value: Value) -> Result<Value, EvalFailure> {
         match value.decode() {
             Some(Decoded::Number(_)) | Some(Decoded::Int32(_)) => self.to_primitive(value),
@@ -3067,18 +10662,35 @@ impl<'a, H: Host> Machine<'a, H> {
                         HeapEntry::Array { elements, .. } if elements.len() == 1 => {
                             self.to_number(elements[0])
                         }
-                        HeapEntry::PrivateName { .. } => {
+                        HeapEntry::Symbol { .. } | HeapEntry::PrivateName { .. } => {
                             Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                                operation: "convert private name to number",
+                                operation: "convert symbol to number",
                             }))
                         }
                         HeapEntry::Object { .. }
+                        | HeapEntry::Generator { .. }
+                        | HeapEntry::AsyncGenerator { .. }
+                        | HeapEntry::Script { .. }
                         | HeapEntry::Array { .. }
                         | HeapEntry::Function { .. }
+                        | HeapEntry::ModuleNamespace { .. }
+                        | HeapEntry::ExternalModuleNamespace { .. }
+                        | HeapEntry::HashState { .. }
                         | HeapEntry::NativeFunction { .. }
                         | HeapEntry::RegExp { .. }
+                        | HeapEntry::Date { .. }
+                        | HeapEntry::BuiltinIterator { .. }
+                        | HeapEntry::Collection { .. }
+                        | HeapEntry::Uint8Array { .. }
+                        | HeapEntry::Promise { .. }
+                        | HeapEntry::PromiseResolver { .. }
+                        | HeapEntry::PromiseAll { .. }
+                        | HeapEntry::AsyncActivation { .. }
+                        | HeapEntry::PromiseAllElement { .. }
                         | HeapEntry::ProcessEnv { .. }
-                        | HeapEntry::Iterator { .. } => Ok(Value::number(f64::NAN)),
+                        | HeapEntry::Iterator { .. }
+                        | HeapEntry::Timeout { .. } => Ok(Value::number(f64::NAN)),
+                        HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
                     },
                     None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                         operation: "coerce host object to number",
@@ -3103,13 +10715,31 @@ impl<'a, H: Host> Machine<'a, H> {
                     HeapEntry::String(text) => !text.is_empty(),
                     HeapEntry::BigInt(text) => text != "0",
                     HeapEntry::Object { .. }
+                    | HeapEntry::Generator { .. }
+                    | HeapEntry::AsyncGenerator { .. }
+                    | HeapEntry::Script { .. }
                     | HeapEntry::Array { .. }
                     | HeapEntry::Function { .. }
+                    | HeapEntry::ModuleNamespace { .. }
+                    | HeapEntry::ExternalModuleNamespace { .. }
+                    | HeapEntry::HashState { .. }
                     | HeapEntry::NativeFunction { .. }
+                    | HeapEntry::Symbol { .. }
                     | HeapEntry::PrivateName { .. }
                     | HeapEntry::RegExp { .. }
+                    | HeapEntry::Date { .. }
+                    | HeapEntry::BuiltinIterator { .. }
+                    | HeapEntry::Collection { .. }
+                    | HeapEntry::Uint8Array { .. }
+                    | HeapEntry::Promise { .. }
+                    | HeapEntry::PromiseResolver { .. }
+                    | HeapEntry::PromiseAll { .. }
+                    | HeapEntry::AsyncActivation { .. }
+                    | HeapEntry::PromiseAllElement { .. }
                     | HeapEntry::ProcessEnv { .. }
-                    | HeapEntry::Iterator { .. } => true,
+                    | HeapEntry::Iterator { .. }
+                    | HeapEntry::Timeout { .. } => true,
+                    HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
                 },
                 Ok(None) => true,
                 Err(_) => false,
@@ -3128,12 +10758,30 @@ impl<'a, H: Host> Machine<'a, H> {
                     HeapEntry::String(_) => "string",
                     HeapEntry::BigInt(_) => "bigint",
                     HeapEntry::Function { .. } | HeapEntry::NativeFunction { .. } => "function",
-                    HeapEntry::PrivateName { .. } => "symbol",
+                    HeapEntry::Symbol { .. } => "symbol",
+                    HeapEntry::PrivateName { .. } => "object",
                     HeapEntry::Object { .. }
+                    | HeapEntry::Generator { .. }
+                    | HeapEntry::AsyncGenerator { .. }
+                    | HeapEntry::Script { .. }
                     | HeapEntry::Array { .. }
+                    | HeapEntry::ModuleNamespace { .. }
+                    | HeapEntry::ExternalModuleNamespace { .. }
+                    | HeapEntry::HashState { .. }
                     | HeapEntry::RegExp { .. }
+                    | HeapEntry::Date { .. }
+                    | HeapEntry::BuiltinIterator { .. }
+                    | HeapEntry::Collection { .. }
+                    | HeapEntry::Uint8Array { .. }
+                    | HeapEntry::Promise { .. }
+                    | HeapEntry::PromiseResolver { .. }
+                    | HeapEntry::PromiseAll { .. }
+                    | HeapEntry::AsyncActivation { .. }
+                    | HeapEntry::PromiseAllElement { .. }
                     | HeapEntry::ProcessEnv { .. }
-                    | HeapEntry::Iterator { .. } => "object",
+                    | HeapEntry::Iterator { .. }
+                    | HeapEntry::Timeout { .. } => "object",
+                    HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
                 },
                 _ => "object",
             },
@@ -3149,8 +10797,8 @@ impl<'a, H: Host> Machine<'a, H> {
             (Some(Decoded::HeapRef(_)), Some(Decoded::HeapRef(_))) => {
                 match (self.runtime_slot(left), self.runtime_slot(right)) {
                     (Ok(Some(a)), Ok(Some(b))) => match (&self.heap[a], &self.heap[b]) {
-                        (HeapEntry::String(a), HeapEntry::String(b))
-                        | (HeapEntry::BigInt(a), HeapEntry::BigInt(b)) => a == b,
+                        (HeapEntry::String(a), HeapEntry::String(b)) => a == b,
+                        (HeapEntry::BigInt(a), HeapEntry::BigInt(b)) => a == b,
                         _ => left == right,
                     },
                     _ => left == right,
@@ -3198,6 +10846,9 @@ impl<'a, H: Host> Machine<'a, H> {
     /// `value instanceof constructor`: walks `value`'s prototype chain for the
     /// constructor's own `prototype` object, matching by heap identity.
     fn instance_of(&mut self, value: Value, constructor: Value) -> Result<bool, EvalFailure> {
+        let constructor = self
+            .bound_target(constructor)
+            .map_err(EvalFailure::Runtime)?;
         match self
             .runtime_slot(constructor)
             .map_err(EvalFailure::Runtime)?
@@ -3211,8 +10862,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         operation: "instanceof",
                     }));
                 }
-                let target = match self.own_get(index, &PropertyKey::Named("prototype".to_owned()))
-                {
+                let target = match self.own_get_ascii(index, "prototype") {
                     Some(Found::Value(value)) if self.is_object(value) => value,
                     _ => {
                         return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
@@ -3248,78 +10898,113 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    fn add_string_primitive(&self, value: Value) -> Result<Option<String>, EvalFailure> {
-        match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
-            Some(index) => match &self.heap[index] {
-                HeapEntry::String(text) => Ok(Some(text.clone())),
-                HeapEntry::Object { .. }
-                | HeapEntry::Array { .. }
-                | HeapEntry::Function { .. }
-                | HeapEntry::NativeFunction { .. }
-                | HeapEntry::RegExp { .. }
-                | HeapEntry::Iterator { .. }
-                | HeapEntry::ProcessEnv { .. }
-                | HeapEntry::PrivateName { .. } => self.value_to_string(value, 0).map(Some),
-                HeapEntry::BigInt(_) => Ok(None),
-            },
-            None => Ok(None),
-        }
-    }
-
-    fn value_to_string(&self, value: Value, depth: u8) -> Result<String, EvalFailure> {
+    fn value_to_string(&self, value: Value, depth: usize) -> Result<EcmaString, EvalFailure> {
         if depth >= 32 {
-            return Ok(String::new());
+            return Ok(EcmaString::default());
         }
+        let ascii = |text: String| EcmaString::from_utf8(&text);
         match value.decode() {
-            Some(Decoded::Number(number)) => Ok(Self::ordinary_number_to_string(number)),
-            Some(Decoded::Int32(raw)) => Ok((raw as i32).to_string()),
-            Some(Decoded::Undefined | Decoded::Uninitialized) => Ok("undefined".to_owned()),
-            Some(Decoded::Null) => Ok("null".to_owned()),
-            Some(Decoded::Boolean(value)) => Ok(value.to_string()),
-            Some(Decoded::Hole) => Ok(String::new()),
+            Some(Decoded::Number(number)) => Ok(ascii(Self::ordinary_number_to_string(number))),
+            Some(Decoded::Int32(raw)) => Ok(ascii((raw as i32).to_string())),
+            Some(Decoded::Undefined | Decoded::Uninitialized) => {
+                Ok(EcmaString::from_utf8("undefined"))
+            }
+            Some(Decoded::Null) => Ok(EcmaString::from_utf8("null")),
+            Some(Decoded::Boolean(value)) => {
+                Ok(EcmaString::from_utf8(if value { "true" } else { "false" }))
+            }
+            Some(Decoded::Hole) => Ok(EcmaString::default()),
             Some(Decoded::HeapRef(_)) => {
                 match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
                     Some(index) => match &self.heap[index] {
-                        HeapEntry::String(text) | HeapEntry::BigInt(text) => Ok(text.clone()),
+                        HeapEntry::String(text) => Ok(text.clone()),
+                        HeapEntry::BigInt(text) => Ok(EcmaString::from_utf8(text)),
                         HeapEntry::Object { .. }
+                        | HeapEntry::Generator { .. }
+                        | HeapEntry::AsyncGenerator { .. }
+                        | HeapEntry::Script { .. }
+                        | HeapEntry::Date { .. }
+                        | HeapEntry::BuiltinIterator { .. }
+                        | HeapEntry::Collection { .. }
+                        | HeapEntry::Uint8Array { .. }
+                        | HeapEntry::Promise { .. }
+                        | HeapEntry::PromiseResolver { .. }
+                        | HeapEntry::PromiseAll { .. }
+                        | HeapEntry::AsyncActivation { .. }
+                        | HeapEntry::PromiseAllElement { .. }
+                        | HeapEntry::ModuleNamespace { .. }
+                        | HeapEntry::ExternalModuleNamespace { .. }
                         | HeapEntry::ProcessEnv { .. }
-                        | HeapEntry::Iterator { .. } => Ok("[object Object]".to_owned()),
+                        | HeapEntry::Iterator { .. }
+                        | HeapEntry::Timeout { .. }
+                        | HeapEntry::HashState { .. } => {
+                            Ok(EcmaString::from_utf8("[object Object]"))
+                        }
                         HeapEntry::RegExp { pattern, flags, .. } => {
-                            Ok(format!("/{pattern}/{flags}"))
+                            let mut builder = EcmaStringBuilder::with_capacity(
+                                pattern
+                                    .len_units()
+                                    .saturating_add(flags.len_units())
+                                    .saturating_add(2),
+                            );
+                            builder.push_unit(u16::from(b'/'));
+                            for &unit in pattern.as_units() {
+                                builder.push_unit(unit);
+                            }
+                            builder.push_unit(u16::from(b'/'));
+                            for &unit in flags.as_units() {
+                                builder.push_unit(unit);
+                            }
+                            Ok(builder.finish())
+                        }
+                        HeapEntry::Symbol { .. } => {
+                            Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                                operation: "convert symbol to string",
+                            }))
                         }
                         HeapEntry::PrivateName { .. } => {
                             Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                                 operation: "convert private name to string",
                             }))
                         }
-                        HeapEntry::Function { function, .. } => {
-                            let flags = self.module.functions()[function.get() as usize].flags();
-                            Ok(match (flags.is_async, flags.is_generator) {
-                                (true, true) => "async function* () { [bytecode] }",
-                                (true, false) => "async function () { [bytecode] }",
-                                (false, true) => "function* () { [bytecode] }",
-                                (false, false) => "function () { [bytecode] }",
-                            }
-                            .to_owned())
+                        HeapEntry::Function {
+                            module, function, ..
+                        } => {
+                            let flags = self.module_code(*module).functions()
+                                [function.get() as usize]
+                                .flags();
+                            Ok(EcmaString::from_utf8(
+                                match (flags.is_async, flags.is_generator) {
+                                    (true, true) => "async function* () { [bytecode] }",
+                                    (true, false) => "async function () { [bytecode] }",
+                                    (false, true) => "function* () { [bytecode] }",
+                                    (false, false) => "function () { [bytecode] }",
+                                },
+                            ))
                         }
                         HeapEntry::NativeFunction { .. } => {
-                            Ok("function () { [native code] }".to_owned())
+                            Ok(EcmaString::from_utf8("function () { [native code] }"))
                         }
                         HeapEntry::Array { elements, .. } => {
-                            let mut text = String::new();
+                            let mut text = EcmaStringBuilder::new();
                             for (index, element) in elements.iter().copied().enumerate() {
                                 if index != 0 {
-                                    text.push(',');
+                                    text.push_unit(u16::from(b','));
                                 }
                                 if element != Value::HOLE
                                     && element != Value::NULL
                                     && element != Value::UNDEFINED
                                 {
-                                    text.push_str(&self.value_to_string(element, depth + 1)?);
+                                    for &unit in
+                                        self.value_to_string(element, depth + 1)?.as_units()
+                                    {
+                                        text.push_unit(unit);
+                                    }
                                 }
                             }
-                            Ok(text)
+                            Ok(text.finish())
                         }
+                        HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
                     },
                     None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                         operation: "coerce host object to string",
@@ -3332,7 +11017,7 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    fn string_text(&self, value: Value) -> Option<&str> {
+    fn string_text(&self, value: Value) -> Option<&EcmaString> {
         let index = self.runtime_slot(value).ok()??;
         match &self.heap[index] {
             HeapEntry::String(text) => Some(text),
@@ -3352,7 +11037,12 @@ impl<'a, H: Host> Machine<'a, H> {
         match self.runtime_slot(value) {
             Ok(Some(index)) => !matches!(
                 self.heap[index],
-                HeapEntry::String(_) | HeapEntry::BigInt(_)
+                HeapEntry::String(_)
+                    | HeapEntry::BigInt(_)
+                    | HeapEntry::PromiseResolver { .. }
+                    | HeapEntry::PromiseAll { .. }
+                    | HeapEntry::AsyncActivation { .. }
+                    | HeapEntry::PromiseAllElement { .. }
             ),
             Ok(None) => matches!(value.decode(), Some(Decoded::HeapRef(_))),
             Err(_) => false,
@@ -3370,7 +11060,8 @@ fn ordered_property_keys(properties: &PropertyMap) -> Vec<PropertyKey> {
                 Some(index) => indices.push((index, key.clone())),
                 None => strings.push(key.clone()),
             },
-            PropertyKey::Private(_) => symbols.push(key.clone()),
+            PropertyKey::Symbol(_) => symbols.push(key.clone()),
+            PropertyKey::Private(_) => {}
         }
     }
     indices.sort_unstable_by_key(|(index, _)| *index);
@@ -3384,6 +11075,17 @@ fn ordered_property_keys(properties: &PropertyMap) -> Vec<PropertyKey> {
 
 fn property_lookup(properties: &PropertyMap, key: &PropertyKey) -> Option<Found> {
     match properties.get(key) {
+        Some(Property::Data { value, .. }) => Some(Found::Value(*value)),
+        Some(Property::Accessor { getter, .. }) => Some(match getter {
+            Some(getter) => Found::Getter(*getter),
+            None => Found::NoGetter,
+        }),
+        None => None,
+    }
+}
+
+fn property_lookup_ascii(properties: &PropertyMap, name: &str) -> Option<Found> {
+    match properties.get_ascii(name) {
         Some(Property::Data { value, .. }) => Some(Found::Value(*value)),
         Some(Property::Accessor { getter, .. }) => Some(match getter {
             Some(getter) => Found::Getter(*getter),
@@ -3407,6 +11109,14 @@ fn innermost_handler(function: &Function, pc: usize) -> Option<bamts_bytecode::E
         })
 }
 
+/// The catch-value guard shared by the interpreter and the native engine:
+/// bytecode throws and already-materialized (non-`UNDEFINED`) engine values
+/// keep their identity; only a still-lazy (`UNDEFINED`) non-bytecode origin is
+/// materialized into a realm-intrinsic error object at the catch boundary.
+pub(crate) fn catch_value_needs_materialization(value: Value, origin: ThrowOrigin) -> bool {
+    !matches!(origin, ThrowOrigin::Bytecode) && value == Value::UNDEFINED
+}
+
 fn numeric_f64(value: Value) -> Option<f64> {
     match value.decode()? {
         Decoded::Number(number) => Some(number),
@@ -3427,7 +11137,14 @@ fn number_value(number: f64) -> Value {
     }
 }
 
-fn parse_number(text: &str) -> f64 {
+fn parse_number(text: &EcmaString) -> f64 {
+    let Ok(text) = text.to_utf8_strict() else {
+        return f64::NAN;
+    };
+    parse_number_utf8(&text)
+}
+
+fn parse_number_utf8(text: &str) -> f64 {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         0.0
@@ -3514,12 +11231,103 @@ fn to_int32(number: f64) -> i32 {
     to_uint32(number) as i32
 }
 
-fn array_index(key: &str) -> Option<u32> {
-    if key.is_empty() || (key.len() > 1 && key.starts_with('0')) {
+fn array_index_ascii(key: &str) -> Option<u32> {
+    if !key.is_ascii() || key.is_empty() || (key.len() > 1 && key.as_bytes()[0] == b'0') {
         return None;
     }
-    let index = key.parse::<u32>().ok()?;
+    let mut index = 0_u32;
+    for byte in key.bytes() {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        index = index.checked_mul(10)?.checked_add(u32::from(byte - b'0'))?;
+    }
     (index != u32::MAX).then_some(index)
+}
+
+fn array_index(key: &EcmaString) -> Option<u32> {
+    let units = key.as_units();
+    if units.is_empty() || (units.len() > 1 && units[0] == u16::from(b'0')) {
+        return None;
+    }
+    let mut index = 0_u32;
+    for &unit in units {
+        if !(u16::from(b'0')..=u16::from(b'9')).contains(&unit) {
+            return None;
+        }
+        index = index
+            .checked_mul(10)?
+            .checked_add(u32::from(unit - u16::from(b'0')))?;
+    }
+    (index != u32::MAX).then_some(index)
+}
+
+fn string_own_get(text: &EcmaString, key: &PropertyKey) -> Option<Found> {
+    let PropertyKey::Named(name) = key else {
+        return None;
+    };
+    let Ok(name) = name.to_utf8_strict() else {
+        return None;
+    };
+    string_own_get_ascii(text, &name)
+}
+
+fn string_own_get_ascii(text: &EcmaString, name: &str) -> Option<Found> {
+    if name == "length" {
+        return Some(Found::Value(number_value(text.len_units() as f64)));
+    }
+    let offset = array_index_ascii(name)?;
+    let unit = text.unit_at(offset as usize)?;
+    Some(Found::Text(EcmaString::from_units(&[unit])))
+}
+
+fn uint8array_index(key: &EcmaString) -> Option<Option<usize>> {
+    let Ok(key) = key.to_utf8_strict() else {
+        return None;
+    };
+    uint8array_index_ascii(&key)
+}
+
+fn uint8array_index_ascii(key: &str) -> Option<Option<usize>> {
+    if key == "-0" {
+        return Some(None);
+    }
+    if !key.is_empty()
+        && key.is_ascii()
+        && key.bytes().all(|byte| byte.is_ascii_digit())
+        && (key.len() == 1 || key.as_bytes()[0] != b'0')
+    {
+        let mut index = 0_usize;
+        let mut overflowed = false;
+        for byte in key.bytes() {
+            match index
+                .checked_mul(10)
+                .and_then(|index| index.checked_add(usize::from(byte - b'0')))
+            {
+                Some(next) => index = next,
+                None => {
+                    overflowed = true;
+                    break;
+                }
+            }
+        }
+        if !overflowed {
+            return Some(Some(index));
+        }
+    }
+    let number = match key {
+        "NaN" => f64::NAN,
+        "Infinity" => f64::INFINITY,
+        "-Infinity" => f64::NEG_INFINITY,
+        _ => key.parse::<f64>().ok()?,
+    };
+    if format_number(number) != key {
+        return None;
+    }
+    if !number.is_finite() || number < 0.0 || number.fract() != 0.0 || number >= usize::MAX as f64 {
+        return Some(None);
+    }
+    Some(Some(number as usize))
 }
 
 fn exact_array_length(value: Value) -> Option<usize> {
@@ -3529,6 +11337,54 @@ fn exact_array_length(value: Value) -> Option<usize> {
     } else {
         None
     }
+}
+
+pub(crate) fn apply_array_length(
+    elements: &mut Vec<Value>,
+    properties: &mut PropertyMap,
+    length: usize,
+    operation: &'static str,
+) -> Result<(), EvalFailure> {
+    if length >= elements.len() {
+        elements.resize(length, Value::HOLE);
+        return Ok(());
+    }
+    let blocked = properties
+        .iter()
+        .filter_map(|(key, property)| {
+            (!property.configurable())
+                .then(|| key.as_string().and_then(array_index))
+                .flatten()
+        })
+        .map(|offset| offset as usize)
+        .filter(|offset| *offset >= length)
+        .max();
+    let effective_length = blocked.map_or(length, |offset| offset + 1);
+    properties.0.retain(|(key, _)| {
+        key.as_string()
+            .and_then(array_index)
+            .is_none_or(|offset| (offset as usize) < effective_length)
+    });
+    elements.resize(effective_length, Value::HOLE);
+    if blocked.is_some() {
+        return Err(EvalFailure::Throw(ThrowOrigin::TypeError { operation }));
+    }
+    Ok(())
+}
+
+pub(crate) fn array_set_length(
+    elements: &mut Vec<Value>,
+    properties: &mut PropertyMap,
+    length_writable: bool,
+    value: Value,
+    operation: &'static str,
+) -> Result<(), EvalFailure> {
+    let length = exact_array_length(value)
+        .ok_or(EvalFailure::Throw(ThrowOrigin::RangeError { operation }))?;
+    if !length_writable {
+        return Err(EvalFailure::Throw(ThrowOrigin::TypeError { operation }));
+    }
+    apply_array_length(elements, properties, length, operation)
 }
 
 fn bigint_i128(text: &str) -> Result<i128, EvalFailure> {
@@ -3663,8 +11519,14 @@ pub(crate) fn accessor_from_selector(kind: u32) -> Option<AccessorKind> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use bamts_bytecode::{ExceptionHandler, FunctionFlags, NumberBits, Register};
+    use crate::intrinsics::BuiltinOutcome;
+    use bamts_bytecode::{
+        Binding, DescriptorSlot, Edge, EdgeKind, ExceptionHandler, Export, ExportSource,
+        FunctionFlags, NumberBits, ProgramModule, Register,
+    };
 
     fn reg(raw: u32) -> Register {
         Register::new(raw)
@@ -3694,6 +11556,66 @@ mod tests {
         )
     }
 
+    fn generator_function(
+        parameters: u32,
+        registers: u32,
+        code: Vec<Instruction>,
+        handlers: Vec<ExceptionHandler>,
+    ) -> Function {
+        Function::new(
+            None,
+            0,
+            parameters,
+            registers,
+            FunctionFlags {
+                is_async: false,
+                is_generator: true,
+            },
+            code,
+            handlers,
+        )
+    }
+
+    fn async_function(
+        parameters: u32,
+        registers: u32,
+        code: Vec<Instruction>,
+        handlers: Vec<ExceptionHandler>,
+    ) -> Function {
+        Function::new(
+            None,
+            0,
+            parameters,
+            registers,
+            FunctionFlags {
+                is_async: true,
+                is_generator: false,
+            },
+            code,
+            handlers,
+        )
+    }
+
+    fn async_generator_function(
+        parameters: u32,
+        registers: u32,
+        code: Vec<Instruction>,
+        handlers: Vec<ExceptionHandler>,
+    ) -> Function {
+        Function::new(
+            None,
+            0,
+            parameters,
+            registers,
+            FunctionFlags {
+                is_async: true,
+                is_generator: true,
+            },
+            code,
+            handlers,
+        )
+    }
+
     /// A function with `captures` leading capture registers.
     fn closure_function(
         captures: u32,
@@ -3712,21 +11634,2650 @@ mod tests {
         )
     }
 
-    fn verified(constants: Vec<Constant>, functions: Vec<Function>) -> Module<Verified> {
-        Module::new(constants, functions, FunctionId::new(0))
+    fn verified(mut constants: Vec<Constant>, functions: Vec<Function>) -> Program<Verified> {
+        let name = ConstantId::new(constants.len() as u32);
+        constants.push(Constant::String(EcmaString::from_utf8("<test>")));
+        let code = Module::new(constants, functions, FunctionId::new(0))
             .verify()
-            .expect("valid test bytecode")
+            .expect("valid test bytecode");
+        Program::link(
+            vec![ProgramModule {
+                name,
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect("valid one-module test program")
+    }
+    fn program_module(
+        name: &str,
+        mut constants: Vec<Constant>,
+        functions: Vec<Function>,
+        edges: Vec<Edge>,
+        bindings: Vec<Binding>,
+        exports: Vec<Export>,
+    ) -> ProgramModule<Verified> {
+        constants.insert(0, Constant::String(EcmaString::from_utf8(name)));
+        let code = Module::new(constants, functions, FunctionId::new(0))
+            .verify()
+            .expect("valid test bytecode");
+        ProgramModule {
+            name: ConstantId::new(0),
+            code,
+            edges,
+            bindings,
+            exports,
+        }
+    }
+
+    fn linked(modules: Vec<ProgramModule<Verified>>, entry: u32) -> Program<Verified> {
+        Program::link(modules, ModuleId::new(entry)).expect("valid linked test program")
+    }
+
+    #[test]
+    fn run_with_telemetry_reports_wall_and_matches_run() {
+        let program = verified(
+            vec![],
+            vec![function(0, 0, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let (outcome, telemetry) =
+            super::run_with_telemetry(&program, &mut host, &Limits::default());
+        let outcome = outcome.expect("halt program runs");
+        assert_eq!(outcome.exit_code, 0);
+        // The interpreter wall is a finite, non-negative measurement.
+        assert!(telemetry.interpreter_wall_ms >= 0.0);
+        assert!(telemetry.interpreter_wall_ms.is_finite());
+        // On this Linux host VmHWM is readable, so peak RSS is populated.
+        assert!(telemetry.rss_kb > 0, "peak RSS should be read from /proc");
+        // The telemetry seam produces the same outcome as `run`.
+        let mut plain_host = TestHost;
+        let plain = super::run(&program, &mut plain_host, &Limits::default()).expect("halt runs");
+        assert_eq!(plain, outcome);
+    }
+
+    fn namespace_descriptor_entry() -> Function {
+        function(
+            0,
+            7,
+            vec![
+                Instruction::LoadGlobal {
+                    dst: reg(0),
+                    name: cid(1),
+                },
+                Instruction::LoadGlobal {
+                    dst: reg(1),
+                    name: cid(3),
+                },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(4),
+                },
+                Instruction::GetProperty {
+                    dst: reg(3),
+                    object: reg(1),
+                    key: reg(2),
+                },
+                Instruction::CreateArray { dst: reg(4) },
+                Instruction::ArrayPush {
+                    array: reg(4),
+                    value: reg(0),
+                },
+                Instruction::LoadConst {
+                    dst: reg(5),
+                    constant: cid(5),
+                },
+                Instruction::ArrayPush {
+                    array: reg(4),
+                    value: reg(5),
+                },
+                Instruction::Call {
+                    dst: reg(6),
+                    callee: reg(3),
+                    this_value: reg(4),
+                    arguments: reg(4),
+                },
+                Instruction::Return { value: reg(6) },
+            ],
+            Vec::new(),
+        )
     }
 
     #[derive(Default)]
     struct TestHost;
     impl Host for TestHost {}
 
-    fn run_ok(module: &Module<Verified>) -> Execution {
+    fn with_machine(limits: Limits, test: impl FnOnce(&mut Machine<'_, TestHost>)) {
+        let program = verified(
+            vec![],
+            vec![function(0, 0, vec![Instruction::Halt], Vec::new())],
+        );
         let mut host = TestHost;
-        Machine::new(module, &mut host, Limits::default())
+        let mut machine = Machine::new(&program, &mut host, limits);
+        test(&mut machine);
+    }
+
+    #[test]
+    fn suppressed_error_allocator_preserves_chain_and_hides_fields() {
+        with_machine(Limits::default(), |machine| {
+            let body_error = Value::int32(1);
+            let inner_disposal_error = Value::int32(2);
+            let outer_disposal_error = Value::int32(4);
+            let inner = machine
+                .make_suppressed_error(inner_disposal_error, body_error)
+                .expect("inner suppression allocates");
+            let outer = machine
+                .make_suppressed_error(outer_disposal_error, inner)
+                .expect("outer suppression allocates");
+
+            assert_eq!(
+                machine.get_named_property(outer, "error").unwrap(),
+                outer_disposal_error
+            );
+            assert_eq!(
+                machine.get_named_property(outer, "suppressed").unwrap(),
+                inner
+            );
+            assert_eq!(
+                machine.get_named_property(inner, "error").unwrap(),
+                inner_disposal_error
+            );
+            assert_eq!(
+                machine.get_named_property(inner, "suppressed").unwrap(),
+                body_error
+            );
+            assert!(
+                machine
+                    .own_descriptor(outer, &PropertyKey::Named(EcmaString::from_utf8("message")))
+                    .unwrap()
+                    .is_none()
+            );
+            for (object, name, expected) in [
+                (outer, "error", outer_disposal_error),
+                (outer, "suppressed", inner),
+                (inner, "error", inner_disposal_error),
+                (inner, "suppressed", body_error),
+            ] {
+                let descriptor = machine
+                    .own_descriptor(object, &PropertyKey::Named(EcmaString::from_utf8(name)))
+                    .unwrap()
+                    .expect("suppression field is own");
+                assert!(matches!(
+                    descriptor,
+                    Property::Data {
+                        value,
+                        writable: true,
+                        enumerable: false,
+                        configurable: true,
+                    } if value == expected
+                ));
+            }
+            let constructor = machine
+                .intrinsics
+                .global("SuppressedError")
+                .expect("SuppressedError exists");
+            let prototype = machine
+                .get_named_property(constructor, "prototype")
+                .unwrap();
+            assert!(machine.inherits_from_prototype(outer, prototype).unwrap());
+        });
+    }
+
+    #[test]
+    fn uint8array_canonical_numeric_keys_never_become_ordinary_properties() {
+        assert!(uint8array_index_ascii("4294967295").is_some());
+        for key in ["-0", "NaN", "Infinity", "1.5"] {
+            assert_eq!(uint8array_index_ascii(key), Some(None), "{key}");
+        }
+        assert_eq!(uint8array_index_ascii("01"), None);
+
+        with_machine(Limits::default(), |machine| {
+            let typed = machine
+                .allocate(HeapEntry::Uint8Array {
+                    bytes: vec![0],
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    extensible: true,
+                })
+                .unwrap();
+            let index = machine.runtime_slot(typed).unwrap().unwrap();
+            for name in ["4294967295", "-0", "NaN", "Infinity", "1.5"] {
+                let key = PropertyKey::Named(EcmaString::from_utf8(name));
+                machine
+                    .set_own_data(index, key.clone(), Value::int32(7))
+                    .unwrap();
+                assert_eq!(
+                    machine.get_property_key(typed, &key).unwrap(),
+                    Value::UNDEFINED,
+                    "{name}"
+                );
+                assert!(machine.delete_property(typed, &key).unwrap(), "{name}");
+                assert!(
+                    machine
+                        .define_descriptor(
+                            typed,
+                            key,
+                            Property::Data {
+                                value: Value::int32(7),
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        )
+                        .is_err(),
+                    "{name}"
+                );
+            }
+
+            let ordinary = PropertyKey::Named(EcmaString::from_utf8("01"));
+            machine
+                .set_own_data(index, ordinary.clone(), Value::int32(7))
+                .unwrap();
+            assert_eq!(
+                machine.get_property_key(typed, &ordinary).unwrap(),
+                Value::int32(7)
+            );
+            assert!(machine.delete_property(typed, &ordinary).unwrap());
+        });
+    }
+
+    #[test]
+    fn heap_ledger_tracks_slot_and_machine_charges() {
+        with_machine(Limits::default(), |machine| {
+            machine.assert_heap_ledger();
+            let value = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .unwrap();
+            let index = machine.runtime_slot(value).unwrap().unwrap();
+            machine.charge_slot(index, 3).unwrap();
+            machine.charge_machine(5).unwrap();
+
+            assert_eq!(machine.slot_bytes[index], 5);
+            assert_eq!(machine.machine_bytes, 5);
+            machine.assert_heap_ledger();
+        });
+    }
+
+    #[test]
+    fn gc_pending_arms_after_successful_mutations_without_preflight_side_effects() {
+        with_machine(Limits::default(), |machine| {
+            machine.set_gc_watermarks_for_test(usize::MAX, 1);
+            assert!(!machine.gc_pending());
+            machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .unwrap();
+            assert!(machine.gc_pending());
+
+            machine.collect_garbage();
+            machine.set_gc_watermarks_for_test(usize::MAX, usize::MAX);
+            let value = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .unwrap();
+            let index = machine.runtime_slot(value).unwrap().unwrap();
+            let bytes = machine.heap_bytes + 1;
+            machine.set_gc_watermarks_for_test(bytes, usize::MAX);
+            assert!(!machine.gc_pending());
+            machine.charge_slot(index, 1).unwrap();
+            assert!(machine.gc_pending());
+
+            machine.collect_garbage();
+            machine.set_gc_watermarks_for_test(usize::MAX, usize::MAX);
+            let bytes = machine.heap_bytes + 1;
+            machine.set_gc_watermarks_for_test(bytes, usize::MAX);
+            machine.charge_machine(1).unwrap();
+            assert!(machine.gc_pending());
+        });
+
+        with_machine(
+            Limits {
+                max_heap_bytes: 1,
+                ..Limits::default()
+            },
+            |machine| {
+                machine.set_gc_watermarks_for_test(usize::MAX, usize::MAX);
+                assert!(matches!(
+                    machine.allocate(HeapEntry::String(EcmaString::from_utf8("x"))),
+                    Err(RuntimeErrorKind::HeapByteLimitExceeded { limit: 1 })
+                ));
+                assert!(!machine.gc_pending());
+                machine.assert_heap_ledger();
+            },
+        );
+    }
+
+    #[test]
+    fn gc_recomputes_watermarks_from_live_usage() {
+        with_machine(Limits::default(), |machine| {
+            let value = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .unwrap();
+            machine.globals.insert(EcmaString::from_utf8("live"), value);
+
+            machine.collect_garbage();
+
+            assert_eq!(
+                machine.gc_watermarks_for_test(),
+                (
+                    machine
+                        .heap_bytes
+                        .saturating_mul(2)
+                        .min(machine.limits.max_heap_bytes),
+                    machine
+                        .live_runtime_slots()
+                        .saturating_mul(2)
+                        .min(machine.limits.max_heap_slots),
+                )
+            );
+        });
+    }
+
+    #[test]
+    fn gc_traces_active_builtin_new_target() {
+        with_machine(Limits::default(), |machine| {
+            let new_target = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.function_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let index = machine.runtime_slot(new_target).unwrap().unwrap();
+            machine.current_new_target = new_target;
+
+            machine.collect_garbage();
+
+            assert!(!matches!(machine.heap[index], HeapEntry::Vacant));
+            assert_eq!(
+                machine.runtime_slot(machine.current_new_target).unwrap(),
+                Some(index)
+            );
+        });
+    }
+
+    #[test]
+    fn interpreter_safe_point_reclaims_overwritten_values() {
+        let program = verified(
+            vec![Constant::Int32(7)],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.set_gc_watermarks_for_test(usize::MAX, 1);
+
+        let execution = machine.evaluate().unwrap();
+        machine.run_to_quiescence().unwrap();
+        assert_eq!(execution.value, Value::int32(7));
+        assert!(matches!(
+            machine.heap[machine.intrinsic_slots],
+            HeapEntry::Vacant
+        ));
+        assert!(machine.vacant_count >= 2);
+        machine.assert_heap_ledger();
+    }
+
+    #[test]
+    fn automatic_gc_repeats_deterministically() {
+        let program = verified(
+            vec![Constant::Int32(7)],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut outcomes = Vec::new();
+        for _ in 0..3 {
+            let mut host = TestHost;
+            let mut machine = Machine::new(&program, &mut host, Limits::default());
+            machine.set_gc_watermarks_for_test(usize::MAX, 1);
+            let execution = machine.evaluate().unwrap();
+            machine.run_to_quiescence().unwrap();
+            outcomes.push((execution.value, machine.heap_bytes, machine.vacant_count));
+        }
+
+        assert_eq!(outcomes, vec![(Value::int32(7), 1, 2); 3]);
+    }
+
+    #[test]
+    fn microtask_safe_point_keeps_queued_callback_rooted() {
+        let program = verified(
+            vec![],
+            vec![function(0, 0, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callback = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(0),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        machine
+            .microtasks
+            .push_back(QueuedMicrotask::uncharged(MicrotaskJob::Callback {
+                callback,
+                context: None,
+            }));
+        machine.set_gc_watermarks_for_test(0, 0);
+
+        assert_eq!(machine.drain_microtasks().unwrap().executed, 1);
+        assert!(matches!(
+            machine.heap[machine.runtime_slot(callback).unwrap().unwrap()],
+            HeapEntry::Function { .. }
+        ));
+    }
+
+    #[test]
+    fn define_accessor_charges_only_net_growth_after_validation() {
+        with_machine(Limits::default(), |machine| {
+            let object = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    extensible: true,
+                    boxed_primitive: None,
+                })
+                .unwrap();
+            let index = machine.runtime_slot(object).unwrap().unwrap();
+            let key = PropertyKey::Named(EcmaString::from_utf8("accessor"));
+
+            machine
+                .define_accessor(object, key.clone(), Value::int32(1), AccessorKind::Getter)
+                .unwrap();
+            let replacement_slot_bytes = machine.slot_bytes[index];
+            let replacement_heap_bytes = machine.heap_bytes;
+            machine
+                .define_accessor(object, key.clone(), Value::int32(2), AccessorKind::Getter)
+                .unwrap();
+            machine
+                .define_accessor(object, key.clone(), Value::int32(3), AccessorKind::Setter)
+                .unwrap();
+            assert_eq!(machine.slot_bytes[index], replacement_slot_bytes);
+            assert_eq!(machine.heap_bytes, replacement_heap_bytes);
+            machine.assert_heap_ledger();
+
+            let HeapEntry::Object { properties, .. } = &mut machine.heap[index] else {
+                panic!("allocated object remains an object");
+            };
+            let Some(Property::Accessor { configurable, .. }) = properties.get_mut(&key) else {
+                panic!("accessor definition stored an accessor");
+            };
+            *configurable = false;
+
+            let failed_slot_bytes = machine.slot_bytes[index];
+            let failed_heap_bytes = machine.heap_bytes;
+            for accessor in [Value::int32(4), Value::int32(5)] {
+                assert!(matches!(
+                    machine.define_accessor(object, key.clone(), accessor, AccessorKind::Getter),
+                    Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+                ));
+                assert_eq!(machine.slot_bytes[index], failed_slot_bytes);
+                assert_eq!(machine.heap_bytes, failed_heap_bytes);
+                machine.assert_heap_ledger();
+            }
+        });
+    }
+
+    #[test]
+    fn failed_array_index_and_push_leave_storage_and_ledger_unchanged() {
+        with_machine(Limits::default(), |machine| {
+            let array = machine
+                .allocate(HeapEntry::Array {
+                    elements: Vec::new(),
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.array_prototype),
+                    extensible: true,
+                    length_writable: false,
+                })
+                .unwrap();
+            let index = machine.runtime_slot(array).unwrap().unwrap();
+            let key = PropertyKey::Named(EcmaString::from_utf8("0"));
+            let baseline_slot = machine.slot_bytes[index];
+            let baseline_heap = machine.heap_bytes;
+
+            for _ in 0..3 {
+                assert!(matches!(
+                    machine.set_own_data(index, key.clone(), Value::int32(1)),
+                    Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+                ));
+                assert!(matches!(
+                    machine.array_push(array, Value::int32(1)),
+                    Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+                ));
+                assert_eq!(machine.slot_bytes[index], baseline_slot);
+                assert_eq!(machine.heap_bytes, baseline_heap);
+                let HeapEntry::Array { elements, .. } = &machine.heap[index] else {
+                    panic!("array remains an array");
+                };
+                assert!(elements.is_empty());
+                machine.assert_heap_ledger();
+            }
+
+            let HeapEntry::Array {
+                extensible,
+                length_writable,
+                ..
+            } = &mut machine.heap[index]
+            else {
+                panic!("array remains an array");
+            };
+            *extensible = false;
+            *length_writable = true;
+            for _ in 0..3 {
+                assert!(matches!(
+                    machine.set_own_data(index, key.clone(), Value::int32(1)),
+                    Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+                ));
+                assert!(matches!(
+                    machine.array_push(array, Value::int32(1)),
+                    Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+                ));
+                assert_eq!(machine.slot_bytes[index], baseline_slot);
+                assert_eq!(machine.heap_bytes, baseline_heap);
+                machine.assert_heap_ledger();
+            }
+        });
+    }
+
+    #[test]
+    fn nonempty_array_shrink_refunds_its_initial_element_charge() {
+        with_machine(Limits::default(), |machine| {
+            let array = machine
+                .allocate(HeapEntry::Array {
+                    elements: vec![Value::int32(1), Value::int32(2)],
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.array_prototype),
+                    extensible: true,
+                    length_writable: true,
+                })
+                .unwrap();
+            let index = machine.runtime_slot(array).unwrap().unwrap();
+            let element_bytes = std::mem::size_of::<Value>();
+            // An array allocated with two elements owns the element storage it
+            // can later shrink away, plus the base slot charge.
+            let initial_charge = element_bytes.saturating_mul(2).saturating_add(1);
+            assert_eq!(machine.slot_bytes[index], initial_charge);
+            machine.assert_heap_ledger();
+
+            machine
+                .set_data_property(array, "length", Value::int32(1))
+                .unwrap();
+
+            // The shrink refund must not underflow and must leave exactly the
+            // one remaining element plus the base slot charge.
+            let shrunk_charge = element_bytes.saturating_add(1);
+            assert_eq!(machine.slot_bytes[index], shrunk_charge);
+            machine.assert_heap_ledger();
+            let HeapEntry::Array { elements, .. } = &machine.heap[index] else {
+                panic!("array remains an array");
+            };
+            assert_eq!(*elements, vec![Value::int32(1)]);
+        });
+    }
+
+    #[test]
+    fn array_length_shrink_refunds_storage_charged_by_array_replacement() {
+        with_machine(Limits::default(), |machine| {
+            let indexed = PropertyKey::Named(EcmaString::from_utf8("1"));
+            let indexed_bytes = indexed.charge_bytes();
+            let mut properties = PropertyMap::default();
+            properties.insert(
+                indexed,
+                Property::Data {
+                    value: Value::int32(99),
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                },
+            );
+            let array = machine
+                .allocate(HeapEntry::Array {
+                    elements: Vec::new(),
+                    properties,
+                    prototype: Some(machine.intrinsics.array_prototype),
+                    extensible: true,
+                    length_writable: true,
+                })
+                .unwrap();
+            let index = machine.runtime_slot(array).unwrap().unwrap();
+            let base_charge = machine.slot_bytes[index];
+            let base_heap = machine.heap_bytes;
+            let element_bytes = std::mem::size_of::<Value>();
+
+            machine
+                .replace_array_elements(array, vec![Value::int32(1), Value::int32(2)])
+                .unwrap();
+            assert_eq!(machine.slot_bytes[index], base_charge + 2 * element_bytes);
+            assert_eq!(machine.heap_bytes, base_heap + 2 * element_bytes);
+
+            machine
+                .set_data_property(array, "length", Value::int32(1))
+                .unwrap();
+            assert_eq!(
+                machine.slot_bytes[index],
+                base_charge + element_bytes - indexed_bytes
+            );
+            assert_eq!(
+                machine.heap_bytes,
+                base_heap + element_bytes - indexed_bytes
+            );
+            let HeapEntry::Array {
+                elements,
+                properties,
+                length_writable,
+                ..
+            } = &machine.heap[index]
+            else {
+                panic!("array remains an array");
+            };
+            assert_eq!(*elements, vec![Value::int32(1)]);
+            assert!(properties.0.is_empty());
+            assert!(*length_writable);
+            machine.assert_heap_ledger();
+
+            let HeapEntry::Array {
+                length_writable, ..
+            } = &mut machine.heap[index]
+            else {
+                panic!("array remains an array");
+            };
+            *length_writable = false;
+            let failed_slot = machine.slot_bytes[index];
+            let failed_heap = machine.heap_bytes;
+            assert!(matches!(
+                machine.set_data_property(array, "length", Value::int32(0)),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+            assert_eq!(machine.slot_bytes[index], failed_slot);
+            assert_eq!(machine.heap_bytes, failed_heap);
+            let HeapEntry::Array {
+                elements,
+                properties,
+                ..
+            } = &machine.heap[index]
+            else {
+                panic!("array remains an array");
+            };
+            assert_eq!(*elements, vec![Value::int32(1)]);
+            assert!(properties.0.is_empty());
+            machine.assert_heap_ledger();
+        });
+    }
+
+    #[test]
+    fn object_add_delete_churn_refunds_data_and_accessor_charges() {
+        with_machine(Limits::default(), |machine| {
+            let object = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let index = machine.runtime_slot(object).unwrap().unwrap();
+            let data = PropertyKey::Named(EcmaString::from_utf8("data"));
+            let accessor = PropertyKey::Named(EcmaString::from_utf8("accessor"));
+            let baseline_slot = machine.slot_bytes[index];
+            let baseline_heap = machine.heap_bytes;
+
+            for _ in 0..3 {
+                machine
+                    .set_own_data(index, data.clone(), Value::int32(1))
+                    .unwrap();
+                assert!(machine.delete_property(object, &data).unwrap());
+                machine
+                    .define_accessor(
+                        object,
+                        accessor.clone(),
+                        Value::int32(2),
+                        AccessorKind::Getter,
+                    )
+                    .unwrap();
+                assert!(machine.delete_property(object, &accessor).unwrap());
+                assert_eq!(machine.slot_bytes[index], baseline_slot);
+                assert_eq!(machine.heap_bytes, baseline_heap);
+                machine.assert_heap_ledger();
+            }
+        });
+    }
+
+    #[test]
+    fn array_grow_shrink_churn_refunds_elements_and_indexed_properties() {
+        with_machine(Limits::default(), |machine| {
+            let array = machine
+                .allocate(HeapEntry::Array {
+                    elements: Vec::new(),
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.array_prototype),
+                    extensible: true,
+                    length_writable: true,
+                })
+                .unwrap();
+            let index = machine.runtime_slot(array).unwrap().unwrap();
+            let element = PropertyKey::Named(EcmaString::from_utf8("3"));
+            let indexed_accessor = PropertyKey::Named(EcmaString::from_utf8("5"));
+            let length = PropertyKey::Named(EcmaString::from_utf8("length"));
+            let baseline_slot = machine.slot_bytes[index];
+            let baseline_heap = machine.heap_bytes;
+
+            for _ in 0..3 {
+                machine
+                    .set_own_data(index, element.clone(), Value::int32(1))
+                    .unwrap();
+                machine
+                    .define_accessor(
+                        array,
+                        indexed_accessor.clone(),
+                        Value::int32(2),
+                        AccessorKind::Getter,
+                    )
+                    .unwrap();
+                machine
+                    .set_own_data(index, length.clone(), Value::int32(0))
+                    .unwrap();
+                assert_eq!(machine.slot_bytes[index], baseline_slot);
+                assert_eq!(machine.heap_bytes, baseline_heap);
+                let HeapEntry::Array {
+                    elements,
+                    properties,
+                    ..
+                } = &machine.heap[index]
+                else {
+                    panic!("array remains an array");
+                };
+                assert!(elements.is_empty());
+                assert!(properties.get(&indexed_accessor).is_none());
+                machine.assert_heap_ledger();
+            }
+        });
+    }
+
+    #[test]
+    fn settled_promise_reaction_charge_survives_source_collection_in_queue() {
+        with_machine(Limits::default(), |machine| {
+            let source = machine.create_promise().unwrap();
+            let source_index = machine.runtime_slot(source).unwrap().unwrap();
+            machine
+                .promise_then(source, Value::UNDEFINED, Value::UNDEFINED)
+                .unwrap();
+            machine.fulfill_promise(source, Value::int32(1)).unwrap();
+            assert_eq!(machine.microtasks.len(), 1);
+            assert_eq!(
+                machine.microtasks.front().unwrap().retained_bytes,
+                std::mem::size_of::<PromiseReaction>()
+            );
+            machine.assert_heap_ledger();
+
+            machine.collect_garbage();
+            assert!(matches!(machine.heap[source_index], HeapEntry::Vacant));
+            assert_eq!(machine.slot_bytes[source_index], 0);
+            assert!(machine.machine_bytes >= std::mem::size_of::<PromiseReaction>());
+            machine.assert_heap_ledger();
+        });
+    }
+
+    #[test]
+    fn dequeued_promise_job_refunds_machine_owned_reaction_charge() {
+        with_machine(Limits::default(), |machine| {
+            let source = machine.create_promise().unwrap();
+            let machine_baseline = machine.machine_bytes;
+            machine
+                .promise_then(source, Value::UNDEFINED, Value::UNDEFINED)
+                .unwrap();
+            machine.fulfill_promise(source, Value::int32(1)).unwrap();
+            assert_eq!(
+                machine.machine_bytes,
+                machine_baseline + std::mem::size_of::<PromiseReaction>()
+            );
+            machine.assert_heap_ledger();
+
+            let drain = machine.drain_microtasks().unwrap();
+            assert_eq!(drain.executed, 1);
+            assert_eq!(machine.machine_bytes, machine_baseline);
+            assert!(machine.microtasks.is_empty());
+            machine.assert_heap_ledger();
+
+            let failing_source = machine.create_promise().unwrap();
+            let failing_index = machine.runtime_slot(failing_source).unwrap().unwrap();
+            machine.charge_promise_reactions(failing_index, 2).unwrap();
+            let HeapEntry::Promise {
+                state:
+                    PromiseState::Pending {
+                        fulfill_reactions,
+                        reject_reactions,
+                    },
+                ..
+            } = &mut machine.heap[failing_index]
+            else {
+                panic!("new Promise is pending");
+            };
+            fulfill_reactions.push(PromiseReaction::Fulfilled {
+                handler: Value::UNDEFINED,
+                derived: Value::int32(0),
+                context: None,
+            });
+            reject_reactions.push(PromiseReaction::Rejected {
+                handler: Value::UNDEFINED,
+                derived: Value::int32(0),
+                context: None,
+            });
+            machine
+                .fulfill_promise(failing_source, Value::int32(1))
+                .unwrap();
+            assert_eq!(
+                machine.machine_bytes,
+                machine_baseline + std::mem::size_of::<PromiseReaction>()
+            );
+            assert!(machine.drain_microtasks().is_err());
+            assert_eq!(machine.machine_bytes, machine_baseline);
+            assert!(machine.microtasks.is_empty());
+            machine.assert_heap_ledger();
+        });
+    }
+
+    #[test]
+    fn promise_all_values_charge_moves_to_output_before_aggregate_collection() {
+        with_machine(Limits::default(), |machine| {
+            let promise = machine.create_promise().unwrap();
+            let aggregate = machine
+                .allocate(HeapEntry::PromiseAll {
+                    promise,
+                    values: Vec::new(),
+                    remaining: 1,
+                    settled: false,
+                })
+                .unwrap();
+            let aggregate_index = machine.runtime_slot(aggregate).unwrap().unwrap();
+            let output_index = machine.add_promise_all_element(aggregate).unwrap();
+            let element = machine
+                .allocate(HeapEntry::PromiseAllElement {
+                    aggregate,
+                    index: output_index,
+                    called: false,
+                })
+                .unwrap();
+            assert!(!machine.finish_promise_all(aggregate).unwrap());
+            machine
+                .resolve_promise_all_element(element, Value::int32(7))
+                .unwrap();
+            let promise_index = machine.runtime_slot(promise).unwrap().unwrap();
+            let HeapEntry::Promise {
+                state: PromiseState::Fulfilled { value: output },
+                ..
+            } = &machine.heap[promise_index]
+            else {
+                panic!("Promise.all result is fulfilled");
+            };
+            let output = *output;
+            let output_index = machine.runtime_slot(output).unwrap().unwrap();
+            assert_eq!(machine.slot_bytes[aggregate_index], 1);
+            assert_eq!(
+                machine.slot_bytes[output_index],
+                1 + std::mem::size_of::<Value>()
+            );
+            machine.assert_heap_ledger();
+
+            machine
+                .globals
+                .insert(EcmaString::from_utf8("promiseAllOutput"), output);
+            machine.collect_garbage();
+            assert!(matches!(machine.heap[aggregate_index], HeapEntry::Vacant));
+            assert_eq!(machine.slot_bytes[aggregate_index], 0);
+            assert_eq!(
+                machine.slot_bytes[output_index],
+                1 + std::mem::size_of::<Value>()
+            );
+            machine.assert_heap_ledger();
+        });
+    }
+
+    #[test]
+    fn vacant_runtime_handle_is_rejected() {
+        with_machine(Limits::default(), |machine| {
+            let value = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .unwrap();
+            let index = machine.runtime_slot(value).unwrap().unwrap();
+            machine.heap_bytes -= machine.slot_bytes[index];
+            machine.slot_bytes[index] = 0;
+            machine.heap[index] = HeapEntry::Vacant;
+            machine.vacant_count += 1;
+
+            let Some(Decoded::HeapRef(id)) = value.decode() else {
+                panic!("allocated value is a heap reference");
+            };
+            assert_eq!(
+                machine.runtime_slot(value),
+                Err(RuntimeErrorKind::InvalidRuntimeHeapReference { slot: id.slot() })
+            );
+            machine.assert_heap_ledger();
+        });
+    }
+
+    #[test]
+    fn slot_ids_stay_append_only_after_a_tombstone() {
+        with_machine(Limits::default(), |machine| {
+            let stale = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("stale")))
+                .unwrap();
+            let stale_index = machine.runtime_slot(stale).unwrap().unwrap();
+            machine.heap_bytes -= machine.slot_bytes[stale_index];
+            machine.slot_bytes[stale_index] = 0;
+            machine.heap[stale_index] = HeapEntry::Vacant;
+            machine.vacant_count += 1;
+
+            let live = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("live")))
+                .unwrap();
+            assert_ne!(stale, live);
+            assert!(matches!(
+                machine.runtime_slot(stale),
+                Err(RuntimeErrorKind::InvalidRuntimeHeapReference { .. })
+            ));
+            assert_eq!(machine.runtime_slot(live).unwrap(), Some(stale_index + 1));
+            machine.assert_heap_ledger();
+        });
+    }
+
+    #[test]
+    fn live_slot_limit_excludes_tombstones() {
+        with_machine(
+            Limits {
+                max_heap_slots: 1,
+                ..Limits::default()
+            },
+            |machine| {
+                let value = machine
+                    .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                    .unwrap();
+                assert!(matches!(
+                    machine.ensure_allocation_capacity(1, 0),
+                    Err(RuntimeErrorKind::HeapSlotLimitExceeded { limit: 1 })
+                ));
+
+                let index = machine.runtime_slot(value).unwrap().unwrap();
+                machine.heap_bytes -= machine.slot_bytes[index];
+                machine.slot_bytes[index] = 0;
+                machine.heap[index] = HeapEntry::Vacant;
+                machine.vacant_count += 1;
+
+                machine.ensure_allocation_capacity(1, 0).unwrap();
+                machine.assert_heap_ledger();
+            },
+        );
+    }
+
+    #[test]
+    fn async_await_setup_failure_releases_suspended_registers() {
+        let program = verified(
+            vec![Constant::Undefined],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Await {
+                            dst: reg(1),
+                            src: reg(0),
+                            resume: pc(2),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let limits = Limits {
+            max_microtasks: 0,
+            ..Limits::default()
+        };
+        let mut machine = Machine::new(&program, &mut host, limits);
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+
+        assert!(matches!(
+            machine.call_value(callable, Value::UNDEFINED, &[]),
+            Err(EvalFailure::Runtime(
+                RuntimeErrorKind::MicrotaskQueueLimitExceeded { limit: 0 }
+            ))
+        ));
+        assert_eq!(machine.live_registers, 0);
+    }
+
+    #[test]
+    fn async_engine_type_error_rejection_has_intrinsic_shape() {
+        // An async body that calls a non-callable must reject via start_async_call
+        // with a materialized intrinsic TypeError (not undefined) while retaining
+        // the matching engine TypeError origin on the Promise.
+        let program = verified(
+            vec![Constant::Int32(0)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::CreateArray { dst: reg(1) },
+                        Instruction::Call {
+                            dst: reg(2),
+                            callee: reg(0),
+                            this_value: reg(0),
+                            arguments: reg(1),
+                        },
+                        Instruction::Return { value: reg(2) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let promise = machine
+            .call_value(callable, Value::UNDEFINED, &[])
+            .expect("async call returns a rejected promise");
+        let index = machine
+            .runtime_slot(promise)
+            .unwrap()
+            .expect("async result is a promise");
+        let HeapEntry::Promise {
+            state: PromiseState::Rejected { reason, origin },
+            ..
+        } = &machine.heap[index]
+        else {
+            panic!("async engine TypeError must reject its promise");
+        };
+        let reason = *reason;
+        let origin = *origin;
+        assert_ne!(reason, Value::UNDEFINED);
+        assert_eq!(origin, ThrowOrigin::TypeError { operation: "call" });
+        let name = machine.get_named_property(reason, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name)
+                .is_some_and(|text| text.eq_ascii("TypeError"))
+        );
+        let message = machine.get_named_property(reason, "message").unwrap();
+        assert!(
+            machine
+                .string_value(message)
+                .is_some_and(|text| text.eq_ascii("call"))
+        );
+        let constructor = machine.intrinsics.global("TypeError").unwrap();
+        assert!(machine.instance_of(reason, constructor).unwrap());
+        machine.run_to_quiescence().unwrap();
+    }
+
+    #[test]
+    fn async_prematerialized_rejection_keeps_identity() {
+        // An async body that throws a preallocated object must reject with that
+        // exact Value and Bytecode origin (no rematerialization).
+        let program = verified(
+            Vec::new(),
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_function(1, 1, vec![Instruction::Throw { value: reg(0) }], Vec::new()),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let preallocated = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        let callable = generator_callable(&mut machine, 1);
+        let promise = machine
+            .call_value(callable, Value::UNDEFINED, &[preallocated])
+            .expect("async call returns a rejected promise");
+        let index = machine
+            .runtime_slot(promise)
+            .unwrap()
+            .expect("async result is a promise");
+        let HeapEntry::Promise {
+            state: PromiseState::Rejected { reason, origin },
+            ..
+        } = &machine.heap[index]
+        else {
+            panic!("async explicit throw must reject its promise");
+        };
+        assert_eq!(*reason, preallocated);
+        assert_eq!(*origin, ThrowOrigin::Bytecode);
+        machine.run_to_quiescence().unwrap();
+    }
+
+    #[test]
+    fn reject_promise_materializes_lazy_type_error_once() {
+        // Direct sink contract: UNDEFINED + engine TypeError origin becomes one
+        // intrinsic TypeError object; a second reject on a settled promise is a
+        // no-op and must not allocate another reason.
+        let program = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let promise = machine.create_promise().unwrap();
+        let before = machine.heap.len();
+        machine
+            .reject_promise(
+                promise,
+                Value::UNDEFINED,
+                ThrowOrigin::TypeError {
+                    operation: "sink materialize",
+                },
+            )
+            .unwrap();
+        let after_first = machine.heap.len();
+        assert!(
+            after_first > before,
+            "lazy rejection must allocate an error"
+        );
+        let index = machine.runtime_slot(promise).unwrap().unwrap();
+        let HeapEntry::Promise {
+            state: PromiseState::Rejected { reason, origin },
+            ..
+        } = &machine.heap[index]
+        else {
+            panic!("sink must reject");
+        };
+        let reason = *reason;
+        let origin = *origin;
+        assert_ne!(reason, Value::UNDEFINED);
+        assert_eq!(
+            origin,
+            ThrowOrigin::TypeError {
+                operation: "sink materialize",
+            }
+        );
+        let name = machine.get_named_property(reason, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name)
+                .is_some_and(|text| text.eq_ascii("TypeError"))
+        );
+        let message = machine.get_named_property(reason, "message").unwrap();
+        assert!(
+            machine
+                .string_value(message)
+                .is_some_and(|text| text.eq_ascii("sink materialize"))
+        );
+        let constructor = machine.intrinsics.global("TypeError").unwrap();
+        assert!(machine.instance_of(reason, constructor).unwrap());
+
+        machine
+            .reject_promise(
+                promise,
+                Value::UNDEFINED,
+                ThrowOrigin::TypeError {
+                    operation: "second materialize",
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            machine.heap.len(),
+            after_first,
+            "settled reject must not rematerialize"
+        );
+        let HeapEntry::Promise {
+            state:
+                PromiseState::Rejected {
+                    reason: kept_reason,
+                    origin: kept_origin,
+                },
+            ..
+        } = &machine.heap[index]
+        else {
+            panic!("sink must stay rejected");
+        };
+        assert_eq!(*kept_reason, reason);
+        assert_eq!(*kept_origin, origin);
+    }
+
+    #[test]
+    fn reject_promise_keeps_prematerialized_identity() {
+        // Direct sink contract: an already-materialized reason and Bytecode
+        // origin keep exact Value identity with no rematerialization.
+        let program = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let preallocated = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        let promise = machine.create_promise().unwrap();
+        let before = machine.heap.len();
+        machine
+            .reject_promise(promise, preallocated, ThrowOrigin::Bytecode)
+            .unwrap();
+        assert_eq!(
+            machine.heap.len(),
+            before,
+            "prematerialized reject allocates no error"
+        );
+        let index = machine.runtime_slot(promise).unwrap().unwrap();
+        let HeapEntry::Promise {
+            state: PromiseState::Rejected { reason, origin },
+            ..
+        } = &machine.heap[index]
+        else {
+            panic!("sink must reject");
+        };
+        assert_eq!(*reason, preallocated);
+        assert_eq!(*origin, ThrowOrigin::Bytecode);
+    }
+
+    fn run_ok(program: &Program<Verified>) -> Execution {
+        let mut host = TestHost;
+        Machine::new(program, &mut host, Limits::default())
             .run()
             .unwrap()
+    }
+
+    fn generator_callable<H: Host>(machine: &mut Machine<'_, H>, function: u32) -> Value {
+        machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(function),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap()
+    }
+
+    fn generator_next<H: Host>(
+        machine: &mut Machine<'_, H>,
+        generator: Value,
+        resume_value: Value,
+    ) -> Result<(Value, bool), EvalFailure> {
+        let next = machine.get_named_property(generator, "next")?;
+        let result = machine.call_value(next, generator, &[resume_value])?;
+        let done = machine.get_named_property(result, "done")?;
+        let value = machine.get_named_property(result, "value")?;
+        Ok((value, machine.truthy(done)))
+    }
+
+    #[test]
+    fn sync_generator_is_lazy_resumes_registers_and_stays_completed() {
+        let program = verified(
+            vec![Constant::Int32(10)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                generator_function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(1),
+                            src: reg(0),
+                            resume: pc(2),
+                        },
+                        Instruction::Binary {
+                            dst: reg(2),
+                            op: BinaryOp::Add,
+                            left: reg(0),
+                            right: reg(1),
+                        },
+                        Instruction::Return { value: reg(2) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        assert_eq!(machine.live_registers, 0, "calling must not start the body");
+        machine
+            .set_data_property(generator, "visible", Value::int32(1))
+            .unwrap();
+        assert_eq!(
+            machine.get_named_property(generator, "visible").unwrap(),
+            Value::int32(1),
+        );
+        assert_eq!(
+            machine.own_property_keys(generator).unwrap(),
+            vec![PropertyKey::Named(EcmaString::from_utf8("visible"))],
+        );
+        assert!(
+            machine
+                .inherits_from_prototype(
+                    generator,
+                    machine.intrinsics.builtins.generator_prototype(),
+                )
+                .unwrap()
+        );
+
+        assert_eq!(
+            generator_next(&mut machine, generator, Value::int32(99)).unwrap(),
+            (Value::int32(10), false),
+        );
+        assert_eq!(machine.live_registers, 3);
+        assert_eq!(
+            generator_next(&mut machine, generator, Value::int32(5)).unwrap(),
+            (Value::int32(15), true),
+        );
+        assert_eq!(machine.live_registers, 0);
+        assert_eq!(
+            generator_next(&mut machine, generator, Value::int32(8)).unwrap(),
+            (Value::UNDEFINED, true),
+        );
+    }
+
+    #[test]
+    fn sync_generator_reentrant_next_is_a_type_error() {
+        let program = verified(
+            Vec::new(),
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                generator_function(0, 1, vec![Instruction::Halt], Vec::new()),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        let _ = machine.take_generator_state(generator).unwrap();
+
+        assert!(matches!(
+            generator_next(&mut machine, generator, Value::UNDEFINED),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+    }
+
+    #[test]
+    fn sync_generator_uncaught_throw_preserves_origin_and_completes() {
+        let program = verified(
+            vec![Constant::Int32(7)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                generator_function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Throw { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        assert!(matches!(
+            generator_next(&mut machine, generator, Value::UNDEFINED),
+            Err(EvalFailure::ThrowValueOrigin {
+                value,
+                origin: ThrowOrigin::Bytecode,
+            }) if value == Value::int32(7)
+        ));
+        assert_eq!(
+            generator_next(&mut machine, generator, Value::UNDEFINED).unwrap(),
+            (Value::UNDEFINED, true),
+        );
+        assert_eq!(machine.live_registers, 0);
+    }
+
+    #[test]
+    fn outer_compiled_handler_catches_generator_throw_value() {
+        let program = verified(
+            vec![
+                Constant::Int32(7),
+                Constant::Undefined,
+                Constant::String(EcmaString::from_utf8("next")),
+            ],
+            vec![
+                function(
+                    0,
+                    8,
+                    vec![
+                        Instruction::CreateArray { dst: reg(0) },
+                        Instruction::CreateClosure {
+                            dst: reg(1),
+                            function: FunctionId::new(1),
+                            captures: reg(0),
+                        },
+                        Instruction::CreateArray { dst: reg(2) },
+                        Instruction::LoadConst {
+                            dst: reg(3),
+                            constant: cid(1),
+                        },
+                        Instruction::Call {
+                            dst: reg(4),
+                            callee: reg(1),
+                            this_value: reg(3),
+                            arguments: reg(2),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(5),
+                            constant: cid(2),
+                        },
+                        Instruction::GetProperty {
+                            dst: reg(6),
+                            object: reg(4),
+                            key: reg(5),
+                        },
+                        Instruction::Call {
+                            dst: reg(7),
+                            callee: reg(6),
+                            this_value: reg(4),
+                            arguments: reg(2),
+                        },
+                        Instruction::Return { value: reg(3) },
+                        Instruction::Return { value: reg(7) },
+                    ],
+                    vec![ExceptionHandler {
+                        start: pc(7),
+                        end: pc(8),
+                        handler: pc(9),
+                        catch_register: reg(7),
+                    }],
+                ),
+                generator_function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Throw { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+
+        assert_eq!(run_ok(&program).value, Value::int32(7));
+    }
+
+    #[test]
+    fn sync_generator_catches_body_throw_before_suspending() {
+        let program = verified(
+            vec![Constant::Int32(7)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                generator_function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Throw { value: reg(0) },
+                        Instruction::Suspend {
+                            dst: reg(2),
+                            src: reg(1),
+                            resume: pc(3),
+                        },
+                        Instruction::Return { value: reg(2) },
+                    ],
+                    vec![ExceptionHandler {
+                        start: pc(1),
+                        end: pc(2),
+                        handler: pc(2),
+                        catch_register: reg(1),
+                    }],
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        assert_eq!(
+            generator_next(&mut machine, generator, Value::UNDEFINED).unwrap(),
+            (Value::int32(7), false),
+        );
+        assert_eq!(
+            generator_next(&mut machine, generator, Value::int32(9)).unwrap(),
+            (Value::int32(9), true),
+        );
+    }
+
+    #[test]
+    fn suspended_generator_registers_remain_charged() {
+        let program = verified(
+            vec![Constant::Int32(1)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                generator_function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(1),
+                            src: reg(0),
+                            resume: pc(2),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(
+            &program,
+            &mut host,
+            Limits {
+                max_total_registers: 3,
+                ..Limits::default()
+            },
+        );
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let first = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        let second = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        assert_eq!(
+            generator_next(&mut machine, first, Value::UNDEFINED).unwrap(),
+            (Value::int32(1), false),
+        );
+        assert!(matches!(
+            generator_next(&mut machine, second, Value::UNDEFINED),
+            Err(EvalFailure::Runtime(
+                RuntimeErrorKind::RegisterLimitExceeded { .. }
+            ))
+        ));
+        assert_eq!(machine.live_registers, 3);
+        assert_eq!(
+            generator_next(&mut machine, first, Value::int32(4)).unwrap(),
+            (Value::int32(4), true),
+        );
+        assert_eq!(machine.live_registers, 0);
+    }
+
+    #[test]
+    fn resumed_generator_call_depth_failure_releases_registers() {
+        let program = verified(
+            vec![Constant::Int32(1)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                generator_function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(1),
+                            src: reg(0),
+                            resume: pc(2),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(
+            &program,
+            &mut host,
+            Limits {
+                max_total_registers: 2,
+                ..Limits::default()
+            },
+        );
+        machine.frames.clear();
+        machine.live_registers = 0;
+
+        let callable = generator_callable(&mut machine, 1);
+        let first = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        // Start and suspend the first generator, charging its two registers.
+        assert_eq!(
+            generator_next(&mut machine, first, Value::UNDEFINED).unwrap(),
+            (Value::int32(1), false),
+        );
+        assert_eq!(machine.live_registers, 2);
+
+        // Fill the compiled call depth to the exact limit so the next resume
+        // fails in push_resumed_generator_frame before it can take ownership.
+        machine.frames.push(Frame {
+            module: ModuleId::new(0),
+            function: 0,
+            pc: 0,
+            registers: Vec::new(),
+            return_to: None,
+            this_value: Value::UNDEFINED,
+            new_target: Value::UNDEFINED,
+            args: Vec::new(),
+            arguments_object: None,
+        });
+        machine.limits.max_call_depth = machine.frames.len();
+
+        assert!(matches!(
+            generator_next(&mut machine, first, Value::int32(7)),
+            Err(EvalFailure::Runtime(
+                RuntimeErrorKind::CallDepthExceeded { .. }
+            ))
+        ));
+        assert_eq!(machine.live_registers, 0);
+
+        // The generator is now sticky Completed.
+        assert_eq!(
+            generator_next(&mut machine, first, Value::UNDEFINED).unwrap(),
+            (Value::UNDEFINED, true),
+        );
+
+        // Remove the artificial depth and make room for another activation.
+        machine.frames.pop();
+        machine.limits.max_call_depth = Limits::default().max_call_depth;
+
+        // A second generator can suspend again only if the first's charge was released.
+        let second = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        assert_eq!(
+            generator_next(&mut machine, second, Value::UNDEFINED).unwrap(),
+            (Value::int32(1), false),
+        );
+        assert_eq!(machine.live_registers, 2);
+        assert_eq!(
+            generator_next(&mut machine, second, Value::int32(9)).unwrap(),
+            (Value::int32(9), true),
+        );
+        assert_eq!(machine.live_registers, 0);
+    }
+    #[test]
+    fn array_extend_consumes_generator_through_sync_iterator_protocol() {
+        let program = verified(
+            vec![Constant::Int32(1), Constant::Int32(2)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                generator_function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(2),
+                            src: reg(0),
+                            resume: pc(2),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(1),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(2),
+                            src: reg(1),
+                            resume: pc(4),
+                        },
+                        Instruction::Return { value: reg(2) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        let array = machine
+            .allocate(HeapEntry::Array {
+                elements: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.array_prototype),
+                extensible: true,
+                length_writable: true,
+            })
+            .unwrap();
+
+        machine.array_extend(array, generator).unwrap();
+        assert_eq!(
+            machine.array_elements(array).unwrap(),
+            Some(vec![Value::int32(1), Value::int32(2)]),
+        );
+        assert_eq!(machine.live_registers, 0);
+    }
+
+    fn async_generator_next<H: Host>(
+        machine: &mut Machine<'_, H>,
+        generator: Value,
+        resume_value: Value,
+    ) -> Result<Value, EvalFailure> {
+        let next = machine.get_named_property(generator, "next")?;
+        machine.call_value(next, generator, &[resume_value])
+    }
+
+    fn settled_iterator_result<H: Host>(
+        machine: &mut Machine<'_, H>,
+        promise: Value,
+    ) -> (Value, bool) {
+        let index = machine.runtime_slot(promise).unwrap().unwrap();
+        let HeapEntry::Promise {
+            state: PromiseState::Fulfilled { value },
+            ..
+        } = &machine.heap[index]
+        else {
+            panic!("capability must be fulfilled");
+        };
+        let result = *value;
+        let done = machine.get_named_property(result, "done").unwrap();
+        let value = machine.get_named_property(result, "value").unwrap();
+        (value, machine.truthy(done))
+    }
+
+    fn rejected_reason<H: Host>(machine: &Machine<'_, H>, promise: Value) -> Value {
+        let index = machine.runtime_slot(promise).unwrap().unwrap();
+        let HeapEntry::Promise {
+            state: PromiseState::Rejected { reason, .. },
+            ..
+        } = &machine.heap[index]
+        else {
+            panic!("capability must be rejected");
+        };
+        *reason
+    }
+
+    fn pending_promise<H: Host>(machine: &Machine<'_, H>, promise: Value) -> bool {
+        let Some(index) = machine.runtime_slot(promise).unwrap() else {
+            return false;
+        };
+        matches!(
+            machine.heap[index],
+            HeapEntry::Promise {
+                state: PromiseState::Pending { .. },
+                ..
+            }
+        )
+    }
+
+    #[test]
+    fn async_generator_call_creates_object_without_running_body() {
+        let program = verified(
+            vec![
+                Constant::Int32(1),
+                Constant::String(EcmaString::from_utf8("started")),
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        assert_eq!(machine.live_registers, 0, "calling must not start the body");
+        assert_eq!(machine.globals.get(&EcmaString::from_utf8("started")), None);
+        let index = machine.runtime_slot(generator).unwrap().unwrap();
+        assert!(matches!(
+            machine.heap[index],
+            HeapEntry::AsyncGenerator {
+                state: AsyncGeneratorState::SuspendedStart(_),
+                ..
+            }
+        ));
+        assert!(
+            machine
+                .inherits_from_prototype(
+                    generator,
+                    machine.intrinsics.builtins.async_generator_prototype(),
+                )
+                .unwrap()
+        );
+
+        // The first next() starts the body and settles once it returns.
+        let capability = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        assert!(pending_promise(&machine, capability));
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            machine.globals.get(&EcmaString::from_utf8("started")),
+            Some(&Value::int32(1)),
+        );
+        assert_eq!(
+            settled_iterator_result(&mut machine, capability),
+            (Value::int32(1), true),
+        );
+        assert_eq!(machine.live_registers, 0);
+    }
+
+    #[test]
+    fn async_generator_next_returns_promise_settled_with_iterator_result() {
+        let program = verified(
+            vec![Constant::Int32(10)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(1),
+                            src: reg(0),
+                            resume: pc(2),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let first = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        let index = machine.runtime_slot(first).unwrap().unwrap();
+        assert!(matches!(machine.heap[index], HeapEntry::Promise { .. }));
+        assert!(pending_promise(&machine, first));
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            settled_iterator_result(&mut machine, first),
+            (Value::int32(10), false),
+        );
+
+        let second = async_generator_next(&mut machine, generator, Value::int32(5)).unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            settled_iterator_result(&mut machine, second),
+            (Value::int32(5), true),
+        );
+        assert_eq!(machine.live_registers, 0);
+    }
+
+    #[test]
+    fn async_generator_await_resumes_without_producing_an_item() {
+        let program = verified(
+            vec![
+                Constant::Int32(1),
+                Constant::String(EcmaString::from_utf8("p")),
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    4,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(1),
+                        },
+                        Instruction::Await {
+                            dst: reg(1),
+                            src: reg(0),
+                            resume: pc(2),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(2),
+                            constant: cid(0),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(3),
+                            src: reg(2),
+                            resume: pc(4),
+                        },
+                        Instruction::Return { value: reg(3) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let awaited = machine.create_promise().unwrap();
+        machine.resolve_promise(awaited, Value::int32(9)).unwrap();
+        machine.globals.insert(EcmaString::from_utf8("p"), awaited);
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let capability = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        machine.drain_microtasks().unwrap();
+        // The await must not settle the request: exactly one item is produced,
+        // by the yield after the await.
+        assert_eq!(
+            settled_iterator_result(&mut machine, capability),
+            (Value::int32(1), false),
+        );
+        let index = machine.runtime_slot(generator).unwrap().unwrap();
+        let HeapEntry::AsyncGenerator { state, queue, .. } = &machine.heap[index] else {
+            panic!("generator heap entry");
+        };
+        assert!(matches!(state, AsyncGeneratorState::SuspendedYield(_)));
+        assert!(queue.is_empty(), "await must not pop the request queue");
+    }
+
+    #[test]
+    fn async_generator_resume_call_depth_failure_releases_registers_once() {
+        let program = verified(
+            vec![Constant::String(EcmaString::from_utf8("p"))],
+            vec![
+                function(0, 0, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::Await {
+                            dst: reg(1),
+                            src: reg(0),
+                            resume: pc(2),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let awaited = machine.create_promise().unwrap();
+        machine.globals.insert(EcmaString::from_utf8("p"), awaited);
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        assert_eq!(machine.live_registers, 2);
+
+        machine.limits.max_call_depth = 0;
+        machine.resolve_promise(awaited, Value::int32(1)).unwrap();
+        let error = machine
+            .drain_microtasks()
+            .expect_err("resume exceeds the call-depth limit");
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::CallDepthExceeded { limit: 0 }
+        ));
+        assert_eq!(machine.live_registers, 0);
+    }
+
+    #[test]
+    fn async_generator_yield_awaits_its_operand() {
+        let program = verified(
+            vec![Constant::String(EcmaString::from_utf8("p"))],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(1),
+                            src: reg(0),
+                            resume: pc(2),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let yielded = machine.create_promise().unwrap();
+        machine.resolve_promise(yielded, Value::int32(41)).unwrap();
+        machine.globals.insert(EcmaString::from_utf8("p"), yielded);
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let capability = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        machine.drain_microtasks().unwrap();
+        // The consumer sees the unwrapped value, never the yielded Promise.
+        assert_eq!(
+            settled_iterator_result(&mut machine, capability),
+            (Value::int32(41), false),
+        );
+    }
+
+    #[test]
+    fn async_generator_queue_serves_concurrent_next_calls_in_order() {
+        let program = verified(
+            vec![Constant::Int32(1), Constant::Int32(2), Constant::Int32(3)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    5,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(4),
+                            src: reg(0),
+                            resume: pc(2),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(1),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(4),
+                            src: reg(1),
+                            resume: pc(4),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(2),
+                            constant: cid(2),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(4),
+                            src: reg(2),
+                            resume: pc(6),
+                        },
+                        Instruction::Return { value: reg(4) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let first = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        let second = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        let third = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        let fourth = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        assert!(pending_promise(&machine, first));
+        assert!(pending_promise(&machine, second));
+        assert!(pending_promise(&machine, third));
+        assert!(pending_promise(&machine, fourth));
+
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            settled_iterator_result(&mut machine, first),
+            (Value::int32(1), false),
+        );
+        assert_eq!(
+            settled_iterator_result(&mut machine, second),
+            (Value::int32(2), false),
+        );
+        assert_eq!(
+            settled_iterator_result(&mut machine, third),
+            (Value::int32(3), false),
+        );
+        assert_eq!(
+            settled_iterator_result(&mut machine, fourth),
+            (Value::UNDEFINED, true),
+        );
+        assert_eq!(machine.live_registers, 0);
+    }
+
+    #[test]
+    fn async_generator_return_settles_front_and_drains_queue() {
+        let program = verified(
+            vec![Constant::Int32(9)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let front = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        let later = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            settled_iterator_result(&mut machine, front),
+            (Value::int32(9), true),
+        );
+        assert_eq!(
+            settled_iterator_result(&mut machine, later),
+            (Value::UNDEFINED, true),
+        );
+        // A completed generator keeps answering done without re-entering.
+        let after = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            settled_iterator_result(&mut machine, after),
+            (Value::UNDEFINED, true),
+        );
+        assert_eq!(machine.live_registers, 0);
+    }
+
+    #[test]
+    fn async_generator_throw_rejects_front_and_drains_queue() {
+        let program = verified(
+            vec![Constant::Int32(7)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Throw { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let front = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        let later = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(rejected_reason(&machine, front), Value::int32(7));
+        assert_eq!(
+            settled_iterator_result(&mut machine, later),
+            (Value::UNDEFINED, true),
+        );
+        assert_eq!(machine.live_registers, 0);
+    }
+
+    #[test]
+    fn async_generator_return_awaits_a_returned_promise() {
+        let program = verified(
+            vec![Constant::String(EcmaString::from_utf8("p"))],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let returned = machine.create_promise().unwrap();
+        machine.resolve_promise(returned, Value::int32(1)).unwrap();
+        machine.globals.insert(EcmaString::from_utf8("p"), returned);
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let capability = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        machine.drain_microtasks().unwrap();
+        // `return Promise.resolve(1)` settles the consumer with the unwrapped
+        // value (Node 24: `{value: 1, done: true}`, not a Promise).
+        assert_eq!(
+            settled_iterator_result(&mut machine, capability),
+            (Value::int32(1), true),
+        );
+        assert_eq!(machine.live_registers, 0);
+    }
+
+    #[test]
+    fn async_generator_returned_promise_rejection_rejects_front() {
+        let program = verified(
+            vec![Constant::String(EcmaString::from_utf8("p"))],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let returned = machine.create_promise().unwrap();
+        machine
+            .reject_promise(returned, Value::int32(5), ThrowOrigin::Bytecode)
+            .unwrap();
+        machine.globals.insert(EcmaString::from_utf8("p"), returned);
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let front = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        let later = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(rejected_reason(&machine, front), Value::int32(5));
+        assert_eq!(
+            settled_iterator_result(&mut machine, later),
+            (Value::UNDEFINED, true),
+        );
+    }
+
+    #[test]
+    fn async_generator_next_on_incompatible_receiver_rejects_promise() {
+        let program = verified(
+            Vec::new(),
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(0, 0, vec![Instruction::Halt], Vec::new()),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        let next = machine.get_named_property(generator, "next").unwrap();
+        let receiver = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+
+        // AsyncGenerator.prototype.next never throws synchronously; an
+        // incompatible receiver rejects with a materialized TypeError.
+        let capability = machine.call_value(next, receiver, &[]).unwrap();
+        let index = machine
+            .runtime_slot(capability)
+            .unwrap()
+            .expect("next returns a promise");
+        let HeapEntry::Promise {
+            state: PromiseState::Rejected { reason, origin },
+            ..
+        } = &machine.heap[index]
+        else {
+            panic!("incompatible receiver must reject its promise");
+        };
+        let reason = *reason;
+        let origin = *origin;
+        assert_ne!(reason, Value::UNDEFINED);
+        assert_eq!(
+            origin,
+            ThrowOrigin::TypeError {
+                operation: "AsyncGenerator.prototype.next called on incompatible receiver",
+            }
+        );
+        let name = machine.get_named_property(reason, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name)
+                .is_some_and(|text| text.eq_ascii("TypeError"))
+        );
+        let message = machine.get_named_property(reason, "message").unwrap();
+        assert!(machine.string_value(message).is_some_and(|text| {
+            text.eq_ascii("AsyncGenerator.prototype.next called on incompatible receiver")
+        }));
+        let constructor = machine.intrinsics.global("TypeError").unwrap();
+        assert!(machine.instance_of(reason, constructor).unwrap());
+    }
+
+    #[test]
+    fn async_generator_engine_type_error_rejection_has_intrinsic_shape() {
+        // An async generator body that calls a non-callable must reject the
+        // front next() capability with a materialized intrinsic TypeError.
+        let program = verified(
+            vec![Constant::Int32(0)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::CreateArray { dst: reg(1) },
+                        Instruction::Call {
+                            dst: reg(2),
+                            callee: reg(0),
+                            this_value: reg(0),
+                            arguments: reg(1),
+                        },
+                        Instruction::Return { value: reg(2) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        let promise = async_generator_next(&mut machine, generator, Value::UNDEFINED)
+            .expect("next returns a rejected promise");
+        let index = machine
+            .runtime_slot(promise)
+            .unwrap()
+            .expect("next result is a promise");
+        let HeapEntry::Promise {
+            state: PromiseState::Rejected { reason, origin },
+            ..
+        } = &machine.heap[index]
+        else {
+            panic!("async generator engine TypeError must reject its promise");
+        };
+        let reason = *reason;
+        let origin = *origin;
+        assert_ne!(reason, Value::UNDEFINED);
+        assert_eq!(origin, ThrowOrigin::TypeError { operation: "call" });
+        let name = machine.get_named_property(reason, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name)
+                .is_some_and(|text| text.eq_ascii("TypeError"))
+        );
+        let message = machine.get_named_property(reason, "message").unwrap();
+        assert!(
+            machine
+                .string_value(message)
+                .is_some_and(|text| text.eq_ascii("call"))
+        );
+        let constructor = machine.intrinsics.global("TypeError").unwrap();
+        assert!(machine.instance_of(reason, constructor).unwrap());
+        machine.run_to_quiescence().unwrap();
+    }
+
+    #[test]
+    fn iterator_result_rejects_non_object() {
+        let program = verified(
+            vec![Constant::Int32(42)],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::IteratorResult {
+                        done: reg(1),
+                        value: reg(2),
+                        result: reg(0),
+                    },
+                    Instruction::Return { value: reg(1) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        assert!(matches!(
+            machine.iterator_result_parts(Value::int32(42)),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+        let error = machine
+            .run()
+            .expect_err("IteratorResult on a primitive throws");
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::TypeError { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn iterator_step_and_result_execute_the_protocol() {
+        let program = verified(
+            Vec::new(),
+            vec![function(
+                0,
+                5,
+                vec![
+                    Instruction::CreateArray { dst: reg(0) },
+                    Instruction::GetIterator {
+                        dst: reg(1),
+                        src: reg(0),
+                        kind: IteratorKind::Sync,
+                    },
+                    Instruction::IteratorStep {
+                        dst: reg(2),
+                        iterator: reg(1),
+                    },
+                    Instruction::IteratorResult {
+                        done: reg(3),
+                        value: reg(4),
+                        result: reg(2),
+                    },
+                    Instruction::Return { value: reg(3) },
+                ],
+                Vec::new(),
+            )],
+        );
+        assert_eq!(run_ok(&program).value, Value::boolean(true));
+    }
+
+    #[test]
+    fn runtime_callback_without_interpreter_caller_propagates_throw() {
+        let program = verified(
+            Vec::new(),
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(1, 1, vec![Instruction::Throw { value: reg(0) }], Vec::new()),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callee = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(1),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        let thrown = Value::int32(7);
+
+        assert!(matches!(
+            machine.call_value(callee, Value::UNDEFINED, &[thrown]),
+            Err(EvalFailure::ThrowValueOrigin {
+                value,
+                origin: ThrowOrigin::Bytecode,
+            }) if value == thrown
+        ));
+    }
+
+    #[test]
+    fn runtime_callback_failure_releases_root_frame() {
+        let program = verified(
+            Vec::new(),
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    1,
+                    1,
+                    vec![Instruction::Return { value: reg(0) }],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callee = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(1),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        machine.fuel = 0;
+
+        assert!(matches!(
+            machine.call_value(callee, Value::UNDEFINED, &[Value::int32(7)]),
+            Err(EvalFailure::Runtime(RuntimeErrorKind::FuelExhausted { .. }))
+        ));
+        assert!(machine.frames.is_empty());
+        assert_eq!(machine.live_registers, 0);
+
+        machine.fuel = 1;
+        assert!(matches!(
+            machine.call_value(callee, Value::UNDEFINED, &[Value::int32(7)]),
+            Ok(value) if value == Value::int32(7)
+        ));
     }
 
     #[test]
@@ -3766,12 +14317,145 @@ mod tests {
     }
 
     #[test]
+    fn addition_coerces_objects_left_to_right_and_interpolates_errors() {
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("L")),
+                Constant::String(EcmaString::from_utf8("additionOrder")),
+                Constant::String(EcmaString::from_utf8("message")),
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(1),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let left = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .unwrap();
+        let right = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .unwrap();
+        let left_value_of = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(1),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        let right_value_of = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(2),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        machine
+            .set_data_property(left, "valueOf", left_value_of)
+            .unwrap();
+        machine
+            .set_data_property(right, "valueOf", right_value_of)
+            .unwrap();
+        let coerced = machine.add(left, right).unwrap();
+        assert!(
+            machine
+                .string_value(coerced)
+                .is_some_and(|text| text.eq_ascii("LL"))
+        );
+
+        let error_constructor = machine.intrinsics.global("Error").unwrap();
+        let message = machine
+            .allocate(HeapEntry::String(EcmaString::from_utf8("message")))
+            .unwrap();
+        let error = machine
+            .call_value(error_constructor, Value::UNDEFINED, &[message])
+            .unwrap();
+        let empty = machine
+            .allocate(HeapEntry::String(EcmaString::default()))
+            .unwrap();
+        let interpolated = machine.add(empty, error).unwrap();
+        assert!(
+            machine
+                .string_value(interpolated)
+                .is_some_and(|text| text.eq_ascii("Error: message"))
+        );
+
+        let date_constructor = machine.intrinsics.global("Date").unwrap();
+        let date_prototype = machine
+            .get_named_property(date_constructor, "prototype")
+            .unwrap();
+        let date = machine
+            .allocate(HeapEntry::Date {
+                time: 0.0,
+                properties: PropertyMap::default(),
+                prototype: Some(date_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        machine
+            .set_data_property(date, "toString", left_value_of)
+            .unwrap();
+        let date_text = machine.add(date, empty).unwrap();
+        assert!(
+            machine
+                .string_value(date_text)
+                .is_some_and(|text| text.eq_ascii("L"))
+        );
+    }
+
+    #[test]
     fn computed_member_access_uses_dynamic_register_key() {
         // key = "a" + "b"; obj[key] = 7; return obj[key].
         let module = verified(
             vec![
-                Constant::String("a".into()),
-                Constant::String("b".into()),
+                Constant::String(EcmaString::from_utf8("a")),
+                Constant::String(EcmaString::from_utf8("b")),
                 Constant::Int32(7),
             ],
             vec![function(
@@ -3818,7 +14502,10 @@ mod tests {
     #[test]
     fn property_delete_and_array_holes_are_real_mutations() {
         let module = verified(
-            vec![Constant::String("0".into()), Constant::Int32(5)],
+            vec![
+                Constant::String(EcmaString::from_utf8("0")),
+                Constant::Int32(5),
+            ],
             vec![function(
                 0,
                 5,
@@ -3991,7 +14678,7 @@ mod tests {
             vec![
                 Constant::Int32(1),
                 Constant::Undefined,
-                Constant::String("length".into()),
+                Constant::String(EcmaString::from_utf8("length")),
             ],
             vec![entry, callee],
         );
@@ -4054,11 +14741,327 @@ mod tests {
                 Constant::Int32(1),
                 Constant::Int32(2),
                 Constant::Int32(3),
-                Constant::String("length".into()),
+                Constant::String(EcmaString::from_utf8("length")),
             ],
             vec![entry],
         );
         assert_eq!(run_ok(&module).value, Value::int32(3));
+    }
+
+    #[test]
+    fn array_extend_uses_sync_protocol_for_set_and_rejects_plain_object() {
+        let module = verified(
+            Vec::new(),
+            vec![function(0, 0, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let set_constructor = machine.intrinsics.global("Set").unwrap();
+        let set_prototype = machine
+            .get_named_property(set_constructor, "prototype")
+            .unwrap();
+        let mut set_index = CollectionIndex::default();
+        set_index.insert(collection_key_hash(&machine, Value::int32(7)), 0);
+        let set = machine
+            .allocate(HeapEntry::Collection {
+                kind: CollectionKind::Set,
+                entries: vec![CollectionEntry {
+                    order: 0,
+                    key: Value::int32(7),
+                    value: Value::int32(7),
+                    live: true,
+                }],
+                index: set_index,
+                size: 1,
+                next_order: 1,
+                properties: PropertyMap::default(),
+                prototype: Some(set_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        let target = machine
+            .allocate(HeapEntry::Array {
+                elements: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.array_prototype),
+                extensible: true,
+                length_writable: true,
+            })
+            .unwrap();
+
+        machine.array_extend(target, set).unwrap();
+        assert_eq!(
+            machine.array_elements(target).unwrap(),
+            Some(vec![Value::int32(7)])
+        );
+
+        let plain_object = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        assert!(matches!(
+            machine.array_extend(target, plain_object),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "value is not iterable"
+            }))
+        ));
+    }
+
+    #[test]
+    fn sync_iterator_uses_symbol_method_and_caches_next() {
+        fn iterator_identity<H: Host>(
+            _machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            Ok(intrinsics::BuiltinOutcome::Value(this))
+        }
+
+        fn next_getter<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            let reads = machine.get_named_property(this, "nextReads")?;
+            let reads = if reads == Value::int32(0) { 1 } else { 2 };
+            machine.set_data_property(this, "nextReads", Value::int32(reads))?;
+            Ok(intrinsics::BuiltinOutcome::Value(
+                machine.get_named_property(this, "nextFunction")?,
+            ))
+        }
+
+        fn next_result<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            Ok(intrinsics::BuiltinOutcome::Value(
+                machine.get_named_property(this, "result")?,
+            ))
+        }
+
+        fn done_getter<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            machine.set_data_property(this, "order", Value::int32(1))?;
+            Ok(intrinsics::BuiltinOutcome::Value(Value::FALSE))
+        }
+
+        fn value_getter<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            if machine.get_named_property(this, "order")? != Value::int32(1) {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "iterator value read before done",
+                }));
+            }
+            Ok(intrinsics::BuiltinOutcome::Value(Value::int32(42)))
+        }
+
+        let module = verified(
+            Vec::new(),
+            vec![function(0, 0, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let mut install = |name, handler| {
+            let id = machine
+                .intrinsics
+                .builtins
+                .register(intrinsics::BuiltinDef {
+                    name,
+                    length: 0,
+                    handler,
+                });
+            intrinsics::native_function(&mut machine.heap, id, name, 0)
+        };
+        let iterator_identity = install(
+            "[Symbol.iterator]",
+            iterator_identity::<TestHost> as intrinsics::BuiltinHandler<TestHost>,
+        );
+        let next_getter = install("get next", next_getter::<TestHost>);
+        let next_result = install("next", next_result::<TestHost>);
+        let done_getter = install("get done", done_getter::<TestHost>);
+        let value_getter = install("get value", value_getter::<TestHost>);
+        let object_prototype = machine.intrinsics.object_prototype;
+        let result = machine
+            .allocate(HeapEntry::Object {
+                properties: {
+                    let mut properties = PropertyMap::default();
+                    for (key, property) in [
+                        (
+                            PropertyKey::Named(EcmaString::from_utf8("order")),
+                            Property::Data {
+                                value: Value::int32(0),
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        ),
+                        (
+                            PropertyKey::Named(EcmaString::from_utf8("done")),
+                            Property::Accessor {
+                                getter: Some(done_getter),
+                                setter: None,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        ),
+                        (
+                            PropertyKey::Named(EcmaString::from_utf8("value")),
+                            Property::Accessor {
+                                getter: Some(value_getter),
+                                setter: None,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        ),
+                    ] {
+                        properties.insert(key, property);
+                    }
+                    properties
+                },
+                prototype: Some(object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
+        let iterator_key = machine.to_property_key(iterator_symbol).unwrap();
+        let source = machine
+            .allocate(HeapEntry::Object {
+                properties: {
+                    let mut properties = PropertyMap::default();
+                    for (key, property) in [
+                        (
+                            iterator_key,
+                            Property::Data {
+                                value: iterator_identity,
+                                writable: true,
+                                enumerable: false,
+                                configurable: true,
+                            },
+                        ),
+                        (
+                            PropertyKey::Named(EcmaString::from_utf8("next")),
+                            Property::Accessor {
+                                getter: Some(next_getter),
+                                setter: None,
+                                enumerable: false,
+                                configurable: true,
+                            },
+                        ),
+                        (
+                            PropertyKey::Named(EcmaString::from_utf8("nextReads")),
+                            Property::Data {
+                                value: Value::int32(0),
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        ),
+                        (
+                            PropertyKey::Named(EcmaString::from_utf8("nextFunction")),
+                            Property::Data {
+                                value: next_result,
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        ),
+                        (
+                            PropertyKey::Named(EcmaString::from_utf8("result")),
+                            Property::Data {
+                                value: result,
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        ),
+                    ] {
+                        properties.insert(key, property);
+                    }
+                    properties
+                },
+                prototype: Some(object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+
+        let iterator = machine.create_iterator(source, IteratorKind::Sync).unwrap();
+        assert_eq!(
+            machine.iterator_next(iterator).unwrap(),
+            (false, Value::int32(42))
+        );
+        assert_eq!(
+            machine.iterator_next(iterator).unwrap(),
+            (false, Value::int32(42))
+        );
+        assert_eq!(
+            machine.get_named_property(source, "nextReads").unwrap(),
+            Value::int32(1)
+        );
+
+        let mut completed_properties = PropertyMap::default();
+        completed_properties.insert(
+            PropertyKey::Named(EcmaString::from_utf8("done")),
+            Property::Data {
+                value: Value::TRUE,
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            },
+        );
+        completed_properties.insert(
+            PropertyKey::Named(EcmaString::from_utf8("value")),
+            Property::Accessor {
+                getter: Some(value_getter),
+                setter: None,
+                enumerable: true,
+                configurable: true,
+            },
+        );
+        let completed = machine
+            .allocate(HeapEntry::Object {
+                properties: completed_properties,
+                prototype: Some(object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        machine
+            .set_data_property(source, "result", completed)
+            .unwrap();
+        assert_eq!(
+            machine.iterator_next(iterator).unwrap(),
+            (true, Value::UNDEFINED)
+        );
+
+        machine
+            .delete_property(source, &PropertyKey::Named(EcmaString::from_utf8("next")))
+            .unwrap();
+        machine
+            .set_data_property(source, "next", Value::int32(1))
+            .unwrap();
+        let invalid_next = machine.create_iterator(source, IteratorKind::Sync).unwrap();
+        assert!(matches!(
+            machine.iterator_next(invalid_next),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
     }
 
     #[test]
@@ -4069,7 +15072,10 @@ mod tests {
             constant: cid(c),
         };
         let module = verified(
-            vec![Constant::String("x".into()), Constant::Int32(9)],
+            vec![
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::Int32(9),
+            ],
             vec![function(
                 0,
                 4,
@@ -4105,11 +15111,125 @@ mod tests {
     }
 
     #[test]
+    fn object_spread_copies_enumerable_symbol_properties() {
+        let module = verified(
+            Vec::new(),
+            vec![function(0, 0, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let prototype = machine.intrinsics.object_prototype;
+        let object = |machine: &mut Machine<'_, TestHost>| {
+            machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap()
+        };
+        let source = object(&mut machine);
+        let target = object(&mut machine);
+        let symbol = machine
+            .allocate(HeapEntry::Symbol {
+                description: EcmaString::from_utf8("key"),
+            })
+            .unwrap();
+        let key = machine.to_property_key(symbol).unwrap();
+        machine
+            .set_data_property_key(source, key.clone(), Value::int32(42))
+            .unwrap();
+
+        machine.object_spread(target, source).unwrap();
+
+        assert_eq!(
+            machine.get_property_key(target, &key).unwrap(),
+            Value::int32(42)
+        );
+    }
+
+    #[test]
+    fn object_spread_rechecks_descriptors_after_getters() {
+        fn delete_next<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            machine.delete_property(this, &PropertyKey::Named(EcmaString::from_utf8("next")))?;
+            Ok(intrinsics::BuiltinOutcome::Value(Value::int32(1)))
+        }
+
+        let module = verified(
+            Vec::new(),
+            vec![function(0, 0, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let getter_id = machine
+            .intrinsics
+            .builtins
+            .register(intrinsics::BuiltinDef {
+                name: "delete next",
+                length: 0,
+                handler: delete_next::<TestHost>,
+            });
+        let getter = intrinsics::native_function(&mut machine.heap, getter_id, "delete next", 0);
+        let first = PropertyKey::Named(EcmaString::from_utf8("first"));
+        let next = PropertyKey::Named(EcmaString::from_utf8("next"));
+        let mut source_properties = PropertyMap::default();
+        source_properties.insert(
+            first.clone(),
+            Property::Accessor {
+                getter: Some(getter),
+                setter: None,
+                enumerable: true,
+                configurable: true,
+            },
+        );
+        source_properties.insert(
+            next.clone(),
+            Property::Data {
+                value: Value::int32(2),
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            },
+        );
+        let prototype = machine.intrinsics.object_prototype;
+        let source = machine
+            .allocate(HeapEntry::Object {
+                properties: source_properties,
+                prototype: Some(prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        let target = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+
+        machine.object_spread(target, source).unwrap();
+
+        assert_eq!(
+            machine.get_property_key(target, &first).unwrap(),
+            Value::int32(1)
+        );
+        assert!(!machine.has_own_property_key(target, &next).unwrap());
+    }
+
+    #[test]
     fn private_names_have_distinct_identity_and_are_gettable() {
         // Two private names with the same description are distinct keys.
         let module = verified(
             vec![
-                Constant::String("x".into()),
+                Constant::String(EcmaString::from_utf8("x")),
                 Constant::Int32(1),
                 Constant::Int32(2),
             ],
@@ -4219,10 +15339,1149 @@ mod tests {
             vec![],
         );
         let module = verified(
-            vec![Constant::String("g".into()), Constant::Int32(99)],
+            vec![
+                Constant::String(EcmaString::from_utf8("g")),
+                Constant::Int32(99),
+            ],
             vec![entry, getter],
         );
         assert_eq!(run_ok(&module).value, Value::int32(99));
+    }
+
+    #[test]
+    fn define_data_property_is_non_enumerable_writable_and_configurable() {
+        // Tag 48 DefineDataProperty installs a fixed data descriptor:
+        // writable / non-enumerable / configurable.
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::Int32(7),
+            ],
+            vec![function(
+                0,
+                4,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(1),
+                    },
+                    Instruction::DefineDataProperty {
+                        object: reg(0),
+                        key: reg(1),
+                        value: reg(2),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(3),
+                        object: reg(0),
+                        key: reg(1),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                vec![],
+            )],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let execution = machine.evaluate().unwrap();
+        assert_eq!(execution.entry_registers[3], Value::int32(7));
+        let object = execution.value;
+        let key = PropertyKey::Named(EcmaString::from_utf8("x"));
+        let descriptor = machine
+            .own_descriptor(object, &key)
+            .unwrap()
+            .expect("DefineDataProperty installs an own data property");
+        assert!(matches!(
+            descriptor,
+            Property::Data {
+                value,
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            } if value == Value::int32(7)
+        ));
+        assert!(
+            machine.enumerable_keys(object).unwrap().is_empty(),
+            "DefineDataProperty must not expose the key to enumeration"
+        );
+        assert!(
+            !machine.own_property_is_enumerable(object, &key).unwrap(),
+            "own property must report non-enumerable"
+        );
+        assert!(
+            machine.delete_property(object, &key).unwrap(),
+            "configurable DefineDataProperty must be deletable"
+        );
+        assert!(machine.own_descriptor(object, &key).unwrap().is_none());
+    }
+
+    #[test]
+    fn define_data_property_preserves_descriptor_errors_on_non_object() {
+        let module = verified(
+            vec![
+                Constant::Int32(1),
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::Int32(7),
+            ],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(1),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(2),
+                    },
+                    Instruction::DefineDataProperty {
+                        object: reg(0),
+                        key: reg(1),
+                        value: reg(2),
+                    },
+                    Instruction::Halt,
+                ],
+                vec![],
+            )],
+        );
+        let mut host = TestHost;
+        let error = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .expect_err("DefineDataProperty on a non-object must throw");
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::TypeError { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn define_data_property_preserves_descriptor_errors_on_non_extensible() {
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("sealed")),
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::Int32(7),
+            ],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(1),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(2),
+                    },
+                    Instruction::DefineDataProperty {
+                        object: reg(0),
+                        key: reg(1),
+                        value: reg(2),
+                    },
+                    Instruction::Halt,
+                ],
+                vec![],
+            )],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let sealed = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: false,
+                boxed_primitive: None,
+            })
+            .unwrap();
+        machine
+            .globals
+            .insert(EcmaString::from_utf8("sealed"), sealed);
+        let error = machine
+            .run()
+            .expect_err("DefineDataProperty on a non-extensible object must throw");
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::TypeError { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn load_own_descriptor_slot_instruction_covers_absent_data_accessor_and_mismatch() {
+        // Tag 49 LoadOwnDescriptorSlot is own-only and non-invoking.
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("data")),
+                Constant::Int32(7),
+                Constant::String(EcmaString::from_utf8("accessor")),
+                Constant::String(EcmaString::from_utf8("missing")),
+            ],
+            vec![function(
+                0,
+                10,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(1),
+                    },
+                    Instruction::DefineDataProperty {
+                        object: reg(0),
+                        key: reg(1),
+                        value: reg(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(3),
+                        constant: cid(2),
+                    },
+                    Instruction::CreateObject { dst: reg(4) },
+                    Instruction::DefineAccessor {
+                        object: reg(0),
+                        key: reg(3),
+                        accessor: reg(4),
+                        kind: AccessorKind::Getter,
+                    },
+                    Instruction::LoadOwnDescriptorSlot {
+                        dst: reg(5),
+                        object: reg(0),
+                        key: reg(1),
+                        slot: DescriptorSlot::Value,
+                    },
+                    Instruction::LoadOwnDescriptorSlot {
+                        dst: reg(6),
+                        object: reg(0),
+                        key: reg(1),
+                        slot: DescriptorSlot::Getter,
+                    },
+                    Instruction::LoadOwnDescriptorSlot {
+                        dst: reg(7),
+                        object: reg(0),
+                        key: reg(3),
+                        slot: DescriptorSlot::Getter,
+                    },
+                    Instruction::LoadOwnDescriptorSlot {
+                        dst: reg(8),
+                        object: reg(0),
+                        key: reg(3),
+                        slot: DescriptorSlot::Value,
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(9),
+                        constant: cid(3),
+                    },
+                    Instruction::LoadOwnDescriptorSlot {
+                        dst: reg(9),
+                        object: reg(0),
+                        key: reg(9),
+                        slot: DescriptorSlot::Value,
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                vec![],
+            )],
+        );
+        let execution = run_ok(&module);
+        assert_eq!(execution.entry_registers[5], Value::int32(7));
+        assert_eq!(
+            execution.entry_registers[6],
+            Value::UNDEFINED,
+            "data/getter mismatch yields undefined"
+        );
+        assert_eq!(
+            execution.entry_registers[7], execution.entry_registers[4],
+            "accessor getter slot returns the installed getter"
+        );
+        assert_eq!(
+            execution.entry_registers[8],
+            Value::UNDEFINED,
+            "accessor/value mismatch yields undefined"
+        );
+        assert_eq!(
+            execution.entry_registers[9],
+            Value::UNDEFINED,
+            "absent property yields undefined"
+        );
+    }
+
+    #[test]
+    fn with_has_binding_absent_property_short_circuits_unscopables() {
+        // HasProperty miss must not read @@unscopables.
+        thread_local! {
+            static LOG: std::cell::RefCell<Vec<&'static str>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        fn unscopables_getter<H: Host>(
+            _machine: &mut Machine<'_, H>,
+            _this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            LOG.with(|log| log.borrow_mut().push("unscopables"));
+            Ok(intrinsics::BuiltinOutcome::Value(Value::UNDEFINED))
+        }
+
+        with_machine(Limits::default(), |machine| {
+            LOG.with(|log| log.borrow_mut().clear());
+            let getter_id = machine
+                .intrinsics
+                .builtins
+                .register(intrinsics::BuiltinDef {
+                    name: "get @@unscopables",
+                    length: 0,
+                    handler: unscopables_getter::<TestHost>,
+                });
+            let getter =
+                intrinsics::native_function(&mut machine.heap, getter_id, "get @@unscopables", 0);
+            let unscopables_key = machine
+                .to_property_key(machine.intrinsics.builtins.symbol_unscopables())
+                .unwrap();
+            let mut properties = PropertyMap::default();
+            properties.insert(
+                unscopables_key,
+                Property::Accessor {
+                    getter: Some(getter),
+                    setter: None,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+            let object = machine
+                .allocate(HeapEntry::Object {
+                    properties,
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let key = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("missing")))
+                .unwrap();
+            assert!(!machine.with_has_binding(object, key).unwrap());
+            LOG.with(|log| assert!(log.borrow().is_empty(), "absent binding must short-circuit"));
+        });
+    }
+
+    #[test]
+    fn with_has_binding_allows_and_blocks_named_bindings() {
+        with_machine(Limits::default(), |machine| {
+            let unscopables_key = machine
+                .to_property_key(machine.intrinsics.builtins.symbol_unscopables())
+                .unwrap();
+            let name = PropertyKey::Named(EcmaString::from_utf8("x"));
+            let key = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .unwrap();
+            let make = |machine: &mut Machine<'_, TestHost>, blocked: Value| {
+                let blocklist = machine
+                    .allocate(HeapEntry::Object {
+                        properties: {
+                            let mut properties = PropertyMap::default();
+                            properties.insert(
+                                name.clone(),
+                                Property::Data {
+                                    value: blocked,
+                                    writable: true,
+                                    enumerable: true,
+                                    configurable: true,
+                                },
+                            );
+                            properties
+                        },
+                        prototype: None,
+                        boxed_primitive: None,
+                        extensible: true,
+                    })
+                    .unwrap();
+                machine
+                    .allocate(HeapEntry::Object {
+                        properties: {
+                            let mut properties = PropertyMap::default();
+                            properties.insert(
+                                name.clone(),
+                                Property::Data {
+                                    value: Value::int32(1),
+                                    writable: true,
+                                    enumerable: true,
+                                    configurable: true,
+                                },
+                            );
+                            properties.insert(
+                                unscopables_key.clone(),
+                                Property::Data {
+                                    value: blocklist,
+                                    writable: true,
+                                    enumerable: false,
+                                    configurable: true,
+                                },
+                            );
+                            properties
+                        },
+                        prototype: Some(machine.intrinsics.object_prototype),
+                        boxed_primitive: None,
+                        extensible: true,
+                    })
+                    .unwrap()
+            };
+            let allowed = make(machine, Value::FALSE);
+            let blocked = make(machine, Value::TRUE);
+            assert!(machine.with_has_binding(allowed, key).unwrap());
+            assert!(!machine.with_has_binding(blocked, key).unwrap());
+        });
+    }
+
+    #[test]
+    fn with_has_binding_follows_inherited_candidate_and_unscopables() {
+        with_machine(Limits::default(), |machine| {
+            let unscopables_key = machine
+                .to_property_key(machine.intrinsics.builtins.symbol_unscopables())
+                .unwrap();
+            let name = PropertyKey::Named(EcmaString::from_utf8("x"));
+            let key = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .unwrap();
+            let candidate_proto = machine
+                .allocate(HeapEntry::Object {
+                    properties: {
+                        let mut properties = PropertyMap::default();
+                        properties.insert(
+                            name.clone(),
+                            Property::Data {
+                                value: Value::int32(7),
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        );
+                        properties
+                    },
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let blocklist_proto = machine
+                .allocate(HeapEntry::Object {
+                    properties: {
+                        let mut properties = PropertyMap::default();
+                        properties.insert(
+                            name.clone(),
+                            Property::Data {
+                                value: Value::TRUE,
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        );
+                        properties
+                    },
+                    prototype: None,
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let blocklist = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(blocklist_proto),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let mid = machine
+                .allocate(HeapEntry::Object {
+                    properties: {
+                        let mut properties = PropertyMap::default();
+                        properties.insert(
+                            unscopables_key,
+                            Property::Data {
+                                value: blocklist,
+                                writable: true,
+                                enumerable: false,
+                                configurable: true,
+                            },
+                        );
+                        properties
+                    },
+                    prototype: Some(candidate_proto),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let object = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(mid),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            assert!(machine.has_property(object, &name).unwrap());
+            assert!(
+                !machine.with_has_binding(object, key).unwrap(),
+                "inherited unscopables entry must block the inherited candidate"
+            );
+
+            let allowed_blocklist_proto = machine
+                .allocate(HeapEntry::Object {
+                    properties: {
+                        let mut properties = PropertyMap::default();
+                        properties.insert(
+                            name,
+                            Property::Data {
+                                value: Value::FALSE,
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        );
+                        properties
+                    },
+                    prototype: None,
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let allowed_blocklist = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(allowed_blocklist_proto),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let allowed = machine
+                .allocate(HeapEntry::Object {
+                    properties: {
+                        let mut properties = PropertyMap::default();
+                        properties.insert(
+                            machine
+                                .to_property_key(machine.intrinsics.builtins.symbol_unscopables())
+                                .unwrap(),
+                            Property::Data {
+                                value: allowed_blocklist,
+                                writable: true,
+                                enumerable: false,
+                                configurable: true,
+                            },
+                        );
+                        properties
+                    },
+                    prototype: Some(candidate_proto),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            assert!(machine.with_has_binding(allowed, key).unwrap());
+        });
+    }
+
+    #[test]
+    fn with_has_binding_invokes_getters_in_order_with_correct_receivers() {
+        thread_local! {
+            static LOG: std::cell::RefCell<Vec<&'static str>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+            static EXPECTED_BINDING: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+            static EXPECTED_BLOCKLIST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        }
+        fn unscopables_getter<H: Host>(
+            _machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            assert_eq!(
+                this.to_bits(),
+                EXPECTED_BINDING.get(),
+                "@@unscopables receiver"
+            );
+            LOG.with(|log| log.borrow_mut().push("unscopables"));
+            Ok(intrinsics::BuiltinOutcome::Value(Value::from_bits(
+                EXPECTED_BLOCKLIST.get(),
+            )))
+        }
+        fn block_getter<H: Host>(
+            _machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            assert_eq!(
+                this.to_bits(),
+                EXPECTED_BLOCKLIST.get(),
+                "blocklist receiver"
+            );
+            LOG.with(|log| log.borrow_mut().push("block"));
+            Ok(intrinsics::BuiltinOutcome::Value(Value::FALSE))
+        }
+        fn candidate_getter<H: Host>(
+            _machine: &mut Machine<'_, H>,
+            _this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            LOG.with(|log| log.borrow_mut().push("candidate"));
+            Ok(intrinsics::BuiltinOutcome::Value(Value::int32(1)))
+        }
+
+        with_machine(Limits::default(), |machine| {
+            LOG.with(|log| log.borrow_mut().clear());
+            let mut install = |name, handler| {
+                let id = machine
+                    .intrinsics
+                    .builtins
+                    .register(intrinsics::BuiltinDef {
+                        name,
+                        length: 0,
+                        handler,
+                    });
+                intrinsics::native_function(&mut machine.heap, id, name, 0)
+            };
+            let unscopables_get = install(
+                "get @@unscopables",
+                unscopables_getter::<TestHost> as intrinsics::BuiltinHandler<TestHost>,
+            );
+            let block_get = install("get x", block_getter::<TestHost>);
+            let candidate_get = install("get candidate x", candidate_getter::<TestHost>);
+            let name = PropertyKey::Named(EcmaString::from_utf8("x"));
+            let unscopables_key = machine
+                .to_property_key(machine.intrinsics.builtins.symbol_unscopables())
+                .unwrap();
+            let blocklist = machine
+                .allocate(HeapEntry::Object {
+                    properties: {
+                        let mut properties = PropertyMap::default();
+                        properties.insert(
+                            name.clone(),
+                            Property::Accessor {
+                                getter: Some(block_get),
+                                setter: None,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        );
+                        properties
+                    },
+                    prototype: None,
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let object = machine
+                .allocate(HeapEntry::Object {
+                    properties: {
+                        let mut properties = PropertyMap::default();
+                        properties.insert(
+                            name.clone(),
+                            Property::Accessor {
+                                getter: Some(candidate_get),
+                                setter: None,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        );
+                        properties.insert(
+                            unscopables_key,
+                            Property::Accessor {
+                                getter: Some(unscopables_get),
+                                setter: None,
+                                enumerable: false,
+                                configurable: true,
+                            },
+                        );
+                        properties
+                    },
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            EXPECTED_BINDING.set(object.to_bits());
+            EXPECTED_BLOCKLIST.set(blocklist.to_bits());
+            let key = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .unwrap();
+            assert!(machine.with_has_binding(object, key).unwrap());
+            LOG.with(|log| assert_eq!(&*log.borrow(), &["unscopables", "block"]));
+            assert_eq!(
+                machine.get_property_key(object, &name).unwrap(),
+                Value::int32(1)
+            );
+            LOG.with(|log| {
+                assert_eq!(&*log.borrow(), &["unscopables", "block", "candidate"]);
+            });
+        });
+    }
+
+    #[test]
+    fn with_has_binding_propagates_getter_throw_through_opcode_path() {
+        thread_local! {
+            static SENTINEL_BITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        }
+        fn throwing_unscopables<H: Host>(
+            _machine: &mut Machine<'_, H>,
+            _this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            Err(EvalFailure::ThrowValue(Value::from_bits(
+                SENTINEL_BITS.get(),
+            )))
+        }
+
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("o")),
+                Constant::String(EcmaString::from_utf8("x")),
+            ],
+            vec![function(
+                0,
+                4,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(1),
+                    },
+                    Instruction::WithHasBinding {
+                        dst: reg(2),
+                        object: reg(0),
+                        key: reg(1),
+                    },
+                    Instruction::Halt,
+                    Instruction::Return { value: reg(3) },
+                ],
+                vec![ExceptionHandler {
+                    start: pc(2),
+                    end: pc(3),
+                    handler: pc(4),
+                    catch_register: reg(3),
+                }],
+            )],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let sentinel = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        SENTINEL_BITS.set(sentinel.to_bits());
+        let getter_id = machine
+            .intrinsics
+            .builtins
+            .register(intrinsics::BuiltinDef {
+                name: "throw @@unscopables",
+                length: 0,
+                handler: throwing_unscopables::<TestHost>,
+            });
+        let getter =
+            intrinsics::native_function(&mut machine.heap, getter_id, "throw @@unscopables", 0);
+        let unscopables_key = machine
+            .to_property_key(machine.intrinsics.builtins.symbol_unscopables())
+            .unwrap();
+        let object = machine
+            .allocate(HeapEntry::Object {
+                properties: {
+                    let mut properties = PropertyMap::default();
+                    properties.insert(
+                        PropertyKey::Named(EcmaString::from_utf8("x")),
+                        Property::Data {
+                            value: Value::int32(1),
+                            writable: true,
+                            enumerable: true,
+                            configurable: true,
+                        },
+                    );
+                    properties.insert(
+                        unscopables_key,
+                        Property::Accessor {
+                            getter: Some(getter),
+                            setter: None,
+                            enumerable: false,
+                            configurable: true,
+                        },
+                    );
+                    properties
+                },
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        machine.globals.insert(EcmaString::from_utf8("o"), object);
+        let execution = machine.evaluate().unwrap();
+        assert_eq!(execution.value, sentinel);
+        assert_ne!(
+            execution.entry_registers[2],
+            Value::TRUE,
+            "dst must remain untouched on abrupt completion"
+        );
+        assert_ne!(execution.entry_registers[2], Value::FALSE);
+    }
+
+    #[test]
+    fn with_has_binding_ignores_primitive_blocklist() {
+        with_machine(Limits::default(), |machine| {
+            let unscopables_key = machine
+                .to_property_key(machine.intrinsics.builtins.symbol_unscopables())
+                .unwrap();
+            // Poison String.prototype.x so a mistaken ToObject/Get on a string
+            // blocklist would incorrectly hide the binding.
+            machine
+                .set_data_property(machine.intrinsics.string_prototype, "x", Value::TRUE)
+                .unwrap();
+            let primitive_blocklist = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("blocklist")))
+                .unwrap();
+            let object = machine
+                .allocate(HeapEntry::Object {
+                    properties: {
+                        let mut properties = PropertyMap::default();
+                        properties.insert(
+                            PropertyKey::Named(EcmaString::from_utf8("x")),
+                            Property::Data {
+                                value: Value::int32(1),
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        );
+                        properties.insert(
+                            unscopables_key,
+                            Property::Data {
+                                value: primitive_blocklist,
+                                writable: true,
+                                enumerable: false,
+                                configurable: true,
+                            },
+                        );
+                        properties
+                    },
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let key = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .unwrap();
+            assert!(
+                machine.with_has_binding(object, key).unwrap(),
+                "primitive @@unscopables must leave the binding visible"
+            );
+        });
+    }
+
+    #[test]
+    fn with_has_binding_instruction_reports_allowed_and_blocked() {
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("allowed")),
+                Constant::String(EcmaString::from_utf8("blocked")),
+                Constant::String(EcmaString::from_utf8("x")),
+            ],
+            vec![function(
+                0,
+                6,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(1),
+                        name: cid(1),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(2),
+                    },
+                    Instruction::WithHasBinding {
+                        dst: reg(3),
+                        object: reg(0),
+                        key: reg(2),
+                    },
+                    Instruction::WithHasBinding {
+                        dst: reg(4),
+                        object: reg(1),
+                        key: reg(2),
+                    },
+                    Instruction::Return { value: reg(3) },
+                ],
+                vec![],
+            )],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let unscopables_key = machine
+            .to_property_key(machine.intrinsics.builtins.symbol_unscopables())
+            .unwrap();
+        let name = PropertyKey::Named(EcmaString::from_utf8("x"));
+        let mk = |machine: &mut Machine<'_, TestHost>, blocked: bool| {
+            let blocklist = machine
+                .allocate(HeapEntry::Object {
+                    properties: {
+                        let mut properties = PropertyMap::default();
+                        properties.insert(
+                            name.clone(),
+                            Property::Data {
+                                value: Value::boolean(blocked),
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        );
+                        properties
+                    },
+                    prototype: None,
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            machine
+                .allocate(HeapEntry::Object {
+                    properties: {
+                        let mut properties = PropertyMap::default();
+                        properties.insert(
+                            name.clone(),
+                            Property::Data {
+                                value: Value::int32(1),
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        );
+                        properties.insert(
+                            unscopables_key.clone(),
+                            Property::Data {
+                                value: blocklist,
+                                writable: true,
+                                enumerable: false,
+                                configurable: true,
+                            },
+                        );
+                        properties
+                    },
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap()
+        };
+        let allowed = mk(&mut machine, false);
+        let blocked = mk(&mut machine, true);
+        machine
+            .globals
+            .insert(EcmaString::from_utf8("allowed"), allowed);
+        machine
+            .globals
+            .insert(EcmaString::from_utf8("blocked"), blocked);
+        let execution = machine.evaluate().unwrap();
+        assert_eq!(execution.value, Value::TRUE);
+        assert_eq!(execution.entry_registers[3], Value::TRUE);
+        assert_eq!(execution.entry_registers[4], Value::FALSE);
+    }
+
+    #[test]
+    fn define_own_descriptor_slot_instruction_creates_absent_preserves_and_rejects_mismatch() {
+        // Tag 50 DefineOwnDescriptorSlot creates when absent and preserves shape.
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("created")),
+                Constant::Int32(9),
+                Constant::String(EcmaString::from_utf8("data")),
+                Constant::Int32(1),
+                Constant::Int32(8),
+                Constant::String(EcmaString::from_utf8("accessor")),
+            ],
+            vec![function(
+                0,
+                8,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(1),
+                    },
+                    Instruction::DefineOwnDescriptorSlot {
+                        object: reg(0),
+                        key: reg(1),
+                        src: reg(2),
+                        slot: DescriptorSlot::Value,
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(3),
+                        constant: cid(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(4),
+                        constant: cid(3),
+                    },
+                    Instruction::DefineDataProperty {
+                        object: reg(0),
+                        key: reg(3),
+                        value: reg(4),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(5),
+                        constant: cid(4),
+                    },
+                    Instruction::DefineOwnDescriptorSlot {
+                        object: reg(0),
+                        key: reg(3),
+                        src: reg(5),
+                        slot: DescriptorSlot::Value,
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(6),
+                        constant: cid(5),
+                    },
+                    Instruction::CreateObject { dst: reg(7) },
+                    Instruction::DefineAccessor {
+                        object: reg(0),
+                        key: reg(6),
+                        accessor: reg(7),
+                        kind: AccessorKind::Getter,
+                    },
+                    Instruction::CreateObject { dst: reg(1) },
+                    Instruction::DefineOwnDescriptorSlot {
+                        object: reg(0),
+                        key: reg(6),
+                        src: reg(1),
+                        slot: DescriptorSlot::Setter,
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                vec![],
+            )],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let execution = machine.evaluate().unwrap();
+        let object = execution.value;
+        let created = PropertyKey::Named(EcmaString::from_utf8("created"));
+        let data = PropertyKey::Named(EcmaString::from_utf8("data"));
+        let accessor = PropertyKey::Named(EcmaString::from_utf8("accessor"));
+        assert!(matches!(
+            machine.own_descriptor(object, &created).unwrap(),
+            Some(Property::Data {
+                value,
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            }) if value == Value::int32(9)
+        ));
+        assert!(matches!(
+            machine.own_descriptor(object, &data).unwrap(),
+            Some(Property::Data {
+                value,
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            }) if value == Value::int32(8)
+        ));
+        match machine
+            .own_descriptor(object, &accessor)
+            .unwrap()
+            .expect("accessor remains installed")
+        {
+            Property::Accessor {
+                getter: Some(getter),
+                setter: Some(setter),
+                enumerable: true,
+                configurable: true,
+            } => {
+                assert_eq!(getter, execution.entry_registers[7]);
+                assert_eq!(setter, execution.entry_registers[1]);
+            }
+            other => panic!("expected accessor with both halves, got {other:?}"),
+        }
+        drop(machine);
+
+        let mismatch = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("data")),
+                Constant::Int32(1),
+                Constant::Int32(2),
+            ],
+            vec![function(
+                0,
+                4,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(1),
+                    },
+                    Instruction::DefineDataProperty {
+                        object: reg(0),
+                        key: reg(1),
+                        value: reg(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(3),
+                        constant: cid(2),
+                    },
+                    Instruction::DefineOwnDescriptorSlot {
+                        object: reg(0),
+                        key: reg(1),
+                        src: reg(3),
+                        slot: DescriptorSlot::Getter,
+                    },
+                    Instruction::Halt,
+                ],
+                vec![],
+            )],
+        );
+        let error = Machine::new(&mismatch, &mut host, Limits::default())
+            .run()
+            .expect_err("data/getter shape mismatch must throw");
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::TypeError {
+                    operation: "decorator replacement changes descriptor shape"
+                },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -4296,9 +16555,9 @@ mod tests {
         let ctor = function(0, 1, vec![Instruction::Halt], vec![]);
         let module = verified(
             vec![
-                Constant::String("m".into()),
+                Constant::String(EcmaString::from_utf8("m")),
                 Constant::Int32(5),
-                Constant::String("prototype".into()),
+                Constant::String(EcmaString::from_utf8("prototype")),
             ],
             vec![entry, ctor],
         );
@@ -4406,7 +16665,10 @@ mod tests {
             vec![],
         );
         let module = verified(
-            vec![Constant::String("a".into()), Constant::Int32(1)],
+            vec![
+                Constant::String(EcmaString::from_utf8("a")),
+                Constant::Int32(1),
+            ],
             vec![entry],
         );
         let execution = run_ok(&module);
@@ -4454,6 +16716,61 @@ mod tests {
     }
 
     #[test]
+    fn async_iterator_prefers_symbol_async_iterator() {
+        let program = verified(
+            Vec::new(),
+            vec![
+                function(0, 0, vec![Instruction::Halt], Vec::new()),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadThis { dst: reg(0) },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let object = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        let method = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(1),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        let key = machine
+            .to_property_key(machine.intrinsics.builtins.symbol_async_iterator())
+            .unwrap();
+        machine.set_data_property_key(object, key, method).unwrap();
+
+        let iterator = machine
+            .create_iterator(object, IteratorKind::Async)
+            .expect("async iterator method is used");
+
+        let index = machine.runtime_slot(iterator).unwrap().unwrap();
+        assert!(matches!(
+            machine.heap[index],
+            HeapEntry::Iterator {
+                state: IteratorState::Protocol { iterator, .. }
+            } if iterator == object
+        ));
+    }
+
+    #[test]
     fn globals_store_load_and_typeof_undeclared() {
         // StoreGlobal x=5; TypeOfGlobal y (undeclared) -> "undefined";
         // TypeOfGlobal x -> "number"; return LoadGlobal x.
@@ -4487,8 +16804,8 @@ mod tests {
         );
         let module = verified(
             vec![
-                Constant::String("x".into()),
-                Constant::String("y".into()),
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::from_utf8("y")),
                 Constant::Int32(5),
             ],
             vec![entry],
@@ -4497,9 +16814,154 @@ mod tests {
     }
 
     #[test]
+    fn create_cell_throws_reference_error_before_initialization() {
+        let module = verified(
+            vec![Constant::Int32(0)],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::CreateCell { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(2),
+                        object: reg(0),
+                        key: reg(1),
+                    },
+                    Instruction::Return { value: reg(2) },
+                ],
+                vec![],
+            )],
+        );
+        let mut host = TestHost;
+        let error = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .expect_err("uninitialized cell read throws");
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::ReferenceError { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn prematerialized_reference_error_keeps_identity_through_catch() {
+        // CreateCell TDZ throws ThrowValueOrigin with a pre-built ReferenceError.
+        // Catch must keep that exact Value: rematerializing would allocate a
+        // different object whose message is the origin operation string.
+        let module = verified(
+            vec![Constant::Int32(0)],
+            vec![function(
+                0,
+                5,
+                vec![
+                    Instruction::CreateCell { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(2),
+                        object: reg(0),
+                        key: reg(1),
+                    },
+                    Instruction::Halt,
+                    // First catch: preserve the prematerialized error, then
+                    // rethrow it so a second catch can StrictEqual identities.
+                    Instruction::Throw { value: reg(3) },
+                    Instruction::Binary {
+                        dst: reg(4),
+                        op: BinaryOp::StrictEqual,
+                        left: reg(3),
+                        right: reg(0),
+                    },
+                    Instruction::Return { value: reg(4) },
+                ],
+                vec![
+                    ExceptionHandler {
+                        start: pc(2),
+                        end: pc(3),
+                        handler: pc(4),
+                        catch_register: reg(3),
+                    },
+                    ExceptionHandler {
+                        start: pc(4),
+                        end: pc(5),
+                        handler: pc(5),
+                        catch_register: reg(0),
+                    },
+                ],
+            )],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let execution = machine.evaluate().unwrap();
+        assert_eq!(execution.value, Value::TRUE);
+        let error = execution.entry_registers[3];
+        assert_eq!(error, execution.entry_registers[0]);
+        let name = machine.get_named_property(error, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name)
+                .is_some_and(|text| text.eq_ascii("ReferenceError"))
+        );
+        let message = machine.get_named_property(error, "message").unwrap();
+        assert!(machine.string_value(message).is_some_and(|text| {
+            text.eq_ascii("Cannot access lexical binding before initialization")
+        }));
+        let constructor = machine.intrinsics.global("ReferenceError").unwrap();
+        assert!(machine.instance_of(error, constructor).unwrap());
+        machine.run_to_quiescence().unwrap();
+    }
+
+    #[test]
+    fn create_cell_can_be_initialized_to_undefined() {
+        let module = verified(
+            vec![Constant::Int32(0), Constant::Undefined],
+            vec![function(
+                0,
+                4,
+                vec![
+                    Instruction::CreateCell { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(1),
+                    },
+                    Instruction::SetProperty {
+                        object: reg(0),
+                        key: reg(1),
+                        value: reg(2),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(3),
+                        object: reg(0),
+                        key: reg(1),
+                    },
+                    Instruction::Return { value: reg(3) },
+                ],
+                vec![],
+            )],
+        );
+        let mut host = TestHost;
+        let execution = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .expect("explicit undefined initializes the cell");
+        assert_eq!(execution.value, Value::UNDEFINED);
+    }
+
+    #[test]
     fn load_undeclared_global_throws_reference_error() {
         let module = verified(
-            vec![Constant::String("missing".into())],
+            vec![Constant::String(EcmaString::from_utf8("missing"))],
             vec![function(
                 0,
                 2,
@@ -4520,18 +16982,81 @@ mod tests {
             )],
         );
         let mut host = TestHost;
-        // No handler at top level path would raise; here it is caught, and the
-        // caught value is undefined (the ReferenceError marker value).
-        let execution = Machine::new(&module, &mut host, Limits::default())
-            .run()
-            .unwrap();
-        assert_eq!(execution.value, Value::UNDEFINED);
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let execution = machine.evaluate().unwrap();
+        let error = execution.value;
+        let name = machine.get_named_property(error, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name)
+                .is_some_and(|text| text.eq_ascii("ReferenceError"))
+        );
+        let message = machine.get_named_property(error, "message").unwrap();
+        assert!(
+            machine
+                .string_value(message)
+                .is_some_and(|text| text.eq_ascii("global is not defined"))
+        );
+        let constructor = machine.intrinsics.global("ReferenceError").unwrap();
+        assert!(machine.instance_of(error, constructor).unwrap());
+        machine.run_to_quiescence().unwrap();
+    }
+
+    #[test]
+    fn caught_engine_type_error_has_intrinsic_shape() {
+        let module = verified(
+            vec![Constant::Int32(0)],
+            vec![function(
+                0,
+                4,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::CreateArray { dst: reg(1) },
+                    Instruction::Call {
+                        dst: reg(2),
+                        callee: reg(0),
+                        this_value: reg(0),
+                        arguments: reg(1),
+                    },
+                    Instruction::Halt,
+                    Instruction::Return { value: reg(3) },
+                ],
+                vec![ExceptionHandler {
+                    start: pc(2),
+                    end: pc(3),
+                    handler: pc(4),
+                    catch_register: reg(3),
+                }],
+            )],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let execution = machine.evaluate().unwrap();
+        let error = execution.value;
+        let name = machine.get_named_property(error, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name)
+                .is_some_and(|text| text.eq_ascii("TypeError"))
+        );
+        let message = machine.get_named_property(error, "message").unwrap();
+        assert!(
+            machine
+                .string_value(message)
+                .is_some_and(|text| text.eq_ascii("call"))
+        );
+        let constructor = machine.intrinsics.global("TypeError").unwrap();
+        assert!(machine.instance_of(error, constructor).unwrap());
+        machine.run_to_quiescence().unwrap();
     }
 
     #[test]
     fn uncaught_reference_error_reports_origin() {
         let module = verified(
-            vec![Constant::String("missing".into())],
+            vec![Constant::String(EcmaString::from_utf8("missing"))],
             vec![function(
                 0,
                 1,
@@ -4550,13 +17075,205 @@ mod tests {
             .run()
             .unwrap_err();
         assert_eq!(error.pc, pc(0));
+        assert_eq!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                value: Value::UNDEFINED,
+                origin: ThrowOrigin::ReferenceError {
+                    operation: "global is not defined",
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn uncaught_engine_type_error_keeps_origin_diagnostic() {
+        let module = verified(
+            vec![Constant::Int32(0)],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::CreateArray { dst: reg(1) },
+                    Instruction::Call {
+                        dst: reg(2),
+                        callee: reg(0),
+                        this_value: reg(0),
+                        arguments: reg(1),
+                    },
+                    Instruction::Return { value: reg(2) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let error = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap_err();
+        assert_eq!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                value: Value::UNDEFINED,
+                origin: ThrowOrigin::TypeError { operation: "call" },
+            }
+        );
+    }
+
+    fn assert_uri_error(global: &str, argument: EcmaString) {
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8(global)),
+                Constant::String(argument),
+                Constant::Undefined,
+            ],
+            vec![function(
+                0,
+                5,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(1),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(2),
+                    },
+                    Instruction::CreateArray { dst: reg(3) },
+                    Instruction::ArrayPush {
+                        array: reg(3),
+                        value: reg(1),
+                    },
+                    Instruction::Call {
+                        dst: reg(4),
+                        callee: reg(0),
+                        this_value: reg(2),
+                        arguments: reg(3),
+                    },
+                    Instruction::Return { value: reg(4) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let error = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap_err();
+        assert_eq!(error.pc, pc(5));
         assert!(matches!(
             error.kind,
             RuntimeErrorKind::UncaughtThrow {
-                origin: ThrowOrigin::ReferenceError { .. },
+                origin: ThrowOrigin::UriError {
+                    operation: "URI malformed"
+                },
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn uri_builtins_report_uri_error() {
+        for (global, argument) in [
+            ("encodeURIComponent", EcmaString::from_units(&[0xd800])),
+            ("decodeURIComponent", EcmaString::from_utf8("%")),
+            ("decodeURIComponent", EcmaString::from_utf8("%GG")),
+            ("decodeURIComponent", EcmaString::from_utf8("%FF")),
+            ("decodeURIComponent", EcmaString::from_utf8("%80")),
+            ("decodeURIComponent", EcmaString::from_utf8("%C0%80")),
+            ("decodeURIComponent", EcmaString::from_utf8("%E2%82")),
+            ("decodeURIComponent", EcmaString::from_utf8("%ED%A0%80")),
+            ("decodeURIComponent", EcmaString::from_utf8("%F4%90%80%80")),
+            (
+                "decodeURIComponent",
+                EcmaString::from_utf8("%F8%80%80%80%80"),
+            ),
+        ] {
+            assert_uri_error(global, argument);
+        }
+    }
+
+    fn assert_uri_decode(argument: EcmaString, expected: EcmaString) {
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("decodeURIComponent")),
+                Constant::String(argument),
+                Constant::Undefined,
+                Constant::String(expected),
+            ],
+            vec![function(
+                0,
+                7,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(1),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(2),
+                    },
+                    Instruction::CreateArray { dst: reg(3) },
+                    Instruction::ArrayPush {
+                        array: reg(3),
+                        value: reg(1),
+                    },
+                    Instruction::Call {
+                        dst: reg(4),
+                        callee: reg(0),
+                        this_value: reg(2),
+                        arguments: reg(3),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(5),
+                        constant: cid(3),
+                    },
+                    Instruction::Binary {
+                        dst: reg(6),
+                        op: BinaryOp::StrictEqual,
+                        left: reg(4),
+                        right: reg(5),
+                    },
+                    Instruction::Return { value: reg(6) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let execution = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap();
+        assert_eq!(execution.value, Value::TRUE);
+    }
+
+    #[test]
+    fn decode_uri_component_preserves_units_and_decodes_utf8() {
+        let exact = EcmaString::from_units(&[0xd800, 0x61, 0xdfff]);
+        for (argument, expected) in [
+            (exact.clone(), exact),
+            (EcmaString::from_utf8("%2F"), EcmaString::from_utf8("/")),
+            (
+                EcmaString::from_utf8("%F0%9F%98%80"),
+                EcmaString::from_utf8("😀"),
+            ),
+            (
+                EcmaString::from_utf8("%E4%B8%ADA"),
+                EcmaString::from_utf8("中A"),
+            ),
+            (EcmaString::from_utf8("%00"), EcmaString::from_units(&[0])),
+        ] {
+            assert_uri_decode(argument, expected);
+        }
     }
 
     #[test]
@@ -4564,10 +17281,10 @@ mod tests {
         // typeof re === "object" is not directly returnable; return re.source.
         let module = verified(
             vec![
-                Constant::String("ab".into()),
-                Constant::String("gi".into()),
-                Constant::String("source".into()),
-                Constant::String("global".into()),
+                Constant::String(EcmaString::from_utf8("ab")),
+                Constant::String(EcmaString::from_utf8("gi")),
+                Constant::String(EcmaString::from_utf8("source")),
+                Constant::String(EcmaString::from_utf8("global")),
             ],
             vec![function(
                 0,
@@ -4723,12 +17440,771 @@ mod tests {
         );
         let module = verified(
             vec![
-                Constant::String("prototype".into()),
-                Constant::String("nt".into()),
+                Constant::String(EcmaString::from_utf8("prototype")),
+                Constant::String(EcmaString::from_utf8("nt")),
             ],
             vec![entry, ctor],
         );
         assert_eq!(run_ok(&module).value, Value::TRUE);
+    }
+
+    #[test]
+    fn construct_tag12_new_target_is_callee() {
+        // Tag 12 Construct must pass callee as new_target (old behavior).
+        let entry = function(
+            0,
+            4,
+            vec![
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(0),
+                    function: FunctionId::new(1),
+                    captures: reg(3),
+                },
+                Instruction::CreateObject { dst: reg(1) },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(0),
+                },
+                Instruction::SetProperty {
+                    object: reg(0),
+                    key: reg(2),
+                    value: reg(1),
+                },
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::Construct {
+                    dst: reg(1),
+                    callee: reg(0),
+                    arguments: reg(3),
+                },
+                // read this.nt === ctor
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(1),
+                },
+                Instruction::GetProperty {
+                    dst: reg(3),
+                    object: reg(1),
+                    key: reg(2),
+                },
+                Instruction::Binary {
+                    dst: reg(3),
+                    op: BinaryOp::StrictEqual,
+                    left: reg(3),
+                    right: reg(0),
+                },
+                Instruction::Return { value: reg(3) },
+            ],
+            vec![],
+        );
+        let ctor = function(
+            0,
+            3,
+            vec![
+                Instruction::LoadNewTarget { dst: reg(0) },
+                Instruction::LoadThis { dst: reg(1) },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(1),
+                },
+                Instruction::SetProperty {
+                    object: reg(1),
+                    key: reg(2),
+                    value: reg(0),
+                },
+                Instruction::Halt,
+            ],
+            vec![],
+        );
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("prototype")),
+                Constant::String(EcmaString::from_utf8("nt")),
+            ],
+            vec![entry, ctor],
+        );
+        assert_eq!(run_ok(&module).value, Value::TRUE);
+    }
+
+    #[test]
+    fn construct_with_new_target_explicit_receiver_prototype() {
+        // Tag 47: construct callee with a *different* new_target.
+        // The constructed receiver's prototype must come from new_target.prototype,
+        // not callee.prototype, and new.target inside the ctor must be the explicit
+        // new_target.
+        let entry = function(
+            0,
+            7,
+            vec![
+                // Create ctor closure (function 1)
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(0),
+                    function: FunctionId::new(1),
+                    captures: reg(3),
+                },
+                // ctor.prototype = {} (distinct from new_target.prototype)
+                Instruction::CreateObject { dst: reg(1) },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(0),
+                },
+                Instruction::SetProperty {
+                    object: reg(0),
+                    key: reg(2),
+                    value: reg(1),
+                },
+                // Create explicit new_target closure (function 2)
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(4),
+                    function: FunctionId::new(2),
+                    captures: reg(3),
+                },
+                // new_target.prototype = {} with marker = 42
+                Instruction::CreateObject { dst: reg(5) },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(0),
+                },
+                Instruction::SetProperty {
+                    object: reg(4),
+                    key: reg(2),
+                    value: reg(5),
+                },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(1),
+                },
+                Instruction::LoadConst {
+                    dst: reg(6),
+                    constant: cid(2),
+                },
+                Instruction::SetProperty {
+                    object: reg(5),
+                    key: reg(2),
+                    value: reg(6),
+                },
+                // obj = new ctor() with explicit new_target
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ConstructWithNewTarget {
+                    dst: reg(1),
+                    callee: reg(0),
+                    new_target: reg(4),
+                    arguments: reg(3),
+                },
+                // Read obj.marker — should be 42 via new_target.prototype chain
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(1),
+                },
+                Instruction::GetProperty {
+                    dst: reg(3),
+                    object: reg(1),
+                    key: reg(2),
+                },
+                Instruction::Return { value: reg(3) },
+            ],
+            vec![],
+        );
+        // ctor body: store new.target on this.nt
+        let ctor = function(
+            0,
+            3,
+            vec![
+                Instruction::LoadNewTarget { dst: reg(0) },
+                Instruction::LoadThis { dst: reg(1) },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(3),
+                },
+                Instruction::SetProperty {
+                    object: reg(1),
+                    key: reg(2),
+                    value: reg(0),
+                },
+                Instruction::Halt,
+            ],
+            vec![],
+        );
+        // new_target body: just a placeholder (never called as a function)
+        let nt_fn = function(0, 1, vec![Instruction::Halt], vec![]);
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("prototype")),
+                Constant::String(EcmaString::from_utf8("marker")),
+                Constant::Int32(42),
+                Constant::String(EcmaString::from_utf8("nt")),
+            ],
+            vec![entry, ctor, nt_fn],
+        );
+        let execution = run_ok(&module);
+        // obj.marker === 42 via new_target.prototype
+        assert_eq!(execution.value, Value::int32(42));
+    }
+
+    #[test]
+    fn construct_with_new_target_return_selection() {
+        // Tag 47: constructor returns a primitive; the constructed receiver
+        // (allocated with new_target.prototype) must be the result.
+        let entry = function(
+            0,
+            7,
+            vec![
+                // Create ctor closure (function 1) — returns 99 (primitive)
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(0),
+                    function: FunctionId::new(1),
+                    captures: reg(3),
+                },
+                // ctor.prototype = {} (unused for receiver)
+                Instruction::CreateObject { dst: reg(1) },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(0),
+                },
+                Instruction::SetProperty {
+                    object: reg(0),
+                    key: reg(2),
+                    value: reg(1),
+                },
+                // Create explicit new_target closure (function 2)
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(4),
+                    function: FunctionId::new(2),
+                    captures: reg(3),
+                },
+                // new_target.prototype = {} with tag = 77
+                Instruction::CreateObject { dst: reg(5) },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(0),
+                },
+                Instruction::SetProperty {
+                    object: reg(4),
+                    key: reg(2),
+                    value: reg(5),
+                },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(1),
+                },
+                Instruction::LoadConst {
+                    dst: reg(6),
+                    constant: cid(2),
+                },
+                Instruction::SetProperty {
+                    object: reg(5),
+                    key: reg(2),
+                    value: reg(6),
+                },
+                // obj = new ctor() with explicit new_target
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ConstructWithNewTarget {
+                    dst: reg(1),
+                    callee: reg(0),
+                    new_target: reg(4),
+                    arguments: reg(3),
+                },
+                // obj must be an object (constructed receiver), not 99
+                // Read obj.tag — should be 77 via new_target.prototype
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(1),
+                },
+                Instruction::GetProperty {
+                    dst: reg(3),
+                    object: reg(1),
+                    key: reg(2),
+                },
+                Instruction::Return { value: reg(3) },
+            ],
+            vec![],
+        );
+        // ctor returns primitive 99
+        let ctor = function(
+            0,
+            1,
+            vec![
+                Instruction::LoadConst {
+                    dst: reg(0),
+                    constant: cid(3),
+                },
+                Instruction::Return { value: reg(0) },
+            ],
+            vec![],
+        );
+        let nt_fn = function(0, 1, vec![Instruction::Halt], vec![]);
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("prototype")),
+                Constant::String(EcmaString::from_utf8("tag")),
+                Constant::Int32(77),
+                Constant::Int32(99),
+            ],
+            vec![entry, ctor, nt_fn],
+        );
+        // obj.tag === 77 via new_target.prototype, not 99
+        assert_eq!(run_ok(&module).value, Value::int32(77));
+    }
+
+    #[test]
+    fn construct_with_new_target_builtin_object() {
+        // Tag 47: construct Object with explicit new_target whose .prototype
+        // is a custom object. The result must have that prototype.
+        let entry = function(
+            0,
+            6,
+            vec![
+                // Load Object global
+                Instruction::LoadGlobal {
+                    dst: reg(0),
+                    name: cid(0),
+                },
+                // Create explicit new_target closure (function 1)
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(1),
+                    function: FunctionId::new(1),
+                    captures: reg(3),
+                },
+                // new_target.prototype = { marker: 42 }
+                Instruction::CreateObject { dst: reg(2) },
+                Instruction::LoadConst {
+                    dst: reg(3),
+                    constant: cid(1),
+                },
+                Instruction::SetProperty {
+                    object: reg(1),
+                    key: reg(3),
+                    value: reg(2),
+                },
+                Instruction::LoadConst {
+                    dst: reg(3),
+                    constant: cid(2),
+                },
+                Instruction::LoadConst {
+                    dst: reg(4),
+                    constant: cid(3),
+                },
+                Instruction::SetProperty {
+                    object: reg(2),
+                    key: reg(3),
+                    value: reg(4),
+                },
+                // obj = new Object() with explicit new_target
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ConstructWithNewTarget {
+                    dst: reg(4),
+                    callee: reg(0),
+                    new_target: reg(1),
+                    arguments: reg(3),
+                },
+                // Read obj.marker — should be 42 via new_target.prototype
+                Instruction::LoadConst {
+                    dst: reg(3),
+                    constant: cid(2),
+                },
+                Instruction::GetProperty {
+                    dst: reg(5),
+                    object: reg(4),
+                    key: reg(3),
+                },
+                Instruction::Return { value: reg(5) },
+            ],
+            vec![],
+        );
+        let nt_fn = function(0, 1, vec![Instruction::Halt], vec![]);
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("Object")),
+                Constant::String(EcmaString::from_utf8("prototype")),
+                Constant::String(EcmaString::from_utf8("marker")),
+                Constant::Int32(42),
+            ],
+            vec![entry, nt_fn],
+        );
+        assert_eq!(run_ok(&module).value, Value::int32(42));
+    }
+
+    #[test]
+    fn construct_with_new_target_builtin_error() {
+        // Tag 47: construct Error with explicit new_target whose .prototype
+        // is a custom object. The error instance must have that prototype.
+        let entry = function(
+            0,
+            6,
+            vec![
+                // Load Error global
+                Instruction::LoadGlobal {
+                    dst: reg(0),
+                    name: cid(0),
+                },
+                // Create explicit new_target closure (function 1)
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(1),
+                    function: FunctionId::new(1),
+                    captures: reg(3),
+                },
+                // new_target.prototype = { custom: 99 }
+                Instruction::CreateObject { dst: reg(2) },
+                Instruction::LoadConst {
+                    dst: reg(3),
+                    constant: cid(1),
+                },
+                Instruction::SetProperty {
+                    object: reg(1),
+                    key: reg(3),
+                    value: reg(2),
+                },
+                Instruction::LoadConst {
+                    dst: reg(3),
+                    constant: cid(2),
+                },
+                Instruction::LoadConst {
+                    dst: reg(4),
+                    constant: cid(3),
+                },
+                Instruction::SetProperty {
+                    object: reg(2),
+                    key: reg(3),
+                    value: reg(4),
+                },
+                // err = new Error() with explicit new_target
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ConstructWithNewTarget {
+                    dst: reg(4),
+                    callee: reg(0),
+                    new_target: reg(1),
+                    arguments: reg(3),
+                },
+                // Read err.custom — should be 99 via new_target.prototype
+                Instruction::LoadConst {
+                    dst: reg(3),
+                    constant: cid(2),
+                },
+                Instruction::GetProperty {
+                    dst: reg(5),
+                    object: reg(4),
+                    key: reg(3),
+                },
+                Instruction::Return { value: reg(5) },
+            ],
+            vec![],
+        );
+        let nt_fn = function(0, 1, vec![Instruction::Halt], vec![]);
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("Error")),
+                Constant::String(EcmaString::from_utf8("prototype")),
+                Constant::String(EcmaString::from_utf8("custom")),
+                Constant::Int32(99),
+            ],
+            vec![entry, nt_fn],
+        );
+        assert_eq!(run_ok(&module).value, Value::int32(99));
+    }
+
+    #[test]
+    fn construct_with_new_target_bound_forwards_to_target() {
+        // Bound constructor: when new_target is the bound wrapper itself,
+        // it must be substituted with the bound target after flattening.
+        // This mirrors the existing tag-12 behavior where callee === new_target
+        // before flattening.
+        let entry = function(
+            0,
+            8,
+            vec![
+                // Create target ctor closure (function 1)
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(0),
+                    function: FunctionId::new(1),
+                    captures: reg(3),
+                },
+                // target.prototype = { tag: 7 }
+                Instruction::CreateObject { dst: reg(1) },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(0),
+                },
+                Instruction::SetProperty {
+                    object: reg(0),
+                    key: reg(2),
+                    value: reg(1),
+                },
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(1),
+                },
+                Instruction::LoadConst {
+                    dst: reg(4),
+                    constant: cid(2),
+                },
+                Instruction::SetProperty {
+                    object: reg(1),
+                    key: reg(2),
+                    value: reg(4),
+                },
+                // bound = target.bind(undefined)
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(3),
+                },
+                Instruction::GetProperty {
+                    dst: reg(4),
+                    object: reg(0),
+                    key: reg(2),
+                },
+                // Load undefined into a register for the bind argument
+                Instruction::LoadConst {
+                    dst: reg(6),
+                    constant: cid(4),
+                },
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ArrayPush {
+                    array: reg(3),
+                    value: reg(6),
+                },
+                Instruction::Call {
+                    dst: reg(5),
+                    callee: reg(4),
+                    this_value: reg(0),
+                    arguments: reg(3),
+                },
+                // obj = new bound() via tag 47 with bound as new_target
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ConstructWithNewTarget {
+                    dst: reg(1),
+                    callee: reg(5),
+                    new_target: reg(5),
+                    arguments: reg(3),
+                },
+                // Read obj.tag — should be 7 via target.prototype
+                // (bound forwarded new_target to target)
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(1),
+                },
+                Instruction::GetProperty {
+                    dst: reg(3),
+                    object: reg(1),
+                    key: reg(2),
+                },
+                Instruction::Return { value: reg(3) },
+            ],
+            vec![],
+        );
+        // target ctor body: does nothing (receiver allocated by engine)
+        let target_ctor = function(0, 1, vec![Instruction::Halt], vec![]);
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("prototype")),
+                Constant::String(EcmaString::from_utf8("tag")),
+                Constant::Int32(7),
+                Constant::String(EcmaString::from_utf8("bind")),
+                Constant::Undefined,
+            ],
+            vec![entry, target_ctor],
+        );
+        assert_eq!(run_ok(&module).value, Value::int32(7));
+    }
+
+    #[test]
+    fn construct_with_new_target_forwards_intermediate_bound_wrapper() {
+        // B2 -> B1 -> Base newTarget matrix:
+        //   ConstructWithNT(B2, B2)        -> Base
+        //   ConstructWithNT(B2, B1)        -> Base
+        //   ConstructWithNT(B2, Base)      -> Base
+        //   ConstructWithNT(B2, Unrelated) -> Unrelated
+        //   Construct(B2)                  -> Base
+        let entry = function(
+            0,
+            14,
+            vec![
+                // Base closure (function 1): returns new.target
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(0),
+                    function: FunctionId::new(1),
+                    captures: reg(3),
+                },
+                // Unrelated closure (function 2)
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(10),
+                    function: FunctionId::new(2),
+                    captures: reg(3),
+                },
+                // B1 = Base.bind(undefined)
+                Instruction::LoadConst {
+                    dst: reg(2),
+                    constant: cid(0),
+                },
+                Instruction::GetProperty {
+                    dst: reg(4),
+                    object: reg(0),
+                    key: reg(2),
+                },
+                Instruction::LoadConst {
+                    dst: reg(6),
+                    constant: cid(1),
+                },
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ArrayPush {
+                    array: reg(3),
+                    value: reg(6),
+                },
+                Instruction::Call {
+                    dst: reg(1),
+                    callee: reg(4),
+                    this_value: reg(0),
+                    arguments: reg(3),
+                },
+                // B2 = B1.bind(undefined)
+                Instruction::GetProperty {
+                    dst: reg(4),
+                    object: reg(1),
+                    key: reg(2),
+                },
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ArrayPush {
+                    array: reg(3),
+                    value: reg(6),
+                },
+                Instruction::Call {
+                    dst: reg(5),
+                    callee: reg(4),
+                    this_value: reg(1),
+                    arguments: reg(3),
+                },
+                // ConstructWithNT(B2, B2) -> Base
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ConstructWithNewTarget {
+                    dst: reg(7),
+                    callee: reg(5),
+                    new_target: reg(5),
+                    arguments: reg(3),
+                },
+                Instruction::Binary {
+                    dst: reg(8),
+                    op: BinaryOp::StrictEqual,
+                    left: reg(7),
+                    right: reg(0),
+                },
+                // ConstructWithNT(B2, B1) -> Base
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ConstructWithNewTarget {
+                    dst: reg(7),
+                    callee: reg(5),
+                    new_target: reg(1),
+                    arguments: reg(3),
+                },
+                Instruction::Binary {
+                    dst: reg(9),
+                    op: BinaryOp::StrictEqual,
+                    left: reg(7),
+                    right: reg(0),
+                },
+                Instruction::Binary {
+                    dst: reg(8),
+                    op: BinaryOp::BitAnd,
+                    left: reg(8),
+                    right: reg(9),
+                },
+                // ConstructWithNT(B2, Base) -> Base
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ConstructWithNewTarget {
+                    dst: reg(7),
+                    callee: reg(5),
+                    new_target: reg(0),
+                    arguments: reg(3),
+                },
+                Instruction::Binary {
+                    dst: reg(9),
+                    op: BinaryOp::StrictEqual,
+                    left: reg(7),
+                    right: reg(0),
+                },
+                Instruction::Binary {
+                    dst: reg(8),
+                    op: BinaryOp::BitAnd,
+                    left: reg(8),
+                    right: reg(9),
+                },
+                // ConstructWithNT(B2, Unrelated) -> Unrelated
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::ConstructWithNewTarget {
+                    dst: reg(7),
+                    callee: reg(5),
+                    new_target: reg(10),
+                    arguments: reg(3),
+                },
+                Instruction::Binary {
+                    dst: reg(9),
+                    op: BinaryOp::StrictEqual,
+                    left: reg(7),
+                    right: reg(10),
+                },
+                Instruction::Binary {
+                    dst: reg(8),
+                    op: BinaryOp::BitAnd,
+                    left: reg(8),
+                    right: reg(9),
+                },
+                // ordinary Construct(B2) -> Base
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::Construct {
+                    dst: reg(7),
+                    callee: reg(5),
+                    arguments: reg(3),
+                },
+                Instruction::Binary {
+                    dst: reg(9),
+                    op: BinaryOp::StrictEqual,
+                    left: reg(7),
+                    right: reg(0),
+                },
+                Instruction::Binary {
+                    dst: reg(8),
+                    op: BinaryOp::BitAnd,
+                    left: reg(8),
+                    right: reg(9),
+                },
+                Instruction::Return { value: reg(8) },
+            ],
+            vec![],
+        );
+        let base = function(
+            0,
+            1,
+            vec![
+                Instruction::LoadNewTarget { dst: reg(0) },
+                Instruction::Return { value: reg(0) },
+            ],
+            vec![],
+        );
+        let unrelated = function(
+            0,
+            1,
+            vec![
+                Instruction::LoadNewTarget { dst: reg(0) },
+                Instruction::Return { value: reg(0) },
+            ],
+            vec![],
+        );
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("bind")),
+                Constant::Undefined,
+            ],
+            vec![entry, base, unrelated],
+        );
+        // five true comparisons BitAnd to 1
+        assert_eq!(run_ok(&module).value, Value::int32(1));
     }
 
     #[test]
@@ -4783,7 +18259,10 @@ mod tests {
             vec![],
         );
         let module = verified(
-            vec![Constant::Int32(42), Constant::String("0".into())],
+            vec![
+                Constant::Int32(42),
+                Constant::String(EcmaString::from_utf8("0")),
+            ],
             vec![entry, callee],
         );
         assert_eq!(run_ok(&module).value, Value::int32(42));
@@ -4813,6 +18292,446 @@ mod tests {
             )],
         );
         assert_eq!(run_ok(&module).value, Value::int32(9));
+    }
+
+    #[test]
+    fn native_callback_throw_is_caught_at_outer_call_site() {
+        let entry = function(
+            0,
+            9,
+            vec![
+                Instruction::CreateArray { dst: reg(0) },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(0),
+                },
+                Instruction::ArrayPush {
+                    array: reg(0),
+                    value: reg(1),
+                },
+                Instruction::CreateArray { dst: reg(2) },
+                Instruction::CreateClosure {
+                    dst: reg(3),
+                    function: FunctionId::new(1),
+                    captures: reg(2),
+                },
+                Instruction::LoadConst {
+                    dst: reg(4),
+                    constant: cid(1),
+                },
+                Instruction::GetProperty {
+                    dst: reg(5),
+                    object: reg(0),
+                    key: reg(4),
+                },
+                Instruction::CreateArray { dst: reg(6) },
+                Instruction::ArrayPush {
+                    array: reg(6),
+                    value: reg(3),
+                },
+                Instruction::Call {
+                    dst: reg(7),
+                    callee: reg(5),
+                    this_value: reg(0),
+                    arguments: reg(6),
+                },
+                Instruction::Halt,
+                Instruction::Return { value: reg(8) },
+            ],
+            vec![ExceptionHandler {
+                start: pc(9),
+                end: pc(10),
+                handler: pc(11),
+                catch_register: reg(8),
+            }],
+        );
+        let callback = closure_function(
+            0,
+            0,
+            1,
+            vec![
+                Instruction::LoadConst {
+                    dst: reg(0),
+                    constant: cid(0),
+                },
+                Instruction::Throw { value: reg(0) },
+            ],
+        );
+        let module = verified(
+            vec![
+                Constant::Int32(7),
+                Constant::String(EcmaString::from_utf8("map")),
+            ],
+            vec![entry, callback],
+        );
+
+        assert_eq!(run_ok(&module).value, Value::int32(7));
+    }
+
+    #[test]
+    fn nested_callback_call_engine_type_error_is_intrinsic() {
+        // Array.prototype.map crosses call_value's callback boundary. An engine
+        // TypeError inside the callback must reach the outer catch as an
+        // intrinsic TypeError object, not undefined.
+        let entry = function(
+            0,
+            9,
+            vec![
+                Instruction::CreateArray { dst: reg(0) },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(0),
+                },
+                Instruction::ArrayPush {
+                    array: reg(0),
+                    value: reg(1),
+                },
+                Instruction::CreateArray { dst: reg(2) },
+                Instruction::CreateClosure {
+                    dst: reg(3),
+                    function: FunctionId::new(1),
+                    captures: reg(2),
+                },
+                Instruction::LoadConst {
+                    dst: reg(4),
+                    constant: cid(1),
+                },
+                Instruction::GetProperty {
+                    dst: reg(5),
+                    object: reg(0),
+                    key: reg(4),
+                },
+                Instruction::CreateArray { dst: reg(6) },
+                Instruction::ArrayPush {
+                    array: reg(6),
+                    value: reg(3),
+                },
+                Instruction::Call {
+                    dst: reg(7),
+                    callee: reg(5),
+                    this_value: reg(0),
+                    arguments: reg(6),
+                },
+                Instruction::Halt,
+                Instruction::Return { value: reg(8) },
+            ],
+            vec![ExceptionHandler {
+                start: pc(9),
+                end: pc(10),
+                handler: pc(11),
+                catch_register: reg(8),
+            }],
+        );
+        let callback = closure_function(
+            0,
+            0,
+            3,
+            vec![
+                Instruction::LoadConst {
+                    dst: reg(0),
+                    constant: cid(0),
+                },
+                Instruction::CreateArray { dst: reg(1) },
+                Instruction::Call {
+                    dst: reg(2),
+                    callee: reg(0),
+                    this_value: reg(0),
+                    arguments: reg(1),
+                },
+                Instruction::Return { value: reg(2) },
+            ],
+        );
+        let module = verified(
+            vec![
+                Constant::Int32(0),
+                Constant::String(EcmaString::from_utf8("map")),
+            ],
+            vec![entry, callback],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let execution = machine.evaluate().unwrap();
+        let error = execution.value;
+        assert_ne!(error, Value::UNDEFINED);
+        let name = machine.get_named_property(error, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name)
+                .is_some_and(|text| text.eq_ascii("TypeError"))
+        );
+        let message = machine.get_named_property(error, "message").unwrap();
+        assert!(
+            machine
+                .string_value(message)
+                .is_some_and(|text| text.eq_ascii("call"))
+        );
+        let constructor = machine.intrinsics.global("TypeError").unwrap();
+        assert!(machine.instance_of(error, constructor).unwrap());
+        machine.run_to_quiescence().unwrap();
+    }
+
+    #[test]
+    fn nested_callback_construct_engine_type_error_is_intrinsic() {
+        let entry = function(
+            0,
+            9,
+            vec![
+                Instruction::CreateArray { dst: reg(0) },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(0),
+                },
+                Instruction::ArrayPush {
+                    array: reg(0),
+                    value: reg(1),
+                },
+                Instruction::CreateArray { dst: reg(2) },
+                Instruction::CreateClosure {
+                    dst: reg(3),
+                    function: FunctionId::new(1),
+                    captures: reg(2),
+                },
+                Instruction::LoadConst {
+                    dst: reg(4),
+                    constant: cid(1),
+                },
+                Instruction::GetProperty {
+                    dst: reg(5),
+                    object: reg(0),
+                    key: reg(4),
+                },
+                Instruction::CreateArray { dst: reg(6) },
+                Instruction::ArrayPush {
+                    array: reg(6),
+                    value: reg(3),
+                },
+                Instruction::Call {
+                    dst: reg(7),
+                    callee: reg(5),
+                    this_value: reg(0),
+                    arguments: reg(6),
+                },
+                Instruction::Halt,
+                Instruction::Return { value: reg(8) },
+            ],
+            vec![ExceptionHandler {
+                start: pc(9),
+                end: pc(10),
+                handler: pc(11),
+                catch_register: reg(8),
+            }],
+        );
+        let callback = closure_function(
+            0,
+            0,
+            3,
+            vec![
+                Instruction::LoadConst {
+                    dst: reg(0),
+                    constant: cid(0),
+                },
+                Instruction::CreateArray { dst: reg(1) },
+                Instruction::Construct {
+                    dst: reg(2),
+                    callee: reg(0),
+                    arguments: reg(1),
+                },
+                Instruction::Return { value: reg(2) },
+            ],
+        );
+        let module = verified(
+            vec![
+                Constant::Int32(0),
+                Constant::String(EcmaString::from_utf8("map")),
+            ],
+            vec![entry, callback],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let execution = machine.evaluate().unwrap();
+        let error = execution.value;
+        assert_ne!(error, Value::UNDEFINED);
+        let name = machine.get_named_property(error, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name)
+                .is_some_and(|text| text.eq_ascii("TypeError"))
+        );
+        let message = machine.get_named_property(error, "message").unwrap();
+        assert!(
+            machine
+                .string_value(message)
+                .is_some_and(|text| text.eq_ascii("construct"))
+        );
+        let constructor = machine.intrinsics.global("TypeError").unwrap();
+        assert!(machine.instance_of(error, constructor).unwrap());
+        machine.run_to_quiescence().unwrap();
+    }
+
+    #[test]
+    fn construct_value_preserves_engine_throw_origin() {
+        // A runtime closure constructor whose body raises an engine-origin
+        // TypeError must surface that body's origin verbatim across the
+        // construct_value runtime-constructor boundary. The body calls a
+        // non-callable, throwing TypeError{operation:"call"}; the outer
+        // boundary is construct, so a leaked boundary error would read
+        // operation:"construct".
+        let program = verified(
+            vec![Constant::Int32(0)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::CreateArray { dst: reg(1) },
+                        Instruction::Call {
+                            dst: reg(2),
+                            callee: reg(0),
+                            this_value: reg(1),
+                            arguments: reg(1),
+                        },
+                        Instruction::Return { value: reg(2) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callee = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(1),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+
+        assert!(matches!(
+            machine.construct_value(callee, &[]),
+            Err(EvalFailure::ThrowValueOrigin {
+                value: Value::UNDEFINED,
+                origin: ThrowOrigin::TypeError { operation: "call" },
+            })
+        ));
+        assert!(machine.frames.is_empty());
+    }
+
+    #[test]
+    fn native_callback_throw_uncaught_at_outer_call_site() {
+        let entry = function(
+            0,
+            9,
+            vec![
+                Instruction::CreateArray { dst: reg(0) },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(0),
+                },
+                Instruction::ArrayPush {
+                    array: reg(0),
+                    value: reg(1),
+                },
+                Instruction::CreateArray { dst: reg(2) },
+                Instruction::CreateClosure {
+                    dst: reg(3),
+                    function: FunctionId::new(1),
+                    captures: reg(2),
+                },
+                Instruction::LoadConst {
+                    dst: reg(4),
+                    constant: cid(1),
+                },
+                Instruction::GetProperty {
+                    dst: reg(5),
+                    object: reg(0),
+                    key: reg(4),
+                },
+                Instruction::CreateArray { dst: reg(6) },
+                Instruction::ArrayPush {
+                    array: reg(6),
+                    value: reg(3),
+                },
+                Instruction::Call {
+                    dst: reg(7),
+                    callee: reg(5),
+                    this_value: reg(0),
+                    arguments: reg(6),
+                },
+                Instruction::Halt,
+            ],
+            Vec::new(),
+        );
+        let callback = closure_function(
+            0,
+            0,
+            1,
+            vec![
+                Instruction::LoadConst {
+                    dst: reg(0),
+                    constant: cid(0),
+                },
+                Instruction::Throw { value: reg(0) },
+            ],
+        );
+        let simple = closure_function(
+            0,
+            0,
+            1,
+            vec![
+                Instruction::LoadConst {
+                    dst: reg(0),
+                    constant: cid(2),
+                },
+                Instruction::Return { value: reg(0) },
+            ],
+        );
+        let module = verified(
+            vec![
+                Constant::Int32(7),
+                Constant::String(EcmaString::from_utf8("map")),
+                Constant::Int32(42),
+            ],
+            vec![entry, callback, simple],
+        );
+
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let error = machine.run_loop(0).unwrap_err();
+        assert_eq!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                value: Value::int32(7),
+                origin: ThrowOrigin::Bytecode,
+            }
+        );
+        assert!(machine.callback_boundaries.is_empty());
+        assert!(machine.frames.is_empty());
+        assert_eq!(machine.live_registers, 0);
+
+        let callee = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(2),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        assert_eq!(
+            machine.call_value(callee, Value::UNDEFINED, &[]).unwrap(),
+            Value::int32(42)
+        );
     }
 
     #[test]
@@ -5040,7 +18959,10 @@ mod tests {
             vec![],
         );
         let module = verified(
-            vec![Constant::String("marker".into()), Constant::Int32(5)],
+            vec![
+                Constant::String(EcmaString::from_utf8("marker")),
+                Constant::Int32(5),
+            ],
             vec![entry, returns_object],
         );
         assert_eq!(run_ok(&module).value, Value::int32(5));
@@ -5085,14 +19007,14 @@ mod tests {
             machine
                 .set_own_data(
                     index,
-                    PropertyKey::Named(key.to_owned()),
+                    PropertyKey::Named(EcmaString::from_utf8(key)),
                     Value::int32(value),
                 )
                 .unwrap();
         }
         assert_eq!(
             machine.enumerable_keys(object).unwrap(),
-            ["1", "2", "b", "a"]
+            ["1", "2", "b", "a"].map(EcmaString::from_utf8)
         );
     }
 
@@ -5110,6 +19032,7 @@ mod tests {
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.array_prototype),
                 extensible: true,
+                length_writable: true,
             })
             .unwrap();
         let object = machine
@@ -5131,7 +19054,11 @@ mod tests {
             (function, "[object Function]"),
         ] {
             let tag = machine.call_value(to_string, value, &[]).unwrap();
-            assert_eq!(machine.string_text(tag), Some(expected));
+            assert!(
+                machine
+                    .string_text(tag)
+                    .is_some_and(|text| text.eq_ascii(expected))
+            );
         }
     }
 
@@ -5176,20 +19103,23 @@ mod tests {
             let console = machine.intrinsics.global("console").unwrap();
             let log = machine.get_named_property(console, "log").unwrap();
             let string = machine
-                .allocate(HeapEntry::String("hello".to_owned()))
+                .allocate(HeapEntry::String(EcmaString::from_utf8("hello")))
                 .unwrap();
-            let array_string = machine.allocate(HeapEntry::String("x".to_owned())).unwrap();
+            let array_string = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .unwrap();
             let array = machine
                 .allocate(HeapEntry::Array {
                     elements: vec![Value::int32(1), array_string],
                     properties: PropertyMap::default(),
                     prototype: Some(machine.intrinsics.array_prototype),
                     extensible: true,
+                    length_writable: true,
                 })
                 .unwrap();
             let mut inner_properties = PropertyMap::default();
             inner_properties.insert(
-                PropertyKey::Named("answer".to_owned()),
+                PropertyKey::Named(EcmaString::from_utf8("answer")),
                 Property::Data {
                     value: Value::int32(42),
                     writable: true,
@@ -5207,7 +19137,7 @@ mod tests {
                 .unwrap();
             let mut outer_properties = PropertyMap::default();
             outer_properties.insert(
-                PropertyKey::Named("nested".to_owned()),
+                PropertyKey::Named(EcmaString::from_utf8("nested")),
                 Property::Data {
                     value: inner,
                     writable: true,
@@ -5224,8 +19154,8 @@ mod tests {
                 })
                 .unwrap();
             let symbol = machine
-                .allocate(HeapEntry::PrivateName {
-                    description: "token".to_owned(),
+                .allocate(HeapEntry::Symbol {
+                    description: EcmaString::from_utf8("token"),
                 })
                 .unwrap();
             for value in [
@@ -5273,13 +19203,5065 @@ mod tests {
                 .set_data_property(env, "BAMTS_MODE", Value::int32(7))
                 .unwrap();
             let value = machine.get_named_property(env, "BAMTS_MODE").unwrap();
-            assert_eq!(machine.string_text(value), Some("7"));
-            assert!(machine.delete_named_property(env, "BAMTS_MODE").unwrap());
+            assert!(
+                machine
+                    .string_text(value)
+                    .is_some_and(|text| text.eq_ascii("7"))
+            );
+            assert!(
+                machine
+                    .delete_property(
+                        env,
+                        &PropertyKey::Named(EcmaString::from_utf8("BAMTS_MODE"))
+                    )
+                    .unwrap()
+            );
             assert_eq!(
                 machine.get_named_property(env, "BAMTS_MODE").unwrap(),
                 Value::UNDEFINED
             );
         }
         assert_eq!(host.env("BAMTS_MODE"), None);
+    }
+
+    #[test]
+    fn independent_modules_keep_same_name_globals_isolated() {
+        let dependency = |name: &str, value: i32| {
+            program_module(
+                name,
+                vec![
+                    Constant::String(EcmaString::from_utf8("x")),
+                    Constant::Int32(value),
+                ],
+                vec![function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(2),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                )],
+                Vec::new(),
+                vec![Binding {
+                    name: cid(1),
+                    kind: BindingKind::Hoisted,
+                }],
+                vec![Export {
+                    name: cid(1),
+                    source: ExportSource::Local(BindingId::new(0)),
+                }],
+            )
+        };
+        let root = program_module(
+            "root",
+            vec![
+                Constant::String(EcmaString::from_utf8("left")),
+                Constant::String(EcmaString::from_utf8("right")),
+                Constant::String(EcmaString::from_utf8("x")),
+            ],
+            vec![function(
+                0,
+                5,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(1),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(1),
+                        name: cid(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(3),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(3),
+                        object: reg(0),
+                        key: reg(2),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(4),
+                        object: reg(1),
+                        key: reg(2),
+                    },
+                    Instruction::Binary {
+                        dst: reg(0),
+                        op: BinaryOp::Add,
+                        left: reg(3),
+                        right: reg(4),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            vec![
+                Edge {
+                    specifier: cid(1),
+                    target: EdgeTarget::Local(ModuleId::new(0)),
+                    kind: EdgeKind::Static,
+                },
+                Edge {
+                    specifier: cid(2),
+                    target: EdgeTarget::Local(ModuleId::new(1)),
+                    kind: EdgeKind::Static,
+                },
+            ],
+            vec![
+                Binding {
+                    name: cid(1),
+                    kind: BindingKind::Namespace {
+                        edge: EdgeId::new(0),
+                    },
+                },
+                Binding {
+                    name: cid(2),
+                    kind: BindingKind::Namespace {
+                        edge: EdgeId::new(1),
+                    },
+                },
+            ],
+            Vec::new(),
+        );
+        let program = linked(vec![dependency("left", 1), dependency("right", 2), root], 2);
+        assert_eq!(run_ok(&program).value, Value::int32(3));
+    }
+
+    #[test]
+    fn imported_binding_observes_post_link_mutation_live() {
+        let dependency = program_module(
+            "dependency",
+            vec![
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::Int32(1),
+                Constant::Int32(2),
+                Constant::String(EcmaString::from_utf8("set")),
+            ],
+            vec![
+                function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(2),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::CreateArray { dst: reg(1) },
+                        Instruction::CreateClosure {
+                            dst: reg(2),
+                            function: FunctionId::new(1),
+                            captures: reg(1),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(4),
+                            value: reg(2),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(3),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+            Vec::new(),
+            vec![
+                Binding {
+                    name: cid(1),
+                    kind: BindingKind::Hoisted,
+                },
+                Binding {
+                    name: cid(4),
+                    kind: BindingKind::Hoisted,
+                },
+            ],
+            vec![
+                Export {
+                    name: cid(1),
+                    source: ExportSource::Local(BindingId::new(0)),
+                },
+                Export {
+                    name: cid(4),
+                    source: ExportSource::Local(BindingId::new(1)),
+                },
+            ],
+        );
+        let root = program_module(
+            "root",
+            vec![
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::from_utf8("set")),
+                Constant::String(EcmaString::from_utf8("dep")),
+            ],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(2),
+                    },
+                    Instruction::CreateArray { dst: reg(1) },
+                    Instruction::Call {
+                        dst: reg(2),
+                        callee: reg(0),
+                        this_value: reg(1),
+                        arguments: reg(1),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(1),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(3),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            vec![
+                Binding {
+                    name: cid(1),
+                    kind: BindingKind::Imported {
+                        edge: EdgeId::new(0),
+                        name: cid(1),
+                    },
+                },
+                Binding {
+                    name: cid(2),
+                    kind: BindingKind::Imported {
+                        edge: EdgeId::new(0),
+                        name: cid(2),
+                    },
+                },
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            run_ok(&linked(vec![dependency, root], 1)).value,
+            Value::int32(2)
+        );
+    }
+
+    #[test]
+    fn closure_globals_resolve_in_the_defining_module() {
+        let dependency = program_module(
+            "dependency",
+            vec![
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::Int32(10),
+                Constant::String(EcmaString::from_utf8("read")),
+            ],
+            vec![
+                function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(2),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::CreateArray { dst: reg(1) },
+                        Instruction::CreateClosure {
+                            dst: reg(2),
+                            function: FunctionId::new(1),
+                            captures: reg(1),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(3),
+                            value: reg(2),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(1),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+            Vec::new(),
+            vec![
+                Binding {
+                    name: cid(1),
+                    kind: BindingKind::Hoisted,
+                },
+                Binding {
+                    name: cid(3),
+                    kind: BindingKind::Hoisted,
+                },
+            ],
+            vec![Export {
+                name: cid(3),
+                source: ExportSource::Local(BindingId::new(1)),
+            }],
+        );
+        let root = program_module(
+            "root",
+            vec![
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::Int32(20),
+                Constant::String(EcmaString::from_utf8("read")),
+                Constant::String(EcmaString::from_utf8("dep")),
+            ],
+            vec![function(
+                0,
+                4,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(2),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(1),
+                        value: reg(0),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(1),
+                        name: cid(3),
+                    },
+                    Instruction::CreateArray { dst: reg(2) },
+                    Instruction::Call {
+                        dst: reg(3),
+                        callee: reg(1),
+                        this_value: reg(2),
+                        arguments: reg(2),
+                    },
+                    Instruction::Return { value: reg(3) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(4),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            vec![
+                Binding {
+                    name: cid(1),
+                    kind: BindingKind::Hoisted,
+                },
+                Binding {
+                    name: cid(3),
+                    kind: BindingKind::Imported {
+                        edge: EdgeId::new(0),
+                        name: cid(3),
+                    },
+                },
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            run_ok(&linked(vec![dependency, root], 1)).value,
+            Value::int32(10)
+        );
+    }
+
+    #[test]
+    fn cycle_traps_a_lexical_read_before_initialization() {
+        let first = program_module(
+            "first",
+            vec![
+                Constant::String(EcmaString::from_utf8("a")),
+                Constant::Int32(1),
+                Constant::String(EcmaString::from_utf8("second")),
+            ],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(2),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(1),
+                        value: reg(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(3),
+                target: EdgeTarget::Local(ModuleId::new(1)),
+                kind: EdgeKind::Static,
+            }],
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Lexical,
+            }],
+            vec![Export {
+                name: cid(1),
+                source: ExportSource::Local(BindingId::new(0)),
+            }],
+        );
+        let second = program_module(
+            "second",
+            vec![
+                Constant::String(EcmaString::from_utf8("a")),
+                Constant::String(EcmaString::from_utf8("first")),
+            ],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(1),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(2),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Imported {
+                    edge: EdgeId::new(0),
+                    name: cid(1),
+                },
+            }],
+            Vec::new(),
+        );
+        let program = linked(vec![first, second], 0);
+        let mut host = TestHost;
+        let error = Machine::new(&program, &mut host, Limits::default())
+            .run()
+            .unwrap_err();
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::TemporalDeadZone { module, binding }
+                if module == ModuleId::new(1) && binding == BindingId::new(0)
+        ));
+    }
+
+    #[test]
+    fn cycle_reentry_with_a_hoisted_binding_completes() {
+        let first = program_module(
+            "first",
+            vec![
+                Constant::String(EcmaString::from_utf8("a")),
+                Constant::Int32(1),
+                Constant::String(EcmaString::from_utf8("second")),
+            ],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(2),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(1),
+                        value: reg(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(3),
+                target: EdgeTarget::Local(ModuleId::new(1)),
+                kind: EdgeKind::Static,
+            }],
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Hoisted,
+            }],
+            vec![Export {
+                name: cid(1),
+                source: ExportSource::Local(BindingId::new(0)),
+            }],
+        );
+        let second = program_module(
+            "second",
+            vec![
+                Constant::String(EcmaString::from_utf8("a")),
+                Constant::String(EcmaString::from_utf8("first")),
+            ],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(1),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(2),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Imported {
+                    edge: EdgeId::new(0),
+                    name: cid(1),
+                },
+            }],
+            Vec::new(),
+        );
+        assert_eq!(
+            run_ok(&linked(vec![first, second], 0)).value,
+            Value::int32(1)
+        );
+    }
+
+    #[test]
+    fn namespace_identity_reads_live_cells_and_enumerates_sorted_keys() {
+        let dependency = program_module(
+            "dependency",
+            vec![
+                Constant::String(EcmaString::from_utf8("z")),
+                Constant::String(EcmaString::from_utf8("a")),
+                Constant::String(EcmaString::from_utf8("mutate")),
+                Constant::Int32(1),
+                Constant::Int32(2),
+                Constant::Int32(3),
+            ],
+            vec![
+                function(
+                    0,
+                    4,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(4),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(5),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(2),
+                            value: reg(0),
+                        },
+                        Instruction::CreateArray { dst: reg(1) },
+                        Instruction::CreateClosure {
+                            dst: reg(2),
+                            function: FunctionId::new(1),
+                            captures: reg(1),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(3),
+                            value: reg(2),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(6),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+            Vec::new(),
+            vec![
+                Binding {
+                    name: cid(1),
+                    kind: BindingKind::Hoisted,
+                },
+                Binding {
+                    name: cid(2),
+                    kind: BindingKind::Hoisted,
+                },
+                Binding {
+                    name: cid(3),
+                    kind: BindingKind::Hoisted,
+                },
+            ],
+            vec![
+                Export {
+                    name: cid(1),
+                    source: ExportSource::Local(BindingId::new(0)),
+                },
+                Export {
+                    name: cid(2),
+                    source: ExportSource::Local(BindingId::new(1)),
+                },
+                Export {
+                    name: cid(3),
+                    source: ExportSource::Local(BindingId::new(2)),
+                },
+            ],
+        );
+        let root = program_module(
+            "root",
+            vec![
+                Constant::String(EcmaString::from_utf8("ns1")),
+                Constant::String(EcmaString::from_utf8("ns2")),
+                Constant::String(EcmaString::from_utf8("mutate")),
+                Constant::String(EcmaString::from_utf8("z")),
+                Constant::String(EcmaString::from_utf8("a")),
+                Constant::String(EcmaString::from_utf8("dep")),
+                Constant::String(EcmaString::from_utf8("Object")),
+                Constant::String(EcmaString::from_utf8("getOwnPropertyDescriptor")),
+                Constant::String(EcmaString::from_utf8("value")),
+                Constant::String(EcmaString::from_utf8("writable")),
+                Constant::String(EcmaString::from_utf8("enumerable")),
+                Constant::String(EcmaString::from_utf8("configurable")),
+                Constant::String(EcmaString::from_utf8("missing")),
+            ],
+            vec![function(
+                0,
+                31,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(1),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(1),
+                        name: cid(2),
+                    },
+                    Instruction::Binary {
+                        dst: reg(2),
+                        op: BinaryOp::StrictEqual,
+                        left: reg(0),
+                        right: reg(1),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(3),
+                        name: cid(3),
+                    },
+                    Instruction::CreateArray { dst: reg(4) },
+                    Instruction::Call {
+                        dst: reg(5),
+                        callee: reg(3),
+                        this_value: reg(4),
+                        arguments: reg(4),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(6),
+                        constant: cid(4),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(7),
+                        object: reg(0),
+                        key: reg(6),
+                    },
+                    Instruction::GetIterator {
+                        dst: reg(8),
+                        src: reg(0),
+                        kind: IteratorKind::Keys,
+                    },
+                    Instruction::IteratorNext {
+                        done: reg(9),
+                        value: reg(10),
+                        iterator: reg(8),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(11),
+                        constant: cid(5),
+                    },
+                    Instruction::Binary {
+                        dst: reg(12),
+                        op: BinaryOp::StrictEqual,
+                        left: reg(10),
+                        right: reg(11),
+                    },
+                    Instruction::IteratorNext {
+                        done: reg(9),
+                        value: reg(10),
+                        iterator: reg(8),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(13),
+                        constant: cid(3),
+                    },
+                    Instruction::Binary {
+                        dst: reg(5),
+                        op: BinaryOp::StrictEqual,
+                        left: reg(10),
+                        right: reg(13),
+                    },
+                    Instruction::IteratorNext {
+                        done: reg(9),
+                        value: reg(10),
+                        iterator: reg(8),
+                    },
+                    Instruction::Binary {
+                        dst: reg(14),
+                        op: BinaryOp::StrictEqual,
+                        left: reg(10),
+                        right: reg(6),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(15),
+                        name: cid(7),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(16),
+                        constant: cid(8),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(17),
+                        object: reg(15),
+                        key: reg(16),
+                    },
+                    Instruction::CreateArray { dst: reg(18) },
+                    Instruction::ArrayPush {
+                        array: reg(18),
+                        value: reg(0),
+                    },
+                    Instruction::ArrayPush {
+                        array: reg(18),
+                        value: reg(6),
+                    },
+                    Instruction::Call {
+                        dst: reg(19),
+                        callee: reg(17),
+                        this_value: reg(18),
+                        arguments: reg(18),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(20),
+                        constant: cid(9),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(21),
+                        object: reg(19),
+                        key: reg(20),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(22),
+                        constant: cid(10),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(23),
+                        object: reg(19),
+                        key: reg(22),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(24),
+                        constant: cid(11),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(25),
+                        object: reg(19),
+                        key: reg(24),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(26),
+                        constant: cid(12),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(27),
+                        object: reg(19),
+                        key: reg(26),
+                    },
+                    Instruction::CreateArray { dst: reg(28) },
+                    Instruction::LoadConst {
+                        dst: reg(29),
+                        constant: cid(13),
+                    },
+                    Instruction::ArrayPush {
+                        array: reg(28),
+                        value: reg(0),
+                    },
+                    Instruction::ArrayPush {
+                        array: reg(28),
+                        value: reg(29),
+                    },
+                    Instruction::Call {
+                        dst: reg(30),
+                        callee: reg(17),
+                        this_value: reg(28),
+                        arguments: reg(28),
+                    },
+                    Instruction::Return { value: reg(21) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(6),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            vec![
+                Binding {
+                    name: cid(1),
+                    kind: BindingKind::Namespace {
+                        edge: EdgeId::new(0),
+                    },
+                },
+                Binding {
+                    name: cid(2),
+                    kind: BindingKind::Namespace {
+                        edge: EdgeId::new(0),
+                    },
+                },
+                Binding {
+                    name: cid(3),
+                    kind: BindingKind::Imported {
+                        edge: EdgeId::new(0),
+                        name: cid(3),
+                    },
+                },
+            ],
+            Vec::new(),
+        );
+        let execution = run_ok(&linked(vec![dependency, root], 1));
+        assert_eq!(execution.value, Value::int32(3));
+        assert_eq!(execution.entry_registers[2], Value::TRUE);
+        assert_eq!(execution.entry_registers[5], Value::TRUE);
+        assert_eq!(execution.entry_registers[12], Value::TRUE);
+        assert_eq!(execution.entry_registers[14], Value::TRUE);
+        assert_eq!(execution.entry_registers[23], Value::TRUE);
+        assert_eq!(execution.entry_registers[25], Value::TRUE);
+        assert_eq!(execution.entry_registers[27], Value::FALSE);
+        assert_eq!(execution.entry_registers[30], Value::UNDEFINED);
+    }
+
+    #[test]
+    fn side_effect_module_runs_once_with_single_or_duplicate_static_edges() {
+        for duplicate in [false, true] {
+            let dependency = program_module(
+                "dependency",
+                vec![
+                    Constant::String(EcmaString::from_utf8("count")),
+                    Constant::Int32(0),
+                    Constant::Int32(1),
+                ],
+                vec![function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(1),
+                        },
+                        Instruction::JumpIfFalse {
+                            condition: reg(0),
+                            target: pc(3),
+                        },
+                        Instruction::Jump { target: pc(5) },
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(2),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(3),
+                        },
+                        Instruction::Binary {
+                            dst: reg(0),
+                            op: BinaryOp::Add,
+                            left: reg(0),
+                            right: reg(1),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                )],
+                Vec::new(),
+                vec![Binding {
+                    name: cid(1),
+                    kind: BindingKind::Hoisted,
+                }],
+                vec![Export {
+                    name: cid(1),
+                    source: ExportSource::Local(BindingId::new(0)),
+                }],
+            );
+            let mut edges = vec![Edge {
+                specifier: cid(2),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }];
+            if duplicate {
+                edges.push(Edge {
+                    specifier: cid(3),
+                    target: EdgeTarget::Local(ModuleId::new(0)),
+                    kind: EdgeKind::Static,
+                });
+            }
+            let root = program_module(
+                "root",
+                vec![
+                    Constant::String(EcmaString::from_utf8("count")),
+                    Constant::String(EcmaString::from_utf8("dep-one")),
+                    Constant::String(EcmaString::from_utf8("dep-two")),
+                ],
+                vec![function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(1),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                )],
+                edges,
+                vec![Binding {
+                    name: cid(1),
+                    kind: BindingKind::Imported {
+                        edge: EdgeId::new(0),
+                        name: cid(1),
+                    },
+                }],
+                Vec::new(),
+            );
+            assert_eq!(
+                run_ok(&linked(vec![dependency, root], 1)).value,
+                Value::int32(1)
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_import_of_tla_module_from_microtask_does_not_reenter_checkpoint() {
+        let root = program_module(
+            "root",
+            vec![
+                Constant::String(EcmaString::from_utf8("./target")),
+                Constant::Undefined,
+                Constant::String(EcmaString::from_utf8("value")),
+            ],
+            vec![function(
+                0,
+                5,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(2),
+                    },
+                    Instruction::Await {
+                        dst: reg(1),
+                        src: reg(0),
+                        resume: pc(2),
+                    },
+                    Instruction::Import {
+                        dst: reg(2),
+                        specifier: cid(1),
+                    },
+                    Instruction::Await {
+                        dst: reg(3),
+                        src: reg(2),
+                        resume: pc(4),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(4),
+                        constant: cid(3),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(0),
+                        object: reg(3),
+                        key: reg(4),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::Local(ModuleId::new(1)),
+                kind: EdgeKind::Dynamic,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let target = program_module(
+            "target",
+            vec![
+                Constant::Int32(7),
+                Constant::String(EcmaString::from_utf8("value")),
+            ],
+            vec![function(
+                0,
+                2,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::Await {
+                        dst: reg(1),
+                        src: reg(0),
+                        resume: pc(2),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(2),
+                        value: reg(1),
+                    },
+                    Instruction::Return { value: reg(1) },
+                ],
+                Vec::new(),
+            )],
+            Vec::new(),
+            vec![Binding {
+                name: cid(2),
+                kind: BindingKind::Hoisted,
+            }],
+            vec![Export {
+                name: cid(2),
+                source: ExportSource::Local(BindingId::new(0)),
+            }],
+        );
+        let program = linked(vec![root, target], 0);
+        let mut host = TestHost;
+        let execution = Machine::new(&program, &mut host, Limits::default())
+            .run()
+            .expect("nested TLA import completes through the active checkpoint");
+        assert_eq!(execution.value, Value::int32(7));
+    }
+
+    #[test]
+    fn top_level_await_resumes_module_entry() {
+        let module = program_module(
+            "root",
+            vec![
+                Constant::String(EcmaString::from_utf8("after")),
+                Constant::Int32(7),
+            ],
+            vec![function(
+                0,
+                2,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(2),
+                    },
+                    Instruction::Await {
+                        dst: reg(1),
+                        src: reg(0),
+                        resume: pc(2),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(1),
+                        value: reg(1),
+                    },
+                    Instruction::Return { value: reg(1) },
+                ],
+                Vec::new(),
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let program = linked(vec![module], 0);
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+
+        let execution = machine.evaluate().expect("top-level await completes");
+        machine.run_to_quiescence().expect("event loop drains");
+
+        assert_eq!(execution.value, Value::int32(7));
+        assert_eq!(execution.entry_registers[1], Value::int32(7));
+        assert_eq!(
+            machine.globals.get(&EcmaString::from_utf8("after")),
+            Some(&Value::int32(7)),
+        );
+    }
+
+    #[test]
+    fn failed_module_rethrows_the_identical_stored_value() {
+        let module = program_module(
+            "throws",
+            Vec::new(),
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::Throw { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let program = linked(vec![module], 0);
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        machine.instantiate_modules().unwrap();
+        let first = machine.evaluate_module(ModuleId::new(0)).unwrap_err();
+        let second = machine.evaluate_module(ModuleId::new(0)).unwrap_err();
+        let RuntimeErrorKind::UncaughtThrow { value: first, .. } = first.kind else {
+            panic!("module must fail by throwing");
+        };
+        let RuntimeErrorKind::UncaughtThrow { value: second, .. } = second.kind else {
+            panic!("stored failure must remain a throw");
+        };
+        assert_eq!(first, second);
+        assert!(first.as_heap_ref().is_some());
+    }
+
+    #[test]
+    fn external_static_edge_is_a_typed_runtime_error() {
+        let module = program_module(
+            "root",
+            vec![Constant::String(EcmaString::from_utf8("external"))],
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::External,
+                kind: EdgeKind::Static,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let program = linked(vec![module], 0);
+        let mut host = TestHost;
+        let error = Machine::new(&program, &mut host, Limits::default())
+            .run()
+            .unwrap_err();
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::ExternalModuleUnavailable { module, edge }
+                if module == ModuleId::new(0) && edge == EdgeId::new(0)
+        ));
+    }
+
+    #[test]
+    fn external_module_and_export_names_preserve_unicode() {
+        for (specifier, export) in [("módulo", "value"), ("external", "café")] {
+            let module = program_module(
+                "root",
+                vec![
+                    Constant::String(EcmaString::from_utf8(export)),
+                    Constant::String(EcmaString::from_utf8(specifier)),
+                ],
+                vec![function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(1),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                )],
+                vec![Edge {
+                    specifier: cid(2),
+                    target: EdgeTarget::External,
+                    kind: EdgeKind::Static,
+                }],
+                vec![Binding {
+                    name: cid(1),
+                    kind: BindingKind::Imported {
+                        edge: EdgeId::new(0),
+                        name: cid(1),
+                    },
+                }],
+                Vec::new(),
+            );
+            let program = linked(vec![module], 0);
+            let mut host = TestHost;
+            let mut machine = Machine::new(&program, &mut host, Limits::default());
+            machine.registry.external.insert(
+                EcmaString::from_utf8(specifier),
+                ExternalModuleInstance {
+                    namespace: Value::UNDEFINED,
+                    exports: BTreeMap::from([(
+                        EcmaString::from_utf8(export),
+                        ExternalExport {
+                            value: Value::int32(7),
+                            cell: None,
+                        },
+                    )]),
+                    internals: BTreeMap::new(),
+                },
+            );
+
+            assert_eq!(machine.run().unwrap().value, Value::int32(7));
+        }
+    }
+
+    #[test]
+    fn dynamic_import_preserves_cycles_identity_and_single_evaluation() {
+        let root = program_module(
+            "root",
+            vec![
+                Constant::String(EcmaString::from_utf8("./dependency")),
+                Constant::String(EcmaString::from_utf8("count")),
+                Constant::Int32(0),
+                Constant::String(EcmaString::from_utf8("value")),
+            ],
+            vec![function(
+                0,
+                7,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(3),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(2),
+                        value: reg(0),
+                    },
+                    Instruction::Import {
+                        dst: reg(1),
+                        specifier: cid(1),
+                    },
+                    Instruction::Import {
+                        dst: reg(2),
+                        specifier: cid(1),
+                    },
+                    Instruction::Binary {
+                        dst: reg(3),
+                        op: BinaryOp::StrictEqual,
+                        left: reg(1),
+                        right: reg(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(4),
+                        constant: cid(4),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(5),
+                        object: reg(2),
+                        key: reg(4),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(6),
+                        name: cid(2),
+                    },
+                    Instruction::Return { value: reg(5) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::Local(ModuleId::new(1)),
+                kind: EdgeKind::Dynamic,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let dependency = program_module(
+            "dependency",
+            vec![
+                Constant::String(EcmaString::from_utf8("./root")),
+                Constant::String(EcmaString::from_utf8("count")),
+                Constant::Int32(1),
+                Constant::Int32(7),
+                Constant::String(EcmaString::from_utf8("value")),
+            ],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(3),
+                    },
+                    Instruction::Binary {
+                        dst: reg(2),
+                        op: BinaryOp::Add,
+                        left: reg(0),
+                        right: reg(1),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(2),
+                        value: reg(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(4),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(5),
+                        value: reg(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            vec![Binding {
+                name: cid(5),
+                kind: BindingKind::Hoisted,
+            }],
+            vec![Export {
+                name: cid(5),
+                source: ExportSource::Local(BindingId::new(0)),
+            }],
+        );
+
+        let execution = run_ok(&linked(vec![root, dependency], 0));
+        assert_eq!(execution.value, Value::int32(7));
+        assert_eq!(execution.entry_registers[1], execution.entry_registers[2]);
+        assert_eq!(execution.entry_registers[3], Value::TRUE);
+        assert_eq!(execution.entry_registers[6], Value::int32(1));
+    }
+
+    #[test]
+    fn dynamic_import_counts_live_registers_and_retries_engine_failures() {
+        let target = program_module(
+            "target",
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let root = program_module(
+            "root",
+            vec![Constant::String(EcmaString::from_utf8("./target"))],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::Import {
+                        dst: reg(0),
+                        specifier: cid(1),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::Local(ModuleId::new(1)),
+                kind: EdgeKind::Dynamic,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let program = linked(vec![root, target], 0);
+        let mut host = TestHost;
+        let mut machine = Machine::new(
+            &program,
+            &mut host,
+            Limits {
+                max_total_registers: 1,
+                ..Limits::default()
+            },
+        );
+        machine.frames.clear();
+        machine.live_registers = 0;
+        machine.instantiate_modules().unwrap();
+
+        let error = machine.evaluate_import(ModuleId::new(0)).unwrap_err();
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::RegisterLimitExceeded { limit: 1 }
+        ));
+        assert_eq!(machine.frames.len(), 0);
+        assert_eq!(machine.live_registers, 0);
+
+        machine.limits.max_total_registers = 2;
+        machine.evaluate_import(ModuleId::new(0)).unwrap();
+    }
+
+    #[test]
+    fn dynamic_import_rethrows_one_stored_failure_at_each_import_site() {
+        let root = program_module(
+            "root",
+            vec![
+                Constant::String(EcmaString::from_utf8("./target")),
+                Constant::String(EcmaString::from_utf8("count")),
+                Constant::Int32(0),
+            ],
+            vec![function(
+                0,
+                4,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(3),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(2),
+                        value: reg(0),
+                    },
+                    Instruction::Import {
+                        dst: reg(0),
+                        specifier: cid(1),
+                    },
+                    Instruction::Halt,
+                    Instruction::Import {
+                        dst: reg(0),
+                        specifier: cid(1),
+                    },
+                    Instruction::Halt,
+                    Instruction::LoadGlobal {
+                        dst: reg(3),
+                        name: cid(2),
+                    },
+                    Instruction::Return { value: reg(2) },
+                ],
+                vec![
+                    ExceptionHandler {
+                        start: pc(2),
+                        end: pc(3),
+                        handler: pc(4),
+                        catch_register: reg(1),
+                    },
+                    ExceptionHandler {
+                        start: pc(4),
+                        end: pc(5),
+                        handler: pc(6),
+                        catch_register: reg(2),
+                    },
+                ],
+            )],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::Local(ModuleId::new(1)),
+                kind: EdgeKind::Dynamic,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let target = program_module(
+            "target",
+            vec![
+                Constant::String(EcmaString::from_utf8("count")),
+                Constant::Int32(1),
+                Constant::Int32(9),
+            ],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(1),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(2),
+                    },
+                    Instruction::Binary {
+                        dst: reg(2),
+                        op: BinaryOp::Add,
+                        left: reg(0),
+                        right: reg(1),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(1),
+                        value: reg(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(3),
+                    },
+                    Instruction::Throw { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let execution = run_ok(&linked(vec![root, target], 0));
+        assert_eq!(execution.value, Value::int32(9));
+        assert_eq!(execution.entry_registers[1], Value::int32(9));
+        assert_eq!(execution.entry_registers[2], Value::int32(9));
+        assert_eq!(execution.entry_registers[3], Value::int32(1));
+    }
+
+    #[test]
+    fn failed_import_caught_by_dependent_is_intrinsic_type_error() {
+        // A dynamic Import of a module whose entry throws an engine TypeError
+        // must deliver an intrinsic error object to the dependent's catch,
+        // not undefined from a stripped origin.
+        let root = program_module(
+            "root",
+            vec![Constant::String(EcmaString::from_utf8("./target"))],
+            vec![function(
+                0,
+                2,
+                vec![
+                    Instruction::Import {
+                        dst: reg(0),
+                        specifier: cid(1),
+                    },
+                    Instruction::Halt,
+                    Instruction::Return { value: reg(1) },
+                ],
+                vec![ExceptionHandler {
+                    start: pc(0),
+                    end: pc(1),
+                    handler: pc(2),
+                    catch_register: reg(1),
+                }],
+            )],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::Local(ModuleId::new(1)),
+                kind: EdgeKind::Dynamic,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let target = program_module(
+            "target",
+            vec![Constant::Int32(0)],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::CreateArray { dst: reg(1) },
+                    Instruction::Call {
+                        dst: reg(2),
+                        callee: reg(0),
+                        this_value: reg(0),
+                        arguments: reg(1),
+                    },
+                    Instruction::Return { value: reg(2) },
+                ],
+                Vec::new(),
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut host = TestHost;
+        let program = linked(vec![root, target], 0);
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let execution = machine.evaluate().unwrap();
+        let error = execution.value;
+        assert_ne!(error, Value::UNDEFINED);
+        let name = machine.get_named_property(error, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name)
+                .is_some_and(|text| text.eq_ascii("TypeError"))
+        );
+        let message = machine.get_named_property(error, "message").unwrap();
+        assert!(
+            machine
+                .string_value(message)
+                .is_some_and(|text| text.eq_ascii("call"))
+        );
+        let constructor = machine.intrinsics.global("TypeError").unwrap();
+        assert!(machine.instance_of(error, constructor).unwrap());
+        machine.run_to_quiescence().unwrap();
+    }
+
+    #[test]
+    fn dynamic_import_returns_the_registered_external_namespace() {
+        let module = program_module(
+            "root",
+            vec![Constant::String(EcmaString::from_utf8("external"))],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::Import {
+                        dst: reg(0),
+                        specifier: cid(1),
+                    },
+                    Instruction::Import {
+                        dst: reg(1),
+                        specifier: cid(1),
+                    },
+                    Instruction::Binary {
+                        dst: reg(2),
+                        op: BinaryOp::StrictEqual,
+                        left: reg(0),
+                        right: reg(1),
+                    },
+                    Instruction::Return { value: reg(2) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::External,
+                kind: EdgeKind::Dynamic,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let program = linked(vec![module], 0);
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let namespace = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        machine.registry.external.insert(
+            EcmaString::from_utf8("external"),
+            ExternalModuleInstance {
+                namespace,
+                exports: BTreeMap::new(),
+                internals: BTreeMap::new(),
+            },
+        );
+
+        let execution = machine.run().unwrap();
+        assert_eq!(execution.value, Value::TRUE);
+        assert_eq!(execution.entry_registers[0], namespace);
+        assert_eq!(execution.entry_registers[1], namespace);
+    }
+
+    #[test]
+    fn dynamic_import_resolution_is_requester_scoped() {
+        let requester = |name, target| {
+            program_module(
+                name,
+                vec![Constant::String(EcmaString::from_utf8("./target"))],
+                vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+                vec![Edge {
+                    specifier: cid(1),
+                    target: EdgeTarget::Local(ModuleId::new(target)),
+                    kind: EdgeKind::Dynamic,
+                }],
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        let target = |name| {
+            program_module(
+                name,
+                Vec::new(),
+                vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        let program = linked(
+            vec![
+                requester("first", 2),
+                requester("second", 3),
+                target("first-target"),
+                target("second-target"),
+            ],
+            0,
+        );
+        let mut host = TestHost;
+        let machine = Machine::new(&program, &mut host, Limits::default());
+
+        assert_eq!(
+            machine.resolve_import(ModuleId::new(0), cid(1)),
+            Ok(ImportTarget::Local(ModuleId::new(2)))
+        );
+        assert_eq!(
+            machine.resolve_import(ModuleId::new(1), cid(1)),
+            Ok(ImportTarget::Local(ModuleId::new(3)))
+        );
+    }
+
+    #[test]
+    fn dynamic_import_of_a_missing_external_is_a_runtime_error() {
+        let module = program_module(
+            "root",
+            vec![Constant::String(EcmaString::from_utf8("dynamic"))],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::Import {
+                        dst: reg(0),
+                        specifier: cid(1),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::External,
+                kind: EdgeKind::Dynamic,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let program = linked(vec![module], 0);
+        let mut host = TestHost;
+        let error = Machine::new(&program, &mut host, Limits::default())
+            .run()
+            .unwrap_err();
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::ExternalModuleUnavailable { module, edge }
+                if module == ModuleId::new(0) && edge == EdgeId::new(0)
+        ));
+    }
+
+    #[test]
+    fn unbound_global_names_fall_back_to_the_realm_global_map() {
+        let program = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("realmOnly")),
+                Constant::Int32(7),
+            ],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(0),
+                        value: reg(0),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+        );
+        assert_eq!(run_ok(&program).value, Value::int32(7));
+    }
+
+    #[test]
+    fn module_cell_limit_is_enforced_before_evaluation() {
+        let module = program_module(
+            "root",
+            vec![Constant::String(EcmaString::from_utf8("x"))],
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+            Vec::new(),
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Hoisted,
+            }],
+            Vec::new(),
+        );
+        let program = linked(vec![module], 0);
+        let mut host = TestHost;
+        let error = Machine::new(
+            &program,
+            &mut host,
+            Limits {
+                max_module_cells: 0,
+                ..Limits::default()
+            },
+        )
+        .run()
+        .unwrap_err();
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::ModuleCellLimitExceeded { limit: 0 }
+        ));
+    }
+    #[test]
+    fn imported_binding_store_throws_without_mutating_the_exporter() {
+        let dependency = program_module(
+            "dependency",
+            vec![
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::Int32(1),
+            ],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(2),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(1),
+                        value: reg(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            Vec::new(),
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Hoisted,
+            }],
+            vec![Export {
+                name: cid(1),
+                source: ExportSource::Local(BindingId::new(0)),
+            }],
+        );
+        let root = program_module(
+            "root",
+            vec![
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::Int32(2),
+                Constant::String(EcmaString::from_utf8("dep")),
+            ],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(2),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(1),
+                        value: reg(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(3),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Imported {
+                    edge: EdgeId::new(0),
+                    name: cid(1),
+                },
+            }],
+            Vec::new(),
+        );
+        let program = linked(vec![dependency, root], 1);
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        machine.instantiate_modules().unwrap();
+        assert!(machine.evaluate_module(ModuleId::new(1)).is_err());
+        let exporter = machine.registry.modules[0].binding_cells[0].unwrap();
+        assert_eq!(machine.registry.cells[exporter.0].value, Value::int32(1));
+    }
+
+    #[test]
+    fn namespace_descriptor_propagates_temporal_dead_zone() {
+        let root = program_module(
+            "root",
+            vec![
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::Int32(1),
+                Constant::String(EcmaString::from_utf8("dependency")),
+            ],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(2),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(1),
+                        value: reg(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(3),
+                target: EdgeTarget::Local(ModuleId::new(1)),
+                kind: EdgeKind::Static,
+            }],
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Lexical,
+            }],
+            vec![Export {
+                name: cid(1),
+                source: ExportSource::Local(BindingId::new(0)),
+            }],
+        );
+        let dependency = program_module(
+            "dependency",
+            vec![
+                Constant::String(EcmaString::from_utf8("ns")),
+                Constant::String(EcmaString::from_utf8("root")),
+                Constant::String(EcmaString::from_utf8("Object")),
+                Constant::String(EcmaString::from_utf8("getOwnPropertyDescriptor")),
+                Constant::String(EcmaString::from_utf8("x")),
+            ],
+            vec![namespace_descriptor_entry()],
+            vec![Edge {
+                specifier: cid(2),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Namespace {
+                    edge: EdgeId::new(0),
+                },
+            }],
+            Vec::new(),
+        );
+        let program = linked(vec![root, dependency], 0);
+        let mut host = TestHost;
+        let error = Machine::new(&program, &mut host, Limits::default())
+            .run()
+            .expect_err("descriptor reads uninitialized namespace export");
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::TemporalDeadZone { module, binding }
+                if module == ModuleId::new(0) && binding == BindingId::new(0)
+        ));
+    }
+
+    #[test]
+    fn namespace_descriptor_propagates_external_linkage_error() {
+        let exported = program_module(
+            "exported",
+            vec![
+                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::from_utf8("external")),
+            ],
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+            vec![Edge {
+                specifier: cid(2),
+                target: EdgeTarget::External,
+                kind: EdgeKind::Static,
+            }],
+            Vec::new(),
+            vec![Export {
+                name: cid(1),
+                source: ExportSource::Indirect {
+                    edge: EdgeId::new(0),
+                    name: cid(1),
+                },
+            }],
+        );
+        let importer = program_module(
+            "importer",
+            vec![
+                Constant::String(EcmaString::from_utf8("ns")),
+                Constant::String(EcmaString::from_utf8("exported")),
+                Constant::String(EcmaString::from_utf8("Object")),
+                Constant::String(EcmaString::from_utf8("getOwnPropertyDescriptor")),
+                Constant::String(EcmaString::from_utf8("x")),
+            ],
+            vec![namespace_descriptor_entry()],
+            vec![Edge {
+                specifier: cid(2),
+                target: EdgeTarget::Local(ModuleId::new(0)),
+                kind: EdgeKind::Static,
+            }],
+            vec![Binding {
+                name: cid(1),
+                kind: BindingKind::Namespace {
+                    edge: EdgeId::new(0),
+                },
+            }],
+            Vec::new(),
+        );
+        let program = linked(vec![exported, importer], 1);
+        let mut host = TestHost;
+        let error = Machine::new(&program, &mut host, Limits::default())
+            .run()
+            .expect_err("descriptor resolves external namespace export");
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::ExternalModuleUnavailable { module, edge }
+                if module == ModuleId::new(0) && edge == EdgeId::new(0)
+        ));
+    }
+
+    #[test]
+    fn installed_script_uses_machine_wide_id_and_keeps_its_code() {
+        let root = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+        let script = Arc::new(verified(
+            vec![Constant::Int32(42)],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+        ));
+        let mut host = TestHost;
+        let mut machine = Machine::new(&root, &mut host, Limits::default());
+        machine.instantiate_modules().unwrap();
+        let module = machine.install_script_reserving(script, 0, 0).unwrap();
+
+        assert_eq!(module, ModuleId::new(root.modules().len() as u32));
+        assert!(machine.program().module(module).is_none());
+        assert_eq!(
+            machine.module_code(module).constants()[0],
+            Constant::Int32(42)
+        );
+
+        let closure = machine
+            .allocate(HeapEntry::Function {
+                module,
+                function: FunctionId::new(0),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        assert!(matches!(
+            machine.call_value(closure, Value::UNDEFINED, &[]),
+            Ok(value) if value == Value::int32(42)
+        ));
+    }
+
+    #[test]
+    fn installed_script_rejects_non_classic_programs_and_enforces_limit() {
+        let root = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+        let two_modules = Arc::new(linked(
+            vec![
+                program_module(
+                    "first",
+                    Vec::new(),
+                    vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                program_module(
+                    "second",
+                    Vec::new(),
+                    vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            ],
+            0,
+        ));
+        let script = Arc::new(verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        ));
+        let mut host = TestHost;
+        let mut machine = Machine::new(
+            &root,
+            &mut host,
+            Limits {
+                max_dynamic_modules: 1,
+                ..Limits::default()
+            },
+        );
+        machine.instantiate_modules().unwrap();
+
+        assert!(matches!(
+            machine.install_script_reserving(two_modules, 0, 0),
+            Err(RuntimeErrorKind::InvalidDynamicScript { .. })
+        ));
+        machine
+            .install_script_reserving(script.clone(), 0, 0)
+            .unwrap();
+        assert!(matches!(
+            machine.install_script_reserving(script, 0, 0),
+            Err(RuntimeErrorKind::DynamicModuleLimitExceeded { limit: 1 })
+        ));
+    }
+
+    #[test]
+    fn script_heap_cost_counts_scalar_constant_slots() {
+        let entry = || vec![function(0, 1, vec![Instruction::Halt], Vec::new())];
+        let empty = verified(Vec::new(), entry());
+        let constants = vec![Constant::Int32(0); 128];
+        let scalars = verified(constants.clone(), entry());
+
+        let added = Machine::<TestHost>::script_heap_cost(&scalars)
+            - Machine::<TestHost>::script_heap_cost(&empty);
+
+        assert!(added >= constants.len() * std::mem::size_of::<Constant>());
+    }
+
+    #[test]
+    fn script_heap_cost_includes_verification_storage() {
+        let small = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+        let large = verified(
+            Vec::new(),
+            vec![function(0, 130, vec![Instruction::Halt], Vec::new())],
+        );
+        let small_verification = small.modules()[0].code.verification_bytes();
+        let large_verification = large.modules()[0].code.verification_bytes();
+
+        assert_eq!(
+            Machine::<TestHost>::script_heap_cost(&large)
+                - Machine::<TestHost>::script_heap_cost(&small),
+            large_verification - small_verification
+        );
+    }
+    #[test]
+    fn promise_resolver_settles_once_and_reactions_wait_for_drain() {
+        let program = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("resolve")),
+                Constant::String(EcmaString::from_utf8("reject")),
+                Constant::String(EcmaString::from_utf8("observed")),
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    2,
+                    2,
+                    vec![
+                        Instruction::StoreGlobal {
+                            name: cid(0),
+                            value: reg(0),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(1),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    1,
+                    1,
+                    vec![
+                        Instruction::StoreGlobal {
+                            name: cid(2),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let executor = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(1),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        let observer = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(2),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let constructor_index = machine.runtime_slot(constructor).unwrap().unwrap();
+        let HeapEntry::NativeFunction {
+            callable: NativeCallable::Builtin(constructor_id),
+            ..
+        } = machine.heap[constructor_index]
+        else {
+            panic!("Promise must be a native constructor");
+        };
+        let BuiltinOutcome::Value(promise) = machine
+            .call_builtin(constructor_id, Value::UNDEFINED, &[executor], true)
+            .unwrap()
+        else {
+            panic!("Promise construction returns a Promise");
+        };
+        let then = machine.get_named_property(promise, "then").unwrap();
+        machine
+            .call_value(then, promise, &[observer])
+            .expect("then returns a derived Promise");
+        let resolve = machine
+            .globals
+            .get(&EcmaString::from_utf8("resolve"))
+            .copied()
+            .unwrap();
+        let reject = machine
+            .globals
+            .get(&EcmaString::from_utf8("reject"))
+            .copied()
+            .unwrap();
+        assert_eq!(
+            machine
+                .call_value(resolve, Value::UNDEFINED, &[Value::int32(1)])
+                .unwrap(),
+            Value::UNDEFINED
+        );
+        assert_eq!(
+            machine
+                .call_value(reject, Value::UNDEFINED, &[Value::int32(2)])
+                .unwrap(),
+            Value::UNDEFINED
+        );
+        assert!(
+            !machine
+                .globals
+                .contains_key(&EcmaString::from_utf8("observed"))
+        );
+
+        let drain = machine.drain_microtasks().unwrap();
+        assert_eq!(drain.executed, 1);
+        assert!(drain.uncaught.is_empty());
+        assert_eq!(
+            machine
+                .globals
+                .get(&EcmaString::from_utf8("observed"))
+                .copied(),
+            Some(Value::int32(1))
+        );
+    }
+
+    #[test]
+    fn promise_resolution_adopts_thenables_with_a_fresh_resolver() {
+        let program = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("resolve")),
+                Constant::String(EcmaString::from_utf8("reject")),
+                Constant::String(EcmaString::from_utf8("observed")),
+                Constant::Int32(7),
+                Constant::Int32(8),
+                Constant::Int32(9),
+                Constant::Undefined,
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    2,
+                    2,
+                    vec![
+                        Instruction::StoreGlobal {
+                            name: cid(0),
+                            value: reg(0),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(1),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    1,
+                    1,
+                    vec![
+                        Instruction::StoreGlobal {
+                            name: cid(2),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    2,
+                    6,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(2),
+                            constant: cid(3),
+                        },
+                        Instruction::CreateArray { dst: reg(3) },
+                        Instruction::ArrayPush {
+                            array: reg(3),
+                            value: reg(2),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(4),
+                            constant: cid(6),
+                        },
+                        Instruction::Call {
+                            dst: reg(5),
+                            callee: reg(0),
+                            this_value: reg(4),
+                            arguments: reg(3),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(2),
+                            constant: cid(4),
+                        },
+                        Instruction::CreateArray { dst: reg(3) },
+                        Instruction::ArrayPush {
+                            array: reg(3),
+                            value: reg(2),
+                        },
+                        Instruction::Call {
+                            dst: reg(5),
+                            callee: reg(1),
+                            this_value: reg(4),
+                            arguments: reg(3),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(2),
+                            constant: cid(5),
+                        },
+                        Instruction::Throw { value: reg(2) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let runtime_function = |machine: &mut Machine<'_, TestHost>, function| {
+            machine
+                .allocate(HeapEntry::Function {
+                    module: ModuleId::new(0),
+                    function: FunctionId::new(function),
+                    captures: Vec::new(),
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.function_prototype),
+                    extensible: true,
+                })
+                .unwrap()
+        };
+        let executor = runtime_function(&mut machine, 1);
+        let observer = runtime_function(&mut machine, 2);
+        let then_callback = runtime_function(&mut machine, 3);
+        let thenable = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        machine
+            .set_data_property(thenable, "then", then_callback)
+            .unwrap();
+
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let constructor_index = machine.runtime_slot(constructor).unwrap().unwrap();
+        let HeapEntry::NativeFunction {
+            callable: NativeCallable::Builtin(constructor_id),
+            ..
+        } = machine.heap[constructor_index]
+        else {
+            panic!("Promise must be a native constructor");
+        };
+        let BuiltinOutcome::Value(promise) = machine
+            .call_builtin(constructor_id, Value::UNDEFINED, &[executor], true)
+            .unwrap()
+        else {
+            panic!("Promise construction returns a Promise");
+        };
+        let resolve = machine
+            .globals
+            .get(&EcmaString::from_utf8("resolve"))
+            .copied()
+            .unwrap();
+        let reject = machine
+            .globals
+            .get(&EcmaString::from_utf8("reject"))
+            .copied()
+            .unwrap();
+        machine
+            .call_value(resolve, Value::UNDEFINED, &[thenable])
+            .unwrap();
+        let then = machine.get_named_property(promise, "then").unwrap();
+        machine.call_value(then, promise, &[observer]).unwrap();
+        machine
+            .call_value(reject, Value::UNDEFINED, &[Value::int32(9)])
+            .unwrap();
+        assert!(
+            !machine
+                .globals
+                .contains_key(&EcmaString::from_utf8("observed"))
+        );
+
+        let drain = machine.drain_microtasks().unwrap();
+        assert_eq!(drain.executed, 2);
+        assert!(drain.uncaught.is_empty());
+        assert_eq!(
+            machine
+                .globals
+                .get(&EcmaString::from_utf8("observed"))
+                .copied(),
+            Some(Value::int32(7))
+        );
+    }
+
+    #[test]
+    fn queue_microtask_drains_fifo_including_jobs_added_during_drain() {
+        let program = verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("order")),
+                Constant::String(EcmaString::from_utf8("queueMicrotask")),
+                Constant::String(EcmaString::from_utf8("third")),
+                Constant::Int32(1),
+                Constant::Int32(2),
+                Constant::Int32(3),
+                Constant::Undefined,
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    0,
+                    7,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(3),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(0),
+                            value: reg(1),
+                        },
+                        Instruction::LoadGlobal {
+                            dst: reg(2),
+                            name: cid(1),
+                        },
+                        Instruction::LoadGlobal {
+                            dst: reg(3),
+                            name: cid(2),
+                        },
+                        Instruction::CreateArray { dst: reg(4) },
+                        Instruction::ArrayPush {
+                            array: reg(4),
+                            value: reg(3),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(5),
+                            constant: cid(6),
+                        },
+                        Instruction::Call {
+                            dst: reg(6),
+                            callee: reg(2),
+                            this_value: reg(5),
+                            arguments: reg(4),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(4),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(0),
+                            value: reg(1),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(5),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(0),
+                            value: reg(1),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let runtime_function = |machine: &mut Machine<'_, TestHost>, function| {
+            machine
+                .allocate(HeapEntry::Function {
+                    module: ModuleId::new(0),
+                    function: FunctionId::new(function),
+                    captures: Vec::new(),
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.function_prototype),
+                    extensible: true,
+                })
+                .unwrap()
+        };
+        let first = runtime_function(&mut machine, 1);
+        let second = runtime_function(&mut machine, 2);
+        let third = runtime_function(&mut machine, 3);
+        let order = machine
+            .allocate(HeapEntry::Array {
+                elements: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.array_prototype),
+                extensible: true,
+                length_writable: true,
+            })
+            .unwrap();
+        machine
+            .globals
+            .insert(EcmaString::from_utf8("order"), order);
+        machine
+            .globals
+            .insert(EcmaString::from_utf8("third"), third);
+        let queue = machine.intrinsics.global("queueMicrotask").unwrap();
+        machine
+            .call_value(queue, Value::UNDEFINED, &[first])
+            .unwrap();
+        machine
+            .call_value(queue, Value::UNDEFINED, &[second])
+            .unwrap();
+
+        let drain = machine.drain_microtasks().unwrap();
+        assert_eq!(drain.executed, 3);
+        assert!(drain.uncaught.is_empty());
+        let index = machine.runtime_slot(order).unwrap().unwrap();
+        let HeapEntry::Array { elements, .. } = &machine.heap[index] else {
+            panic!("order remains an array");
+        };
+        assert_eq!(
+            elements,
+            &[Value::int32(1), Value::int32(2), Value::int32(3)]
+        );
+    }
+
+    #[test]
+    fn queue_microtask_reports_callback_throws_and_continues() {
+        let program = verified(
+            vec![
+                Constant::Int32(7),
+                Constant::Int32(1),
+                Constant::String(EcmaString::from_utf8("observed")),
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Throw { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(1),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(2),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let runtime_function = |machine: &mut Machine<'_, TestHost>, function| {
+            machine
+                .allocate(HeapEntry::Function {
+                    module: ModuleId::new(0),
+                    function: FunctionId::new(function),
+                    captures: Vec::new(),
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.function_prototype),
+                    extensible: true,
+                })
+                .unwrap()
+        };
+        let throwing = runtime_function(&mut machine, 1);
+        let observer = runtime_function(&mut machine, 2);
+        let queue = machine.intrinsics.global("queueMicrotask").unwrap();
+        machine
+            .call_value(queue, Value::UNDEFINED, &[throwing])
+            .unwrap();
+        machine
+            .call_value(queue, Value::UNDEFINED, &[observer])
+            .unwrap();
+
+        let drain = machine.drain_microtasks().unwrap();
+        assert_eq!(drain.executed, 2);
+        assert_eq!(
+            drain.uncaught,
+            vec![CallbackException {
+                value: Value::int32(7),
+                origin: ThrowOrigin::Bytecode,
+            }]
+        );
+        assert_eq!(
+            machine
+                .globals
+                .get(&EcmaString::from_utf8("observed"))
+                .copied(),
+            Some(Value::int32(1))
+        );
+    }
+
+    #[test]
+    fn microtask_boundaries_preserve_the_queued_head() {
+        let program = verified(
+            vec![Constant::Undefined],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(
+            &program,
+            &mut host,
+            Limits {
+                max_microtasks: 1,
+                ..Limits::default()
+            },
+        );
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callback = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(1),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        let queue = machine.intrinsics.global("queueMicrotask").unwrap();
+        assert!(matches!(
+            machine.call_value(queue, Value::UNDEFINED, &[Value::int32(1)]),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+        machine
+            .call_value(queue, Value::UNDEFINED, &[callback])
+            .unwrap();
+        assert!(matches!(
+            machine.call_value(queue, Value::UNDEFINED, &[callback]),
+            Err(EvalFailure::Runtime(
+                RuntimeErrorKind::MicrotaskQueueLimitExceeded { limit: 1 }
+            ))
+        ));
+
+        let fuel = machine.fuel;
+        machine.microtask_drain_active = true;
+        let reentry = machine.drain_microtasks().unwrap_err();
+        assert!(matches!(
+            reentry.kind,
+            RuntimeErrorKind::MicrotaskDrainReentry
+        ));
+        assert_eq!(machine.fuel, fuel);
+        assert_eq!(machine.microtasks.len(), 1);
+        machine.microtask_drain_active = false;
+
+        machine.fuel = 0;
+        let exhausted = machine.drain_microtasks().unwrap_err();
+        assert!(matches!(
+            exhausted.kind,
+            RuntimeErrorKind::FuelExhausted { .. }
+        ));
+        assert!(!machine.microtask_drain_active);
+        assert_eq!(machine.microtasks.len(), 1);
+
+        machine.fuel = 100;
+        let drain = machine.drain_microtasks().unwrap();
+        assert_eq!(drain.executed, 1);
+        assert!(machine.microtasks.is_empty());
+    }
+
+    // ---- timers -----------------------------------------------------------
+
+    #[derive(Default)]
+    struct ManualTimerState {
+        live: std::collections::BTreeMap<u64, u64>,
+        reports: std::collections::VecDeque<TimerWakeup>,
+        scheduled: Vec<(u64, u32)>,
+        cancelled: Vec<u64>,
+        auto_report: bool,
+        fail_schedule: bool,
+        fail_poll: bool,
+    }
+
+    #[derive(Clone, Default)]
+    struct ManualTimerProvider {
+        state: std::rc::Rc<std::cell::RefCell<ManualTimerState>>,
+    }
+
+    impl TimerProvider for ManualTimerProvider {
+        fn schedule(&mut self, id: u64, delay_ms: u32) -> Result<u64, TimerError> {
+            let mut state = self.state.borrow_mut();
+            state.scheduled.push((id, delay_ms));
+            if state.fail_schedule {
+                return Err(TimerError::new("manual schedule failure"));
+            }
+            let deadline = u64::from(delay_ms);
+            state.live.insert(id, deadline);
+            if state.auto_report {
+                state.reports.push_back(TimerWakeup {
+                    id,
+                    deadline_ms: deadline,
+                });
+            }
+            Ok(deadline)
+        }
+
+        fn cancel(&mut self, id: u64) -> Result<bool, TimerError> {
+            let mut state = self.state.borrow_mut();
+            state.cancelled.push(id);
+            Ok(state.live.remove(&id).is_some())
+        }
+
+        fn poll_expired(&mut self, output: &mut Vec<TimerWakeup>) -> Result<(), TimerError> {
+            let mut state = self.state.borrow_mut();
+            if state.fail_poll {
+                return Err(TimerError::new("manual poll failure"));
+            }
+            output.extend(state.reports.drain(..));
+            Ok(())
+        }
+
+        fn wait_expired(&mut self) -> Result<Option<TimerWakeup>, TimerError> {
+            Ok(self.state.borrow_mut().reports.pop_front())
+        }
+
+        fn has_pending(&self) -> bool {
+            !self.state.borrow().live.is_empty()
+        }
+    }
+
+    #[derive(Default)]
+    struct TimerTestHost {
+        provider: ManualTimerProvider,
+    }
+
+    impl Host for TimerTestHost {
+        fn timers(&mut self) -> Option<&mut (dyn TimerProvider + 'static)> {
+            Some(&mut self.provider)
+        }
+    }
+
+    fn timer_program() -> Program<Verified> {
+        verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("a")),
+                Constant::String(EcmaString::from_utf8("b")),
+                Constant::String(EcmaString::from_utf8("this_seen")),
+                Constant::String(EcmaString::from_utf8("arg_seen")),
+                Constant::Int32(1),
+                Constant::Int32(7),
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(4),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(0),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(4),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    1,
+                    2,
+                    vec![
+                        Instruction::LoadThis { dst: reg(1) },
+                        Instruction::StoreGlobal {
+                            name: cid(2),
+                            value: reg(1),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(3),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(5),
+                        },
+                        Instruction::Throw { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        )
+    }
+
+    fn timer_fn(machine: &mut Machine<'_, TimerTestHost>, index: u32) -> Value {
+        machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(index),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap()
+    }
+
+    fn read_global(machine: &Machine<'_, TimerTestHost>, name: &str) -> Option<Value> {
+        machine.globals.get(&EcmaString::from_utf8(name)).copied()
+    }
+
+    fn set_timeout_global(machine: &Machine<'_, TimerTestHost>) -> Value {
+        machine
+            .intrinsics
+            .global("setTimeout")
+            .expect("setTimeout is installed")
+    }
+
+    fn test_context(machine: &mut Machine<'_, TimerTestHost>) -> Value {
+        machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn deferred_jobs_restore_their_captured_contexts() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let first = test_context(&mut machine);
+        let second = test_context(&mut machine);
+        let write_a = timer_fn(&mut machine, 1);
+        let write_b = timer_fn(&mut machine, 2);
+
+        machine.context_global = Some(first);
+        machine.enqueue_microtask_callback(write_a).unwrap();
+        let promise = machine.create_promise().unwrap();
+        machine
+            .promise_then(promise, write_b, Value::UNDEFINED)
+            .unwrap();
+
+        machine.context_global = Some(second);
+        machine.enqueue_microtask_callback(write_b).unwrap();
+        machine.schedule_timeout(write_a, 1, Vec::new()).unwrap();
+        machine.context_global = None;
+
+        machine.fulfill_promise(promise, Value::UNDEFINED).unwrap();
+        machine.drain_microtasks().unwrap();
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 1,
+        });
+        machine.run_one_expired_timer().unwrap();
+
+        assert_eq!(
+            machine.get_named_property(first, "a").unwrap(),
+            Value::int32(1)
+        );
+        assert_eq!(
+            machine.get_named_property(first, "b").unwrap(),
+            Value::int32(1)
+        );
+        assert_eq!(
+            machine.get_named_property(second, "a").unwrap(),
+            Value::int32(1)
+        );
+        assert_eq!(
+            machine.get_named_property(second, "b").unwrap(),
+            Value::int32(1)
+        );
+        assert_eq!(read_global(&machine, "a"), None);
+        assert_eq!(read_global(&machine, "b"), None);
+        assert_eq!(machine.context_global, None);
+    }
+
+    #[test]
+    fn timer_safe_point_keeps_callback_rooted() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let callback = timer_fn(&mut machine, 1);
+        machine.schedule_timeout(callback, 1, Vec::new()).unwrap();
+        machine.set_gc_watermarks_for_test(0, 0);
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 1,
+        });
+
+        assert_eq!(machine.run_one_expired_timer().unwrap().executed, 1);
+        assert_eq!(read_global(&machine, "a"), Some(Value::int32(1)));
+    }
+
+    fn schedule_nested_timer(
+        machine: &mut Machine<'_, TimerTestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let callback = machine
+            .globals
+            .get(&EcmaString::from_utf8("nestedCallback"))
+            .copied()
+            .expect("test installs nested callback");
+        let set_timeout = set_timeout_global(machine);
+        machine.call_value(set_timeout, Value::UNDEFINED, &[callback, Value::int32(1)])?;
+        Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+    }
+
+    fn schedule_recursive_timer(
+        machine: &mut Machine<'_, TimerTestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let callback = machine
+            .globals
+            .get(&EcmaString::from_utf8("recursiveTimerCallback"))
+            .copied()
+            .expect("test installs recursive timer callback");
+        let set_timeout = set_timeout_global(machine);
+        machine.call_value(set_timeout, Value::UNDEFINED, &[callback, Value::int32(0)])?;
+        Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+    }
+
+    fn timer_native(
+        machine: &mut Machine<'_, TimerTestHost>,
+        name: &'static str,
+        handler: crate::intrinsics::BuiltinHandler<TimerTestHost>,
+    ) -> Value {
+        let id = machine
+            .intrinsics
+            .builtins
+            .register(crate::intrinsics::BuiltinDef {
+                name,
+                length: 0,
+                handler,
+            });
+        crate::intrinsics::native_function(&mut machine.heap, id, name, 0)
+    }
+
+    #[test]
+    fn timers_are_absent_without_the_capability() {
+        let program = timer_program();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        assert!(machine.intrinsics.global("setTimeout").is_none());
+        assert!(machine.intrinsics.global("clearTimeout").is_none());
+        assert!(!machine.has_pending_timers());
+        assert_eq!(
+            machine.run_one_expired_timer().unwrap(),
+            TimerRun::default()
+        );
+        assert!(!machine.wait_for_timer_expiry().unwrap());
+    }
+
+    #[test]
+    fn set_timeout_rejects_a_non_callable_callback_before_coercion() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_timeout = set_timeout_global(&machine);
+        let failure = machine
+            .call_value(
+                set_timeout,
+                Value::UNDEFINED,
+                &[Value::int32(3), Value::int32(5)],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            failure,
+            EvalFailure::Throw(ThrowOrigin::TypeError { .. })
+        ));
+        // Nothing was armed, so no delay coercion or provider call happened.
+        assert!(shared.borrow().scheduled.is_empty());
+        assert!(!machine.has_pending_timers());
+    }
+
+    #[test]
+    fn set_timeout_clamps_and_truncates_like_node() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_timeout = set_timeout_global(&machine);
+        let callback = timer_fn(&mut machine, 1);
+        for delay in [
+            Value::int32(0),
+            Value::number(-5.0),
+            Value::number(f64::NAN),
+            Value::number(2_147_483_648.0),
+            Value::int32(2_147_483_647),
+            Value::number(3.9),
+        ] {
+            machine
+                .call_value(set_timeout, Value::UNDEFINED, &[callback, delay])
+                .unwrap();
+        }
+        let delays: Vec<u32> = shared.borrow().scheduled.iter().map(|(_, d)| *d).collect();
+        assert_eq!(delays, vec![1, 1, 1, 1, 2_147_483_647, 3]);
+        // Ids are minted monotonically from 1 and never reused.
+        let ids: Vec<u64> = shared
+            .borrow()
+            .scheduled
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn same_deadline_timers_run_in_registration_order_despite_reverse_reports() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_timeout = set_timeout_global(&machine);
+        let a = timer_fn(&mut machine, 1);
+        let b = timer_fn(&mut machine, 2);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(5)])
+            .unwrap();
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[b, Value::int32(5)])
+            .unwrap();
+        // Host reports the later registration first and in split batches.
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 2,
+            deadline_ms: 5,
+        });
+        let first = machine.run_one_expired_timer().unwrap();
+        assert_eq!(first.executed, 1);
+        assert_eq!(read_global(&machine, "a"), Some(Value::int32(1)));
+        assert_eq!(read_global(&machine, "b"), None);
+        let second = machine.run_one_expired_timer().unwrap();
+        assert_eq!(second.executed, 1);
+        assert_eq!(read_global(&machine, "b"), Some(Value::int32(1)));
+        assert!(!machine.has_pending_timers());
+    }
+
+    #[test]
+    fn a_shorter_deadline_beats_an_older_sequence() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_timeout = set_timeout_global(&machine);
+        let a = timer_fn(&mut machine, 1);
+        let b = timer_fn(&mut machine, 2);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(5)])
+            .unwrap();
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[b, Value::int32(3)])
+            .unwrap();
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 5,
+        });
+        machine.run_one_expired_timer().unwrap();
+        assert_eq!(read_global(&machine, "b"), Some(Value::int32(1)));
+        assert_eq!(read_global(&machine, "a"), None);
+    }
+
+    #[test]
+    fn clear_timeout_prevents_a_ready_timer_and_ignores_stale_ids() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_timeout = set_timeout_global(&machine);
+        let clear_timeout = machine.intrinsics.global("clearTimeout").unwrap();
+        let a = timer_fn(&mut machine, 1);
+        let b = timer_fn(&mut machine, 2);
+        let handle_a = machine
+            .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(3)])
+            .unwrap();
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[b, Value::int32(3)])
+            .unwrap();
+        // Clear the first timer even though the host already reported it.
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 3,
+        });
+        machine
+            .call_value(clear_timeout, Value::UNDEFINED, &[handle_a])
+            .unwrap();
+        assert!(shared.borrow().cancelled.contains(&1));
+        // A stale positive-integer id must not cancel the surviving timer.
+        machine
+            .call_value(clear_timeout, Value::UNDEFINED, &[Value::int32(1)])
+            .unwrap();
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 2,
+            deadline_ms: 3,
+        });
+        let run = machine.run_one_expired_timer().unwrap();
+        assert_eq!(run.executed, 1);
+        assert_eq!(read_global(&machine, "a"), None);
+        assert_eq!(read_global(&machine, "b"), Some(Value::int32(1)));
+    }
+
+    #[test]
+    fn clear_timeout_accepts_a_direct_positive_integer_id() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_timeout = set_timeout_global(&machine);
+        let clear_timeout = machine.intrinsics.global("clearTimeout").unwrap();
+        let a = timer_fn(&mut machine, 1);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(3)])
+            .unwrap();
+        machine
+            .call_value(clear_timeout, Value::UNDEFINED, &[Value::int32(1)])
+            .unwrap();
+        assert!(!machine.has_pending_timers());
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 3,
+        });
+        assert_eq!(machine.run_one_expired_timer().unwrap().executed, 0);
+
+        machine.next_timer_id = Some(u64::MAX);
+        let handle = machine
+            .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(3)])
+            .unwrap();
+        machine
+            .call_value(
+                clear_timeout,
+                Value::UNDEFINED,
+                &[Value::number(u64::MAX as f64)],
+            )
+            .unwrap();
+        assert!(machine.has_pending_timers());
+        machine
+            .call_value(clear_timeout, Value::UNDEFINED, &[handle])
+            .unwrap();
+        assert!(!machine.has_pending_timers());
+        // A no-op clear of an unrelated value never coerces or errors.
+        machine
+            .call_value(clear_timeout, Value::UNDEFINED, &[Value::UNDEFINED])
+            .unwrap();
+    }
+
+    #[test]
+    fn timer_callback_receives_trailing_args_and_the_handle_as_this() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_timeout = set_timeout_global(&machine);
+        let callback = timer_fn(&mut machine, 3);
+        let handle = machine
+            .call_value(
+                set_timeout,
+                Value::UNDEFINED,
+                &[callback, Value::int32(1), Value::int32(42)],
+            )
+            .unwrap();
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 1,
+        });
+        machine.run_one_expired_timer().unwrap();
+        assert_eq!(read_global(&machine, "this_seen"), Some(handle));
+        assert_eq!(read_global(&machine, "arg_seen"), Some(Value::int32(42)));
+    }
+
+    #[test]
+    fn a_callback_created_timer_waits_for_a_later_checkpoint() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_timeout = set_timeout_global(&machine);
+        let nested = timer_fn(&mut machine, 2);
+        machine
+            .globals
+            .insert(EcmaString::from_utf8("nestedCallback"), nested);
+        let creator = timer_native(&mut machine, "schedule nested", schedule_nested_timer);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[creator, Value::int32(1)])
+            .unwrap();
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 1,
+        });
+        assert_eq!(machine.run_one_expired_timer().unwrap().executed, 1);
+        assert_eq!(read_global(&machine, "b"), None);
+        assert!(machine.has_pending_timers());
+        // Even if the provider can report it immediately, it runs only in a
+        // later explicit timer checkpoint.
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 2,
+            deadline_ms: 1,
+        });
+        assert_eq!(machine.run_one_expired_timer().unwrap().executed, 1);
+        assert_eq!(read_global(&machine, "b"), Some(Value::int32(1)));
+    }
+
+    #[test]
+    fn timer_callback_throw_is_reported_and_a_runtime_failure_propagates() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_timeout = set_timeout_global(&machine);
+        let thrower = timer_fn(&mut machine, 4);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[thrower, Value::int32(1)])
+            .unwrap();
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 1,
+        });
+        let run = machine.run_one_expired_timer().unwrap();
+        assert_eq!(run.executed, 1);
+        assert_eq!(
+            run.uncaught,
+            vec![CallbackException {
+                value: Value::int32(7),
+                origin: ThrowOrigin::Bytecode
+            }]
+        );
+
+        // A runtime failure inside the callback stops the checkpoint.
+        let another = timer_fn(&mut machine, 1);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[another, Value::int32(1)])
+            .unwrap();
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 2,
+            deadline_ms: 1,
+        });
+        machine.fuel = 1;
+        let error = machine.run_one_expired_timer().unwrap_err();
+        assert!(matches!(error.kind, RuntimeErrorKind::FuelExhausted { .. }));
+    }
+
+    #[test]
+    fn a_timer_checkpoint_never_drains_microtasks() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_timeout = set_timeout_global(&machine);
+        let queue = machine.intrinsics.global("queueMicrotask").unwrap();
+        let a = timer_fn(&mut machine, 1);
+        let b = timer_fn(&mut machine, 2);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(1)])
+            .unwrap();
+        machine.call_value(queue, Value::UNDEFINED, &[b]).unwrap();
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 1,
+        });
+        let run = machine.run_one_expired_timer().unwrap();
+        assert_eq!(run.executed, 1);
+        assert_eq!(read_global(&machine, "a"), Some(Value::int32(1)));
+        assert_eq!(read_global(&machine, "b"), None);
+        assert_eq!(machine.microtasks.len(), 1);
+        machine.drain_microtasks().unwrap();
+        assert_eq!(read_global(&machine, "b"), Some(Value::int32(1)));
+    }
+
+    #[test]
+    fn timer_reentry_capacity_and_fuel_preserve_state() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(
+            &program,
+            &mut host,
+            Limits {
+                max_timers: 1,
+                ..Limits::default()
+            },
+        );
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_timeout = set_timeout_global(&machine);
+        let a = timer_fn(&mut machine, 1);
+        let b = timer_fn(&mut machine, 2);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(1)])
+            .unwrap();
+        // Capacity is enforced before any provider or table mutation.
+        let capacity = machine
+            .call_value(set_timeout, Value::UNDEFINED, &[b, Value::int32(1)])
+            .unwrap_err();
+        assert!(matches!(
+            capacity,
+            EvalFailure::Runtime(RuntimeErrorKind::TimerCapacityExceeded { limit: 1 })
+        ));
+        assert_eq!(shared.borrow().scheduled.len(), 1);
+
+        // Reentry fails without consuming fuel or touching the ready timer.
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 1,
+        });
+        machine.timer_checkpoint_active = true;
+        let fuel = machine.fuel;
+        let reentry = machine.run_one_expired_timer().unwrap_err();
+        assert!(matches!(
+            reentry.kind,
+            RuntimeErrorKind::TimerCheckpointReentry
+        ));
+        assert_eq!(machine.fuel, fuel);
+        machine.timer_checkpoint_active = false;
+
+        // Fuel is charged before the live record is removed.
+        machine.fuel = 0;
+        let exhausted = machine.run_one_expired_timer().unwrap_err();
+        assert!(matches!(
+            exhausted.kind,
+            RuntimeErrorKind::FuelExhausted { .. }
+        ));
+        assert!(machine.has_pending_timers());
+        machine.fuel = 100;
+        assert_eq!(machine.run_one_expired_timer().unwrap().executed, 1);
+        assert_eq!(read_global(&machine, "a"), Some(Value::int32(1)));
+    }
+
+    #[test]
+    fn a_failed_schedule_never_reuses_its_timer_id() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_timeout = set_timeout_global(&machine);
+        let a = timer_fn(&mut machine, 1);
+        shared.borrow_mut().fail_schedule = true;
+        let failure = machine
+            .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(1)])
+            .unwrap_err();
+        assert!(matches!(
+            failure,
+            EvalFailure::Runtime(RuntimeErrorKind::TimerProviderFailure { .. })
+        ));
+        shared.borrow_mut().fail_schedule = false;
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(1)])
+            .unwrap();
+        let ids: Vec<u64> = shared
+            .borrow()
+            .scheduled
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn wait_for_timer_expiry_promotes_a_reported_timer() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        assert!(!machine.wait_for_timer_expiry().unwrap());
+        let set_timeout = set_timeout_global(&machine);
+        let a = timer_fn(&mut machine, 1);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(1)])
+            .unwrap();
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 1,
+        });
+        assert!(machine.wait_for_timer_expiry().unwrap());
+        assert_eq!(machine.run_one_expired_timer().unwrap().executed, 1);
+        assert_eq!(read_global(&machine, "a"), Some(Value::int32(1)));
+    }
+
+    // ---- automatic event loop ---------------------------------------------
+
+    /// A program whose entry queues the global `"job"` microtask, with helper
+    /// functions that push a marker onto the global `"order"` array. Function 1
+    /// also queues `"job"` so a microtask can be created during a drain or a
+    /// timer turn. The entry function is only exercised by `evaluate`.
+    fn loop_test_program() -> Program<Verified> {
+        verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("order")), // 0
+                Constant::Int32(1),                               // 1
+                Constant::Int32(2),                               // 2
+                Constant::Int32(3),                               // 3
+                Constant::Int32(4),                               // 4
+                Constant::String(EcmaString::from_utf8("queueMicrotask")), // 5
+                Constant::String(EcmaString::from_utf8("job")),   // 6
+                Constant::Undefined,                              // 7
+            ],
+            vec![
+                function(
+                    0,
+                    7,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(5),
+                        },
+                        Instruction::LoadGlobal {
+                            dst: reg(1),
+                            name: cid(6),
+                        },
+                        Instruction::CreateArray { dst: reg(2) },
+                        Instruction::ArrayPush {
+                            array: reg(2),
+                            value: reg(1),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(3),
+                            constant: cid(7),
+                        },
+                        Instruction::Call {
+                            dst: reg(4),
+                            callee: reg(0),
+                            this_value: reg(3),
+                            arguments: reg(2),
+                        },
+                        Instruction::Return { value: reg(3) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    7,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(1),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(0),
+                            value: reg(1),
+                        },
+                        Instruction::LoadGlobal {
+                            dst: reg(2),
+                            name: cid(5),
+                        },
+                        Instruction::LoadGlobal {
+                            dst: reg(3),
+                            name: cid(6),
+                        },
+                        Instruction::CreateArray { dst: reg(4) },
+                        Instruction::ArrayPush {
+                            array: reg(4),
+                            value: reg(3),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(5),
+                            constant: cid(7),
+                        },
+                        Instruction::Call {
+                            dst: reg(6),
+                            callee: reg(2),
+                            this_value: reg(5),
+                            arguments: reg(4),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(2),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(0),
+                            value: reg(1),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(3),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(0),
+                            value: reg(1),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(4),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(0),
+                            value: reg(1),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        )
+    }
+
+    fn promise_throw_program() -> Program<Verified> {
+        verified(
+            vec![
+                Constant::String(EcmaString::from_utf8("resolve")), // 0
+                Constant::String(EcmaString::from_utf8("reject")),  // 1
+                Constant::String(EcmaString::from_utf8("observed")), // 2
+                Constant::Int32(7),                                 // 3
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    2,
+                    2,
+                    vec![
+                        Instruction::StoreGlobal {
+                            name: cid(0),
+                            value: reg(0),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(1),
+                            value: reg(1),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    1,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(3),
+                        },
+                        Instruction::Throw { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    1,
+                    1,
+                    vec![
+                        Instruction::StoreGlobal {
+                            name: cid(2),
+                            value: reg(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        )
+    }
+
+    fn install_order_array(machine: &mut Machine<'_, TimerTestHost>) -> Value {
+        let order = machine
+            .allocate(HeapEntry::Array {
+                elements: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.array_prototype),
+                extensible: true,
+                length_writable: true,
+            })
+            .unwrap();
+        machine
+            .globals
+            .insert(EcmaString::from_utf8("order"), order);
+        order
+    }
+
+    fn order_markers(machine: &Machine<'_, TimerTestHost>) -> Vec<Value> {
+        let order = machine
+            .globals
+            .get(&EcmaString::from_utf8("order"))
+            .copied()
+            .expect("order array is installed");
+        let index = machine
+            .runtime_slot(order)
+            .expect("order resolves")
+            .expect("order is a heap value");
+        let HeapEntry::Array { elements, .. } = &machine.heap[index] else {
+            panic!("order remains an array");
+        };
+        elements.clone()
+    }
+
+    fn schedule_global_job(
+        machine: &mut Machine<'_, TimerTestHost>,
+        global: &str,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let job = machine
+            .globals
+            .get(&EcmaString::from_utf8(global))
+            .copied()
+            .unwrap_or_else(|| panic!("test installs the {global} job"));
+        let queue = machine
+            .intrinsics
+            .global("queueMicrotask")
+            .expect("queueMicrotask is installed");
+        machine.call_value(queue, Value::UNDEFINED, &[job])?;
+        Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+    }
+
+    fn queue_job_then_throw(
+        machine: &mut Machine<'_, TimerTestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        schedule_global_job(machine, "nestedCallback")?;
+        Err(EvalFailure::ThrowValue(Value::int32(7)))
+    }
+
+    fn respawn_job(
+        machine: &mut Machine<'_, TimerTestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        schedule_global_job(machine, "nestedCallback")
+    }
+
+    #[test]
+    fn automatic_loop_leaves_an_idle_machine_untouched() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let fuel = machine.fuel;
+        machine.run_to_quiescence().unwrap();
+        assert_eq!(machine.fuel, fuel);
+        assert!(machine.microtasks.is_empty());
+        assert!(!machine.has_pending_timers());
+        assert!(!machine.microtask_drain_active);
+        assert!(!machine.timer_checkpoint_active);
+    }
+
+    #[test]
+    fn run_returns_the_synchronous_execution_snapshot() {
+        let program = loop_test_program();
+        let mut host = TimerTestHost::default();
+        let mut first = Machine::new(&program, &mut host, Limits::default());
+        first.frames.clear();
+        first.live_registers = 0;
+        install_order_array(&mut first);
+        let first_job = timer_fn(&mut first, 2);
+        first
+            .globals
+            .insert(EcmaString::from_utf8("job"), first_job);
+        let snapshot = first.evaluate().unwrap();
+        assert!(order_markers(&first).is_empty());
+        first.run_to_quiescence().unwrap();
+        assert_eq!(order_markers(&first), vec![Value::int32(2)]);
+        drop(first);
+
+        let mut host = TimerTestHost::default();
+        let mut second = Machine::new(&program, &mut host, Limits::default());
+        second.frames.clear();
+        second.live_registers = 0;
+        install_order_array(&mut second);
+        let second_job = timer_fn(&mut second, 2);
+        second
+            .globals
+            .insert(EcmaString::from_utf8("job"), second_job);
+        let execution = second.run().unwrap();
+        assert_eq!(execution, snapshot);
+    }
+
+    #[test]
+    fn automatic_loop_drains_nested_microtasks_in_fifo_order() {
+        let program = loop_test_program();
+        let mut host = TimerTestHost::default();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        install_order_array(&mut machine);
+        let first = timer_fn(&mut machine, 1); // pushes 1, queues "job"
+        let second = timer_fn(&mut machine, 2); // pushes 2
+        let third = timer_fn(&mut machine, 3); // pushes 3
+        machine.globals.insert(EcmaString::from_utf8("job"), third);
+        let queue = machine.intrinsics.global("queueMicrotask").unwrap();
+        machine
+            .call_value(queue, Value::UNDEFINED, &[first])
+            .unwrap();
+        machine
+            .call_value(queue, Value::UNDEFINED, &[second])
+            .unwrap();
+
+        machine.run_to_quiescence().unwrap();
+        assert_eq!(
+            order_markers(&machine),
+            vec![Value::int32(1), Value::int32(2), Value::int32(3)]
+        );
+        assert!(machine.microtasks.is_empty());
+    }
+
+    #[test]
+    fn automatic_loop_runs_two_timers_with_a_full_drain_between_turns() {
+        let program = loop_test_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        install_order_array(&mut machine);
+        let first = timer_fn(&mut machine, 1); // pushes 1, queues "job"
+        let second = timer_fn(&mut machine, 3); // pushes 3
+        let microtask = timer_fn(&mut machine, 2); // pushes 2
+        machine
+            .globals
+            .insert(EcmaString::from_utf8("job"), microtask);
+        let set_timeout = set_timeout_global(&machine);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[first, Value::int32(5)])
+            .unwrap();
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[second, Value::int32(5)])
+            .unwrap();
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 5,
+        });
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 2,
+            deadline_ms: 5,
+        });
+
+        machine.run_to_quiescence().unwrap();
+        // The first timer's microtask (2) runs before the second timer (3).
+        assert_eq!(
+            order_markers(&machine),
+            vec![Value::int32(1), Value::int32(2), Value::int32(3)]
+        );
+        assert!(machine.microtasks.is_empty());
+        assert!(!machine.has_pending_timers());
+    }
+
+    #[test]
+    fn automatic_loop_runs_a_timer_created_timer_in_a_later_turn() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let nested = timer_fn(&mut machine, 2);
+        machine
+            .globals
+            .insert(EcmaString::from_utf8("nestedCallback"), nested);
+        let creator = timer_native(&mut machine, "schedule nested", schedule_nested_timer);
+        let set_timeout = set_timeout_global(&machine);
+        shared.borrow_mut().auto_report = true;
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[creator, Value::int32(1)])
+            .unwrap();
+
+        machine.run_to_quiescence().unwrap();
+        assert_eq!(read_global(&machine, "b"), Some(Value::int32(1)));
+        assert!(!machine.has_pending_timers());
+        assert!(machine.microtasks.is_empty());
+    }
+
+    #[test]
+    fn automatic_loop_ignores_stale_and_premature_reports_until_real_expiry() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let a = timer_fn(&mut machine, 1);
+        let set_timeout = set_timeout_global(&machine);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(50)])
+            .unwrap();
+        // A stale wakeup for an unknown id must not terminate the loop.
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 999,
+            deadline_ms: 10,
+        });
+        // A premature wakeup for the live timer cannot fire it before its deadline.
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 10,
+        });
+        // The real expiry report finally fires the callback.
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 50,
+        });
+
+        machine.run_to_quiescence().unwrap();
+        assert_eq!(read_global(&machine, "a"), Some(Value::int32(1)));
+        assert!(!machine.has_pending_timers());
+    }
+
+    #[test]
+    fn automatic_loop_rejects_an_empty_wait_while_a_timer_is_live() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let a = timer_fn(&mut machine, 1);
+        let set_timeout = set_timeout_global(&machine);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[a, Value::int32(5)])
+            .unwrap();
+        // A broken nonblocking provider returns no report for an armed timer.
+
+        let error = machine.run_to_quiescence().unwrap_err();
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::TimerProviderFailure { .. }
+        ));
+        // The machine-owned live record and flags survive the failure.
+        assert!(machine.has_pending_timers());
+        assert!(shared.borrow().live.contains_key(&1));
+        assert!(!machine.microtask_drain_active);
+        assert!(!machine.timer_checkpoint_active);
+    }
+
+    #[test]
+    fn automatic_loop_maps_the_first_uncaught_microtask_throw_and_stops() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let throwing = timer_fn(&mut machine, 4); // throws 7
+        let observer = timer_fn(&mut machine, 1); // stores a = 1
+        let queue = machine.intrinsics.global("queueMicrotask").unwrap();
+        machine
+            .call_value(queue, Value::UNDEFINED, &[throwing])
+            .unwrap();
+        machine
+            .call_value(queue, Value::UNDEFINED, &[observer])
+            .unwrap();
+
+        let error = machine.run_to_quiescence().unwrap_err();
+        assert_eq!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                value: Value::int32(7),
+                origin: ThrowOrigin::Bytecode,
+            }
+        );
+        // The later job stays queued and unrun.
+        assert_eq!(read_global(&machine, "a"), None);
+        assert_eq!(machine.microtasks.len(), 1);
+        assert!(!machine.microtask_drain_active);
+    }
+
+    #[test]
+    fn automatic_loop_timer_throw_suppresses_queued_microtasks_and_later_timers() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let suppressed_microtask = timer_fn(&mut machine, 2); // stores b = 1
+        machine.globals.insert(
+            EcmaString::from_utf8("nestedCallback"),
+            suppressed_microtask,
+        );
+        let thrower = timer_native(&mut machine, "queue then throw", queue_job_then_throw);
+        let later_timer = timer_fn(&mut machine, 1); // stores a = 1
+        let set_timeout = set_timeout_global(&machine);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[thrower, Value::int32(1)])
+            .unwrap();
+        machine
+            .call_value(
+                set_timeout,
+                Value::UNDEFINED,
+                &[later_timer, Value::int32(2)],
+            )
+            .unwrap();
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 1,
+        });
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 2,
+            deadline_ms: 2,
+        });
+
+        let error = machine.run_to_quiescence().unwrap_err();
+        assert_eq!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                value: Value::int32(7),
+                origin: ThrowOrigin::Bytecode,
+            }
+        );
+        // The exception converts before any drain, so the queued microtask and
+        // the later timer both stay pending.
+        assert_eq!(read_global(&machine, "b"), None);
+        assert_eq!(read_global(&machine, "a"), None);
+        assert_eq!(machine.microtasks.len(), 1);
+        assert!(machine.has_pending_timers());
+        assert!(!machine.microtask_drain_active);
+        assert!(!machine.timer_checkpoint_active);
+    }
+
+    #[test]
+    fn automatic_loop_settles_derived_promises_when_a_handler_throws() {
+        let program = promise_throw_program();
+        let mut host = TimerTestHost::default();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let executor = timer_fn(&mut machine, 1);
+        let throwing = timer_fn(&mut machine, 2);
+        let observer = timer_fn(&mut machine, 3);
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let constructor_index = machine.runtime_slot(constructor).unwrap().unwrap();
+        let HeapEntry::NativeFunction {
+            callable: NativeCallable::Builtin(constructor_id),
+            ..
+        } = machine.heap[constructor_index]
+        else {
+            panic!("Promise must be a native constructor");
+        };
+        let BuiltinOutcome::Value(promise) = machine
+            .call_builtin(constructor_id, Value::UNDEFINED, &[executor], true)
+            .unwrap()
+        else {
+            panic!("Promise construction returns a Promise");
+        };
+        let resolve = machine
+            .globals
+            .get(&EcmaString::from_utf8("resolve"))
+            .copied()
+            .unwrap();
+        machine
+            .call_value(resolve, Value::UNDEFINED, &[Value::int32(1)])
+            .unwrap();
+        let then = machine.get_named_property(promise, "then").unwrap();
+        let derived = machine.call_value(then, promise, &[throwing]).unwrap();
+        let then_again = machine.get_named_property(derived, "then").unwrap();
+        machine
+            .call_value(then_again, derived, &[Value::UNDEFINED, observer])
+            .unwrap();
+
+        machine.run_to_quiescence().unwrap();
+        // The thrown handler rejects the derived promise, whose rejection
+        // observer runs instead of aborting the loop.
+        assert_eq!(
+            machine
+                .globals
+                .get(&EcmaString::from_utf8("observed"))
+                .copied(),
+            Some(Value::int32(7))
+        );
+        assert!(machine.microtasks.is_empty());
+    }
+
+    #[test]
+    fn recursive_microtask_work_reaches_existing_fuel() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let respawn = timer_native(&mut machine, "respawn", respawn_job);
+        machine
+            .globals
+            .insert(EcmaString::from_utf8("nestedCallback"), respawn);
+        let queue = machine.intrinsics.global("queueMicrotask").unwrap();
+        machine
+            .call_value(queue, Value::UNDEFINED, &[respawn])
+            .unwrap();
+        machine.fuel = 16;
+
+        let error = machine.run_to_quiescence().unwrap_err();
+        assert!(matches!(error.kind, RuntimeErrorKind::FuelExhausted { .. }));
+        // Recursive work never reaches quiescence; fuel was fully spent.
+        assert_eq!(machine.fuel, 0);
+        assert!(!machine.microtask_drain_active);
+    }
+
+    #[test]
+    fn recursive_timer_work_reaches_existing_fuel() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        shared.borrow_mut().auto_report = true;
+        let respawn = timer_native(&mut machine, "respawn timer", schedule_recursive_timer);
+        machine
+            .globals
+            .insert(EcmaString::from_utf8("recursiveTimerCallback"), respawn);
+        let set_timeout = set_timeout_global(&machine);
+        machine
+            .call_value(set_timeout, Value::UNDEFINED, &[respawn, Value::int32(0)])
+            .unwrap();
+        machine.fuel = 16;
+
+        let error = machine.run_to_quiescence().unwrap_err();
+        assert!(matches!(error.kind, RuntimeErrorKind::FuelExhausted { .. }));
+        assert_eq!(machine.fuel, 0);
+        assert!(machine.has_pending_timers());
+        assert!(!machine.timer_checkpoint_active);
+    }
+
+    #[test]
+    fn manual_drain_still_collects_every_throw_and_continues() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let throwing = timer_fn(&mut machine, 4); // throws 7
+        let observer = timer_fn(&mut machine, 1); // stores a = 1
+        let queue = machine.intrinsics.global("queueMicrotask").unwrap();
+        machine
+            .call_value(queue, Value::UNDEFINED, &[throwing])
+            .unwrap();
+        machine
+            .call_value(queue, Value::UNDEFINED, &[observer])
+            .unwrap();
+        machine
+            .call_value(queue, Value::UNDEFINED, &[throwing])
+            .unwrap();
+
+        let drain = machine.drain_microtasks().unwrap();
+        assert_eq!(drain.executed, 3);
+        assert_eq!(
+            drain.uncaught,
+            vec![
+                CallbackException {
+                    value: Value::int32(7),
+                    origin: ThrowOrigin::Bytecode,
+                },
+                CallbackException {
+                    value: Value::int32(7),
+                    origin: ThrowOrigin::Bytecode,
+                },
+            ]
+        );
+        assert_eq!(read_global(&machine, "a"), Some(Value::int32(1)));
+        assert!(machine.microtasks.is_empty());
+    }
+
+    #[derive(Default)]
+    struct ImportMetaHost {
+        seen: Vec<EcmaString>,
+    }
+
+    impl Host for ImportMetaHost {
+        fn import_meta_url(&mut self, module_name: &EcmaString) -> EcmaString {
+            self.seen.push(module_name.clone());
+            EcmaString::from_utf8("host://modules/entry.mjs")
+        }
+    }
+
+    #[test]
+    fn import_meta_is_host_url_backed_stable_and_edge_independent() {
+        let program = linked(
+            vec![program_module(
+                "entry",
+                vec![
+                    Constant::String(EcmaString::from_utf8("url")),
+                    Constant::String(EcmaString::from_utf8("host://modules/entry.mjs")),
+                ],
+                vec![function(
+                    0,
+                    7,
+                    vec![
+                        Instruction::LoadImportMeta { dst: reg(0) },
+                        Instruction::LoadImportMeta { dst: reg(1) },
+                        Instruction::Binary {
+                            dst: reg(2),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(0),
+                            right: reg(1),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(3),
+                            constant: cid(1),
+                        },
+                        Instruction::GetProperty {
+                            dst: reg(4),
+                            object: reg(0),
+                            key: reg(3),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(5),
+                            constant: cid(2),
+                        },
+                        Instruction::Binary {
+                            dst: reg(6),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(4),
+                            right: reg(5),
+                        },
+                        Instruction::Return { value: reg(6) },
+                    ],
+                    Vec::new(),
+                )],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )],
+            0,
+        );
+        assert!(program.modules()[0].edges.is_empty());
+        let mut host = ImportMetaHost::default();
+        let execution = Machine::new(&program, &mut host, Limits::default())
+            .run()
+            .unwrap();
+        assert_eq!(execution.entry_registers[0], execution.entry_registers[1]);
+        assert_eq!(execution.entry_registers[2], Value::TRUE);
+        assert_eq!(execution.value, Value::TRUE);
+        assert_eq!(host.seen, vec![EcmaString::from_utf8("entry")]);
+    }
+
+    #[test]
+    fn to_object_preserves_objects_boxes_primitives_and_rejects_nullish() {
+        let program = verified(
+            vec![Constant::Int32(7)],
+            vec![function(
+                0,
+                4,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::ToObject {
+                        dst: reg(1),
+                        src: reg(0),
+                    },
+                    Instruction::CreateObject { dst: reg(2) },
+                    Instruction::ToObject {
+                        dst: reg(3),
+                        src: reg(2),
+                    },
+                    Instruction::Return { value: reg(3) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let execution = run_ok(&program);
+        assert_ne!(execution.entry_registers[1], Value::int32(7));
+        assert_eq!(execution.entry_registers[2], execution.entry_registers[3]);
+
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let boxed = machine
+            .value_to_object(Value::int32(7))
+            .expect("primitive boxes");
+        assert_eq!(
+            machine
+                .unbox_primitive_or_self(boxed)
+                .expect("valid wrapper"),
+            Value::int32(7)
+        );
+        assert!(matches!(
+            machine.value_to_object(Value::NULL),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+    }
+
+    #[test]
+    fn raw_string_own_properties_expose_length_and_in_range_indices() {
+        with_machine(Limits::default(), |machine| {
+            let string = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("ab")))
+                .unwrap();
+            let length = PropertyKey::Named(EcmaString::from_utf8("length"));
+            let zero = PropertyKey::Named(EcmaString::from_utf8("0"));
+            let one = PropertyKey::Named(EcmaString::from_utf8("1"));
+            let two = PropertyKey::Named(EcmaString::from_utf8("2"));
+
+            assert!(machine.has_own_property_key(string, &length).unwrap());
+            assert!(machine.has_own_property_key(string, &zero).unwrap());
+            assert!(machine.has_own_property_key(string, &one).unwrap());
+            assert!(!machine.has_own_property_key(string, &two).unwrap());
+            assert!(machine.has_property(string, &length).unwrap());
+            assert!(machine.has_property(string, &zero).unwrap());
+            assert!(!machine.has_property(string, &two).unwrap());
+
+            assert_eq!(
+                machine.get_property_key(string, &length).unwrap(),
+                number_value(2.0)
+            );
+            let zero_value = machine.get_property_key(string, &zero).unwrap();
+            assert_eq!(
+                machine.string_value(zero_value).unwrap(),
+                EcmaString::from_utf8("a")
+            );
+            let one_value = machine.get_property_key(string, &one).unwrap();
+            assert_eq!(
+                machine.string_value(one_value).unwrap(),
+                EcmaString::from_utf8("b")
+            );
+        });
+    }
+
+    #[test]
+    fn boxed_string_own_properties_expose_length_and_in_range_indices() {
+        with_machine(Limits::default(), |machine| {
+            let string = machine
+                .allocate(HeapEntry::String(EcmaString::from_utf8("ab")))
+                .unwrap();
+            let boxed = machine.value_to_object(string).unwrap();
+            let length = PropertyKey::Named(EcmaString::from_utf8("length"));
+            let zero = PropertyKey::Named(EcmaString::from_utf8("0"));
+            let one = PropertyKey::Named(EcmaString::from_utf8("1"));
+            let two = PropertyKey::Named(EcmaString::from_utf8("2"));
+
+            assert!(machine.has_own_property_key(boxed, &length).unwrap());
+            assert!(machine.has_own_property_key(boxed, &zero).unwrap());
+            assert!(machine.has_own_property_key(boxed, &one).unwrap());
+            assert!(!machine.has_own_property_key(boxed, &two).unwrap());
+            assert!(machine.has_property(boxed, &length).unwrap());
+            assert!(machine.has_property(boxed, &zero).unwrap());
+            assert!(!machine.has_property(boxed, &two).unwrap());
+
+            assert_eq!(
+                machine.get_property_key(boxed, &length).unwrap(),
+                number_value(2.0)
+            );
+            assert_eq!(
+                machine.get_named_property(boxed, "length").unwrap(),
+                number_value(2.0)
+            );
+            let zero_value = machine.get_property_key(boxed, &zero).unwrap();
+            assert_eq!(
+                machine.string_value(zero_value).unwrap(),
+                EcmaString::from_utf8("a")
+            );
+            let one_value = machine.get_property_key(boxed, &one).unwrap();
+            assert_eq!(
+                machine.string_value(one_value).unwrap(),
+                EcmaString::from_utf8("b")
+            );
+        });
+    }
+
+    #[test]
+    fn import_dynamic_instruction_resolves_local_module_namespace() {
+        let root = program_module(
+            "root",
+            vec![Constant::String(EcmaString::from_utf8("./target"))],
+            vec![function(
+                0,
+                2,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::ImportDynamic {
+                        dst: reg(1),
+                        specifier: reg(0),
+                    },
+                    Instruction::Return { value: reg(1) },
+                ],
+                Vec::new(),
+            )],
+            vec![Edge {
+                specifier: cid(1),
+                target: EdgeTarget::Local(ModuleId::new(1)),
+                kind: EdgeKind::Dynamic,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let target = program_module(
+            "target",
+            vec![
+                Constant::Int32(7),
+                Constant::String(EcmaString::from_utf8("value")),
+            ],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(2),
+                        value: reg(0),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            Vec::new(),
+            vec![Binding {
+                name: cid(2),
+                kind: BindingKind::Hoisted,
+            }],
+            vec![Export {
+                name: cid(2),
+                source: ExportSource::Local(BindingId::new(0)),
+            }],
+        );
+        let program = linked(vec![root, target], 0);
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+
+        let execution = machine
+            .evaluate()
+            .expect("dynamic import opcode returns its promise normally");
+        let promise = execution.entry_registers[1];
+        let index = machine
+            .runtime_slot(promise)
+            .expect("dynamic import result is a valid runtime value")
+            .expect("dynamic import result is heap allocated");
+        let namespace = match &machine.heap[index] {
+            HeapEntry::Promise {
+                state: PromiseState::Fulfilled { value },
+                ..
+            } => *value,
+            _ => panic!("local ImportDynamic resolves its result promise"),
+        };
+
+        assert_eq!(
+            machine.get_named_property(namespace, "value").unwrap(),
+            Value::int32(7)
+        );
+    }
+
+    #[test]
+    fn import_dynamic_instruction_resolves_registered_external_namespace() {
+        let program = linked(
+            vec![program_module(
+                "root",
+                vec![Constant::String(EcmaString::from_utf8("external"))],
+                vec![function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(1),
+                        },
+                        Instruction::ImportDynamic {
+                            dst: reg(1),
+                            specifier: reg(0),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                )],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )],
+            0,
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let namespace = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        machine.registry.external.insert(
+            EcmaString::from_utf8("external"),
+            ExternalModuleInstance {
+                namespace,
+                exports: BTreeMap::new(),
+                internals: BTreeMap::new(),
+            },
+        );
+
+        let execution = machine
+            .evaluate()
+            .expect("external dynamic import opcode returns its promise normally");
+        let promise = execution.entry_registers[1];
+        let index = machine
+            .runtime_slot(promise)
+            .expect("dynamic import result is a valid runtime value")
+            .expect("dynamic import result is heap allocated");
+        let HeapEntry::Promise {
+            state: PromiseState::Fulfilled { value },
+            ..
+        } = &machine.heap[index]
+        else {
+            panic!("external ImportDynamic resolves its result promise");
+        };
+
+        assert_eq!(*value, namespace);
+    }
+
+    #[test]
+    fn import_dynamic_instruction_rejects_missing_and_symbol_specifiers() {
+        let missing = linked(
+            vec![program_module(
+                "root",
+                vec![Constant::String(EcmaString::from_utf8("missing"))],
+                vec![function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(1),
+                        },
+                        Instruction::ImportDynamic {
+                            dst: reg(1),
+                            specifier: reg(0),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                )],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )],
+            0,
+        );
+        let mut missing_host = TestHost;
+        let mut missing_machine = Machine::new(&missing, &mut missing_host, Limits::default());
+        let missing_promise = missing_machine
+            .evaluate()
+            .expect("unresolved dynamic import returns a rejected promise")
+            .entry_registers[1];
+        let missing_index = missing_machine
+            .runtime_slot(missing_promise)
+            .unwrap()
+            .expect("rejected dynamic import result is a promise");
+        let HeapEntry::Promise {
+            state: PromiseState::Rejected { origin, .. },
+            ..
+        } = &missing_machine.heap[missing_index]
+        else {
+            panic!("missing ImportDynamic target rejects its promise");
+        };
+        assert_eq!(
+            *origin,
+            ThrowOrigin::TypeError {
+                operation: "resolve dynamic module specifier",
+            }
+        );
+
+        let coercion = linked(
+            vec![program_module(
+                "root",
+                vec![Constant::String(EcmaString::from_utf8("specifier"))],
+                vec![function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(1),
+                        },
+                        Instruction::ImportDynamic {
+                            dst: reg(1),
+                            specifier: reg(0),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                )],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )],
+            0,
+        );
+        let mut coercion_host = TestHost;
+        let mut coercion_machine = Machine::new(&coercion, &mut coercion_host, Limits::default());
+        let symbol = coercion_machine
+            .allocate(HeapEntry::Symbol {
+                description: EcmaString::from_utf8("specifier"),
+            })
+            .unwrap();
+        coercion_machine
+            .globals
+            .insert(EcmaString::from_utf8("specifier"), symbol);
+        let coercion_promise = coercion_machine
+            .evaluate()
+            .expect("uncoercible dynamic import returns a rejected promise")
+            .entry_registers[1];
+        let coercion_index = coercion_machine
+            .runtime_slot(coercion_promise)
+            .unwrap()
+            .expect("rejected dynamic import result is a promise");
+        let HeapEntry::Promise {
+            state: PromiseState::Rejected { origin, .. },
+            ..
+        } = &coercion_machine.heap[coercion_index]
+        else {
+            panic!("symbol ImportDynamic specifier rejects its promise");
+        };
+        assert_eq!(
+            *origin,
+            ThrowOrigin::TypeError {
+                operation: "convert symbol to string",
+            }
+        );
+    }
+
+    #[test]
+    fn normalize_relative_module_name_collapses_dot_components() {
+        assert_eq!(
+            normalize_relative_module_name(&EcmaString::from_utf8("a/b/.././c//d")),
+            EcmaString::from_utf8("a/c/d")
+        );
+        assert_eq!(
+            normalize_relative_module_name(&EcmaString::from_utf8("../x")),
+            EcmaString::from_utf8("x")
+        );
+        assert_eq!(
+            normalize_relative_module_name(&EcmaString::from_utf8("./")),
+            EcmaString::default()
+        );
+        assert_eq!(
+            resolve_relative_against_module_name(
+                &EcmaString::from_utf8("src/nested/main.ts"),
+                &EcmaString::from_utf8("../dependency.ts"),
+            ),
+            EcmaString::from_utf8("src/dependency.ts")
+        );
+        assert_eq!(
+            resolve_relative_against_module_name(
+                &EcmaString::from_utf8("main.ts"),
+                &EcmaString::from_utf8("./dependency.ts"),
+            ),
+            EcmaString::from_utf8("dependency.ts")
+        );
+    }
+
+    #[test]
+    fn import_dynamic_expression_resolves_computed_relative_bundled_module() {
+        let root = program_module(
+            "main.ts",
+            vec![Constant::String(EcmaString::from_utf8("./dependency.ts"))],
+            vec![function(
+                0,
+                2,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::ImportDynamic {
+                        dst: reg(1),
+                        specifier: reg(0),
+                    },
+                    Instruction::Return { value: reg(1) },
+                ],
+                Vec::new(),
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let dependency = program_module(
+            "dependency.ts",
+            vec![
+                Constant::Int32(41),
+                Constant::String(EcmaString::from_utf8("answer")),
+            ],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(2),
+                        value: reg(0),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            Vec::new(),
+            vec![Binding {
+                name: cid(2),
+                kind: BindingKind::Hoisted,
+            }],
+            vec![Export {
+                name: cid(2),
+                source: ExportSource::Local(BindingId::new(0)),
+            }],
+        );
+        let program = linked(vec![root, dependency], 0);
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+
+        let execution = machine
+            .evaluate()
+            .expect("computed relative dynamic import returns a promise");
+        let promise = execution.entry_registers[1];
+        let index = machine
+            .runtime_slot(promise)
+            .expect("dynamic import result is a valid runtime value")
+            .expect("dynamic import result is heap allocated");
+        let namespace = match &machine.heap[index] {
+            HeapEntry::Promise {
+                state: PromiseState::Fulfilled { value },
+                ..
+            } => *value,
+            _ => panic!("computed relative ImportDynamic resolves its result promise"),
+        };
+
+        assert_eq!(
+            machine.get_named_property(namespace, "answer").unwrap(),
+            Value::int32(41)
+        );
+        assert_eq!(
+            machine
+                .registry
+                .local_modules
+                .get(&EcmaString::from_utf8("dependency.ts")),
+            Some(&ModuleId::new(1))
+        );
+    }
+
+    #[test]
+    fn import_dynamic_expression_resolves_nested_relative_and_rejects_missing() {
+        let nested = program_module(
+            "src/app.ts",
+            vec![
+                Constant::String(EcmaString::from_utf8("./lib/dependency.ts")),
+                Constant::String(EcmaString::from_utf8("./missing.ts")),
+            ],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::ImportDynamic {
+                        dst: reg(1),
+                        specifier: reg(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(2),
+                    },
+                    Instruction::ImportDynamic {
+                        dst: reg(0),
+                        specifier: reg(2),
+                    },
+                    Instruction::Return { value: reg(1) },
+                ],
+                Vec::new(),
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let dependency = program_module(
+            "src/lib/dependency.ts",
+            vec![
+                Constant::Int32(17),
+                Constant::String(EcmaString::from_utf8("value")),
+            ],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(2),
+                        value: reg(0),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            Vec::new(),
+            vec![Binding {
+                name: cid(2),
+                kind: BindingKind::Hoisted,
+            }],
+            vec![Export {
+                name: cid(2),
+                source: ExportSource::Local(BindingId::new(0)),
+            }],
+        );
+        let program = linked(vec![nested, dependency], 0);
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+
+        let execution = machine
+            .evaluate()
+            .expect("nested relative dynamic import returns normally");
+        let fulfilled = execution.entry_registers[1];
+        let fulfilled_index = machine
+            .runtime_slot(fulfilled)
+            .unwrap()
+            .expect("nested relative import result is a promise");
+        let namespace = match &machine.heap[fulfilled_index] {
+            HeapEntry::Promise {
+                state: PromiseState::Fulfilled { value },
+                ..
+            } => *value,
+            _ => panic!("nested relative ImportDynamic resolves its result promise"),
+        };
+        assert_eq!(
+            machine.get_named_property(namespace, "value").unwrap(),
+            Value::int32(17)
+        );
+
+        let rejected = execution.entry_registers[0];
+        let rejected_index = machine
+            .runtime_slot(rejected)
+            .unwrap()
+            .expect("missing relative import result is a promise");
+        let HeapEntry::Promise {
+            state: PromiseState::Rejected { origin, .. },
+            ..
+        } = &machine.heap[rejected_index]
+        else {
+            panic!("missing relative ImportDynamic rejects its promise");
+        };
+        assert_eq!(
+            *origin,
+            ThrowOrigin::TypeError {
+                operation: "resolve dynamic module specifier",
+            }
+        );
+    }
+
+    #[test]
+    fn import_dynamic_expression_ignores_opaque_and_absolute_as_local_paths() {
+        let program = linked(
+            vec![
+                program_module(
+                    "main.ts",
+                    vec![
+                        Constant::String(EcmaString::from_utf8("dependency.ts")),
+                        Constant::String(EcmaString::from_utf8("/dependency.ts")),
+                    ],
+                    vec![function(
+                        0,
+                        3,
+                        vec![
+                            Instruction::LoadConst {
+                                dst: reg(0),
+                                constant: cid(1),
+                            },
+                            Instruction::ImportDynamic {
+                                dst: reg(1),
+                                specifier: reg(0),
+                            },
+                            Instruction::LoadConst {
+                                dst: reg(2),
+                                constant: cid(2),
+                            },
+                            Instruction::ImportDynamic {
+                                dst: reg(0),
+                                specifier: reg(2),
+                            },
+                            Instruction::Return { value: reg(1) },
+                        ],
+                        Vec::new(),
+                    )],
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                program_module(
+                    "dependency.ts",
+                    vec![
+                        Constant::Int32(9),
+                        Constant::String(EcmaString::from_utf8("value")),
+                    ],
+                    vec![function(
+                        0,
+                        1,
+                        vec![
+                            Instruction::LoadConst {
+                                dst: reg(0),
+                                constant: cid(1),
+                            },
+                            Instruction::StoreGlobal {
+                                name: cid(2),
+                                value: reg(0),
+                            },
+                            Instruction::Halt,
+                        ],
+                        Vec::new(),
+                    )],
+                    Vec::new(),
+                    vec![Binding {
+                        name: cid(2),
+                        kind: BindingKind::Hoisted,
+                    }],
+                    vec![Export {
+                        name: cid(2),
+                        source: ExportSource::Local(BindingId::new(0)),
+                    }],
+                ),
+            ],
+            0,
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let execution = machine
+            .evaluate()
+            .expect("opaque and absolute dynamic imports return promises");
+        for register in [0usize, 1usize] {
+            let promise = execution.entry_registers[register];
+            let index = machine
+                .runtime_slot(promise)
+                .unwrap()
+                .expect("unresolved dynamic import result is a promise");
+            let HeapEntry::Promise {
+                state: PromiseState::Rejected { origin, .. },
+                ..
+            } = &machine.heap[index]
+            else {
+                panic!("opaque/absolute ImportDynamic must not resolve as a local path");
+            };
+            assert_eq!(
+                *origin,
+                ThrowOrigin::TypeError {
+                    operation: "resolve dynamic module specifier",
+                }
+            );
+        }
     }
 }

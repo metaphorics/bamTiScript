@@ -1,0 +1,39 @@
+# BH1 — pinned benchmark host fingerprint (U0.8 / PB-1).
+#
+# `perf_budget` strictly matches every `[fingerprint]` field against the current
+# machine; any mismatch yields `INVALID_HOST` and invalidates the run. The
+# `[conditions]` table records the measurement preconditions BH1 must be tuned to
+# before data is collected (performance governor, zero swap, NUMA/CPU pinning);
+# these are surfaced in the result and reported, but are runtime-tunable and are
+# never part of the immutable host identity. `[source]` names the evidence each
+# fingerprint/condition field is read from, per
+# `.outline/wayfinder/decisions/performance-resource-budgets.md` §3.
+schema = 1
+host = "BH1"
+
+# Immutable hardware/OS identity. Read live and compared byte-for-byte.
+[fingerprint]
+kernel_release = "7.0.0-28-generic"
+kernel_version = "#28-Ubuntu SMP PREEMPT_DYNAMIC"
+arch = "x86_64"
+cpu_model = "Intel(R) Xeon(R) Gold 6138 CPU @ 2.00GHz"
+sockets = 2
+cores_per_socket = 20
+microcode = "0x2007006"
+
+# Measurement preconditions (advisory; recorded, not part of host identity).
+[conditions]
+governor = "performance"
+swap_total_kib = 0
+numa_node0_cpus = "0-19"
+
+# Fingerprint / condition evidence sources.
+[source]
+kernel_release = "/proc/version"
+kernel_version = "/proc/version"
+cpu_model = "/proc/cpuinfo"
+sockets = "/proc/cpuinfo"
+cores_per_socket = "/proc/cpuinfo"
+microcode = "/proc/cpuinfo"
+swap_total_kib = "/proc/meminfo"
+governor = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"

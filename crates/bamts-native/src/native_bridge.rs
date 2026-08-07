@@ -1,4 +1,4 @@
-//! The native runtime bridge: the typed helper-call algebra, the exact 30
+//! The native runtime bridge: the typed helper-call algebra, the exact 35
 //! `bamts_*` C-ABI helper exports, the panic- and nesting-safe thread-local
 //! [`NativeOps`] dispatch seam, and the feature-gated JIT and AOT linkage
 //! surfaces.
@@ -37,272 +37,118 @@ use crate::{Completion, CompletionTag, ShadowFrame, Value};
 // -- The helper algebra ------------------------------------------------------
 
 /// The number of runtime helpers, `0..HELPER_COUNT`.
-pub const HELPER_COUNT: u32 = 30;
+pub const HELPER_COUNT: u32 = 46;
 
 /// A runtime helper, identified by its stable ABI index. The variant order is
-/// the canonical `external_index` order (0..29) and is byte-identical to
+/// the canonical `external_index` order (0..45) and is byte-identical to
+/// `bamts_codegen::Helper`; [`NativeHelper::symbol`] returns the exact linker
+/// symbol generated code resolves against.
+///
 /// # Safety
 ///
 /// The caller must provide a live, uniquely owned `frame` whose nonempty handle
 /// range is disjoint from its header, and a live, aligned, writable `out` when
 /// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_codegen::Helper`; [`NativeHelper::symbol`] returns the exact linker
-/// symbol generated code resolves against.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum NativeHelper {
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_load_constant` — index 0.
+    /// `bamts_load_constant` — index 0.
     LoadConstant = 0,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_unary` — index 1.
+    /// `bamts_unary` — index 1.
     Unary = 1,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_binary` — index 2.
+    /// `bamts_binary` — index 2.
     Binary = 2,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_create_object` — index 3.
+    /// `bamts_create_object` — index 3.
     CreateObject = 3,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_create_array` — index 4.
+    /// `bamts_create_array` — index 4.
     CreateArray = 4,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_create_closure` — index 5.
+    /// `bamts_create_closure` — index 5.
     CreateClosure = 5,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_get_property` — index 6.
+    /// `bamts_get_property` — index 6.
     GetProperty = 6,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_set_property` — index 7.
+    /// `bamts_set_property` — index 7.
     SetProperty = 7,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_delete_property` — index 8.
+    /// `bamts_delete_property` — index 8.
     DeleteProperty = 8,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_call` — index 9.
+    /// `bamts_call` — index 9.
     Call = 9,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_construct` — index 10.
+    /// `bamts_construct` — index 10.
     Construct = 10,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_import` — index 11.
+    /// `bamts_import` — index 11.
     Import = 11,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_truthy` — index 12 (returns `0`/`1`, never writes `out`).
+    /// `bamts_truthy` — index 12 (returns `0`/`1`, never writes `out`).
     Truthy = 12,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_resume_value` — index 13.
+    /// `bamts_resume_value` — index 13.
     ResumeValue = 13,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_define_accessor` — index 14.
+    /// `bamts_define_accessor` — index 14.
     DefineAccessor = 14,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_load_global` — index 15.
+    /// `bamts_load_global` — index 15.
     LoadGlobal = 15,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_store_global` — index 16.
+    /// `bamts_store_global` — index 16.
     StoreGlobal = 16,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_typeof_global` — index 17.
+    /// `bamts_typeof_global` — index 17.
     TypeOfGlobal = 17,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_load_this` — index 18.
+    /// `bamts_load_this` — index 18.
     LoadThis = 18,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_load_arguments` — index 19.
+    /// `bamts_load_arguments` — index 19.
     LoadArguments = 19,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_load_new_target` — index 20.
+    /// `bamts_load_new_target` — index 20.
     LoadNewTarget = 20,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_array_push` — index 21.
+    /// `bamts_array_push` — index 21.
     ArrayPush = 21,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_array_extend` — index 22.
+    /// `bamts_array_extend` — index 22.
     ArrayExtend = 22,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_object_spread` — index 23.
+    /// `bamts_object_spread` — index 23.
     ObjectSpread = 23,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_set_prototype` — index 24.
+    /// `bamts_set_prototype` — index 24.
     SetPrototype = 24,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_create_private_name` — index 25.
+    /// `bamts_create_private_name` — index 25.
     CreatePrivateName = 25,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_create_regexp` — index 26.
+    /// `bamts_create_regexp` — index 26.
     CreateRegExp = 26,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_get_iterator` — index 27.
+    /// `bamts_get_iterator` — index 27.
     GetIterator = 27,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_iterator_next` — index 28 (writes two registers directly).
+    /// `bamts_iterator_next` — index 28 (writes two registers directly).
     IteratorNext = 28,
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_export` — index 29.
+    /// `bamts_export` — index 29.
     Export = 29,
+    /// `bamts_consume_fuel` — index 30.
+    ConsumeFuel = 30,
+    /// `bamts_create_cell` — index 31.
+    CreateCell = 31,
+    /// `bamts_iterator_step` — index 32 (raw, possibly-promised iterator result).
+    IteratorStep = 32,
+    /// `bamts_iterator_result` — index 33 (writes two registers directly).
+    IteratorResult = 33,
+    /// `bamts_iterator_close` — index 34 (raw close result; writes called flag).
+    IteratorClose = 34,
+    /// `bamts_require_close_result` — index 35 (validates an invoked close result).
+    RequireCloseResult = 35,
+    /// `bamts_to_object` — index 36 (ECMAScript object coercion).
+    ToObject = 36,
+    /// `bamts_import_dynamic` — index 37 (runtime expression import).
+    ImportDynamic = 37,
+    /// `bamts_load_import_meta` — index 38 (cached host module metadata).
+    LoadImportMeta = 38,
+    /// `bamts_dispose_capture` — index 39 (captures method and writes disposal kind).
+    DisposeCapture = 39,
+    /// `bamts_suppress_error` — index 40 (intrinsic error chaining).
+    SuppressError = 40,
+    /// `bamts_construct_with_new_target` — index 41 (explicit `new.target`).
+    ConstructWithNewTarget = 41,
+    /// `bamts_define_data_property` — index 42 (fixed data descriptor).
+    DefineDataProperty = 42,
+    /// `bamts_load_own_descriptor_slot` — index 43 (own-only descriptor slot read).
+    LoadOwnDescriptorSlot = 43,
+    /// `bamts_define_own_descriptor_slot` — index 44 (own-only descriptor slot write).
+    DefineOwnDescriptorSlot = 44,
+    /// `bamts_with_has_binding` — index 45 (object-environment HasBinding for `with`).
+    WithHasBinding = 45,
 }
 
 impl NativeHelper {
     /// The C symbol generated code links against. Byte-identical to
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_codegen::Helper::symbol`.
+    /// `bamts_codegen::Helper::symbol`.
     #[must_use]
     pub const fn symbol(self) -> &'static str {
         match self {
@@ -336,6 +182,22 @@ impl NativeHelper {
             NativeHelper::GetIterator => "bamts_get_iterator",
             NativeHelper::IteratorNext => "bamts_iterator_next",
             NativeHelper::Export => "bamts_export",
+            NativeHelper::ConsumeFuel => "bamts_consume_fuel",
+            NativeHelper::CreateCell => "bamts_create_cell",
+            NativeHelper::IteratorStep => "bamts_iterator_step",
+            NativeHelper::IteratorResult => "bamts_iterator_result",
+            NativeHelper::IteratorClose => "bamts_iterator_close",
+            NativeHelper::RequireCloseResult => "bamts_require_close_result",
+            NativeHelper::ToObject => "bamts_to_object",
+            NativeHelper::ImportDynamic => "bamts_import_dynamic",
+            NativeHelper::LoadImportMeta => "bamts_load_import_meta",
+            NativeHelper::DisposeCapture => "bamts_dispose_capture",
+            NativeHelper::SuppressError => "bamts_suppress_error",
+            NativeHelper::ConstructWithNewTarget => "bamts_construct_with_new_target",
+            NativeHelper::DefineDataProperty => "bamts_define_data_property",
+            NativeHelper::LoadOwnDescriptorSlot => "bamts_load_own_descriptor_slot",
+            NativeHelper::DefineOwnDescriptorSlot => "bamts_define_own_descriptor_slot",
+            NativeHelper::WithHasBinding => "bamts_with_has_binding",
         }
     }
 
@@ -380,6 +242,22 @@ impl NativeHelper {
             27 => Some(NativeHelper::GetIterator),
             28 => Some(NativeHelper::IteratorNext),
             29 => Some(NativeHelper::Export),
+            30 => Some(NativeHelper::ConsumeFuel),
+            31 => Some(NativeHelper::CreateCell),
+            32 => Some(NativeHelper::IteratorStep),
+            33 => Some(NativeHelper::IteratorResult),
+            34 => Some(NativeHelper::IteratorClose),
+            35 => Some(NativeHelper::RequireCloseResult),
+            36 => Some(NativeHelper::ToObject),
+            37 => Some(NativeHelper::ImportDynamic),
+            38 => Some(NativeHelper::LoadImportMeta),
+            39 => Some(NativeHelper::DisposeCapture),
+            40 => Some(NativeHelper::SuppressError),
+            41 => Some(NativeHelper::ConstructWithNewTarget),
+            42 => Some(NativeHelper::DefineDataProperty),
+            43 => Some(NativeHelper::LoadOwnDescriptorSlot),
+            44 => Some(NativeHelper::DefineOwnDescriptorSlot),
+            45 => Some(NativeHelper::WithHasBinding),
             _ => None,
         }
     }
@@ -407,8 +285,14 @@ pub enum HelperCall {
     Binary { op: u32, left: Value, right: Value },
     /// A fresh empty object.
     CreateObject,
+    /// Apply ECMAScript `ToObject` to `value`.
+    ToObject { value: Value },
+    /// Load the current module's stable import-meta object.
+    LoadImportMeta,
     /// A fresh empty array.
     CreateArray,
+    /// A compiler-private array cell seeded with the uninitialized sentinel.
+    CreateCell,
     /// A closure over `function_id` binding the `captures` array value.
     CreateClosure { function_id: u32, captures: Value },
     /// `object[key]`.
@@ -429,8 +313,17 @@ pub enum HelperCall {
     },
     /// Construct with `callee` over the `arguments` array.
     Construct { callee: Value, arguments: Value },
+    /// Construct with `callee` and an explicit `new_target` over the
+    /// `arguments` array.
+    ConstructWithNewTarget {
+        callee: Value,
+        new_target: Value,
+        arguments: Value,
+    },
     /// Import the module named by string constant `specifier`.
     Import { specifier: u32 },
+    /// Evaluate `import(specifier)` through the runtime resolver.
+    ImportDynamic { specifier: Value },
     /// ToBoolean on `value`. Routed to [`NativeOps::truthy`]; present here for a
     /// complete algebra but never delivered to [`NativeOps::dispatch`] in normal
     /// operation.
@@ -444,6 +337,27 @@ pub enum HelperCall {
         accessor: Value,
         kind: u32,
     },
+    /// Install a data property under `key` with a fixed descriptor.
+    DefineDataProperty {
+        object: Value,
+        key: Value,
+        value: Value,
+    },
+    /// Read one own-descriptor slot of `object[key]` (`slot` selector).
+    LoadOwnDescriptorSlot {
+        object: Value,
+        key: Value,
+        slot: u32,
+    },
+    /// Write `src` into one own-descriptor slot of `object[key]` (`slot` selector).
+    DefineOwnDescriptorSlot {
+        object: Value,
+        key: Value,
+        src: Value,
+        slot: u32,
+    },
+    /// Object Environment Record `HasBinding` for a `with` binding object.
+    WithHasBinding { object: Value, key: Value },
     /// `globalThis[name]`.
     LoadGlobal { name: u32 },
     /// `globalThis[name] = value`.
@@ -479,8 +393,44 @@ pub enum HelperCall {
         done_reg: u32,
         value_reg: u32,
     },
+    /// Advance `iterator`, returning the raw iterator result object (possibly
+    /// a promise for an async iterator) as the completion value. `for await`
+    /// suspends on that result before [`HelperCall::IteratorResult`] reads it.
+    IteratorStep { iterator: Value },
+    /// Validate the iterator result object `result`, writing the done flag
+    /// into register `done_reg` and the produced value into register
+    /// `value_reg` (both via the frame). On `Throw`, the thrown handle is the
+    /// result value and neither register is written.
+    IteratorResult {
+        result: Value,
+        done_reg: u32,
+        value_reg: u32,
+    },
+    /// Close `iterator`, writing whether a callable `return` was invoked into
+    /// register `called_reg` before that invocation and returning the raw close
+    /// result. `mode` selects whether a user close throw propagates (`0`) or
+    /// preserves an existing abrupt completion (`1`).
+    IteratorClose {
+        iterator: Value,
+        mode: u32,
+        called_reg: u32,
+    },
+    /// Require an object `result` only when `called` is true.
+    RequireCloseResult { result: Value, called: Value },
+    /// Capture the callable disposal method for `src`, returning it as the
+    /// completion value and writing its kind (`0`, `1`, or `2`) to `kind_reg`.
+    DisposeCapture {
+        src: Value,
+        hint: u32,
+        kind_reg: u32,
+    },
+    /// Construct the intrinsic `SuppressedError` chain node for a disposal
+    /// failure over an earlier body or disposal failure.
+    SuppressError { error: Value, suppressed: Value },
     /// Export local value `src` under string constant `name`.
     Export { name: u32, src: Value },
+    /// Consume `amount` units from the shared instruction budget.
+    ConsumeFuel { amount: u32 },
 }
 
 impl HelperCall {
@@ -492,17 +442,26 @@ impl HelperCall {
             HelperCall::Unary { .. } => NativeHelper::Unary,
             HelperCall::Binary { .. } => NativeHelper::Binary,
             HelperCall::CreateObject => NativeHelper::CreateObject,
+            HelperCall::ToObject { .. } => NativeHelper::ToObject,
+            HelperCall::LoadImportMeta => NativeHelper::LoadImportMeta,
             HelperCall::CreateArray => NativeHelper::CreateArray,
+            HelperCall::CreateCell => NativeHelper::CreateCell,
             HelperCall::CreateClosure { .. } => NativeHelper::CreateClosure,
             HelperCall::GetProperty { .. } => NativeHelper::GetProperty,
             HelperCall::SetProperty { .. } => NativeHelper::SetProperty,
             HelperCall::DeleteProperty { .. } => NativeHelper::DeleteProperty,
             HelperCall::Call { .. } => NativeHelper::Call,
             HelperCall::Construct { .. } => NativeHelper::Construct,
+            HelperCall::ConstructWithNewTarget { .. } => NativeHelper::ConstructWithNewTarget,
             HelperCall::Import { .. } => NativeHelper::Import,
+            HelperCall::ImportDynamic { .. } => NativeHelper::ImportDynamic,
             HelperCall::Truthy { .. } => NativeHelper::Truthy,
             HelperCall::ResumeValue => NativeHelper::ResumeValue,
             HelperCall::DefineAccessor { .. } => NativeHelper::DefineAccessor,
+            HelperCall::DefineDataProperty { .. } => NativeHelper::DefineDataProperty,
+            HelperCall::LoadOwnDescriptorSlot { .. } => NativeHelper::LoadOwnDescriptorSlot,
+            HelperCall::DefineOwnDescriptorSlot { .. } => NativeHelper::DefineOwnDescriptorSlot,
+            HelperCall::WithHasBinding { .. } => NativeHelper::WithHasBinding,
             HelperCall::LoadGlobal { .. } => NativeHelper::LoadGlobal,
             HelperCall::StoreGlobal { .. } => NativeHelper::StoreGlobal,
             HelperCall::TypeOfGlobal { .. } => NativeHelper::TypeOfGlobal,
@@ -517,7 +476,14 @@ impl HelperCall {
             HelperCall::CreateRegExp { .. } => NativeHelper::CreateRegExp,
             HelperCall::GetIterator { .. } => NativeHelper::GetIterator,
             HelperCall::IteratorNext { .. } => NativeHelper::IteratorNext,
+            HelperCall::IteratorStep { .. } => NativeHelper::IteratorStep,
+            HelperCall::IteratorResult { .. } => NativeHelper::IteratorResult,
+            HelperCall::IteratorClose { .. } => NativeHelper::IteratorClose,
+            HelperCall::RequireCloseResult { .. } => NativeHelper::RequireCloseResult,
+            HelperCall::DisposeCapture { .. } => NativeHelper::DisposeCapture,
+            HelperCall::SuppressError { .. } => NativeHelper::SuppressError,
             HelperCall::Export { .. } => NativeHelper::Export,
+            HelperCall::ConsumeFuel { .. } => NativeHelper::ConsumeFuel,
         }
     }
 }
@@ -636,7 +602,10 @@ impl<'a> NativeFrame<'a> {
             // non-overlap; the caller contract guarantees initialized Values.
             unsafe { core::slice::from_raw_parts_mut(handles_ptr, len) }
         };
-        Some(NativeFrame { frame: header, handles })
+        Some(NativeFrame {
+            frame: header,
+            handles,
+        })
     }
 
     /// The number of live registers (`ShadowFrame::handle_len`).
@@ -644,6 +613,13 @@ impl<'a> NativeFrame<'a> {
     #[must_use]
     pub fn handle_len(&self) -> u32 {
         u32::from(self.frame.handle_len)
+    }
+
+    /// The dense module id of the executing function.
+    #[inline]
+    #[must_use]
+    pub fn module_id(&self) -> u32 {
+        self.frame.module_id
     }
 
     /// The current bytecode program counter / resume token.
@@ -869,7 +845,7 @@ fn dispatch_simple(frame: *mut ShadowFrame, out: *mut Completion, call: HelperCa
     })
 }
 
-// -- The exact 30 exported C-ABI helpers -------------------------------------
+// -- The exact 35 exported C-ABI helpers -------------------------------------
 //
 // Parameter order and widths mirror `bamts_codegen::Helper::param_types`
 // exactly: `frame` (pointer) first, `out` (pointer) last, runtime `Value`s as
@@ -960,10 +936,57 @@ pub unsafe extern "C" fn bamts_create_object(frame: *mut ShadowFrame, out: *mut 
 /// range is disjoint from its header, and a live, aligned, writable `out` when
 /// this helper has one. Both remain valid and unaliased for the full call.
 ///
+/// `bamts_to_object(frame, value, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_to_object(
+    frame: *mut ShadowFrame,
+    value: u64,
+    out: *mut Completion,
+) -> u32 {
+    dispatch_simple(
+        frame,
+        out,
+        HelperCall::ToObject {
+            value: Value::from_bits(value),
+        },
+    )
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` and writable `out`.
+///
+/// `bamts_load_import_meta(frame, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_load_import_meta(
+    frame: *mut ShadowFrame,
+    out: *mut Completion,
+) -> u32 {
+    dispatch_simple(frame, out, HelperCall::LoadImportMeta)
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out` when
+/// this helper has one. Both remain valid and unaliased for the full call.
+///
 /// `bamts_create_array(frame, out)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bamts_create_array(frame: *mut ShadowFrame, out: *mut Completion) -> u32 {
     dispatch_simple(frame, out, HelperCall::CreateArray)
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out`.
+/// Both remain valid and unaliased for the full call.
+///
+/// `bamts_create_cell(frame, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_create_cell(frame: *mut ShadowFrame, out: *mut Completion) -> u32 {
+    dispatch_simple(frame, out, HelperCall::CreateCell)
 }
 
 /// # Safety
@@ -1120,6 +1143,32 @@ pub unsafe extern "C" fn bamts_construct(
 /// range is disjoint from its header, and a live, aligned, writable `out` when
 /// this helper has one. Both remain valid and unaliased for the full call.
 ///
+/// `bamts_construct_with_new_target(frame, callee, new_target, arguments, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_construct_with_new_target(
+    frame: *mut ShadowFrame,
+    callee: u64,
+    new_target: u64,
+    arguments: u64,
+    out: *mut Completion,
+) -> u32 {
+    dispatch_simple(
+        frame,
+        out,
+        HelperCall::ConstructWithNewTarget {
+            callee: Value::from_bits(callee),
+            new_target: Value::from_bits(new_target),
+            arguments: Value::from_bits(arguments),
+        },
+    )
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out` when
+/// this helper has one. Both remain valid and unaliased for the full call.
+///
 /// `bamts_import(frame, specifier, out)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bamts_import(
@@ -1128,6 +1177,27 @@ pub unsafe extern "C" fn bamts_import(
     out: *mut Completion,
 ) -> u32 {
     dispatch_simple(frame, out, HelperCall::Import { specifier })
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out`.
+///
+/// `bamts_import_dynamic(frame, specifier, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_import_dynamic(
+    frame: *mut ShadowFrame,
+    specifier: u64,
+    out: *mut Completion,
+) -> u32 {
+    dispatch_simple(
+        frame,
+        out,
+        HelperCall::ImportDynamic {
+            specifier: Value::from_bits(specifier),
+        },
+    )
 }
 
 /// Validates `frame` and runs the tagless truthy helper for `value`.
@@ -1177,6 +1247,22 @@ pub unsafe extern "C" fn bamts_resume_value(frame: *mut ShadowFrame, out: *mut C
 /// range is disjoint from its header, and a live, aligned, writable `out` when
 /// this helper has one. Both remain valid and unaliased for the full call.
 ///
+/// `bamts_consume_fuel(frame, amount, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_consume_fuel(
+    frame: *mut ShadowFrame,
+    amount: u32,
+    out: *mut Completion,
+) -> u32 {
+    dispatch_simple(frame, out, HelperCall::ConsumeFuel { amount })
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out` when
+/// this helper has one. Both remain valid and unaliased for the full call.
+///
 /// `bamts_define_accessor(frame, object, key, accessor, kind, out)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bamts_define_accessor(
@@ -1195,6 +1281,110 @@ pub unsafe extern "C" fn bamts_define_accessor(
             key: Value::from_bits(key),
             accessor: Value::from_bits(accessor),
             kind,
+        },
+    )
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out` when
+/// this helper has one. Both remain valid and unaliased for the full call.
+///
+/// `bamts_define_data_property(frame, object, key, value, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_define_data_property(
+    frame: *mut ShadowFrame,
+    object: u64,
+    key: u64,
+    value: u64,
+    out: *mut Completion,
+) -> u32 {
+    dispatch_simple(
+        frame,
+        out,
+        HelperCall::DefineDataProperty {
+            object: Value::from_bits(object),
+            key: Value::from_bits(key),
+            value: Value::from_bits(value),
+        },
+    )
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out` when
+/// this helper has one. Both remain valid and unaliased for the full call.
+///
+/// `bamts_load_own_descriptor_slot(frame, object, key, slot, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_load_own_descriptor_slot(
+    frame: *mut ShadowFrame,
+    object: u64,
+    key: u64,
+    slot: u32,
+    out: *mut Completion,
+) -> u32 {
+    dispatch_simple(
+        frame,
+        out,
+        HelperCall::LoadOwnDescriptorSlot {
+            object: Value::from_bits(object),
+            key: Value::from_bits(key),
+            slot,
+        },
+    )
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out` when
+/// this helper has one. Both remain valid and unaliased for the full call.
+///
+/// `bamts_define_own_descriptor_slot(frame, object, key, src, slot, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_define_own_descriptor_slot(
+    frame: *mut ShadowFrame,
+    object: u64,
+    key: u64,
+    src: u64,
+    slot: u32,
+    out: *mut Completion,
+) -> u32 {
+    dispatch_simple(
+        frame,
+        out,
+        HelperCall::DefineOwnDescriptorSlot {
+            object: Value::from_bits(object),
+            key: Value::from_bits(key),
+            src: Value::from_bits(src),
+            slot,
+        },
+    )
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out` when
+/// this helper has one. Both remain valid and unaliased for the full call.
+///
+/// `bamts_with_has_binding(frame, object, key, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_with_has_binding(
+    frame: *mut ShadowFrame,
+    object: u64,
+    key: u64,
+    out: *mut Completion,
+) -> u32 {
+    dispatch_simple(
+        frame,
+        out,
+        HelperCall::WithHasBinding {
+            object: Value::from_bits(object),
+            key: Value::from_bits(key),
         },
     )
 }
@@ -1275,7 +1465,10 @@ pub unsafe extern "C" fn bamts_load_this(frame: *mut ShadowFrame, out: *mut Comp
 ///
 /// `bamts_load_arguments(frame, out)`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn bamts_load_arguments(frame: *mut ShadowFrame, out: *mut Completion) -> u32 {
+pub unsafe extern "C" fn bamts_load_arguments(
+    frame: *mut ShadowFrame,
+    out: *mut Completion,
+) -> u32 {
     dispatch_simple(frame, out, HelperCall::LoadArguments)
 }
 
@@ -1287,7 +1480,10 @@ pub unsafe extern "C" fn bamts_load_arguments(frame: *mut ShadowFrame, out: *mut
 ///
 /// `bamts_load_new_target(frame, out)`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn bamts_load_new_target(frame: *mut ShadowFrame, out: *mut Completion) -> u32 {
+pub unsafe extern "C" fn bamts_load_new_target(
+    frame: *mut ShadowFrame,
+    out: *mut Completion,
+) -> u32 {
     dispatch_simple(frame, out, HelperCall::LoadNewTarget)
 }
 
@@ -1483,6 +1679,176 @@ pub unsafe extern "C" fn bamts_iterator_next(
 /// range is disjoint from its header, and a live, aligned, writable `out` when
 /// this helper has one. Both remain valid and unaliased for the full call.
 ///
+/// `bamts_iterator_step(frame, iterator, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_iterator_step(
+    frame: *mut ShadowFrame,
+    iterator: u64,
+    out: *mut Completion,
+) -> u32 {
+    dispatch_simple(
+        frame,
+        out,
+        HelperCall::IteratorStep {
+            iterator: Value::from_bits(iterator),
+        },
+    )
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out` when
+/// this helper has one. Both remain valid and unaliased for the full call.
+///
+/// `bamts_iterator_result(frame, result, done_reg, value_reg, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_iterator_result(
+    frame: *mut ShadowFrame,
+    result: u64,
+    done_reg: u32,
+    value_reg: u32,
+    out: *mut Completion,
+) -> u32 {
+    run_completion_helper(frame, out, |native_frame, ops| {
+        if done_reg >= native_frame.handle_len() || value_reg >= native_frame.handle_len() {
+            return HelperResult {
+                tag: CompletionTag::FatalTrap,
+                value: Value::int32(TRAP_INVALID_REGISTER),
+            };
+        }
+        ops.dispatch(
+            native_frame,
+            HelperCall::IteratorResult {
+                result: Value::from_bits(result),
+                done_reg,
+                value_reg,
+            },
+        )
+    })
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out` when
+/// this helper has one. Both remain valid and unaliased for the full call.
+///
+/// `bamts_iterator_close(frame, iterator, mode, called_reg, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_iterator_close(
+    frame: *mut ShadowFrame,
+    iterator: u64,
+    mode: u32,
+    called_reg: u32,
+    out: *mut Completion,
+) -> u32 {
+    run_completion_helper(frame, out, |native_frame, ops| {
+        if called_reg >= native_frame.handle_len() {
+            return HelperResult {
+                tag: CompletionTag::FatalTrap,
+                value: Value::int32(TRAP_INVALID_REGISTER),
+            };
+        }
+        ops.dispatch(
+            native_frame,
+            HelperCall::IteratorClose {
+                iterator: Value::from_bits(iterator),
+                mode,
+                called_reg,
+            },
+        )
+    })
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out`. Both
+/// remain valid and unaliased for the full call.
+///
+/// `bamts_require_close_result(frame, result, called, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_require_close_result(
+    frame: *mut ShadowFrame,
+    result: u64,
+    called: u64,
+    out: *mut Completion,
+) -> u32 {
+    dispatch_simple(
+        frame,
+        out,
+        HelperCall::RequireCloseResult {
+            result: Value::from_bits(result),
+            called: Value::from_bits(called),
+        },
+    )
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, a `kind_reg` within that handle range, and
+/// a live, aligned, writable `out`. All remain valid and unaliased for the full
+/// call.
+///
+/// `bamts_dispose_capture(frame, src, hint, kind_reg, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_dispose_capture(
+    frame: *mut ShadowFrame,
+    src: u64,
+    hint: u32,
+    kind_reg: u32,
+    out: *mut Completion,
+) -> u32 {
+    run_completion_helper(frame, out, |native_frame, ops| {
+        if kind_reg >= native_frame.handle_len() {
+            return HelperResult {
+                tag: CompletionTag::FatalTrap,
+                value: Value::int32(TRAP_INVALID_REGISTER),
+            };
+        }
+        ops.dispatch(
+            native_frame,
+            HelperCall::DisposeCapture {
+                src: Value::from_bits(src),
+                hint,
+                kind_reg,
+            },
+        )
+    })
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out`. Both
+/// remain valid and unaliased for the full call.
+///
+/// `bamts_suppress_error(frame, error, suppressed, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_suppress_error(
+    frame: *mut ShadowFrame,
+    error: u64,
+    suppressed: u64,
+    out: *mut Completion,
+) -> u32 {
+    dispatch_simple(
+        frame,
+        out,
+        HelperCall::SuppressError {
+            error: Value::from_bits(error),
+            suppressed: Value::from_bits(suppressed),
+        },
+    )
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out` when
+/// this helper has one. Both remain valid and unaliased for the full call.
+///
 /// `bamts_export(frame, name, src, out)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bamts_export(
@@ -1508,14 +1874,18 @@ pub unsafe extern "C" fn bamts_export(
 // compiling, so the JIT/AOT linker can never silently mismatch a helper.
 const _: unsafe extern "C" fn(*mut ShadowFrame, u32, *mut Completion) -> u32 = bamts_load_constant; // 0
 const _: unsafe extern "C" fn(*mut ShadowFrame, u32, u64, *mut Completion) -> u32 = bamts_unary; // 1
-const _: unsafe extern "C" fn(*mut ShadowFrame, u32, u64, u64, *mut Completion) -> u32 = bamts_binary; // 2
+const _: unsafe extern "C" fn(*mut ShadowFrame, u32, u64, u64, *mut Completion) -> u32 =
+    bamts_binary; // 2
 const _: unsafe extern "C" fn(*mut ShadowFrame, *mut Completion) -> u32 = bamts_create_object; // 3
 const _: unsafe extern "C" fn(*mut ShadowFrame, *mut Completion) -> u32 = bamts_create_array; // 4
-const _: unsafe extern "C" fn(*mut ShadowFrame, u32, u64, *mut Completion) -> u32 = bamts_create_closure; // 5
-const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 = bamts_get_property; // 6
+const _: unsafe extern "C" fn(*mut ShadowFrame, u32, u64, *mut Completion) -> u32 =
+    bamts_create_closure; // 5
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 =
+    bamts_get_property; // 6
 const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, u64, *mut Completion) -> u32 =
     bamts_set_property; // 7
-const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 = bamts_delete_property; // 8
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 =
+    bamts_delete_property; // 8
 const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, u64, *mut Completion) -> u32 = bamts_call; // 9
 const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 = bamts_construct; // 10
 const _: unsafe extern "C" fn(*mut ShadowFrame, u32, *mut Completion) -> u32 = bamts_import; // 11
@@ -1524,36 +1894,78 @@ const _: unsafe extern "C" fn(*mut ShadowFrame, *mut Completion) -> u32 = bamts_
 const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, u64, u32, *mut Completion) -> u32 =
     bamts_define_accessor; // 14
 const _: unsafe extern "C" fn(*mut ShadowFrame, u32, *mut Completion) -> u32 = bamts_load_global; // 15
-const _: unsafe extern "C" fn(*mut ShadowFrame, u32, u64, *mut Completion) -> u32 = bamts_store_global; // 16
+const _: unsafe extern "C" fn(*mut ShadowFrame, u32, u64, *mut Completion) -> u32 =
+    bamts_store_global; // 16
 const _: unsafe extern "C" fn(*mut ShadowFrame, u32, *mut Completion) -> u32 = bamts_typeof_global; // 17
 const _: unsafe extern "C" fn(*mut ShadowFrame, *mut Completion) -> u32 = bamts_load_this; // 18
 const _: unsafe extern "C" fn(*mut ShadowFrame, *mut Completion) -> u32 = bamts_load_arguments; // 19
 const _: unsafe extern "C" fn(*mut ShadowFrame, *mut Completion) -> u32 = bamts_load_new_target; // 20
-const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 = bamts_array_push; // 21
-const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 = bamts_array_extend; // 22
-const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 = bamts_object_spread; // 23
-const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 = bamts_set_prototype; // 24
-const _: unsafe extern "C" fn(*mut ShadowFrame, u32, *mut Completion) -> u32 = bamts_create_private_name; // 25
-const _: unsafe extern "C" fn(*mut ShadowFrame, u32, u32, *mut Completion) -> u32 = bamts_create_regexp; // 26
-const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u32, *mut Completion) -> u32 = bamts_get_iterator; // 27
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 =
+    bamts_array_push; // 21
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 =
+    bamts_array_extend; // 22
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 =
+    bamts_object_spread; // 23
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 =
+    bamts_set_prototype; // 24
+const _: unsafe extern "C" fn(*mut ShadowFrame, u32, *mut Completion) -> u32 =
+    bamts_create_private_name; // 25
+const _: unsafe extern "C" fn(*mut ShadowFrame, u32, u32, *mut Completion) -> u32 =
+    bamts_create_regexp; // 26
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u32, *mut Completion) -> u32 =
+    bamts_get_iterator; // 27
 const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u32, u32, *mut Completion) -> u32 =
     bamts_iterator_next; // 28
 const _: unsafe extern "C" fn(*mut ShadowFrame, u32, u64, *mut Completion) -> u32 = bamts_export; // 29
+const _: unsafe extern "C" fn(*mut ShadowFrame, u32, *mut Completion) -> u32 = bamts_consume_fuel; // 30
+const _: unsafe extern "C" fn(*mut ShadowFrame, *mut Completion) -> u32 = bamts_create_cell; // 31
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, *mut Completion) -> u32 = bamts_iterator_step; // 32
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u32, u32, *mut Completion) -> u32 =
+    bamts_iterator_result; // 33
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u32, u32, *mut Completion) -> u32 =
+    bamts_iterator_close; // 34
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 =
+    bamts_require_close_result; // 35
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, *mut Completion) -> u32 = bamts_to_object; // 36
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, *mut Completion) -> u32 = bamts_import_dynamic; // 37
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 =
+    bamts_suppress_error; // 40
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, u64, *mut Completion) -> u32 =
+    bamts_construct_with_new_target; // 41
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, u64, *mut Completion) -> u32 =
+    bamts_define_data_property; // 42
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, u32, *mut Completion) -> u32 =
+    bamts_load_own_descriptor_slot; // 43
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, u64, u32, *mut Completion) -> u32 =
+    bamts_define_own_descriptor_slot; // 44
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 =
+    bamts_with_has_binding; // 45
+const _: unsafe extern "C" fn(*mut ShadowFrame, *mut Completion) -> u32 = bamts_load_import_meta; // 38
 
 // -- Native entry invocation seam --------------------------------------------
 
 /// A finalized native entry point: `extern "C" fn(frame, out) -> tag`.
 pub type NativeEntryFn = unsafe extern "C" fn(*mut ShadowFrame, *mut Completion) -> u32;
 
-/// A non-self-referential seam for invoking a compiled native entry by
-/// function id. A JIT backend implements this over its `JITModule`; a linked
-/// AOT image ([`LinkedProgram`]) implements it over its unit table. The runtime
-/// engine stores `&dyn NativeEntryTable` and routes nested `CreateClosure`
-/// re-entry through it.
+/// A non-self-referential seam for invoking a compiled native entry by its
+/// `(module_id, function_id)` identity. A JIT backend implements this over its
+/// `JITModule`; a linked AOT image ([`LinkedProgram`]) implements it over its
+/// unit table. The runtime engine stores `&dyn NativeEntryTable` and routes
+/// nested `CreateClosure` re-entry through it.
 pub trait NativeEntryTable {
-    /// Invokes the entry for `function_id`, returning its completion tag.
+    /// The exact canonical [`bamts_bytecode::Program::encode`] bytes compiled into these entries.
+    ///
+    /// Callers must compare these bytes with the supplied program before any native entry runs.
+    fn program_bytes(&self) -> &[u8];
+
+    /// Invokes the entry for `(module_id, function_id)` with one completion.
+    ///
+    /// Implementations must reject `frame.module_id != module_id` before
+    /// entering native code so module-local constants and linkage use the
+    /// selected entry's identity.
     fn invoke(
         &self,
+        module_id: u32,
         function_id: u32,
         frame: &mut ShadowFrame,
         out: &mut Completion,
@@ -1591,7 +2003,7 @@ unsafe fn call_native_entry(
 /// The little-endian image magic, `b"BMTSAOT1"`.
 pub const AOT_MAGIC: u64 = u64::from_le_bytes(*b"BMTSAOT1");
 /// The supported AOT image ABI version.
-pub const AOT_ABI_VERSION: u32 = 1;
+pub const AOT_ABI_VERSION: u32 = 4;
 
 /// One compiled function in a linked AOT image.
 #[repr(C)]
@@ -1599,8 +2011,8 @@ pub const AOT_ABI_VERSION: u32 = 1;
 pub struct UnitDescriptor {
     /// The bytecode function id this entry implements.
     pub function_id: u32,
-    /// Reserved; must be zero.
-    pub reserved: u32,
+    /// The bytecode module id containing `function_id`.
+    pub module_id: u32,
     /// The finalized native entry.
     pub entry: NativeEntryFn,
 }
@@ -1624,10 +2036,10 @@ pub struct ProgramDescriptor {
     pub units: *const UnitDescriptor,
     /// The number of units.
     pub unit_count: usize,
-    /// The entry function id (must appear in `units`).
+    /// The entry function id (must appear in `units` with `entry_module`).
     pub entry_function: u32,
-    /// Reserved; must be zero.
-    pub reserved: u32,
+    /// The entry module id.
+    pub entry_module: u32,
 }
 
 /// A validated, borrow-checked view of a linked AOT image. The bytecode is
@@ -1636,16 +2048,17 @@ pub struct ProgramDescriptor {
 pub struct LinkedProgram<'a> {
     bytecode: &'a [u8],
     units: &'a [UnitDescriptor],
+    entry_module: u32,
     entry_function: u32,
 }
 
 impl<'a> LinkedProgram<'a> {
     /// Validates a program descriptor into a borrowed linked view.
     ///
-    /// Checks magic, ABI version, zeroed flags/reserved fields, non-null and
-    /// non-empty bytecode and unit tables, overflow-safe slice extents, unique
-    /// unit function ids, and that `entry_function` is present. Layout is only
-    /// defined on 64-bit targets; other widths yield
+    /// Checks magic, ABI version, zeroed flags, non-null and non-empty bytecode
+    /// and unit tables, overflow-safe slice extents, unit identities sorted and
+    /// unique by `(module_id, function_id)`, and that the tuple entry is present.
+    /// Layout is only defined on 64-bit targets; other widths yield
     /// [`AbiError::UnsupportedPointerWidth`].
     ///
     /// # Safety
@@ -1675,11 +2088,6 @@ impl<'a> LinkedProgram<'a> {
         if descriptor.flags != 0 {
             return Err(AbiError::NonZeroFlags {
                 flags: descriptor.flags,
-            });
-        }
-        if descriptor.reserved != 0 {
-            return Err(AbiError::NonZeroReserved {
-                reserved: descriptor.reserved,
             });
         }
 
@@ -1718,28 +2126,36 @@ impl<'a> LinkedProgram<'a> {
         let units = unsafe { core::slice::from_raw_parts(descriptor.units, descriptor.unit_count) };
 
         let mut entry_present = false;
-        for (index, unit) in units.iter().enumerate() {
-            if unit.reserved != 0 {
-                return Err(AbiError::NonZeroReserved {
-                    reserved: unit.reserved,
-                });
-            }
-            if unit.function_id == descriptor.entry_function {
+        let mut previous = None;
+        for unit in units {
+            let identity = (unit.module_id, unit.function_id);
+            if identity == (descriptor.entry_module, descriptor.entry_function) {
                 entry_present = true;
             }
-            // Unit counts are bounded by the bytecode's function ceiling, so a
-            // quadratic uniqueness scan stays cheap and allocation-free.
-            if units[..index]
-                .iter()
-                .any(|prior| prior.function_id == unit.function_id)
-            {
-                return Err(AbiError::DuplicateFunctionId {
-                    function_id: unit.function_id,
-                });
+            if let Some((previous_module_id, previous_function_id)) = previous {
+                match identity.cmp(&(previous_module_id, previous_function_id)) {
+                    core::cmp::Ordering::Less => {
+                        return Err(AbiError::UnsortedUnits {
+                            previous_module_id,
+                            previous_function_id,
+                            module_id: unit.module_id,
+                            function_id: unit.function_id,
+                        });
+                    }
+                    core::cmp::Ordering::Equal => {
+                        return Err(AbiError::DuplicateFunction {
+                            module_id: unit.module_id,
+                            function_id: unit.function_id,
+                        });
+                    }
+                    core::cmp::Ordering::Greater => {}
+                }
             }
+            previous = Some(identity);
         }
         if !entry_present {
             return Err(AbiError::EntryFunctionMissing {
+                module_id: descriptor.entry_module,
                 function_id: descriptor.entry_function,
             });
         }
@@ -1747,11 +2163,12 @@ impl<'a> LinkedProgram<'a> {
         Ok(LinkedProgram {
             bytecode,
             units,
+            entry_module: descriptor.entry_module,
             entry_function: descriptor.entry_function,
         })
     }
 
-    /// The embedded verified bytecode image (opaque to native code).
+    /// The embedded canonical [`bamts_bytecode::Program::encode`] bytes (opaque to native code).
     #[inline]
     #[must_use]
     pub fn bytecode(&self) -> &'a [u8] {
@@ -1765,6 +2182,13 @@ impl<'a> LinkedProgram<'a> {
         self.units
     }
 
+    /// The entry module id.
+    #[inline]
+    #[must_use]
+    pub fn entry_module(&self) -> u32 {
+        self.entry_module
+    }
+
     /// The entry function id.
     #[inline]
     #[must_use]
@@ -1772,25 +2196,37 @@ impl<'a> LinkedProgram<'a> {
         self.entry_function
     }
 
-    /// The unit for `function_id`, if present.
+    /// The unit for `(module_id, function_id)`, if present.
     #[must_use]
-    pub fn unit(&self, function_id: u32) -> Option<&'a UnitDescriptor> {
+    pub fn unit(&self, module_id: u32, function_id: u32) -> Option<&'a UnitDescriptor> {
         self.units
-            .iter()
-            .find(|unit| unit.function_id == function_id)
+            .binary_search_by_key(&(module_id, function_id), |unit| {
+                (unit.module_id, unit.function_id)
+            })
+            .ok()
+            .map(|index| &self.units[index])
     }
 }
 
 impl NativeEntryTable for LinkedProgram<'_> {
+    fn program_bytes(&self) -> &[u8] {
+        self.bytecode
+    }
+
     fn invoke(
         &self,
+        module_id: u32,
         function_id: u32,
         frame: &mut ShadowFrame,
         out: &mut Completion,
     ) -> Result<CompletionTag, AbiError> {
         let unit = self
-            .unit(function_id)
-            .ok_or(AbiError::UnknownFunction { function_id })?;
+            .unit(module_id, function_id)
+            .ok_or(AbiError::UnknownFunction {
+                module_id,
+                function_id,
+            })?;
+        require_frame_module_id(frame, unit.module_id)?;
         // SAFETY: `unit.entry` is a finalized native entry installed by the AOT
         // image, upholding the native-entry ABI; its code stays mapped for the
         // program's lifetime.
@@ -1807,7 +2243,7 @@ const _: () = {
     assert!(size_of::<UnitDescriptor>() == 16);
     assert!(align_of::<UnitDescriptor>() == 8);
     assert!(offset_of!(UnitDescriptor, function_id) == 0);
-    assert!(offset_of!(UnitDescriptor, reserved) == 4);
+    assert!(offset_of!(UnitDescriptor, module_id) == 4);
     assert!(offset_of!(UnitDescriptor, entry) == 8);
 
     // ProgramDescriptor: 56 bytes, 8-aligned, fields at fixed offsets.
@@ -1821,7 +2257,7 @@ const _: () = {
     assert!(offset_of!(ProgramDescriptor, units) == 32);
     assert!(offset_of!(ProgramDescriptor, unit_count) == 40);
     assert!(offset_of!(ProgramDescriptor, entry_function) == 48);
-    assert!(offset_of!(ProgramDescriptor, reserved) == 52);
+    assert!(offset_of!(ProgramDescriptor, entry_module) == 52);
 };
 
 /// A typed AOT/entry-linkage failure.
@@ -1847,11 +2283,6 @@ pub enum AbiError {
         /// The observed flags.
         flags: u32,
     },
-    /// A `reserved` field was non-zero.
-    NonZeroReserved {
-        /// The observed reserved value.
-        reserved: u32,
-    },
     /// The bytecode pointer was null with a non-zero length.
     NullBytecode,
     /// The bytecode image was empty.
@@ -1862,21 +2293,62 @@ pub enum AbiError {
     EmptyUnits,
     /// A slice extent overflowed `isize::MAX`.
     LengthOverflow,
-    /// Two units shared a function id.
-    DuplicateFunctionId {
-        /// The duplicated id.
+    /// Unit identities are not sorted by `(module_id, function_id)`.
+    UnsortedUnits {
+        /// The preceding module id.
+        previous_module_id: u32,
+        /// The preceding function id.
+        previous_function_id: u32,
+        /// The out-of-order module id.
+        module_id: u32,
+        /// The out-of-order function id.
         function_id: u32,
     },
-    /// The declared entry function was absent from the unit table.
+    /// Two units shared a `(module_id, function_id)` identity.
+    DuplicateFunction {
+        /// The duplicated module id.
+        module_id: u32,
+        /// The duplicated function id.
+        function_id: u32,
+    },
+    /// The declared tuple entry was absent from the unit table.
     EntryFunctionMissing {
-        /// The missing entry id.
+        /// The missing module id.
+        module_id: u32,
+        /// The missing function id.
         function_id: u32,
     },
-    /// [`NativeEntryTable::invoke`] was asked for an unknown function id.
+    /// [`NativeEntryTable::invoke`] was asked for an unknown function identity.
     UnknownFunction {
-        /// The requested id.
+        /// The requested module id.
+        module_id: u32,
+        /// The requested function id.
         function_id: u32,
     },
+    /// The frame belongs to a different module than the selected native entry.
+    FrameModuleMismatch {
+        /// The module id attached to the selected native entry.
+        selected_module_id: u32,
+        /// The module id stored in the caller's shadow frame.
+        frame_module_id: u32,
+    },
+}
+
+/// Rejects a shadow frame that would make a selected native entry resolve
+/// constants or linkage against another module.
+#[inline]
+pub fn require_frame_module_id(
+    frame: &ShadowFrame,
+    selected_module_id: u32,
+) -> Result<(), AbiError> {
+    if frame.module_id == selected_module_id {
+        Ok(())
+    } else {
+        Err(AbiError::FrameModuleMismatch {
+            selected_module_id,
+            frame_module_id: frame.module_id,
+        })
+    }
 }
 
 impl fmt::Display for AbiError {
@@ -1894,23 +2366,48 @@ impl fmt::Display for AbiError {
             AbiError::NonZeroFlags { flags } => {
                 write!(f, "AOT image flags {flags:#x} must be zero")
             }
-            AbiError::NonZeroReserved { reserved } => {
-                write!(f, "AOT reserved field {reserved:#x} must be zero")
-            }
             AbiError::NullBytecode => f.write_str("AOT image bytecode pointer is null"),
             AbiError::EmptyBytecode => f.write_str("AOT image bytecode is empty"),
             AbiError::NullUnits => f.write_str("AOT image unit pointer is null"),
             AbiError::EmptyUnits => f.write_str("AOT image unit table is empty"),
             AbiError::LengthOverflow => f.write_str("AOT image slice extent overflows isize::MAX"),
-            AbiError::DuplicateFunctionId { function_id } => {
-                write!(f, "AOT image has duplicate function id {function_id}")
-            }
-            AbiError::EntryFunctionMissing { function_id } => {
-                write!(f, "AOT image entry function {function_id} is absent")
-            }
-            AbiError::UnknownFunction { function_id } => {
-                write!(f, "no native entry for function id {function_id}")
-            }
+            AbiError::UnsortedUnits {
+                previous_module_id,
+                previous_function_id,
+                module_id,
+                function_id,
+            } => write!(
+                f,
+                "AOT unit ({module_id}, {function_id}) follows ({previous_module_id}, {previous_function_id}) out of order"
+            ),
+            AbiError::DuplicateFunction {
+                module_id,
+                function_id,
+            } => write!(
+                f,
+                "AOT image has duplicate native function ({module_id}, {function_id})"
+            ),
+            AbiError::EntryFunctionMissing {
+                module_id,
+                function_id,
+            } => write!(
+                f,
+                "AOT image entry function ({module_id}, {function_id}) is absent"
+            ),
+            AbiError::UnknownFunction {
+                module_id,
+                function_id,
+            } => write!(
+                f,
+                "no native entry for function ({module_id}, {function_id})"
+            ),
+            AbiError::FrameModuleMismatch {
+                selected_module_id,
+                frame_module_id,
+            } => write!(
+                f,
+                "native entry module {selected_module_id} cannot execute frame for module {frame_module_id}"
+            ),
         }
     }
 }
@@ -2004,13 +2501,127 @@ mod jit {
 
 #[cfg(test)]
 mod tests {
-    fn test_bamts_load_this(f: *mut ShadowFrame, o: *mut Completion) -> u32 { unsafe { super::bamts_load_this(f, o) } }
-    fn test_bamts_call(f: *mut ShadowFrame, a: u64, t: u64, x: u64, o: *mut Completion) -> u32 { unsafe { super::bamts_call(f, a, t, x, o) } }
-    fn test_bamts_binary(f: *mut ShadowFrame, op: u32, l: u64, r: u64, o: *mut Completion) -> u32 { unsafe { super::bamts_binary(f, op, l, r, o) } }
-    fn test_bamts_truthy(f: *mut ShadowFrame, v: u64) -> u32 { unsafe { super::bamts_truthy(f, v) } }
-    fn test_bamts_iterator_next(f: *mut ShadowFrame, i: u64, d: u32, v: u32, o: *mut Completion) -> u32 { unsafe { super::bamts_iterator_next(f, i, d, v, o) } }
-    fn test_bamts_create_object(f: *mut ShadowFrame, o: *mut Completion) -> u32 { unsafe { super::bamts_create_object(f, o) } }
-    fn test_bamts_load_global(f: *mut ShadowFrame, n: u32, o: *mut Completion) -> u32 { unsafe { super::bamts_load_global(f, n, o) } }
+    fn test_bamts_load_this(f: *mut ShadowFrame, o: *mut Completion) -> u32 {
+        unsafe { super::bamts_load_this(f, o) }
+    }
+    fn test_bamts_call(f: *mut ShadowFrame, a: u64, t: u64, x: u64, o: *mut Completion) -> u32 {
+        unsafe { super::bamts_call(f, a, t, x, o) }
+    }
+    fn test_bamts_construct_with_new_target(
+        f: *mut ShadowFrame,
+        c: u64,
+        n: u64,
+        x: u64,
+        o: *mut Completion,
+    ) -> u32 {
+        unsafe { super::bamts_construct_with_new_target(f, c, n, x, o) }
+    }
+    fn test_bamts_define_data_property(
+        f: *mut ShadowFrame,
+        object: u64,
+        key: u64,
+        value: u64,
+        o: *mut Completion,
+    ) -> u32 {
+        unsafe { super::bamts_define_data_property(f, object, key, value, o) }
+    }
+    fn test_bamts_load_own_descriptor_slot(
+        f: *mut ShadowFrame,
+        object: u64,
+        key: u64,
+        slot: u32,
+        o: *mut Completion,
+    ) -> u32 {
+        unsafe { super::bamts_load_own_descriptor_slot(f, object, key, slot, o) }
+    }
+    fn test_bamts_define_own_descriptor_slot(
+        f: *mut ShadowFrame,
+        object: u64,
+        key: u64,
+        src: u64,
+        slot: u32,
+        o: *mut Completion,
+    ) -> u32 {
+        unsafe { super::bamts_define_own_descriptor_slot(f, object, key, src, slot, o) }
+    }
+    fn test_bamts_with_has_binding(
+        f: *mut ShadowFrame,
+        object: u64,
+        key: u64,
+        o: *mut Completion,
+    ) -> u32 {
+        unsafe { super::bamts_with_has_binding(f, object, key, o) }
+    }
+    fn test_bamts_binary(f: *mut ShadowFrame, op: u32, l: u64, r: u64, o: *mut Completion) -> u32 {
+        unsafe { super::bamts_binary(f, op, l, r, o) }
+    }
+    fn test_bamts_truthy(f: *mut ShadowFrame, v: u64) -> u32 {
+        unsafe { super::bamts_truthy(f, v) }
+    }
+    fn test_bamts_consume_fuel(f: *mut ShadowFrame, amount: u32, o: *mut Completion) -> u32 {
+        unsafe { super::bamts_consume_fuel(f, amount, o) }
+    }
+    fn test_bamts_iterator_next(
+        f: *mut ShadowFrame,
+        i: u64,
+        d: u32,
+        v: u32,
+        o: *mut Completion,
+    ) -> u32 {
+        unsafe { super::bamts_iterator_next(f, i, d, v, o) }
+    }
+    fn test_bamts_iterator_step(f: *mut ShadowFrame, i: u64, o: *mut Completion) -> u32 {
+        unsafe { super::bamts_iterator_step(f, i, o) }
+    }
+    fn test_bamts_iterator_result(
+        f: *mut ShadowFrame,
+        r: u64,
+        d: u32,
+        v: u32,
+        o: *mut Completion,
+    ) -> u32 {
+        unsafe { super::bamts_iterator_result(f, r, d, v, o) }
+    }
+    fn test_bamts_iterator_close(
+        f: *mut ShadowFrame,
+        i: u64,
+        m: u32,
+        c: u32,
+        o: *mut Completion,
+    ) -> u32 {
+        unsafe { super::bamts_iterator_close(f, i, m, c, o) }
+    }
+    fn test_bamts_require_close_result(
+        f: *mut ShadowFrame,
+        r: u64,
+        c: u64,
+        o: *mut Completion,
+    ) -> u32 {
+        unsafe { super::bamts_require_close_result(f, r, c, o) }
+    }
+    fn test_bamts_to_object(f: *mut ShadowFrame, v: u64, o: *mut Completion) -> u32 {
+        // SAFETY: test fixtures provide a live frame and output.
+        unsafe { super::bamts_to_object(f, v, o) }
+    }
+    fn test_bamts_dispose_capture(
+        f: *mut ShadowFrame,
+        s: u64,
+        h: u32,
+        k: u32,
+        o: *mut Completion,
+    ) -> u32 {
+        // SAFETY: test fixtures provide a live frame, an in-range kind register, and output.
+        unsafe { super::bamts_dispose_capture(f, s, h, k, o) }
+    }
+    fn test_bamts_suppress_error(f: *mut ShadowFrame, e: u64, s: u64, o: *mut Completion) -> u32 {
+        unsafe { super::bamts_suppress_error(f, e, s, o) }
+    }
+    fn test_bamts_create_object(f: *mut ShadowFrame, o: *mut Completion) -> u32 {
+        unsafe { super::bamts_create_object(f, o) }
+    }
+    fn test_bamts_load_global(f: *mut ShadowFrame, n: u32, o: *mut Completion) -> u32 {
+        unsafe { super::bamts_load_global(f, n, o) }
+    }
 
     use super::*;
     use crate::{Completion, CompletionTag, ShadowFrame, Value};
@@ -2021,14 +2632,8 @@ mod tests {
     /// comparison to `bamts_codegen::Helper` is impossible (codegen depends on
     /// this crate under `host-jit`, so importing it would be a cycle), so this
     /// literal is the pinned contract; it must stay byte-identical to
-    /// # Safety
-///
-/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
-/// range is disjoint from its header, and a live, aligned, writable `out` when
-/// this helper has one. Both remain valid and unaliased for the full call.
-///
-/// `bamts_codegen::Helper::{external_index, symbol}`.
-    const CODEGEN_HELPERS: [(u32, &str); 30] = [
+    /// `bamts_codegen::Helper::{external_index, symbol}`.
+    const CODEGEN_HELPERS: [(u32, &str); 46] = [
         (0, "bamts_load_constant"),
         (1, "bamts_unary"),
         (2, "bamts_binary"),
@@ -2059,6 +2664,22 @@ mod tests {
         (27, "bamts_get_iterator"),
         (28, "bamts_iterator_next"),
         (29, "bamts_export"),
+        (30, "bamts_consume_fuel"),
+        (31, "bamts_create_cell"),
+        (32, "bamts_iterator_step"),
+        (33, "bamts_iterator_result"),
+        (34, "bamts_iterator_close"),
+        (35, "bamts_require_close_result"),
+        (36, "bamts_to_object"),
+        (37, "bamts_import_dynamic"),
+        (38, "bamts_load_import_meta"),
+        (39, "bamts_dispose_capture"),
+        (40, "bamts_suppress_error"),
+        (41, "bamts_construct_with_new_target"),
+        (42, "bamts_define_data_property"),
+        (43, "bamts_load_own_descriptor_slot"),
+        (44, "bamts_define_own_descriptor_slot"),
+        (45, "bamts_with_has_binding"),
     ];
 
     /// A recording dispatcher: captures the last call and returns a fixed
@@ -2094,6 +2715,11 @@ mod tests {
                 done_reg,
                 value_reg,
                 ..
+            }
+            | HelperCall::IteratorResult {
+                done_reg,
+                value_reg,
+                ..
             } = call
             {
                 frame.set_register(done_reg, Value::TRUE);
@@ -2125,7 +2751,7 @@ mod tests {
 
     fn frame_with(regs: &mut [Value]) -> ShadowFrame {
         let len = u16::try_from(regs.len()).expect("register count fits u16");
-        ShadowFrame::new(core::ptr::null_mut(), 0, regs.as_mut_ptr(), len)
+        ShadowFrame::new(core::ptr::null_mut(), 0, 0, regs.as_mut_ptr(), len)
     }
 
     /// A dispatcher that re-enters itself once on the outer `Call`: it fires a
@@ -2226,6 +2852,110 @@ mod tests {
             .helper(),
             NativeHelper::Export
         );
+        assert_eq!(
+            HelperCall::ConsumeFuel { amount: 1 }.helper(),
+            NativeHelper::ConsumeFuel
+        );
+        assert_eq!(HelperCall::CreateCell.helper(), NativeHelper::CreateCell);
+        assert_eq!(
+            HelperCall::LoadImportMeta.helper(),
+            NativeHelper::LoadImportMeta
+        );
+        assert_eq!(
+            HelperCall::IteratorStep {
+                iterator: Value::NULL,
+            }
+            .helper(),
+            NativeHelper::IteratorStep
+        );
+        assert_eq!(
+            HelperCall::IteratorResult {
+                result: Value::NULL,
+                done_reg: 0,
+                value_reg: 1,
+            }
+            .helper(),
+            NativeHelper::IteratorResult
+        );
+        assert_eq!(
+            HelperCall::IteratorClose {
+                iterator: Value::NULL,
+                mode: 1,
+                called_reg: 0,
+            }
+            .helper(),
+            NativeHelper::IteratorClose
+        );
+        assert_eq!(
+            HelperCall::RequireCloseResult {
+                result: Value::NULL,
+                called: Value::TRUE,
+            }
+            .helper(),
+            NativeHelper::RequireCloseResult
+        );
+        assert_eq!(
+            HelperCall::SuppressError {
+                error: Value::int32(1),
+                suppressed: Value::int32(2),
+            }
+            .helper(),
+            NativeHelper::SuppressError
+        );
+        assert_eq!(
+            HelperCall::DisposeCapture {
+                src: Value::NULL,
+                hint: 1,
+                kind_reg: 0,
+            }
+            .helper(),
+            NativeHelper::DisposeCapture
+        );
+        assert_eq!(
+            HelperCall::ConstructWithNewTarget {
+                callee: Value::NULL,
+                new_target: Value::NULL,
+                arguments: Value::NULL,
+            }
+            .helper(),
+            NativeHelper::ConstructWithNewTarget
+        );
+        assert_eq!(
+            HelperCall::DefineDataProperty {
+                object: Value::NULL,
+                key: Value::NULL,
+                value: Value::NULL,
+            }
+            .helper(),
+            NativeHelper::DefineDataProperty
+        );
+        assert_eq!(
+            HelperCall::LoadOwnDescriptorSlot {
+                object: Value::NULL,
+                key: Value::NULL,
+                slot: 0,
+            }
+            .helper(),
+            NativeHelper::LoadOwnDescriptorSlot
+        );
+        assert_eq!(
+            HelperCall::DefineOwnDescriptorSlot {
+                object: Value::NULL,
+                key: Value::NULL,
+                src: Value::NULL,
+                slot: 1,
+            }
+            .helper(),
+            NativeHelper::DefineOwnDescriptorSlot
+        );
+        assert_eq!(
+            HelperCall::WithHasBinding {
+                object: Value::NULL,
+                key: Value::NULL,
+            }
+            .helper(),
+            NativeHelper::WithHasBinding
+        );
     }
 
     #[test]
@@ -2251,6 +2981,44 @@ mod tests {
                 op: 2,
                 left: Value::int32(3),
                 right: Value::int32(4),
+            })
+        );
+    }
+
+    #[test]
+    fn consume_fuel_wrapper_preserves_amount() {
+        let mut regs = [Value::UNINITIALIZED; 1];
+        let mut frame = frame_with(&mut regs);
+        let mut completion = Completion::new(Value::UNDEFINED);
+        let mut ops = Recorder::normal(Value::UNDEFINED);
+        let tag = with_native_ops(&mut ops, || {
+            test_bamts_consume_fuel(&mut frame, 7, &mut completion)
+        });
+        assert_eq!(tag, CompletionTag::Normal.as_u32());
+        assert_eq!(ops.last.get(), Some(HelperCall::ConsumeFuel { amount: 7 }));
+    }
+
+    #[test]
+    fn with_has_binding_wrapper_preserves_object_and_key() {
+        let mut regs = [Value::UNINITIALIZED; 1];
+        let mut frame = frame_with(&mut regs);
+        let mut completion = Completion::new(Value::UNDEFINED);
+        let mut ops = Recorder::normal(Value::TRUE);
+        let tag = with_native_ops(&mut ops, || {
+            test_bamts_with_has_binding(
+                &mut frame,
+                Value::NULL.to_bits(),
+                Value::int32(7).to_bits(),
+                &mut completion,
+            )
+        });
+        assert_eq!(tag, CompletionTag::Normal.as_u32());
+        assert_eq!(completion.value, Value::TRUE);
+        assert_eq!(
+            ops.last.get(),
+            Some(HelperCall::WithHasBinding {
+                object: Value::NULL,
+                key: Value::int32(7),
             })
         );
     }
@@ -2381,7 +3149,7 @@ mod tests {
     fn native_frame_new_validates_metadata() {
         let mut regs = [Value::int32(1), Value::int32(2)];
         let base = regs.as_mut_ptr();
-        let mut frame = ShadowFrame::new(core::ptr::null_mut(), 0, base, 2);
+        let mut frame = ShadowFrame::new(core::ptr::null_mut(), 0, 3, base, 2);
         // Length mismatch against the frame header.
         {
             let mut short = [Value::int32(1)];
@@ -2412,12 +3180,13 @@ mod tests {
         );
 
         let mut regs = [Value::int32(10), Value::int32(20)];
-        let mut frame = ShadowFrame::new(core::ptr::null_mut(), 7, regs.as_mut_ptr(), 2);
+        let mut frame = ShadowFrame::new(core::ptr::null_mut(), 7, 11, regs.as_mut_ptr(), 2);
         {
             // SAFETY: `frame` is a live, unaliased local and its metadata points
             // at exactly the two initialized Values in `regs` for this scope.
             let mut native = unsafe { NativeFrame::from_raw(&mut frame) }.expect("valid frame");
             assert_eq!(native.handle_len(), 2);
+            assert_eq!(native.module_id(), 11);
             assert_eq!(native.pc(), 7);
             assert_eq!(native.register(0), Value::int32(10));
             assert_eq!(native.try_register(5), None);
@@ -2432,14 +3201,17 @@ mod tests {
 
     #[test]
     fn native_frame_from_raw_rejects_handles_overlapping_header() {
-        let mut frame = ShadowFrame::new(core::ptr::null_mut(), 0, core::ptr::null_mut(), 1);
+        let mut frame = ShadowFrame::new(core::ptr::null_mut(), 0, 0, core::ptr::null_mut(), 1);
         frame.handles = core::ptr::addr_of_mut!(frame).cast::<Value>();
         // SAFETY: `frame` is live and aligned; this test intentionally supplies
         // malformed metadata to verify it is rejected before aliasing references.
         assert!(unsafe { NativeFrame::from_raw(&mut frame) }.is_none());
     }
 
-    unsafe extern "C" fn entry_returns_seven(_frame: *mut ShadowFrame, out: *mut Completion) -> u32 {
+    unsafe extern "C" fn entry_returns_seven(
+        _frame: *mut ShadowFrame,
+        out: *mut Completion,
+    ) -> u32 {
         // SAFETY: the test passes a valid, writable `Completion` out-parameter.
         unsafe { core::ptr::write(out, Completion::new(Value::int32(7))) };
         CompletionTag::Normal.as_u32()
@@ -2457,7 +3229,7 @@ mod tests {
     #[test]
     fn invalid_native_completion_tag_replaces_stale_output() {
         let mut regs: [Value; 0] = [];
-        let mut frame = ShadowFrame::new(core::ptr::null_mut(), 0, regs.as_mut_ptr(), 0);
+        let mut frame = ShadowFrame::new(core::ptr::null_mut(), 0, 0, regs.as_mut_ptr(), 0);
         let mut out = Completion::new(Value::int32(123));
         // SAFETY: test entry has the native ABI and frame/output are live, unique.
         let tag = unsafe { call_native_entry(entry_returns_invalid_tag, &mut frame, &mut out) };
@@ -2465,15 +3237,20 @@ mod tests {
         assert_eq!(out.value.as_int32(), Some(TRAP_INVALID_COMPLETION_TAG));
     }
 
-    fn unit(function_id: u32) -> UnitDescriptor {
+    fn unit(module_id: u32, function_id: u32) -> UnitDescriptor {
         UnitDescriptor {
             function_id,
-            reserved: 0,
+            module_id,
             entry: entry_returns_seven,
         }
     }
 
-    fn program(bytecode: &[u8], units: &[UnitDescriptor], entry: u32) -> ProgramDescriptor {
+    fn program(
+        bytecode: &[u8],
+        units: &[UnitDescriptor],
+        entry_module: u32,
+        entry_function: u32,
+    ) -> ProgramDescriptor {
         ProgramDescriptor {
             magic: AOT_MAGIC,
             abi_version: AOT_ABI_VERSION,
@@ -2482,8 +3259,8 @@ mod tests {
             bytecode_len: bytecode.len(),
             units: units.as_ptr(),
             unit_count: units.len(),
-            entry_function: entry,
-            reserved: 0,
+            entry_function,
+            entry_module,
         }
     }
 
@@ -2504,98 +3281,123 @@ mod tests {
     }
 
     #[test]
-    fn linked_program_validates_and_invokes_a_synthetic_image() {
+    fn linked_program_validates_and_invokes_tuple_identities() {
         let bytecode = [1u8, 2, 3];
-        let units = [unit(4), unit(5)];
-        let descriptor = program(&bytecode, &units, 5);
+        let units = [unit(2, 4), unit(2, 5), unit(3, 5)];
+        let descriptor = program(&bytecode, &units, 3, 5);
         let linked = linked_of(&descriptor, &bytecode, &units).expect("valid image");
         assert_eq!(linked.bytecode(), &[1, 2, 3]);
-        assert_eq!(linked.units().len(), 2);
+        assert_eq!(linked.program_bytes(), &[1, 2, 3]);
+        assert_eq!(linked.units().len(), 3);
+        assert_eq!(linked.entry_module(), 3);
         assert_eq!(linked.entry_function(), 5);
-        assert!(linked.unit(4).is_some());
-        assert!(linked.unit(9).is_none());
+        assert!(linked.unit(2, 5).is_some());
+        assert!(linked.unit(3, 5).is_some());
+        assert!(linked.unit(3, 4).is_none());
 
         let mut regs: [Value; 0] = [];
-        let mut frame = ShadowFrame::new(core::ptr::null_mut(), 0, regs.as_mut_ptr(), 0);
+        let mut frame = ShadowFrame::new(core::ptr::null_mut(), 0, 3, regs.as_mut_ptr(), 0);
         let mut completion = Completion::new(Value::UNDEFINED);
         let tag = linked
-            .invoke(5, &mut frame, &mut completion)
+            .invoke(3, 5, &mut frame, &mut completion)
             .expect("entry present");
         assert_eq!(tag, CompletionTag::Normal);
         assert_eq!(completion.value.as_int32(), Some(7));
+
+        let mut mismatched_frame =
+            ShadowFrame::new(core::ptr::null_mut(), 0, 2, regs.as_mut_ptr(), 0);
+        let mut mismatched_completion = Completion::new(Value::int32(123));
         assert_eq!(
-            linked.invoke(9, &mut frame, &mut completion).err(),
-            Some(AbiError::UnknownFunction { function_id: 9 })
+            linked.invoke(3, 5, &mut mismatched_frame, &mut mismatched_completion),
+            Err(AbiError::FrameModuleMismatch {
+                selected_module_id: 3,
+                frame_module_id: 2,
+            })
+        );
+        assert_eq!(mismatched_completion.value.as_int32(), Some(123));
+
+        assert_eq!(
+            linked.invoke(4, 5, &mut frame, &mut completion).err(),
+            Some(AbiError::UnknownFunction {
+                module_id: 4,
+                function_id: 5,
+            })
         );
     }
 
     #[test]
     fn linked_program_rejects_malformed_descriptors() {
         let bytecode = [1u8, 2, 3];
-        let units = [unit(5)];
+        let units = [unit(2, 5)];
 
-        let mut bad_magic = program(&bytecode, &units, 5);
+        let mut bad_magic = program(&bytecode, &units, 2, 5);
         bad_magic.magic = 0;
         assert_eq!(
             linked_of(&bad_magic, &bytecode, &units).err(),
             Some(AbiError::BadMagic { found: 0 })
         );
 
-        let mut bad_version = program(&bytecode, &units, 5);
-        bad_version.abi_version = 2;
+        let mut bad_version = program(&bytecode, &units, 2, 5);
+        bad_version.abi_version = 1;
         assert_eq!(
             linked_of(&bad_version, &bytecode, &units).err(),
-            Some(AbiError::UnsupportedAbiVersion { found: 2 })
+            Some(AbiError::UnsupportedAbiVersion { found: 1 })
         );
 
-        let mut bad_flags = program(&bytecode, &units, 5);
+        let mut bad_flags = program(&bytecode, &units, 2, 5);
         bad_flags.flags = 1;
         assert_eq!(
             linked_of(&bad_flags, &bytecode, &units).err(),
             Some(AbiError::NonZeroFlags { flags: 1 })
         );
 
-        let mut bad_reserved = program(&bytecode, &units, 5);
-        bad_reserved.reserved = 1;
-        assert_eq!(
-            linked_of(&bad_reserved, &bytecode, &units).err(),
-            Some(AbiError::NonZeroReserved { reserved: 1 })
-        );
-
-        let empty_bytecode = program(&[], &units, 5);
+        let empty_bytecode = program(&[], &units, 2, 5);
         assert_eq!(
             linked_of(&empty_bytecode, &[], &units).err(),
             Some(AbiError::EmptyBytecode)
         );
 
-        let empty_units = program(&bytecode, &[], 5);
+        let empty_units = program(&bytecode, &[], 2, 5);
         assert_eq!(
             linked_of(&empty_units, &bytecode, &[]).err(),
             Some(AbiError::EmptyUnits)
         );
+    }
 
-        let duplicate = [unit(5), unit(5)];
-        let dup_descriptor = program(&bytecode, &duplicate, 5);
+    #[test]
+    fn linked_program_rejects_unsorted_duplicate_and_missing_tuple_entries() {
+        let bytecode = [1u8, 2, 3];
+
+        let unsorted = [unit(2, 5), unit(1, 9)];
+        let unsorted_descriptor = program(&bytecode, &unsorted, 2, 5);
         assert_eq!(
-            linked_of(&dup_descriptor, &bytecode, &duplicate).err(),
-            Some(AbiError::DuplicateFunctionId { function_id: 5 })
+            linked_of(&unsorted_descriptor, &bytecode, &unsorted).err(),
+            Some(AbiError::UnsortedUnits {
+                previous_module_id: 2,
+                previous_function_id: 5,
+                module_id: 1,
+                function_id: 9,
+            })
         );
 
-        let missing_entry = program(&bytecode, &units, 6);
+        let duplicate = [unit(2, 5), unit(2, 5)];
+        let duplicate_descriptor = program(&bytecode, &duplicate, 2, 5);
+        assert_eq!(
+            linked_of(&duplicate_descriptor, &bytecode, &duplicate).err(),
+            Some(AbiError::DuplicateFunction {
+                module_id: 2,
+                function_id: 5,
+            })
+        );
+
+        let units = [unit(2, 5), unit(3, 5)];
+        let missing_entry = program(&bytecode, &units, 4, 5);
         assert_eq!(
             linked_of(&missing_entry, &bytecode, &units).err(),
-            Some(AbiError::EntryFunctionMissing { function_id: 6 })
-        );
-
-        let bad_unit = [UnitDescriptor {
-            function_id: 5,
-            reserved: 9,
-            entry: entry_returns_seven,
-        }];
-        let bad_unit_descriptor = program(&bytecode, &bad_unit, 5);
-        assert_eq!(
-            linked_of(&bad_unit_descriptor, &bytecode, &bad_unit).err(),
-            Some(AbiError::NonZeroReserved { reserved: 9 })
+            Some(AbiError::EntryFunctionMissing {
+                module_id: 4,
+                function_id: 5,
+            })
         );
     }
 
@@ -2609,6 +3411,341 @@ mod tests {
             test_bamts_load_global(&mut frame, 0, core::ptr::null_mut())
         });
         assert_eq!(tag, CompletionTag::FatalTrap.as_u32());
+    }
+
+    #[test]
+    fn iterator_step_wrapper_dispatches_the_raw_result_call() {
+        let mut regs = [Value::UNINITIALIZED; 1];
+        let mut frame = frame_with(&mut regs);
+        let mut completion = Completion::new(Value::UNDEFINED);
+        let mut ops = Recorder::normal(Value::int32(7));
+        let tag = with_native_ops(&mut ops, || {
+            test_bamts_iterator_step(&mut frame, Value::NULL.to_bits(), &mut completion)
+        });
+        assert_eq!(tag, CompletionTag::Normal.as_u32());
+        assert_eq!(completion.value.as_int32(), Some(7));
+        assert_eq!(
+            ops.last.get(),
+            Some(HelperCall::IteratorStep {
+                iterator: Value::NULL,
+            })
+        );
+    }
+
+    #[test]
+    fn iterator_result_writes_both_registers() {
+        let mut regs = [Value::UNINITIALIZED; 2];
+        let mut frame = frame_with(&mut regs);
+        let mut completion = Completion::new(Value::UNDEFINED);
+        let mut ops = Recorder::normal(Value::UNDEFINED);
+        let tag = with_native_ops(&mut ops, || {
+            test_bamts_iterator_result(&mut frame, Value::NULL.to_bits(), 0, 1, &mut completion)
+        });
+        assert_eq!(tag, CompletionTag::Normal.as_u32());
+        assert_eq!(regs[0], Value::TRUE);
+        assert_eq!(regs[1], Value::int32(9));
+        assert_eq!(
+            ops.last.get(),
+            Some(HelperCall::IteratorResult {
+                result: Value::NULL,
+                done_reg: 0,
+                value_reg: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn iterator_result_out_of_range_register_is_fatal_trap() {
+        let mut regs = [Value::UNINITIALIZED; 1];
+        let mut frame = frame_with(&mut regs);
+        let mut completion = Completion::new(Value::UNDEFINED);
+        let mut ops = Recorder::normal(Value::UNDEFINED);
+        let tag = with_native_ops(&mut ops, || {
+            test_bamts_iterator_result(&mut frame, Value::NULL.to_bits(), 99, 0, &mut completion)
+        });
+        assert_eq!(tag, CompletionTag::FatalTrap.as_u32());
+        assert_eq!(completion.value.as_int32(), Some(TRAP_INVALID_REGISTER));
+        // The dispatcher was never reached, so no register was mutated.
+        assert_eq!(regs[0], Value::UNINITIALIZED);
+    }
+
+    #[test]
+    fn to_object_wrapper_dispatches_exact_payload() {
+        let mut regs = [Value::UNINITIALIZED; 1];
+        let mut frame = frame_with(&mut regs);
+        let mut completion = Completion::new(Value::UNDEFINED);
+        let mut ops = Recorder::normal(Value::int32(7));
+        let tag = with_native_ops(&mut ops, || {
+            test_bamts_to_object(&mut frame, Value::int32(5).to_bits(), &mut completion)
+        });
+        assert_eq!(tag, CompletionTag::Normal.as_u32());
+        assert_eq!(completion.value, Value::int32(7));
+        assert_eq!(
+            ops.last.get(),
+            Some(HelperCall::ToObject {
+                value: Value::int32(5),
+            })
+        );
+    }
+
+    #[test]
+    fn close_result_wrappers_dispatch_exact_payloads() {
+        let mut regs = [Value::UNINITIALIZED; 1];
+        let mut frame = frame_with(&mut regs);
+        let mut completion = Completion::new(Value::UNDEFINED);
+        let mut ops = Recorder::normal(Value::int32(7));
+        let close_tag = with_native_ops(&mut ops, || {
+            test_bamts_iterator_close(&mut frame, Value::NULL.to_bits(), 1, 0, &mut completion)
+        });
+        assert_eq!(close_tag, CompletionTag::Normal.as_u32());
+        assert_eq!(
+            ops.last.get(),
+            Some(HelperCall::IteratorClose {
+                iterator: Value::NULL,
+                mode: 1,
+                called_reg: 0,
+            })
+        );
+
+        let require_tag = with_native_ops(&mut ops, || {
+            test_bamts_require_close_result(
+                &mut frame,
+                Value::int32(7).to_bits(),
+                Value::TRUE.to_bits(),
+                &mut completion,
+            )
+        });
+        assert_eq!(require_tag, CompletionTag::Normal.as_u32());
+        assert_eq!(
+            ops.last.get(),
+            Some(HelperCall::RequireCloseResult {
+                result: Value::int32(7),
+                called: Value::TRUE,
+            })
+        );
+
+        let dispose_tag = with_native_ops(&mut ops, || {
+            test_bamts_dispose_capture(&mut frame, Value::NULL.to_bits(), 1, 0, &mut completion)
+        });
+        assert_eq!(dispose_tag, CompletionTag::Normal.as_u32());
+        assert_eq!(
+            ops.last.get(),
+            Some(HelperCall::DisposeCapture {
+                src: Value::NULL,
+                hint: 1,
+                kind_reg: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn dispose_capture_out_of_range_kind_register_is_fatal_trap() {
+        let mut regs = [Value::UNINITIALIZED; 1];
+        let mut frame = frame_with(&mut regs);
+        let mut completion = Completion::new(Value::UNDEFINED);
+        let mut ops = Recorder::normal(Value::UNDEFINED);
+        let tag = with_native_ops(&mut ops, || {
+            test_bamts_dispose_capture(&mut frame, Value::NULL.to_bits(), 0, 99, &mut completion)
+        });
+        assert_eq!(tag, CompletionTag::FatalTrap.as_u32());
+        assert_eq!(completion.value.as_int32(), Some(TRAP_INVALID_REGISTER));
+        assert_eq!(regs[0], Value::UNINITIALIZED);
+    }
+
+    #[test]
+    fn construct_with_new_target_wrapper_dispatches_all_three_values() {
+        let mut regs = [Value::UNINITIALIZED; 1];
+        let mut frame = frame_with(&mut regs);
+        let mut completion = Completion::new(Value::UNDEFINED);
+        let mut ops = Recorder::normal(Value::int32(5));
+        let tag = with_native_ops(&mut ops, || {
+            test_bamts_construct_with_new_target(
+                &mut frame,
+                Value::int32(31).to_bits(),
+                Value::int32(37).to_bits(),
+                Value::int32(41).to_bits(),
+                &mut completion,
+            )
+        });
+        assert_eq!(tag, CompletionTag::Normal.as_u32());
+        assert_eq!(completion.value, Value::int32(5));
+        assert_eq!(
+            ops.last.get(),
+            Some(HelperCall::ConstructWithNewTarget {
+                callee: Value::int32(31),
+                new_target: Value::int32(37),
+                arguments: Value::int32(41),
+            })
+        );
+    }
+
+    #[test]
+    fn define_data_property_helper_abi_is_appended_at_42() {
+        // The pinned ABI: index 42 directly after ConstructWithNewTarget.
+        assert_eq!(NativeHelper::ConstructWithNewTarget.as_u32(), 41);
+        assert_eq!(NativeHelper::DefineDataProperty.as_u32(), 42);
+        assert_eq!(
+            NativeHelper::DefineDataProperty.symbol(),
+            "bamts_define_data_property"
+        );
+        assert_eq!(
+            NativeHelper::from_u32(42),
+            Some(NativeHelper::DefineDataProperty)
+        );
+        // Earlier appends stay stable.
+        assert_eq!(NativeHelper::Construct.as_u32(), 10);
+        assert_eq!(NativeHelper::Construct.symbol(), "bamts_construct");
+        assert_eq!(
+            NativeHelper::from_u32(41),
+            Some(NativeHelper::ConstructWithNewTarget)
+        );
+    }
+
+    #[test]
+    fn own_descriptor_slot_helpers_abi_are_appended_at_43_and_44() {
+        // The pinned ABI: indices 43/44 directly after DefineDataProperty.
+        assert_eq!(NativeHelper::DefineDataProperty.as_u32(), 42);
+        assert_eq!(NativeHelper::LoadOwnDescriptorSlot.as_u32(), 43);
+        assert_eq!(NativeHelper::DefineOwnDescriptorSlot.as_u32(), 44);
+        assert_eq!(
+            NativeHelper::LoadOwnDescriptorSlot.symbol(),
+            "bamts_load_own_descriptor_slot"
+        );
+        assert_eq!(
+            NativeHelper::DefineOwnDescriptorSlot.symbol(),
+            "bamts_define_own_descriptor_slot"
+        );
+        assert_eq!(
+            NativeHelper::from_u32(43),
+            Some(NativeHelper::LoadOwnDescriptorSlot)
+        );
+        assert_eq!(
+            NativeHelper::from_u32(44),
+            Some(NativeHelper::DefineOwnDescriptorSlot)
+        );
+        assert_eq!(
+            NativeHelper::from_u32(45),
+            Some(NativeHelper::WithHasBinding)
+        );
+        assert_eq!(NativeHelper::from_u32(46), None);
+        // Earlier appends stay stable.
+        assert_eq!(NativeHelper::DefineDataProperty.as_u32(), 42);
+        assert_eq!(
+            NativeHelper::DefineDataProperty.symbol(),
+            "bamts_define_data_property"
+        );
+        assert_eq!(
+            NativeHelper::from_u32(42),
+            Some(NativeHelper::DefineDataProperty)
+        );
+    }
+
+    #[test]
+    fn define_data_property_wrapper_dispatches_object_key_value() {
+        let mut regs = [Value::UNINITIALIZED; 1];
+        let mut frame = frame_with(&mut regs);
+        let mut completion = Completion::new(Value::UNDEFINED);
+        let mut ops = Recorder::normal(Value::UNDEFINED);
+        let tag = with_native_ops(&mut ops, || {
+            test_bamts_define_data_property(
+                &mut frame,
+                Value::int32(1).to_bits(),
+                Value::int32(2).to_bits(),
+                Value::int32(3).to_bits(),
+                &mut completion,
+            )
+        });
+        assert_eq!(tag, CompletionTag::Normal.as_u32());
+        assert_eq!(completion.value, Value::UNDEFINED);
+        assert_eq!(
+            ops.last.get(),
+            Some(HelperCall::DefineDataProperty {
+                object: Value::int32(1),
+                key: Value::int32(2),
+                value: Value::int32(3),
+            })
+        );
+    }
+
+    #[test]
+    fn load_own_descriptor_slot_wrapper_dispatches_object_key_slot() {
+        let mut regs = [Value::UNINITIALIZED; 1];
+        let mut frame = frame_with(&mut regs);
+        let mut completion = Completion::new(Value::UNDEFINED);
+        let mut ops = Recorder::normal(Value::int32(9));
+        let tag = with_native_ops(&mut ops, || {
+            test_bamts_load_own_descriptor_slot(
+                &mut frame,
+                Value::int32(1).to_bits(),
+                Value::int32(2).to_bits(),
+                0,
+                &mut completion,
+            )
+        });
+        assert_eq!(tag, CompletionTag::Normal.as_u32());
+        assert_eq!(completion.value, Value::int32(9));
+        assert_eq!(
+            ops.last.get(),
+            Some(HelperCall::LoadOwnDescriptorSlot {
+                object: Value::int32(1),
+                key: Value::int32(2),
+                slot: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn define_own_descriptor_slot_wrapper_dispatches_object_key_src_slot() {
+        let mut regs = [Value::UNINITIALIZED; 1];
+        let mut frame = frame_with(&mut regs);
+        let mut completion = Completion::new(Value::UNDEFINED);
+        let mut ops = Recorder::normal(Value::UNDEFINED);
+        let tag = with_native_ops(&mut ops, || {
+            test_bamts_define_own_descriptor_slot(
+                &mut frame,
+                Value::int32(1).to_bits(),
+                Value::int32(2).to_bits(),
+                Value::int32(3).to_bits(),
+                2,
+                &mut completion,
+            )
+        });
+        assert_eq!(tag, CompletionTag::Normal.as_u32());
+        assert_eq!(completion.value, Value::UNDEFINED);
+        assert_eq!(
+            ops.last.get(),
+            Some(HelperCall::DefineOwnDescriptorSlot {
+                object: Value::int32(1),
+                key: Value::int32(2),
+                src: Value::int32(3),
+                slot: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn suppress_error_wrapper_dispatches_both_error_values() {
+        let mut regs = [Value::UNINITIALIZED; 1];
+        let mut frame = frame_with(&mut regs);
+        let mut completion = Completion::new(Value::UNDEFINED);
+        let mut ops = Recorder::normal(Value::int32(7));
+        let tag = with_native_ops(&mut ops, || {
+            test_bamts_suppress_error(
+                &mut frame,
+                Value::int32(11).to_bits(),
+                Value::int32(22).to_bits(),
+                &mut completion,
+            )
+        });
+        assert_eq!(tag, CompletionTag::Normal.as_u32());
+        assert_eq!(completion.value, Value::int32(7));
+        assert_eq!(
+            ops.last.get(),
+            Some(HelperCall::SuppressError {
+                error: Value::int32(11),
+                suppressed: Value::int32(22),
+            })
+        );
     }
 
     #[test]

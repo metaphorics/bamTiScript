@@ -29,7 +29,7 @@
 
 use std::fmt::Write as _;
 
-use bamts_compiler::diagnostic::{Diagnostic, DiagnosticSeverity};
+use bamts_compiler::diagnostic::{Diagnostic, DiagnosticReport, DiagnosticSeverity};
 use bamts_compiler::source::{SourceId, SourcePositionError, SourceText, TextRange, Utf16Pos};
 
 use crate::args::DiagnosticsFormat;
@@ -69,6 +69,101 @@ pub fn render(
         DiagnosticsFormat::Github => render_github(&ordered, sources),
         DiagnosticsFormat::Compact => render_compact(&ordered, sources),
     }
+}
+/// A typed indicator that the rendered diagnostic count exceeded the limit.
+///
+/// Rendering never panics when the limit is exceeded: the surplus diagnostics
+/// are dropped in canonical order and this notice is rendered in their place
+/// so the user can see that output was truncated and how to raise the cap.
+/// This is the typed, non-panicking equivalent of an "error limit reached"
+/// signal — callers receive a value they can inspect rather than a panic or a
+/// silent drop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TruncationNotice {
+    /// The number of diagnostics dropped after applying the limit.
+    elided: usize,
+    /// The limit that was in effect when the diagnostics were truncated.
+    limit: usize,
+}
+
+impl TruncationNotice {
+    /// Returns the canonical, stable truncation note line (no trailing newline).
+    ///
+    /// The message is deterministic so equivalent compilations produce
+    /// byte-identical output, and it names the flag a user raises to see the
+    /// elided diagnostics.
+    #[must_use]
+    pub fn render(&self) -> String {
+        format!(
+            "note: {} diagnostic(s) elided after limit {}; raise with `--error-limit`",
+            self.elided, self.limit,
+        )
+    }
+
+    /// Returns the number of diagnostics dropped.
+    #[must_use]
+    pub const fn elided(&self) -> usize {
+        self.elided
+    }
+
+    /// Returns the limit that was in effect.
+    #[must_use]
+    pub const fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+/// Renders a compiler-prepared report without reimplementing its deduplication,
+/// poisoning, per-rule cap, or summary accounting.
+///
+/// When the report carries more diagnostics than `error_limit`, the surplus is
+/// dropped in canonical order and a [`TruncationNotice`] line is emitted (for
+/// the line-oriented formats) so truncation is observable rather than silent.
+/// Rendering never panics at the limit boundary.
+#[must_use]
+pub fn render_report(
+    format: DiagnosticsFormat,
+    report: &DiagnosticReport,
+    sources: &[DiagnosticSource<'_>],
+    error_limit: usize,
+) -> String {
+    // Apply the compiler's canonical total order to the complete report, then
+    // enforce the limit so the earliest canonical diagnostics are preserved
+    // regardless of the order the pipeline reported them in.
+    let total = report.diagnostics().len();
+    let diagnostics: Vec<Diagnostic> = ordered(report.diagnostics())
+        .into_iter()
+        .take(error_limit)
+        .cloned()
+        .collect();
+    let elided = total.saturating_sub(diagnostics.len());
+    let mut rendered = render(format, &diagnostics, sources);
+    if matches!(
+        format,
+        DiagnosticsFormat::Text | DiagnosticsFormat::Pretty | DiagnosticsFormat::Compact
+    ) {
+        if elided > 0 {
+            let _ = writeln!(
+                rendered,
+                "{}",
+                TruncationNotice {
+                    elided,
+                    limit: error_limit
+                }
+                .render()
+            );
+        }
+        for summary in report.summaries() {
+            let _ = writeln!(
+                rendered,
+                "note[{}]: {} diagnostic(s); silence with `{}`",
+                summary.rule().code(),
+                summary.total_count(),
+                summary.silence_flag(),
+            );
+        }
+    }
+    rendered
 }
 
 /// Returns the diagnostics in the compiler's canonical total order.
@@ -537,6 +632,7 @@ fn escape_github_property(value: &str) -> String {
 mod tests {
     use super::*;
     use bamts_compiler::diagnostic::DiagnosticCode;
+    use bamts_compiler::lint::LintLevel;
     use bamts_compiler::source::Utf16Pos;
 
     const FILE: SourceId = SourceId::new(0);
@@ -559,7 +655,8 @@ mod tests {
 
     #[test]
     fn text_reports_utf16_line_and_column() {
-        let text = SourceText::new("let x = 1;\nlet y = 2;\n");
+        let text = SourceText::new("let x = 1;\nlet y = 2;\n")
+            .expect("test source fits the per-file budget");
         let diag = Diagnostic::error(code("BTS0001"), FILE, range(15, 16), "bad y");
         let out = render(DiagnosticsFormat::Text, &[diag], &sources("main.ts", &text));
         // Offset 15 is line 2 (1-based), UTF-16 column 5 (1-based).
@@ -568,7 +665,7 @@ mod tests {
 
     #[test]
     fn diagnostics_render_in_canonical_order() {
-        let text = SourceText::new("aaaaaaaa");
+        let text = SourceText::new("aaaaaaaa").expect("test source fits the per-file budget");
         let later = Diagnostic::error(code("BTS0002"), FILE, range(4, 5), "later");
         let earlier = Diagnostic::warning(code("BTS0001"), FILE, range(1, 2), "earlier");
         // Supplied out of order; output must be sorted by position.
@@ -582,7 +679,7 @@ mod tests {
 
     #[test]
     fn json_has_stable_fields_and_escapes_strings() {
-        let text = SourceText::new("x");
+        let text = SourceText::new("x").expect("test source fits the per-file budget");
         let diag = Diagnostic::error(code("BTS0003"), FILE, range(0, 1), "a\"b\\c\n\td");
         let out = render(DiagnosticsFormat::Json, &[diag], &sources("q.ts", &text));
         assert_eq!(
@@ -615,7 +712,7 @@ mod tests {
     #[test]
     fn non_bmp_positions_and_pretty_carets_use_utf16_units() {
         // "😀" is two UTF-16 units; 'x' begins at UTF-16 position 2.
-        let text = SourceText::new("😀x");
+        let text = SourceText::new("😀x").expect("test source fits the per-file budget");
         let diag = Diagnostic::error(code("BTS0005"), FILE, range(2, 3), "on x");
 
         // JSON/text column is UTF-16 based: 'x' is at column 3 (1-based).
@@ -641,7 +738,8 @@ mod tests {
 
     #[test]
     fn pretty_underlines_multi_unit_range_within_line() {
-        let text = SourceText::new("let value = 1;\n");
+        let text =
+            SourceText::new("let value = 1;\n").expect("test source fits the per-file budget");
         let diag = Diagnostic::warning(code("BTS0006"), FILE, range(4, 9), "value");
         let out = render(DiagnosticsFormat::Pretty, &[diag], &sources("m.ts", &text));
         assert!(out.contains("warning[BTS0006]: value\n"));
@@ -652,7 +750,7 @@ mod tests {
 
     #[test]
     fn github_escapes_message_and_property_metacharacters() {
-        let text = SourceText::new("x");
+        let text = SourceText::new("x").expect("test source fits the per-file budget");
         let diag = Diagnostic::error(code("BTS0007"), FILE, range(0, 1), "bad, thing\nnext");
         let out = render(
             DiagnosticsFormat::Github,
@@ -668,7 +766,7 @@ mod tests {
 
     #[test]
     fn crlf_snippet_excludes_terminator() {
-        let text = SourceText::new("a\r\nbc\r\n");
+        let text = SourceText::new("a\r\nbc\r\n").expect("test source fits the per-file budget");
         // "bc" begins at UTF-16 offset 3 (after "a\r\n").
         let diag = Diagnostic::error(code("BTS0008"), FILE, range(3, 5), "bc");
         let out = render(DiagnosticsFormat::Pretty, &[diag], &sources("c.ts", &text));
@@ -687,8 +785,8 @@ mod tests {
 
     #[test]
     fn multiple_sources_group_by_source_id() {
-        let a = SourceText::new("aa");
-        let b = SourceText::new("bb");
+        let a = SourceText::new("aa").expect("test source fits the per-file budget");
+        let b = SourceText::new("bb").expect("test source fits the per-file budget");
         let src_a = SourceId::new(0);
         let src_b = SourceId::new(1);
         let da = Diagnostic::error(code("BTS0001"), src_a, range(0, 1), "in a");
@@ -713,7 +811,7 @@ mod tests {
         // 120 ASCII chars; far exceeds PRETTY_SNIPPET_WIDTH (80).
         // The span targets 'X' at UTF-16 offset 60 (column 61, 1-based).
         let body = "a".repeat(60) + "X" + &"b".repeat(59);
-        let text = SourceText::new(body.as_str());
+        let text = SourceText::new(body.as_str()).expect("test source fits the per-file budget");
         let diag = Diagnostic::error(code("BTS0009"), FILE, range(60, 61), "on X");
         let out = render(
             DiagnosticsFormat::Pretty,
@@ -781,7 +879,7 @@ mod tests {
         let mid = "😀"; // offsets 77..79 in UTF-16
         let post = "b".repeat(3);
         let body = format!("{pre}{mid}{post}");
-        let text = SourceText::new(body.as_str());
+        let text = SourceText::new(body.as_str()).expect("test source fits the per-file budget");
         let diag = Diagnostic::error(code("BTS0010"), FILE, range(0, 1), "first");
         let out = render(DiagnosticsFormat::Pretty, &[diag], &sources("nb.ts", &text));
 
@@ -819,7 +917,7 @@ mod tests {
     #[test]
     fn snap_utf16_to_char_boundary_handles_surrogate_pair() {
         // "a😀b": 'a' at offset 0, 😀 at offsets 1..3 (2 UTF-16 units), 'b' at 3.
-        let text = SourceText::new("a😀b");
+        let text = SourceText::new("a😀b").expect("test source fits the per-file budget");
 
         // Offset 2 lands on the low surrogate of 😀 (inside the pair).
         // Snapping backward (forward=false) → offset 1 (the high surrogate,
@@ -855,7 +953,7 @@ mod tests {
         // A span wider than the display budget. The caret must be clamped to
         // the visible window, never underflow.
         let body = "a".repeat(200);
-        let text = SourceText::new(body.as_str());
+        let text = SourceText::new(body.as_str()).expect("test source fits the per-file budget");
         // Span covers UTF-16 offsets 10..190 — far wider than the cap.
         let diag = Diagnostic::error(code("BTS0011"), FILE, range(10, 190), "wide");
         let out = render(
@@ -887,5 +985,327 @@ mod tests {
             "caret width {caret_width} exceeds cap: {caret_displayed}",
         );
         assert!(caret_width >= 1, "wide span produced zero-width caret");
+    }
+
+    #[test]
+    fn report_rendering_uses_compiler_summary_and_limit() {
+        let text = SourceText::new("xx").expect("test source fits the per-file budget");
+        let rule = bamts_compiler::lint::rule_by_name("explicit-any")
+            .expect("registered rule")
+            .id();
+        let diagnostics = [
+            Diagnostic::lint(LintLevel::Warn, rule, FILE, range(0, 1), "first").expect("warns"),
+            Diagnostic::lint(LintLevel::Warn, rule, FILE, range(1, 2), "second").expect("warns"),
+        ];
+        let report = DiagnosticReport::new(&diagnostics);
+        let out = render_report(DiagnosticsFormat::Text, &report, &sources("a.ts", &text), 1);
+        assert!(out.contains("first"));
+        assert!(!out.contains("second"));
+        assert!(out.contains("2 diagnostic(s); silence with `-A explicit-any`"));
+    }
+
+    #[test]
+    fn report_limit_preserves_earliest_canonical_diagnostics_across_modules() {
+        // Regression: the limit must be applied after canonical ordering of the
+        // full report, not to the raw pipeline order, so earlier diagnostics are
+        // never hidden behind later ones when aggregating across modules.
+        let text_a = SourceText::new("ab").expect("test source fits the per-file budget");
+        let text_b = SourceText::new("xy").expect("test source fits the per-file budget");
+        let src_a = SourceId::new(0);
+        let src_b = SourceId::new(1);
+        let catalog = vec![
+            DiagnosticSource {
+                id: src_a,
+                name: "a.ts",
+                text: &text_a,
+            },
+            DiagnosticSource {
+                id: src_b,
+                name: "b.ts",
+                text: &text_b,
+            },
+        ];
+        let diagnostics = [
+            Diagnostic::error(code("BTS0002"), src_b, range(0, 1), "b-first"),
+            Diagnostic::error(code("BTS0001"), src_a, range(1, 2), "a-second"),
+            Diagnostic::error(code("BTS0003"), src_b, range(1, 2), "b-last"),
+            Diagnostic::error(code("BTS0004"), src_a, range(0, 1), "a-earliest"),
+        ];
+        let report = DiagnosticReport::new(&diagnostics);
+        let out = render_report(DiagnosticsFormat::Text, &report, &catalog, 3);
+
+        let pos_earliest = out.find("a-earliest").expect("earliest A diagnostic");
+        let pos_second = out.find("a-second").expect("second A diagnostic");
+        let pos_b_first = out.find("b-first").expect("first B diagnostic");
+        assert!(pos_earliest < pos_second, "A diagnostics out of order");
+        assert!(
+            pos_second < pos_b_first,
+            "B diagnostic rendered before A diagnostics"
+        );
+        assert!(
+            !out.contains("b-last"),
+            "limit retained a later diagnostic over an earlier one"
+        );
+    }
+
+    // --- U2.7: diagnostic rendering bounds ---------------------------------
+
+    /// Builds `count` distinct error diagnostics at successive offsets inside
+    /// `body`, so canonical ordering is stable and none are deduplicated.
+    fn offset_diagnostics(count: usize, body_len: usize) -> Vec<Diagnostic> {
+        (0..count)
+            .map(|i| {
+                let start = i.min(body_len.saturating_sub(1));
+                let end = (start + 1).min(body_len);
+                Diagnostic::error(code("BTS1000"), FILE, range(start, end), "diag")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn render_report_below_limit_emits_no_truncation_notice() {
+        let text = SourceText::new("abcde").expect("test source fits the per-file budget");
+        let limit = 4;
+        let diagnostics = offset_diagnostics(limit - 1, 5);
+        let report = DiagnosticReport::new(&diagnostics);
+        let out = render_report(
+            DiagnosticsFormat::Text,
+            &report,
+            &sources("a.ts", &text),
+            limit,
+        );
+        assert!(
+            !out.contains("elided"),
+            "unexpected truncation notice below limit: {out}",
+        );
+        assert_eq!(
+            out.lines()
+                .filter(|line| line.contains("error[BTS1000]"))
+                .count(),
+            limit - 1,
+            "wrong diagnostic count below limit: {out}",
+        );
+    }
+
+    #[test]
+    fn render_report_at_limit_emits_no_truncation_notice() {
+        let text = SourceText::new("abcde").expect("test source fits the per-file budget");
+        let limit = 4;
+        let diagnostics = offset_diagnostics(limit, 5);
+        let report = DiagnosticReport::new(&diagnostics);
+        let out = render_report(
+            DiagnosticsFormat::Text,
+            &report,
+            &sources("a.ts", &text),
+            limit,
+        );
+        assert!(
+            !out.contains("elided"),
+            "unexpected truncation notice at limit: {out}",
+        );
+        assert_eq!(
+            out.lines()
+                .filter(|line| line.contains("error[BTS1000]"))
+                .count(),
+            limit,
+            "wrong diagnostic count at limit: {out}",
+        );
+    }
+
+    #[test]
+    fn render_report_above_limit_emits_truncation_notice_and_elides_surplus() {
+        let text = SourceText::new("abcdef").expect("test source fits the per-file budget");
+        let limit = 4;
+        let diagnostics = offset_diagnostics(limit + 1, 6);
+        let report = DiagnosticReport::new(&diagnostics);
+        let out = render_report(
+            DiagnosticsFormat::Text,
+            &report,
+            &sources("a.ts", &text),
+            limit,
+        );
+
+        // Exactly `limit` diagnostics are rendered; the surplus is dropped.
+        assert_eq!(
+            out.lines()
+                .filter(|line| line.contains("error[BTS1000]"))
+                .count(),
+            limit,
+            "wrong rendered count above limit: {out}",
+        );
+
+        // The typed truncation notice is present and reports the elided count.
+        let notice = TruncationNotice { elided: 1, limit };
+        assert!(
+            out.contains(&notice.render()),
+            "missing truncation notice `{}`: {out}",
+            notice.render(),
+        );
+        assert!(
+            out.contains("1 diagnostic(s) elided after limit 4"),
+            "wrong truncation message: {out}",
+        );
+        assert!(
+            out.contains("--error-limit"),
+            "truncation notice must name the raise flag: {out}",
+        );
+    }
+
+    #[test]
+    fn render_report_limit_boundary_does_not_panic() {
+        // limit-1, limit, and limit+1 must all render without panicking.
+        let text = SourceText::new("abcdefg").expect("test source fits the per-file budget");
+        let limit = 5;
+        for count in [limit - 1, limit, limit + 1] {
+            let diagnostics = offset_diagnostics(count, 7);
+            let report = DiagnosticReport::new(&diagnostics);
+            let _ = render_report(
+                DiagnosticsFormat::Pretty,
+                &report,
+                &sources("a.ts", &text),
+                limit,
+            );
+        }
+    }
+
+    #[test]
+    fn render_report_truncation_notice_respects_format() {
+        // The line-oriented formats carry the notice; JSON and GitHub do not
+        // (they have structured schemas without a free-form note channel).
+        let text = SourceText::new("abcdef").expect("test source fits the per-file budget");
+        let limit = 2;
+        let diagnostics = offset_diagnostics(limit + 1, 6);
+        let report = DiagnosticReport::new(&diagnostics);
+        for format in [
+            DiagnosticsFormat::Text,
+            DiagnosticsFormat::Pretty,
+            DiagnosticsFormat::Compact,
+        ] {
+            let out = render_report(format, &report, &sources("a.ts", &text), limit);
+            assert!(
+                out.contains("elided"),
+                "{format:?} missing truncation notice: {out}",
+            );
+        }
+        let json = render_report(
+            DiagnosticsFormat::Json,
+            &report,
+            &sources("a.ts", &text),
+            limit,
+        );
+        assert!(
+            !json.contains("elided"),
+            "JSON must not carry a free-form truncation note: {json}",
+        );
+        let gh = render_report(
+            DiagnosticsFormat::Github,
+            &report,
+            &sources("a.ts", &text),
+            limit,
+        );
+        assert!(
+            !gh.contains("elided"),
+            "GitHub format must not carry a free-form truncation note: {gh}",
+        );
+    }
+
+    #[test]
+    fn pretty_snippet_width_79_does_not_truncate() {
+        // 79 UTF-16 units: below the 80-unit cap, no ellipses.
+        let body = "a".repeat(79);
+        let text = SourceText::new(body.as_str()).expect("test source fits the per-file budget");
+        let diag = Diagnostic::error(code("BTS2000"), FILE, range(39, 40), "mid");
+        let out = render(DiagnosticsFormat::Pretty, &[diag], &sources("w.ts", &text));
+        let source_line = out
+            .lines()
+            .find(|line| line.starts_with("1 | "))
+            .expect("source line");
+        let displayed = source_line.strip_prefix("1 | ").expect("stripped");
+        assert!(
+            !displayed.contains('…'),
+            "79-unit line should not truncate: {displayed}",
+        );
+        assert_eq!(
+            displayed.encode_utf16().count(),
+            79,
+            "79-unit line changed length: {displayed}",
+        );
+    }
+
+    #[test]
+    fn pretty_snippet_width_80_fits_exactly() {
+        // Exactly 80 UTF-16 units: fits the cap, no ellipses.
+        let body = "a".repeat(80);
+        let text = SourceText::new(body.as_str()).expect("test source fits the per-file budget");
+        let diag = Diagnostic::error(code("BTS2000"), FILE, range(40, 41), "mid");
+        let out = render(DiagnosticsFormat::Pretty, &[diag], &sources("w.ts", &text));
+        let source_line = out
+            .lines()
+            .find(|line| line.starts_with("1 | "))
+            .expect("source line");
+        let displayed = source_line.strip_prefix("1 | ").expect("stripped");
+        assert!(
+            !displayed.contains('…'),
+            "80-unit line should not truncate: {displayed}",
+        );
+        assert_eq!(
+            displayed.encode_utf16().count(),
+            80,
+            "80-unit line changed length: {displayed}",
+        );
+    }
+
+    #[test]
+    fn pretty_snippet_width_81_truncates_with_ellipses() {
+        // 81 UTF-16 units: exceeds the 80-unit cap, must truncate.
+        let body = "a".repeat(81);
+        let text = SourceText::new(body.as_str()).expect("test source fits the per-file budget");
+        let diag = Diagnostic::error(code("BTS2000"), FILE, range(40, 41), "mid");
+        let out = render(DiagnosticsFormat::Pretty, &[diag], &sources("w.ts", &text));
+        let source_line = out
+            .lines()
+            .find(|line| line.starts_with("1 | "))
+            .expect("source line");
+        let displayed = source_line.strip_prefix("1 | ").expect("stripped");
+        assert!(
+            displayed.starts_with('…'),
+            "81-unit line missing prefix ellipsis: {displayed}",
+        );
+        assert!(
+            displayed.ends_with('…'),
+            "81-unit line missing suffix ellipsis: {displayed}",
+        );
+        let total_utf16 = displayed.encode_utf16().count();
+        assert!(
+            total_utf16 <= PRETTY_SNIPPET_WIDTH,
+            "81-unit excerpt {total_utf16} exceeds cap {PRETTY_SNIPPET_WIDTH}: {displayed}",
+        );
+    }
+
+    #[test]
+    fn pretty_snippet_width_boundary_does_not_panic() {
+        // Widths 79, 80, and 81 must all render without panicking.
+        for width in [79, 80, 81] {
+            let body = "a".repeat(width);
+            let text =
+                SourceText::new(body.as_str()).expect("test source fits the per-file budget");
+            let mid = width / 2;
+            let diag = Diagnostic::error(code("BTS2000"), FILE, range(mid, mid + 1), "mid");
+            let _ = render(DiagnosticsFormat::Pretty, &[diag], &sources("w.ts", &text));
+        }
+    }
+
+    #[test]
+    fn truncation_notice_render_is_stable() {
+        let notice = TruncationNotice {
+            elided: 3,
+            limit: 50,
+        };
+        assert_eq!(
+            notice.render(),
+            "note: 3 diagnostic(s) elided after limit 50; raise with `--error-limit`",
+        );
+        assert_eq!(notice.elided(), 3);
+        assert_eq!(notice.limit(), 50);
     }
 }

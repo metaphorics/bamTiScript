@@ -21,10 +21,11 @@ const LEDGER_PATH: &str = "proof/completeness-ledger.json";
 const BLOCKER_PATH: &str = "verification/blockers/webassembly.json";
 const SET_PREVIEW_LIMIT: usize = 16;
 
-const SOURCE_NAMES: [&str; 20] = [
+const SOURCE_NAMES: [&str; 19] = [
     "rust",
-    "typescript-primary",
-    "typescript-compat",
+    "typescript-7-npm",
+    "typescript-7-compiler",
+    "typescript-7-suite",
     "node-source",
     "node-headers",
     "libuv",
@@ -40,13 +41,10 @@ const SOURCE_NAMES: [&str; 20] = [
     "racket",
     "redex",
     "quint-connect",
-    "typescript-primary-tests",
-    "typescript-compat-tests",
 ];
 
-const CATALOG_NAMES: [&str; 10] = [
-    "typescript-6.0.2",
-    "typescript-5.9.3",
+const CATALOG_NAMES: [&str; 9] = [
+    "typescript-7.0.2",
     "test262",
     "node-24.18.0",
     "node-api-v1-v9",
@@ -796,8 +794,7 @@ fn validate_catalog_identifiers(path: &Path, catalog: &Catalog) -> Result<()> {
 
 fn upstream_source_name(catalog_id: &str) -> Option<&'static str> {
     match catalog_id {
-        "typescript-6.0.2" => Some("typescript-primary-tests"),
-        "typescript-5.9.3" => Some("typescript-compat-tests"),
+        "typescript-7.0.2" => Some("typescript-7-suite"),
         "test262" => Some("test262"),
         "node-24.18.0" => Some("node-source"),
         "node-api-v1-v9" => Some("node-headers"),
@@ -1847,7 +1844,7 @@ mod tests {
             let rows = ledger["rows"].as_array_mut().unwrap();
             let mut extra = rows[0].clone();
             extra["case"] = json!("case-extra");
-            extra["id"] = json!("typescript-6.0.2:case-extra");
+            extra["id"] = json!("typescript-7.0.2:case-extra");
             rows.push(extra);
         });
         assert_eq!(
@@ -1903,6 +1900,39 @@ mod tests {
             verify_ledger_g0(&fixture.root).unwrap_err().code(),
             ErrorCode::Transition
         );
+    }
+
+    #[test]
+    fn release_proof_rejects_stale_typescript_5_or_6_catalog() {
+        let fixture_6 = fixture();
+        let path = fixture_6.root.join(MANIFEST_PATH);
+        let mut manifest = read_json(&path);
+        let catalogs = manifest["catalogs"].as_array_mut().unwrap();
+        catalogs[0]["id"] = json!("typescript-6.0.2");
+        write_json(&path, &manifest);
+        assert_eq!(
+            verify_ledger_g0(&fixture_6.root).unwrap_err().code(),
+            ErrorCode::SetMismatch
+        );
+
+        let fixture_5 = fixture();
+        let path = fixture_5.root.join(MANIFEST_PATH);
+        let mut manifest = read_json(&path);
+        let catalogs = manifest["catalogs"].as_array_mut().unwrap();
+        catalogs[0]["id"] = json!("typescript-5.9.3");
+        write_json(&path, &manifest);
+        assert_eq!(
+            verify_ledger_g0(&fixture_5.root).unwrap_err().code(),
+            ErrorCode::SetMismatch
+        );
+    }
+
+    #[test]
+    fn verify_oracle_pins_succeeds_on_real_root() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = root.canonicalize().expect("workspace root");
+        let pins = crate::verify_oracle_pins(&root).expect("migrated real root pins");
+        assert_eq!(pins, crate::OraclePins::expected());
     }
 
     #[test]
