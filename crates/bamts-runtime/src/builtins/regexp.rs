@@ -495,6 +495,54 @@ mod tests {
         .expect("valid test program")
     }
 
+    /// Builds a program that materializes a RegExp via `Instruction::CreateRegExp`
+    /// (the literal bytecode path) and returns the RegExp value itself, so the
+    /// caller can inspect its own properties. Unlike `literal_source_program`,
+    /// which returns a boolean comparison, this yields the live heap entry.
+    fn literal_regexp_program(pattern: &str, flags: &str) -> Program<Verified> {
+        let mut constants = vec![
+            Constant::String(EcmaString::encode(pattern)),
+            Constant::String(EcmaString::encode(flags)),
+        ];
+        let name = ConstantId::new(constants.len() as u32);
+        constants.push(Constant::String(EcmaString::encode("<test>")));
+        let code = Module::new(
+            constants,
+            vec![Function::new(
+                None,
+                0,
+                0,
+                1,
+                FunctionFlags::default(),
+                vec![
+                    Instruction::CreateRegExp {
+                        dst: Register::new(0),
+                        pattern: ConstantId::new(0),
+                        flags: ConstantId::new(1),
+                    },
+                    Instruction::Return {
+                        value: Register::new(0),
+                    },
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("valid test module");
+        Program::link(
+            vec![ProgramModule {
+                name,
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect("valid test program")
+    }
+
     #[test]
     fn source_and_to_string_preserve_rou3_character_class_solidus() {
         let module = blank_program("<test>");
@@ -584,44 +632,96 @@ mod tests {
     fn literal_and_constructed_regexp_have_same_own_properties() {
         // ECMA-262 §22.2.6 defines `source` and `flags` as accessor properties
         // on RegExp.prototype, not own data properties on instances. Only
-        // `lastIndex` is an own data property. Both construction paths
-        // (`new RegExp("x")` and `/x/`) must produce the same own-property set.
+        // `lastIndex` is an own data property (§22.2.3.3). Both construction
+        // paths — `new RegExp("x")` via the constructor and `/x/` via
+        // `Instruction::CreateRegExp` — must install exactly the own-property
+        // map from `initial_regexp_properties`, so the two cannot drift.
+
+        // --- Constructed side: the `new RegExp("x", "i")` path ---
         let module = blank_program("<test>");
         let mut host = TestHost;
-        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let mut constructed_machine = Machine::new(&module, &mut host, Limits::default());
+        let constructed = construct_regexp(&mut constructed_machine, "x", "i");
+        let constructed_keys = constructed_machine.own_property_keys(constructed).unwrap();
 
-        let constructed = construct_regexp(&mut machine, "x", "i");
+        // --- Literal side: actually execute `Instruction::CreateRegExp` ---
+        // `evaluate` (not `run`) keeps the machine alive so the returned
+        // RegExp's heap entry can be inspected below.
+        let program = literal_regexp_program("x", "i");
+        let mut host = TestHost;
+        let mut literal_machine = Machine::new(&program, &mut host, Limits::default());
+        let execution = literal_machine
+            .evaluate()
+            .expect("literal program evaluates");
+        let literal = execution.value;
+        let literal_keys = literal_machine.own_property_keys(literal).unwrap();
 
-        // The literal bytecode path (`Instruction::CreateRegExp`) must install
-        // the same own properties as the constructor: `lastIndex` alone.
-        let mut properties = PropertyMap::default();
-        properties.insert(
-            PropertyKey::Named(EcmaString::encode("lastIndex")),
-            Property::Data {
-                value: Value::int32(0),
-                writable: true,
-                enumerable: false,
-                configurable: false,
-            },
-        );
-        let literal = machine
-            .allocate(HeapEntry::RegExp {
-                pattern: EcmaString::encode("x"),
-                flags: EcmaString::encode("i"),
-                properties,
-                prototype: Some(machine.intrinsics.regexp_prototype()),
-                extensible: true,
-            })
-            .unwrap();
-
-        let constructed_keys = machine.own_property_keys(constructed).unwrap();
-        let literal_keys = machine.own_property_keys(literal).unwrap();
+        // --- Parity: both paths must produce the same own-property keys ---
         assert_eq!(
             constructed_keys, literal_keys,
             "new RegExp('x') and /x/ must have the same own-property set"
         );
 
-        // Neither should own `source` or `flags` — those are prototype accessors.
+        // --- Source of truth: both paths must match `initial_regexp_properties`
+        // ---
+        // Comparing against the shared helper (not a hand-copied duplicate)
+        // means the test's expected set drifts with the helper. If a call
+        // site stops using the helper, this assertion catches the divergence.
+        let expected = initial_regexp_properties();
+        let expected_keys: Vec<PropertyKey> = expected.iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(
+            constructed_keys, expected_keys,
+            "constructor must install exactly `initial_regexp_properties`"
+        );
+        assert_eq!(
+            literal_keys, expected_keys,
+            "CreateRegExp must install exactly `initial_regexp_properties`"
+        );
+
+        // --- ECMA-262 oracle: `lastIndex` is the only own data property ---
+        // This independent assertion is what makes the test catch mutations
+        // to `initial_regexp_properties` itself — if the helper gains a property
+        // or flips a descriptor flag, the spec-mandated shape breaks. Under
+        // the old hand-copied version a descriptor-only change (e.g. flipping
+        // `enumerable`) would have passed silently because only keys were
+        // compared.
+        assert_eq!(
+            constructed_keys,
+            vec![PropertyKey::Named(EcmaString::encode("lastIndex"))],
+            "ECMA-262 §22.2.3.3: lastIndex is the only own property"
+        );
+
+        // Verify the full descriptor on both paths, not just the key set.
+        // A descriptor-only mutation (flipping `enumerable`) changes no keys
+        // but breaks the spec-mandated attribute.
+        let last_index_key = PropertyKey::Named(EcmaString::encode("lastIndex"));
+        for (label, machine, regexp) in [
+            ("constructed", &constructed_machine, constructed),
+            ("literal", &literal_machine, literal),
+        ] {
+            let index = machine.runtime_slot(regexp).unwrap().unwrap();
+            let HeapEntry::RegExp { properties, .. } = &machine.heap[index] else {
+                panic!("{label} is a RegExp");
+            };
+            let Property::Data {
+                value,
+                writable,
+                enumerable,
+                configurable,
+            } = properties
+                .get(&last_index_key)
+                .unwrap_or_else(|| panic!("{label} owns lastIndex"))
+            else {
+                panic!("{label} lastIndex is a data property");
+            };
+            assert_eq!(*value, Value::int32(0), "{label} lastIndex value");
+            assert!(*writable, "{label} lastIndex writable");
+            assert!(!*enumerable, "{label} lastIndex non-enumerable");
+            assert!(!*configurable, "{label} lastIndex non-configurable");
+        }
+
+        // Neither should own `source` or `flags` — those are prototype
+        // accessors.
         for key in &constructed_keys {
             if let PropertyKey::Named(name) = key {
                 let text = name.to_utf8_lossy();
