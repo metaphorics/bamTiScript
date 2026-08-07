@@ -297,11 +297,25 @@ impl Program<Verified> {
     }
 
     /// Resolves a verified export by its exact ECMAScript name.
+    ///
+    /// # Termination
+    ///
+    /// This walk has no visit set. It terminates because a `Program<Verified>`
+    /// can only be produced by [`Program::link`], which runs
+    /// `verify_export_resolutions` and rejects every export cycle before this
+    /// method can ever run. The two hop kinds handled below --
+    /// `ExportSource::Local` through a `BindingKind::Imported` over a local
+    /// edge, and `ExportSource::Indirect` over a local edge -- are exactly the
+    /// hops `verify_export_resolutions` walks when detecting cycles. Any new
+    /// hop kind added here must also be covered there, or the bound below
+    /// turns the divergence into a `None` instead of a hang.
     #[must_use]
     pub fn resolve_export(&self, module: ModuleId, name: &EcmaString) -> Option<ResolvedExport> {
         let mut module_id = module;
         let mut linked_name = None;
-        loop {
+        // Bound by the module count: an acyclic walk visits at most every
+        // module once, so this is unreachable while the invariant above holds.
+        for _ in 0..=self.modules.len() {
             let current = self.module(module_id)?;
             let export_name = linked_name.unwrap_or(name);
             let export = current
@@ -357,6 +371,7 @@ impl Program<Verified> {
                 }
             }
         }
+        None
     }
 }
 
@@ -1060,8 +1075,28 @@ fn verify_program_metadata(
         }
         verify_module_metadata(modules, module_id, module)?;
     }
-    verify_export_resolutions(modules)?;
-    verify_imported_bindings(modules)
+    // Built once and shared by both verifiers so they cannot disagree about
+    // what "exported" means. `verify_module_metadata` already rejected
+    // out-of-bounds/non-string export names above, so the lookup is total.
+    let export_indices: Vec<HashMap<&EcmaString, usize>> = modules
+        .iter()
+        .map(|module| {
+            module
+                .exports
+                .iter()
+                .enumerate()
+                .map(|(index, export)| {
+                    (
+                        string(&module.code, export.name)
+                            .expect("metadata verifier checked export name"),
+                        index,
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    verify_export_resolutions(modules, &export_indices)?;
+    verify_imported_bindings(modules, &export_indices)
 }
 
 fn verify_module_metadata(
@@ -1360,7 +1395,10 @@ fn require_edge(
     })
 }
 
-fn verify_imported_bindings(modules: &[ProgramModule<Verified>]) -> Result<(), ProgramVerifyError> {
+fn verify_imported_bindings(
+    modules: &[ProgramModule<Verified>],
+    export_indices: &[HashMap<&EcmaString, usize>],
+) -> Result<(), ProgramVerifyError> {
     for (module_index, module) in modules.iter().enumerate() {
         let module_id = ModuleId::new(module_index as u32);
         for (binding_index, binding) in module.bindings.iter().enumerate() {
@@ -1372,11 +1410,10 @@ fn verify_imported_bindings(modules: &[ProgramModule<Verified>]) -> Result<(), P
             };
             let imported_name =
                 string(&module.code, name).expect("metadata verifier checked imported name");
-            let target = &modules[target.get() as usize];
-            if !target.exports.iter().any(|export| {
-                string(&target.code, export.name).expect("metadata verifier checked export name")
-                    == imported_name
-            }) {
+            // O(1) lookup against the shared index instead of a linear scan of
+            // the target's exports; the index is the same one
+            // `verify_export_resolutions` resolves through.
+            if !export_indices[target.get() as usize].contains_key(imported_name) {
                 return Err(module_error(
                     module_id,
                     ProgramVerifyErrorKind::MissingImportedExport {
@@ -1391,24 +1428,8 @@ fn verify_imported_bindings(modules: &[ProgramModule<Verified>]) -> Result<(), P
 
 fn verify_export_resolutions(
     modules: &[ProgramModule<Verified>],
+    export_indices: &[HashMap<&EcmaString, usize>],
 ) -> Result<(), ProgramVerifyError> {
-    let export_indices: Vec<HashMap<&EcmaString, usize>> = modules
-        .iter()
-        .map(|module| {
-            module
-                .exports
-                .iter()
-                .enumerate()
-                .map(|(index, export)| {
-                    (
-                        string(&module.code, export.name)
-                            .expect("metadata verifier checked export name"),
-                        index,
-                    )
-                })
-                .collect()
-        })
-        .collect();
     let mut states: Vec<Vec<u8>> = modules
         .iter()
         .map(|module| vec![0; module.exports.len()])
