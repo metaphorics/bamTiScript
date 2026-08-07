@@ -4224,12 +4224,6 @@ impl<'src> Binder<'src> {
         if !self.is_typescript() {
             return;
         }
-        let callee_symbol = if let Expression::Identifier(identifier) = call.callee.data() {
-            self.references.get(&identifier.id()).copied()
-        } else {
-            None
-        };
-        let callable = callee_symbol.and_then(|symbol| self.jsx_callables.get(&symbol).copied());
         let not_callable_range = match call.callee.data() {
             Expression::Member(member) => match &member.property {
                 MemberProperty::Named(identifier) => identifier.range(),
@@ -4292,21 +4286,18 @@ impl<'src> Binder<'src> {
             _ => None,
         };
 
-        let signature = if let Some(callable) = callable {
-            if call.type_arguments.is_some() {
-                self.explicit_callable_signature(call, scope, callable, callee_type)
-                    .or(signature)
-            } else {
-                self.instantiated_callable_signature(callable, callee_type, &argument_types)
-                    .or(signature)
-            }
-        } else {
-            signature
-        };
-
         let Some(signature) = signature else {
             return;
         };
+        // Instantiate the callee's type parameters against the arguments. This runs
+        // off the signature alone, so a method reached through a member expression
+        // is instantiated the same as a call through a plain identifier.
+        let instantiated = if call.type_arguments.is_some() {
+            self.explicit_function_signature(call, scope, &signature, &argument_types)
+        } else {
+            self.inferred_function_signature(&signature, &argument_types)
+        };
+        let signature = instantiated.unwrap_or(signature);
 
         let argument_count = argument_types.len();
         let (required, total, rest_index) = signature.arity();
@@ -4364,116 +4355,6 @@ impl<'src> Binder<'src> {
                 );
             }
         }
-    }
-
-    /// Resolves a value callable (function declaration or function/arrow
-    /// initializer) for an actual call, inferring type arguments from the
-    /// already-resolved callee signature. Returns `None` when the callable is
-    /// not generic or cannot be resolved.
-    fn instantiated_callable_signature(
-        &mut self,
-        callable: JsxCallable<'src>,
-        callee_type: TypeId,
-        argument_types: &[TypeId],
-    ) -> Option<FunctionSignature> {
-        let (type_parameters, _, _) = callable.parts();
-        type_parameters.filter(|list| !list.parameters.is_empty())?;
-        let Type::Function(signature) = self.types.get(callee_type).clone() else {
-            return None;
-        };
-
-        let mut inference_symbols = Vec::new();
-        for parameter in signature.parameters() {
-            self.collect_type_parameter_symbols(parameter.type_id(), &mut inference_symbols);
-        }
-        self.collect_type_parameter_symbols(signature.return_type(), &mut inference_symbols);
-        if inference_symbols.is_empty() {
-            return Some(signature);
-        }
-
-        let inference_parameters: Vec<_> = inference_symbols
-            .iter()
-            .map(|symbol| InferenceParameter::new(*symbol))
-            .collect();
-        let temp_signature = signature.clone();
-        let mut context = InferenceContext::new(&mut self.types, &inference_parameters);
-        context.infer_from_arguments(&temp_signature, argument_types);
-        let inferred = context.resolve();
-
-        let mut instantiated_parameters = Vec::with_capacity(signature.parameters().len());
-        for parameter in signature.parameters() {
-            let type_id = inferred.instantiate(&mut self.types, parameter.type_id());
-            instantiated_parameters.push(FunctionParameter::new(
-                parameter.name().to_owned(),
-                type_id,
-                parameter.optional(),
-                parameter.rest(),
-            ));
-        }
-        let instantiated_return = inferred.instantiate(&mut self.types, signature.return_type());
-        Some(FunctionSignature {
-            type_parameters: Vec::new(),
-            parameters: instantiated_parameters,
-            return_type: instantiated_return,
-        })
-    }
-    fn explicit_callable_signature(
-        &mut self,
-        call: &'src CallExpression,
-        scope: ScopeId,
-        callable: JsxCallable<'src>,
-        callee_type: TypeId,
-    ) -> Option<FunctionSignature> {
-        let Type::Function(signature) = self.types.get(callee_type).clone() else {
-            return None;
-        };
-        let (type_parameters, _, _) = callable.parts();
-        let Some(list) = type_parameters else {
-            return Some(signature);
-        };
-        let explicit = self.resolve_type_arguments(call.type_arguments.as_ref(), scope);
-        let mut inference_symbols = Vec::new();
-        self.collect_type_parameter_symbols(callee_type, &mut inference_symbols);
-        let mut inferred = Vec::new();
-        for (index, param) in list.parameters.iter().enumerate() {
-            let name = self.identifier_text(&param.data().name);
-            let Some(symbol) = inference_symbols
-                .iter()
-                .copied()
-                .find(|s| self.symbols[s.get() as usize].name() == name.as_ref())
-            else {
-                continue;
-            };
-            let type_id = explicit
-                .get(index)
-                .copied()
-                .unwrap_or_else(|| self.types.any());
-            inferred.push(InferredTypeArgument::new(
-                symbol,
-                type_id,
-                InferenceProvenance::Explicit,
-            ));
-        }
-        if inferred.is_empty() {
-            return Some(signature);
-        }
-        let inferred = InferredTypeArguments::new(inferred);
-        let mut instantiated_parameters = Vec::with_capacity(signature.parameters().len());
-        for parameter in signature.parameters() {
-            let type_id = inferred.instantiate(&mut self.types, parameter.type_id());
-            instantiated_parameters.push(FunctionParameter::new(
-                parameter.name().to_owned(),
-                type_id,
-                parameter.optional(),
-                parameter.rest(),
-            ));
-        }
-        let instantiated_return = inferred.instantiate(&mut self.types, signature.return_type());
-        Some(FunctionSignature {
-            type_parameters: Vec::new(),
-            parameters: instantiated_parameters,
-            return_type: instantiated_return,
-        })
     }
 
     fn collect_type_parameter_symbols(&self, type_id: TypeId, out: &mut Vec<SymbolId>) {

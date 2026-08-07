@@ -2345,6 +2345,17 @@ mod tests {
     }
 
     #[test]
+    fn generic_method_call_instantiates_type_parameters_from_arguments() {
+        let result = check_text(
+            "class Hooks<H extends string> {\n\
+               hook<N extends H>(name: N, fn: number): void {}\n\
+               deprecate<N extends H>(name: N): void { this.hook(name, 1); }\n\
+             }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
     fn a_derived_class_instance_flows_into_its_base_through_the_chain() {
         let result = check_text(
             "abstract class A { abstract readonly name: string; }\n\
