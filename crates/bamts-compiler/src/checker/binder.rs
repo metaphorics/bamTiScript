@@ -4199,7 +4199,7 @@ impl<'src> Binder<'src> {
             Expression::Assignment(assignment) => {
                 self.resolve_assignment_target(&assignment.left, scope);
                 self.resolve_expr(&assignment.right, scope);
-                if assignment.operator == AssignmentOperator::Assign {
+                if assignment.operator == AssignmentOperator::Assign && self.is_typescript() {
                     let target = self.type_of_assignment_target(&assignment.left, scope);
                     let source = self.type_of_expr(&assignment.right, scope);
                     if !self.types_assignable(source, target) {
@@ -6170,6 +6170,15 @@ mod tests {
         bind_source(parsed.product())
     }
 
+    fn bound_js(text: &str) -> (super::SemanticModel, Vec<Diagnostic>) {
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::JavaScript,
+            source(text),
+        ));
+        bind_source(parsed.product())
+    }
+
     #[test]
     fn c052_statement_not_allowed_in_ambient_context() {
         let (_, diagnostics) = bound_declaration("try { } catch (e) { }\n");
@@ -7025,5 +7034,31 @@ mod tests {
             .expect("x property");
         assert!(!x.readonly(), "get/set pair should not be readonly");
         assert_eq!(model.types().get(x.type_id()), &Type::Number);
+    }
+
+    #[test]
+    fn js_unannotated_let_accepts_reassignment_of_different_type() {
+        // In plain JavaScript the checker must not invent an annotation for an
+        // un-annotated mutable binding, so reassigning it to a wholly different
+        // type is not a TYPE_NOT_ASSIGNABLE error.
+        let (_, diagnostics) = bound_js("let g = { a: 1 };\ng = 0;\n");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code() == TYPE_NOT_ASSIGNABLE),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn ts_annotated_const_mismatch_still_reports_not_assignable() {
+        // A genuine annotation mismatch in a TypeScript source must still fire.
+        let (_, diagnostics) = bound("const s: string = 1;\n");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code() == TYPE_NOT_ASSIGNABLE),
+            "{diagnostics:?}"
+        );
     }
 }
