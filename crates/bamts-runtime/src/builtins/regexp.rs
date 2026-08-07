@@ -5,7 +5,7 @@ use bamts_bytecode::EcmaString;
 use bamts_native::Value;
 
 use super::{allocate_array, allocate_string, define_data, install_function, type_error};
-use crate::intrinsics::regexp::{Match, Regex};
+use crate::intrinsics::regexp::{Match, Regex, canonical_flags};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
 
@@ -59,16 +59,7 @@ fn constructor<H: Host>(
         inherited_flags
     };
     compile(machine, &pattern, &flags)?;
-    let mut properties = PropertyMap::default();
-    properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8("lastIndex")),
-        Property::Data {
-            value: Value::int32(0),
-            writable: true,
-            enumerable: false,
-            configurable: false,
-        },
-    );
+    let properties = initial_regexp_properties();
     let prototype = machine.intrinsics.regexp_prototype();
     let value = machine
         .allocate(HeapEntry::RegExp {
@@ -95,6 +86,24 @@ pub(super) fn compile<H: Host>(
             .expect("SyntaxError installed");
         machine.throw_error(id, error.message().to_owned())
     })
+}
+
+/// Build the initial own-property map for a newly constructed RegExp.
+/// ECMA-262 §22.2.3.3: only `lastIndex` is an own data property.
+/// Called from the constructor, the bytecode literal path, and the native
+/// helper path so all three agree by construction.
+pub(crate) fn initial_regexp_properties() -> PropertyMap {
+    let mut properties = PropertyMap::default();
+    properties.insert(
+        PropertyKey::Named(EcmaString::from_utf8("lastIndex")),
+        Property::Data {
+            value: Value::int32(0),
+            writable: true,
+            enumerable: false,
+            configurable: false,
+        },
+    );
+    properties
 }
 
 pub(super) fn regexp_parts<H: Host>(
@@ -199,13 +208,12 @@ fn flags_getter<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let (pattern, flags) = regexp_parts(machine, this).ok_or_else(|| {
+    let (_pattern, flags) = regexp_parts(machine, this).ok_or_else(|| {
         type_error("RegExp.prototype.flags getter called on incompatible receiver")
     })?;
-    let regex = compile(machine, &pattern, &flags)?;
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
-        regex.flags().canonical(),
+        canonical_flags(&flags),
     )?))
 }
 
@@ -609,5 +617,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn flags_getter_returns_canonical_ordering_for_multi_flag_regex() {
+        // The flags accessor must canonicalize the stored flag string into
+        // the standard gimsuy order without recompiling the pattern. A
+        // regex constructed with out-of-order flags ("mig") must report
+        // "gim" — the same output the old compile-based path produced.
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        // "mig" is valid but non-canonical; canonical order is "gim".
+        let regexp = construct_regexp(&mut machine, "x", "mig");
+        let BuiltinOutcome::Value(flags_value) =
+            flags_getter(&mut machine, regexp, &[], false).unwrap()
+        else {
+            panic!("flags_getter returns a value");
+        };
+        assert_eq!(
+            machine.to_string(flags_value).unwrap(),
+            EcmaString::from_utf8("gim"),
+            "flags_getter must return flags in canonical gimsuy order"
+        );
+
+        // Also verify the full flag set in reverse order ("yusmig") → "gimsuy".
+        let all_flags = construct_regexp(&mut machine, "x", "yusmig");
+        let BuiltinOutcome::Value(all_value) =
+            flags_getter(&mut machine, all_flags, &[], false).unwrap()
+        else {
+            panic!("flags_getter returns a value");
+        };
+        assert_eq!(
+            machine.to_string(all_value).unwrap(),
+            EcmaString::from_utf8("gimsuy"),
+            "flags_getter must return all flags in canonical gimsuy order"
+        );
     }
 }

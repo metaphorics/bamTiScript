@@ -66,6 +66,19 @@ impl Flags {
     }
 }
 
+/// Canonicalize a flags string into the standard `gimsuy` order without
+/// compiling the pattern. Reuses `Flags::parse` and `Flags::canonical` so
+/// the ordering stays identical to the compile-based path. The flags on a
+/// stored RegExp were validated at construction, so parse never fails in
+/// practice; the fallback returns the stored string verbatim rather than
+/// inventing output for an impossible state.
+pub(crate) fn canonical_flags(flags: &EcmaString) -> EcmaString {
+    match Flags::parse(flags) {
+        Ok(parsed) => parsed.canonical(),
+        Err(_) => flags.clone(),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RegexError {
     message: String,
