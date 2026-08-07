@@ -66,6 +66,16 @@ structure Verification (program : FunctionBody) where
 
 def verifies (program : FunctionBody) : Prop := Nonempty (Verification program)
 
+/-- Every function body in every module of an envelope verifies.
+
+`decode` produces a `ProgramEnvelope` but does not imply this predicate:
+per-body verification is a host obligation performed as a separate pass after
+decode. This definition names that obligation so the gap between the
+envelope-level `decode` and the per-body `verifies` is explicit in the model,
+and `envelope_verify_sound` below lifts per-body soundness across it. -/
+def envelopeVerifies (program : ProgramEnvelope) : Prop :=
+  ∀ module ∈ program.modules, ∀ function ∈ module.code.functions, verifies function
+
 inductive VerifyResult where
   | accepted
   | rejected
@@ -326,6 +336,19 @@ theorem verifier_never_skips_invariant (program : FunctionBody) (h : verifies pr
     rcases current with halted | ⟨currentInstruction, currentFetch, currentBoundary, currentFacts⟩
     · cases running.symm.trans halted
     · exact currentFacts register (certificate.readsCovered state.pc instruction fetch register read)
+
+/-- Envelope-level soundness: when the host verifies every function body in
+every module of a decoded envelope (`envelopeVerifies`), each such body is
+`executionSafe`. This is the join between `decode` (envelope of many) and
+`verifies`/`verify_sound` (one body): `decode` supplies the envelope, the host
+obligation `envelopeVerifies` covers every body, and this theorem lifts
+`verify_sound` across all of them. `decode` alone does not imply
+`envelopeVerifies`; that is the host obligation stated above, not a gap. -/
+theorem envelope_verify_sound (program : ProgramEnvelope) (h : envelopeVerifies program) :
+    ∀ module ∈ program.modules, ∀ function ∈ module.code.functions,
+      executionSafe function := by
+  intro module moduleMember function functionMember
+  exact verify_sound function (h module moduleMember function functionMember)
 
 
 end Bamti.Bytecode
