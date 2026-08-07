@@ -1221,12 +1221,21 @@ fn visit_class(
     for member in &class.members {
         match member.data() {
             ClassMember::Constructor(constructor) => {
-                flag_parameter_count(member.range(), constructor.parameters.len(), findings);
-                for parameter in &constructor.parameters {
-                    if let Some(initializer) = &parameter.data().initializer {
-                        visit_expression(initializer, script_kind, findings);
-                    }
-                }
+                // Constructors share the same signature surface as other callables
+                // (parameter count, mutable-array params, JS-only type syntax,
+                // decorators, initializers) and must not skip it. A constructor
+                // carries no return type or type parameters, so passing `None`
+                // for both keeps the JS-only function-type-syntax check (W085)
+                // from firing on it — that rule targets syntax a constructor
+                // cannot legally have.
+                visit_callable_signature(
+                    member.range(),
+                    &constructor.parameters,
+                    None,
+                    None,
+                    script_kind,
+                    findings,
+                );
                 visit_statement_list(&constructor.body.data().statements, script_kind, findings);
             }
             ClassMember::Method(method) => {
@@ -1989,6 +1998,13 @@ mod tests {
         "BAMTS-W059",
         "const f = (xs: number[]) => xs;",
         "const f = (value: number) => value;"
+    );
+
+    rule_test!(
+        w059_mutable_array_constructor,
+        "BAMTS-W059",
+        "class C { constructor(xs: number[]) {} }",
+        "class C { constructor(value: number) {} }"
     );
 
     #[test]
