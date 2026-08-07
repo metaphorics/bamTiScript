@@ -325,6 +325,16 @@ fn constructor<H: Host>(
     }
 
     let promise = machine.create_promise()?;
+    let new_target = machine.current_new_target();
+    if new_target != Value::UNDEFINED {
+        let default_prototype = machine.intrinsics.builtins.promise_prototype();
+        let prototype = machine
+            .constructed_prototype(new_target)
+            .unwrap_or(default_prototype);
+        if prototype != default_prototype {
+            machine.set_prototype_value(promise, Some(prototype))?;
+        }
+    }
     let record = machine.create_promise_resolver(promise)?;
     let (resolve_target, reject_target) = machine.intrinsics.builtins.promise_resolver_targets();
     let resolve = machine.create_promise_resolver_function(resolve_target, record)?;
@@ -384,6 +394,14 @@ fn then<H: Host>(
     constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     if constructing {
+        return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+            operation: "Promise.prototype.then",
+        }));
+    }
+    if !matches!(
+        machine.runtime_slot(this).map_err(EvalFailure::Runtime)?,
+        Some(index) if matches!(machine.heap[index], HeapEntry::Promise { .. })
+    ) {
         return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
             operation: "Promise.prototype.then",
         }));
@@ -1066,5 +1084,122 @@ mod tests {
         assert!(
             matches!(state(&machine, derived), PromiseState::Fulfilled { value } if value == Value::int32(7))
         );
+    }
+
+    #[test]
+    fn constructor_honors_new_target_for_subclass_prototype() {
+        let module = blank_program("<promise-subclass-test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let promise_constructor = machine.intrinsics.global("Promise").unwrap();
+        let promise_prototype = machine.intrinsics.builtins.promise_prototype();
+
+        // Build a subclass prototype that inherits from Promise.prototype.
+        let subclass_prototype =
+            super::super::ordinary_runtime(&mut machine, Some(promise_prototype)).unwrap();
+        machine
+            .set_data_property(subclass_prototype, "myMethod", Value::int32(42))
+            .unwrap();
+
+        // Build a new_target whose .prototype is the subclass prototype.
+        let new_target = super::super::ordinary_runtime(&mut machine, None).unwrap();
+        machine
+            .set_data_property(new_target, "prototype", subclass_prototype)
+            .unwrap();
+
+        let promise_id = machine.intrinsics.builtins.id_named("Promise").unwrap();
+        let executor = callback(&mut machine, "resolve immediately", return_undefined);
+        let BuiltinOutcome::Value(promise) = machine
+            .call_builtin_with_new_target(
+                promise_id,
+                Value::UNDEFINED,
+                &[executor],
+                true,
+                new_target,
+            )
+            .unwrap()
+        else {
+            panic!("Promise construct returns a value");
+        };
+
+        // The promise must inherit from the subclass prototype, not
+        // Promise.prototype directly.
+        assert_eq!(
+            machine.prototype_value(promise).unwrap(),
+            Some(subclass_prototype)
+        );
+        // Subclass methods are visible on the instance.
+        assert_eq!(
+            machine.get_named_property(promise, "myMethod").unwrap(),
+            Value::int32(42)
+        );
+        // And it is still a real promise.
+        assert!(matches!(
+            state(&machine, promise),
+            PromiseState::Pending { .. }
+        ));
+        let _ = promise_constructor;
+    }
+
+    #[test]
+    fn then_rejects_non_promise_receiver_without_observable_getter() {
+        let module = blank_program("<promise-then-brand-test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        // A spy object with a `constructor` getter that would be observed
+        // if the brand check did not short-circuit first.
+        let spy = super::super::ordinary_runtime(&mut machine, None).unwrap();
+        let getter = callback(&mut machine, "constructor getter", constructor_getter);
+        machine
+            .define_accessor(
+                spy,
+                PropertyKey::Named(EcmaString::from_utf8("constructor")),
+                getter,
+                crate::AccessorKind::Getter,
+            )
+            .unwrap();
+
+        let then = machine
+            .get_named_property(machine.intrinsics.builtins.promise_prototype(), "then")
+            .unwrap();
+        let result = machine.call_value(then, spy, &[Value::UNDEFINED]);
+
+        // Must throw a TypeError.
+        assert!(matches!(
+            result,
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+        // The constructor getter must NOT have been invoked.
+        assert_eq!(
+            machine
+                .globals
+                .get(&EcmaString::from_utf8("constructorGetCount")),
+            None
+        );
+    }
+
+    fn constructor_getter(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let count = machine
+            .globals
+            .get(&EcmaString::from_utf8("constructorGetCount"))
+            .and_then(|value| value.decode())
+            .and_then(|value| match value {
+                bamts_native::Decoded::Int32(raw) => Some(raw),
+                _ => None,
+            })
+            .unwrap_or(0);
+        machine.globals.insert(
+            EcmaString::from_utf8("constructorGetCount"),
+            Value::int32(count + 1),
+        );
+        Ok(BuiltinOutcome::Value(
+            machine.intrinsics.global("Promise").unwrap(),
+        ))
     }
 }
