@@ -1690,9 +1690,12 @@ fn can_complete_normally(statement: &Stmt) -> bool {
         Statement::Switch(statement) => {
             // Without a default the discriminant may match no case, so the
             // switch always completes normally. With a default it completes
-            // normally only if some case can fall out the bottom — either by
-            // being empty, ending in a break (which exits the switch), or
-            // ending in a statement that itself completes normally.
+            // normally only if some case can fall out the bottom: it ends in
+            // an unlabeled `break` (which exits the switch), or it is the last
+            // case and its final statement completes normally (control drops
+            // out the bottom). An empty consequent is fall-through to the next
+            // case and decides nothing on its own — except a trailing empty
+            // case, which has nothing to fall through to and so drops out.
             let has_default = statement
                 .cases
                 .iter()
@@ -1700,10 +1703,21 @@ fn can_complete_normally(statement: &Stmt) -> bool {
             if !has_default {
                 return true;
             }
-            statement.cases.iter().any(|case| {
-                case.data().consequent.last().is_none_or(|last| {
-                    matches!(last.data(), Statement::Break(_)) || can_complete_normally(last)
-                })
+            let last_index = statement.cases.len().saturating_sub(1);
+            statement.cases.iter().enumerate().any(|(index, case)| {
+                let Some(last) = case.data().consequent.last() else {
+                    // Empty consequent: falls through to the next case,
+                    // unless it is the final case (nothing to fall into).
+                    return index == last_index;
+                };
+                // An unlabeled break exits the switch normally. A labeled
+                // break targets an enclosing statement and does not.
+                if matches!(last.data(), Statement::Break(jump) if jump.label.is_none()) {
+                    return true;
+                }
+                // Only the final case can drop out the bottom; any other
+                // case that completes normally just falls through.
+                index == last_index && can_complete_normally(last)
             })
         }
         _ => true,
@@ -2023,6 +2037,19 @@ mod tests {
         assert!(
             !codes(source, ScriptKind::TypeScript).contains(&"BAMTS-W065"),
             "a function that returns from every switch case must not be flagged as missing a return"
+        );
+    }
+
+    #[test]
+    fn w065_switch_grouped_empty_case_labels_are_not_flagged() {
+        // `case 1:` has an empty consequent and falls through to `case 2:`.
+        // Every reachable path returns, so W065 must not fire. The prior
+        // implementation treated the empty consequent as a path that completes
+        // normally, producing a false "missing return".
+        let source = "function f(x: 1 | 2 | 3): string {\n  switch (x) {\n    case 1:\n    case 2:\n      return 'a';\n    default:\n      return 'b';\n  }\n}";
+        assert!(
+            !codes(source, ScriptKind::TypeScript).contains(&"BAMTS-W065"),
+            "a function whose only empty case label falls through to a returning case must not be flagged as missing a return"
         );
     }
 }
