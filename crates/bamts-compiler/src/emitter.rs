@@ -63,6 +63,16 @@ pub mod codes {
     pub const NAMESPACE_UNLOWERED: DiagnosticCode = DiagnosticCode::new("TS-EMIT-1011");
     /// A runtime enum declaration has no matching checked enum plan.
     pub const ENUM_FACTS_UNAVAILABLE: DiagnosticCode = DiagnosticCode::new("TS-EMIT-1013");
+    /// `export =` cannot be lowered to JavaScript without a module target.
+    ///
+    /// `export =` is the CommonJS single-module-value form: TypeScript emits
+    /// `module.exports = x` for CommonJS targets and rejects it for ESM. The
+    /// emitter's [`EmitOptions`] carries no module-target or interop setting, so
+    /// the correct runtime form is unknowable here. Silently rewriting it to an
+    /// ESM `export default` would change the module shape, so we report this
+    /// instead of guessing. Declaration (`.d.ts`) emit preserves `export =`.
+    pub const EXPORT_ASSIGNMENT_NO_MODULE_TARGET: DiagnosticCode =
+        DiagnosticCode::new("TS-EMIT-1014");
 }
 
 /// Which surface the emitter prints.
@@ -903,11 +913,18 @@ impl<'a> Emitter<'a> {
                 }
                 ExportDefaultValue::Interface(_) => false,
             },
-            ExportDeclaration::Assignment(expression) => {
-                self.raw("export default ");
-                self.emit_expression_prec(expression, P_ASSIGN);
-                self.raw(";");
-                true
+            ExportDeclaration::Assignment(_) => {
+                // `export =` is a CommonJS single-module-value form. Its
+                // JavaScript lowering depends on the module target
+                // (`module.exports = x` for CommonJS; rejected for ESM), which
+                // EmitOptions does not carry. Refuse to emit rather than
+                // silently rewrite it to an ESM `export default`, which would
+                // change the module shape. Declaration emit preserves it.
+                self.diag_here(
+                    codes::EXPORT_ASSIGNMENT_NO_MODULE_TARGET,
+                    "export = cannot be lowered to JavaScript without a module target",
+                );
+                false
             }
         }
     }
@@ -3987,7 +4004,11 @@ mod tests {
     }
 
     #[test]
-    fn export_assignment_emits_default_export_in_javascript_mode() {
+    fn export_assignment_reports_diagnostic_in_javascript_mode() {
+        // `export =` is a CommonJS single-module-value form. Without a module
+        // target the emitter cannot know whether to print `module.exports = x`
+        // (CommonJS) or reject it (ESM), so it must report a diagnostic rather
+        // than silently rewrite the construct to an ESM `export default`.
         let input = "const answer = 42;
 export = answer;";
         let parsed = crate::parser::parse(crate::scanner::scan(
@@ -3998,23 +4019,19 @@ export = answer;";
         assert!(parsed.diagnostics().is_empty());
 
         let output = emit_js(parsed.product());
-        assert!(!output.has_errors());
-        assert_eq!(
-            output.code,
-            "const answer = 42;
-export default answer;
-"
-        );
 
-        let reparsed = crate::parser::parse(crate::scanner::scan(
-            SourceId::new(0),
-            ScriptKind::TypeScript,
-            Arc::new(
-                SourceText::new(output.code.as_str())
-                    .expect("test source fits the per-file budget"),
-            ),
-        ));
-        assert!(reparsed.diagnostics().is_empty());
+        // The non-export statement still emits; only the unsupported construct
+        // is dropped.
+        assert_eq!(output.code, "const answer = 42;\n");
+        // Exactly one diagnostic, and it is the module-target error — not a
+        // silent `export default` rewrite.
+        assert_eq!(output.diagnostics.len(), 1);
+        assert_eq!(
+            output.diagnostics[0].code(),
+            codes::EXPORT_ASSIGNMENT_NO_MODULE_TARGET
+        );
+        assert!(output.has_errors());
+        assert!(!output.code.contains("export default"));
     }
 
     #[test]
