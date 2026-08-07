@@ -2345,6 +2345,12 @@ mod tests {
     }
 
     #[test]
+    fn an_unmodelled_intrinsic_type_target_stays_permissive() {
+        let result = check_text("const record: Record<string, unknown> = { name: 'root' };");
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
     fn object_methods_satisfy_structural_function_members() {
         let result = check_text(
             "interface Service { compute(value: number): Promise<number>; }\
