@@ -1093,8 +1093,16 @@ fn execute_driver_request(request: &WorkerRequest) -> Result<WorkerResponse> {
 /// `bamts_runtime::run` against a Node host.  Fuel bounds interpreted loops,
 /// while the enclosing worker process is wall-clock killable by `run_worker`.
 fn execute_interpreter_request(request: &WorkerRequest) -> Result<WorkerResponse> {
-    let entrypoint = request.root.join(&request.spec.entrypoint);
+    // Compilation happens inside the worker, so it spends the case's wall-clock
+    // budget; the interpreter run below gets only what is left.
     let started = Instant::now();
+    let entrypoint = request.root.join(&request.spec.entrypoint);
+    // `compile_program` runs only the frontend, lint, and lowering pipeline —
+    // it never reads `args.target`, so ExecutionTarget is irrelevant to the
+    // bytecode it produces.  There is no ExecutionTarget::Interpreter variant;
+    // the actual interpreter execution happens below via `bamts_runtime::run`,
+    // which interprets the bytecode directly and is distinct from JIT mode's
+    // `bamts_codegen::compile_jit` + native `run_linked_program`.
     let args = cli_args(
         Mode::Run,
         ExecutionTarget::Jit,
@@ -1187,10 +1195,7 @@ fn run_worker(
             format!("cannot resolve corpus worker executable: {error}"),
         )
     })?;
-    let mut environment = normalized_env();
-    if let Some(path) = env::var_os("PATH") {
-        environment.push(("PATH".to_owned(), path.to_string_lossy().into_owned()));
-    }
+    let mut environment = worker_env(request.operation);
     environment.push((
         CORPUS_WORKER_REQUEST.to_owned(),
         request_path.to_string_lossy().into_owned(),
@@ -1234,6 +1239,21 @@ fn run_worker(
     )
     .map_err(|error| json_error(&response_path, error))?;
     Ok(WorkerRun::Completed(response))
+}
+
+/// Builds the worker process environment, reusing the canonical
+/// [`normalized_env`] as the base.  Only the AOT compile step needs a
+/// discoverable toolchain (the linker); the JIT and interpreter workers
+/// execute the case program in-process and must observe the same
+/// normalized environment as the Node oracle and the AOT executable.
+fn worker_env(operation: WorkerOperation) -> Vec<(String, String)> {
+    let mut environment = normalized_env();
+    if matches!(operation, WorkerOperation::AotCompile)
+        && let Some(path) = env::var_os("PATH")
+    {
+        environment.push(("PATH".to_owned(), path.to_string_lossy().into_owned()));
+    }
+    environment
 }
 
 fn interpreter_limits(budget: Duration) -> Limits {
@@ -2488,6 +2508,26 @@ mod tests {
         assert_eq!(short.fuel, 25 * INTERPRETER_FUEL_PER_MILLISECOND);
         assert_eq!(long.fuel, 250 * INTERPRETER_FUEL_PER_MILLISECOND);
         assert_eq!(long.fuel, short.fuel * 10);
+    }
+
+    #[test]
+    fn worker_env_excludes_path_for_in_process_modes() {
+        // JIT and Interpreter execute the case program in-process, so they
+        // must not inherit PATH — only the AOT compile step needs a
+        // discoverable toolchain for the linker.
+        let has_path = |env: &[(String, String)]| env.iter().any(|(key, _)| key == "PATH");
+        assert!(
+            !has_path(&worker_env(WorkerOperation::Jit)),
+            "JIT worker must not expose PATH to the case program"
+        );
+        assert!(
+            !has_path(&worker_env(WorkerOperation::Interpreter)),
+            "interpreter worker must not expose PATH to the case program"
+        );
+        assert!(
+            has_path(&worker_env(WorkerOperation::AotCompile)),
+            "AOT compile worker needs PATH for the linker"
+        );
     }
 
     #[test]
