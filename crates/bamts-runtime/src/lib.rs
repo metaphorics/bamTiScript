@@ -1232,6 +1232,9 @@ enum HeapEntry {
         callable: NativeCallable,
         properties: PropertyMap,
         extensible: bool,
+        /// Explicit prototype override; `None` falls back to
+        /// `%Function.prototype%` (the historical default for builtins).
+        prototype: Option<Value>,
     },
 }
 
@@ -2874,6 +2877,7 @@ impl<'a, H: Host> Machine<'a, H> {
             })),
             properties: PropertyMap::default(),
             extensible: true,
+            prototype: None,
         })
         .map_err(EvalFailure::Runtime)
     }
@@ -7693,7 +7697,9 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Promise { prototype, .. }
             | HeapEntry::Timeout { prototype, .. }
             | HeapEntry::ProcessEnv { prototype, .. } => *prototype,
-            HeapEntry::NativeFunction { .. } => Some(self.intrinsics.function_prototype),
+            HeapEntry::NativeFunction { prototype, .. } => {
+                prototype.or(Some(self.intrinsics.function_prototype))
+            }
             _ => None,
         };
         match prototype {
@@ -8616,6 +8622,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     prototype: slot, ..
                 }
                 | HeapEntry::Promise {
+                    prototype: slot, ..
+                }
+                | HeapEntry::NativeFunction {
                     prototype: slot, ..
                 } => {
                     *slot = prototype;

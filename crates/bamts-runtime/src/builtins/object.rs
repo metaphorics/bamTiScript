@@ -468,7 +468,121 @@ fn apply_property_descriptor<H: Host>(
         return Ok(());
     }
     let current = machine.own_descriptor(target, &key)?;
+    validate_property_descriptor(machine, current.as_ref(), descriptor)?;
     machine.define_descriptor(target, key, descriptor.into_property(current))
+}
+
+/// ECMA-262 §7.2.10 SameValue(x, y).
+///
+/// Like SameValueZero except that `+0` and `-0` are distinct.
+fn same_value<H: Host>(machine: &Machine<'_, H>, left: Value, right: Value) -> bool {
+    match (left.decode(), right.decode()) {
+        (Some(Decoded::Number(a)), Some(Decoded::Number(b))) => {
+            if a.is_nan() && b.is_nan() {
+                return true;
+            }
+            if a == 0.0 && b == 0.0 {
+                return a.is_sign_positive() == b.is_sign_positive();
+            }
+            a == b
+        }
+        (Some(Decoded::Number(a)), Some(Decoded::Int32(b)))
+        | (Some(Decoded::Int32(b)), Some(Decoded::Number(a))) => {
+            let b_f64 = f64::from(b);
+            if a.is_nan() && b_f64.is_nan() {
+                return true;
+            }
+            if a == 0.0 && b_f64 == 0.0 {
+                return a.is_sign_positive();
+            }
+            a == b_f64
+        }
+        _ => machine.same_value_zero(left, right),
+    }
+}
+
+/// ECMA-262 §10.1.6.3 ValidateAndApplyPropertyDescriptor — validation half.
+///
+/// When `current` is absent the property is being created and any descriptor is
+/// accepted. When `current` is configurable any change is permitted. Otherwise
+/// the spec forbids: making the property configurable, changing enumerability,
+/// converting between data and accessor form, making a non-writable data
+/// property writable, or changing the value of a non-writable data property
+/// (using SameValue). A no-op redefinition that changes nothing is allowed.
+fn validate_property_descriptor<H: Host>(
+    machine: &Machine<'_, H>,
+    current: Option<&Property>,
+    descriptor: PropertyDescriptor,
+) -> Result<(), EvalFailure> {
+    let Some(current) = current else {
+        return Ok(());
+    };
+    if current.configurable() {
+        return Ok(());
+    }
+    if descriptor.configurable == Some(true) {
+        return Err(type_error(
+            "Cannot redefine property: non-configurable property cannot be made configurable",
+        ));
+    }
+    if descriptor
+        .enumerable
+        .is_some_and(|enumerable| enumerable != current.enumerable())
+    {
+        return Err(type_error(
+            "Cannot redefine property: cannot change enumerability of non-configurable property",
+        ));
+    }
+    match current {
+        Property::Data {
+            writable, value, ..
+        } => {
+            if descriptor.is_accessor() {
+                return Err(type_error(
+                    "Cannot redefine property: cannot convert non-configurable data property to accessor",
+                ));
+            }
+            if !*writable {
+                if descriptor.writable == Some(true) {
+                    return Err(type_error(
+                        "Cannot redefine property: cannot make non-writable property writable",
+                    ));
+                }
+                if descriptor
+                    .value
+                    .is_some_and(|next| !same_value(machine, next, *value))
+                {
+                    return Err(type_error(
+                        "Cannot redefine property: cannot change value of non-writable property",
+                    ));
+                }
+            }
+        }
+        Property::Accessor { getter, setter, .. } => {
+            if descriptor.is_data() {
+                return Err(type_error(
+                    "Cannot redefine property: cannot convert non-configurable accessor property to data",
+                ));
+            }
+            if descriptor
+                .getter
+                .is_some_and(|next| !same_value(machine, next, getter.unwrap_or(Value::UNDEFINED)))
+            {
+                return Err(type_error(
+                    "Cannot redefine property: cannot change getter of non-configurable accessor property",
+                ));
+            }
+            if descriptor
+                .setter
+                .is_some_and(|next| !same_value(machine, next, setter.unwrap_or(Value::UNDEFINED)))
+            {
+                return Err(type_error(
+                    "Cannot redefine property: cannot change setter of non-configurable accessor property",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn define_property<H: Host>(
@@ -901,6 +1015,7 @@ fn function_bind<H: Host>(
             configurable: true,
         },
     );
+    let bound_prototype = machine.prototype_value(this)?;
     let value = machine
         .allocate(HeapEntry::NativeFunction {
             callable: NativeCallable::Bound(Box::new(BoundCallable {
@@ -910,6 +1025,7 @@ fn function_bind<H: Host>(
             })),
             properties,
             extensible: true,
+            prototype: bound_prototype,
         })
         .map_err(EvalFailure::Runtime)?;
     Ok(BuiltinOutcome::Value(value))
@@ -2798,6 +2914,7 @@ mod tests {
                     })),
                     properties: PropertyMap::default(),
                     extensible: true,
+                    prototype: None,
                 })
                 .unwrap();
         }
@@ -3002,6 +3119,244 @@ mod tests {
         assert_eq!(
             machine.get_named_property(result, "b").unwrap(),
             Value::int32(2)
+        );
+    }
+
+    // ---- Finding 1: ValidateAndApplyPropertyDescriptor ---------------------
+
+    fn non_configurable_data(machine: &mut Machine<'_, TestHost>) -> Value {
+        let target = ordinary_object(machine);
+        let descriptor = ordinary_object(machine);
+        machine
+            .set_data_property(descriptor, "value", Value::int32(1))
+            .unwrap();
+        machine
+            .set_data_property(descriptor, "writable", Value::FALSE)
+            .unwrap();
+        machine
+            .set_data_property(descriptor, "configurable", Value::FALSE)
+            .unwrap();
+        machine
+            .set_data_property(descriptor, "enumerable", Value::FALSE)
+            .unwrap();
+        let key = allocate_string(machine, EcmaString::from_utf8("x")).unwrap();
+        call_object(machine, "defineProperty", &[target, key, descriptor]).unwrap();
+        target
+    }
+
+    #[test]
+    fn redefining_non_configurable_value_throws() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = non_configurable_data(&mut machine);
+        let change_value = ordinary_object(&mut machine);
+        machine
+            .set_data_property(change_value, "value", Value::int32(2))
+            .unwrap();
+        let key = allocate_string(&mut machine, EcmaString::from_utf8("x")).unwrap();
+        let result = call_object(&mut machine, "defineProperty", &[target, key, change_value]);
+        assert!(
+            matches!(
+                result,
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ),
+            "redefining value of non-writable non-configurable property must throw TypeError"
+        );
+        assert_eq!(
+            machine.get_named_property(target, "x").unwrap(),
+            Value::int32(1),
+            "value must be unchanged after rejected redefinition"
+        );
+    }
+
+    #[test]
+    fn redefining_non_configurable_to_configurable_throws() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = non_configurable_data(&mut machine);
+        let make_configurable = ordinary_object(&mut machine);
+        machine
+            .set_data_property(make_configurable, "configurable", Value::TRUE)
+            .unwrap();
+        let key = allocate_string(&mut machine, EcmaString::from_utf8("x")).unwrap();
+        let result = call_object(
+            &mut machine,
+            "defineProperty",
+            &[target, key, make_configurable],
+        );
+        assert!(
+            matches!(
+                result,
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ),
+            "making a non-configurable property configurable must throw TypeError"
+        );
+    }
+
+    #[test]
+    fn redefining_non_configurable_to_accessor_throws() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = non_configurable_data(&mut machine);
+        let to_accessor = ordinary_object(&mut machine);
+        let getter = probe(&mut machine, "getter", 0);
+        machine
+            .set_data_property(to_accessor, "get", getter)
+            .unwrap();
+        let key = allocate_string(&mut machine, EcmaString::from_utf8("x")).unwrap();
+        let result = call_object(&mut machine, "defineProperty", &[target, key, to_accessor]);
+        assert!(
+            matches!(
+                result,
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ),
+            "converting non-configurable data property to accessor must throw TypeError"
+        );
+    }
+
+    #[test]
+    fn freeze_then_define_property_throws() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = ordinary_object(&mut machine);
+        machine
+            .set_data_property(target, "x", Value::int32(1))
+            .unwrap();
+        call_object(&mut machine, "freeze", &[target]).unwrap();
+        let change_value = ordinary_object(&mut machine);
+        machine
+            .set_data_property(change_value, "value", Value::int32(4))
+            .unwrap();
+        let key = allocate_string(&mut machine, EcmaString::from_utf8("x")).unwrap();
+        let result = call_object(&mut machine, "defineProperty", &[target, key, change_value]);
+        assert!(
+            matches!(
+                result,
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ),
+            "defineProperty on a frozen property must throw TypeError"
+        );
+        assert_eq!(
+            machine.get_named_property(target, "x").unwrap(),
+            Value::int32(1),
+            "frozen value must be unchanged"
+        );
+    }
+
+    #[test]
+    fn legal_no_op_redefinition_of_non_configurable_succeeds() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = non_configurable_data(&mut machine);
+        // Redefine with the exact same values — spec permits this.
+        let no_op = ordinary_object(&mut machine);
+        machine
+            .set_data_property(no_op, "value", Value::int32(1))
+            .unwrap();
+        machine
+            .set_data_property(no_op, "writable", Value::FALSE)
+            .unwrap();
+        machine
+            .set_data_property(no_op, "configurable", Value::FALSE)
+            .unwrap();
+        machine
+            .set_data_property(no_op, "enumerable", Value::FALSE)
+            .unwrap();
+        let key = allocate_string(&mut machine, EcmaString::from_utf8("x")).unwrap();
+        call_object(&mut machine, "defineProperty", &[target, key, no_op])
+            .expect("no-op redefinition of non-configurable property must succeed");
+        assert_eq!(
+            machine.get_named_property(target, "x").unwrap(),
+            Value::int32(1)
+        );
+    }
+
+    #[test]
+    fn making_non_writable_non_configurable_writable_throws() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = non_configurable_data(&mut machine);
+        let make_writable = ordinary_object(&mut machine);
+        machine
+            .set_data_property(make_writable, "writable", Value::TRUE)
+            .unwrap();
+        let key = allocate_string(&mut machine, EcmaString::from_utf8("x")).unwrap();
+        let result = call_object(
+            &mut machine,
+            "defineProperty",
+            &[target, key, make_writable],
+        );
+        assert!(
+            matches!(
+                result,
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ),
+            "making a non-writable non-configurable property writable must throw TypeError"
+        );
+    }
+
+    // ---- Finding 2: bound function inherits target's prototype -------------
+
+    #[test]
+    fn bound_function_inherits_target_prototype() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        // Create a user function with a custom [[Prototype]]. The custom
+        // prototype must itself inherit from %Function.prototype% so that
+        // `bind` (which lives on %Function.prototype%) stays reachable on
+        // the target — exactly as `Object.setPrototypeOf(fn, customProto)`
+        // would in real JS only if customProto's chain reaches
+        // %Function.prototype%. A plain ordinary object here would sever
+        // that chain and make `target.bind` resolve to `undefined`.
+        let custom_prototype = ordinary_object(&mut machine);
+        machine
+            .set_prototype_value(
+                custom_prototype,
+                Some(machine.intrinsics.function_prototype),
+            )
+            .unwrap();
+        let target = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(0),
+                captures: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: Some(custom_prototype),
+                extensible: true,
+            })
+            .unwrap();
+
+        let bound = call_method(&mut machine, target, "bind", &[Value::UNDEFINED]).unwrap();
+
+        // The bound function must inherit the target's prototype, not the
+        // default %Function.prototype%.
+        assert_eq!(
+            machine.prototype_value(bound).unwrap(),
+            Some(custom_prototype),
+            "bound function must inherit target's prototype"
+        );
+    }
+
+    #[test]
+    fn bound_builtin_still_gets_function_prototype() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = probe(&mut machine, "probe", 2);
+        let bound = call_method(&mut machine, target, "bind", &[]).unwrap();
+        // A builtin has prototype: None, which falls back to %Function.prototype%.
+        assert_eq!(
+            machine.prototype_value(bound).unwrap(),
+            Some(machine.intrinsics.function_prototype),
+            "bound builtin must still get %Function.prototype%"
         );
     }
 }

@@ -801,6 +801,7 @@ fn trace_entry(
         HeapEntry::NativeFunction {
             callable,
             properties,
+            prototype,
             ..
         } => {
             match callable {
@@ -812,6 +813,9 @@ fn trace_entry(
                 }
             }
             trace_property_map(properties, heap, marks, work);
+            if let Some(prototype) = prototype {
+                mark_value(heap, marks, work, *prototype);
+            }
         }
     }
 }

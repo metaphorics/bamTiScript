@@ -565,6 +565,7 @@ pub(crate) fn native_function(
             callable: NativeCallable::Builtin(id),
             properties,
             extensible: true,
+            prototype: None,
         },
     )
 }
