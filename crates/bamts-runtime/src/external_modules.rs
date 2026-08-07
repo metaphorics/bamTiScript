@@ -827,13 +827,14 @@ fn encode_output(bytes: &[u8], encoding: &str) -> String {
 }
 
 fn decode_hex(text: &str) -> Result<Vec<u8>, EvalFailure> {
-    if !text.len().is_multiple_of(2) {
+    if !text.is_ascii() || !text.len().is_multiple_of(2) {
         return Err(type_error("invalid hexadecimal hash input"));
     }
     text.as_bytes()
         .chunks_exact(2)
         .map(|pair| {
-            let digits = std::str::from_utf8(pair).expect("hex input is a string");
+            let digits = std::str::from_utf8(pair)
+                .map_err(|_| type_error("invalid hexadecimal hash input"))?;
             u8::from_str_radix(digits, 16).map_err(|_| type_error("invalid hexadecimal hash input"))
         })
         .collect()
@@ -1461,6 +1462,28 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn hash_update_rejects_non_ascii_hex_input() {
+        // "aéb" is 4 bytes ([0x61, 0xC3, 0xA9, 0x62]) — a multiple of two, so the
+        // length guard passes, but the first byte pair [0x61, 0xC3] straddles a
+        // UTF-8 boundary. Previously this panicked the runtime; it must surface
+        // as a normal JS-visible TypeError instead.
+        let program = blank_program();
+        let mut host = EchoHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let algorithm = alloc_string(&mut machine, "echo").unwrap();
+        let BuiltinOutcome::Value(hash) =
+            create_hash(&mut machine, Value::UNDEFINED, &[algorithm], false).unwrap()
+        else {
+            unreachable!()
+        };
+        let non_ascii_hex = alloc_string(&mut machine, "aéb").unwrap();
+        let hex = alloc_string(&mut machine, "hex").unwrap();
+        assert!(matches!(
+            hash_update(&mut machine, hash, &[non_ascii_hex, hex], false),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+    }
     #[test]
     fn hash_replaces_lone_surrogates_and_releases_digested_payload() {
         let program = blank_program();
