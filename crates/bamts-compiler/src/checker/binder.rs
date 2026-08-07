@@ -5114,7 +5114,13 @@ impl<'src> Binder<'src> {
             SymbolKind::Interface | SymbolKind::TypeAlias | SymbolKind::Enum => {
                 self.resolve_type_symbol(symbol)
             }
-            SymbolKind::Class | SymbolKind::TypeParameter | SymbolKind::IntrinsicType => {
+            SymbolKind::Class | SymbolKind::TypeParameter => self.types.named(symbol),
+            // `Object` is the only intrinsic type the table models nominally, because
+            // relations knows it is the top object type. The other intrinsics
+            // (`Record`, `Promise`, `Iterable`, ...) have no structural definition yet.
+            // A nominal target that no structural source can satisfy rejects valid
+            // code, so they keep the permissive error type until they are modelled.
+            SymbolKind::IntrinsicType if self.types.is_object_symbol(symbol) => {
                 self.types.named(symbol)
             }
             SymbolKind::Import => self.resolve_import_equals_type_symbol(symbol),
