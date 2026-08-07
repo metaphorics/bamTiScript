@@ -2345,6 +2345,24 @@ mod tests {
     }
 
     #[test]
+    fn explicit_type_arguments_bind_in_declaration_order() {
+        // T is declared before U, yet U occurs first in the parameter list.
+        // Explicit args <number, string> must bind T := number and U := string
+        // (declaration order), so u: U = string rejects 1 and t: T = number
+        // rejects "a" — two argument errors. Occurrence-order binding would
+        // swap the bindings and report zero errors.
+        let result = check_text(
+            "function f<T, U>(u: U, t: T): T { return t; }\n\
+             const r = f<number, string>(1, \"a\");",
+        );
+        let argument_errors: Vec<&'static str> = checker_codes(&result)
+            .into_iter()
+            .filter(|code| *code == "BAMTS-C053")
+            .collect();
+        assert_eq!(argument_errors.len(), 2);
+    }
+
+    #[test]
     fn rest_parameter_target_accepts_any_fixed_source_arity() {
         let result = check_text(
             "type Handler = (...args: any[]) => any;\n\

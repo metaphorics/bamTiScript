@@ -3119,41 +3119,9 @@ impl<'src> Binder<'src> {
                 .unwrap_or_default();
             let mut function_parameters = Vec::with_capacity(function.parameters.len());
             for (idx, parameter) in function.parameters.iter().enumerate() {
-                if self.is_this_parameter(parameter) {
-                    continue;
+                if let Some(lowered) = self.lower_parameter(idx, parameter, scope) {
+                    function_parameters.push(lowered);
                 }
-                let data = parameter.data();
-                let type_id = match &data.type_annotation {
-                    Some(annotation) => self.resolve_type(&annotation.data().type_node, scope),
-                    None => self.types.any(),
-                };
-                let rest = matches!(data.binding.data(), BindingPattern::Rest(_));
-                let optional = data.optional || data.initializer.is_some();
-                let name = match data.binding.data() {
-                    BindingPattern::Identifier(identifier) => {
-                        self.identifier_text(identifier).into_owned()
-                    }
-                    BindingPattern::Rest(rest) => match rest.argument.data() {
-                        BindingPattern::Identifier(identifier) => {
-                            self.identifier_text(identifier).into_owned()
-                        }
-                        _ => format!("arg{idx}"),
-                    },
-                    BindingPattern::Assignment(assign) => match assign.left.data() {
-                        BindingPattern::Identifier(identifier) => {
-                            self.identifier_text(identifier).into_owned()
-                        }
-                        BindingPattern::Rest(rest) => match rest.argument.data() {
-                            BindingPattern::Identifier(identifier) => {
-                                self.identifier_text(identifier).into_owned()
-                            }
-                            _ => format!("arg{idx}"),
-                        },
-                        _ => format!("arg{idx}"),
-                    },
-                    _ => format!("arg{idx}"),
-                };
-                function_parameters.push(FunctionParameter::new(name, type_id, optional, rest));
             }
             let function_type = self.types.function_with_parameters(
                 type_parameters,
@@ -3274,6 +3242,50 @@ impl<'src> Binder<'src> {
             BindingPattern::Identifier(identifier)
                 if self.identifier_text(identifier).as_ref() == "this"
         )
+    }
+    /// Lowers one parsed parameter into an interned [`FunctionParameter`],
+    /// skipping `this` parameters. Shared by function-declaration binding and
+    /// [`Binder::signature_type`] so the two lowering paths cannot quietly
+    /// diverge.
+    fn lower_parameter(
+        &mut self,
+        index: usize,
+        parameter: &'src ParameterNode,
+        scope: ScopeId,
+    ) -> Option<FunctionParameter> {
+        if self.is_this_parameter(parameter) {
+            return None;
+        }
+        let data = parameter.data();
+        let type_id = match &data.type_annotation {
+            Some(annotation) => self.resolve_type(&annotation.data().type_node, scope),
+            None => self.types.any(),
+        };
+        let rest = matches!(data.binding.data(), BindingPattern::Rest(_));
+        let optional = data.optional || data.initializer.is_some();
+        let name = match data.binding.data() {
+            BindingPattern::Identifier(identifier) => self.identifier_text(identifier).into_owned(),
+            BindingPattern::Rest(rest) => match rest.argument.data() {
+                BindingPattern::Identifier(identifier) => {
+                    self.identifier_text(identifier).into_owned()
+                }
+                _ => format!("arg{index}"),
+            },
+            BindingPattern::Assignment(assign) => match assign.left.data() {
+                BindingPattern::Identifier(identifier) => {
+                    self.identifier_text(identifier).into_owned()
+                }
+                BindingPattern::Rest(rest) => match rest.argument.data() {
+                    BindingPattern::Identifier(identifier) => {
+                        self.identifier_text(identifier).into_owned()
+                    }
+                    _ => format!("arg{index}"),
+                },
+                _ => format!("arg{index}"),
+            },
+            _ => format!("arg{index}"),
+        };
+        Some(FunctionParameter::new(name, type_id, optional, rest))
     }
 
     fn this_parameter_type(
@@ -5862,41 +5874,9 @@ impl<'src> Binder<'src> {
     ) -> TypeId {
         let mut function_parameters: Vec<FunctionParameter> = Vec::with_capacity(parameters.len());
         for (idx, parameter) in parameters.iter().enumerate() {
-            if self.is_this_parameter(parameter) {
-                continue;
+            if let Some(lowered) = self.lower_parameter(idx, parameter, scope) {
+                function_parameters.push(lowered);
             }
-            let data = parameter.data();
-            let type_id = match &data.type_annotation {
-                Some(annotation) => self.resolve_type(&annotation.data().type_node, scope),
-                None => self.types.any(),
-            };
-            let rest = matches!(data.binding.data(), BindingPattern::Rest(_));
-            let optional = data.optional || data.initializer.is_some();
-            let name = match data.binding.data() {
-                BindingPattern::Identifier(identifier) => {
-                    self.identifier_text(identifier).into_owned()
-                }
-                BindingPattern::Rest(rest) => match rest.argument.data() {
-                    BindingPattern::Identifier(identifier) => {
-                        self.identifier_text(identifier).into_owned()
-                    }
-                    _ => format!("arg{idx}"),
-                },
-                BindingPattern::Assignment(assign) => match assign.left.data() {
-                    BindingPattern::Identifier(identifier) => {
-                        self.identifier_text(identifier).into_owned()
-                    }
-                    BindingPattern::Rest(rest) => match rest.argument.data() {
-                        BindingPattern::Identifier(identifier) => {
-                            self.identifier_text(identifier).into_owned()
-                        }
-                        _ => format!("arg{idx}"),
-                    },
-                    _ => format!("arg{idx}"),
-                },
-                _ => format!("arg{idx}"),
-            };
-            function_parameters.push(FunctionParameter::new(name, type_id, optional, rest));
         }
         let return_type = match return_type {
             Some(annotation) => self.resolve_type(&annotation.data().type_node, scope),
@@ -5973,17 +5953,14 @@ impl<'src> Binder<'src> {
             return Some(signature.clone());
         };
         let explicit = self.resolve_type_arguments(Some(type_args), scope);
-        let mut inference_symbols = Vec::new();
-        for parameter in signature.parameters() {
-            self.collect_type_parameter_symbols(parameter.type_id(), &mut inference_symbols);
-        }
-        self.collect_type_parameter_symbols(signature.return_type(), &mut inference_symbols);
-        let mut deduped: Vec<SymbolId> = Vec::new();
-        for sym in inference_symbols {
-            if !deduped.contains(&sym) {
-                deduped.push(sym);
-            }
-        }
+        // Bind explicit type arguments against the signature's declared type
+        // parameters in declaration order — not occurrence order — so
+        // `f<T, U>(u: U, t: T)` called as `f<number, string>(...)` binds
+        // T := number and U := string, matching TypeScript. Every construction
+        // site that places type-parameter symbols into the parameter/return
+        // types populates `type_parameters`, so no occurrence-order fallback
+        // is needed here.
+        let deduped: Vec<SymbolId> = signature.type_parameters().to_vec();
         if deduped.is_empty() {
             return Some(signature.clone());
         }
@@ -6031,16 +6008,10 @@ impl<'src> Binder<'src> {
             self.collect_type_parameter_symbols(parameter.type_id(), &mut inference_symbols);
         }
         self.collect_type_parameter_symbols(signature.return_type(), &mut inference_symbols);
-        let mut deduped: Vec<SymbolId> = Vec::new();
-        for sym in inference_symbols {
-            if !deduped.contains(&sym) {
-                deduped.push(sym);
-            }
-        }
-        if deduped.is_empty() {
+        if inference_symbols.is_empty() {
             return Some(signature.clone());
         }
-        let inference_parameters: Vec<_> = deduped
+        let inference_parameters: Vec<_> = inference_symbols
             .iter()
             .map(|symbol| InferenceParameter::new(*symbol))
             .collect();
