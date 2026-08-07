@@ -148,7 +148,13 @@ fn put(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) {
     put_ecma(heap, object, EcmaString::from_utf8(name), value);
 }
 
-fn put_ecma(heap: &mut [HeapEntry], object: Value, name: EcmaString, value: Value) {
+fn define_data(
+    heap: &mut [HeapEntry],
+    object: Value,
+    name: EcmaString,
+    value: Value,
+    enumerable: bool,
+) {
     let index = heap_index(object);
     let properties = match &mut heap[index] {
         HeapEntry::Object { properties, .. }
@@ -161,28 +167,18 @@ fn put_ecma(heap: &mut [HeapEntry], object: Value, name: EcmaString, value: Valu
         Property::Data {
             value,
             writable: true,
-            enumerable: true,
+            enumerable,
             configurable: true,
         },
     );
 }
+
+fn put_ecma(heap: &mut [HeapEntry], object: Value, name: EcmaString, value: Value) {
+    define_data(heap, object, name, value, true);
+}
+
 fn define_global_data(heap: &mut [HeapEntry], object: Value, name: EcmaString, value: Value) {
-    let index = heap_index(object);
-    let properties = match &mut heap[index] {
-        HeapEntry::Object { properties, .. }
-        | HeapEntry::Array { properties, .. }
-        | HeapEntry::NativeFunction { properties, .. } => properties,
-        _ => unreachable!("host object installation target owns properties"),
-    };
-    properties.insert(
-        PropertyKey::Named(name),
-        Property::Data {
-            value,
-            writable: true,
-            enumerable: false,
-            configurable: true,
-        },
-    );
+    define_data(heap, object, name, value, false);
 }
 
 fn put_text(heap: &mut Vec<HeapEntry>, object: Value, name: &str, text: &str) {
