@@ -1042,7 +1042,9 @@ impl<'a> Emitter<'a> {
                 } else if value == f64::NEG_INFINITY {
                     self.raw("-Infinity");
                 } else {
-                    write!(self.out, "{value}").expect("writing to a String cannot fail");
+                    let mut text = String::new();
+                    write!(text, "{value}").expect("writing to a String cannot fail");
+                    self.raw(&text);
                 }
             }
             EnumScalar::String(value) => self.emit_enum_string(value),
@@ -1060,10 +1062,16 @@ impl<'a> Emitter<'a> {
                 0x0D => self.raw("\\r"),
                 0x22 => self.raw("\\\""),
                 0x5C => self.raw("\\\\"),
-                0x20..=0x7E => self
-                    .out
-                    .push(char::from_u32(u32::from(unit)).expect("ASCII unit")),
-                _ => write!(self.out, "\\u{unit:04X}").expect("writing to a String cannot fail"),
+                0x20..=0x7E => {
+                    let ch = char::from_u32(u32::from(unit)).expect("ASCII unit");
+                    let mut buf = [0u8; 4];
+                    self.raw(ch.encode_utf8(&mut buf));
+                }
+                _ => {
+                    let mut text = String::new();
+                    write!(text, "\\u{unit:04X}").expect("writing to a String cannot fail");
+                    self.raw(&text);
+                }
             }
         }
         self.raw("\"");
@@ -3615,6 +3623,23 @@ mod tests {
         let file = b.finish(vec![first, second]);
         let output = emit(&file, EmitOptions::javascript().with_newline(Newline::CrLf));
         assert_eq!(output.code, "a;\r\nb;\r\n");
+    }
+
+    #[test]
+    fn const_enum_scalar_use_keeps_block_indentation() {
+        // A const-enum member used as a bare expression statement inside an
+        // indented block is inlined to its numeric scalar. That scalar must
+        // flow through the indentation machinery (`raw`) like every other
+        // emitted token, so the line keeps its leading spaces.
+        let source = Arc::new(
+            SourceText::new("const enum K { X = 2 }\n{ K.X; }")
+                .expect("test source fits the per-file budget"),
+        );
+        let scanned = crate::scanner::scan(SourceId::new(0), ScriptKind::TypeScript, source);
+        let parsed = crate::parser::parse(scanned);
+        let output = emit(parsed.product(), EmitOptions::javascript());
+        // The const enum declaration is erased; only the inlined block remains.
+        assert_eq!(output.code, "{\n    2;\n}\n");
     }
 
     #[test]
