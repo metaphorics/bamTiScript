@@ -487,9 +487,18 @@ impl<H: Host> Intrinsics<H> {
 
     pub(crate) fn global(&self, name: &str) -> Option<Value> {
         debug_assert!(name.is_ascii());
-        self.globals
-            .iter()
-            .find_map(|(candidate, value)| candidate.eq_ascii(name).then_some(*value))
+        // The previous scan used `eq_ascii`, which returns false for every
+        // candidate when `name` is non-ASCII, so a non-ASCII lookup always
+        // yielded `None`. Preserve that contract by bailing out before the
+        // keyed lookup, which would otherwise match a non-ASCII global.
+        if !name.is_ascii() {
+            return None;
+        }
+        // `EcmaString::encode` encodes ASCII as the identical u16 code
+        // units that `eq_ascii` compared against, and BTreeMap keys are
+        // unique, so `get` returns the same single match the scan did — in
+        // O(log n) instead of walking every global on each construction.
+        self.globals.get(&EcmaString::encode(name)).copied()
     }
 
     pub(crate) fn regexp_prototype(&self) -> Value {
