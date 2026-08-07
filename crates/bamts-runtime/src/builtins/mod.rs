@@ -1106,6 +1106,13 @@ impl<'a, H: Host> Machine<'a, H> {
                 .saturating_sub(new_length)
                 .saturating_mul(std::mem::size_of::<Value>())
                 .saturating_add(old_property_bytes.saturating_sub(new_property_bytes));
+            // On failure nothing grew, so return the speculative growth charge
+            // in addition to any bytes released by a partial shrink.
+            let released = if result.is_err() {
+                released.saturating_add(growth)
+            } else {
+                released
+            };
             self.refund_slot(index, released);
             return result;
         }
@@ -1908,6 +1915,66 @@ mod tests {
         ));
         assert_eq!(machine.slot_bytes[index], before_slot);
         assert_eq!(machine.heap_bytes, before_heap);
+        machine.assert_heap_ledger();
+    }
+
+    #[test]
+    fn array_length_redefinition_failure_refunds_speculative_charge() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let array = machine
+            .allocate(HeapEntry::Array {
+                elements: vec![Value::int32(1), Value::int32(2), Value::int32(3)],
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.array_prototype),
+                extensible: true,
+                length_writable: true,
+            })
+            .expect("array allocation succeeds");
+        let index = machine
+            .runtime_slot(array)
+            .expect("array slot lookup succeeds")
+            .expect("array has a runtime slot");
+        let length_key = PropertyKey::Named(EcmaString::from_utf8("length"));
+
+        // Freeze the length so subsequent redefinitions with a different value fail.
+        machine
+            .define_descriptor(
+                array,
+                length_key.clone(),
+                Property::Data {
+                    value: Value::int32(3),
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                },
+            )
+            .expect("freezing array length succeeds");
+
+        let baseline_slot = machine.slot_bytes[index];
+        let baseline_heap = machine.heap_bytes;
+
+        // Repeatedly attempt a large length redefinition that must fail because
+        // the length is non-writable. Each failure must refund the speculative
+        // growth charge; otherwise the charged heap total grows without bound.
+        for _ in 0..10 {
+            assert!(matches!(
+                machine.define_descriptor(
+                    array,
+                    length_key.clone(),
+                    Property::Data {
+                        value: Value::int32(1_000_000),
+                        writable: false,
+                        enumerable: false,
+                        configurable: false,
+                    },
+                ),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+            assert_eq!(machine.slot_bytes[index], baseline_slot);
+            assert_eq!(machine.heap_bytes, baseline_heap);
+        }
         machine.assert_heap_ledger();
     }
 
