@@ -360,13 +360,27 @@ impl<'table> TypeRelations<'table> {
         target: &FunctionSignature,
         strictness: Strictness,
     ) -> bool {
-        if source.parameters().len() > target.parameters().len() {
+        // A source signature is only too narrow when it *requires* more than the
+        // target can ever supply. A trailing rest parameter supplies any count,
+        // so `arity` reports `usize::MAX` and no fixed source arity exceeds it.
+        let (source_required, _, _) = source.arity();
+        let (_, target_total, _) = target.arity();
+        if source_required > target_total {
             return false;
         }
-        for (source_param, target_param) in source.parameters().iter().zip(target.parameters()) {
+        let positions = source.parameters().len().max(target.parameters().len());
+        for index in 0..positions {
+            // A position absent from either side needs no check: extra target
+            // parameters go unread, and extra optional source parameters go unsupplied.
+            let (Some(source_type), Some(target_type)) = (
+                self.parameter_type_at(source, index),
+                self.parameter_type_at(target, index),
+            ) else {
+                continue;
+            };
             // Parameters are contravariant: the target must supply a value the
             // source accepts.
-            if !self.relates(target_param.type_id(), source_param.type_id(), strictness) {
+            if !self.relates(target_type, source_type, strictness) {
                 return false;
             }
         }
@@ -374,6 +388,32 @@ impl<'table> TypeRelations<'table> {
         // source return, a genuine subtyping rule kept in both modes.
         matches!(self.table.get(target.return_type()), Type::Void)
             || self.relates(source.return_type(), target.return_type(), strictness)
+    }
+
+    /// Type a signature accepts at `index`, or `None` when it accepts nothing
+    /// there. A trailing rest parameter covers every position from its own index
+    /// onward and contributes its element type, not the array type it declares.
+    fn parameter_type_at(&self, signature: &FunctionSignature, index: usize) -> Option<TypeId> {
+        let parameters = signature.parameters();
+        if let Some(parameter) = parameters.get(index) {
+            return Some(if parameter.rest() {
+                self.rest_element(parameter.type_id())
+            } else {
+                parameter.type_id()
+            });
+        }
+        let last = parameters.last()?;
+        last.rest().then(|| self.rest_element(last.type_id()))
+    }
+
+    /// Element type a rest parameter binds per position. A rest parameter is
+    /// declared as an array; a non-array declaration is already an error
+    /// elsewhere, so it stands for itself here rather than failing the relation.
+    fn rest_element(&self, type_id: TypeId) -> TypeId {
+        match self.table.get(type_id) {
+            Type::Array(element) => *element,
+            _ => type_id,
+        }
     }
 }
 

@@ -2345,6 +2345,26 @@ mod tests {
     }
 
     #[test]
+    fn rest_parameter_target_accepts_any_fixed_source_arity() {
+        let result = check_text(
+            "type Handler = (...args: any[]) => any;\n\
+             const identity = <T>(value: T): T => value;\n\
+             const one: Handler = identity;\n\
+             const two: Handler = (a: string, b: string) => `${a}${b}`;",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn fixed_arity_target_still_rejects_a_wider_required_source() {
+        let result = check_text(
+            "type Unary = (a: string) => string;\n\
+             const two: Unary = (a: string, b: string) => `${a}${b}`;",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
     fn generic_method_call_instantiates_type_parameters_from_arguments() {
         let result = check_text(
             "class Hooks<H extends string> {\n\
