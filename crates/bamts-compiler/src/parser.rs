@@ -206,6 +206,7 @@ struct ParserCheckpoint {
     diagnostics: usize,
     next_node_id: u32,
     journal: usize,
+    jsx_spans: usize,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -711,6 +712,7 @@ impl Parser {
             diagnostics: self.diagnostics.len(),
             next_node_id: self.next_node_id,
             journal: self.journal.len(),
+            jsx_spans: self.jsx_spans.len(),
         }
     }
 
@@ -724,6 +726,7 @@ impl Parser {
         self.prev_end = checkpoint.prev_end;
         self.diagnostics.truncate(checkpoint.diagnostics);
         self.next_node_id = checkpoint.next_node_id;
+        self.jsx_spans.truncate(checkpoint.jsx_spans);
     }
 
     // ------------------------------------------------------------------
@@ -5184,7 +5187,6 @@ impl Parser {
                 }
                 _ => {
                     let range = expr.range();
-
                     self.node_at(
                         range,
                         AssignmentTarget::Missing(MissingNode::new(
@@ -5253,9 +5255,8 @@ impl Parser {
                     elements.push(AssignmentArrayElement::Target(target));
                 }
                 ArrayElement::Spread(_) => {
-                    // A rest element has no array-target slot; diagnose and
-                    // record a missing element rather than dropping it.
-
+                    // A rest element has no array-target slot. Record a missing
+                    // element so the checker can report it; the parser stays silent.
                     elements.push(AssignmentArrayElement::Missing(MissingNode::new(
                         NodeKind::MissingAssignmentTarget,
                     )));
@@ -6151,10 +6152,9 @@ impl Parser {
 
     fn parse_type_member(&mut self) -> TypeMemberNode {
         let start = self.cur_start();
-
         // Call signature `<T>(...): R` / `(...): R`.
         if self.at(TokenKind::LParen) || self.at_less_like() {
-            let function = self.parse_function_type_signature(false, self.cur().range());
+            let function = self.parse_function_type_signature(false);
             return self.node(start, TypeMember::Call(CallSignature { function }));
         }
 
@@ -6163,7 +6163,7 @@ impl Parser {
             && matches!(self.nth_kind(1), TokenKind::LParen | TokenKind::LessThan)
         {
             self.bump();
-            let function = self.parse_function_type_signature(true, self.cur().range());
+            let function = self.parse_function_type_signature(true);
             return self.node(
                 start,
                 TypeMember::Construct(ConstructSignature {
@@ -6200,15 +6200,7 @@ impl Parser {
         let name = self.parse_property_name();
         let optional = self.eat(TokenKind::Question).is_some();
         if self.at(TokenKind::LParen) || self.at_less_like() {
-            let error_range = match &name {
-                PropertyName::Identifier(n) => n.range(),
-                PropertyName::Private(n) => n.range(),
-                PropertyName::String(n) => n.range(),
-                PropertyName::Number(n) => n.range(),
-                PropertyName::Computed(n) => n.range(),
-                PropertyName::Missing(_) => self.cur().range(),
-            };
-            let function = self.parse_function_type_signature(false, error_range);
+            let function = self.parse_function_type_signature(false);
             return self.node(
                 start,
                 TypeMember::Method(TypeMethodSignature {
@@ -6229,12 +6221,7 @@ impl Parser {
             }),
         )
     }
-
-    fn parse_function_type_signature(
-        &mut self,
-        constructor: bool,
-        _error_range: TextRange,
-    ) -> FunctionType {
+    fn parse_function_type_signature(&mut self, constructor: bool) -> FunctionType {
         let type_parameters = self.parse_optional_type_parameters();
         let parameters = self.parse_function_type_parameters();
         let (return_type, return_type_missing) = if constructor {
@@ -7064,6 +7051,59 @@ mod tests {
         let unbalanced = parse_ts("function f() { if (a) {");
         assert!(!errors(&unbalanced).is_empty());
         assert_eq!(unbalanced.product().eof().kind(), TokenKind::EndOfFile);
+    }
+
+    #[test]
+    fn discarded_jsx_speculation_does_not_suppress_lexical_diagnostics() {
+        // `(…): T` makes `paren_arrow_follow` return `Colon`, so
+        // `try_parse_arrow_function` speculatively parses a parameter list
+        // via `speculate_paren_arrow`. In `.tsx` the parameter default
+        // `<div>` triggers a JSX rescan that records a `jsx_spans` entry.
+        // With no `=>` after the return type the speculation is rolled back.
+        // A rolled-back JSX span must not survive: `rollback()` must truncate
+        // `jsx_spans` so the discarded rescan does not suppress the default
+        // scanner's lexical diagnostics for that range in the final
+        // `parse()` diagnostic filter.
+        //
+        // This is tested at the parser-method level because the public
+        // `parse()` entry point re-parses the same `<div>` as JSX after
+        // rollback — in TSX `<` in expression position always triggers
+        // `rescan_jsx_span` — which re-commits an identical span and masks
+        // the bug. The contract under test (rollback undoes `jsx_spans`
+        // growth) is observable only between the speculation rollback and
+        // the re-parse, i.e. directly on the `Parser` before `parse()`
+        // runs its diagnostic-filtering epilogue.
+        let source = Arc::new(
+            SourceText::new("(x = <div>\u{1}</div>): T")
+                .expect("test source fits the per-file budget"),
+        );
+        let scanned = scan(SourceId::new(0), ScriptKind::TypeScriptReact, source);
+        let (scanned, _lexical) = scanned.into_parts();
+        let mut parser = Parser::new(
+            scanned.source_id(),
+            scanned.script_kind(),
+            Arc::clone(scanned.source()),
+            scanned.tokens().to_vec(),
+            *scanned.eof(),
+        );
+
+        // Drives the full speculation path: `paren_arrow_follow` → `Colon`,
+        // `speculate_paren_arrow` checkpoints, parses the parameter default
+        // `<div>\u{1}</div>` (recording a jsx_span), parses `: T`, finds no
+        // `=>`, and rolls back.
+        assert!(
+            parser.try_parse_arrow_function(false).is_none(),
+            "input is not an arrow function"
+        );
+
+        // After rollback the discarded JSX span must be gone. If it survives,
+        // `parse()` would suppress the L005 diagnostic for the control byte
+        // inside the would-be JSX text — the exact bug the fix targets.
+        assert!(
+            parser.jsx_spans.is_empty(),
+            "rolled-back JSX span survived: {:?}",
+            parser.jsx_spans,
+        );
     }
 
     #[test]
