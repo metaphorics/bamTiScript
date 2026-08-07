@@ -1484,10 +1484,10 @@ mod tests {
         BARE_SUPER_EXPRESSION, CANNOT_FIND_NAME, CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE,
         CONSTRUCTOR_DECORATOR_NOT_SUPPORTED, DUPLICATE_DECLARATION, IMPORTED_CONST_ENUM_AMBIGUOUS,
         IMPORTED_CONST_ENUM_CYCLE, IMPORTED_CONST_ENUM_NONCONSTANT, MIXED_EXPORT_ASSIGNMENT,
-        PARAMETER_DECORATOR_NOT_SUPPORTED, ProgramCheckInput, PropertyType, ResolvedModuleEdge,
-        SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
-        SUPER_REFERENCE_NON_DERIVED, ScopeKind, SymbolKind, TYPE_NOT_ASSIGNABLE, Type, TypeTable,
-        WITH_STATEMENT_NOT_ALLOWED, check, check_program,
+        PARAMETER_DECORATOR_NOT_SUPPORTED, PROPERTY_DOES_NOT_EXIST, ProgramCheckInput,
+        PropertyType, ResolvedModuleEdge, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS,
+        SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_REFERENCE_NON_DERIVED, ScopeKind, SymbolKind,
+        TYPE_NOT_ASSIGNABLE, Type, TypeTable, WITH_STATEMENT_NOT_ALLOWED, check, check_program,
     };
     use crate::diagnostic::{DiagnosticSeverity, Recovered};
     use crate::namespace_plan::{ContainerAcquisition, ExportStorage};
@@ -4397,6 +4397,54 @@ mod tests {
         assert!(
             !plan.is_value_bearing(),
             "non-identifier namespace names must never be value-bearing"
+        );
+    }
+
+    #[test]
+    fn class_constructor_prototype_resolves_to_instance_type() {
+        // `C.prototype` is the instance type of `class C`, so reading it must
+        // not report PROPERTY_DOES_NOT_EXIST and must type as the structural
+        // object carrying the declared instance member `greet`.
+        let src = "class C { greet(): string { return \"hi\"; } }\nconst p = C.prototype;";
+        let result = check_text(src);
+        assert!(
+            !checker_codes(&result).contains(&PROPERTY_DOES_NOT_EXIST.as_str()),
+            "C.prototype must resolve to the instance type: {:?}",
+            checker_codes(&result)
+        );
+        // The initializer `C.prototype` is typed via `type_of_expr`, so its
+        // node type is the instance type: an object carrying `greet`.
+        let parsed_src = parsed(0, src);
+        let Statement::Variable(decl) = parsed_src.product().statements()[1].data() else {
+            panic!("second statement is the variable declaration");
+        };
+        let member_id = decl.declarations[0]
+            .data()
+            .initializer
+            .as_ref()
+            .expect("declarator has an initializer")
+            .id();
+        let model = result.product();
+        let prototype_type = model.node_type(member_id).expect("C.prototype is typed");
+        assert!(
+            matches!(
+                model.types().get(prototype_type),
+                Type::ObjectType(properties)
+                    if properties.iter().any(|property| property.name() == "greet")
+            ),
+            "C.prototype must be the instance type carrying `greet`"
+        );
+    }
+
+    #[test]
+    fn class_constructor_unknown_static_property_reports_c057() {
+        // Only `prototype` is contributed; any other static property on a
+        // class constructor must still report PROPERTY_DOES_NOT_EXIST.
+        let result = check_text("class C {}\nC.nope = 1;");
+        assert!(
+            checker_codes(&result).contains(&PROPERTY_DOES_NOT_EXIST.as_str()),
+            "C.nope must report PROPERTY_DOES_NOT_EXIST: {:?}",
+            checker_codes(&result)
         );
     }
 }

@@ -4660,7 +4660,21 @@ impl<'src> Binder<'src> {
             }
             Type::Named(symbol) => {
                 if let Some(instance_type) = self.class_instance_types.get(&symbol).copied() {
-                    return self.property_type_for_member(instance_type, name, range);
+                    // A class constructor value exposes `prototype`, typed as the
+                    // class instance type, alongside its static members. The
+                    // static side has no property table yet, so resolve
+                    // `prototype` here. For user classes an unknown constructor
+                    // property falls through to the instance-type lookup, which
+                    // reports `PROPERTY_DOES_NOT_EXIST`. Intrinsics (Error, ...)
+                    // instead keep the permissive `resolve_named_type_symbol`
+                    // fallthrough below, so `Error.captureStackTrace` and other
+                    // unmodelled statics do not newly report C057.
+                    if name == "prototype" {
+                        return Some(instance_type);
+                    }
+                    if self.symbols[symbol.get() as usize].kind == SymbolKind::Class {
+                        return self.property_type_for_member(instance_type, name, range);
+                    }
                 }
                 let resolved = self.resolve_named_type_symbol(symbol);
                 if resolved == object_type {
