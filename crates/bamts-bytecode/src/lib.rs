@@ -1478,6 +1478,12 @@ pub enum VerifyErrorKind {
     AliasedIteratorCloseOutputs {
         register: Register,
     },
+    AliasedIteratorNextOutputs {
+        register: Register,
+    },
+    AliasedIteratorResultOutputs {
+        register: Register,
+    },
     AliasedDisposeCaptureOutputs {
         register: Register,
     },
@@ -1600,6 +1606,16 @@ impl fmt::Display for VerifyError {
             VerifyErrorKind::AliasedIteratorCloseOutputs { register } => write!(
                 formatter,
                 "iterator close result and called outputs alias register {}",
+                register.get()
+            ),
+            VerifyErrorKind::AliasedIteratorNextOutputs { register } => write!(
+                formatter,
+                "iterator next done and value outputs alias register {}",
+                register.get()
+            ),
+            VerifyErrorKind::AliasedIteratorResultOutputs { register } => write!(
+                formatter,
+                "iterator result done and value outputs alias register {}",
                 register.get()
             ),
             VerifyErrorKind::AliasedDisposeCaptureOutputs { register } => write!(
@@ -2139,6 +2155,13 @@ fn verify_instruction(
             check_register(done)?;
             check_register(value)?;
             check_register(iterator)?;
+            if done == value {
+                return Err(instruction_error(
+                    function_index,
+                    pc,
+                    VerifyErrorKind::AliasedIteratorNextOutputs { register: done },
+                ));
+            }
         }
         Instruction::IteratorStep { dst, iterator } => {
             check_register(dst)?;
@@ -2152,6 +2175,13 @@ fn verify_instruction(
             check_register(done)?;
             check_register(value)?;
             check_register(result)?;
+            if done == value {
+                return Err(instruction_error(
+                    function_index,
+                    pc,
+                    VerifyErrorKind::AliasedIteratorResultOutputs { register: done },
+                ));
+            }
         }
         Instruction::IteratorClose {
             result,
@@ -5882,6 +5912,70 @@ mod tests {
             module.verify(),
             Err(VerifyError {
                 kind: VerifyErrorKind::AliasedDisposeCaptureOutputs { register: found },
+                ..
+            }) if found == register
+        ));
+    }
+
+    #[test]
+    fn verifier_rejects_aliased_iterator_next_outputs() {
+        let register = Register::new(1);
+        let module = Module::new(
+            vec![],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                2,
+                flags(),
+                vec![
+                    Instruction::IteratorNext {
+                        done: register,
+                        value: register,
+                        iterator: Register::new(0),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        assert!(matches!(
+            module.verify(),
+            Err(VerifyError {
+                kind: VerifyErrorKind::AliasedIteratorNextOutputs { register: found },
+                ..
+            }) if found == register
+        ));
+    }
+
+    #[test]
+    fn verifier_rejects_aliased_iterator_result_outputs() {
+        let register = Register::new(1);
+        let module = Module::new(
+            vec![],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                2,
+                flags(),
+                vec![
+                    Instruction::IteratorResult {
+                        done: register,
+                        value: register,
+                        result: Register::new(0),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        assert!(matches!(
+            module.verify(),
+            Err(VerifyError {
+                kind: VerifyErrorKind::AliasedIteratorResultOutputs { register: found },
                 ..
             }) if found == register
         ));
