@@ -29,7 +29,7 @@
 
 use std::fmt::Write as _;
 
-use bamts_compiler::diagnostic::{Diagnostic, DiagnosticSeverity};
+use bamts_compiler::diagnostic::{Diagnostic, DiagnosticReport, DiagnosticSeverity};
 use bamts_compiler::source::{SourceId, SourcePositionError, SourceText, TextRange, Utf16Pos};
 
 use crate::args::DiagnosticsFormat;
@@ -69,6 +69,39 @@ pub fn render(
         DiagnosticsFormat::Github => render_github(&ordered, sources),
         DiagnosticsFormat::Compact => render_compact(&ordered, sources),
     }
+}
+
+/// Renders a compiler-prepared report without reimplementing its deduplication,
+/// poisoning, per-rule cap, or summary accounting.
+#[must_use]
+pub fn render_report(
+    format: DiagnosticsFormat,
+    report: &DiagnosticReport,
+    sources: &[DiagnosticSource<'_>],
+    error_limit: usize,
+) -> String {
+    let diagnostics = report
+        .diagnostics()
+        .iter()
+        .take(error_limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut rendered = render(format, &diagnostics, sources);
+    if matches!(
+        format,
+        DiagnosticsFormat::Text | DiagnosticsFormat::Pretty | DiagnosticsFormat::Compact
+    ) {
+        for summary in report.summaries() {
+            let _ = writeln!(
+                rendered,
+                "note[{}]: {} diagnostic(s); silence with `{}`",
+                summary.rule().code(),
+                summary.total_count(),
+                summary.silence_flag(),
+            );
+        }
+    }
+    rendered
 }
 
 /// Returns the diagnostics in the compiler's canonical total order.
@@ -537,6 +570,7 @@ fn escape_github_property(value: &str) -> String {
 mod tests {
     use super::*;
     use bamts_compiler::diagnostic::DiagnosticCode;
+    use bamts_compiler::lint::LintLevel;
     use bamts_compiler::source::Utf16Pos;
 
     const FILE: SourceId = SourceId::new(0);
@@ -887,5 +921,22 @@ mod tests {
             "caret width {caret_width} exceeds cap: {caret_displayed}",
         );
         assert!(caret_width >= 1, "wide span produced zero-width caret");
+    }
+
+    #[test]
+    fn report_rendering_uses_compiler_summary_and_limit() {
+        let text = SourceText::new("xx");
+        let rule = bamts_compiler::lint::rule_by_name("explicit-any")
+            .expect("registered rule")
+            .id();
+        let diagnostics = [
+            Diagnostic::lint(LintLevel::Warn, rule, FILE, range(0, 1), "first").expect("warns"),
+            Diagnostic::lint(LintLevel::Warn, rule, FILE, range(1, 2), "second").expect("warns"),
+        ];
+        let report = DiagnosticReport::new(&diagnostics);
+        let out = render_report(DiagnosticsFormat::Text, &report, &sources("a.ts", &text), 1);
+        assert!(out.contains("first"));
+        assert!(!out.contains("second"));
+        assert!(out.contains("2 diagnostic(s); silence with `-A explicit-any`"));
     }
 }

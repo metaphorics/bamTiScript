@@ -398,9 +398,9 @@ impl Completion {
 /// The register frame header shared by the interpreter and native code.
 ///
 /// Layout is fixed and identical on every 64-bit target: `previous` at 0,
-/// `bytecode_pc` at 8, `handles` at 16, `handle_len` at 24, with explicit
-/// zeroed padding. `size = 32`, `align = 8`. `handles` addresses exactly
-/// `handle_len` `Value`s.
+/// `bytecode_pc` at 8, `module_id` at 12, `handles` at 16, and `handle_len` at
+/// 24, with explicit zeroed trailing padding. `size = 32`, `align = 8`.
+/// `handles` addresses exactly `handle_len` `Value`s.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ShadowFrame {
@@ -408,7 +408,8 @@ pub struct ShadowFrame {
     pub previous: *mut ShadowFrame,
     /// The current bytecode program counter.
     pub bytecode_pc: u32,
-    _pad0: [u8; 4],
+    /// The dense module id of the executing function.
+    pub module_id: u32,
     /// The register array; register `r[i]` is `handles[i]`.
     pub handles: *mut Value,
     /// The number of live registers, equal to `function.register_count`.
@@ -422,13 +423,14 @@ impl ShadowFrame {
     pub fn new(
         previous: *mut ShadowFrame,
         bytecode_pc: u32,
+        module_id: u32,
         handles: *mut Value,
         handle_len: u16,
     ) -> ShadowFrame {
         ShadowFrame {
             previous,
             bytecode_pc,
-            _pad0: [0; 4],
+            module_id,
             handles,
             handle_len,
             _pad1: [0; 6],
@@ -458,11 +460,12 @@ const _: () = {
     assert!(size_of::<CompletionTag>() == 4);
     assert!(align_of::<CompletionTag>() == 4);
 
-    // ShadowFrame: 32 bytes, 8-aligned, fields at 0/8/16/24 (Abi.lean).
+    // ShadowFrame: 32 bytes, 8-aligned, fields at 0/8/12/16/24 (Abi.lean).
     assert!(size_of::<ShadowFrame>() == 32);
     assert!(align_of::<ShadowFrame>() == 8);
     assert!(offset_of!(ShadowFrame, previous) == 0);
     assert!(offset_of!(ShadowFrame, bytecode_pc) == 8);
+    assert!(offset_of!(ShadowFrame, module_id) == 12);
     assert!(offset_of!(ShadowFrame, handles) == 16);
     assert!(offset_of!(ShadowFrame, handle_len) == 24);
 };
@@ -662,11 +665,11 @@ mod tests {
     #[test]
     fn shadow_frame_new_zeroes_padding_and_keeps_fields() {
         let mut register = Value::UNINITIALIZED;
-        let frame = ShadowFrame::new(core::ptr::null_mut(), 12, &mut register, 1);
+        let frame = ShadowFrame::new(core::ptr::null_mut(), 12, 7, &mut register, 1);
         assert!(frame.previous.is_null());
         assert_eq!(frame.bytecode_pc, 12);
+        assert_eq!(frame.module_id, 7);
         assert_eq!(frame.handle_len, 1);
-        assert_eq!(frame._pad0, [0; 4]);
         assert_eq!(frame._pad1, [0; 6]);
         assert!(core::ptr::eq(frame.handles, &raw mut register));
     }

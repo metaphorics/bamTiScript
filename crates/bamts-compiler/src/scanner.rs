@@ -761,11 +761,13 @@ impl<'a> Scanner<'a> {
         }
         self.bump();
         if let Some(code_point) = self.read_hex_code_point(esc_start) {
-            let valid = if is_start {
-                is_id_start(code_point)
-            } else {
-                is_id_continue(code_point)
-            };
+            let valid = char::try_from(code_point).ok().is_some_and(|character| {
+                if is_start {
+                    is_id_start(character)
+                } else {
+                    is_id_continue(character)
+                }
+            });
             if !valid {
                 self.error(
                     INVALID_UNICODE_ESCAPE,
@@ -860,7 +862,7 @@ impl<'a> Scanner<'a> {
 
     /// Reads a `\u`-style code point after the `u` has been consumed, handling
     /// both the fixed four-digit and braced forms and reporting malformations.
-    fn read_hex_code_point(&mut self, esc_start: usize) -> Option<char> {
+    fn read_hex_code_point(&mut self, esc_start: usize) -> Option<u32> {
         if self.first() == Some('{') {
             self.bump();
             let mut value: u32 = 0;
@@ -903,7 +905,7 @@ impl<'a> Scanner<'a> {
                 );
                 return None;
             }
-            char::from_u32(value)
+            Some(value)
         } else {
             let mut value: u32 = 0;
             let mut count = 0;
@@ -926,7 +928,7 @@ impl<'a> Scanner<'a> {
                 );
                 return None;
             }
-            char::from_u32(value)
+            Some(value)
         }
     }
 
@@ -1347,6 +1349,13 @@ mod tests {
         assert_eq!(product.eof().range().start().get(), len);
         assert_eq!(product.eof().range().end().get(), len);
         assert_eq!(product.eof().kind(), TokenKind::EndOfFile);
+    }
+
+    #[test]
+    fn scanner_accepts_lone_surrogate_escape() {
+        let recovered = scan_text("'\\uD800'");
+        assert!(recovered.diagnostics().is_empty());
+        assert_eq!(kinds("'\\uD800'"), vec![TokenKind::StringLiteral]);
     }
 
     #[test]

@@ -12,16 +12,20 @@
 
 use std::fmt;
 
+use bamts_compiler::lint::{LintLevel, rule_by_name};
+
 /// The operational mode for the CLI compiler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Mode {
     /// Type-check source files without emitting output artifacts.
     #[default]
     Check,
-    /// Compile TypeScript/JavaScript source files to output artifacts.
+    /// Compile source files to executable or artifact outputs.
     Compile,
-    /// Execute the program.
+    /// Execute the compiled program.
     Run,
+    /// Explain a registered lint rule.
+    Explain,
 }
 
 impl fmt::Display for Mode {
@@ -30,6 +34,7 @@ impl fmt::Display for Mode {
             Self::Check => write!(f, "check"),
             Self::Compile => write!(f, "compile"),
             Self::Run => write!(f, "run"),
+            Self::Explain => write!(f, "explain"),
         }
     }
 }
@@ -159,10 +164,39 @@ pub struct CliArgs {
     pub output: OutputOptions,
     /// Formatting style for diagnostic messages.
     pub diagnostics_format: DiagnosticsFormat,
+    /// Ordered command-line lint-level overrides.
+    pub lint_overrides: Vec<LintOverrideArg>,
+    /// Enables the strict lint profile before project configuration is applied.
+    pub strict: bool,
+    /// Enables the pedantic lint profile before project configuration is applied.
+    pub pedantic: bool,
+    /// The maximum number of diagnostics rendered by one command.
+    pub error_limit: usize,
+    /// Rule requested by the `explain` subcommand.
+    pub explain_rule: Option<String>,
     /// Print help information flag (`-h`, `--help`).
     pub help: bool,
     /// Print version information flag (`-V`, `--version`).
     pub version: bool,
+}
+
+/// One order-sensitive lint-level override from the command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LintOverrideArg {
+    /// The exact rule code, rule slug, or group name selected by the user.
+    pub selector: String,
+    /// The level assigned to the selector.
+    pub level: LintLevel,
+}
+
+impl LintOverrideArg {
+    #[must_use]
+    pub fn new(selector: impl Into<String>, level: LintLevel) -> Self {
+        Self {
+            selector: selector.into(),
+            level,
+        }
+    }
 }
 
 impl CliArgs {
@@ -179,6 +213,11 @@ impl CliArgs {
     /// Returns `true` if mode is [`Mode::Run`].
     pub fn is_run(&self) -> bool {
         self.mode == Mode::Run
+    }
+
+    /// Returns `true` if the `explain` subcommand was selected.
+    pub fn is_explain(&self) -> bool {
+        self.mode == Mode::Explain
     }
 }
 
@@ -216,6 +255,14 @@ pub enum ArgsError {
     MultipleEntrypoints { first: String, second: String },
     /// Unexpected positional argument.
     UnexpectedArgument { arg: String },
+    /// The explain subcommand was not given a rule name.
+    MissingExplainRule,
+    /// A lint's `forbid` level was lowered by a later setting.
+    ForbiddenLintOverride {
+        rule: String,
+        forbidden_by: String,
+        lowered_by: String,
+    },
 }
 
 impl fmt::Display for ArgsError {
@@ -271,6 +318,15 @@ impl fmt::Display for ArgsError {
                 )
             }
             Self::UnexpectedArgument { arg } => write!(f, "unexpected argument '{arg}'"),
+            Self::MissingExplainRule => write!(f, "missing rule name for explain subcommand"),
+            Self::ForbiddenLintOverride {
+                rule,
+                forbidden_by,
+                lowered_by,
+            } => write!(
+                f,
+                "rule '{rule}' was forbidden by '{forbidden_by}' and cannot be lowered by '{lowered_by}'"
+            ),
         }
     }
 }
@@ -288,6 +344,7 @@ SUBCOMMANDS:
     check       Type-check source files without emitting output artifacts
     compile     Compile TypeScript source files to output artifacts
     run         Execute TypeScript/JavaScript program
+    explain     Explain a lint rule and its sound alternative
 
 OPTIONS:
     -c, --compile               Select compile mode
@@ -314,6 +371,14 @@ OPTIONS:
         --json                  Alias for --diagnostics-format json
         --pretty                Alias for --diagnostics-format pretty
 
+    -A, --allow <RULE>          Set a rule or group to allow
+    -W, --warn <RULE>           Set a rule or group to warn
+    -D, --deny <RULE>           Set a rule or group to deny
+    -F, --forbid <RULE>         Set a rule or group to forbid
+        --strict                Enable strict lint profile
+        --pedantic              Enable pedantic lint profile
+        --error-limit <N>       Render at most N diagnostics (default: 50)
+
     -h, --help                  Print help information
     -V, --version               Print version information
 "#
@@ -322,6 +387,23 @@ OPTIONS:
 /// Returns version string formatted as `bamts <version>`.
 pub fn version_message() -> &'static str {
     concat!("bamts ", env!("CARGO_PKG_VERSION"))
+}
+
+/// Formats the compiler-owned explanation for a stable code or rule slug.
+pub fn explain_rule(name: &str) -> Result<String, ArgsError> {
+    let rule = rule_by_name(name).ok_or_else(|| ArgsError::InvalidOptionValue {
+        option: "explain".to_string(),
+        value: name.to_string(),
+        expected: "a stable BAMTS-W code or rule slug".to_string(),
+    })?;
+    Ok(format!(
+        "{} ({})\nrationale: {}\nsound alternative: {}\nsilence: {}\n",
+        rule.code(),
+        rule.slug(),
+        rule.rationale(),
+        rule.sound_alternative(),
+        rule.silence_flag(),
+    ))
 }
 
 /// Parse command-line arguments from environment [`std::env::args`].
@@ -368,9 +450,13 @@ where
     let mut js_compat = JsCompatOptions::default();
     let mut output = OutputOptions::default();
     let mut diagnostics_format = DiagnosticsFormat::default();
-
     let mut help = false;
     let mut version = false;
+    let mut lint_overrides = Vec::new();
+    let mut strict = false;
+    let mut pedantic = false;
+    let mut error_limit = 50;
+    let mut explain_rule = None;
 
     let mut idx = 0;
     while idx < args_slice.len() {
@@ -543,6 +629,44 @@ where
                 "--pretty" | "--pretty-diagnostics" => {
                     diagnostics_format = DiagnosticsFormat::Pretty;
                 }
+                "-A" | "--allow" => {
+                    lint_overrides.push(LintOverrideArg::new(
+                        get_val(flag, inline_val, &mut idx, args_slice)?,
+                        LintLevel::Allow,
+                    ));
+                }
+                "-W" | "--warn" => {
+                    lint_overrides.push(LintOverrideArg::new(
+                        get_val(flag, inline_val, &mut idx, args_slice)?,
+                        LintLevel::Warn,
+                    ));
+                }
+                "-D" | "--deny" => {
+                    lint_overrides.push(LintOverrideArg::new(
+                        get_val(flag, inline_val, &mut idx, args_slice)?,
+                        LintLevel::Deny,
+                    ));
+                }
+                "-F" | "--forbid" => {
+                    lint_overrides.push(LintOverrideArg::new(
+                        get_val(flag, inline_val, &mut idx, args_slice)?,
+                        LintLevel::Forbid,
+                    ));
+                }
+                "--strict" => strict = true,
+                "--pedantic" => pedantic = true,
+                "--error-limit" => {
+                    let value = get_val(flag, inline_val, &mut idx, args_slice)?;
+                    error_limit = value
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|limit| *limit > 0)
+                        .ok_or_else(|| ArgsError::InvalidOptionValue {
+                            option: "--error-limit".to_string(),
+                            value,
+                            expected: "a positive integer".to_string(),
+                        })?;
+                }
                 _ => {
                     return Err(ArgsError::UnknownOption {
                         option: arg.clone(),
@@ -555,8 +679,13 @@ where
                 "check" => set_mode(&mut mode, Mode::Check)?,
                 "compile" => set_mode(&mut mode, Mode::Compile)?,
                 "run" => set_mode(&mut mode, Mode::Run)?,
+                "explain" => set_mode(&mut mode, Mode::Explain)?,
                 _ => {
-                    if entrypoint.is_some() {
+                    if mode == Some(Mode::Explain) {
+                        if explain_rule.replace(arg.clone()).is_some() {
+                            return Err(ArgsError::UnexpectedArgument { arg: arg.clone() });
+                        }
+                    } else if entrypoint.is_some() {
                         extra_inputs.push(arg.clone());
                     } else {
                         entrypoint = Some(arg.clone());
@@ -576,10 +705,15 @@ where
         Mode::Check
     });
 
-    // Run mode requires exactly one entrypoint regardless of where `run`
-    // appears relative to positional inputs. Check after the effective mode is
-    // resolved so the constraint is order-independent.
-    if effective_mode == Mode::Run
+    if effective_mode == Mode::Explain && explain_rule.is_none() && !help && !version {
+        return Err(ArgsError::MissingExplainRule);
+    }
+
+    // Every program command resolves one canonical graph from exactly one entrypoint.
+    // Check after the effective mode is resolved so the constraint is order-independent.
+    if !help
+        && !version
+        && effective_mode != Mode::Explain
         && let Some(first) = &entrypoint
         && let Some(second) = extra_inputs.first()
     {
@@ -617,7 +751,7 @@ where
             }
         }
 
-        if entrypoint.is_none() {
+        if effective_mode != Mode::Explain && entrypoint.is_none() {
             return Err(ArgsError::MissingEntrypoint {
                 mode: effective_mode,
             });
@@ -633,6 +767,11 @@ where
         js_compat,
         output,
         diagnostics_format,
+        lint_overrides,
+        strict,
+        pedantic,
+        error_limit,
+        explain_rule,
         help,
         version,
     })
@@ -796,6 +935,9 @@ mod tests {
         let args = parse_args(["check", "-h"]).unwrap();
         assert!(args.help);
         assert_eq!(args.mode, Mode::Check);
+
+        let args = parse_args(["check", "a.ts", "b.ts", "--help"]).unwrap();
+        assert!(args.help);
 
         let args = parse_args(["-V"]).unwrap();
         assert!(args.version);
@@ -1068,26 +1210,66 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_check_multiple_inputs_preserved() {
-        // compile and check modes keep multiple-input semantics in any order.
-        let args = parse_args(["compile", "a.ts", "b.ts", "c.ts"]).unwrap();
-        assert_eq!(args.mode, Mode::Compile);
-        assert_eq!(args.entrypoint.as_deref(), Some("a.ts"));
-        assert_eq!(args.extra_inputs, vec!["b.ts", "c.ts"]);
+    fn test_program_modes_reject_multiple_entrypoints() {
+        for arguments in [
+            ["compile", "a.ts", "b.ts"],
+            ["a.ts", "b.ts", "compile"],
+            ["check", "a.ts", "b.ts"],
+            ["a.ts", "b.ts", "check"],
+        ] {
+            assert!(matches!(
+                parse_args(arguments),
+                Err(ArgsError::MultipleEntrypoints { first, second })
+                    if first == "a.ts" && second == "b.ts"
+            ));
+        }
+    }
 
-        let args = parse_args(["a.ts", "b.ts", "compile"]).unwrap();
-        assert_eq!(args.mode, Mode::Compile);
-        assert_eq!(args.entrypoint.as_deref(), Some("a.ts"));
-        assert_eq!(args.extra_inputs, vec!["b.ts"]);
+    #[test]
+    fn strictness_flags_preserve_selector_order() {
+        let args = parse_args([
+            "check",
+            "-W",
+            "escape-hatches",
+            "-A",
+            "BAMTS-W017",
+            "-D",
+            "explicit-any",
+            "--strict",
+            "--pedantic",
+            "--error-limit=7",
+            "main.ts",
+        ])
+        .expect("strictness flags parse");
+        assert_eq!(
+            args.lint_overrides,
+            vec![
+                LintOverrideArg::new("escape-hatches", LintLevel::Warn),
+                LintOverrideArg::new("BAMTS-W017", LintLevel::Allow),
+                LintOverrideArg::new("explicit-any", LintLevel::Deny),
+            ]
+        );
+        assert!(args.strict);
+        assert!(args.pedantic);
+        assert_eq!(args.error_limit, 7);
+    }
 
-        let args = parse_args(["check", "a.ts", "b.ts"]).unwrap();
-        assert_eq!(args.mode, Mode::Check);
-        assert_eq!(args.entrypoint.as_deref(), Some("a.ts"));
-        assert_eq!(args.extra_inputs, vec!["b.ts"]);
+    #[test]
+    fn explain_accepts_code_and_uses_catalog_metadata() {
+        let args = parse_args(["explain", "BAMTS-W017"]).expect("explain parses");
+        assert!(args.is_explain());
+        assert_eq!(args.explain_rule.as_deref(), Some("BAMTS-W017"));
+        let explanation = explain_rule(args.explain_rule.as_deref().unwrap()).expect("known rule");
+        assert!(explanation.contains("rationale:"));
+        assert!(explanation.contains("sound alternative:"));
+        assert!(explanation.contains("silence: -A explicit-any"));
+    }
 
-        let args = parse_args(["a.ts", "b.ts", "check"]).unwrap();
-        assert_eq!(args.mode, Mode::Check);
-        assert_eq!(args.entrypoint.as_deref(), Some("a.ts"));
-        assert_eq!(args.extra_inputs, vec!["b.ts"]);
+    #[test]
+    fn error_limit_rejects_zero() {
+        assert!(matches!(
+            parse_args(["check", "--error-limit", "0", "main.ts"]),
+            Err(ArgsError::InvalidOptionValue { option, .. }) if option == "--error-limit"
+        ));
     }
 }

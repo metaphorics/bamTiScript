@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
 use super::{
@@ -10,16 +11,18 @@ use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey};
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
-    globals: &mut BTreeMap<String, Value>,
+    globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
-    let registry = super::super::ordinary_prototype(heap, builtins.object_prototype());
-    let iterator = private_name(heap, "Symbol.iterator");
-    let async_iterator = private_name(heap, "Symbol.asyncIterator");
-    let has_instance = private_name(heap, "Symbol.hasInstance");
-    let to_string_tag = private_name(heap, "Symbol.toStringTag");
+    let iterator = symbol(heap, "Symbol.iterator");
+    let async_iterator = symbol(heap, "Symbol.asyncIterator");
+    let has_instance = symbol(heap, "Symbol.hasInstance");
+    let to_string_tag = symbol(heap, "Symbol.toStringTag");
+    let dispose = symbol(heap, "Symbol.dispose");
     builtins.set_symbol_iterator(iterator);
+    builtins.set_symbol_to_string_tag(to_string_tag);
+    builtins.set_symbol_prototype(prototype);
 
     let constructor = install_function(heap, builtins, "Symbol", 0, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
@@ -30,6 +33,7 @@ pub(super) fn install<H: Host>(
         ("asyncIterator", async_iterator),
         ("hasInstance", has_instance),
         ("toStringTag", to_string_tag),
+        ("dispose", dispose),
     ] {
         define_readonly_property(heap, constructor, name, value);
     }
@@ -44,7 +48,7 @@ pub(super) fn install<H: Host>(
         unreachable!()
     };
     properties.insert(
-        PropertyKey::Named("description".to_owned()),
+        PropertyKey::Named(EcmaString::from_utf8("description")),
         Property::Accessor {
             getter: Some(description),
             setter: None,
@@ -53,32 +57,34 @@ pub(super) fn install<H: Host>(
         },
     );
     properties.insert(
-        PropertyKey::Private(heap_index(to_string_tag) as u32),
+        PropertyKey::Symbol(heap_index(to_string_tag) as u32),
         builtin_property(symbol_tag),
     );
 
-    globals.insert("Symbol".to_owned(), constructor);
-    globals.insert("\0Symbol.registry".to_owned(), registry);
+    globals.insert(EcmaString::from_utf8("Symbol"), constructor);
 }
 
-fn private_name(heap: &mut Vec<HeapEntry>, description: &str) -> Value {
+fn symbol(heap: &mut Vec<HeapEntry>, description: &str) -> Value {
     super::super::push(
         heap,
-        HeapEntry::PrivateName {
-            description: description.to_owned(),
+        HeapEntry::Symbol {
+            description: EcmaString::from_utf8(description),
         },
     )
 }
 
 fn allocate_literal_string(heap: &mut Vec<HeapEntry>, text: &str) -> Value {
-    super::super::push(heap, HeapEntry::String(text.to_owned()))
+    super::super::push(heap, HeapEntry::String(EcmaString::from_utf8(text)))
 }
 
 fn define_native_property(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) {
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[heap_index(object)] else {
         unreachable!()
     };
-    properties.insert(PropertyKey::Named(name.to_owned()), builtin_property(value));
+    properties.insert(
+        PropertyKey::Named(EcmaString::from_utf8(name)),
+        builtin_property(value),
+    );
 }
 
 fn define_readonly_property(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) {
@@ -86,7 +92,7 @@ fn define_readonly_property(heap: &mut [HeapEntry], object: Value, name: &str, v
         unreachable!()
     };
     properties.insert(
-        PropertyKey::Named(name.to_owned()),
+        PropertyKey::Named(EcmaString::from_utf8(name)),
         Property::Data {
             value,
             writable: false,
@@ -113,7 +119,7 @@ fn constructor<H: Host>(
         .transpose()?
         .unwrap_or_default();
     let symbol = machine
-        .allocate(HeapEntry::PrivateName { description })
+        .allocate(HeapEntry::Symbol { description })
         .map_err(EvalFailure::Runtime)?;
     Ok(BuiltinOutcome::Value(symbol))
 }
@@ -125,33 +131,31 @@ fn symbol_for<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let key = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-    let registry = machine
-        .intrinsics
-        .global("\0Symbol.registry")
-        .expect("symbol registry installed");
-    let existing = machine.get_named_property(registry, &key)?;
-    if existing != Value::UNDEFINED {
+    if let Some(existing) = machine.intrinsics.symbol_registry.get(&key).copied() {
         return Ok(BuiltinOutcome::Value(existing));
     }
     let symbol = machine
-        .allocate(HeapEntry::PrivateName {
+        .allocate(HeapEntry::Symbol {
             description: key.clone(),
         })
         .map_err(EvalFailure::Runtime)?;
-    machine.set_data_property(registry, &key, symbol)?;
+    machine
+        .charge_heap(PropertyKey::Named(key.clone()).charge_bytes())
+        .map_err(EvalFailure::Runtime)?;
+    machine.intrinsics.symbol_registry.insert(key, symbol);
     Ok(BuiltinOutcome::Value(symbol))
 }
 
-fn private_description<H: Host>(
+fn symbol_description<H: Host>(
     machine: &Machine<'_, H>,
     value: Value,
-) -> Result<String, EvalFailure> {
+) -> Result<EcmaString, EvalFailure> {
     let Some(Decoded::HeapRef(id)) = value.decode() else {
         return Err(type_error("Symbol method called on incompatible receiver"));
     };
     let index = id.slot() as usize - 1;
     match machine.heap.get(index) {
-        Some(HeapEntry::PrivateName { description }) => Ok(description.clone()),
+        Some(HeapEntry::Symbol { description }) => Ok(description.clone()),
         _ => Err(type_error("Symbol method called on incompatible receiver")),
     }
 }
@@ -162,9 +166,10 @@ fn description<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
+    let description = symbol_description(machine, this)?;
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
-        private_description(machine, this)?,
+        description,
     )?))
 }
 
@@ -174,8 +179,18 @@ fn to_string<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let text = format!("Symbol({})", private_description(machine, this)?);
-    Ok(BuiltinOutcome::Value(allocate_string(machine, text)?))
+    let description = symbol_description(machine, this)?;
+    let mut builder =
+        bamts_bytecode::EcmaStringBuilder::with_capacity(description.len_units().saturating_add(8));
+    builder.push_utf8("Symbol(");
+    for &unit in description.as_units() {
+        builder.push_unit(unit);
+    }
+    builder.push_unit(u16::from(b')'));
+    Ok(BuiltinOutcome::Value(allocate_string(
+        machine,
+        builder.finish(),
+    )?))
 }
 
 fn value_of<H: Host>(
@@ -184,6 +199,120 @@ fn value_of<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    private_description(machine, this)?;
+    symbol_description(machine, this)?;
     Ok(BuiltinOutcome::Value(this))
+}
+
+#[cfg(test)]
+mod tests {
+    use bamts_bytecode::{
+        Constant, ConstantId, Function, FunctionFlags, FunctionId, Instruction, Module, ModuleId,
+        Program, ProgramModule, Verified,
+    };
+
+    use super::*;
+    use crate::Limits;
+
+    #[derive(Default)]
+    struct TestHost;
+
+    impl Host for TestHost {}
+
+    fn module() -> Program<Verified> {
+        let code = Module::new(
+            vec![Constant::String(EcmaString::from_utf8("<test>"))],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                1,
+                FunctionFlags::default(),
+                vec![Instruction::Halt],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("valid test module");
+        Program::link(
+            vec![ProgramModule {
+                name: ConstantId::new(0),
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect("valid test program")
+    }
+
+    #[test]
+    fn symbol_dispose_is_installed_on_constructor() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let symbol = machine
+            .intrinsics
+            .global("Symbol")
+            .expect("Symbol is installed");
+        let dispose = machine
+            .get_named_property(symbol, "dispose")
+            .expect("Symbol.dispose is installed");
+        let description = symbol_description(&machine, dispose).expect("dispose is a symbol");
+        assert!(
+            description.eq_ascii("Symbol.dispose"),
+            "Symbol.dispose description must be 'Symbol.dispose'"
+        );
+    }
+
+    #[test]
+    fn symbol_dispose_descriptor_is_readonly_non_enumerable_non_configurable() {
+        let module = module();
+        let mut host = TestHost;
+        let machine = Machine::new(&module, &mut host, Limits::default());
+        let symbol = machine
+            .intrinsics
+            .global("Symbol")
+            .expect("Symbol is installed");
+        let key = PropertyKey::Named(EcmaString::from_utf8("dispose"));
+        let descriptor = machine
+            .own_descriptor(symbol, &key)
+            .expect("descriptor lookup succeeds")
+            .expect("Symbol.dispose is defined");
+        match descriptor {
+            Property::Data {
+                writable,
+                enumerable,
+                configurable,
+                ..
+            } => {
+                assert!(!writable, "Symbol.dispose must be non-writable");
+                assert!(!enumerable, "Symbol.dispose must be non-enumerable");
+                assert!(!configurable, "Symbol.dispose must be non-configurable");
+            }
+            Property::Accessor { .. } => panic!("Symbol.dispose must be a data property"),
+        }
+    }
+
+    #[test]
+    fn symbol_dispose_identity_is_stable_across_reads() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let symbol = machine
+            .intrinsics
+            .global("Symbol")
+            .expect("Symbol is installed");
+        let first = machine
+            .get_named_property(symbol, "dispose")
+            .expect("Symbol.dispose is readable");
+        let second = machine
+            .get_named_property(symbol, "dispose")
+            .expect("Symbol.dispose is readable on second read");
+        assert_eq!(
+            first, second,
+            "Symbol.dispose identity must be stable across reads"
+        );
+    }
 }

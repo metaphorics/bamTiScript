@@ -26,14 +26,24 @@ fn main() {
     let rustc = env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
     match select_node_rlib(&rustc, &target, &dependencies, &wrapper, &out_dir) {
         Some(node_rlib) => {
-            assemble_staticlib(&rustc, &target, &dependencies, &node_rlib, &archive, &wrapper);
+            assemble_staticlib(
+                &rustc,
+                &target,
+                &dependencies,
+                &node_rlib,
+                &archive,
+                &wrapper,
+            );
         }
         None => write_check_placeholder(&dependencies, &archive),
     }
 
     cargo_line("rerun-if-changed=../bamts-node/src");
     cargo_line("rerun-if-changed=../bamts-node/Cargo.toml");
-    cargo_line(&format!("rustc-env=BAMTS_NODE_STATICLIB={}", archive.display()));
+    cargo_line(&format!(
+        "rustc-env=BAMTS_NODE_STATICLIB={}",
+        archive.display()
+    ));
     cargo_line(&format!("rustc-env=BAMTS_HOST_TARGET={host}"));
     cargo_line(&format!("rustc-env=BAMTS_BUILD_TARGET={target}"));
 }
@@ -53,11 +63,19 @@ fn select_node_rlib(
     if candidates.is_empty() {
         return None;
     }
-    let compatible = candidates
+    let mut compatible = candidates
         .iter()
-        .filter(|candidate| metadata_supports_aot_main(rustc, target, dependencies, candidate, wrapper, out_dir))
+        .filter(|candidate| {
+            metadata_supports_aot_main(rustc, target, dependencies, candidate, wrapper, out_dir)
+        })
         .cloned()
         .collect::<Vec<_>>();
+    compatible.sort_by(|left, right| {
+        let modified = |path: &PathBuf| fs::metadata(path).and_then(|value| value.modified()).ok();
+        modified(right)
+            .cmp(&modified(left))
+            .then_with(|| left.cmp(right))
+    });
     Some(compatible.first().cloned().unwrap_or_else(|| {
         panic!(
             "no bamts-node rlib in `{}` has the metadata required for the aot-main entrypoint; candidates: {}",
@@ -99,7 +117,9 @@ fn metadata_supports_aot_main(
         .arg(&probe)
         .arg(wrapper)
         .output()
-        .unwrap_or_else(|error| panic!("could not start `{}`: {error}", Path::new(rustc).display()));
+        .unwrap_or_else(|error| {
+            panic!("could not start `{}`: {error}", Path::new(rustc).display())
+        });
     let _ = fs::remove_file(probe);
     output.status.success()
 }

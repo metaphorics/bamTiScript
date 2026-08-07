@@ -1,10 +1,9 @@
 //! Shared, backend-neutral Cranelift lowering for verified BamTS bytecode.
 //!
-//! This crate turns a [`bamts_bytecode::Module<Verified>`] into Cranelift IR
-//! through one lowering function, [`lower_module`]. It produces a stable
-//! [`LoweredModule`] record (one [`ir::Function`] per bytecode function plus
-//! its ABI signature, resume-dispatch tokens, and required runtime helpers)
-//! that later feature-gated backends consume:
+//! This crate turns a canonical [`bamts_bytecode::Program<Verified>`] into
+//! Cranelift IR through [`lower_program`]. It retains one [`LoweredModule`] per
+//! program module, with module-local pools and module-qualified native symbols,
+//! for both feature-gated backends:
 //!
 //! * a `host-jit` backend that finalizes each `ir::Function` into executable
 //!   memory, and
@@ -26,8 +25,9 @@
 //! ```
 //!
 //! * `frame` points at the register frame; `frame.handles` (offset 16) is the
-//!   `*mut Value` register array and `frame.bytecode_pc` (offset 8) carries the
-//!   resume token (see [`Suspend`](#suspend-and-the-resume-helper)).
+//!   `*mut Value` register array. `frame.bytecode_pc` (offset 8) records the
+//!   active instruction and carries the resume token after
+//!   [`Suspend`](#suspend-and-the-resume-helper).
 //! * `out` receives the completion value; the returned `u32` is a
 //!   `bamts_native::CompletionTag` discriminant (`Normal`/`Throw`/`Suspend`/
 //!   `FatalTrap`).
@@ -94,6 +94,7 @@
 //! | `Binary`            | [`Helper::Binary`] with the operator selector              |
 //! | `CreateObject`      | [`Helper::CreateObject`] → `dst`                            |
 //! | `CreateArray`       | [`Helper::CreateArray`] → `dst`                             |
+//! | `CreateCell`        | [`Helper::CreateCell`] → `dst`                             |
 //! | `CreateClosure`     | [`Helper::CreateClosure`] (`function`, `captures` array)→dst|
 //! | `GetProperty`       | [`Helper::GetProperty`] (`object`, register `key`) → `dst`  |
 //! | `SetProperty`       | [`Helper::SetProperty`] (`object`, register `key`, `value`) |
@@ -176,8 +177,8 @@ use std::error::Error;
 use std::fmt;
 
 use bamts_bytecode::{
-    AccessorKind, BinaryOp, ExceptionHandler, FunctionId, Instruction, IteratorKind, Module, Pc,
-    Register, UnaryOp, Verified,
+    AccessorKind, BinaryOp, ExceptionHandler, FunctionId, Instruction, IteratorKind, Module,
+    ModuleId, Pc, Program, Register, UnaryOp, Verified,
 };
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
@@ -193,6 +194,8 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
 /// Byte offset of `ShadowFrame.bytecode_pc` (a `u32`).
 const SHADOW_FRAME_PC_OFFSET: i32 = 8;
+/// Byte offset of `ShadowFrame.module_id` (a `u32`).
+const SHADOW_FRAME_MODULE_OFFSET: i32 = 12;
 /// Byte offset of `ShadowFrame.handles` (a `*mut Value`).
 const SHADOW_FRAME_HANDLES_OFFSET: i32 = 16;
 /// Byte offset of `Completion.value` within the out-parameter.
@@ -231,6 +234,9 @@ pub const HELPER_NAMESPACE: u32 = 1;
 const _: () = {
     use core::mem::offset_of;
     assert!(offset_of!(bamts_native::ShadowFrame, bytecode_pc) == SHADOW_FRAME_PC_OFFSET as usize);
+    assert!(
+        offset_of!(bamts_native::ShadowFrame, module_id) == SHADOW_FRAME_MODULE_OFFSET as usize
+    );
     assert!(offset_of!(bamts_native::ShadowFrame, handles) == SHADOW_FRAME_HANDLES_OFFSET as usize);
     assert!(core::mem::size_of::<bamts_native::Completion>() == VALUE_BYTES as usize);
     assert!(bamts_native::Value::UNDEFINED.to_bits() == UNDEFINED_BITS as u64);
@@ -284,6 +290,8 @@ const _: () = {
 /// | 27  | `GetIterator`       | `src: i64, kind: i32`                        |
 /// | 28  | `IteratorNext`      | `iterator: i64, done_reg: i32, value_reg: i32` (two-write) |
 /// | 29  | `Export`            | `name: i32, src: i64`                        |
+/// | 30  | `ConsumeFuel`       | `amount: i32` (total except `FatalTrap`)     |
+/// | 31 | `CreateCell`        | —                                            |
 ///
 /// Every helper except [`Helper::Truthy`] returns a
 /// `bamts_native::CompletionTag`. [`Helper::Truthy`] returns `0`/`1`.
@@ -302,6 +310,8 @@ pub enum Helper {
     CreateObject,
     /// `bamts_create_array(frame, out)`: fresh empty array into `out.value`.
     CreateArray,
+    /// `bamts_create_cell(frame, out)`: fresh compiler-private TDZ cell.
+    CreateCell,
     /// `bamts_create_closure(frame, function_id, captures, out)`: materialize a
     /// closure over the named function, binding the captured cells held in the
     /// `captures` array value, into `out.value`. The runtime reads the callee's
@@ -381,6 +391,10 @@ pub enum Helper {
     /// `bamts_export(frame, name, src, out)`: export the local value `src` under
     /// the string constant `name`.
     Export,
+    /// `bamts_consume_fuel(frame, amount, out)`: reserve `amount` bytecode
+    /// instructions from the shared machine budget. Returns `FatalTrap` on
+    /// exhaustion and never routes through a bytecode exception handler.
+    ConsumeFuel,
 }
 
 impl Helper {
@@ -418,6 +432,8 @@ impl Helper {
             Helper::GetIterator => "bamts_get_iterator",
             Helper::IteratorNext => "bamts_iterator_next",
             Helper::Export => "bamts_export",
+            Helper::ConsumeFuel => "bamts_consume_fuel",
+            Helper::CreateCell => "bamts_create_cell",
         }
     }
 
@@ -456,6 +472,8 @@ impl Helper {
             Helper::GetIterator => 27,
             Helper::IteratorNext => 28,
             Helper::Export => 29,
+            Helper::ConsumeFuel => 30,
+            Helper::CreateCell => 31,
         }
     }
 
@@ -494,6 +512,8 @@ impl Helper {
             27 => Some(Helper::GetIterator),
             28 => Some(Helper::IteratorNext),
             29 => Some(Helper::Export),
+            30 => Some(Helper::ConsumeFuel),
+            31 => Some(Helper::CreateCell),
             _ => None,
         }
     }
@@ -512,6 +532,7 @@ impl Helper {
             // (frame, out)
             Helper::CreateObject
             | Helper::CreateArray
+            | Helper::CreateCell
             | Helper::ResumeValue
             | Helper::LoadThis
             | Helper::LoadArguments
@@ -520,7 +541,8 @@ impl Helper {
             Helper::Import
             | Helper::LoadGlobal
             | Helper::TypeOfGlobal
-            | Helper::CreatePrivateName => &[types::I64, types::I32, types::I64],
+            | Helper::CreatePrivateName
+            | Helper::ConsumeFuel => &[types::I64, types::I32, types::I64],
             // (frame, function_id, captures, out)
             Helper::CreateClosure => &[types::I64, types::I32, types::I64, types::I64],
             // (frame, object, key, out)
@@ -707,6 +729,32 @@ impl fmt::Display for LowerError {
 
 impl Error for LowerError {}
 
+/// A deterministic lowering failure anchored to its canonical program module.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgramLowerError {
+    /// The module whose bytecode could not be lowered.
+    pub module: ModuleId,
+    /// The module-local lowering failure.
+    pub kind: LowerError,
+}
+
+impl fmt::Display for ProgramLowerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "module {} could not be lowered: {}",
+            self.module.get(),
+            self.kind
+        )
+    }
+}
+
+impl Error for ProgramLowerError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.kind)
+    }
+}
+
 // -- Lowered records ---------------------------------------------------------
 
 /// One lowered function: its Cranelift IR plus the metadata a backend needs to
@@ -744,10 +792,12 @@ impl fmt::Debug for LoweredFunction {
     }
 }
 
-/// The complete lowering of a verified module.
+/// The complete lowering of one verified module within a program.
 #[derive(Clone)]
 pub struct LoweredModule {
-    /// One lowered function per bytecode function, in index order.
+    /// The canonical program-local module id.
+    pub id: ModuleId,
+    /// One lowered function per bytecode function, in module-local index order.
     pub functions: Vec<LoweredFunction>,
     /// The module entry function.
     pub entry: FunctionId,
@@ -758,6 +808,7 @@ pub struct LoweredModule {
 impl fmt::Debug for LoweredModule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LoweredModule")
+            .field("id", &self.id)
             .field("functions", &self.functions)
             .field("entry", &self.entry)
             .field("call_conv", &self.call_conv)
@@ -765,28 +816,60 @@ impl fmt::Debug for LoweredModule {
     }
 }
 
-/// The linker symbol for the lowered function at `index`.
+/// The shared lowering of one canonical verified program.
+#[derive(Clone, Debug)]
+pub struct LoweredProgram {
+    /// One lowering per program module, in canonical module-id order.
+    pub modules: Vec<LoweredModule>,
+    /// The program entry module.
+    pub entry_module: ModuleId,
+    /// The entry function local to `entry_module`.
+    pub entry_function: FunctionId,
+}
+
+/// The collision-free linker symbol for a module-qualified lowered function.
 #[must_use]
-pub fn function_symbol(index: u32) -> String {
-    format!("bamts_fn_{index}")
+pub fn function_symbol(module_id: u32, function_id: u32) -> String {
+    format!("bamts_m{module_id}_fn_{function_id}")
 }
 
 // -- Lowering entry point ----------------------------------------------------
 
-/// Lowers every function of a verified module to Cranelift IR.
+/// Lowers every function of every module in a verified canonical program.
 ///
-/// `config` is supplied by the backend from its ISA (`isa.frontend_config()`);
-/// it fixes the calling convention and pointer type. The target must be 64-bit.
-/// Each produced function is validated (signature and register-slot bounds) and
-/// then run through Cranelift's IR verifier before return, so a successful
-/// result is structurally valid IR.
-///
-/// # Errors
-///
-/// Returns [`LowerError`] for a non-64-bit target, an unaddressable function
-/// count, an unaddressable register file, a signature mismatch, or an internal
-/// IR-verification failure.
-pub fn lower_module(
+/// Modules remain separate: function and constant ids are never flattened or
+/// renumbered. Each error carries the module id whose lowering failed.
+pub fn lower_program(
+    program: &Program<Verified>,
+    config: TargetFrontendConfig,
+) -> Result<LoweredProgram, ProgramLowerError> {
+    let mut modules = Vec::with_capacity(program.modules().len());
+    for (index, module) in program.modules().iter().enumerate() {
+        let module_id = ModuleId::new(index as u32);
+        modules.push(
+            lower_code_module(module_id, module.code(), config).map_err(|kind| {
+                ProgramLowerError {
+                    module: module_id,
+                    kind,
+                }
+            })?,
+        );
+    }
+    let entry_module = program.entry();
+    let entry_function = program
+        .module(entry_module)
+        .expect("verified program entry module exists")
+        .code()
+        .entry();
+    Ok(LoweredProgram {
+        modules,
+        entry_module,
+        entry_function,
+    })
+}
+
+fn lower_code_module(
+    module_id: ModuleId,
     module: &Module<Verified>,
     config: TargetFrontendConfig,
 ) -> Result<LoweredModule, LowerError> {
@@ -812,6 +895,7 @@ pub fn lower_module(
         // Bounds checked above.
         let id = FunctionId::new(index as u32);
         let lowered = lower_function(
+            module_id,
             id,
             function,
             &entry_signature,
@@ -823,6 +907,7 @@ pub fn lower_module(
     }
 
     Ok(LoweredModule {
+        id: module_id,
         functions,
         entry: module.entry(),
         call_conv,
@@ -858,6 +943,7 @@ fn validate_slots(id: FunctionId, function: &bamts_bytecode::Function) -> Result
 }
 
 fn lower_function(
+    module_id: ModuleId,
     id: FunctionId,
     function: &bamts_bytecode::Function,
     entry_signature: &Signature,
@@ -896,7 +982,7 @@ fn lower_function(
 
     Ok(LoweredFunction {
         id,
-        symbol: function_symbol(id.get()),
+        symbol: function_symbol(module_id.get(), id.get()),
         signature: entry_signature.clone(),
         clif,
         entry_points,
@@ -1027,6 +1113,16 @@ impl<'a> Lowering<'a> {
     fn emit_instruction(&mut self, pc: usize, instruction: Instruction) {
         let block = self.pc_blocks[pc].expect("reachable pc has a block");
         self.builder.switch_to_block(block);
+        let current_pc = self.iconst32(i64::from(pc as u32));
+        self.builder.ins().store(
+            MemFlagsData::trusted(),
+            current_pc,
+            self.frame,
+            SHADOW_FRAME_PC_OFFSET,
+        );
+        if is_inline_instruction(instruction) {
+            self.emit_consume_fuel();
+        }
         match instruction {
             Instruction::LoadConst { dst, constant } => {
                 let const_id = self.iconst32(i64::from(constant.get()));
@@ -1071,6 +1167,10 @@ impl<'a> Lowering<'a> {
             }
             Instruction::CreateArray { dst } => {
                 let tag = self.call_helper(Helper::CreateArray, &[self.frame, self.out]);
+                self.route_completion(pc, tag, Some(dst));
+            }
+            Instruction::CreateCell { dst } => {
+                let tag = self.call_helper(Helper::CreateCell, &[self.frame, self.out]);
                 self.route_completion(pc, tag, Some(dst));
             }
             Instruction::CreateClosure {
@@ -1449,6 +1549,13 @@ impl<'a> Lowering<'a> {
     fn emit_resume_prologue(&mut self, pc: usize, dst: Register, resume: Pc) {
         let block = self.resume_blocks[&pc];
         self.builder.switch_to_block(block);
+        let current_pc = self.iconst32(i64::from(pc as u32));
+        self.builder.ins().store(
+            MemFlagsData::trusted(),
+            current_pc,
+            self.frame,
+            SHADOW_FRAME_PC_OFFSET,
+        );
         let tag = self.call_helper(Helper::ResumeValue, &[self.frame, self.out]);
 
         let normal = self.builder.create_block();
@@ -1568,6 +1675,19 @@ impl<'a> Lowering<'a> {
         self.helper_refs.insert(helper, func_ref);
         func_ref
     }
+
+    fn emit_consume_fuel(&mut self) {
+        let amount = self.iconst32(1);
+        let tag = self.call_helper(Helper::ConsumeFuel, &[self.frame, amount, self.out]);
+        let normal = self.builder.create_block();
+        let abnormal = self.builder.create_block();
+        self.builder.ins().brif(tag, abnormal, &[], normal, &[]);
+
+        self.builder.switch_to_block(abnormal);
+        self.builder.ins().return_(&[tag]);
+
+        self.builder.switch_to_block(normal);
+    }
 }
 
 /// The byte offset of a register slot within the handles array. [`validate_slots`]
@@ -1622,6 +1742,7 @@ fn routes_to_handler(instruction: Instruction) -> bool {
         | Instruction::Binary { .. }
         | Instruction::CreateObject { .. }
         | Instruction::CreateArray { .. }
+        | Instruction::CreateCell { .. }
         | Instruction::CreateClosure { .. }
         | Instruction::GetProperty { .. }
         | Instruction::SetProperty { .. }
@@ -1653,6 +1774,51 @@ fn routes_to_handler(instruction: Instruction) -> bool {
         | Instruction::JumpIfFalse { .. }
         | Instruction::Return { .. }
         | Instruction::Halt => false,
+    }
+}
+
+/// Whether the opcode is emitted directly by the compiler/reference driver and
+/// therefore requires an explicit pre-effect fuel charge. This exhaustive match
+/// keeps the one-charge ledger synchronized with the bytecode algebra.
+fn is_inline_instruction(instruction: Instruction) -> bool {
+    match instruction {
+        Instruction::Move { .. }
+        | Instruction::Jump { .. }
+        | Instruction::JumpIfTrue { .. }
+        | Instruction::JumpIfFalse { .. }
+        | Instruction::Return { .. }
+        | Instruction::Halt
+        | Instruction::Throw { .. }
+        | Instruction::Suspend { .. } => true,
+        Instruction::LoadConst { .. }
+        | Instruction::Unary { .. }
+        | Instruction::Binary { .. }
+        | Instruction::CreateObject { .. }
+        | Instruction::CreateArray { .. }
+        | Instruction::CreateCell { .. }
+        | Instruction::CreateClosure { .. }
+        | Instruction::GetProperty { .. }
+        | Instruction::SetProperty { .. }
+        | Instruction::DeleteProperty { .. }
+        | Instruction::DefineAccessor { .. }
+        | Instruction::Call { .. }
+        | Instruction::Construct { .. }
+        | Instruction::LoadGlobal { .. }
+        | Instruction::StoreGlobal { .. }
+        | Instruction::TypeOfGlobal { .. }
+        | Instruction::LoadThis { .. }
+        | Instruction::LoadArguments { .. }
+        | Instruction::LoadNewTarget { .. }
+        | Instruction::ArrayPush { .. }
+        | Instruction::ArrayExtend { .. }
+        | Instruction::ObjectSpread { .. }
+        | Instruction::SetPrototype { .. }
+        | Instruction::CreatePrivateName { .. }
+        | Instruction::CreateRegExp { .. }
+        | Instruction::GetIterator { .. }
+        | Instruction::IteratorNext { .. }
+        | Instruction::Import { .. }
+        | Instruction::Export { .. } => false,
     }
 }
 
@@ -1720,6 +1886,7 @@ impl NormalSuccessors for Instruction {
             | Instruction::Binary { .. }
             | Instruction::CreateObject { .. }
             | Instruction::CreateArray { .. }
+            | Instruction::CreateCell { .. }
             | Instruction::CreateClosure { .. }
             | Instruction::GetProperty { .. }
             | Instruction::SetProperty { .. }
@@ -1751,8 +1918,8 @@ impl NormalSuccessors for Instruction {
 mod tests {
     use super::*;
     use bamts_bytecode::{
-        Constant, ConstantId, Function as BytecodeFunction, FunctionFlags, Instruction, Pc,
-        Register,
+        Constant, ConstantId, EcmaString, Function as BytecodeFunction, FunctionFlags, Instruction,
+        Pc, Register,
     };
     use cranelift_codegen::isa;
 
@@ -1827,7 +1994,7 @@ mod tests {
             Vec::new(),
         );
         let module = single(function);
-        let lowered = lower_module(&module, host_config()).expect("lowers");
+        let lowered = lower_code_module(ModuleId::new(0), &module, host_config()).expect("lowers");
         assert_eq!(lowered.functions[0].capture_count, 2);
     }
 
@@ -1841,13 +2008,13 @@ mod tests {
     }
 
     fn clif_of(module: &Module<Verified>) -> String {
-        let lowered = lower_module(module, host_config()).expect("lowers");
+        let lowered = lower_code_module(ModuleId::new(0), module, host_config()).expect("lowers");
         lowered.functions[0].clif.display().to_string()
     }
 
     /// Lower a module and return the single function's helpers and CLIF text.
     fn lower_one(module: &Module<Verified>) -> (Vec<Helper>, String) {
-        let lowered = lower_module(module, host_config()).expect("lowers");
+        let lowered = lower_code_module(ModuleId::new(0), module, host_config()).expect("lowers");
         let function = &lowered.functions[0];
         (
             function.helpers.clone(),
@@ -1858,7 +2025,7 @@ mod tests {
     #[test]
     fn entry_signature_is_the_native_abi() {
         let module = single(func(1, vec![Instruction::Halt], Vec::new()));
-        let lowered = lower_module(&module, host_config()).expect("lowers");
+        let lowered = lower_code_module(ModuleId::new(0), &module, host_config()).expect("lowers");
         let function = &lowered.functions[0];
         let signature = &function.signature;
         assert_eq!(signature.params.len(), 2);
@@ -1866,7 +2033,7 @@ mod tests {
         assert_eq!(signature.params[1].value_type, types::I64);
         assert_eq!(signature.returns.len(), 1);
         assert_eq!(signature.returns[0].value_type, types::I32);
-        assert_eq!(function.symbol, "bamts_fn_0");
+        assert_eq!(function.symbol, "bamts_m0_fn_0");
         assert_eq!(function.id.get(), 0);
         assert_eq!(lowered.entry.get(), 0);
     }
@@ -1885,15 +2052,15 @@ mod tests {
             "undefined store missing:\n{clif}"
         );
         assert!(clif.contains("return"), "must return:\n{clif}");
-        let lowered = lower_module(&module, host_config()).expect("lowers");
-        assert!(lowered.functions[0].helpers.is_empty());
+        let lowered = lower_code_module(ModuleId::new(0), &module, host_config()).expect("lowers");
+        assert_eq!(lowered.functions[0].helpers, vec![Helper::ConsumeFuel]);
         assert_eq!(lowered.functions[0].entry_points, vec![0]);
     }
 
     #[test]
     fn helper_index_table_is_a_stable_bijection() {
         // Every helper round-trips through its external index, and the table
-        // covers a dense 0..=29 range with unique symbols.
+        // covers a dense 0..=31 range with unique symbols.
         let helpers = [
             Helper::LoadConstant,
             Helper::Unary,
@@ -1925,6 +2092,8 @@ mod tests {
             Helper::GetIterator,
             Helper::IteratorNext,
             Helper::Export,
+            Helper::ConsumeFuel,
+            Helper::CreateCell,
         ];
         let mut symbols = BTreeSet::new();
         for (expected_index, helper) in helpers.iter().copied().enumerate() {
@@ -1937,8 +2106,8 @@ mod tests {
             );
             assert!(symbols.insert(helper.symbol()), "unique symbol {helper:?}");
         }
-        assert_eq!(symbols.len(), 30);
-        assert_eq!(Helper::from_external_index(30), None);
+        assert_eq!(symbols.len(), 32);
+        assert_eq!(Helper::from_external_index(32), None);
     }
 
     #[test]
@@ -1949,7 +2118,7 @@ mod tests {
             Vec::new(),
         ));
         let (helpers, clif) = lower_one(&module);
-        assert_eq!(helpers, vec![Helper::LoadConstant]);
+        assert_eq!(helpers, vec![Helper::LoadConstant, Helper::ConsumeFuel]);
         assert_eq!(Helper::LoadConstant.symbol(), "bamts_load_constant");
         assert_eq!(Helper::LoadConstant.external_index(), 0);
         assert_eq!(Helper::from_external_index(0), Some(Helper::LoadConstant));
@@ -2027,8 +2196,44 @@ mod tests {
         ];
         let module = single(func(2, code, Vec::new()));
         let (helpers, _) = lower_one(&module);
-        // Move introduces no helper of its own.
-        assert_eq!(helpers, vec![Helper::LoadConstant]);
+        // Move introduces only its explicit instruction-budget helper.
+        assert_eq!(helpers, vec![Helper::LoadConstant, Helper::ConsumeFuel]);
+    }
+
+    #[test]
+    fn reachable_inline_pcs_each_emit_one_fuel_charge() {
+        let code = vec![
+            load_undef(reg(0)),
+            Instruction::Move {
+                dst: reg(1),
+                src: reg(0),
+            },
+            Instruction::Jump { target: Pc::new(4) },
+            Instruction::Binary {
+                dst: reg(0),
+                op: BinaryOp::Add,
+                left: reg(0),
+                right: reg(0),
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(2, code, Vec::new()));
+        let (helpers, clif) = lower_one(&module);
+        assert_eq!(helpers, vec![Helper::LoadConstant, Helper::ConsumeFuel]);
+
+        let declaration = clif
+            .lines()
+            .find(|line| line.contains("u1:30"))
+            .expect("consume-fuel import");
+        let function_ref = declaration
+            .split_whitespace()
+            .next()
+            .expect("helper function reference");
+        assert_eq!(
+            clif.matches(&format!("call {function_ref}")).count(),
+            3,
+            "Move, Jump, and Halt each charge once; LoadConst and unreachable Binary do not:\n{clif}"
+        );
     }
 
     #[test]
@@ -2076,16 +2281,20 @@ mod tests {
         let module = single(func(1, code, Vec::new()));
         let (helpers, clif) = lower_one(&module);
         assert!(helpers.contains(&Helper::Truthy));
-        // The conditional's `brif` is the last branch emitted (the LoadConst
-        // completion routing precedes it). Its operands render truthy (then)
-        // first, falsy (else) second. Blocks are numbered in ascending
-        // reachable-pc order, so for JumpIfFalse the truthy edge must target the
-        // earlier fallthrough (pc2) block and the falsy edge the later jump
-        // target (pc3) block: truthy block number < falsy block number. A swap
-        // to JumpIfTrue polarity would reverse this.
-        let brif = clif
+        let truthy_declaration = clif
             .lines()
-            .rfind(|line| line.contains("brif"))
+            .find(|line| line.contains("u1:12"))
+            .expect("truthy import");
+        let truthy_ref = truthy_declaration
+            .split_whitespace()
+            .next()
+            .expect("truthy function reference");
+        let mut lines = clif.lines();
+        lines
+            .find(|line| line.contains(&format!("call {truthy_ref}")))
+            .expect("truthy call");
+        let brif = lines
+            .find(|line| line.contains("brif"))
             .expect("conditional branch missing");
         let edges: Vec<u32> = brif
             .split(|c: char| !c.is_ascii_alphanumeric())
@@ -2312,7 +2521,7 @@ mod tests {
             Instruction::Halt,
         ];
         let module = verified(
-            vec![Constant::String("g".to_string())],
+            vec![Constant::String(EcmaString::from_utf8("g"))],
             vec![func(2, code, Vec::new())],
         );
         let (helpers, clif) = lower_one(&module);
@@ -2383,11 +2592,11 @@ mod tests {
             catch_register: reg(0),
         }];
         let module = verified(
-            vec![Constant::String("g".to_string())],
+            vec![Constant::String(EcmaString::from_utf8("g"))],
             vec![func(1, code, handlers)],
         );
         // Must lower without panicking on a missing handler block.
-        let lowered = lower_module(&module, host_config()).expect("lowers");
+        let lowered = lower_code_module(ModuleId::new(0), &module, host_config()).expect("lowers");
         assert!(lowered.functions[0].helpers.contains(&Helper::TypeOfGlobal));
     }
 
@@ -2449,8 +2658,8 @@ mod tests {
         ];
         let module = verified(
             vec![
-                Constant::String("p".to_string()),
-                Constant::String("g".to_string()),
+                Constant::String(EcmaString::from_utf8("p")),
+                Constant::String(EcmaString::from_utf8("g")),
             ],
             vec![func(4, code, Vec::new())],
         );
@@ -2575,7 +2784,7 @@ mod tests {
             Instruction::Halt,
         ];
         let module = verified(
-            vec![Constant::String("x".to_string())],
+            vec![Constant::String(EcmaString::from_utf8("x"))],
             vec![func(1, code, Vec::new())],
         );
         let (helpers, clif) = lower_one(&module);
@@ -2601,7 +2810,7 @@ mod tests {
             Instruction::Halt,
         ];
         let module = single(func(1, code, Vec::new()));
-        let lowered = lower_module(&module, host_config()).expect("lowers");
+        let lowered = lower_code_module(ModuleId::new(0), &module, host_config()).expect("lowers");
         let function = &lowered.functions[0];
         // Fresh token 0 plus the suspend at pc 1 -> token 2.
         assert_eq!(function.entry_points, vec![0, 2]);
@@ -2675,8 +2884,8 @@ mod tests {
         }];
         let module = single(func(1, code, handlers));
         let (helpers, clif) = lower_one(&module);
-        // A locally-caught throw needs no helper and jumps to the handler.
-        assert_eq!(helpers, vec![Helper::LoadConstant]);
+        // A locally-caught throw needs only its fuel helper and jumps to the handler.
+        assert_eq!(helpers, vec![Helper::LoadConstant, Helper::ConsumeFuel]);
         assert!(clif.contains("jump"), "handler jump missing:\n{clif}");
         assert!(
             clif.contains("store"),
@@ -2689,7 +2898,7 @@ mod tests {
         let code = vec![load_undef(reg(0)), Instruction::Return { value: reg(0) }];
         let module = single(func(1, code, Vec::new()));
         let (helpers, clif) = lower_one(&module);
-        assert_eq!(helpers, vec![Helper::LoadConstant]);
+        assert_eq!(helpers, vec![Helper::LoadConstant, Helper::ConsumeFuel]);
         assert!(
             clif.contains("store"),
             "return value store missing:\n{clif}"
@@ -2727,7 +2936,7 @@ mod tests {
             Instruction::Halt,
         ];
         let module = verified(
-            vec![Constant::String("mod".to_string())],
+            vec![Constant::String(EcmaString::from_utf8("mod"))],
             vec![func(3, code, Vec::new())],
         );
         let (helpers, _) = lower_one(&module);
@@ -2770,7 +2979,11 @@ mod tests {
         ];
         let module = single(func(1, code, Vec::new()));
         let (helpers, _) = lower_one(&module);
-        assert!(helpers.is_empty(), "unreachable Binary lowered a helper");
+        assert_eq!(
+            helpers,
+            vec![Helper::ConsumeFuel],
+            "unreachable Binary must not lower its helper"
+        );
     }
 
     #[test]
@@ -2780,10 +2993,10 @@ mod tests {
             func(0, vec![Instruction::Halt], Vec::new()),
         ];
         let module = verified(Vec::new(), functions);
-        let lowered = lower_module(&module, host_config()).expect("lowers");
+        let lowered = lower_code_module(ModuleId::new(0), &module, host_config()).expect("lowers");
         assert_eq!(lowered.functions.len(), 2);
-        assert_eq!(lowered.functions[0].symbol, "bamts_fn_0");
-        assert_eq!(lowered.functions[1].symbol, "bamts_fn_1");
+        assert_eq!(lowered.functions[0].symbol, "bamts_m0_fn_0");
+        assert_eq!(lowered.functions[1].symbol, "bamts_m0_fn_1");
         let name0 = lowered.functions[0].clif.display().to_string();
         assert!(name0.contains("u0:0"), "function 0 name wrong:\n{name0}");
         let name1 = lowered.functions[1].clif.display().to_string();
@@ -2833,7 +3046,8 @@ mod tests {
             page_size_align_log2: 12,
         };
         let module = single(func(0, vec![Instruction::Halt], Vec::new()));
-        let error = lower_module(&module, config).expect_err("32-bit rejected");
+        let error =
+            lower_code_module(ModuleId::new(0), &module, config).expect_err("32-bit rejected");
         assert!(matches!(
             error,
             LowerError::UnsupportedPointerWidth { bits: 32 }
@@ -2876,13 +3090,45 @@ mod tests {
             Vec::new(),
         )];
         let module = Module::new(
-            vec![Constant::String("main".to_string())],
+            vec![Constant::String(EcmaString::from_utf8("main"))],
             functions,
             FunctionId::new(0),
         )
         .verify()
         .expect("verifies");
-        let lowered = lower_module(&module, host_config()).expect("lowers");
-        assert_eq!(lowered.functions[0].symbol, "bamts_fn_0");
+        let lowered = lower_code_module(ModuleId::new(0), &module, host_config()).expect("lowers");
+        assert_eq!(lowered.functions[0].symbol, "bamts_m0_fn_0");
+    }
+    #[test]
+    fn program_lowering_retains_module_local_ids_and_entry_tuple() {
+        let make_module = |name: &str| bamts_bytecode::ProgramModule {
+            name: ConstantId::new(0),
+            code: Module::new(
+                vec![Constant::String(EcmaString::from_utf8(name))],
+                vec![func(0, vec![Instruction::Halt], Vec::new())],
+                FunctionId::new(0),
+            )
+            .verify()
+            .expect("module verifies"),
+            edges: Vec::new(),
+            bindings: Vec::new(),
+            exports: Vec::new(),
+        };
+        let program = Program::link(
+            vec![make_module("dependency"), make_module("entry")],
+            ModuleId::new(1),
+        )
+        .expect("program verifies");
+
+        let lowered = lower_program(&program, host_config()).expect("program lowers");
+        assert_eq!(lowered.modules.len(), 2);
+        assert_eq!(lowered.modules[0].id, ModuleId::new(0));
+        assert_eq!(lowered.modules[1].id, ModuleId::new(1));
+        assert_eq!(lowered.modules[0].functions[0].id, FunctionId::new(0));
+        assert_eq!(lowered.modules[1].functions[0].id, FunctionId::new(0));
+        assert_eq!(lowered.modules[0].functions[0].symbol, "bamts_m0_fn_0");
+        assert_eq!(lowered.modules[1].functions[0].symbol, "bamts_m1_fn_0");
+        assert_eq!(lowered.entry_module, ModuleId::new(1));
+        assert_eq!(lowered.entry_function, FunctionId::new(0));
     }
 }

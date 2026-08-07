@@ -1,4 +1,4 @@
-use std::{fmt, sync::Arc};
+use std::{fmt, path::Path, sync::Arc};
 
 /// Identifies one source file within a compilation.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -22,6 +22,31 @@ impl SourceId {
 impl From<u32> for SourceId {
     fn from(value: u32) -> Self {
         Self::new(value)
+    }
+}
+/// The canonical identity of one source in a resolved program.
+///
+/// The path is filesystem-canonical and the numeric id is assigned once by the
+/// compiler's program loader; consumers must not substitute mtimes or allocations.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SourceIdentity {
+    source_id: SourceId,
+    path: Arc<Path>,
+}
+
+impl SourceIdentity {
+    pub(crate) fn new(source_id: SourceId, path: Arc<Path>) -> Self {
+        Self { source_id, path }
+    }
+
+    #[must_use]
+    pub const fn source_id(&self) -> SourceId {
+        self.source_id
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 }
 

@@ -18,8 +18,6 @@ use bamts_verification::{
     workspace_guard::audit_workspace,
 };
 
-const FORMAL_AUDIT_ORDER: [Gate; 6] = [Gate::G1, Gate::G2, Gate::G3, Gate::G4, Gate::G5, Gate::G6];
-
 enum Command {
     LedgerVerify,
     FormalAudit(Vec<Gate>),
@@ -190,15 +188,17 @@ fn parse_formal_gates(value: &str) -> Result<Vec<Gate>> {
         gates.push(gate);
     }
 
-    if gates.len() > FORMAL_AUDIT_ORDER.len()
+    let dependency_order = Gate::FORMAL_ORDER;
+    if gates.len() > dependency_order.len()
         || gates
             .iter()
-            .zip(FORMAL_AUDIT_ORDER)
+            .zip(dependency_order)
             .any(|(actual, expected)| *actual != expected)
     {
+        let expected = dependency_order.map(gate_name).join(",");
         return Err(VerificationError::new(
             ErrorCode::GateDependency,
-            "formal audit gates must be a dependency-respecting prefix of G1,G2,G3,G4,G5,G6",
+            format!("formal audit gates must be a dependency-respecting prefix of {expected}"),
         ));
     }
 
@@ -380,4 +380,20 @@ fn gate_name(gate: Gate) -> &'static str {
 
 fn usage(detail: impl Into<String>) -> VerificationError {
     VerificationError::new(ErrorCode::Usage, detail)
+}
+
+#[cfg(test)]
+mod tests {
+    use bamts_verification::Gate;
+
+    use super::parse_formal_gates;
+
+    #[test]
+    fn formal_gate_parser_uses_authoritative_dependency_order() {
+        assert_eq!(
+            parse_formal_gates("G1,G2,G5,G3").unwrap(),
+            Gate::FORMAL_ORDER[..4]
+        );
+        assert!(parse_formal_gates("G1,G2,G3").is_err());
+    }
 }

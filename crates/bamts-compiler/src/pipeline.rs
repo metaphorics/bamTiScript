@@ -14,7 +14,9 @@ use std::sync::Arc;
 use crate::checker::{self, SemanticModel};
 use crate::diagnostic::Diagnostic;
 use crate::emitter::{self, EmitOptions, EmitOutput};
+use crate::lint::{LintProfile, LintTable};
 use crate::parser;
+use crate::program::ResolvedProgram;
 use crate::scanner;
 use crate::source::{ScriptKind, SourceId, SourceText};
 use crate::syntax::SourceFile;
@@ -127,7 +129,77 @@ impl FrontendOutput {
     }
 }
 
-/// Runs the fixed scan -> parse -> check -> optional emit frontend pipeline.
+/// Frontend products for every module of one canonical resolved program.
+pub struct ProgramFrontendOutput {
+    entrypoint: SourceId,
+    modules: Vec<FrontendOutput>,
+}
+
+impl ProgramFrontendOutput {
+    #[must_use]
+    pub const fn entrypoint_id(&self) -> SourceId {
+        self.entrypoint
+    }
+
+    /// Products in the same dependency-first order as the resolved program.
+    #[must_use]
+    pub fn modules(&self) -> &[FrontendOutput] {
+        &self.modules
+    }
+
+    #[must_use]
+    pub fn module(&self, source_id: SourceId) -> Option<&FrontendOutput> {
+        self.modules
+            .iter()
+            .find(|output| output.source_file().source_id() == source_id)
+    }
+}
+
+/// Runs the frontend for every module while preserving the graph's canonical identities.
+#[must_use]
+pub fn compile_program_frontend(
+    program: &ResolvedProgram,
+    mode: FrontendMode,
+) -> ProgramFrontendOutput {
+    compile_program_frontend_with_lints(program, mode, &LintTable::new(LintProfile::Default))
+}
+
+/// Runs the frontend for every module with caller-resolved lint levels.
+#[must_use]
+pub fn compile_program_frontend_with_lints(
+    program: &ResolvedProgram,
+    mode: FrontendMode,
+    levels: &LintTable,
+) -> ProgramFrontendOutput {
+    let modules = program
+        .modules()
+        .iter()
+        .map(|module| {
+            compile_frontend_with_lints(
+                FrontendRequest {
+                    source_id: module.source_id(),
+                    script_kind: module.script_kind(),
+                    source: Arc::clone(module.source()),
+                    mode,
+                },
+                levels,
+            )
+        })
+        .collect();
+    ProgramFrontendOutput {
+        entrypoint: program.entrypoint_id(),
+        modules,
+    }
+}
+
+/// Runs the fixed frontend pipeline with settled default lint levels.
+#[must_use]
+pub fn compile_frontend(request: FrontendRequest) -> FrontendOutput {
+    compile_frontend_with_lints(request, &LintTable::new(LintProfile::Default))
+}
+
+/// Runs the fixed scan -> parse -> check -> optional emit frontend pipeline
+/// using the caller's resolved lint table.
 ///
 /// Every stage runs regardless of the diagnostics its predecessor produced, so
 /// the returned [`FrontendOutput`] always carries a recovered `SourceFile` and
@@ -135,7 +207,7 @@ impl FrontendOutput {
 /// stages reported errors. All stage diagnostics are merged, canonically
 /// ordered, and de-duplicated into one vector.
 #[must_use]
-pub fn compile_frontend(request: FrontendRequest) -> FrontendOutput {
+pub fn compile_frontend_with_lints(request: FrontendRequest, levels: &LintTable) -> FrontendOutput {
     let FrontendRequest {
         source_id,
         script_kind,
@@ -145,7 +217,7 @@ pub fn compile_frontend(request: FrontendRequest) -> FrontendOutput {
 
     let scanned = scanner::scan(source_id, script_kind, source);
     let parsed = parser::parse(scanned);
-    let checked = checker::check(&parsed);
+    let checked = checker::check_with_lints(&parsed, levels);
 
     // Emit runs against the recovered tree; it never gates on prior diagnostics.
     let emit = mode

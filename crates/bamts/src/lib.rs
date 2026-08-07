@@ -10,14 +10,19 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use bamts_compiler::diagnostic::{Diagnostic, DiagnosticSeverity};
-use bamts_compiler::source::{ScriptKind, SourceId, SourceText};
+use bamts_compiler::lower::LowerOptions;
+use bamts_compiler::pipeline::{FrontendMode, compile_program_frontend};
+use bamts_compiler::program::{ProgramLoadError, ProgramLoader, ProgramLowerError, lower_program};
+use bamts_compiler::project::{ConfigError, ProjectConfig, ProjectRoot};
 
 pub use bamts_bytecode as bytecode;
 pub use bamts_compiler as compiler;
+#[cfg(feature = "node-host")]
 pub use bamts_node as node;
+#[cfg(feature = "node-host")]
+pub use bamts_node::ScriptCompiler;
 pub use bamts_runtime as runtime;
 
 /// Native-code backends, available only when either native-code feature is enabled.
@@ -36,21 +41,20 @@ pub struct ProgramOutput {
 /// A failure at the facade boundary.
 #[derive(Debug)]
 pub enum Error {
-    /// The source file could not be read.
-    ReadSource {
+    /// The project configuration could not be read.
+    ReadConfig {
         path: PathBuf,
         source: std::io::Error,
     },
-    /// The source file extension does not select a supported syntax.
-    UnsupportedSourceExtension { path: PathBuf },
-    /// Parsing produced one or more error diagnostics.
-    Diagnostics {
-        path: PathBuf,
-        diagnostics: Vec<Diagnostic>,
-    },
-    /// The parsed source cannot be represented in verified BamTS bytecode.
-    Lower(bamts_compiler::lower::LowerError),
-    /// The verified bytecode did not execute successfully.
+    /// The project configuration is invalid.
+    ProjectConfig { path: PathBuf, source: ConfigError },
+    /// The entrypoint or one of its dependencies could not be loaded.
+    ProgramLoad(ProgramLoadError),
+    /// The complete program frontend produced one or more error diagnostics.
+    Diagnostics { diagnostics: Vec<Diagnostic> },
+    /// The checked program cannot be represented in verified BamTS bytecode.
+    Lower(ProgramLowerError),
+    /// The verified program did not execute successfully.
     Runtime(bamts_runtime::RuntimeError),
     /// Native object emission failed.
     #[cfg(feature = "aot")]
@@ -60,25 +64,23 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ReadSource { path, source } => {
-                write!(
-                    formatter,
-                    "could not read source file `{}`: {source}",
-                    path.display()
-                )
-            }
-            Self::UnsupportedSourceExtension { path } => write!(
+            Self::ReadConfig { path, source } => write!(
                 formatter,
-                "source file `{}` has an unsupported extension",
+                "could not read project configuration `{}`: {source}",
                 path.display()
             ),
-            Self::Diagnostics { path, diagnostics } => write!(
+            Self::ProjectConfig { path, source } => write!(
                 formatter,
-                "source file `{}` has {} error diagnostic(s)",
-                path.display(),
+                "invalid project configuration `{}`: {source}",
+                path.display()
+            ),
+            Self::ProgramLoad(error) => write!(formatter, "could not load program: {error}"),
+            Self::Diagnostics { diagnostics } => write!(
+                formatter,
+                "program has {} error diagnostic(s)",
                 diagnostics.len()
             ),
-            Self::Lower(error) => write!(formatter, "could not compile source: {error}"),
+            Self::Lower(error) => write!(formatter, "could not compile program: {error}"),
             Self::Runtime(error) => write!(formatter, "program execution failed: {error}"),
             #[cfg(feature = "aot")]
             Self::Aot(error) => write!(formatter, "could not emit native object: {error}"),
@@ -89,8 +91,10 @@ impl fmt::Display for Error {
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
-            Self::ReadSource { source, .. } => Some(source),
-            Self::UnsupportedSourceExtension { .. } | Self::Diagnostics { .. } => None,
+            Self::ReadConfig { source, .. } => Some(source),
+            Self::ProjectConfig { source, .. } => Some(source),
+            Self::ProgramLoad(error) => Some(error),
+            Self::Diagnostics { .. } => None,
             Self::Lower(error) => Some(error),
             Self::Runtime(error) => Some(error),
             #[cfg(feature = "aot")]
@@ -99,8 +103,14 @@ impl StdError for Error {
     }
 }
 
-impl From<bamts_compiler::lower::LowerError> for Error {
-    fn from(error: bamts_compiler::lower::LowerError) -> Self {
+impl From<ProgramLoadError> for Error {
+    fn from(error: ProgramLoadError) -> Self {
+        Self::ProgramLoad(error)
+    }
+}
+
+impl From<ProgramLowerError> for Error {
+    fn from(error: ProgramLowerError) -> Self {
         Self::Lower(error)
     }
 }
@@ -114,60 +124,89 @@ impl From<bamts_runtime::RuntimeError> for Error {
 /// Result type returned by facade convenience entry points.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Compiles one source file into verified BamTS bytecode.
+/// Compiles an entrypoint and its complete local module graph into one executable program.
 ///
 /// ```
 /// # fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-/// let path = std::env::temp_dir().join(format!(
-///     "bamts-facade-compile-{}.ts",
+/// let directory = std::env::temp_dir().join(format!(
+///     "bamts-facade-compile-{}",
 ///     std::process::id(),
 /// ));
+/// std::fs::create_dir_all(&directory)?;
+/// let path = directory.join("main.ts");
 /// std::fs::write(&path, "let answer = 42;")?;
-/// let bytecode = bamts::compile_source_file(&path)?;
-/// std::fs::remove_file(path)?;
-/// assert_eq!(bytecode.functions().len(), 1);
+/// let executable = bamts::compile_source_file(&path)?;
+/// std::fs::remove_dir_all(directory)?;
+/// assert_eq!(executable.wire().modules().len(), 1);
 /// # Ok(())
 /// # }
 /// ```
 pub fn compile_source_file(
     path: impl AsRef<Path>,
-) -> Result<bamts_bytecode::Module<bamts_bytecode::Verified>> {
-    let path = path.as_ref();
-    let source = fs::read_to_string(path).map_err(|source| Error::ReadSource {
-        path: path.to_owned(),
-        source,
+) -> Result<bamts_compiler::program::ExecutableProgram> {
+    let path = canonical_entrypoint(path.as_ref())?;
+    let config_path = path
+        .ancestors()
+        .skip(1)
+        .map(|directory| directory.join("tsconfig.json"))
+        .find(|candidate| candidate.is_file());
+    let root_path = config_path
+        .as_deref()
+        .and_then(Path::parent)
+        .or_else(|| path.parent())
+        .ok_or_else(|| {
+            Error::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "entrypoint has no parent directory",
+            )))
+        })?;
+    let root_path = fs::canonicalize(root_path)
+        .map_err(|error| Error::ProgramLoad(ProgramLoadError::InvalidRoot(error)))?;
+    let root = ProjectRoot::new(&root_path).map_err(|error| {
+        Error::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            error,
+        )))
     })?;
-    let script_kind = script_kind(path)?;
-    let scanned = bamts_compiler::scanner::scan(
-        SourceId::new(0),
-        script_kind,
-        Arc::new(SourceText::new(source)),
-    );
-    let parsed = bamts_compiler::parser::parse(scanned);
-    let diagnostics = parsed.diagnostics();
-    if diagnostics
+    let config_path = config_path.unwrap_or_else(|| root_path.join("tsconfig.json"));
+    let config_source = if config_path.is_file() {
+        fs::read_to_string(&config_path).map_err(|source| Error::ReadConfig {
+            path: config_path.clone(),
+            source,
+        })?
+    } else {
+        "{}".to_owned()
+    };
+    let config = ProjectConfig::parse(&root, &config_path, &config_source).map_err(|source| {
+        Error::ProjectConfig {
+            path: config_path,
+            source,
+        }
+    })?;
+    let resolved = ProgramLoader::new(&root, config.options())?.load(&path)?;
+    let frontend = compile_program_frontend(&resolved, FrontendMode::Check);
+    let diagnostics = frontend
+        .modules()
         .iter()
-        .any(|diagnostic| diagnostic.severity() == DiagnosticSeverity::Error)
-    {
-        return Err(Error::Diagnostics {
-            path: path.to_owned(),
-            diagnostics: diagnostics.to_vec(),
-        });
+        .flat_map(|module| module.diagnostics().iter())
+        .filter(|diagnostic| diagnostic.severity() == DiagnosticSeverity::Error)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !diagnostics.is_empty() {
+        return Err(Error::Diagnostics { diagnostics });
     }
-
-    bamts_compiler::lower::lower(
-        parsed.product(),
-        bamts_compiler::lower::LowerOptions {
-            javascript_compatibility: matches!(
-                script_kind,
-                ScriptKind::JavaScript | ScriptKind::JavaScriptReact
-            ),
+    lower_program(
+        &resolved,
+        &frontend,
+        LowerOptions {
+            javascript_compatibility: true,
         },
     )
     .map_err(Error::from)
 }
 
-/// Runs one source file with the deterministic Node-compatible host.
+/// Runs an entrypoint and its complete local module graph with the deterministic
+/// Node-compatible host.
 ///
 /// ```
 /// # fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -183,10 +222,16 @@ pub fn compile_source_file(
 /// # Ok(())
 /// # }
 /// ```
+#[cfg(feature = "node-host")]
 pub fn run_program(path: impl AsRef<Path>) -> Result<ProgramOutput> {
-    let bytecode = compile_source_file(path)?;
+    let executable = compile_source_file(path)?;
     let mut host = bamts_node::NodeHost::new();
-    bamts_runtime::run(&bytecode, &mut host, &bamts_runtime::Limits::default())?;
+    host.set_script_compiler(Box::new(ScriptCompiler));
+    bamts_runtime::run(
+        executable.wire(),
+        &mut host,
+        &bamts_runtime::Limits::default(),
+    )?;
 
     Ok(ProgramOutput {
         stdout: host.stdout().to_vec(),
@@ -194,7 +239,8 @@ pub fn run_program(path: impl AsRef<Path>) -> Result<ProgramOutput> {
     })
 }
 
-/// Compiles one source file into a relocatable native object for `target`.
+/// Compiles an entrypoint and its complete local module graph into a relocatable
+/// native object.
 ///
 /// This entry point requires the `aot` feature because object emission is not
 /// part of the default interpreter-only dependency closure.
@@ -217,8 +263,8 @@ pub fn compile_native_object(
     path: impl AsRef<Path>,
     target: &str,
 ) -> Result<bamts_codegen::AotObject> {
-    let bytecode = compile_source_file(path)?;
-    bamts_codegen::compile_aot(&bytecode, target).map_err(Error::Aot)
+    let executable = compile_source_file(path)?;
+    bamts_codegen::compile_aot(executable.wire(), target).map_err(Error::Aot)
 }
 
 #[cfg(feature = "aot")]
@@ -228,61 +274,605 @@ impl From<bamts_codegen::AotError> for Error {
     }
 }
 
-fn script_kind(path: &Path) -> Result<ScriptKind> {
-    let extension = path.extension().and_then(|extension| extension.to_str());
-    match extension {
-        Some("js" | "mjs" | "cjs") => Ok(ScriptKind::JavaScript),
-        Some("jsx") => Ok(ScriptKind::JavaScriptReact),
-        Some("ts" | "mts" | "cts") => Ok(ScriptKind::TypeScript),
-        Some("tsx") => Ok(ScriptKind::TypeScriptReact),
-        _ => Err(Error::UnsupportedSourceExtension {
-            path: path.to_owned(),
-        }),
-    }
+fn canonical_entrypoint(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()
+            .map(|directory| directory.join(path))
+            .map_err(|error| Error::ProgramLoad(ProgramLoadError::InvalidRoot(error)))?
+    };
+    fs::canonicalize(&absolute).map_err(|source| {
+        Error::ProgramLoad(ProgramLoadError::Read {
+            path: absolute,
+            source,
+        })
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{compile_source_file, run_program};
+    use super::compile_source_file;
+    #[cfg(feature = "node-host")]
+    use super::run_program;
     use std::error::Error;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
-    fn fixture_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("bamts-facade-{name}-{}.ts", std::process::id()))
+    fn fixture(name: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+        let directory =
+            std::env::temp_dir().join(format!("bamts-facade-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(
+            directory.join("dependency.ts"),
+            "export let value = 1; value = 2;",
+        )?;
+        let entrypoint = directory.join("main.ts");
+        std::fs::write(
+            &entrypoint,
+            "import { value } from './dependency.js'; console.log(value);",
+        )?;
+        Ok((directory, entrypoint))
     }
 
-    #[test]
-    fn compiles_source_to_verified_bytecode() -> Result<(), Box<dyn Error>> {
-        let path = fixture_path("compile");
-        std::fs::write(&path, "let answer = 42;")?;
-        let bytecode = compile_source_file(&path)?;
-        std::fs::remove_file(path)?;
-
-        assert_eq!(bytecode.functions().len(), 1);
+    fn remove_fixture(directory: &Path) -> Result<(), Box<dyn Error>> {
+        std::fs::remove_dir_all(directory)?;
         Ok(())
     }
 
-    #[test]
-    fn runs_program_and_returns_host_output() -> Result<(), Box<dyn Error>> {
-        let path = fixture_path("run");
-        std::fs::write(&path, "console.log(42);")?;
-        let output = run_program(&path)?;
-        std::fs::remove_file(path)?;
+    #[cfg(feature = "node-host")]
+    fn script_fixture(name: &str, source: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+        let directory =
+            std::env::temp_dir().join(format!("bamts-facade-script-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory)?;
+        let entrypoint = directory.join("main.ts");
+        std::fs::write(&entrypoint, source)?;
+        Ok((directory, entrypoint))
+    }
 
-        assert_eq!(output.stdout, b"42\n");
+    #[cfg(feature = "node-host")]
+    fn run_microtask_checkpoint(
+        name: &str,
+        source: &str,
+    ) -> Result<(Vec<u8>, bamts_runtime::MicrotaskDrain), Box<dyn Error>> {
+        let (directory, entrypoint) = script_fixture(name, source)?;
+        let executable = compile_source_file(&entrypoint)?;
+        let mut host = bamts_node::NodeHost::new();
+        host.set_script_compiler(Box::new(super::ScriptCompiler));
+        let mut machine = bamts_runtime::Machine::new(
+            executable.wire(),
+            &mut host,
+            bamts_runtime::Limits::default(),
+        );
+        machine.evaluate()?;
+        let drain = machine.drain_microtasks()?;
+        drop(machine);
+        let stdout = host.stdout().to_vec();
+        remove_fixture(&directory)?;
+        Ok((stdout, drain))
+    }
+
+    #[cfg(feature = "node-host")]
+    struct TimerCheckpoint {
+        stdout: Vec<u8>,
+        waited: bool,
+        timer: bamts_runtime::TimerRun,
+        before_timer: bamts_runtime::MicrotaskDrain,
+        after_timer: bamts_runtime::MicrotaskDrain,
+    }
+
+    #[cfg(feature = "node-host")]
+    fn run_timer_checkpoint(name: &str, source: &str) -> Result<TimerCheckpoint, Box<dyn Error>> {
+        let (directory, entrypoint) = script_fixture(name, source)?;
+        let executable = compile_source_file(&entrypoint)?;
+        let mut host = bamts_node::NodeHost::new();
+        host.set_script_compiler(Box::new(super::ScriptCompiler));
+        let mut machine = bamts_runtime::Machine::new(
+            executable.wire(),
+            &mut host,
+            bamts_runtime::Limits::default(),
+        );
+        machine.evaluate()?;
+        let before_timer = machine.drain_microtasks()?;
+        let waited = machine.wait_for_timer_expiry()?;
+        let timer = machine.run_one_expired_timer()?;
+        let after_timer = machine.drain_microtasks()?;
+        drop(machine);
+        let stdout = host.stdout().to_vec();
+        remove_fixture(&directory)?;
+        Ok(TimerCheckpoint {
+            stdout,
+            waited,
+            timer,
+            before_timer,
+            after_timer,
+        })
+    }
+
+    #[test]
+    fn compiles_complete_program_with_module_local_function_ids() -> Result<(), Box<dyn Error>> {
+        let (directory, entrypoint) = fixture("compile")?;
+        let executable = compile_source_file(&entrypoint)?;
+
+        assert_eq!(executable.wire().modules().len(), 2);
+        assert!(
+            executable
+                .wire()
+                .modules()
+                .iter()
+                .all(|module| module.code().entry().get() == 0)
+        );
+        remove_fixture(&directory)
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn runs_two_module_program_with_live_imported_mutation() -> Result<(), Box<dyn Error>> {
+        let (directory, entrypoint) = fixture("run")?;
+        let output = run_program(&entrypoint)?;
+
+        assert_eq!(output.stdout, b"2\n");
         assert_eq!(output.exit_code, 0);
+        remove_fixture(&directory)
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn object_reflection_cannot_transfer_private_fields() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            class Secret {
+                #value = {
+                    value: 7,
+                    enumerable: true,
+                    configurable: true,
+                    writable: true,
+                };
+
+                probe(target: object) {
+                    try {
+                        return target.#value;
+                    } catch {
+                        return "missing";
+                    }
+                }
+            }
+
+            const source = new Secret();
+            const target = {};
+            const before = source.probe(target);
+            Object.defineProperties(target, source);
+            const after = source.probe(target);
+            process.stdout.write(String(before === after) + "\n");
+        "#;
+        let (directory, entrypoint) = script_fixture("private-field-reflection", source)?;
+        let output = run_program(&entrypoint)?;
+
+        assert_eq!(output.stdout, b"true\n");
+        assert_eq!(output.exit_code, 0);
+        remove_fixture(&directory)
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn runs_node_vm_scripts() -> Result<(), Box<dyn Error>> {
+        let cases = [
+            (
+                "default-import",
+                "import vm from 'node:vm'; process.stdout.write(String(vm.runInThisContext('1+1')) + '\\n');",
+                b"2\n".as_slice(),
+            ),
+            (
+                "named-import",
+                "import { runInThisContext } from 'node:vm'; process.stdout.write(String(runInThisContext('1+1')) + '\\n');",
+                b"2\n".as_slice(),
+            ),
+            (
+                "syntax-error",
+                "import vm from 'node:vm'; try { new vm.Script('('); } catch (error) { process.stdout.write(error.name + '\\n'); }",
+                b"SyntaxError\n".as_slice(),
+            ),
+            (
+                "escaped-function",
+                "import vm from 'node:vm'; const script = new vm.Script('(function(){ return 42; })'); const f = script.runInThisContext(); process.stdout.write(String(f()) + '\\n');",
+                b"42\n".as_slice(),
+            ),
+            (
+                "construct-runner",
+                "import vm from 'node:vm'; const runner = vm.runInThisContext; const before = runner.prototype; const after = {}; const options = { get filename() { runner.prototype = after; return 'changed.js'; } }; const fallback = new runner('1', options); const result = new runner('({ answer: 42 })'); process.stdout.write(String(Object.getPrototypeOf(fallback) === before) + ',' + String(runner.prototype === after) + ',' + String(result.answer) + '\\n');",
+                b"true,true,42\n".as_slice(),
+            ),
+        ];
+
+        for (name, source, expected_stdout) in cases {
+            let (directory, entrypoint) = script_fixture(name, source)?;
+            let output = run_program(&entrypoint)?;
+            assert_eq!(output.stdout, expected_stdout, "{name}");
+            assert_eq!(output.exit_code, 0, "{name}");
+            remove_fixture(&directory)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn classic_script_completion_matches_node_24() -> Result<(), Box<dyn Error>> {
+        let cases = [
+            ("expression", "1+1", b"2\n".as_slice()),
+            ("declaration", "var x=5", b"undefined\n".as_slice()),
+            ("if-value", "if(true){42}", b"42\n".as_slice()),
+            ("if-empty", "1;if(true){}", b"undefined\n".as_slice()),
+            ("block", "{7}", b"7\n".as_slice()),
+            ("for", "for(let i=0;i<3;i++){i}", b"2\n".as_slice()),
+            (
+                "while-empty",
+                "1;while(false){2}",
+                b"undefined\n".as_slice(),
+            ),
+            ("finally", "try{1}finally{2}", b"1\n".as_slice()),
+            (
+                "catch-empty",
+                "try{1;throw 2}catch(e){}",
+                b"undefined\n".as_slice(),
+            ),
+            ("catch-value", "try{throw 1}catch(e){4}", b"4\n".as_slice()),
+            (
+                "catch-empty-finally",
+                "try{1;throw 2}catch(e){}finally{3}",
+                b"undefined\n".as_slice(),
+            ),
+            (
+                "try-value-finally",
+                "try{1}catch(e){}finally{3}",
+                b"1\n".as_slice(),
+            ),
+            ("switch", "switch(1){case 1:5}", b"5\n".as_slice()),
+            ("function", "function f(){}", b"undefined\n".as_slice()),
+        ];
+
+        for (name, script, expected_stdout) in cases {
+            let source = format!(
+                "import vm from 'node:vm'; process.stdout.write(String(vm.runInThisContext({script:?})) + '\\n');"
+            );
+            let (directory, entrypoint) = script_fixture(&format!("completion-{name}"), &source)?;
+            let output = run_program(&entrypoint)?;
+            assert_eq!(output.stdout, expected_stdout, "{name}");
+            assert_eq!(output.exit_code, 0, "{name}");
+            remove_fixture(&directory)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn promise_static_methods_chain_at_an_explicit_microtask_checkpoint()
+    -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            const seen: number[] = [];
+            const first = Promise.resolve(1).then(value => { seen.push(value); });
+            const second = Promise.reject(2).catch(reason => { seen.push(reason); });
+            const third = Promise.all([Promise.resolve(3), 4]).then(values => {
+                seen.push(values[0] + values[1]);
+            });
+            const fourth = Promise.resolve(5).finally(() => {}).then(value => {
+                seen.push(value);
+            });
+            Promise.all([first, second, third, fourth]).then(() => {
+                process.stdout.write(seen.join(",") + "\n");
+            });
+        "#;
+        let (stdout, drain) = run_microtask_checkpoint("promise-checkpoint", source)?;
+        assert!(drain.executed > 0);
+        assert!(drain.uncaught.is_empty());
+        assert_eq!(stdout, b"1,2,7,5\n");
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn promise_finally_waits_and_all_keeps_input_order() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            const seen: string[] = [];
+            let releaseCleanup;
+            const cleanup = new Promise(resolve => { releaseCleanup = resolve; });
+            const waited = Promise.resolve(10)
+                .finally(() => cleanup)
+                .then(value => { seen.push("value:" + value); });
+            queueMicrotask(() => { seen.push("checkpoint"); });
+            queueMicrotask(() => { releaseCleanup(); });
+
+            const replaced = Promise.reject(20)
+                .finally(() => Promise.reject(30))
+                .catch(reason => { seen.push("reason:" + reason); });
+            const empty = Promise.all([]).then(values => {
+                seen.push("empty:" + values.length);
+            });
+
+            let resolveFirst;
+            let resolveSecond;
+            const first = new Promise(resolve => { resolveFirst = resolve; });
+            const second = new Promise(resolve => { resolveSecond = resolve; });
+            const ordered = Promise.all([first, second]).then(values => {
+                seen.push("order:" + values.join(":"));
+            });
+            resolveSecond(2);
+            resolveFirst(1);
+
+            Promise.all([waited, replaced, empty, ordered]).then(() => {
+                process.stdout.write(seen.join(",") + "\n");
+            });
+        "#;
+        let (stdout, drain) = run_microtask_checkpoint("promise-edges", source)?;
+        assert!(drain.executed > 0);
+        assert!(drain.uncaught.is_empty());
+        assert_eq!(stdout, b"checkpoint,empty:0,order:1:2,value:10,reason:30\n");
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn promise_all_closes_an_abrupt_iterator_and_keeps_the_original_throw()
+    -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            let closed = false;
+            const iterable = {
+                [Symbol.iterator]() {
+                    return {
+                        next() { throw 7; },
+                        return() {
+                            closed = true;
+                            throw 8;
+                        },
+                    };
+                },
+            };
+            Promise.all(iterable).catch(reason => {
+                process.stdout.write(reason + "|" + closed + "\n");
+            });
+
+            const lookupFailure = {
+                [Symbol.iterator]() {
+                    return {
+                        next() { throw 7; },
+                        get return() { throw 8; },
+                    };
+                },
+            };
+            Promise.all(lookupFailure).catch(reason => {
+                process.stdout.write("lookup:" + reason + "\n");
+            });
+        "#;
+        let (stdout, drain) = run_microtask_checkpoint("promise-iterator-close", source)?;
+        assert!(drain.executed > 0);
+        assert!(drain.uncaught.is_empty());
+        assert_eq!(stdout, b"7|true\nlookup:7\n");
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn promise_thenable_getter_is_sync_and_body_is_queued() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            let gets = 0;
+            let calls = 0;
+            const thenable = {
+                get then() {
+                    gets += 1;
+                    return resolve => {
+                        calls += 1;
+                        resolve(7);
+                    };
+                },
+            };
+            const promise = Promise.resolve(thenable);
+            process.stdout.write(gets + "|" + calls + "|");
+            promise.then(value => {
+                process.stdout.write(gets + "|" + calls + "|" + value + "\n");
+            });
+        "#;
+        let (stdout, drain) = run_microtask_checkpoint("promise-thenable-getter", source)?;
+        assert!(drain.executed > 0);
+        assert!(drain.uncaught.is_empty());
+        assert_eq!(stdout, b"1|0|1|1|7\n");
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn promise_reactions_keep_registration_order_across_settlement() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            const seen: string[] = [];
+            let resolve;
+            const promise = new Promise(settle => { resolve = settle; });
+            promise.then(() => { seen.push("A"); });
+            promise.then(() => { seen.push("B"); });
+            resolve();
+            promise.then(() => { seen.push("C"); });
+            queueMicrotask(() => {
+                process.stdout.write(seen.join("") + "\n");
+            });
+        "#;
+        let (stdout, drain) = run_microtask_checkpoint("promise-reaction-order", source)?;
+        assert_eq!(drain.executed, 4);
+        assert!(drain.uncaught.is_empty());
+        assert_eq!(stdout, b"ABC\n");
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn promise_self_resolution_rejects() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            let resolve;
+            const promise = new Promise(settle => { resolve = settle; });
+            resolve(promise);
+            promise.catch(() => {
+                process.stdout.write("self-rejected\n");
+            });
+        "#;
+        let (stdout, drain) = run_microtask_checkpoint("promise-self-resolution", source)?;
+        assert!(drain.executed > 0);
+        assert!(drain.uncaught.is_empty());
+        assert_eq!(stdout, b"self-rejected\n");
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn promise_surface_has_node_tags_brands_and_lengths() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            const checks = [Object.prototype.toString.call(Promise.resolve())];
+            try {
+                Promise.prototype.then.call({}, () => {});
+                checks.push("bad-brand");
+            } catch (error) {
+                checks.push("brand-error");
+            }
+            try {
+                queueMicrotask(1);
+                checks.push("bad-callback");
+            } catch (error) {
+                checks.push("callback-error");
+            }
+            try {
+                const detached = Promise.resolve;
+                detached(1);
+                checks.push("bad-static");
+            } catch (error) {
+                checks.push("static-error");
+            }
+            checks.push(
+                Promise.length,
+                Promise.resolve.length,
+                Promise.reject.length,
+                Promise.all.length,
+                Promise.prototype.then.length,
+                Promise.prototype.catch.length,
+                Promise.prototype.finally.length,
+                queueMicrotask.length,
+            );
+            process.stdout.write(checks.join("|") + "\n");
+        "#;
+        let (directory, entrypoint) = script_fixture("promise-surface", source)?;
+        let output = run_program(&entrypoint)?;
+
+        assert_eq!(
+            output.stdout,
+            b"[object Promise]|brand-error|callback-error|static-error|1|1|1|1|2|1|1|1\n"
+        );
+        assert_eq!(output.exit_code, 0);
+        remove_fixture(&directory)
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn async_await_resumes_in_node_microtask_order() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            const seen: string[] = [];
+            async function run() {
+                seen.push("start");
+                await Promise.resolve();
+                seen.push("A");
+            }
+            run();
+            Promise.resolve()
+                .then(() => { seen.push("B1"); })
+                .then(() => { seen.push("B2"); })
+                .then(() => { process.stdout.write(seen.join(",") + "\n"); });
+        "#;
+        let (stdout, drain) = run_microtask_checkpoint("async-order", source)?;
+        assert!(drain.executed >= 4);
+        assert!(drain.uncaught.is_empty());
+        assert_eq!(stdout, b"start,A,B1,B2\n");
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn async_function_awaits_a_timeout_at_explicit_checkpoints() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            async function run() {
+                const value = await new Promise(resolve => {
+                    const handle = setTimeout(function (value) {
+                        process.stdout.write(String(this === handle) + "|");
+                        resolve(value);
+                    }, 1, 42);
+                });
+                process.stdout.write(String(value) + "\n");
+            }
+            run();
+        "#;
+        let checkpoint = run_timer_checkpoint("async-timeout", source)?;
+        assert!(checkpoint.waited);
+        assert_eq!(checkpoint.timer.executed, 1);
+        assert!(checkpoint.timer.uncaught.is_empty());
+        assert!(checkpoint.before_timer.uncaught.is_empty());
+        assert!(checkpoint.after_timer.executed > 0);
+        assert!(checkpoint.after_timer.uncaught.is_empty());
+        assert_eq!(checkpoint.stdout, b"true|42\n");
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn clear_timeout_suppresses_only_its_own_callback() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            const canceled = setTimeout(() => {
+                process.stdout.write("canceled\n");
+            }, 1);
+            clearTimeout(canceled);
+            setTimeout(() => {
+                process.stdout.write("kept\n");
+            }, 1);
+        "#;
+        let checkpoint = run_timer_checkpoint("clear-timeout", source)?;
+        assert!(checkpoint.waited);
+        assert_eq!(checkpoint.timer.executed, 1);
+        assert!(checkpoint.timer.uncaught.is_empty());
+        assert!(checkpoint.before_timer.uncaught.is_empty());
+        assert!(checkpoint.after_timer.uncaught.is_empty());
+        assert_eq!(checkpoint.stdout, b"kept\n");
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn rejected_await_enters_its_catch_and_preserves_later_resumes() -> Result<(), Box<dyn Error>> {
+        let source = r#"
+            async function caught() {
+                try {
+                    await Promise.reject(7);
+                    process.stdout.write("missed\n");
+                } catch (reason) {
+                    process.stdout.write("caught:" + reason + "\n");
+                }
+                let total = 1 + await Promise.resolve(2);
+                return total + await Promise.resolve(3);
+            }
+            async function uncaught() {
+                await Promise.reject(8);
+            }
+            caught().then(value => {
+                process.stdout.write("return:" + value + "\n");
+            });
+            uncaught().catch(reason => {
+                process.stdout.write("uncaught:" + reason + "\n");
+            });
+        "#;
+        let (stdout, drain) = run_microtask_checkpoint("async-rejection", source)?;
+        assert!(drain.executed >= 6);
+        assert!(drain.uncaught.is_empty());
+        assert_eq!(stdout, b"caught:7\nuncaught:8\nreturn:6\n");
         Ok(())
     }
 
     #[cfg(feature = "aot")]
     #[test]
-    fn compiles_source_to_native_object() -> Result<(), Box<dyn Error>> {
-        let path = fixture_path("aot");
-        std::fs::write(&path, "let answer = 42;")?;
-        let object = super::compile_native_object(&path, "x86_64")?;
-        std::fs::remove_file(path)?;
+    fn compiles_complete_program_to_native_object() -> Result<(), Box<dyn Error>> {
+        let (directory, entrypoint) = fixture("aot")?;
+        let object = super::compile_native_object(&entrypoint, "x86_64")?;
 
         assert!(!object.bytes.is_empty());
-        Ok(())
+        remove_fixture(&directory)
     }
 }

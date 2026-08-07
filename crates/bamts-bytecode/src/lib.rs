@@ -57,8 +57,9 @@
 //!   [`Instruction::LoadThis`], [`Instruction::LoadArguments`], and
 //!   [`Instruction::LoadNewTarget`] name the ambient bindings a function body
 //!   observes.
-//! * **Modules.** [`Instruction::Import`] and [`Instruction::Export`] name a
-//!   module linkage entry by string constant.
+//! * **Modules.** [`Instruction::Import`] is dynamic and names a dependency by
+//!   string constant; static bindings and exports live in [`Program`] linkage
+//!   metadata so they identify live cells rather than activation registers.
 //! * **Regular expressions.** [`Instruction::CreateRegExp`] materializes a
 //!   `RegExp` from string-constant pattern and flags.
 //!
@@ -102,7 +103,7 @@ use std::marker::PhantomData;
 /// `BMTBC\0\0\1`, matching `Bamti.Bytecode.magicBytes`.
 pub const MAGIC: [u8; 8] = [66, 77, 84, 66, 67, 0, 0, 1];
 /// The sole supported wire version.
-pub const FORMAT_VERSION: u8 = 1;
+pub const FORMAT_VERSION: u8 = 3;
 
 /// Structural verify-time ceiling on a function's register count. Generous
 /// enough for real code yet bounds definite-initialization bitset allocation.
@@ -167,6 +168,19 @@ index_type!(
     /// A program counter: an instruction index within a function's code.
     Pc
 );
+
+mod string;
+
+mod program;
+
+pub use string::{EcmaString, EcmaStringBuilder, IllFormedUtf16, InvalidCodePoint};
+
+pub use program::{
+    Binding, BindingId, BindingKind, Edge, EdgeId, EdgeKind, EdgeTarget, Export, ExportSource,
+    ModuleId, PROGRAM_MAGIC, PROGRAM_VERSION, Program, ProgramDecodeError, ProgramDecodeErrorKind,
+    ProgramDecodeLimits, ProgramLoadError, ProgramModule, ProgramVerifyError,
+    ProgramVerifyErrorKind, ResolvedExport, decode_program, decode_verified_program,
+};
 
 /// Canonical IEEE-754 bits. Every positive or negative NaN payload collapses
 /// to the unique arithmetic NaN from `Bamti.canonical_nan`.
@@ -262,7 +276,7 @@ fn is_canonical_bigint(text: &str) -> bool {
 pub enum Constant {
     Number(NumberBits),
     Int32(i32),
-    String(String),
+    String(EcmaString),
     Boolean(bool),
     Null,
     Undefined,
@@ -445,7 +459,7 @@ impl AccessorKind {
     }
 }
 
-/// The production instruction algebra. Opcodes 0..=35 are stable wire tags.
+/// The production instruction algebra. Opcodes 0..=36 are stable wire tags.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Instruction {
     /// Load a constant into `dst` (refines the formal `Load`).
@@ -469,6 +483,9 @@ pub enum Instruction {
     CreateObject { dst: Register },
     /// Create a fresh empty array in `dst`.
     CreateArray { dst: Register },
+    /// Create a compiler-private one-element array cell seeded with the
+    /// runtime-only uninitialized sentinel.
+    CreateCell { dst: Register },
     /// Materialize a closure over `function`, binding the captured cells held in
     /// the array register `captures`, into `dst`. The captured cells initialize
     /// the callee's leading `capture_count` registers.
@@ -673,6 +690,7 @@ impl Instruction {
             Self::LoadConst { .. }
             | Self::CreateObject { .. }
             | Self::CreateArray { .. }
+            | Self::CreateCell { .. }
             | Self::LoadGlobal { .. }
             | Self::TypeOfGlobal { .. }
             | Self::LoadThis { .. }
@@ -696,6 +714,7 @@ impl Instruction {
             | Self::Binary { dst, .. }
             | Self::CreateObject { dst }
             | Self::CreateArray { dst }
+            | Self::CreateCell { dst }
             | Self::CreateClosure { dst, .. }
             | Self::GetProperty { dst, .. }
             | Self::DeleteProperty { dst, .. }
@@ -750,6 +769,7 @@ impl Instruction {
             | Self::Binary { .. }
             | Self::CreateObject { .. }
             | Self::CreateArray { .. }
+            | Self::CreateCell { .. }
             | Self::CreateClosure { .. }
             | Self::GetProperty { .. }
             | Self::SetProperty { .. }
@@ -968,6 +988,14 @@ impl Module<Verified> {
         self.certificates.get(function.get() as usize)
     }
 
+    /// Heap bytes retained by this module's verification certificates.
+    #[must_use]
+    pub fn verification_bytes(&self) -> usize {
+        self.certificates.iter().fold(0usize, |bytes, certificate| {
+            bytes.saturating_add(certificate.retained_bytes())
+        })
+    }
+
     /// Emits one deterministic canonical representation.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -996,6 +1024,19 @@ pub struct Certificate {
 }
 
 impl Certificate {
+    fn retained_bytes(&self) -> usize {
+        self.facts.iter().fold(
+            std::mem::size_of::<Self>().saturating_add(
+                self.facts
+                    .len()
+                    .saturating_mul(std::mem::size_of::<RegisterSet>()),
+            ),
+            |bytes, facts| {
+                bytes.saturating_add(facts.words.len().saturating_mul(std::mem::size_of::<u64>()))
+            },
+        )
+    }
+
     #[must_use]
     pub fn instruction_count(&self) -> usize {
         self.facts.len()
@@ -1629,7 +1670,9 @@ fn verify_instruction(
             check_register(left)?;
             check_register(right)?;
         }
-        Instruction::CreateObject { dst } | Instruction::CreateArray { dst } => {
+        Instruction::CreateObject { dst }
+        | Instruction::CreateArray { dst }
+        | Instruction::CreateCell { dst } => {
             check_register(dst)?;
         }
         Instruction::CreateClosure {
@@ -1881,7 +1924,8 @@ pub struct DecodeLimits {
     pub max_instructions_per_function: u32,
     pub max_total_instructions: u64,
     pub max_handlers_per_function: u32,
-    pub max_string_bytes: u32,
+    pub max_string_units: u32,
+    pub max_bigint_bytes: u32,
 }
 
 impl Default for DecodeLimits {
@@ -1896,7 +1940,8 @@ impl Default for DecodeLimits {
             max_instructions_per_function: MAX_INSTRUCTIONS,
             max_total_instructions: 1 << 24,
             max_handlers_per_function: MAX_HANDLERS,
-            max_string_bytes: 1 << 20,
+            max_string_units: 1 << 20,
+            max_bigint_bytes: 1 << 20,
         }
     }
 }
@@ -1988,7 +2033,7 @@ impl fmt::Display for DecodeError {
             DecodeErrorKind::NonCanonicalNumber { bits } => {
                 write!(formatter, "noncanonical NaN bits {bits:#018x}")
             }
-            DecodeErrorKind::InvalidUtf8 => formatter.write_str("constant string is not UTF-8"),
+            DecodeErrorKind::InvalidUtf8 => formatter.write_str("bigint text is not UTF-8"),
             DecodeErrorKind::InvalidBigInt => {
                 formatter.write_str("bigint constant is not canonical decimal text")
             }
@@ -2142,7 +2187,7 @@ impl<'a> Decoder<'a> {
                     })
             }
             1 => Ok(Constant::Int32(i32::from_le_bytes(self.exact::<4>()?))),
-            2 => Ok(Constant::String(self.text()?)),
+            2 => Ok(Constant::String(self.string()?)),
             3 => Ok(Constant::Boolean(false)),
             4 => Ok(Constant::Boolean(true)),
             5 => Ok(Constant::Null),
@@ -2158,8 +2203,18 @@ impl<'a> Decoder<'a> {
         }
     }
 
+    fn string(&mut self) -> Result<EcmaString, DecodeError> {
+        let unit_count = self.bounded("string unit count", self.limits.max_string_units)?;
+        let byte_count = usize::try_from(unit_count)
+            .ok()
+            .and_then(|units| units.checked_mul(2))
+            .ok_or_else(|| self.error(self.offset, DecodeErrorKind::UnexpectedEof))?;
+        let bytes = self.slice(byte_count)?;
+        Ok(EcmaString::from_le_bytes(bytes))
+    }
+
     fn text(&mut self) -> Result<String, DecodeError> {
-        let length = self.bounded("string byte length", self.limits.max_string_bytes)?;
+        let length = self.bounded("bigint byte length", self.limits.max_bigint_bytes)?;
         let start = self.offset;
         let bytes = self.slice(length as usize)?;
         let value = std::str::from_utf8(bytes)
@@ -2377,6 +2432,9 @@ impl<'a> Decoder<'a> {
                 src: Register::new(self.leb128()?),
             }),
             35 => Ok(Instruction::Halt),
+            36 => Ok(Instruction::CreateCell {
+                dst: Register::new(self.leb128()?),
+            }),
             opcode => Err(self.error(opcode_at, DecodeErrorKind::InvalidOpcode { opcode })),
         }
     }
@@ -2483,7 +2541,7 @@ impl<'a> Decoder<'a> {
             return Err(self.error(self.offset, DecodeErrorKind::UnexpectedEof));
         };
         let Some(bytes) = source.get(self.offset..end) else {
-            return Err(self.error(source.len(), DecodeErrorKind::UnexpectedEof));
+            return Err(self.error(self.offset, DecodeErrorKind::UnexpectedEof));
         };
         self.offset = end;
         Ok(bytes)
@@ -2519,7 +2577,7 @@ fn encode_constant(constant: &Constant, output: &mut Vec<u8>) {
         }
         Constant::String(value) => {
             output.push(2);
-            write_text(value, output);
+            write_string(value, output);
         }
         Constant::Boolean(false) => output.push(3),
         Constant::Boolean(true) => output.push(4),
@@ -2529,6 +2587,13 @@ fn encode_constant(constant: &Constant, output: &mut Vec<u8>) {
             output.push(7);
             write_text(value.as_str(), output);
         }
+    }
+}
+
+fn write_string(value: &EcmaString, output: &mut Vec<u8>) {
+    write_u32(value.len_units() as u32, output);
+    for unit in value.as_units() {
+        output.extend_from_slice(&unit.to_le_bytes());
     }
 }
 
@@ -2773,6 +2838,10 @@ fn encode_instruction(instruction: Instruction, output: &mut Vec<u8>) {
             write_u32(src.get(), output);
         }
         Instruction::Halt => output.push(35),
+        Instruction::CreateCell { dst } => {
+            output.push(36);
+            write_u32(dst.get(), output);
+        }
     }
 }
 
@@ -2807,19 +2876,19 @@ mod tests {
     /// * handler over [0,34) catches into r25
     fn rich_module() -> Module<Unverified> {
         let constants = vec![
-            Constant::String("main".to_owned()), // 0: function name + key string
-            Constant::Int32(21),                 // 1
-            Constant::Number(NumberBits::from_f64(1.5)), // 2
+            Constant::String(EcmaString::from_utf8("main")), // 0: function name + key string
+            Constant::Int32(21),                             // 1
+            Constant::Number(NumberBits::from_f64(1.5)),     // 2
             Constant::BigInt(BigIntLiteral::new("-1234567890123".to_owned()).unwrap()), // 3
-            Constant::Boolean(true),             // 4
-            Constant::Null,                      // 5
-            Constant::Undefined,                 // 6
-            Constant::String("./dep".to_owned()), // 7: import specifier
-            Constant::String("g".to_owned()),    // 8: global name
-            Constant::String("#p".to_owned()),   // 9: private description
-            Constant::String("ab".to_owned()),   // 10: regexp pattern
-            Constant::String("gi".to_owned()),   // 11: regexp flags
-            Constant::String("x".to_owned()),    // 12: export name
+            Constant::Boolean(true),                         // 4
+            Constant::Null,                                  // 5
+            Constant::Undefined,                             // 6
+            Constant::String(EcmaString::from_utf8("./dep")), // 7: import specifier
+            Constant::String(EcmaString::from_utf8("g")),    // 8: global name
+            Constant::String(EcmaString::from_utf8("#p")),   // 9: private description
+            Constant::String(EcmaString::from_utf8("ab")),   // 10: regexp pattern
+            Constant::String(EcmaString::from_utf8("gi")),   // 11: regexp flags
+            Constant::String(EcmaString::from_utf8("x")),    // 12: export name
         ];
         let code = vec![
             Instruction::LoadConst {
@@ -3007,7 +3076,7 @@ mod tests {
 
     /// Every opcode variant survives an encode -> decode round-trip at the
     /// instruction level, independent of CFG/reference validity. This pins the
-    /// wire tag and field order for all 36 opcodes.
+    /// wire tag and field order for all 37 opcodes.
     #[test]
     fn every_opcode_round_trips_on_the_wire() {
         let instructions = [
@@ -3160,8 +3229,11 @@ mod tests {
                 src: Register::new(74),
             },
             Instruction::Halt,
+            Instruction::CreateCell {
+                dst: Register::new(75),
+            },
         ];
-        assert_eq!(instructions.len(), 36, "one case per opcode");
+        assert_eq!(instructions.len(), 37, "one case per opcode");
         let limits = DecodeLimits::default();
         for (opcode, instruction) in instructions.into_iter().enumerate() {
             let mut bytes = Vec::new();
@@ -3402,12 +3474,26 @@ mod tests {
             })
         );
         let mut bad_version = MAGIC.to_vec();
-        bad_version.push(2);
+        bad_version.push(1);
         assert_eq!(
             decode(&bad_version, &DecodeLimits::default()),
             Err(DecodeError {
                 offset: 8,
-                kind: DecodeErrorKind::UnsupportedVersion { version: 2 },
+                kind: DecodeErrorKind::UnsupportedVersion { version: 1 },
+            })
+        );
+    }
+
+    #[test]
+    fn truncated_string_reports_payload_start() {
+        let mut bytes = prefix();
+        bytes.extend_from_slice(&[1, 2, 2, b'a', 0]);
+
+        assert_eq!(
+            decode(&bytes, &DecodeLimits::default()),
+            Err(DecodeError {
+                offset: 12,
+                kind: DecodeErrorKind::UnexpectedEof,
             })
         );
     }
@@ -3434,10 +3520,10 @@ mod tests {
     }
 
     #[test]
-    fn decoder_rejects_invalid_utf8_without_recovery() {
+    fn decoder_rejects_invalid_bigint_utf8_without_recovery() {
         let mut bytes = prefix();
         write_u32(1, &mut bytes); // constant count
-        bytes.push(2); // string tag
+        bytes.push(7); // bigint tag
         write_u32(1, &mut bytes); // length
         bytes.push(0xff); // invalid UTF-8
         assert_eq!(
@@ -3447,6 +3533,76 @@ mod tests {
                 kind: DecodeErrorKind::InvalidUtf8,
             })
         );
+    }
+
+    #[test]
+    fn decoder_rejects_truncated_string_units() {
+        let mut bytes = prefix();
+        write_u32(1, &mut bytes);
+        bytes.push(2);
+        write_u32(2, &mut bytes);
+        bytes.extend_from_slice(&0xD800_u16.to_le_bytes());
+        assert!(matches!(
+            decode(&bytes, &DecodeLimits::default()),
+            Err(DecodeError {
+                kind: DecodeErrorKind::UnexpectedEof,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn decoder_rejects_string_over_unit_limit() {
+        let mut bytes = prefix();
+        write_u32(1, &mut bytes);
+        bytes.push(2);
+        write_u32(3, &mut bytes);
+        let limits = DecodeLimits {
+            max_string_units: 2,
+            ..DecodeLimits::default()
+        };
+        assert!(matches!(
+            decode(&bytes, &limits),
+            Err(DecodeError {
+                kind: DecodeErrorKind::LimitExceeded {
+                    field: "string unit count",
+                    limit: 2,
+                    actual: 3,
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn string_constants_round_trip_lone_surrogates() {
+        let encoded = Module::new(
+            vec![Constant::String(EcmaString::from_units(&[
+                0xD800, 0xDC00, 0xDFFF,
+            ]))],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                1,
+                flags(),
+                vec![Instruction::Halt],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("lone surrogates are valid literal constants")
+        .encode();
+        let module = decode(&encoded, &DecodeLimits::default())
+            .expect("valid UTF-16 units")
+            .verify()
+            .expect("the decoded module verifies");
+        assert!(matches!(
+            module.constants(),
+            [Constant::String(value)] if value.as_units() == [0xD800, 0xDC00, 0xDFFF]
+        ));
+        assert_eq!(module.encode(), encoded);
     }
 
     #[test]
@@ -4568,6 +4724,41 @@ mod tests {
         );
         // Missing certificate for an out-of-range function -> None.
         assert!(verified.certificate(FunctionId::new(9)).is_none());
+    }
+
+    #[test]
+    fn verification_bytes_counts_certificate_storage() {
+        let instruction_count = 2usize;
+        let register_count = 130u32;
+        let module = Module::new(
+            vec![],
+            vec![Function::new(
+                None,
+                0,
+                1,
+                register_count,
+                flags(),
+                vec![
+                    Instruction::Move {
+                        dst: Register::new(129),
+                        src: Register::new(0),
+                    },
+                    Instruction::Return {
+                        value: Register::new(129),
+                    },
+                ],
+                vec![],
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("test module verifies");
+        let words = RegisterSet::words_for(register_count);
+        let expected = std::mem::size_of::<Certificate>()
+            + instruction_count * std::mem::size_of::<RegisterSet>()
+            + instruction_count * words * std::mem::size_of::<u64>();
+
+        assert_eq!(module.verification_bytes(), expected);
     }
 
     #[test]

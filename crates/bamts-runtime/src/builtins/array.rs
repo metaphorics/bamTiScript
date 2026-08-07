@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
+use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
 use super::{
@@ -8,17 +9,17 @@ use super::{
     type_error, value_number,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
-use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyKey};
+use crate::{EvalFailure, HeapEntry, Host, IterationKind, Machine, PropertyKey};
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
-    globals: &mut BTreeMap<String, Value>,
+    globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.array_prototype();
     let constructor = install_function(heap, builtins, "Array", 1, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
-    globals.insert("Array".to_owned(), constructor);
+    globals.insert(EcmaString::from_utf8("Array"), constructor);
     for (name, length, handler) in [
         ("isArray", 1, is_array::<H> as BuiltinHandler<H>),
         ("from", 1, from::<H>),
@@ -69,7 +70,7 @@ pub(super) fn install<H: Host>(
         unreachable!()
     };
     properties.insert(
-        PropertyKey::Private(super::heap_index(builtins.symbol_iterator()) as u32),
+        PropertyKey::Symbol(super::heap_index(builtins.symbol_iterator()) as u32),
         super::builtin_property(values),
     );
 }
@@ -80,7 +81,7 @@ fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: 
         panic!("Array constructor must be native")
     };
     properties.insert(
-        PropertyKey::Named(name.to_owned()),
+        PropertyKey::Named(EcmaString::from_utf8(name)),
         super::builtin_property(value),
     );
 }
@@ -122,20 +123,17 @@ fn from<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let source = args.first().copied().unwrap_or(Value::UNDEFINED);
-    let mut elements = if let Some(values) = machine.array_elements(source)? {
-        values
-    } else if let Some(text) = machine.string_value(source) {
-        text.encode_utf16()
-            .map(|unit| allocate_string(machine, String::from_utf16_lossy(&[unit])))
-            .collect::<Result<Vec<_>, _>>()?
-    } else {
-        return Err(type_error("Array.from requires an array-like object"));
-    };
-    if let Some(callback) = args
+    let callback = args
         .get(1)
         .copied()
-        .filter(|value| *value != Value::UNDEFINED)
+        .filter(|value| *value != Value::UNDEFINED);
+    if let Some(callback) = callback
+        && !machine.is_callable(callback)?
     {
+        return Err(type_error("Array.from mapper is not callable"));
+    }
+    let mut elements = machine.iterable_values(source)?;
+    if let Some(callback) = callback {
         let this_arg = args.get(2).copied().unwrap_or(Value::UNDEFINED);
         for (index, element) in elements.iter_mut().enumerate() {
             *element = machine.call_value(
@@ -317,26 +315,29 @@ fn join<H: Host>(
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let values = elements(machine, this)?;
-    let sep = if args.is_empty() || args[0] == Value::UNDEFINED {
-        ",".to_owned()
+    let separator = if args.is_empty() || args[0] == Value::UNDEFINED {
+        EcmaString::from_utf8(",")
     } else {
         machine.to_string(args[0])?
     };
-    let mut parts = Vec::with_capacity(values.len());
-    for value in values {
-        parts.push(
-            if value == Value::HOLE
-                || matches!(value.decode(), Some(Decoded::Undefined | Decoded::Null))
-            {
-                String::new()
-            } else {
-                machine.to_string(value)?
-            },
-        );
+    let mut output = bamts_bytecode::EcmaStringBuilder::new();
+    for (index, value) in values.into_iter().enumerate() {
+        if index != 0 {
+            for &unit in separator.as_units() {
+                output.push_unit(unit);
+            }
+        }
+        if value != Value::HOLE
+            && !matches!(value.decode(), Some(Decoded::Undefined | Decoded::Null))
+        {
+            for &unit in machine.to_string(value)?.as_units() {
+                output.push_unit(unit);
+            }
+        }
     }
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
-        parts.join(&sep),
+        output.finish(),
     )?))
 }
 fn from_index<H: Host>(
@@ -705,7 +706,7 @@ fn sort<H: Host>(
             }
         } else {
             match (machine.to_string(*a), machine.to_string(*b)) {
-                (Ok(a), Ok(b)) => a.encode_utf16().cmp(b.encode_utf16()),
+                (Ok(a), Ok(b)) => a.cmp(&b),
                 (Err(e), _) | (_, Err(e)) => {
                     error = Some(e);
                     Ordering::Equal
@@ -831,13 +832,11 @@ fn keys_iterator<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let length = elements(machine, this)?.len();
-    let keys = (0..length)
-        .map(|index| crate::number_value(index as f64))
-        .collect();
-    let source = allocate_array(machine, keys)?;
+    elements(machine, this)?;
     Ok(BuiltinOutcome::Value(super::collections::iterator(
-        machine, source,
+        machine,
+        this,
+        IterationKind::Key,
     )?))
 }
 
@@ -849,7 +848,9 @@ fn values_iterator<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     elements(machine, this)?;
     Ok(BuiltinOutcome::Value(super::collections::iterator(
-        machine, this,
+        machine,
+        this,
+        IterationKind::Value,
     )?))
 }
 
@@ -859,23 +860,306 @@ fn entries_iterator<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let values = elements(machine, this)?;
-    let mut entries = Vec::with_capacity(values.len());
-    for (index, value) in values.into_iter().enumerate() {
-        entries.push(allocate_array(
-            machine,
-            vec![
-                crate::number_value(index as f64),
-                if value == Value::HOLE {
-                    Value::UNDEFINED
-                } else {
-                    value
-                },
-            ],
-        )?);
-    }
-    let source = allocate_array(machine, entries)?;
+    elements(machine, this)?;
     Ok(BuiltinOutcome::Value(super::collections::iterator(
-        machine, source,
+        machine,
+        this,
+        IterationKind::Entry,
     )?))
+}
+
+#[cfg(test)]
+mod tests {
+    use bamts_bytecode::{
+        Constant, ConstantId, Function, FunctionFlags, FunctionId, Instruction, Module, ModuleId,
+        Program, ProgramModule, Verified,
+    };
+    use bamts_native::Decoded;
+
+    use super::*;
+    use crate::intrinsics::BuiltinDef;
+    use crate::{Limits, PropertyMap};
+
+    #[derive(Default)]
+    struct TestHost;
+
+    impl Host for TestHost {}
+
+    fn module() -> Program<Verified> {
+        let code = Module::new(
+            vec![Constant::String(EcmaString::from_utf8("<test>"))],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                1,
+                FunctionFlags::default(),
+                vec![Instruction::Halt],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("valid test module");
+        Program::link(
+            vec![ProgramModule {
+                name: ConstantId::new(0),
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect("valid test program")
+    }
+
+    fn object(machine: &mut Machine<'_, TestHost>) -> Value {
+        machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .unwrap()
+    }
+
+    fn call_array(
+        machine: &mut Machine<'_, TestHost>,
+        method_name: &str,
+        args: &[Value],
+    ) -> Result<Value, EvalFailure> {
+        let constructor = machine.intrinsics.global("Array").unwrap();
+        let method = machine.get_named_property(constructor, method_name)?;
+        machine.call_value(method, constructor, args)
+    }
+
+    // ---- custom iterable helpers -------------------------------------------
+
+    fn custom_iterator_next<H: Host>(
+        machine: &mut Machine<'_, H>,
+        this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let values = machine.get_named_property(this, "_values")?;
+        let index_val = machine.get_named_property(this, "_index")?;
+        let elements = machine.array_elements(values)?.unwrap_or_default();
+        let index = match index_val.decode() {
+            Some(Decoded::Int32(i)) => i as usize,
+            Some(Decoded::Number(n)) => n as usize,
+            _ => 0,
+        };
+        let result = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .map_err(EvalFailure::Runtime)?;
+        if index >= elements.len() {
+            machine.set_data_property(result, "done", Value::TRUE)?;
+            machine.set_data_property(result, "value", Value::UNDEFINED)?;
+        } else {
+            machine.set_data_property(result, "done", Value::FALSE)?;
+            machine.set_data_property(result, "value", elements[index])?;
+            machine.set_data_property(this, "_index", Value::int32((index + 1) as u32))?;
+        }
+        Ok(BuiltinOutcome::Value(result))
+    }
+
+    fn custom_iterator_create<H: Host>(
+        machine: &mut Machine<'_, H>,
+        this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let iter = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .map_err(EvalFailure::Runtime)?;
+        let values = machine.get_named_property(this, "_values")?;
+        let next = machine.get_named_property(this, "_next")?;
+        machine.set_data_property(iter, "_values", values)?;
+        machine.set_data_property(iter, "_index", Value::int32(0))?;
+        machine.set_data_property(iter, "next", next)?;
+        Ok(BuiltinOutcome::Value(iter))
+    }
+
+    /// Builds an object with a custom `Symbol.iterator` that yields `values`
+    /// in order, bypassing any structural shortcuts.
+    fn custom_iterable(machine: &mut Machine<'_, TestHost>, values: Vec<Value>) -> Value {
+        let next_id = machine.intrinsics.builtins.register(BuiltinDef {
+            name: "custom next",
+            length: 0,
+            handler: custom_iterator_next::<TestHost>,
+        });
+        let next_fn =
+            crate::intrinsics::native_function(&mut machine.heap, next_id, "custom next", 0);
+        let create_id = machine.intrinsics.builtins.register(BuiltinDef {
+            name: "custom iterator",
+            length: 0,
+            handler: custom_iterator_create::<TestHost>,
+        });
+        let create_fn =
+            crate::intrinsics::native_function(&mut machine.heap, create_id, "custom iterator", 0);
+        let iterable = object(machine);
+        let values_array = allocate_array(machine, values).unwrap();
+        machine
+            .set_data_property(iterable, "_values", values_array)
+            .unwrap();
+        machine
+            .set_data_property(iterable, "_next", next_fn)
+            .unwrap();
+        let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
+        let iterator_key = machine.to_property_key(iterator_symbol).unwrap();
+        machine
+            .set_data_property_key(iterable, iterator_key, create_fn)
+            .unwrap();
+        iterable
+    }
+
+    // ---- tests -------------------------------------------------------------
+
+    #[test]
+    fn array_from_observes_custom_iterator_override() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        // An array with real elements [1, 2, 3] but a custom Symbol.iterator
+        // that yields [10, 20, 30]. Array.from must observe the override.
+        let backing = allocate_array(
+            &mut machine,
+            vec![Value::int32(1), Value::int32(2), Value::int32(3)],
+        )
+        .unwrap();
+        let source = custom_iterable(
+            &mut machine,
+            vec![Value::int32(10), Value::int32(20), Value::int32(30)],
+        );
+        // Copy the fixture state the custom iterator needs from `source` onto
+        // `backing` before installing the custom Symbol.iterator.
+        let values = machine.get_named_property(source, "_values").unwrap();
+        let next = machine.get_named_property(source, "_next").unwrap();
+        machine.set_data_property(backing, "_values", values).unwrap();
+        machine.set_data_property(backing, "_next", next).unwrap();
+
+        let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
+        let iterator_key = machine.to_property_key(iterator_symbol).unwrap();
+        let custom_iter_fn = machine.get_property_key(source, &iterator_key).unwrap();
+        machine
+            .set_data_property_key(backing, iterator_key, custom_iter_fn)
+            .unwrap();
+
+        let result = call_array(&mut machine, "from", &[backing]).unwrap();
+        let elements = machine.array_elements(result).unwrap().unwrap();
+        assert_eq!(
+            elements,
+            vec![Value::int32(10), Value::int32(20), Value::int32(30)]
+        );
+    }
+
+    #[test]
+    fn array_from_preserves_mapper_order_and_thisarg() {
+        fn mapper<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            let element = args.first().copied().unwrap_or(Value::int32(0));
+            let index = args.get(1).copied().unwrap_or(Value::int32(0));
+            let offset = machine.get_named_property(this, "offset")?;
+            let e = match element.decode() {
+                Some(Decoded::Int32(i)) => i,
+                _ => 0,
+            };
+            let i = match index.decode() {
+                Some(Decoded::Int32(i)) => i,
+                _ => 0,
+            };
+            let o = match offset.decode() {
+                Some(Decoded::Int32(i)) => i,
+                _ => 0,
+            };
+            Ok(BuiltinOutcome::Value(Value::int32(e * 100 + i + o)))
+        }
+
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let source = custom_iterable(
+            &mut machine,
+            vec![Value::int32(1), Value::int32(2), Value::int32(3)],
+        );
+        let mapper_id = machine.intrinsics.builtins.register(BuiltinDef {
+            name: "mapper",
+            length: 1,
+            handler: mapper::<TestHost>,
+        });
+        let mapper_fn =
+            crate::intrinsics::native_function(&mut machine.heap, mapper_id, "mapper", 1);
+        let this_arg = object(&mut machine);
+        machine
+            .set_data_property(this_arg, "offset", Value::int32(1000))
+            .unwrap();
+
+        let result = call_array(&mut machine, "from", &[source, mapper_fn, this_arg]).unwrap();
+        let elements = machine.array_elements(result).unwrap().unwrap();
+        // element*100 + index + offset(1000)
+        assert_eq!(
+            elements,
+            vec![
+                Value::int32(1100), // 1*100 + 0 + 1000
+                Value::int32(1201), // 2*100 + 1 + 1000
+                Value::int32(1302), // 3*100 + 2 + 1000
+            ]
+        );
+    }
+
+    #[test]
+    fn array_from_consumes_string_through_protocol() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let text = allocate_string(&mut machine, EcmaString::from_utf8("abc")).unwrap();
+        let result = call_array(&mut machine, "from", &[text]).unwrap();
+        let elements = machine.array_elements(result).unwrap().unwrap();
+        assert_eq!(elements.len(), 3);
+        assert!(
+            machine
+                .string_value(elements[0])
+                .is_some_and(|s| s.eq_ascii("a"))
+        );
+        assert!(
+            machine
+                .string_value(elements[1])
+                .is_some_and(|s| s.eq_ascii("b"))
+        );
+        assert!(
+            machine
+                .string_value(elements[2])
+                .is_some_and(|s| s.eq_ascii("c"))
+        );
+    }
+
+    #[test]
+    fn array_from_rejects_non_iterable() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let source = object(&mut machine); // no Symbol.iterator
+        let result = call_array(&mut machine, "from", &[source]);
+        assert!(result.is_err());
+    }
 }

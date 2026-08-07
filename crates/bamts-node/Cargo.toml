@@ -10,6 +10,10 @@ crate-type = ["rlib", "staticlib"]
 [features]
 default = ["node-host"]
 node-host = ["bamts-native/node-host"]
+# The classic-script `CompileProvider`. Off by default: it is the only feature
+# that links the compiler frontend into a host, and `node:vm` is installed only
+# when a host supplies a provider.
+script-compiler = ["dep:bamts-compiler", "dep:bamts-bytecode"]
 aot-main = [
     "node-host",
     "dep:bamts-bytecode",
@@ -18,8 +22,11 @@ aot-main = [
 
 [dependencies]
 bamts-bytecode = { path = "../bamts-bytecode", optional = true }
+bamts-compiler = { path = "../bamts-compiler", optional = true }
 bamts-native = { path = "../bamts-native" }
 bamts-runtime = { path = "../bamts-runtime" }
+tokio = { version = "=1.53.1", features = ["rt", "sync", "time"] }
+tokio-util = { version = "=0.7.19", features = ["time"] }
 
 [lints.rust]
 # `unsafe_code` is downgraded from the workspace `forbid` to `deny` so that a

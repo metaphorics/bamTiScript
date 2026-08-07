@@ -416,13 +416,12 @@ fn validate_codegen_features(manifest: &Value, context: &str) -> Result<()> {
     )
 }
 
-/// `bamts-node` keeps the `node-host` and `aot-image` capabilities of
-/// `bamts-native` behind its own features so a default dependency on the Node
-/// host never pulls the AOT image reader and its external descriptor symbol.
+/// `bamts-node` keeps compiler and native capabilities behind explicit
+/// features so its default host does not pull the frontend or AOT image reader.
 fn validate_node_features(manifest: &Value, context: &str) -> Result<()> {
     let root = root_table(manifest, context)?;
     let features = required_table(root, "features", context)?;
-    let expected_keys: BTreeSet<String> = ["default", "node-host", "aot-main"]
+    let expected_keys: BTreeSet<String> = ["default", "node-host", "script-compiler", "aot-main"]
         .into_iter()
         .map(str::to_owned)
         .collect();
@@ -436,6 +435,12 @@ fn validate_node_features(manifest: &Value, context: &str) -> Result<()> {
 
     require_feature_set(features, "default", &["node-host"], context)?;
     require_feature_set(features, "node-host", &["bamts-native/node-host"], context)?;
+    require_feature_set(
+        features,
+        "script-compiler",
+        &["dep:bamts-compiler", "dep:bamts-bytecode"],
+        context,
+    )?;
     require_feature_set(
         features,
         "aot-main",
@@ -476,7 +481,7 @@ fn validate_cli_features(manifest: &Value, context: &str) -> Result<()> {
 fn validate_facade_manifest_features(manifest: &Value, context: &str) -> Result<()> {
     let root = root_table(manifest, context)?;
     let features = required_table(root, "features", context)?;
-    let expected_keys: BTreeSet<String> = ["default", "aot", "host-jit"]
+    let expected_keys: BTreeSet<String> = ["default", "aot", "host-jit", "node-host"]
         .into_iter()
         .map(str::to_owned)
         .collect();
@@ -499,6 +504,16 @@ fn validate_facade_manifest_features(manifest: &Value, context: &str) -> Result<
         features,
         "host-jit",
         &["dep:bamts-codegen", "bamts-codegen/host-jit"],
+        context,
+    )?;
+    require_feature_set(
+        features,
+        "node-host",
+        &[
+            "dep:bamts-node",
+            "bamts-node/node-host",
+            "bamts-node/script-compiler",
+        ],
         context,
     )
 }
@@ -875,6 +890,7 @@ fn expected_internal_graph() -> InternalGraph {
         "bamts-node".to_owned(),
         BTreeMap::from([
             ("bamts-runtime".to_owned(), internal_dependency(false, &[])),
+            ("bamts-compiler".to_owned(), internal_dependency(true, &[])),
             ("bamts-native".to_owned(), internal_dependency(false, &[])),
             // Enabled only by `aot-main`, which decodes the canonical bytecode
             // embedded in a linked AOT image before handing it to the engine.
@@ -898,13 +914,17 @@ fn expected_internal_graph() -> InternalGraph {
             ("bamts-bytecode".to_owned(), internal_dependency(false, &[])),
             ("bamts-codegen".to_owned(), internal_dependency(true, &[])),
             ("bamts-compiler".to_owned(), internal_dependency(false, &[])),
-            ("bamts-node".to_owned(), internal_dependency(false, &[])),
+            ("bamts-node".to_owned(), internal_dependency(true, &[])),
             ("bamts-runtime".to_owned(), internal_dependency(false, &[])),
         ]),
     );
     graph.insert(
         "bamts-cli".to_owned(),
         BTreeMap::from([
+            (
+                "bamts".to_owned(),
+                internal_dependency(false, &["node-host"]),
+            ),
             ("bamts-compiler".to_owned(), internal_dependency(false, &[])),
             ("bamts-runtime".to_owned(), internal_dependency(false, &[])),
             (
@@ -913,7 +933,7 @@ fn expected_internal_graph() -> InternalGraph {
             ),
             (
                 "bamts-node".to_owned(),
-                internal_dependency(false, &["aot-main"]),
+                internal_dependency(false, &["aot-main", "script-compiler"]),
             ),
         ]),
     );
@@ -1006,7 +1026,6 @@ fn validate_feature_closures(root: &Path) -> Result<()> {
     require_present_package(&closure, "bamts-cli", "bamts-native")
 }
 
-
 fn cargo_metadata(root: &Path, feature: Option<&str>) -> Result<CargoMetadata> {
     let cargo = match env::var_os("CARGO") {
         Some(path) => path,
@@ -1053,9 +1072,6 @@ fn cargo_metadata(root: &Path, feature: Option<&str>) -> Result<CargoMetadata> {
         )
     })
 }
-
-
-
 
 fn codegen_closure(metadata: &CargoMetadata) -> Result<ResolvedClosure> {
     let resolve = metadata
@@ -1128,7 +1144,6 @@ fn codegen_closure(metadata: &CargoMetadata) -> Result<ResolvedClosure> {
     Ok(closure)
 }
 
-
 fn require_enabled_feature(closure: &ResolvedClosure, mode: &str, feature: &str) -> Result<()> {
     let active = closure
         .package_features
@@ -1143,7 +1158,6 @@ fn require_enabled_feature(closure: &ResolvedClosure, mode: &str, feature: &str)
     Ok(())
 }
 
-
 fn require_present_package(closure: &ResolvedClosure, mode: &str, package: &str) -> Result<()> {
     if !closure.package_names.contains(package) {
         return Err(workspace_error(format!(
@@ -1153,7 +1167,6 @@ fn require_present_package(closure: &ResolvedClosure, mode: &str, package: &str)
 
     Ok(())
 }
-
 
 fn root_table<'a>(value: &'a Value, context: &str) -> Result<&'a Table> {
     value

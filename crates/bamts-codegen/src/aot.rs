@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fmt;
 
-use bamts_bytecode::{Module as BytecodeModule, Verified};
+use bamts_bytecode::{Program as BytecodeProgram, Verified};
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::{ExternalName, Function, UserExternalName};
 use cranelift_codegen::isa;
@@ -11,11 +11,14 @@ use cranelift_codegen::settings::{self, Flags};
 use cranelift_module::{DataDescription, FuncId, Linkage, Module, default_libcall_names};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
-use crate::{HELPER_NAMESPACE, Helper, LowerError, LoweredModule, function_symbol, lower_module};
+use crate::{
+    HELPER_NAMESPACE, Helper, LowerError, LoweredProgram, ProgramLowerError, function_symbol,
+    lower_program,
+};
 
-const HELPER_COUNT: u32 = 30;
+const HELPER_COUNT: u32 = 32;
 const AOT_MAGIC: u64 = u64::from_le_bytes(*b"BMTSAOT1");
-const AOT_ABI_VERSION: u32 = 1;
+const AOT_ABI_VERSION: u32 = 3;
 const UNIT_DESCRIPTOR_BYTES: usize = 16;
 const PROGRAM_DESCRIPTOR_BYTES: usize = 56;
 
@@ -33,7 +36,9 @@ pub struct AotObject {
     pub target: String,
     /// Exported descriptor symbol that roots the embedded program image.
     pub descriptor_symbol: &'static str,
-    /// Bytecode id of the program entry.
+    /// Canonical module id of the program entry.
+    pub entry_module: u32,
+    /// Bytecode function id local to `entry_module`.
     pub entry_function: u32,
     /// Native symbol implementing `entry_function`.
     pub entry_symbol: String,
@@ -50,8 +55,8 @@ pub enum AotError {
     TargetBuild(String),
     /// The target does not expose a usable byte order.
     TargetEndianness(String),
-    /// Shared bytecode-to-CLIF lowering failed.
-    Lower(LowerError),
+    /// Shared program lowering failed.
+    Lower(ProgramLowerError),
     /// The lowered module violated a backend invariant.
     InvalidLoweredModule(String),
     /// A Cranelift module declaration or definition failed.
@@ -87,21 +92,22 @@ impl Error for AotError {
     }
 }
 
-impl From<LowerError> for AotError {
-    fn from(error: LowerError) -> Self {
+impl From<ProgramLowerError> for AotError {
+    fn from(error: ProgramLowerError) -> Self {
         Self::Lower(error)
     }
 }
 
-fn require_64_bit_pointer_width(bits: u8) -> Result<(), AotError> {
+fn require_64_bit_pointer_width(bits: u8) -> Result<(), LowerError> {
     if bits != 64 {
-        Err(AotError::Lower(LowerError::UnsupportedPointerWidth { bits }))
+        Err(LowerError::UnsupportedPointerWidth { bits })
     } else {
         Ok(())
     }
 }
 
-/// Compiles a verified module into one relocatable object for `target`.
+/// Compiles every module of one verified canonical program into one relocatable
+/// object for `target`. Module-local pools and ids remain module-local.
 ///
 /// The object contains every lowered function, the canonical bytecode encoding,
 /// a `UnitDescriptor` record for every function, and the exported
@@ -114,7 +120,7 @@ fn require_64_bit_pointer_width(bits: u8) -> Result<(), AotError> {
 /// object module rejects a declaration or definition, or object serialization
 /// fails.
 pub fn compile_aot(
-    bytecode: &BytecodeModule<Verified>,
+    bytecode: &BytecodeProgram<Verified>,
     target: &str,
 ) -> Result<AotObject, AotError> {
     let flags = Flags::new(settings::builder());
@@ -123,7 +129,12 @@ pub fn compile_aot(
     let isa = isa_builder
         .finish(flags)
         .map_err(|error| AotError::TargetBuild(error.to_string()))?;
-    require_64_bit_pointer_width(isa.frontend_config().pointer_bits())?;
+    require_64_bit_pointer_width(isa.frontend_config().pointer_bits()).map_err(|kind| {
+        AotError::Lower(ProgramLowerError {
+            module: bamts_bytecode::ModuleId::new(0),
+            kind,
+        })
+    })?;
     let target_endianness = isa
         .triple()
         .endianness()
@@ -134,14 +145,15 @@ pub fn compile_aot(
         .endianness()
         .expect("x86-64 has a defined byte order");
     let little_endian = target_endianness == little_endianness;
-    let lowered = lower_module(bytecode, isa.frontend_config())?;
+    let lowered = lower_program(bytecode, isa.frontend_config())?;
     let normalized_target = isa.triple().to_string();
+    let call_conv = isa.frontend_config().default_call_conv;
     let builder = ObjectBuilder::new(isa, "bamts", default_libcall_names())
         .map_err(|error| AotError::Module(error.to_string()))?;
     let mut object = ObjectModule::new(builder);
 
     let function_ids = declare_functions(&mut object, &lowered)?;
-    let helper_ids = declare_helpers(&mut object, lowered.call_conv)?;
+    let helper_ids = declare_helpers(&mut object, call_conv)?;
     define_functions(&mut object, &lowered, &function_ids, &helper_ids)?;
     define_program_data(
         &mut object,
@@ -154,14 +166,17 @@ pub fn compile_aot(
     let required_helpers = (0..HELPER_COUNT)
         .filter_map(Helper::from_external_index)
         .filter(|helper| {
-            lowered
-                .functions
-                .iter()
-                .any(|function| function.helpers.contains(helper))
+            lowered.modules.iter().any(|module| {
+                module
+                    .functions
+                    .iter()
+                    .any(|function| function.helpers.contains(helper))
+            })
         })
         .map(Helper::symbol)
         .collect();
-    let entry_function = lowered.entry.get();
+    let entry_module = lowered.entry_module.get();
+    let entry_function = lowered.entry_function.get();
     let bytes = object
         .finish()
         .emit()
@@ -171,38 +186,54 @@ pub fn compile_aot(
         bytes,
         target: normalized_target,
         descriptor_symbol: PROGRAM_DESCRIPTOR_SYMBOL,
+        entry_module,
         entry_function,
-        entry_symbol: function_symbol(entry_function),
+        entry_symbol: function_symbol(entry_module, entry_function),
         required_helpers,
     })
 }
 
+struct DeclaredUnit {
+    module_id: u32,
+    function_id: u32,
+    function: FuncId,
+}
+
 fn declare_functions(
     object: &mut ObjectModule,
-    lowered: &LoweredModule,
-) -> Result<Vec<FuncId>, AotError> {
-    lowered
-        .functions
+    lowered: &LoweredProgram,
+) -> Result<Vec<DeclaredUnit>, AotError> {
+    let function_count = lowered
+        .modules
         .iter()
-        .enumerate()
-        .map(|(index, function)| {
-            if function.id.get() as usize != index {
+        .map(|module| module.functions.len())
+        .sum();
+    let mut units = Vec::with_capacity(function_count);
+    for (module_index, module) in lowered.modules.iter().enumerate() {
+        if module.id.get() as usize != module_index {
+            return Err(AotError::InvalidLoweredModule(format!(
+                "module {} appears at index {module_index}",
+                module.id.get()
+            )));
+        }
+        for (function_index, function) in module.functions.iter().enumerate() {
+            if function.id.get() as usize != function_index {
                 return Err(AotError::InvalidLoweredModule(format!(
-                    "function {} appears at index {index}",
+                    "module {} function {} appears at local index {function_index}",
+                    module.id.get(),
                     function.id.get()
                 )));
             }
-            let id = object
-                .declare_function(&function.symbol, Linkage::Export, &function.signature)
-                .map_err(|error| AotError::Module(error.to_string()))?;
-            if id.as_u32() as usize != index {
-                return Err(AotError::InvalidLoweredModule(
-                    "object function ids are not index-ordered".to_string(),
-                ));
-            }
-            Ok(id)
-        })
-        .collect()
+            units.push(DeclaredUnit {
+                module_id: module.id.get(),
+                function_id: function.id.get(),
+                function: object
+                    .declare_function(&function.symbol, Linkage::Export, &function.signature)
+                    .map_err(|error| AotError::Module(error.to_string()))?,
+            });
+        }
+    }
+    Ok(units)
 }
 
 fn declare_helpers(
@@ -227,17 +258,21 @@ fn declare_helpers(
 
 fn define_functions(
     object: &mut ObjectModule,
-    lowered: &LoweredModule,
-    function_ids: &[FuncId],
+    lowered: &LoweredProgram,
+    units: &[DeclaredUnit],
     helper_ids: &[FuncId],
 ) -> Result<(), AotError> {
-    for (lowered_function, &function_id) in lowered.functions.iter().zip(function_ids) {
-        let mut function = lowered_function.clif.clone();
-        remap_helper_names(&mut function, helper_ids)?;
-        let mut context = Context::for_function(function);
-        object
-            .define_function(function_id, &mut context)
-            .map_err(|error| AotError::Module(error.to_string()))?;
+    let mut unit_index = 0;
+    for module in &lowered.modules {
+        for lowered_function in &module.functions {
+            let mut function = lowered_function.clif.clone();
+            remap_helper_names(&mut function, helper_ids)?;
+            let mut context = Context::for_function(function);
+            object
+                .define_function(units[unit_index].function, &mut context)
+                .map_err(|error| AotError::Module(error.to_string()))?;
+            unit_index += 1;
+        }
     }
     Ok(())
 }
@@ -269,13 +304,12 @@ fn remap_helper_names(function: &mut Function, helper_ids: &[FuncId]) -> Result<
 
 fn define_program_data(
     object: &mut ObjectModule,
-    lowered: &LoweredModule,
-    function_ids: &[FuncId],
+    lowered: &LoweredProgram,
+    function_ids: &[DeclaredUnit],
     bytecode: Vec<u8>,
     little_endian: bool,
 ) -> Result<(), AotError> {
-    let unit_bytes = lowered
-        .functions
+    let unit_bytes = function_ids
         .len()
         .checked_mul(UNIT_DESCRIPTOR_BYTES)
         .ok_or_else(|| AotError::InvalidLoweredModule("unit table size overflow".to_string()))?;
@@ -299,19 +333,21 @@ fn define_program_data(
         .declare_data(UNITS_SYMBOL, Linkage::Local, false, false)
         .map_err(|error| AotError::Module(error.to_string()))?;
     let mut unit_contents = vec![0; unit_bytes];
-    for (index, function) in lowered.functions.iter().enumerate() {
+    for (index, unit) in function_ids.iter().enumerate() {
+        let offset = index * UNIT_DESCRIPTOR_BYTES;
+        write_u32(&mut unit_contents, offset, unit.function_id, little_endian);
         write_u32(
             &mut unit_contents,
-            index * UNIT_DESCRIPTOR_BYTES,
-            function.id.get(),
+            offset + 4,
+            unit.module_id,
             little_endian,
         );
     }
     let mut units_data = DataDescription::new();
     units_data.define(unit_contents.into_boxed_slice());
     units_data.set_align(8);
-    for (index, &function_id) in function_ids.iter().enumerate() {
-        let function_ref = object.declare_func_in_data(function_id, &mut units_data);
+    for (index, unit) in function_ids.iter().enumerate() {
+        let function_ref = object.declare_func_in_data(unit.function, &mut units_data);
         units_data.write_function_addr((index * UNIT_DESCRIPTOR_BYTES + 8) as u32, function_ref);
     }
     object
@@ -336,7 +372,18 @@ fn define_program_data(
         function_ids.len() as u64,
         little_endian,
     );
-    write_u32(&mut descriptor, 48, lowered.entry.get(), little_endian);
+    write_u32(
+        &mut descriptor,
+        48,
+        lowered.entry_function.get(),
+        little_endian,
+    );
+    write_u32(
+        &mut descriptor,
+        52,
+        lowered.entry_module.get(),
+        little_endian,
+    );
 
     let mut descriptor_data = DataDescription::new();
     descriptor_data.define(descriptor.into_boxed_slice());
@@ -373,8 +420,9 @@ fn write_u64(bytes: &mut [u8], offset: usize, value: u64, little_endian: bool) {
 mod tests {
     use super::*;
     use bamts_bytecode::{
-        Constant, ConstantId, Function as BytecodeFunction, FunctionFlags, FunctionId, Instruction,
-        Module as BytecodeModule, Register,
+        Constant, ConstantId, EcmaString, Function as BytecodeFunction, FunctionFlags, FunctionId,
+        Instruction, Module, ModuleId, Program, ProgramDecodeLimits, ProgramModule, Register,
+        decode_verified_program,
     };
     use cranelift_object::object::{
         Object, ObjectSection, ObjectSymbol, RelocationTarget, SymbolIndex,
@@ -392,28 +440,44 @@ mod tests {
         )
     }
 
-    fn test_module() -> BytecodeModule<Verified> {
-        BytecodeModule::new(
-            vec![Constant::Undefined],
+    fn module(name: &str, value: i32, loads_constant: bool) -> ProgramModule<Verified> {
+        let code = if loads_constant {
             vec![
-                function(
-                    vec![
-                        Instruction::LoadConst {
-                            dst: Register::new(0),
-                            constant: ConstantId::new(0),
-                        },
-                        Instruction::Return {
-                            value: Register::new(0),
-                        },
-                    ],
-                    1,
-                ),
-                function(vec![Instruction::Halt], 0),
-            ],
-            FunctionId::new(1),
+                Instruction::LoadConst {
+                    dst: Register::new(0),
+                    constant: ConstantId::new(1),
+                },
+                Instruction::Return {
+                    value: Register::new(0),
+                },
+            ]
+        } else {
+            vec![Instruction::Halt]
+        };
+        ProgramModule {
+            name: ConstantId::new(0),
+            code: Module::new(
+                vec![
+                    Constant::String(EcmaString::from_utf8(name)),
+                    Constant::Int32(value),
+                ],
+                vec![function(code, u32::from(loads_constant))],
+                FunctionId::new(0),
+            )
+            .verify()
+            .expect("test module verifies"),
+            edges: Vec::new(),
+            bindings: Vec::new(),
+            exports: Vec::new(),
+        }
+    }
+
+    fn test_program() -> Program<Verified> {
+        Program::link(
+            vec![module("dependency", 7, true), module("entry", 42, false)],
+            ModuleId::new(1),
         )
-        .verify()
-        .expect("test bytecode verifies")
+        .expect("test program verifies")
     }
 
     fn target() -> &'static str {
@@ -469,20 +533,16 @@ mod tests {
     }
 
     #[test]
-    fn emits_pinned_descriptor_units_and_canonical_bytecode() {
-        let bytecode = test_module();
-        let canonical = bytecode.encode();
-        let emitted = compile_aot(&bytecode, target()).expect("AOT object emits");
+    fn emits_two_module_tuple_units_and_canonical_program() {
+        let program = test_program();
+        let canonical = program.encode();
+        let emitted = compile_aot(&program, target()).expect("AOT object emits");
         let file = cranelift_object::object::File::parse(&*emitted.bytes).expect("object parses");
 
         let (descriptor, descriptor_index) = symbol_bytes(&file, PROGRAM_DESCRIPTOR_SYMBOL);
         assert_eq!(descriptor.len(), PROGRAM_DESCRIPTOR_BYTES);
         assert_eq!(&descriptor[0..8], b"BMTSAOT1");
-        assert_eq!(u32::from_le_bytes(descriptor[8..12].try_into().unwrap()), 1);
-        assert_eq!(
-            u32::from_le_bytes(descriptor[12..16].try_into().unwrap()),
-            0
-        );
+        assert_eq!(u32::from_le_bytes(descriptor[8..12].try_into().unwrap()), 3);
         assert_eq!(
             u64::from_le_bytes(descriptor[24..32].try_into().unwrap()),
             canonical.len() as u64
@@ -493,11 +553,11 @@ mod tests {
         );
         assert_eq!(
             u32::from_le_bytes(descriptor[48..52].try_into().unwrap()),
-            1
+            0
         );
         assert_eq!(
             u32::from_le_bytes(descriptor[52..56].try_into().unwrap()),
-            0
+            1
         );
         assert_eq!(
             relocation_targets(&file, descriptor_index),
@@ -506,29 +566,48 @@ mod tests {
 
         let (embedded, _) = symbol_bytes(&file, BYTECODE_SYMBOL);
         assert_eq!(embedded, canonical);
+        let decoded = decode_verified_program(embedded, &ProgramDecodeLimits::default())
+            .expect("embedded canonical program decodes");
+        assert_eq!(decoded, program);
+        assert_eq!(decoded.encode(), embedded);
 
         let (units, units_index) = symbol_bytes(&file, UNITS_SYMBOL);
         assert_eq!(units.len(), 2 * UNIT_DESCRIPTOR_BYTES);
         assert_eq!(u32::from_le_bytes(units[0..4].try_into().unwrap()), 0);
         assert_eq!(u32::from_le_bytes(units[4..8].try_into().unwrap()), 0);
-        assert_eq!(u32::from_le_bytes(units[16..20].try_into().unwrap()), 1);
-        assert_eq!(u32::from_le_bytes(units[20..24].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(units[16..20].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(units[20..24].try_into().unwrap()), 1);
         assert_eq!(
             relocation_targets(&file, units_index),
-            [function_symbol(0), function_symbol(1)]
+            [function_symbol(0, 0), function_symbol(1, 0)]
         );
         assert!(file.symbols().any(|symbol| {
             symbol.name() == Ok(emitted.entry_symbol.as_str()) && !symbol.is_undefined()
         }));
-        assert_eq!(emitted.required_helpers, [Helper::LoadConstant.symbol()]);
-        assert_eq!(emitted.entry_function, 1);
+        assert_eq!(
+            emitted.required_helpers,
+            [Helper::LoadConstant.symbol(), Helper::ConsumeFuel.symbol()]
+        );
+        assert!(file.symbols().any(|symbol| {
+            symbol.name() == Ok(Helper::ConsumeFuel.symbol()) && symbol.is_undefined()
+        }));
+        assert_eq!((emitted.entry_module, emitted.entry_function), (1, 0));
+        assert_eq!(emitted.entry_symbol, function_symbol(1, 0));
+    }
+
+    #[test]
+    fn object_emission_is_deterministic() {
+        let program = test_program();
+        let first = compile_aot(&program, target()).expect("first AOT object emits");
+        let second = compile_aot(&program, target()).expect("second AOT object emits");
+        assert_eq!(first, second);
     }
 
     #[test]
     fn require_64_bit_pointer_width_rejects_32() {
         assert!(matches!(
             require_64_bit_pointer_width(32),
-            Err(AotError::Lower(LowerError::UnsupportedPointerWidth { bits: 32 }))
+            Err(LowerError::UnsupportedPointerWidth { bits: 32 })
         ));
     }
 
@@ -539,7 +618,7 @@ mod tests {
 
     #[test]
     fn compile_aot_rejects_i686_without_panic() {
-        let error = compile_aot(&test_module(), "i686-unknown-linux-gnu")
+        let error = compile_aot(&test_program(), "i686-unknown-linux-gnu")
             .expect_err("i686 AOT target is rejected");
         assert!(matches!(error, AotError::TargetLookup(_)));
     }

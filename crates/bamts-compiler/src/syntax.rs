@@ -1537,7 +1537,7 @@ pub struct SequenceExpression {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AsExpression {
     pub expression: Box<Expr>,
-    pub type_node: Box<Ty>,
+    pub type_node: Option<Box<Ty>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
