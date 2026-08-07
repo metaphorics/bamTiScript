@@ -489,9 +489,11 @@ fn same_value<H: Host>(machine: &Machine<'_, H>, left: Value, right: Value) -> b
         (Some(Decoded::Number(a)), Some(Decoded::Int32(b)))
         | (Some(Decoded::Int32(b)), Some(Decoded::Number(a))) => {
             let b_f64 = f64::from(b);
-            if a.is_nan() && b_f64.is_nan() {
-                return true;
-            }
+            // b is an Int32 payload, so b_f64 is always finite — never NaN.
+            // Only a can be NaN, and NaN compares unequal to every finite
+            // f64, so SameValue(NaN, <int>) correctly falls through to false
+            // without a dedicated guard. The +0/-0 split still matters:
+            // Int32(0) maps to +0.0, so a negative zero must not match it.
             if a == 0.0 && b_f64 == 0.0 {
                 return a.is_sign_positive();
             }
@@ -3357,6 +3359,62 @@ mod tests {
             machine.prototype_value(bound).unwrap(),
             Some(machine.intrinsics.function_prototype),
             "bound builtin must still get %Function.prototype%"
+        );
+    }
+
+    #[test]
+    fn same_value_handles_nan_and_signed_zero_across_number_and_int32() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let machine = Machine::new(&module, &mut host, Limits::default());
+
+        let nan = Value::number(f64::NAN);
+        let pos_zero = Value::number(0.0);
+        let neg_zero = Value::number(-0.0);
+        let int_zero = Value::int32(0);
+        let int_five = Value::int32(5);
+
+        // Number/Number: NaN equals NaN, and +0/-0 stay distinct.
+        assert!(
+            same_value(&machine, nan, nan),
+            "NaN === NaN under SameValue"
+        );
+        assert!(
+            !same_value(&machine, nan, pos_zero),
+            "NaN !== 0 under SameValue"
+        );
+        assert!(
+            !same_value(&machine, pos_zero, neg_zero),
+            "+0 !== -0 under SameValue"
+        );
+        assert!(
+            same_value(&machine, neg_zero, neg_zero),
+            "-0 === -0 under SameValue"
+        );
+        assert!(same_value(&machine, pos_zero, pos_zero), "+0 === +0");
+
+        // Number/Int32: the Int32 side is always finite, so NaN can only come
+        // from the Number side and must NOT match any integer. Int32(0) is
+        // +0.0, so -0.0 must be distinct from it while +0.0 matches.
+        assert!(
+            !same_value(&machine, nan, int_zero),
+            "NaN !== Int32(0) under SameValue"
+        );
+        assert!(
+            !same_value(&machine, int_zero, nan),
+            "Int32(0) !== NaN under SameValue (symmetric)"
+        );
+        assert!(
+            same_value(&machine, pos_zero, int_zero),
+            "+0.0 === Int32(0)"
+        );
+        assert!(
+            !same_value(&machine, neg_zero, int_zero),
+            "-0.0 !== Int32(0): signed-zero distinction crosses the mixed branch"
+        );
+        assert!(
+            same_value(&machine, Value::number(5.0), int_five),
+            "5.0 === Int32(5)"
         );
     }
 }
