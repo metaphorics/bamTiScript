@@ -540,22 +540,34 @@ fn map_delete_for<H: Host>(
     let Some(entry_index) = entry_index else {
         return Ok(BuiltinOutcome::Value(Value::FALSE));
     };
-    let HeapEntry::Collection { entries, size, .. } = &mut machine.heap[slot] else {
-        unreachable!("collection brand was checked")
-    };
-    entries.remove(entry_index);
-    *size -= 1;
-    let mut rebuilt = crate::CollectionIndex::default();
-    let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
-        unreachable!("collection brand was checked")
-    };
-    for (index, entry) in entries.iter().enumerate() {
-        rebuilt.insert(crate::collection_key_hash(machine, entry.key), index);
+    // Extract the entry key and tombstone in one mutable pass, then compute
+    // the hash outside the mutable borrow to satisfy the borrow checker.
+    let entry_key;
+    {
+        let HeapEntry::Collection { entries, size, .. } = &mut machine.heap[slot] else {
+            unreachable!("collection brand was checked")
+        };
+        // Tombstone the entry rather than removing it: the `live` flag keeps
+        // index positions stable so live iterators keep valid order cursors,
+        // and only this one hash bucket needs pruning instead of a full rebuild.
+        entries[entry_index].live = false;
+        entry_key = entries[entry_index].key;
+        *size = size
+            .checked_sub(1)
+            .expect("delete found a live entry so size is at least one");
     }
-    let HeapEntry::Collection { index, .. } = &mut machine.heap[slot] else {
-        unreachable!("collection brand was checked")
-    };
-    *index = rebuilt;
+    let hash = crate::collection_key_hash(machine, entry_key);
+    {
+        let HeapEntry::Collection { index, .. } = &mut machine.heap[slot] else {
+            unreachable!("collection brand was checked")
+        };
+        if let Some(bucket) = index.buckets.get_mut(&hash) {
+            bucket.retain(|&idx| idx != entry_index);
+            if bucket.is_empty() {
+                index.buckets.remove(&hash);
+            }
+        }
+    }
     machine.refund_slot(
         slot,
         crate::CollectionEntry::BYTES + crate::CollectionIndex::ENTRY_BYTES,
@@ -563,13 +575,12 @@ fn map_delete_for<H: Host>(
     Ok(BuiltinOutcome::Value(Value::TRUE))
 }
 
-fn map_clear<H: Host>(
+fn collection_clear<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
-    _args: &[Value],
-    _constructing: bool,
+    expected: CollectionKind,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let slot = collection_slot(machine, this, CollectionKind::Map)?;
+    let slot = collection_slot(machine, this, expected)?;
     let removed = {
         let HeapEntry::Collection {
             entries,
@@ -593,6 +604,15 @@ fn map_clear<H: Host>(
             .expect("collection entry charge fits heap limits"),
     );
     Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+}
+
+fn map_clear<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    collection_clear(machine, this, CollectionKind::Map)
 }
 
 fn map_size<H: Host>(
@@ -730,30 +750,7 @@ fn set_clear<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let slot = collection_slot(machine, this, CollectionKind::Set)?;
-    let removed = {
-        let HeapEntry::Collection {
-            entries,
-            index,
-            size,
-            ..
-        } = &mut machine.heap[slot]
-        else {
-            unreachable!("collection brand was checked")
-        };
-        let removed = *size;
-        entries.clear();
-        index.clear();
-        *size = 0;
-        removed
-    };
-    machine.refund_slot(
-        slot,
-        removed
-            .checked_mul(crate::CollectionEntry::BYTES + crate::CollectionIndex::ENTRY_BYTES)
-            .expect("collection entry charge fits heap limits"),
-    );
-    Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+    collection_clear(machine, this, CollectionKind::Set)
 }
 
 fn set_size<H: Host>(
@@ -884,13 +881,27 @@ pub(super) fn append_collection_entry<H: Host>(
     else {
         unreachable!("collection slot owns collection storage")
     };
-    let entry_index = entries.len();
-    entries.push(crate::CollectionEntry {
-        order,
-        key,
-        value,
-        live: true,
-    });
+    // Reuse a tombstoned slot if one exists, so repeated insert-and-delete
+    // does not grow the entries vector without bound.
+    let entry_index = entries
+        .iter()
+        .position(|entry| !entry.live)
+        .unwrap_or(entries.len());
+    if entry_index == entries.len() {
+        entries.push(crate::CollectionEntry {
+            order,
+            key,
+            value,
+            live: true,
+        });
+    } else {
+        entries[entry_index] = crate::CollectionEntry {
+            order,
+            key,
+            value,
+            live: true,
+        };
+    }
     index.insert(hash, entry_index);
     *size += 1;
     *stored_next_order = next_order;
@@ -974,12 +985,18 @@ fn require_weak_key<H: Host>(machine: &Machine<'_, H>, key: Value) -> Result<(),
     let Some(index) = machine.runtime_slot(key).map_err(EvalFailure::Runtime)? else {
         return Err(type_error("Invalid value used as weak collection key"));
     };
+    // Exhaustive match: every HeapEntry variant is listed so adding a new
+    // one forces a decision here instead of silently rejecting it via `_`.
     let valid = match &machine.heap[index] {
-        HeapEntry::Symbol { .. } => !machine
-            .intrinsics
-            .symbol_registry
-            .values()
-            .any(|registered| *registered == key),
+        HeapEntry::Symbol { description } => {
+            // O(log n) registry lookup by description instead of scanning
+            // every registered symbol value on each weak-key validation.
+            !machine
+                .intrinsics
+                .symbol_registry
+                .get(description)
+                .is_some_and(|registered| *registered == key)
+        }
         HeapEntry::Object { .. }
         | HeapEntry::Array { .. }
         | HeapEntry::Function { .. }
@@ -998,7 +1015,16 @@ fn require_weak_key<H: Host>(machine: &Machine<'_, H>, key: Value) -> Result<(),
         | HeapEntry::Promise { .. }
         | HeapEntry::Timeout { .. }
         | HeapEntry::NativeFunction { .. } => true,
-        _ => false,
+        // Primitives and internal bookkeeping entries are not valid keys.
+        HeapEntry::Vacant
+        | HeapEntry::String(_)
+        | HeapEntry::BigInt(_)
+        | HeapEntry::PrivateName { .. }
+        | HeapEntry::Iterator { .. }
+        | HeapEntry::PromiseResolver { .. }
+        | HeapEntry::PromiseAll { .. }
+        | HeapEntry::PromiseAllElement { .. }
+        | HeapEntry::AsyncActivation { .. } => false,
     };
     if valid {
         Ok(())
@@ -1167,6 +1193,7 @@ mod tests {
         };
         entries
             .iter()
+            .filter(|entry| entry.live)
             .map(|entry| (entry.key, entry.value))
             .collect()
     }
@@ -2136,5 +2163,175 @@ mod tests {
         machine.collect_garbage();
 
         assert_eq!(slot(&machine, symbol), symbol_slot);
+    }
+
+    fn raw_entries_len(machine: &Machine<'_, TestHost>, obj: Value) -> usize {
+        let slot = machine
+            .runtime_slot(obj)
+            .unwrap()
+            .expect("runtime collection");
+        let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
+            panic!("not a collection")
+        };
+        entries.len()
+    }
+
+    #[test]
+    fn delete_tombstones_entry_without_shrinking_vector() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let map = construct_builtin(&mut machine, "Map", &[]);
+        map_put(
+            &mut machine,
+            map,
+            Value::int32(1),
+            Value::int32(10),
+            CollectionKind::Map,
+        )
+        .unwrap();
+        map_put(
+            &mut machine,
+            map,
+            Value::int32(2),
+            Value::int32(20),
+            CollectionKind::Map,
+        )
+        .unwrap();
+        assert_eq!(raw_entries_len(&machine, map), 2);
+
+        // Delete key 1 — the entry must be tombstoned, not removed.
+        assert!(matches!(
+            map_delete_for(&mut machine, map, &[Value::int32(1)], CollectionKind::Map),
+            Ok(BuiltinOutcome::Value(Value::TRUE))
+        ));
+        assert_eq!(
+            raw_entries_len(&machine, map),
+            2,
+            "tombstone must not shrink"
+        );
+        assert_eq!(
+            collection_entries(&machine, map),
+            vec![(Value::int32(2), Value::int32(20))],
+            "tombstoned entry must be invisible to collection_entries"
+        );
+
+        // has/get must not find the deleted key.
+        assert!(matches!(
+            map_has_for(&mut machine, map, &[Value::int32(1)], CollectionKind::Map),
+            Ok(BuiltinOutcome::Value(Value::FALSE))
+        ));
+        assert!(matches!(
+            map_get_for(&mut machine, map, &[Value::int32(1)], CollectionKind::Map),
+            Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+        ));
+
+        // Re-inserting key 1 must reuse the tombstoned slot, not grow the vector.
+        map_put(
+            &mut machine,
+            map,
+            Value::int32(1),
+            Value::int32(99),
+            CollectionKind::Map,
+        )
+        .unwrap();
+        assert_eq!(
+            raw_entries_len(&machine, map),
+            2,
+            "re-insert must reuse tombstoned slot"
+        );
+        assert_eq!(
+            collection_entries(&machine, map),
+            vec![
+                (Value::int32(1), Value::int32(99)),
+                (Value::int32(2), Value::int32(20))
+            ],
+        );
+    }
+
+    #[test]
+    fn delete_during_iteration_skips_tombstoned_entries() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let map = construct_builtin(&mut machine, "Map", &[]);
+        for n in 1..=3 {
+            map_put(
+                &mut machine,
+                map,
+                Value::int32(n),
+                Value::int32(n * 10),
+                CollectionKind::Map,
+            )
+            .unwrap();
+        }
+        // Delete key 2 before iterating; the iterator must skip the tombstone.
+        assert!(matches!(
+            map_delete_for(&mut machine, map, &[Value::int32(2)], CollectionKind::Map),
+            Ok(BuiltinOutcome::Value(Value::TRUE))
+        ));
+        let mut visited = Vec::new();
+        let mut cursor = 0;
+        while let Some((next, key, value)) =
+            collection_next(&machine, map, CollectionKind::Map, cursor).unwrap()
+        {
+            cursor = next;
+            visited.push((key, value));
+        }
+        assert_eq!(
+            visited,
+            vec![
+                (Value::int32(1), Value::int32(10)),
+                (Value::int32(3), Value::int32(30)),
+            ],
+            "iteration must skip tombstoned entries"
+        );
+    }
+
+    #[test]
+    fn weak_key_rejects_internal_bookkeeping_entries() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let weak_map = construct_builtin(&mut machine, "WeakMap", &[]);
+
+        // An ordinary object is a valid weak key (object-like).
+        let obj = ordinary_object(&mut machine);
+        assert!(
+            call_prototype_method(
+                &mut machine,
+                "WeakMap",
+                "set",
+                weak_map,
+                &[obj, Value::int32(1)],
+            )
+            .is_ok(),
+            "ordinary object must be a valid weak key"
+        );
+
+        // A registered symbol must be rejected (the catch-all previously
+        // handled this, but the linear scan was the performance problem).
+        let registered = symbol_for(&mut machine, Value::int32(42));
+        assert_type_error(call_prototype_method(
+            &mut machine,
+            "WeakMap",
+            "set",
+            weak_map,
+            &[registered, Value::int32(2)],
+        ));
+
+        // A local symbol must be accepted.
+        let local = local_symbol(&mut machine);
+        assert!(
+            call_prototype_method(
+                &mut machine,
+                "WeakMap",
+                "set",
+                weak_map,
+                &[local, Value::int32(3)],
+            )
+            .is_ok(),
+            "local Symbol must be a valid weak key"
+        );
     }
 }
