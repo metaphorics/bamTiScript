@@ -8,18 +8,18 @@ use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use bamts::discover_project;
+use bamts::{ResolutionError, resolve_project};
 use bamts_compiler::lower::LowerOptions;
 use bamts_compiler::pipeline::{
     FrontendMode, ProgramFrontendOutput, compile_program_frontend_with_lints,
 };
 use bamts_compiler::program::{
-    ProgramLoadError, ProgramLoader, ProgramLowerError, ResolvedProgram, lower_program,
+    ProgramLoadError, ProgramLowerError, ResolvedProgram, lower_program,
 };
 use bamts_compiler::{
     diagnostic::DiagnosticReport,
     lint::{LintOverride, LintProfile, LintTable},
-    project::{ProjectConfig, ProjectRoot, parse_bamts_toml},
+    project::parse_bamts_toml,
 };
 use bamts_runtime::{Limits, run_linked_program};
 
@@ -376,6 +376,22 @@ fn forbidden_lint_override(error: bamts_compiler::lint::ForbidOverrideError) -> 
         forbidden_by: error.forbidden_by().to_string(),
         lowered_by: error.lowered_by().to_string(),
     })
+}
+
+/// Maps the shared facade resolution error into the CLI's typed driver error,
+/// preserving the same variants the inlined code produced before unification.
+fn map_resolution_error(error: ResolutionError) -> DriverError {
+    match error {
+        ResolutionError::InvalidRoot(io_error) => {
+            DriverError::ProgramLoad(ProgramLoadError::InvalidRoot(io_error))
+        }
+        ResolutionError::ReadConfig { path, source } => DriverError::ReadSource { path, source },
+        ResolutionError::Config { path, source } => DriverError::ProjectConfig {
+            path,
+            message: source.to_string(),
+        },
+        ResolutionError::Load(load_error) => DriverError::ProgramLoad(load_error),
+    }
 }
 
 fn lower_options(args: &CliArgs) -> LowerOptions {
@@ -1020,37 +1036,15 @@ fn load_program_frontend(args: &CliArgs) -> Result<LoadedProgramFrontend, Driver
             .unwrap_or_else(|| Path::new("/"))
             .to_path_buf()
     };
-    let project = discover_project(&absolute_entrypoint, fallback_root);
-    let canonical_root = fs::canonicalize(project.root())
-        .map_err(|error| DriverError::ProgramLoad(ProgramLoadError::InvalidRoot(error)))?;
-    let root = ProjectRoot::new(canonical_root).map_err(|error| {
-        DriverError::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            error,
-        )))
-    })?;
-    let config_path = project.config().to_owned();
-    let config_source = if config_path.is_file() {
-        fs::read_to_string(&config_path).map_err(|source| DriverError::ReadSource {
-            path: config_path.clone(),
-            source,
-        })?
-    } else {
-        "{}".to_owned()
-    };
-    let config = ProjectConfig::parse(&root, &config_path, &config_source).map_err(|error| {
-        DriverError::ProjectConfig {
-            path: config_path,
-            message: error.to_string(),
-        }
-    })?;
-    let loader = ProgramLoader::new(&root, config.options()).map_err(DriverError::ProgramLoad)?;
-    let program = loader
-        .load(&absolute_entrypoint)
-        .map_err(DriverError::ProgramLoad)?;
-    let levels = levels(args, root.path())?;
-    let output = compile_program_frontend_with_lints(&program, FrontendMode::Check, &levels);
-    Ok(LoadedProgramFrontend { program, output })
+    let resolved =
+        resolve_project(&absolute_entrypoint, fallback_root).map_err(map_resolution_error)?;
+    let levels = levels(args, resolved.root.path())?;
+    let output =
+        compile_program_frontend_with_lints(&resolved.program, FrontendMode::Check, &levels);
+    Ok(LoadedProgramFrontend {
+        program: resolved.program,
+        output,
+    })
 }
 
 fn render_program_diagnostics(args: &CliArgs, frontend: &LoadedProgramFrontend) -> String {

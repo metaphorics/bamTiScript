@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use bamts_compiler::diagnostic::{Diagnostic, DiagnosticSeverity};
 use bamts_compiler::lower::LowerOptions;
 use bamts_compiler::pipeline::{FrontendMode, compile_program_frontend};
-use bamts_compiler::program::{ProgramLoadError, ProgramLoader, ProgramLowerError, lower_program};
+use bamts_compiler::program::{
+    ProgramLoadError, ProgramLoader, ProgramLowerError, ResolvedProgram, lower_program,
+};
 use bamts_compiler::project::{ConfigError, ProjectConfig, ProjectRoot};
 
 pub use bamts_bytecode as bytecode;
@@ -151,32 +153,8 @@ pub fn compile_source_file(
             "entrypoint has no parent directory",
         )))
     })?;
-    let project = discover_project(&path, fallback_root);
-    let root_path = fs::canonicalize(project.root())
-        .map_err(|error| Error::ProgramLoad(ProgramLoadError::InvalidRoot(error)))?;
-    let root = ProjectRoot::new(&root_path).map_err(|error| {
-        Error::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            error,
-        )))
-    })?;
-    let config_path = project.config().to_owned();
-    let config_source = if config_path.is_file() {
-        fs::read_to_string(&config_path).map_err(|source| Error::ReadConfig {
-            path: config_path.clone(),
-            source,
-        })?
-    } else {
-        "{}".to_owned()
-    };
-    let config = ProjectConfig::parse(&root, &config_path, &config_source).map_err(|source| {
-        Error::ProjectConfig {
-            path: config_path,
-            source,
-        }
-    })?;
-    let resolved = ProgramLoader::new(&root, config.options())?.load(&path)?;
-    let frontend = compile_program_frontend(&resolved, FrontendMode::Check);
+    let resolved = resolve_project(&path, fallback_root)?;
+    let frontend = compile_program_frontend(&resolved.program, FrontendMode::Check);
     let diagnostics = frontend
         .modules()
         .iter()
@@ -188,7 +166,7 @@ pub fn compile_source_file(
         return Err(Error::Diagnostics { diagnostics });
     }
     lower_program(
-        &resolved,
+        &resolved.program,
         &frontend,
         LowerOptions {
             javascript_compatibility: true,
@@ -321,6 +299,109 @@ pub fn discover_project(entrypoint: &Path, fallback_root: PathBuf) -> ProjectDis
         .find(|path| path.is_file())
         .unwrap_or_else(|| root.join("tsconfig.json"));
     ProjectDiscovery { root, config }
+}
+
+/// The project root and loaded module graph selected for a canonical entrypoint.
+#[derive(Debug)]
+pub struct ResolvedProject {
+    /// The canonicalized, validated project root.
+    pub root: ProjectRoot,
+    /// The loaded entrypoint and its complete local module graph.
+    pub program: ResolvedProgram,
+}
+
+/// A failure while selecting a project root and loading its module graph.
+#[derive(Debug)]
+pub enum ResolutionError {
+    /// The project root could not be canonicalized or is not absolute.
+    InvalidRoot(std::io::Error),
+    /// The project configuration file could not be read.
+    ReadConfig {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// The project configuration is invalid.
+    Config { path: PathBuf, source: ConfigError },
+    /// The entrypoint or one of its dependencies could not be loaded.
+    Load(ProgramLoadError),
+}
+
+impl fmt::Display for ResolutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRoot(error) => write!(formatter, "invalid project root: {error}"),
+            Self::ReadConfig { path, source } => write!(
+                formatter,
+                "could not read project configuration `{}`: {source}",
+                path.display()
+            ),
+            Self::Config { path, source } => write!(
+                formatter,
+                "invalid project configuration `{}`: {source}",
+                path.display()
+            ),
+            Self::Load(error) => write!(formatter, "could not load program: {error}"),
+        }
+    }
+}
+
+impl StdError for ResolutionError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::InvalidRoot(error) => Some(error),
+            Self::ReadConfig { source, .. } => Some(source),
+            Self::Config { source, .. } => Some(source),
+            Self::Load(error) => Some(error),
+        }
+    }
+}
+
+impl From<ResolutionError> for Error {
+    fn from(error: ResolutionError) -> Self {
+        match error {
+            ResolutionError::InvalidRoot(io_error) => {
+                Error::ProgramLoad(ProgramLoadError::InvalidRoot(io_error))
+            }
+            ResolutionError::ReadConfig { path, source } => Error::ReadConfig { path, source },
+            ResolutionError::Config { path, source } => Error::ProjectConfig { path, source },
+            ResolutionError::Load(load_error) => Error::ProgramLoad(load_error),
+        }
+    }
+}
+
+/// Selects a project root, reads its configuration, and loads the complete
+/// module graph for a canonical entrypoint.
+///
+/// `fallback_root` is used only when no `bamts.toml` or `tsconfig.json`
+/// ancestor exists; the caller chooses it (the CLI uses the current directory
+/// when the entrypoint is inside it, the facade uses the entrypoint's parent).
+pub fn resolve_project(
+    entrypoint: &Path,
+    fallback_root: PathBuf,
+) -> Result<ResolvedProject, ResolutionError> {
+    let project = discover_project(entrypoint, fallback_root);
+    let canonical_root = fs::canonicalize(project.root()).map_err(ResolutionError::InvalidRoot)?;
+    let root = ProjectRoot::new(canonical_root).map_err(|error| {
+        ResolutionError::InvalidRoot(std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+    })?;
+    let config_path = project.config().to_owned();
+    let config_source = if config_path.is_file() {
+        fs::read_to_string(&config_path).map_err(|source| ResolutionError::ReadConfig {
+            path: config_path.clone(),
+            source,
+        })?
+    } else {
+        "{}".to_owned()
+    };
+    let config = ProjectConfig::parse(&root, &config_path, &config_source).map_err(|source| {
+        ResolutionError::Config {
+            path: config_path,
+            source,
+        }
+    })?;
+    let loader = ProgramLoader::new(&root, config.options()).map_err(ResolutionError::Load)?;
+    let program = loader.load(entrypoint).map_err(ResolutionError::Load)?;
+    Ok(ResolvedProject { root, program })
 }
 
 #[cfg(test)]
