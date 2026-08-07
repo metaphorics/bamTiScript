@@ -2376,6 +2376,31 @@ mod tests {
     }
 
     #[test]
+    fn typeof_guard_narrows_a_union_in_both_branches() {
+        let result = check_text(
+            "declare function takesStr(s: string): number;\n\
+             declare function takesArr(a: string[]): number;\n\
+             function viaIf(g: string | string[]): number {\n\
+               if (typeof g === 'string') { return takesStr(g); }\n\
+               return takesArr(g);\n\
+             }\n\
+             function viaConditional(g: string | string[]): number {\n\
+               return typeof g === 'string' ? takesStr(g) : takesArr(g);\n\
+             }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn an_unguarded_union_member_is_still_rejected() {
+        let result = check_text(
+            "declare function takesStr(s: string): number;\n\
+             function unguarded(g: string | string[]): number { return takesStr(g); }",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C053"]);
+    }
+
+    #[test]
     fn a_derived_class_instance_flows_into_its_base_through_the_chain() {
         let result = check_text(
             "abstract class A { abstract readonly name: string; }\n\

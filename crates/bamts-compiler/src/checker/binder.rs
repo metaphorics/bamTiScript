@@ -20,6 +20,9 @@ use super::inference::{
 };
 use super::intrinsic_environment::GlobalEnvironment;
 use super::jsx::JsxCallable;
+use super::narrowing::{
+    FlowFacts, FlowKey, FlowNodeId, GuardResolver, NarrowingContext, NarrowingGuard,
+};
 use super::relations::{TypeRelation, TypeRelations};
 use super::{
     ACCESSOR_THIS_PARAMETER, AMBIENT_IMPLEMENTATION, ARGUMENT_COUNT_MISMATCH,
@@ -1155,6 +1158,36 @@ enum SuperCallContext {
     NonConstructor,
 }
 
+/// Answers [`GuardResolver`] from the binder's already-resolved facts.
+///
+/// It borrows only the fields guard interpretation reads, so the narrowing
+/// algebra can hold the type table mutably at the same time.
+struct BinderGuardResolver<'a> {
+    references: &'a HashMap<NodeId, SymbolId>,
+    node_types: &'a HashMap<NodeId, TypeId>,
+    source: &'a SourceFile,
+    fallback: TypeId,
+}
+
+impl GuardResolver for BinderGuardResolver<'_> {
+    fn resolve_identifier(&self, identifier: &IdentifierNode) -> Option<SymbolId> {
+        self.references.get(&identifier.id()).copied()
+    }
+
+    fn expression_type(&self, expression: &Expr) -> TypeId {
+        // Only `instanceof` consults this, and its right operand is typed before
+        // the guard is read. An untyped operand narrows nothing.
+        self.node_types
+            .get(&expression.id())
+            .copied()
+            .unwrap_or(self.fallback)
+    }
+
+    fn token_text(&self, token: &Token) -> &str {
+        self.source.token_text(token).unwrap_or("")
+    }
+}
+
 pub(crate) struct Binder<'src> {
     pub(crate) source: &'src SourceFile,
     intrinsics: GlobalEnvironment,
@@ -1205,6 +1238,11 @@ pub(crate) struct Binder<'src> {
     /// during class-body resolution so `new C()` and member access on class-typed
     /// values can resolve declared instance members.
     pub(crate) class_instance_types: HashMap<SymbolId, TypeId>,
+    /// Control-flow facts for guard narrowing, and the program point the walk
+    /// currently sits at. Constructs the walk does not model contribute no
+    /// facts, so a reference there falls back to its declared type.
+    flow_facts: FlowFacts,
+    flow: FlowNodeId,
     /// Enclosing function contexts for `super(...)` call legality, innermost
     /// last. Empty means top level, which behaves as
     /// [`SuperCallContext::NonConstructor`].
@@ -1307,6 +1345,8 @@ impl<'src> Binder<'src> {
             jsx_element_types: HashMap::new(),
             jsx_callables: HashMap::new(),
             class_instance_types: HashMap::new(),
+            flow_facts: FlowFacts::new(),
+            flow: FlowNodeId::ROOT,
             super_call_contexts: Vec::new(),
             class_derived_stack: Vec::new(),
             new_target_contexts: Vec::new(),
@@ -1506,6 +1546,65 @@ impl<'src> Binder<'src> {
 
     pub(crate) fn text(&self, token: &Token) -> &'src str {
         self.source.token_text(token).unwrap_or("")
+    }
+    // -- control-flow narrowing ------------------------------------------------
+
+    /// Guards a condition proves at `negated` polarity, with every guarded
+    /// symbol's declared type registered so the refinement has a base to narrow.
+    fn guards_for(&mut self, condition: &'src Expr, negated: bool) -> Vec<NarrowingGuard> {
+        let resolver = BinderGuardResolver {
+            references: &self.references,
+            node_types: &self.node_types,
+            source: self.source,
+            fallback: self.types.any(),
+        };
+        let mut narrowing = NarrowingContext::new(&mut self.types, &mut self.flow_facts);
+        let guards = narrowing.guards_from(condition, &resolver, negated);
+        for guard in &guards {
+            let symbol = guard.reference().root_symbol();
+            narrowing.declare(symbol, self.symbol_types[symbol.get() as usize]);
+        }
+        guards
+    }
+
+    /// Forks `parent` and refines the fork by `guards`.
+    fn branch_guarded(&mut self, parent: FlowNodeId, guards: &[NarrowingGuard]) -> FlowNodeId {
+        let mut narrowing = NarrowingContext::new(&mut self.types, &mut self.flow_facts);
+        let flow = narrowing.branch(parent);
+        narrowing.apply_guards(flow, guards);
+        flow
+    }
+
+    /// Runs `walk` at the program point `parent` refined by `guards`, then
+    /// restores the caller's point and reports where the branch ended.
+    fn in_branch(
+        &mut self,
+        parent: FlowNodeId,
+        guards: &[NarrowingGuard],
+        walk: impl FnOnce(&mut Self),
+    ) -> FlowNodeId {
+        let outer = self.flow;
+        self.flow = self.branch_guarded(parent, guards);
+        walk(self);
+        let ended = self.flow;
+        self.flow = outer;
+        ended
+    }
+
+    /// Merges forked points back into `parent` and settles the walk there.
+    fn join_flow(&mut self, parent: FlowNodeId, branches: &[FlowNodeId]) {
+        self.flow =
+            NarrowingContext::new(&mut self.types, &mut self.flow_facts).join(parent, branches);
+    }
+
+    /// Effective type of `symbol` at the current program point: the nearest
+    /// guard refinement, else `declared`.
+    fn narrowed_type(&mut self, symbol: SymbolId, declared: TypeId) -> TypeId {
+        let key = FlowKey::root(symbol);
+        let flow = self.flow;
+        let mut narrowing = NarrowingContext::new(&mut self.types, &mut self.flow_facts);
+        narrowing.declare(symbol, declared);
+        narrowing.type_at(flow, &key).unwrap_or(declared)
     }
 
     pub(crate) fn identifier_text(&self, identifier: &IdentifierNode) -> Cow<'src, str> {
@@ -2545,10 +2644,31 @@ impl<'src> Binder<'src> {
             Statement::Expression(statement) => self.resolve_expr(&statement.expression, scope),
             Statement::If(statement) => {
                 self.resolve_expr(&statement.test, scope);
-                self.resolve_statement(&statement.consequent, scope);
-                if let Some(alternate) = &statement.alternate {
-                    self.resolve_statement(alternate, scope);
+                let parent = self.flow;
+                let truthy = self.guards_for(&statement.test, false);
+                let falsy = self.guards_for(&statement.test, true);
+                let then_end = self.in_branch(parent, &truthy, |binder| {
+                    binder.resolve_statement(&statement.consequent, scope);
+                });
+                let else_end = self.in_branch(parent, &falsy, |binder| {
+                    if let Some(alternate) = &statement.alternate {
+                        binder.resolve_statement(alternate, scope);
+                    }
+                });
+                // Only branches control can fall out of reach the merge, so an
+                // `if (guard) { return; }` leaves the negated guard in force after it.
+                let mut live = Vec::with_capacity(2);
+                if !Self::statement_always_exits(statement.consequent.data()) {
+                    live.push(then_end);
                 }
+                if !statement
+                    .alternate
+                    .as_ref()
+                    .is_some_and(|alt| Self::statement_always_exits(alt.data()))
+                {
+                    live.push(else_end);
+                }
+                self.join_flow(parent, &live);
             }
             Statement::Switch(statement) => {
                 self.resolve_expr(&statement.discriminant, scope);
@@ -3638,6 +3758,34 @@ impl<'src> Binder<'src> {
         }
     }
 
+    /// Whether control can never fall out of `statement`, so a flow branch
+    /// ending in it contributes no facts to the merge after it.
+    ///
+    /// Conservative by construction: an unmodelled construct answers `false`,
+    /// which costs narrowing precision rather than soundness.
+    fn statement_always_exits(statement: &'src Statement) -> bool {
+        match statement {
+            Statement::Return(_)
+            | Statement::Throw(_)
+            | Statement::Break(_)
+            | Statement::Continue(_) => true,
+            Statement::Block(block) => block
+                .data()
+                .statements
+                .iter()
+                .any(|stmt| Self::statement_always_exits(stmt.data())),
+            Statement::Labeled(labeled) => Self::statement_always_exits(labeled.body.data()),
+            Statement::If(if_stmt) => {
+                Self::statement_always_exits(if_stmt.consequent.data())
+                    && if_stmt
+                        .alternate
+                        .as_ref()
+                        .is_some_and(|alt| Self::statement_always_exits(alt.data()))
+            }
+            _ => false,
+        }
+    }
+
     fn block_returns_value(block: &'src crate::syntax::Block) -> bool {
         block
             .statements
@@ -4035,8 +4183,16 @@ impl<'src> Binder<'src> {
                         self.resolve_expr(&conditional.alternate, scope);
                     }
                     None => {
-                        self.resolve_expr(&conditional.consequent, scope);
-                        self.resolve_expr(&conditional.alternate, scope);
+                        let parent = self.flow;
+                        let truthy = self.guards_for(&conditional.test, false);
+                        let falsy = self.guards_for(&conditional.test, true);
+                        let consequent_end = self.in_branch(parent, &truthy, |binder| {
+                            binder.resolve_expr(&conditional.consequent, scope);
+                        });
+                        let alternate_end = self.in_branch(parent, &falsy, |binder| {
+                            binder.resolve_expr(&conditional.alternate, scope);
+                        });
+                        self.join_flow(parent, &[consequent_end, alternate_end]);
                     }
                 }
             }
@@ -5485,10 +5641,11 @@ impl<'src> Binder<'src> {
     fn compute_type_of_expr(&mut self, expression: &'src Expr, scope: ScopeId) -> TypeId {
         match expression.data() {
             Expression::Identifier(identifier) => {
-                self.references.get(&identifier.id()).map_or_else(
-                    || self.types.any(),
-                    |symbol| self.symbol_types[symbol.get() as usize],
-                )
+                let Some(&symbol) = self.references.get(&identifier.id()) else {
+                    return self.types.any();
+                };
+                let declared = self.symbol_types[symbol.get() as usize];
+                self.narrowed_type(symbol, declared)
             }
             Expression::Literal(literal) => self.type_of_literal(literal),
             Expression::Parenthesized(inner) => self.type_of_expr(inner, scope),
@@ -5597,8 +5754,20 @@ impl<'src> Binder<'src> {
                     Some(true) => self.type_of_expr(conditional.consequent.as_ref(), scope),
                     Some(false) => self.type_of_expr(conditional.alternate.as_ref(), scope),
                     None => {
-                        let consequent = self.type_of_expr(conditional.consequent.as_ref(), scope);
-                        let alternate = self.type_of_expr(conditional.alternate.as_ref(), scope);
+                        // Each arm is typed at its own guarded program point, so a
+                        // `typeof x === "s" ? f(x) : g(x)` sees the narrowed `x`.
+                        let parent = self.flow;
+                        let truthy = self.guards_for(&conditional.test, false);
+                        let falsy = self.guards_for(&conditional.test, true);
+                        let mut consequent = self.types.any();
+                        self.in_branch(parent, &truthy, |binder| {
+                            consequent =
+                                binder.type_of_expr(conditional.consequent.as_ref(), scope);
+                        });
+                        let mut alternate = self.types.any();
+                        self.in_branch(parent, &falsy, |binder| {
+                            alternate = binder.type_of_expr(conditional.alternate.as_ref(), scope);
+                        });
                         if self.types.assignable(consequent, alternate) {
                             alternate
                         } else if self.types.assignable(alternate, consequent) {

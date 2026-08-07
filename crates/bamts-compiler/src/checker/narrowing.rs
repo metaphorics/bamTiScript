@@ -271,26 +271,28 @@ enum Narrow {
     Replace(TypeId),
 }
 
-/// Flow-fact table and narrowing algebra over one interned [`TypeTable`].
+/// Flow facts accumulated over one flow pass: the declared type of every
+/// trackable symbol plus the frame tree of refinements.
 ///
-/// Construct once per flow pass, register the declared type of every
-/// trackable symbol with [`NarrowingContext::declare`], then drive it over
-/// the syntax: fork frames with [`NarrowingContext::branch`], apply guard
-/// conditions with [`NarrowingContext::narrow_by_condition`], and merge
-/// frames with [`NarrowingContext::join`].
-pub struct NarrowingContext<'table> {
-    table: &'table mut TypeTable,
+/// State lives here rather than in [`NarrowingContext`] so the checker can own
+/// it across a whole walk while the [`TypeTable`] stays borrowable between
+/// narrowing steps.
+pub struct FlowFacts {
     declared: HashMap<SymbolId, TypeId>,
     frames: Vec<FlowFrame>,
 }
 
-impl<'table> NarrowingContext<'table> {
-    /// Opens a narrowing session over `table`, with [`FlowNodeId::ROOT`] as
-    /// the entry frame.
+impl Default for FlowFacts {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FlowFacts {
+    /// Opens an empty fact table whose only frame is [`FlowNodeId::ROOT`].
     #[must_use]
-    pub fn new(table: &'table mut TypeTable) -> Self {
+    pub fn new() -> Self {
         Self {
-            table,
             declared: HashMap::new(),
             frames: vec![FlowFrame {
                 parent: None,
@@ -298,17 +300,37 @@ impl<'table> NarrowingContext<'table> {
             }],
         }
     }
+}
+
+/// Narrowing algebra over one interned [`TypeTable`] and one [`FlowFacts`].
+///
+/// Register the declared type of every trackable symbol with
+/// [`NarrowingContext::declare`], then drive it over the syntax: fork frames
+/// with [`NarrowingContext::branch`], apply guard conditions with
+/// [`NarrowingContext::narrow_by_condition`], and merge frames with
+/// [`NarrowingContext::join`].
+pub struct NarrowingContext<'a> {
+    table: &'a mut TypeTable,
+    facts: &'a mut FlowFacts,
+}
+
+impl<'a> NarrowingContext<'a> {
+    /// Borrows `table` and `facts` for one narrowing step.
+    #[must_use]
+    pub fn new(table: &'a mut TypeTable, facts: &'a mut FlowFacts) -> Self {
+        Self { table, facts }
+    }
 
     /// Registers the declared type of a trackable symbol: the fallback every
     /// flow lookup returns to when no refinement applies.
     pub fn declare(&mut self, symbol: SymbolId, declared: TypeId) {
-        self.declared.insert(symbol, declared);
+        self.facts.declared.insert(symbol, declared);
     }
 
     /// The declared type of a symbol, if registered.
     #[must_use]
     pub fn declared_type(&self, symbol: SymbolId) -> Option<TypeId> {
-        self.declared.get(&symbol).copied()
+        self.facts.declared.get(&symbol).copied()
     }
 
     /// Forks a frame that inherits every fact visible at `flow`.
@@ -363,7 +385,7 @@ impl<'table> NarrowingContext<'table> {
     /// Records an unconditional fact — an assignment's new declared type, or
     /// a guard's refinement — at one program point.
     pub fn refine(&mut self, flow: FlowNodeId, key: FlowKey, ty: TypeId) {
-        self.frames[flow.index()].facts.insert(key, ty);
+        self.facts.frames[flow.index()].facts.insert(key, ty);
     }
 
     /// The effective type of a reference at one program point: the nearest
@@ -374,13 +396,13 @@ impl<'table> NarrowingContext<'table> {
     pub fn type_at(&mut self, flow: FlowNodeId, key: &FlowKey) -> Option<TypeId> {
         let mut current = Some(flow);
         while let Some(id) = current {
-            let frame = &self.frames[id.index()];
+            let frame = &self.facts.frames[id.index()];
             if let Some(ty) = frame.facts.get(key) {
                 return Some(*ty);
             }
             current = frame.parent;
         }
-        let declared = self.declared.get(&key.root_symbol()).copied()?;
+        let declared = self.facts.declared.get(&key.root_symbol()).copied()?;
         self.project(declared, key.path())
     }
 
@@ -429,7 +451,7 @@ impl<'table> NarrowingContext<'table> {
             NarrowingGuard::Truthiness { negated, .. } => self.narrow_truthiness(current, *negated),
         };
         if narrowed != current {
-            self.frames[flow.index()]
+            self.facts.frames[flow.index()]
                 .facts
                 .insert(key.clone(), narrowed);
         }
@@ -443,7 +465,9 @@ impl<'table> NarrowingContext<'table> {
                 let root_narrowed =
                     self.narrow_discriminant(root_current, segment, *literal, *negated);
                 if root_narrowed != root_current {
-                    self.frames[flow.index()].facts.insert(root, root_narrowed);
+                    self.facts.frames[flow.index()]
+                        .facts
+                        .insert(root, root_narrowed);
                 }
             }
         }
@@ -686,8 +710,10 @@ impl<'table> NarrowingContext<'table> {
         parent: Option<FlowNodeId>,
         facts: HashMap<FlowKey, TypeId>,
     ) -> FlowNodeId {
-        let id = FlowNodeId(u32::try_from(self.frames.len()).expect("flow node count fits in u32"));
-        self.frames.push(FlowFrame { parent, facts });
+        let id = FlowNodeId(
+            u32::try_from(self.facts.frames.len()).expect("flow node count fits in u32"),
+        );
+        self.facts.frames.push(FlowFrame { parent, facts });
         id
     }
 
@@ -705,7 +731,7 @@ impl<'table> NarrowingContext<'table> {
             if id == ancestor {
                 return facts;
             }
-            let frame = &self.frames[id.index()];
+            let frame = &self.facts.frames[id.index()];
             for (key, ty) in &frame.facts {
                 facts.entry(key.clone()).or_insert(*ty);
             }
@@ -1167,7 +1193,8 @@ mod tests {
         );
         let union = table.union(&[string, number, null]);
         let number_or_null = table.union(&[number, null]);
-        let mut context = NarrowingContext::new(&mut table);
+        let mut facts = FlowFacts::new();
+        let mut context = NarrowingContext::new(&mut table, &mut facts);
 
         assert_eq!(
             context.narrow_typeof(union, TypeofName::String, false),
@@ -1213,7 +1240,8 @@ mod tests {
         let literal_union = table.union(&[a, b]);
         let nullable = table.union(&[string, null]);
         let nullish = table.union(&[null, undefined]);
-        let mut context = NarrowingContext::new(&mut table);
+        let mut facts = FlowFacts::new();
+        let mut context = NarrowingContext::new(&mut table, &mut facts);
 
         // `x === "a"` narrows a union containing string to the literal.
         assert_eq!(context.narrow_equality(union, a, false), a);
@@ -1242,7 +1270,8 @@ mod tests {
         let other = table.object_type(vec![PropertyType::new("other", false, table.number())]);
         let union = table.union(&[kinded, other]);
         let (number, never) = (table.number(), table.never());
-        let mut context = NarrowingContext::new(&mut table);
+        let mut facts = FlowFacts::new();
+        let mut context = NarrowingContext::new(&mut table, &mut facts);
 
         assert_eq!(context.narrow_in(union, "kind", false), kinded);
         assert_eq!(context.narrow_in(union, "kind", true), other);
@@ -1273,7 +1302,8 @@ mod tests {
         let with_tagless = table.union(&[circle, square, tagless]);
         let square_or_tagless = table.union(&[square, tagless]);
         let any = table.any();
-        let mut context = NarrowingContext::new(&mut table);
+        let mut facts = FlowFacts::new();
+        let mut context = NarrowingContext::new(&mut table, &mut facts);
 
         assert_eq!(
             context.narrow_discriminant(shape, "kind", circle_tag, false),
@@ -1318,7 +1348,8 @@ mod tests {
         let one_or_null = table.union(&[one, null]);
         let zero_or_false = table.union(&[zero, false_literal]);
         let zero_or_string = table.union(&[zero, string]);
-        let mut context = NarrowingContext::new(&mut table);
+        let mut facts = FlowFacts::new();
+        let mut context = NarrowingContext::new(&mut table, &mut facts);
 
         assert_eq!(context.narrow_truthiness(union, false), string);
         // The falsy branch keeps `string` too: the empty string is falsy.
@@ -1344,7 +1375,8 @@ mod tests {
         let mut table = TypeTable::new();
         let (animal, dog) = (table.named(symbol(1)), table.named(symbol(2)));
         let union = table.union(&[animal, dog]);
-        let mut context = NarrowingContext::new(&mut table);
+        let mut facts = FlowFacts::new();
+        let mut context = NarrowingContext::new(&mut table, &mut facts);
 
         assert_eq!(context.narrow_instanceof(union, animal, false), animal);
         assert_eq!(context.narrow_instanceof(union, animal, true), dog);
@@ -1358,7 +1390,8 @@ mod tests {
         let (string, number) = (table.string(), table.number());
         let union = table.union(&[string, number]);
         let key = FlowKey::root(symbol(1));
-        let mut context = NarrowingContext::new(&mut table);
+        let mut facts = FlowFacts::new();
+        let mut context = NarrowingContext::new(&mut table, &mut facts);
         context.declare(symbol(1), union);
 
         let positive = context.branch(FlowNodeId::ROOT);
@@ -1395,7 +1428,8 @@ mod tests {
         let (string, number) = (table.string(), table.number());
         let union = table.union(&[string, number]);
         let key = FlowKey::root(symbol(1));
-        let mut context = NarrowingContext::new(&mut table);
+        let mut facts = FlowFacts::new();
+        let mut context = NarrowingContext::new(&mut table, &mut facts);
         context.declare(symbol(1), union);
 
         let refined = context.branch(FlowNodeId::ROOT);
@@ -1440,7 +1474,8 @@ mod tests {
         let expected_sync = table.function(vec![number], string);
         let expected_annotated = table.function(vec![string, any], string);
         let expected_async = table.function(vec![number], body);
-        let mut context = NarrowingContext::new(&mut table);
+        let mut facts = FlowFacts::new();
+        let mut context = NarrowingContext::new(&mut table, &mut facts);
 
         // Unannotated parameters take the contextual parameter type; the
         // return is the body's own type, not the contextual return.
@@ -1474,7 +1509,8 @@ mod tests {
         let (one, two) = (table.number_literal("1"), table.number_literal("2"));
         let number_or_string = table.union(&[number, string]);
         let one_or_two = table.union(&[one, two]);
-        let mut context = NarrowingContext::new(&mut table);
+        let mut facts = FlowFacts::new();
+        let mut context = NarrowingContext::new(&mut table, &mut facts);
 
         assert_eq!(context.contextual_property_type(object, "x"), Some(number));
         assert_eq!(
@@ -1570,7 +1606,8 @@ mod tests {
         let mut table = model.types().clone();
         let string = table.string();
         let (x, branch_type, root_type) = {
-            let mut context = NarrowingContext::new(&mut table);
+            let mut facts = FlowFacts::new();
+            let mut context = NarrowingContext::new(&mut table, &mut facts);
             let guards = context.guards_from(test, &resolver, false);
             let [
                 NarrowingGuard::Typeof {
@@ -1614,7 +1651,8 @@ mod tests {
         let mut table = model.types().clone();
         let null = table.null_type();
         let branch_type = {
-            let mut context = NarrowingContext::new(&mut table);
+            let mut facts = FlowFacts::new();
+            let mut context = NarrowingContext::new(&mut table, &mut facts);
             let guards = context.guards_from(tests[0], &resolver, false);
             let [
                 NarrowingGuard::Equality {
@@ -1646,7 +1684,8 @@ mod tests {
         };
         let mut table = model.types().clone();
         {
-            let mut context = NarrowingContext::new(&mut table);
+            let mut facts = FlowFacts::new();
+            let mut context = NarrowingContext::new(&mut table, &mut facts);
             let guards = context.guards_from(tests[0], &resolver, false);
             let [
                 NarrowingGuard::In {
@@ -1682,7 +1721,8 @@ mod tests {
         };
         let mut table = model.types().clone();
         {
-            let mut context = NarrowingContext::new(&mut table);
+            let mut facts = FlowFacts::new();
+            let mut context = NarrowingContext::new(&mut table, &mut facts);
             let guards = context.guards_from(tests[0], &resolver, false);
             let [
                 NarrowingGuard::Instanceof {
@@ -1711,7 +1751,8 @@ mod tests {
         let mut table = model.types().clone();
         let string = table.string();
         let branch_type = {
-            let mut context = NarrowingContext::new(&mut table);
+            let mut facts = FlowFacts::new();
+            let mut context = NarrowingContext::new(&mut table, &mut facts);
             let guards = context.guards_from(tests[0], &resolver, false);
             let [NarrowingGuard::Truthiness { reference, negated }] = guards.as_slice() else {
                 panic!("expected one truthiness guard, got {guards:?}");
@@ -1745,7 +1786,8 @@ mod tests {
         };
         let mut table = model.types().clone();
         let (member_type, narrowed_root) = {
-            let mut context = NarrowingContext::new(&mut table);
+            let mut facts = FlowFacts::new();
+            let mut context = NarrowingContext::new(&mut table, &mut facts);
             let guards = context.guards_from(test, &resolver, false);
             let [
                 NarrowingGuard::Equality {
@@ -1805,7 +1847,8 @@ mod tests {
             class_type: model.types().any(),
         };
         let mut table = model.types().clone();
-        let mut context = NarrowingContext::new(&mut table);
+        let mut facts = FlowFacts::new();
+        let mut context = NarrowingContext::new(&mut table, &mut facts);
 
         // The truthy side of a conjunction proves both operands.
         let guards = context.guards_from(conjunction, &resolver, false);
@@ -1846,7 +1889,8 @@ mod tests {
         let mut table = model.types().clone();
         let nullish = table.union(&[table.null_type(), table.undefined_type()]);
         let branch_type = {
-            let mut context = NarrowingContext::new(&mut table);
+            let mut facts = FlowFacts::new();
+            let mut context = NarrowingContext::new(&mut table, &mut facts);
             let guards = context.guards_from(test, &resolver, false);
             let [
                 NarrowingGuard::Equality {
@@ -1881,7 +1925,8 @@ mod tests {
         );
         let animal = table.named(symbol(1));
         let with_error = table.union(&[animal, error]);
-        let mut context = NarrowingContext::new(&mut table);
+        let mut facts = FlowFacts::new();
+        let mut context = NarrowingContext::new(&mut table, &mut facts);
 
         // An opaque class operand covers nothing provably: a negative
         // `instanceof` must never subtract it, whatever the checked type.
@@ -1924,7 +1969,8 @@ mod tests {
         let error_or_null = table.union(&[error, null]);
         let a_or_error = table.union(&[a, error]);
 
-        let mut context = NarrowingContext::new(&mut table);
+        let mut facts = FlowFacts::new();
+        let mut context = NarrowingContext::new(&mut table, &mut facts);
 
         // typeof: the error member passes both polarities.
         assert_eq!(
