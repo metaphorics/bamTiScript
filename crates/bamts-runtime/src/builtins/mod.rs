@@ -613,6 +613,29 @@ fn install_error_type<H: Host>(
     globals.insert(EcmaString::from_utf8(name), constructor);
 }
 
+/// Installs a non-enumerable, writable, configurable data property on an error
+/// instance. ECMA-262 §20.5 requires error own fields (`message`, `cause`,
+/// `stack`, `errors`, ...) to be created with `CreateNonEnumerableDataPropertyOrThrow`.
+/// An ordinary `[[Set]]` would land them enumerable and walk the prototype chain
+/// into inherited accessors, so every field goes through `define_descriptor` with
+/// `enumerable: false` instead.
+fn define_error_field<H: Host>(
+    machine: &mut Machine<'_, H>,
+    object: Value,
+    name: &str,
+    value: Value,
+) -> Result<(), EvalFailure> {
+    machine.define_descriptor(
+        object,
+        PropertyKey::Named(EcmaString::from_utf8(name)),
+        Property::Data {
+            value,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        },
+    )
+}
 fn error_constructor<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
@@ -649,7 +672,7 @@ fn error_constructor<H: Host>(
             let errors = args.first().copied().unwrap_or(Value::UNDEFINED);
             let values = machine.iterable_values(errors)?;
             let array = allocate_array(machine, values)?;
-            machine.set_data_property(object, "errors", array)?;
+            define_error_field(machine, object, "errors", array)?;
             (1, 2)
         }
         "SuppressedError" => {
@@ -660,16 +683,7 @@ fn error_constructor<H: Host>(
                     args.get(1).copied().unwrap_or(Value::UNDEFINED),
                 ),
             ] {
-                machine.define_descriptor(
-                    object,
-                    PropertyKey::Named(EcmaString::from_utf8(property)),
-                    Property::Data {
-                        value,
-                        writable: true,
-                        enumerable: false,
-                        configurable: true,
-                    },
-                )?;
+                define_error_field(machine, object, property, value)?;
             }
             (2, 3)
         }
@@ -682,7 +696,7 @@ fn error_constructor<H: Host>(
         .transpose()?;
     if let Some(message) = &message {
         let text = allocate_string(machine, message.clone())?;
-        machine.set_data_property(object, "message", text)?;
+        define_error_field(machine, object, "message", text)?;
     }
     if let Some(options) = args
         .get(options_index)
@@ -692,7 +706,7 @@ fn error_constructor<H: Host>(
         let cause_key = PropertyKey::Named(EcmaString::from_utf8("cause"));
         if machine.has_property(options, &cause_key)? {
             let cause = machine.get_named_property(options, "cause")?;
-            machine.set_data_property(object, "cause", cause)?;
+            define_error_field(machine, object, "cause", cause)?;
         }
     }
     let mut stack = bamts_bytecode::EcmaStringBuilder::new();
@@ -707,7 +721,7 @@ fn error_constructor<H: Host>(
     }
     stack.push_utf8("\n    at <bamts>");
     let stack = allocate_string(machine, stack.finish())?;
-    machine.set_data_property(object, "stack", stack)?;
+    define_error_field(machine, object, "stack", stack)?;
     Ok(BuiltinOutcome::Value(object))
 }
 
@@ -1811,6 +1825,141 @@ mod tests {
                     configurable: true,
                 } if value == expected
             ));
+        }
+    }
+
+    #[test]
+    fn error_own_fields_are_non_enumerable() {
+        // ECMA-262 §20.5.6.2/§20.5.7.1/§20.5.8.1: message, cause, stack, and
+        // errors must be created with CreateNon EnumerableDataPropertyOrThrow.
+        // If they land enumerable, Object.keys/JSON.stringify leak stack and
+        // every other engine returns [] for `Object.keys(new Error("m"))`.
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        // Plain Error with a message: message + stack must be non-enumerable.
+        let error_constructor = machine.intrinsics.global("Error").expect("Error exists");
+        let message = machine
+            .allocate(HeapEntry::String(EcmaString::from_utf8("boom")))
+            .expect("message allocation succeeds");
+        let error = machine
+            .construct_value(error_constructor, &[message])
+            .expect("Error construction succeeds");
+        assert!(
+            machine.enumerable_keys(error).unwrap().is_empty(),
+            "Error own fields must not appear in Object.keys / for...in"
+        );
+        for field in ["message", "stack"] {
+            let descriptor = machine
+                .own_descriptor(error, &PropertyKey::Named(EcmaString::from_utf8(field)))
+                .expect("descriptor lookup succeeds")
+                .expect("Error has an own {field} property");
+            assert!(
+                matches!(
+                    descriptor,
+                    Property::Data {
+                        writable: true,
+                        enumerable: false,
+                        configurable: true,
+                        ..
+                    }
+                ),
+                "{field} must be a non-enumerable writable configurable data property"
+            );
+        }
+
+        // Error with a cause option: cause must be non-enumerable.
+        let cause = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .expect("cause object allocation succeeds");
+        let options = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .expect("options object allocation succeeds");
+        machine
+            .set_data_property(options, "cause", cause)
+            .expect("options.cause set succeeds");
+        let msg2 = machine
+            .allocate(HeapEntry::String(EcmaString::from_utf8("outer")))
+            .expect("message allocation succeeds");
+        let with_cause = machine
+            .construct_value(error_constructor, &[msg2, options])
+            .expect("Error with cause construction succeeds");
+        let cause_descriptor = machine
+            .own_descriptor(
+                with_cause,
+                &PropertyKey::Named(EcmaString::from_utf8("cause")),
+            )
+            .expect("descriptor lookup succeeds")
+            .expect("Error has an own cause property");
+        assert!(
+            matches!(
+                cause_descriptor,
+                Property::Data {
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                    ..
+                }
+            ),
+            "cause must be a non-enumerable writable configurable data property"
+        );
+        assert!(
+            machine.enumerable_keys(with_cause).unwrap().is_empty(),
+            "Error with cause must not expose any enumerable own fields"
+        );
+
+        // AggregateError: errors + message + stack must all be non-enumerable.
+        let aggregate_constructor = machine
+            .intrinsics
+            .global("AggregateError")
+            .expect("AggregateError exists");
+        let errors_array = machine
+            .allocate(HeapEntry::Array {
+                elements: vec![error],
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.array_prototype),
+                extensible: true,
+                length_writable: true,
+            })
+            .expect("errors array allocation succeeds");
+        let agg_message = machine
+            .allocate(HeapEntry::String(EcmaString::from_utf8("several")))
+            .expect("message allocation succeeds");
+        let aggregate = machine
+            .construct_value(aggregate_constructor, &[errors_array, agg_message])
+            .expect("AggregateError construction succeeds");
+        assert!(
+            machine.enumerable_keys(aggregate).unwrap().is_empty(),
+            "AggregateError own fields must not appear in Object.keys / for...in"
+        );
+        for field in ["errors", "message", "stack"] {
+            let descriptor = machine
+                .own_descriptor(aggregate, &PropertyKey::Named(EcmaString::from_utf8(field)))
+                .expect("descriptor lookup succeeds")
+                .expect("AggregateError has an own {field} property");
+            assert!(
+                matches!(
+                    descriptor,
+                    Property::Data {
+                        writable: true,
+                        enumerable: false,
+                        configurable: true,
+                        ..
+                    }
+                ),
+                "{field} must be a non-enumerable writable configurable data property"
+            );
         }
     }
 
