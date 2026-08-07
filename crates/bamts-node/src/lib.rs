@@ -11,7 +11,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 
 #[cfg(feature = "script-compiler")]
-use bamts_bytecode::{Program, Verified};
+use bamts_bytecode::{EcmaString, Program, Verified};
 use bamts_runtime::Host;
 
 /// Parent-to-AOT-child transport for the logical source entrypoint.
@@ -38,12 +38,18 @@ impl bamts_runtime::CompileProvider for ScriptCompiler {
         &mut self,
         source: bamts_runtime::ScriptSource<'_>,
     ) -> std::result::Result<Arc<Program<Verified>>, bamts_runtime::ScriptCompileError> {
-        bamts_compiler::compile_classic_script(
-            source.source,
-            &String::from_utf16_lossy(source.name),
-        )
-        .map(Arc::new)
-        .map_err(map_script_compile_error)
+        // Strict conversion preserves the exact name the caller supplied.
+        // Lossy conversion would replace unpaired surrogates with U+FFFD,
+        // causing diagnostics and module resolution to disagree with the
+        // caller's intent.
+        let resource_name = EcmaString::from_units(source.name)
+            .to_utf8_strict()
+            .map_err(|error| bamts_runtime::ScriptCompileError::IllFormedSource {
+                unit_offset: error.unit_offset,
+            })?;
+        bamts_compiler::compile_classic_script(source.source, &resource_name)
+            .map(Arc::new)
+            .map_err(map_script_compile_error)
     }
 }
 
@@ -1067,6 +1073,62 @@ mod tests {
         assert_eq!(error, AotProcessContextError::EnvironmentValue);
         assert!(host.argv().is_empty());
         assert_eq!(host.env("SAFE"), None);
+    }
+
+    #[cfg(feature = "script-compiler")]
+    #[test]
+    fn compile_script_passes_exact_resource_name_to_compiler() {
+        use bamts_bytecode::Constant;
+        use bamts_runtime::{CompileProvider, ScriptSource};
+
+        // A non-ASCII name proves the UTF-16 → UTF-8 path preserves every
+        // code point the caller supplied, rather than substituting or
+        // dropping characters.
+        let name: Vec<u16> = "café-σ-script.js".encode_utf16().collect();
+        let source: Vec<u16> = "1 + 1".encode_utf16().collect();
+
+        let program = ScriptCompiler
+            .compile_script(ScriptSource {
+                source: &source,
+                name: &name,
+            })
+            .expect("script compiles");
+
+        let module = &program.modules()[program.entry().get() as usize];
+        match &module.code().constants()[module.name().get() as usize] {
+            Constant::String(stored) => {
+                assert_eq!(
+                    stored
+                        .to_utf8_strict()
+                        .expect("module name is valid UTF-16"),
+                    "café-σ-script.js",
+                );
+            }
+            other => panic!("module name is a string constant, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "script-compiler")]
+    #[test]
+    fn compile_script_rejects_ill_formed_resource_name() {
+        use bamts_runtime::{CompileProvider, ScriptCompileError, ScriptSource};
+
+        // An unpaired high surrogate must not be silently replaced with
+        // U+FFFD; the caller should learn the name was ill-formed.
+        let name = [0xD800_u16];
+        let source: Vec<u16> = "1 + 1".encode_utf16().collect();
+
+        let error = ScriptCompiler
+            .compile_script(ScriptSource {
+                source: &source,
+                name: &name,
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ScriptCompileError::IllFormedSource { unit_offset: 0 }
+        );
     }
 }
 
