@@ -1120,8 +1120,8 @@ fn validate_feature_closures(root: &Path) -> Result<()> {
     // Positive check: unified workspace metadata closure.
     let metadata = cargo_metadata(root, None)?;
     let closure = codegen_closure(&metadata)?;
-    require_enabled_feature(&closure, "bamts-cli", "aot")?;
-    require_enabled_feature(&closure, "bamts-cli", "host-jit")?;
+    require_enabled_feature(&closure, "bamts-cli", "bamts-codegen", "aot")?;
+    require_enabled_feature(&closure, "bamts-cli", "bamts-codegen", "host-jit")?;
     require_present_package(&closure, "bamts-cli", "cranelift-object")?;
     require_present_package(&closure, "bamts-cli", "cranelift-jit")?;
     require_present_package(&closure, "bamts-cli", "bamts-native")?;
@@ -1218,37 +1218,26 @@ fn validate_feature_closures(root: &Path) -> Result<()> {
     // cargo_metadata + codegen_closure resolves correctly from bamts-codegen.
     let meta = cargo_metadata(root, Some("bamts-codegen/host-jit"))?;
     let closure = codegen_closure(&meta)?;
-    require_enabled_feature(&closure, "bamts-codegen/host-jit", "host-jit")?;
+    require_enabled_feature(
+        &closure,
+        "bamts-codegen/host-jit",
+        "bamts-codegen",
+        "host-jit",
+    )?;
     // `bamts-native/jit-entry` is activated transitively by
     // `bamts-codegen/host-jit`; verify it on bamts-native's features.
-    let native_features = closure
-        .package_features
-        .get("bamts-native")
-        .ok_or_else(|| {
-            workspace_error("bamts-codegen/host-jit closure does not contain bamts-native features")
-        })?;
-    if !native_features.contains("jit-entry") {
-        return Err(workspace_error(
-            "bamts-codegen/host-jit closure does not enable bamts-native/jit-entry",
-        ));
-    }
+    require_enabled_feature(
+        &closure,
+        "bamts-codegen/host-jit",
+        "bamts-native",
+        "jit-entry",
+    )?;
 
     // `bamts/host-jit`: host-jit is a feature of bamts (the facade), so we
     // must resolve from `bamts`, not `bamts-codegen`.
     let meta = cargo_metadata(root, Some("bamts/host-jit"))?;
     let closure = resolve_closure_from(&meta, "bamts")?;
-    // Verify host-jit reaches bamts-codegen with host-jit enabled.
-    let codegen_features = closure
-        .package_features
-        .get("bamts-codegen")
-        .ok_or_else(|| {
-            workspace_error("bamts/host-jit closure does not contain bamts-codegen features")
-        })?;
-    if !codegen_features.contains("host-jit") {
-        return Err(workspace_error(
-            "bamts/host-jit closure does not enable bamts-codegen/host-jit",
-        ));
-    }
+    require_enabled_feature(&closure, "bamts/host-jit", "bamts-codegen", "host-jit")?;
 
     Ok(())
 }
@@ -1304,14 +1293,19 @@ fn codegen_closure(metadata: &CargoMetadata) -> Result<ResolvedClosure> {
     resolve_closure_from(metadata, "bamts-codegen")
 }
 
-fn require_enabled_feature(closure: &ResolvedClosure, mode: &str, feature: &str) -> Result<()> {
+fn require_enabled_feature(
+    closure: &ResolvedClosure,
+    mode: &str,
+    package: &str,
+    feature: &str,
+) -> Result<()> {
     let active = closure
         .package_features
-        .get("bamts-codegen")
-        .ok_or_else(|| workspace_error("codegen closure lacks bamts-codegen features"))?;
+        .get(package)
+        .ok_or_else(|| workspace_error(format!("{mode} closure lacks `{package}` features")))?;
     if !active.contains(feature) {
         return Err(workspace_error(format!(
-            "{mode} metadata closure does not enable bamts-codegen feature `{feature}`"
+            "{mode} metadata closure does not enable `{package}` feature `{feature}`"
         )));
     }
 
