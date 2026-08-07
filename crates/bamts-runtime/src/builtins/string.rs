@@ -995,19 +995,29 @@ fn string_iterator<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let pieces: Vec<EcmaString> = text(machine, this)?
-        .code_points()
-        .map(|(_, code_point)| {
-            let mut builder = EcmaStringBuilder::new();
-            builder
-                .push_code_point(code_point)
-                .expect("EcmaString code point is valid");
-            builder.finish()
-        })
-        .collect();
-    let mut values = Vec::with_capacity(pieces.len());
-    for piece in pieces {
-        values.push(allocate_string(machine, piece)?);
+    let string = text(machine, this)?;
+    let count = string.code_points().count();
+    // The iterator protocol is lazy, so materializing every code point up
+    // front charges the machine slot by slot. Preflight the full allocation
+    // (one heap string per code point plus the backing array) before building
+    // anything, matching the pad/repeat discipline that fails fast on an
+    // oversized source instead of allocating toward the heap limit.
+    let piece_bytes = string.len_units().saturating_mul(2);
+    let array_bytes = count
+        .saturating_mul(std::mem::size_of::<Value>())
+        .saturating_add(1);
+    let total_bytes = piece_bytes.saturating_add(array_bytes).saturating_add(1);
+    let total_slots = count.saturating_add(2);
+    machine
+        .ensure_allocation_capacity(total_slots, total_bytes)
+        .map_err(EvalFailure::Runtime)?;
+    let mut values = Vec::with_capacity(count);
+    for (_, code_point) in string.code_points() {
+        let mut builder = EcmaStringBuilder::new();
+        builder
+            .push_code_point(code_point)
+            .expect("EcmaString code point is valid");
+        values.push(allocate_string(machine, builder.finish())?);
     }
     let source = allocate_array(machine, values)?;
     Ok(BuiltinOutcome::Value(super::collections::iterator(
@@ -1610,5 +1620,47 @@ mod unescape_tests {
                 "failed string expansion must not allocate or charge the machine"
             );
         }
+    }
+
+    #[test]
+    fn string_iterator_preflights_oversized_sources() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let source = machine
+            .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+            .expect("source string allocation succeeds");
+        let iterator_key = machine
+            .to_property_key(machine.intrinsics.builtins.symbol_iterator())
+            .expect("Symbol.iterator is a property key");
+        let iterator = machine
+            .get_property_key(
+                machine.intrinsics.builtins.string_prototype(),
+                &iterator_key,
+            )
+            .expect("string iterator is installed");
+        let before = (
+            machine.heap.len(),
+            machine.heap_bytes,
+            machine.machine_bytes,
+        );
+        // With no remaining heap budget, the iterator must fail fast instead
+        // of allocating one heap string per code point toward the limit.
+        machine.limits.max_heap_bytes = machine.heap_bytes;
+        assert!(matches!(
+            machine.call_value(iterator, source, &[]),
+            Err(EvalFailure::Runtime(
+                crate::RuntimeErrorKind::HeapByteLimitExceeded { .. }
+            ))
+        ));
+        assert_eq!(
+            (
+                machine.heap.len(),
+                machine.heap_bytes,
+                machine.machine_bytes
+            ),
+            before,
+            "a failed string iterator must not allocate or charge the machine"
+        );
     }
 }
