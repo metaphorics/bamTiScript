@@ -4,25 +4,62 @@
 //! The checker never mutates the syntax tree. It builds three immutable models
 //! from one traversal: a lexical [`Scope`] tree, a [`Symbol`] table populated by
 //! binding declarations, and an interned structural [`TypeTable`] used by the
-//! named type algebra and [`TypeTable::assignable`]. Binding detects duplicate
+//! named type algebra and the [`relations`] queries. Binding detects duplicate
 //! declarations, reference resolution detects unresolved local names, and
 //! variable initializers are checked against their annotations. Its diagnostics
 //! are merged with the front-end hard warnings and returned in canonical order
 //! alongside the [`SemanticModel`], following the crate's `Recovered` contract.
+//!
+//! Scope-tree, symbol-table, and type-table population lives in [`binder`];
+//! assignability, subtyping, and variance live in [`relations`]; type-parameter
+//! inference, contextual signatures, and inference priorities live in
+//! [`inference`]; control-flow narrowing and contextual typing live in
+//! [`narrowing`]; JSX namespace resolution, intrinsic lookup, and factory
+//! props checking live in [`jsx`]; this module keeps the public entry points
+//! and linked multi-file checking.
 
-use std::collections::{BTreeMap, HashMap};
+#[path = "checker/binder.rs"]
+pub(crate) mod binder;
+#[path = "checker/inference.rs"]
+pub mod inference;
+#[path = "checker/intrinsic_environment.rs"]
+pub(crate) mod intrinsic_environment;
+#[path = "checker/jsx.rs"]
+pub mod jsx;
+#[path = "checker/narrowing.rs"]
+pub mod narrowing;
+#[path = "checker/relations.rs"]
+pub mod relations;
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+use bamts_bytecode::EcmaString;
+
+pub use binder::{
+    PropertyType, Scope, ScopeId, ScopeKind, SemanticModel, Symbol, SymbolId, SymbolKind, Type,
+    TypeId, TypeTable,
+};
+pub(crate) use binder::{
+    bind_source, bind_source_with_environment, is_numeric_enum_initializer, source_is_module,
+};
+pub use inference::{
+    InferenceContext, InferenceParameter, InferencePriority, InferenceProvenance,
+    InferredTypeArgument, InferredTypeArguments,
+};
+pub use narrowing::{
+    FlowKey, FlowNodeId, GuardResolver, NarrowingContext, NarrowingGuard, TypeofName,
+};
+pub use relations::{RelationHazard, TypeRelation};
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
-use crate::source::TextRange;
+use crate::enum_plan::{self, EnumDeclarationBinding};
+use crate::lint::{LintProfile, LintTable};
+use crate::source::{SourceId, TextRange};
 use crate::syntax::{
-    ArrayElement, AssignmentTarget, BindingPattern, CallArgument, ClassDeclaration, ClassMember,
-    EntityName, Expr, Expression, ForBinding, ForInitializer, FunctionBody, FunctionLike,
-    FunctionType, IdentifierNode, ImportBinding, InterfaceDeclaration, KeywordType, Literal,
-    MemberProperty, NodeId, ObjectMember, PropertyName, SourceFile, Statement, Token, Ty,
-    TypeAliasDeclaration, TypeLiteral, TypeMember, TypeNode, TypeReference, VariableDeclaration,
-    VariableKind,
+    IdentifierNode, ImportBinding, ModuleExportName, NodeId, SourceFile, Statement,
 };
-use crate::warning::analyze_hard_warnings;
+use crate::warning::analyze_warnings;
+use intrinsic_environment::GlobalEnvironment;
 
 /// Diagnostic emitted when a block-scoped name redeclares an existing binding.
 pub const DUPLICATE_DECLARATION: DiagnosticCode = DiagnosticCode::new("BAMTS-C001");
@@ -30,2041 +67,1438 @@ pub const DUPLICATE_DECLARATION: DiagnosticCode = DiagnosticCode::new("BAMTS-C00
 pub const CANNOT_FIND_NAME: DiagnosticCode = DiagnosticCode::new("BAMTS-C002");
 /// Diagnostic emitted when a type reference resolves to no local type name.
 pub const CANNOT_FIND_TYPE: DiagnosticCode = DiagnosticCode::new("BAMTS-C003");
+/// Diagnostic emitted when a qualified type name's left side is not a namespace.
+pub const CANNOT_FIND_NAMESPACE: DiagnosticCode = DiagnosticCode::new("BAMTS-C013");
 /// Diagnostic emitted when an initializer is not assignable to its annotation.
 pub const TYPE_NOT_ASSIGNABLE: DiagnosticCode = DiagnosticCode::new("BAMTS-C004");
+/// Diagnostic emitted when an imported const-enum member cannot be resolved.
+pub const IMPORTED_CONST_ENUM_UNRESOLVED: DiagnosticCode = DiagnosticCode::new("BAMTS-C012");
+/// Diagnostic emitted when a const-enum export-star lookup has multiple candidates.
+pub const IMPORTED_CONST_ENUM_AMBIGUOUS: DiagnosticCode = DiagnosticCode::new("BAMTS-C016");
+/// Diagnostic emitted when a const-enum re-export chain cycles.
+pub const IMPORTED_CONST_ENUM_CYCLE: DiagnosticCode = DiagnosticCode::new("BAMTS-C014");
+/// Diagnostic emitted when an imported const-enum member was not already constant.
+pub const IMPORTED_CONST_ENUM_NONCONSTANT: DiagnosticCode = DiagnosticCode::new("BAMTS-C015");
+/// Diagnostic emitted when a `with` statement appears in a context that forbids it.
+pub const WITH_STATEMENT_NOT_ALLOWED: DiagnosticCode = DiagnosticCode::new("BAMTS-C023");
+/// Diagnostic emitted when an export assignment is mixed with another export.
+pub const MIXED_EXPORT_ASSIGNMENT: DiagnosticCode = DiagnosticCode::new("BAMTS-C017");
+/// Diagnostic emitted when a parameter carries a decorator.
+pub const PARAMETER_DECORATOR_NOT_SUPPORTED: DiagnosticCode = DiagnosticCode::new("BAMTS-C018");
+/// Diagnostic emitted when a constructor carries a decorator.
+pub const CONSTRUCTOR_DECORATOR_NOT_SUPPORTED: DiagnosticCode = DiagnosticCode::new("BAMTS-C019");
+/// Diagnostic emitted when an intrinsic JSX tag is absent from `JSX.IntrinsicElements`.
+pub const JSX_INTRINSIC_ELEMENT_NOT_FOUND: DiagnosticCode = DiagnosticCode::new("BAMTS-C020");
+/// Diagnostic emitted when a JSX tag's value type is neither callable nor constructible.
+pub const JSX_ELEMENT_TYPE_NOT_CALLABLE: DiagnosticCode = DiagnosticCode::new("BAMTS-C021");
+/// Diagnostic emitted when JSX attributes are not assignable to the element's props type.
+pub const JSX_ATTRIBUTES_NOT_ASSIGNABLE: DiagnosticCode = DiagnosticCode::new("BAMTS-C022");
+/// Diagnostic emitted when a `super` expression is not followed by an argument
+/// list or member access.
+pub const BARE_SUPER_EXPRESSION: DiagnosticCode = DiagnosticCode::new("BAMTS-C024");
+/// Diagnostic emitted when `super` is referenced in a class with no base class.
+pub const SUPER_REFERENCE_NON_DERIVED: DiagnosticCode = DiagnosticCode::new("BAMTS-C025");
+/// Diagnostic emitted when a `super(...)` call appears outside a constructor or
+/// inside a function nested in a constructor.
+pub const SUPER_CALL_OUTSIDE_CONSTRUCTOR: DiagnosticCode = DiagnosticCode::new("BAMTS-C026");
+/// Diagnostic emitted when a `super(...)` call appears in constructor parameter
+/// initializers.
+pub const SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS: DiagnosticCode = DiagnosticCode::new("BAMTS-C027");
 
 const DUPLICATE_MESSAGE: &str = "A block-scoped declaration cannot redeclare an existing binding.";
 const CANNOT_FIND_NAME_MESSAGE: &str = "Cannot find name in any enclosing scope.";
 const CANNOT_FIND_TYPE_MESSAGE: &str = "Cannot find type name in any enclosing scope.";
+const CANNOT_FIND_NAMESPACE_MESSAGE: &str = "Cannot find namespace in any enclosing scope.";
 const NOT_ASSIGNABLE_MESSAGE: &str = "Initializer type is not assignable to the annotated type.";
+/// Diagnostic emitted when a class property has no initializer and is not
+/// definitely assigned in the constructor.
+pub const PROPERTY_NOT_INITIALIZED: DiagnosticCode = DiagnosticCode::new("BAMTS-C028");
+/// Diagnostic emitted when an assignment target resolves to a function.
+pub const ASSIGNMENT_TO_FUNCTION: DiagnosticCode = DiagnosticCode::new("BAMTS-C029");
+/// Diagnostic emitted when an assignment target resolves to a namespace.
+pub const ASSIGNMENT_TO_NAMESPACE: DiagnosticCode = DiagnosticCode::new("BAMTS-C030");
+/// Diagnostic emitted when the left-hand side of a `for...in` statement is not a
+/// variable or property access.
+pub const FOR_IN_LEFT_HAND_SIDE_INVALID: DiagnosticCode = DiagnosticCode::new("BAMTS-C031");
+/// Diagnostic emitted when a `for...in` statement uses a `using` declaration as
+/// its left-hand side.
+pub const USING_DECLARATION_IN_FOR_IN: DiagnosticCode = DiagnosticCode::new("BAMTS-C032");
+/// Diagnostic emitted when a `for...in` statement uses an `await using`
+/// declaration as its left-hand side.
+pub const AWAIT_USING_DECLARATION_IN_FOR_IN: DiagnosticCode = DiagnosticCode::new("BAMTS-C033");
+/// Diagnostic emitted when a `using` or `await using` declaration uses a binding
+/// pattern instead of a single identifier.
+pub const USING_DECLARATION_BINDING_PATTERN: DiagnosticCode = DiagnosticCode::new("BAMTS-C034");
+/// Diagnostic emitted when a `using` or `await using` declaration lacks an
+/// initializer outside a `for...of` head.
+pub const USING_DECLARATION_MISSING_INITIALIZER: DiagnosticCode = DiagnosticCode::new("BAMTS-C035");
+/// Diagnostic emitted when an assignment or update target is not a variable or
+/// property access.
+pub const INVALID_ASSIGNMENT_TARGET: DiagnosticCode = DiagnosticCode::new("BAMTS-C036");
+/// Diagnostic emitted when a method or constructor signature in an interface or
+/// object type lacks a return type annotation.
+pub const MISSING_METHOD_RETURN_TYPE: DiagnosticCode = DiagnosticCode::new("BAMTS-C037");
+/// Diagnostic emitted when a variable is read before it has been assigned.
+pub const USED_BEFORE_ASSIGNED: DiagnosticCode = DiagnosticCode::new("BAMTS-C038");
+/// Diagnostic emitted when a function overload signature has no implementation
+/// immediately following it.
+pub const FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION: DiagnosticCode =
+    DiagnosticCode::new("BAMTS-C039");
+/// Diagnostic emitted when a function or method overload implementation has a
+/// different name than the preceding overload signature(s).
+pub const FUNCTION_IMPLEMENTATION_WRONG_NAME: DiagnosticCode = DiagnosticCode::new("BAMTS-C049");
+/// Diagnostic emitted when a constructor declaration has type parameters.
+pub const CONSTRUCTOR_TYPE_PARAMETERS: DiagnosticCode = DiagnosticCode::new("BAMTS-C050");
+/// Diagnostic emitted when a statement appears in an ambient context where
+/// only declarations are allowed.
+pub const STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT: DiagnosticCode =
+    DiagnosticCode::new("BAMTS-C052");
+/// Diagnostic emitted when a function call argument is not assignable to the
+/// declared parameter type.
+pub const ARGUMENT_NOT_ASSIGNABLE: DiagnosticCode = DiagnosticCode::new("BAMTS-C053");
+/// Diagnostic emitted when the number of arguments in a call does not match
+/// the callable's parameter count.
+pub const ARGUMENT_COUNT_MISMATCH: DiagnosticCode = DiagnosticCode::new("BAMTS-C054");
+/// Diagnostic emitted when a property access names a member that does not exist
+/// on the object's apparent type.
+pub const PROPERTY_DOES_NOT_EXIST: DiagnosticCode = DiagnosticCode::new("BAMTS-C057");
+/// Diagnostic emitted when an expression with no call signatures is invoked.
+pub const EXPRESSION_NOT_CALLABLE: DiagnosticCode = DiagnosticCode::new("BAMTS-C055");
+/// Diagnostic emitted when a function declaration appears inside a block-like
+/// scope in strict mode while targeting 'ES5'.
+pub const FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT: DiagnosticCode =
+    DiagnosticCode::new("BAMTS-C040");
+/// Diagnostic emitted when an import declaration introduces a name that is
+/// already declared by a local value declaration.
+pub const IMPORT_CONFLICTS_WITH_LOCAL: DiagnosticCode = DiagnosticCode::new("BAMTS-C041");
+/// Diagnostic emitted when `new.target` is used outside the body of a function
+/// declaration, function expression, or constructor.
+pub const NEW_TARGET_OUTSIDE_FUNCTION: DiagnosticCode = DiagnosticCode::new("BAMTS-C044");
+/// Diagnostic emitted when a function or class member body appears in an
+/// ambient context.
+pub const AMBIENT_IMPLEMENTATION: DiagnosticCode = DiagnosticCode::new("BAMTS-C046");
+pub const SET_ACCESSOR_PARAMETER_INITIALIZER: DiagnosticCode = DiagnosticCode::new("BAMTS-C045");
+/// Diagnostic emitted when a 'get' accessor has one or more parameters.
+pub const GET_ACCESSOR_PARAMETERS: DiagnosticCode = DiagnosticCode::new("BAMTS-C047");
+/// Diagnostic emitted when a 'get' accessor does not return a value.
+pub const GET_ACCESSOR_NO_RETURN: DiagnosticCode = DiagnosticCode::new("BAMTS-C048");
+/// Diagnostic emitted when a 'get' or 'set' accessor declares a 'this' parameter.
+pub const ACCESSOR_THIS_PARAMETER: DiagnosticCode = DiagnosticCode::new("BAMTS-C058");
+const PROPERTY_NOT_INITIALIZED_MESSAGE: &str =
+    "Property has no initializer and is not definitely assigned in the constructor.";
+const ASSIGNMENT_TO_FUNCTION_MESSAGE: &str = "Cannot assign to a function.";
+const ASSIGNMENT_TO_NAMESPACE_MESSAGE: &str = "Cannot assign to a namespace.";
+const WITH_STATEMENT_NOT_ALLOWED_MESSAGE: &str =
+    "The 'with' statement is not allowed in this context.";
+const FOR_IN_LEFT_HAND_SIDE_INVALID_MESSAGE: &str =
+    "The left-hand side of a 'for...in' statement must be a variable or a property access.";
+const USING_DECLARATION_IN_FOR_IN_MESSAGE: &str =
+    "The left-hand side of a 'for...in' statement cannot be a 'using' declaration.";
+const AWAIT_USING_DECLARATION_IN_FOR_IN_MESSAGE: &str =
+    "The left-hand side of a 'for...in' statement cannot be an 'await using' declaration.";
+const MIXED_EXPORT_ASSIGNMENT_MESSAGE: &str =
+    "An export assignment cannot be used with other exported elements.";
+const PARAMETER_DECORATOR_NOT_SUPPORTED_MESSAGE: &str = "Parameter decorators are not supported.";
+const CONSTRUCTOR_DECORATOR_NOT_SUPPORTED_MESSAGE: &str =
+    "Constructor decorators are not supported.";
+const USING_DECLARATION_BINDING_PATTERN_MESSAGE: &str =
+    "'using' declarations may not have binding patterns.";
+const USING_DECLARATION_MISSING_INITIALIZER_MESSAGE: &str =
+    "'using' declarations must be initialized.";
+const INVALID_ASSIGNMENT_TARGET_MESSAGE: &str =
+    "The left-hand side of an assignment expression must be a variable or a property access.";
+const USED_BEFORE_ASSIGNED_MESSAGE: &str = "Variable is used before being assigned.";
+const FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION_MESSAGE: &str =
+    "Function implementation is missing or not immediately following its declaration.";
+const FUNCTION_IMPLEMENTATION_WRONG_NAME_MESSAGE: &str =
+    "Function implementation name does not match overload signature.";
+const CONSTRUCTOR_TYPE_PARAMETERS_MESSAGE: &str =
+    "Type parameters cannot appear on a constructor declaration.";
+const STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT_MESSAGE: &str =
+    "Statements are not allowed in ambient contexts.";
+const FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT_MESSAGE: &str =
+    "Function declarations are not allowed inside blocks in strict mode when targeting 'ES5'.";
+const IMPORT_CONFLICTS_WITH_LOCAL_MESSAGE: &str =
+    "Import declaration conflicts with a local declaration.";
+const NEW_TARGET_OUTSIDE_FUNCTION_MESSAGE: &str = "Meta-property 'new.target' is only allowed in the body of a function declaration, function expression, or constructor.";
+const AMBIENT_IMPLEMENTATION_MESSAGE: &str =
+    "An implementation cannot be declared in ambient contexts.";
+const SET_ACCESSOR_PARAMETER_INITIALIZER_MESSAGE: &str =
+    "A 'set' accessor parameter cannot have an initializer.";
+const GET_ACCESSOR_PARAMETERS_MESSAGE: &str = "A 'get' accessor cannot have parameters.";
+const GET_ACCESSOR_NO_RETURN_MESSAGE: &str = "A 'get' accessor must return a value.";
+const ACCESSOR_THIS_PARAMETER_MESSAGE: &str =
+    "A 'get' or 'set' accessor cannot declare a 'this' parameter.";
+pub(crate) const JSX_INTRINSIC_ELEMENT_NOT_FOUND_MESSAGE: &str =
+    "Property does not exist on type 'JSX.IntrinsicElements'";
+pub(crate) const JSX_ELEMENT_TYPE_NOT_CALLABLE_MESSAGE: &str =
+    "JSX element type is neither a construct nor a call signature.";
+pub(crate) const JSX_ATTRIBUTES_NOT_ASSIGNABLE_MESSAGE: &str =
+    "JSX attributes are not assignable to the element's props type.";
+const MISSING_METHOD_RETURN_TYPE_MESSAGE: &str =
+    "Method signature lacks return-type annotation and implicitly has an 'any' return type.";
+pub(crate) const BARE_SUPER_EXPRESSION_MESSAGE: &str =
+    "'super' must be followed by an argument list or member access.";
+pub(crate) const SUPER_REFERENCE_NON_DERIVED_MESSAGE: &str =
+    "'super' can only be referenced in a derived class.";
+pub(crate) const SUPER_CALL_OUTSIDE_CONSTRUCTOR_MESSAGE: &str = "Super calls are not permitted outside constructors or in nested functions inside constructors.";
+pub(crate) const SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE: &str =
+    "'super' cannot be referenced in constructor arguments.";
+const ARGUMENT_NOT_ASSIGNABLE_MESSAGE: &str = "Argument type is not assignable to parameter type.";
+const ARGUMENT_COUNT_MISMATCH_MESSAGE: &str =
+    "Supplied arguments do not match the expected parameter count.";
+const PROPERTY_DOES_NOT_EXIST_MESSAGE: &str = "Property does not exist on this type.";
+const EXPRESSION_NOT_CALLABLE_MESSAGE: &str = "This expression is not callable.";
 
-/// Value names always in scope, so free references to them are not unresolved.
-static GLOBAL_VALUES: &[&str] = &[
-    "undefined",
-    "NaN",
-    "Infinity",
-    "globalThis",
-    "console",
-    "Math",
-    "JSON",
-    "Object",
-    "Array",
-    "String",
-    "Number",
-    "Boolean",
-    "Symbol",
-    "BigInt",
-    "Function",
-    "Promise",
-    "Error",
-    "TypeError",
-    "RangeError",
-    "SyntaxError",
-    "Map",
-    "Set",
-    "WeakMap",
-    "WeakSet",
-    "Date",
-    "RegExp",
-    "Reflect",
-    "Proxy",
-    "Intl",
-    "parseInt",
-    "parseFloat",
-    "isNaN",
-    "isFinite",
-    "encodeURIComponent",
-    "decodeURIComponent",
-    "require",
-    "module",
-    "exports",
-    "process",
-    "Buffer",
-    "globalThis",
-    "setTimeout",
-    "setInterval",
-    "clearTimeout",
-    "clearInterval",
-    "queueMicrotask",
-    "structuredClone",
-];
-
-/// Type names always in scope, so references to them are not unresolved types.
-static GLOBAL_TYPES: &[&str] = &[
-    "Array",
-    "ReadonlyArray",
-    "Readonly",
-    "Partial",
-    "Required",
-    "Record",
-    "Pick",
-    "Omit",
-    "Exclude",
-    "Extract",
-    "NonNullable",
-    "ReturnType",
-    "Parameters",
-    "InstanceType",
-    "Awaited",
-    "Promise",
-    "Map",
-    "Set",
-    "WeakMap",
-    "WeakSet",
-    "Date",
-    "RegExp",
-    "Error",
-    "Object",
-    "Function",
-    "Iterable",
-    "Iterator",
-    "AsyncIterable",
-    "ArrayLike",
-    "ThisType",
-    "Uppercase",
-    "Lowercase",
-    "Capitalize",
-    "Uncapitalize",
-];
-
-/// A lexical scope's identity within a [`SemanticModel`].
+/// Compact identity for one allocated object literal and its aliases.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ScopeId(u32);
+pub struct ObjectId(u32);
 
-impl ScopeId {
-    #[must_use]
-    pub const fn get(self) -> u32 {
-        self.0
-    }
+/// Source-qualified syntax identity used by cross-file facts.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct NodeKey {
+    pub source_id: SourceId,
+    pub node_id: NodeId,
 }
 
-/// A bound name's identity within a [`SemanticModel`].
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct SymbolId(u32);
-
-impl SymbolId {
-    #[must_use]
-    pub const fn new(value: u32) -> Self {
-        Self(value)
-    }
-
-    #[must_use]
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-}
-
-/// An interned structural type's identity within a [`TypeTable`].
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct TypeId(u32);
-
-impl TypeId {
-    #[must_use]
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-}
-
-/// The kind of lexical scope, used only to describe the model to callers.
+/// One checker-derived condition consumed by a semantic rule.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ScopeKind {
-    Module,
-    Function,
-    Block,
-    For,
-    Catch,
-    Class,
+pub enum SemanticHazard {
+    UncheckedIndexRead,
+    ExplicitUndefinedOptional,
+    DetachedMethod,
+    DivergentAccessor,
+    ReadonlyAliasMutation,
+    FewerCallbackParameters,
+    ValueReturnedToVoid,
+    OpenObjectKeys,
+    IndexSignatureDotAccess,
+    ImplicitAny,
+    UncheckedAssertion,
+    DeclarationInferenceDependency,
+    TypeImportedAsValue,
+    TypeReexportedAsValue,
+    UncheckedSideEffectImport,
+    InteropDependentDefaultImport,
+    CjsEsmNamedExportMismatch,
+    VirtualCallInConstructor,
+    InitializedFieldShadowsAccessor,
+    ImplicitOverride,
+    NumericEnumNumber,
+    NumericEnumReverseLookup,
+    NonExhaustiveSwitch,
+    InvalidNumberFormatting,
+    NumericKeyOrder,
+    JsonStringifyUnserializable,
+    UncheckedJsonParse,
+    NumericDefaultSort,
+    LooseEqualityCoercion,
+    ObjectToPrimitive,
+    SymbolInterpolation,
+    UnsafeToStringTag,
+    UninitializedFieldShadowsAccessor,
 }
 
-/// One immutable lexical scope with its two-namespace symbol tables.
+/// Immutable evidence for one semantic lint.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Scope {
-    kind: ScopeKind,
-    parent: Option<ScopeId>,
-    values: BTreeMap<String, SymbolId>,
-    types: BTreeMap<String, SymbolId>,
+pub struct HazardFact {
+    pub hazard: SemanticHazard,
+    pub range: TextRange,
+    pub note: Option<Box<str>>,
 }
 
-impl Scope {
-    #[must_use]
-    pub const fn kind(&self) -> ScopeKind {
-        self.kind
-    }
-
-    #[must_use]
-    pub const fn parent(&self) -> Option<ScopeId> {
-        self.parent
-    }
-
-    /// Returns the value binding declared directly in this scope, if any.
-    #[must_use]
-    pub fn value(&self, name: &str) -> Option<SymbolId> {
-        self.values.get(name).copied()
-    }
-
-    /// Returns the type binding declared directly in this scope, if any.
-    #[must_use]
-    pub fn type_binding(&self, name: &str) -> Option<SymbolId> {
-        self.types.get(name).copied()
-    }
+/// Frozen checker facts. Rule implementations only query this product.
+#[derive(Clone, Debug, Default)]
+pub struct AnalysisFacts {
+    hazards: Vec<HazardFact>,
+    index: HashSet<(SemanticHazard, TextRange)>,
 }
 
-/// What a bound name declares. This drives namespace membership and whether a
-/// redeclaration is a legal merge or a duplicate error.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum SymbolKind {
-    Variable(VariableKind),
-    Function,
-    Parameter,
-    Class,
-    Interface,
-    TypeAlias,
-    Enum,
-    TypeParameter,
-    Import,
-    Namespace,
-}
-
-impl SymbolKind {
-    const fn occupies_value(self) -> bool {
-        matches!(
-            self,
-            Self::Variable(_)
-                | Self::Function
-                | Self::Parameter
-                | Self::Class
-                | Self::Enum
-                | Self::Import
-                | Self::Namespace
-        )
-    }
-
-    const fn occupies_type(self) -> bool {
-        matches!(
-            self,
-            Self::Class | Self::Enum | Self::Interface | Self::TypeAlias | Self::TypeParameter
-        )
-    }
-
-    /// Two value bindings may share a name only when both are `var`/`function`.
-    const fn value_mergeable(self) -> bool {
-        matches!(self, Self::Variable(VariableKind::Var) | Self::Function)
-    }
-
-    /// Two type bindings may share a name only when both are interfaces.
-    const fn type_mergeable(self) -> bool {
-        matches!(self, Self::Interface)
-    }
-}
-
-/// One immutable bound name.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Symbol {
-    name: String,
-    kind: SymbolKind,
-    scope: ScopeId,
-    declaration: NodeId,
-    range: TextRange,
-}
-
-impl Symbol {
+impl AnalysisFacts {
     #[must_use]
-    pub fn name(&self) -> &str {
-        &self.name
+    pub fn hazards(&self) -> &[HazardFact] {
+        &self.hazards
     }
 
-    #[must_use]
-    pub const fn kind(&self) -> SymbolKind {
-        self.kind
-    }
-
-    #[must_use]
-    pub const fn scope(&self) -> ScopeId {
-        self.scope
-    }
-
-    #[must_use]
-    pub const fn declaration(&self) -> NodeId {
-        self.declaration
-    }
-
-    #[must_use]
-    pub const fn range(&self) -> TextRange {
-        self.range
-    }
-}
-
-/// One member of an interned object type.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct PropertyType {
-    name: Box<str>,
-    optional: bool,
-    type_id: TypeId,
-}
-
-impl PropertyType {
-    #[must_use]
-    pub fn new(name: impl Into<Box<str>>, optional: bool, type_id: TypeId) -> Self {
-        Self {
-            name: name.into(),
-            optional,
-            type_id,
+    pub(crate) fn push(&mut self, fact: HazardFact) {
+        if self.index.insert((fact.hazard, fact.range)) {
+            self.hazards.push(fact);
         }
     }
 
-    #[must_use]
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    #[must_use]
-    pub const fn optional(&self) -> bool {
-        self.optional
-    }
-
-    #[must_use]
-    pub const fn type_id(&self) -> TypeId {
-        self.type_id
+    pub(crate) fn extend(&mut self, facts: impl IntoIterator<Item = HazardFact>) {
+        for fact in facts {
+            self.push(fact);
+        }
     }
 }
 
-/// One interned function signature.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct FunctionSignature {
-    parameters: Vec<TypeId>,
-    return_type: TypeId,
-}
-
-impl FunctionSignature {
-    #[must_use]
-    pub fn parameters(&self) -> &[TypeId] {
-        &self.parameters
-    }
-
-    #[must_use]
-    pub const fn return_type(&self) -> TypeId {
-        self.return_type
-    }
-}
-
-/// The closed space of structural types the first checker slice models.
-///
-/// `Error` is a recovery type produced for unresolved or unsupported syntax; it
-/// behaves like `Any` in assignability so one upstream mistake never cascades.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub enum Type {
-    Error,
-    Any,
-    Unknown,
-    Never,
-    Void,
-    Null,
-    Undefined,
-    Boolean,
-    Number,
-    BigInt,
-    String,
-    Symbol,
-    Object,
-    BooleanLiteral(bool),
-    NumberLiteral(Box<str>),
-    StringLiteral(Box<str>),
-    BigIntLiteral(Box<str>),
-    Array(TypeId),
-    Union(Vec<TypeId>),
-    ObjectType(Vec<PropertyType>),
-    Function(FunctionSignature),
-    /// A nominal named type (type parameter, class, or enum) compared by identity.
-    Named(SymbolId),
-}
-
-/// An interning table for structural types plus the assignability relation.
-///
-/// The table is append-only while checking and frozen into the immutable
-/// [`SemanticModel`]. It is also a standalone reusable value: [`TypeTable::new`]
-/// yields the primitive types so the algebra can be exercised directly.
-#[derive(Clone, Debug)]
-pub struct TypeTable {
-    types: Vec<Type>,
-    index: HashMap<Type, TypeId>,
-    error: TypeId,
-    any: TypeId,
-    unknown: TypeId,
-    never: TypeId,
-    void: TypeId,
-    null: TypeId,
-    undefined: TypeId,
-    boolean: TypeId,
-    number: TypeId,
-    bigint: TypeId,
-    string: TypeId,
-    symbol: TypeId,
-    object: TypeId,
-}
-
-impl Default for TypeTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TypeTable {
-    /// Creates a table pre-populated with every primitive type.
-    #[must_use]
-    pub fn new() -> Self {
-        let mut table = Self {
-            types: Vec::new(),
-            index: HashMap::new(),
-            error: TypeId(0),
-            any: TypeId(0),
-            unknown: TypeId(0),
-            never: TypeId(0),
-            void: TypeId(0),
-            null: TypeId(0),
-            undefined: TypeId(0),
-            boolean: TypeId(0),
-            number: TypeId(0),
-            bigint: TypeId(0),
-            string: TypeId(0),
-            symbol: TypeId(0),
-            object: TypeId(0),
-        };
-        table.error = table.intern(Type::Error);
-        table.any = table.intern(Type::Any);
-        table.unknown = table.intern(Type::Unknown);
-        table.never = table.intern(Type::Never);
-        table.void = table.intern(Type::Void);
-        table.null = table.intern(Type::Null);
-        table.undefined = table.intern(Type::Undefined);
-        table.boolean = table.intern(Type::Boolean);
-        table.number = table.intern(Type::Number);
-        table.bigint = table.intern(Type::BigInt);
-        table.string = table.intern(Type::String);
-        table.symbol = table.intern(Type::Symbol);
-        table.object = table.intern(Type::Object);
-        table
-    }
-
-    fn intern(&mut self, ty: Type) -> TypeId {
-        if let Some(existing) = self.index.get(&ty) {
-            return *existing;
-        }
-        let id = TypeId(u32::try_from(self.types.len()).expect("type count fits in u32"));
-        self.types.push(ty.clone());
-        self.index.insert(ty, id);
-        id
-    }
-
-    /// Returns the interned representation of a type identity.
-    #[must_use]
-    pub fn get(&self, id: TypeId) -> &Type {
-        &self.types[id.0 as usize]
-    }
-
-    #[must_use]
-    pub const fn error_type(&self) -> TypeId {
-        self.error
-    }
-    #[must_use]
-    pub const fn any(&self) -> TypeId {
-        self.any
-    }
-    #[must_use]
-    pub const fn unknown(&self) -> TypeId {
-        self.unknown
-    }
-    #[must_use]
-    pub const fn never(&self) -> TypeId {
-        self.never
-    }
-    #[must_use]
-    pub const fn void(&self) -> TypeId {
-        self.void
-    }
-    #[must_use]
-    pub const fn null_type(&self) -> TypeId {
-        self.null
-    }
-    #[must_use]
-    pub const fn undefined_type(&self) -> TypeId {
-        self.undefined
-    }
-    #[must_use]
-    pub const fn boolean(&self) -> TypeId {
-        self.boolean
-    }
-    #[must_use]
-    pub const fn number(&self) -> TypeId {
-        self.number
-    }
-    #[must_use]
-    pub const fn bigint(&self) -> TypeId {
-        self.bigint
-    }
-    #[must_use]
-    pub const fn string(&self) -> TypeId {
-        self.string
-    }
-    #[must_use]
-    pub const fn symbol_type(&self) -> TypeId {
-        self.symbol
-    }
-    #[must_use]
-    pub const fn object(&self) -> TypeId {
-        self.object
-    }
-
-    /// Interns a boolean literal type.
-    pub fn boolean_literal(&mut self, value: bool) -> TypeId {
-        self.intern(Type::BooleanLiteral(value))
-    }
-
-    /// Interns a numeric literal type keyed by its source lexeme.
-    pub fn number_literal(&mut self, text: &str) -> TypeId {
-        self.intern(Type::NumberLiteral(text.into()))
-    }
-
-    /// Interns a string literal type keyed by its source lexeme.
-    pub fn string_literal(&mut self, text: &str) -> TypeId {
-        self.intern(Type::StringLiteral(text.into()))
-    }
-
-    /// Interns a bigint literal type keyed by its source lexeme.
-    pub fn bigint_literal(&mut self, text: &str) -> TypeId {
-        self.intern(Type::BigIntLiteral(text.into()))
-    }
-
-    /// Interns a nominal named type.
-    pub fn named(&mut self, symbol: SymbolId) -> TypeId {
-        self.intern(Type::Named(symbol))
-    }
-
-    /// Interns an array type over `element`.
-    pub fn array(&mut self, element: TypeId) -> TypeId {
-        self.intern(Type::Array(element))
-    }
-
-    /// Interns an object type after canonically ordering its members by name.
-    pub fn object_type(&mut self, mut properties: Vec<PropertyType>) -> TypeId {
-        properties.sort_by(|left, right| left.name.cmp(&right.name));
-        properties.dedup_by(|left, right| left.name == right.name);
-        self.intern(Type::ObjectType(properties))
-    }
-
-    /// Interns a function type.
-    pub fn function(&mut self, parameters: Vec<TypeId>, return_type: TypeId) -> TypeId {
-        self.intern(Type::Function(FunctionSignature {
-            parameters,
-            return_type,
-        }))
-    }
-
-    /// Interns a union, normalizing absorption, `never` removal, and duplicates.
-    pub fn union(&mut self, members: &[TypeId]) -> TypeId {
-        let mut flat = Vec::new();
-        for member in members {
-            match self.get(*member) {
-                Type::Any => return self.any,
-                Type::Unknown => return self.unknown,
-                Type::Never => {}
-                Type::Union(nested) => flat.extend(nested.iter().copied()),
-                _ => flat.push(*member),
-            }
-        }
-        flat.sort_by_key(|id| id.get());
-        flat.dedup();
-        match flat.len() {
-            0 => self.never,
-            1 => flat[0],
-            _ => self.intern(Type::Union(flat)),
-        }
-    }
-
-    /// Returns whether a value of `source` may be assigned where `target` is
-    /// expected, using structural rules over the modeled type space.
-    #[must_use]
-    pub fn assignable(&self, source: TypeId, target: TypeId) -> bool {
-        if source == target {
-            return true;
-        }
-        let (from, to) = (self.get(source), self.get(target));
-        match (from, to) {
-            (Type::Error, _) | (_, Type::Error) => true,
-            // `any` is the deliberate escape hatch in both directions.
-            (Type::Any, _) | (_, Type::Any) => true,
-            // `unknown` is the top type: everything flows in, nothing flows out.
-            (_, Type::Unknown) => true,
-            (Type::Unknown, _) => false,
-            // `never` is the bottom type: it flows into everything, nothing else
-            // flows into it (identity already handled above).
-            (Type::Never, _) => true,
-            (_, Type::Never) => false,
-            (Type::StringLiteral(_), Type::String) => true,
-            (Type::NumberLiteral(_), Type::Number) => true,
-            (Type::BooleanLiteral(_), Type::Boolean) => true,
-            (Type::BigIntLiteral(_), Type::BigInt) => true,
-            (Type::Union(sources), _) => sources.iter().all(|s| self.assignable(*s, target)),
-            (_, Type::Union(targets)) => targets.iter().any(|t| self.assignable(source, *t)),
-            (Type::Array(source_element), Type::Array(target_element)) => {
-                self.assignable(*source_element, *target_element)
-            }
-            (Type::ObjectType(source_props), Type::ObjectType(target_props)) => {
-                self.object_assignable(source_props, target_props)
-            }
-            (Type::Function(source_sig), Type::Function(target_sig)) => {
-                self.function_assignable(source_sig, target_sig)
-            }
-            _ => false,
-        }
-    }
-
-    fn object_assignable(&self, source: &[PropertyType], target: &[PropertyType]) -> bool {
-        // Excess source properties are allowed; each target property must be
-        // satisfied. Members are name-sorted, so a merge walk suffices.
-        target.iter().all(
-            |want| match source.iter().find(|have| have.name == want.name) {
-                Some(have) => self.assignable(have.type_id, want.type_id),
-                None => want.optional,
-            },
-        )
-    }
-
-    fn function_assignable(&self, source: &FunctionSignature, target: &FunctionSignature) -> bool {
-        if source.parameters.len() > target.parameters.len() {
-            return false;
-        }
-        for (source_param, target_param) in source.parameters.iter().zip(&target.parameters) {
-            // Parameters are contravariant: the target must supply a value the
-            // source accepts.
-            if !self.assignable(*target_param, *source_param) {
-                return false;
-            }
-        }
-        matches!(self.get(target.return_type), Type::Void)
-            || self.assignable(source.return_type, target.return_type)
-    }
-}
-
-/// The immutable product of semantic analysis.
-#[derive(Clone, Debug)]
-pub struct SemanticModel {
-    scopes: Vec<Scope>,
-    symbols: Vec<Symbol>,
-    symbol_types: Vec<TypeId>,
-    references: HashMap<NodeId, SymbolId>,
-    types: TypeTable,
-    module_scope: ScopeId,
-}
-
-impl SemanticModel {
-    /// Returns every lexical scope, with the module scope first.
-    #[must_use]
-    pub fn scopes(&self) -> &[Scope] {
-        &self.scopes
-    }
-
-    /// Returns a scope by identity.
-    #[must_use]
-    pub fn scope(&self, id: ScopeId) -> &Scope {
-        &self.scopes[id.0 as usize]
-    }
-
-    /// Returns the top-level module scope.
-    #[must_use]
-    pub const fn module_scope(&self) -> ScopeId {
-        self.module_scope
-    }
-
-    /// Returns every bound name.
-    #[must_use]
-    pub fn symbols(&self) -> &[Symbol] {
-        &self.symbols
-    }
-
-    /// Returns a symbol by identity.
-    #[must_use]
-    pub fn symbol(&self, id: SymbolId) -> &Symbol {
-        &self.symbols[id.0 as usize]
-    }
-
-    /// Returns the declared or inferred type of a bound name.
-    #[must_use]
-    pub fn symbol_type(&self, id: SymbolId) -> TypeId {
-        self.symbol_types[id.0 as usize]
-    }
-
-    /// Returns the interned type table.
-    #[must_use]
-    pub const fn types(&self) -> &TypeTable {
-        &self.types
-    }
-
-    /// Returns the symbol an identifier reference resolved to, if any.
-    #[must_use]
-    pub fn reference(&self, node: NodeId) -> Option<SymbolId> {
-        self.references.get(&node).copied()
-    }
-
-    /// Returns how many identifier references resolved to a local binding.
-    #[must_use]
-    pub fn resolved_reference_count(&self) -> usize {
-        self.references.len()
-    }
-
-    /// Resolves a value name from `scope` outward through its ancestors.
-    #[must_use]
-    pub fn lookup_value(&self, scope: ScopeId, name: &str) -> Option<SymbolId> {
-        let mut current = Some(scope);
-        while let Some(id) = current {
-            let scope = &self.scopes[id.0 as usize];
-            if let Some(symbol) = scope.values.get(name) {
-                return Some(*symbol);
-            }
-            current = scope.parent;
-        }
-        None
-    }
-
-    /// Resolves a type name from `scope` outward through its ancestors.
-    #[must_use]
-    pub fn lookup_type(&self, scope: ScopeId, name: &str) -> Option<SymbolId> {
-        let mut current = Some(scope);
-        while let Some(id) = current {
-            let scope = &self.scopes[id.0 as usize];
-            if let Some(symbol) = scope.types.get(name) {
-                return Some(*symbol);
-            }
-            current = scope.parent;
-        }
-        None
-    }
-}
-
-/// Analyzes a recovered parse product into an immutable [`SemanticModel`].
-///
-/// The returned diagnostics merge the checker's semantic errors with the
-/// front-end hard warnings in canonical order. Existing parser diagnostics stay
-/// with the [`SourceFile`]; the parent compiler owns their integration.
+/// Analyzes one source with the default lint profile.
 #[must_use]
 pub fn check(source_file: &Recovered<SourceFile>) -> Recovered<SemanticModel> {
-    let warnings = analyze_hard_warnings(source_file);
-    let mut checker = Checker::new(source_file.product());
-    checker.run();
-    let (model, mut diagnostics) = checker.finish();
-    diagnostics.extend(warnings);
+    check_with_lints(source_file, &LintTable::new(LintProfile::Default))
+}
+
+/// Analyzes one source using an already-resolved lint table.
+#[must_use]
+pub fn check_with_lints(
+    source_file: &Recovered<SourceFile>,
+    levels: &LintTable,
+) -> Recovered<SemanticModel> {
+    let source = source_file.product();
+    let (mut model, mut diagnostics) = bind_source(source);
+    model.replace_facts(crate::rules::semantic::collect_facts(source, &model));
+    diagnostics.extend(analyze_warnings(source_file, levels));
+    diagnostics.extend(crate::rules::analyze_semantic(source, &model, None, levels));
     Recovered::new(model, diagnostics)
 }
 
-/// Lazy resolution state for a type-declaring symbol.
+/// One resolved module edge supplied by the project loader.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ResolvedModuleEdge {
+    pub from: SourceId,
+    pub specifier: NodeId,
+    pub to: SourceId,
+}
+
+/// Borrowed input for a linked multi-file checker run.
 #[derive(Clone, Copy)]
-enum TypeState {
-    Unresolved,
-    InProgress,
-    Done(TypeId),
+pub struct ProgramCheckInput<'a> {
+    pub files: &'a [Recovered<SourceFile>],
+    pub edges: &'a [ResolvedModuleEdge],
 }
 
-/// A named type definition kept by reference for lazy, memoized resolution.
-#[derive(Clone, Copy)]
-enum TypeDef<'src> {
-    Alias {
-        scope: ScopeId,
-        node: &'src Ty,
-    },
-    Interface {
-        scope: ScopeId,
-        extends: &'src [TypeReference],
-        members: &'src [crate::syntax::TypeMemberNode],
-    },
+/// Checker environment selected by the project's module compiler option.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct ProgramCheckOptions {
+    commonjs: bool,
+    strict_null_checks: bool,
+    no_implicit_any: bool,
+    /// Whether `alwaysStrict` is enabled: every source file is treated as if
+    /// it begins with the "use strict" directive.
+    always_strict: bool,
+    /// Whether the compilation target is ES5 or earlier, which forbids function
+    /// declarations inside blocks in strict mode.
+    es5: bool,
 }
 
-struct Checker<'src> {
-    source: &'src SourceFile,
-    scopes: Vec<Scope>,
-    symbols: Vec<Symbol>,
-    symbol_types: Vec<TypeId>,
-    type_state: Vec<TypeState>,
-    type_defs: HashMap<SymbolId, TypeDef<'src>>,
-    references: HashMap<NodeId, SymbolId>,
-    diagnostics: Vec<Diagnostic>,
-    types: TypeTable,
-    module_scope: ScopeId,
-}
-
-impl<'src> Checker<'src> {
-    fn new(source: &'src SourceFile) -> Self {
-        let mut checker = Self {
-            source,
-            scopes: Vec::new(),
-            symbols: Vec::new(),
-            symbol_types: Vec::new(),
-            type_state: Vec::new(),
-            type_defs: HashMap::new(),
-            references: HashMap::new(),
-            diagnostics: Vec::new(),
-            types: TypeTable::new(),
-            module_scope: ScopeId(0),
-        };
-        checker.module_scope = checker.new_scope(ScopeKind::Module, None);
-        checker
-    }
-
-    fn run(&mut self) {
-        let statements = self.source.statements();
-        let scope = self.module_scope;
-        self.bind_statements(statements, scope);
-        self.resolve_statements(statements, scope);
-    }
-
-    fn finish(self) -> (SemanticModel, Vec<Diagnostic>) {
-        let model = SemanticModel {
-            scopes: self.scopes,
-            symbols: self.symbols,
-            symbol_types: self.symbol_types,
-            references: self.references,
-            types: self.types,
-            module_scope: self.module_scope,
-        };
-        (model, self.diagnostics)
-    }
-
-    // -- text and scope helpers ------------------------------------------------
-
-    fn text(&self, token: &Token) -> &'src str {
-        self.source.token_text(token).unwrap_or("")
-    }
-
-    fn identifier_text(&self, identifier: &IdentifierNode) -> &'src str {
-        self.text(identifier.data().token())
-    }
-
-    fn new_scope(&mut self, kind: ScopeKind, parent: Option<ScopeId>) -> ScopeId {
-        let id = ScopeId(u32::try_from(self.scopes.len()).expect("scope count fits in u32"));
-        self.scopes.push(Scope {
-            kind,
-            parent,
-            values: BTreeMap::new(),
-            types: BTreeMap::new(),
-        });
-        id
-    }
-
-    /// Walks outward from `scope` to the nearest Function or Module scope, the
-    /// declaration target for JS-hoisted `var` and function bindings. Stopping
-    /// at the first such scope keeps inner-function `var`s from escaping into an
-    /// outer function; the Module scope has no parent and terminates the walk.
-    fn value_hoist_scope(&self, scope: ScopeId) -> ScopeId {
-        let mut current = scope;
-        loop {
-            let node = &self.scopes[current.0 as usize];
-            if matches!(node.kind, ScopeKind::Function | ScopeKind::Module) {
-                return current;
-            }
-            match node.parent {
-                Some(parent) => current = parent,
-                None => return current,
-            }
+impl ProgramCheckOptions {
+    #[must_use]
+    pub const fn standard() -> Self {
+        Self {
+            commonjs: false,
+            strict_null_checks: false,
+            no_implicit_any: false,
+            always_strict: false,
+            es5: false,
         }
     }
 
-    fn emit(&mut self, code: DiagnosticCode, range: TextRange, message: &'static str) {
-        self.diagnostics.push(Diagnostic::error(
-            code,
-            self.source.source_id(),
-            range,
-            message,
+    #[must_use]
+    pub const fn commonjs() -> Self {
+        Self {
+            commonjs: true,
+            strict_null_checks: false,
+            no_implicit_any: false,
+            always_strict: false,
+            es5: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_strict_null_checks(mut self, value: bool) -> Self {
+        self.strict_null_checks = value;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_no_implicit_any(mut self, value: bool) -> Self {
+        self.no_implicit_any = value;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_always_strict(mut self, value: bool) -> Self {
+        self.always_strict = value;
+        self
+    }
+
+    #[must_use]
+    pub fn with_target(mut self, target: Option<&str>) -> Self {
+        self.es5 = match target {
+            Some(target) => {
+                target.eq_ignore_ascii_case("es5") || target.eq_ignore_ascii_case("es3")
+            }
+            None => false,
+        };
+        self
+    }
+
+    #[must_use]
+    pub const fn strict_null_checks(&self) -> bool {
+        self.strict_null_checks
+    }
+
+    #[must_use]
+    pub const fn no_implicit_any(&self) -> bool {
+        self.no_implicit_any
+    }
+
+    #[must_use]
+    pub const fn always_strict(&self) -> bool {
+        self.always_strict
+    }
+
+    #[must_use]
+    pub const fn es5(&self) -> bool {
+        self.es5
+    }
+
+    const fn environment(self) -> GlobalEnvironment {
+        if self.commonjs {
+            GlobalEnvironment::commonjs()
+        } else {
+            GlobalEnvironment::standard()
+        }
+    }
+}
+
+/// Immutable linked checker product.
+#[derive(Clone, Debug)]
+pub struct ProgramSemanticModel {
+    files: BTreeMap<SourceId, SemanticModel>,
+    edges: Box<[ResolvedModuleEdge]>,
+}
+
+impl ProgramSemanticModel {
+    #[must_use]
+    pub fn file(&self, source_id: SourceId) -> Option<&SemanticModel> {
+        self.files.get(&source_id)
+    }
+
+    #[must_use]
+    pub fn edges(&self) -> &[ResolvedModuleEdge] {
+        &self.edges
+    }
+}
+
+/// Checks a set of loaded files after module resolution.
+#[must_use]
+pub fn check_program(
+    input: ProgramCheckInput<'_>,
+    levels: &LintTable,
+) -> Recovered<ProgramSemanticModel> {
+    check_program_with_options(input, levels, ProgramCheckOptions::standard())
+}
+
+/// Checks a set of loaded files using the environment selected by module options.
+#[must_use]
+pub fn check_program_with_options(
+    input: ProgramCheckInput<'_>,
+    levels: &LintTable,
+    options: ProgramCheckOptions,
+) -> Recovered<ProgramSemanticModel> {
+    let mut files = BTreeMap::new();
+    let mut diagnostics = Vec::new();
+    for recovered in input.files {
+        let source = recovered.product();
+        let (mut model, core_diagnostics) = bind_source_with_environment(
+            source,
+            options.environment(),
+            source_is_module(source),
+            options,
+        );
+        model.replace_facts(crate::rules::semantic::collect_facts(source, &model));
+        diagnostics.extend(core_diagnostics);
+        diagnostics.extend(analyze_warnings(recovered, levels));
+        files.insert(source.source_id(), model);
+    }
+    crate::rules::semantic::collect_program_facts(input.files, input.edges, &mut files);
+    collect_imported_const_enum_facts(input.files, input.edges, &mut files, &mut diagnostics);
+    let program = ProgramSemanticModel {
+        files,
+        edges: input.edges.into(),
+    };
+    for recovered in input.files {
+        let source = recovered.product();
+        let model = program
+            .file(source.source_id())
+            .expect("program model contains every input source");
+        diagnostics.extend(crate::rules::analyze_semantic(
+            source,
+            model,
+            Some(&program),
+            levels,
         ));
     }
+    Recovered::new(program, diagnostics)
+}
 
-    // -- declaration binding ---------------------------------------------------
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct LinkedEnum {
+    source: SourceId,
+    symbol: SymbolId,
+}
 
-    fn declare(
-        &mut self,
-        name: &str,
-        kind: SymbolKind,
-        scope: ScopeId,
-        declaration: NodeId,
-        range: TextRange,
-    ) -> SymbolId {
-        // `var` and function declarations are hoisted to the nearest Function or
-        // Module scope, so a binding textually nested in a block, `for`, or
-        // `catch` scope is owned by its enclosing function. `let`/`const` and all
-        // other kinds stay in the scope they were written in.
-        let scope = if matches!(
-            kind,
-            SymbolKind::Variable(VariableKind::Var) | SymbolKind::Function
-        ) {
-            self.value_hoist_scope(scope)
-        } else {
-            scope
-        };
-        let id = SymbolId(u32::try_from(self.symbols.len()).expect("symbol count fits in u32"));
-        self.symbols.push(Symbol {
-            name: name.to_owned(),
-            kind,
-            scope,
-            declaration,
-            range,
-        });
-        self.symbol_types.push(self.types.any());
-        self.type_state.push(TypeState::Unresolved);
+#[derive(Clone, Debug)]
+enum ImportTarget {
+    Named {
+        source: SourceId,
+        name: EcmaString,
+        specifier: Option<NodeId>,
+    },
+    Namespace {
+        source: SourceId,
+    },
+}
 
-        let mut conflict = false;
-        if kind.occupies_value() {
-            conflict |= self.insert_value(scope, name, id, kind);
-        }
-        if kind.occupies_type() {
-            conflict |= self.insert_type(scope, name, id, kind);
-        }
-        if conflict {
-            self.emit(DUPLICATE_DECLARATION, range, DUPLICATE_MESSAGE);
-        }
-        id
-    }
+#[derive(Clone, Debug)]
+enum ExportTarget {
+    Local(SymbolId),
+    Forward { source: SourceId, name: EcmaString },
+}
 
-    fn insert_value(&mut self, scope: ScopeId, name: &str, id: SymbolId, kind: SymbolKind) -> bool {
-        match self.scopes[scope.0 as usize].values.get(name) {
-            None => {
-                self.scopes[scope.0 as usize]
-                    .values
-                    .insert(name.to_owned(), id);
-                false
-            }
-            Some(existing) => {
-                let existing_kind = self.symbols[existing.get() as usize].kind;
-                !(kind.value_mergeable() && existing_kind.value_mergeable())
-            }
-        }
-    }
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct LinkedExport {
+    source: SourceId,
+    symbol: SymbolId,
+}
 
-    fn insert_type(&mut self, scope: ScopeId, name: &str, id: SymbolId, kind: SymbolKind) -> bool {
-        match self.scopes[scope.0 as usize].types.get(name) {
-            None => {
-                self.scopes[scope.0 as usize]
-                    .types
-                    .insert(name.to_owned(), id);
-                false
-            }
-            Some(existing) => {
-                let existing_kind = self.symbols[existing.get() as usize].kind;
-                !(kind.type_mergeable() && existing_kind.type_mergeable())
-            }
-        }
-    }
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ExportCandidate {
+    Const(LinkedEnum),
+    Value(LinkedExport),
+    Namespace(SourceId),
+}
 
-    fn bind_statements(&mut self, statements: &'src [crate::syntax::Stmt], scope: ScopeId) {
-        for statement in statements {
-            self.bind_statement(statement, scope);
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ExportResolution {
+    Const(LinkedEnum),
+    /// An ordinary enum remains a runtime import and is not a const-enum failure.
+    NotConst,
+    Namespace(SourceId),
+    Unresolved,
+    Cycle,
+    Ambiguous,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImportedMemberBaseResolution {
+    Export(ExportResolution),
+    Scalar,
+}
+
+#[derive(Default)]
+struct ExportStars {
+    namespace_exports: HashMap<(SourceId, EcmaString), SourceId>,
+    targets: HashMap<SourceId, Vec<SourceId>>,
+}
+
+#[derive(Default)]
+struct ExportResolutionSet {
+    candidates: HashSet<ExportCandidate>,
+    has_cycle: bool,
+}
+
+impl ExportResolutionSet {
+    fn candidate(candidate: ExportCandidate) -> Self {
+        let mut candidates = HashSet::new();
+        let inserted = candidates.insert(candidate);
+        debug_assert!(inserted);
+        Self {
+            candidates,
+            has_cycle: false,
         }
     }
 
-    fn bind_statement(&mut self, statement: &'src crate::syntax::Stmt, scope: ScopeId) {
-        let declaration = statement.id();
-        match statement.data() {
-            Statement::Variable(variable) => self.bind_variable(variable, scope, declaration),
-            Statement::Function(function) => {
-                if let Some(name) = &function.function.name {
-                    self.declare(
-                        self.identifier_text(name),
-                        SymbolKind::Function,
-                        scope,
-                        declaration,
-                        name.range(),
-                    );
-                }
-            }
-            Statement::Class(class) => {
-                if let Some(name) = &class.name {
-                    self.declare(
-                        self.identifier_text(name),
-                        SymbolKind::Class,
-                        scope,
-                        declaration,
-                        name.range(),
-                    );
-                }
-            }
-            Statement::Interface(interface) => self.bind_interface(interface, scope, declaration),
-            Statement::TypeAlias(alias) => self.bind_type_alias(alias, scope, declaration),
-            Statement::Enum(declaration_node) => {
-                self.declare(
-                    self.identifier_text(&declaration_node.name),
-                    SymbolKind::Enum,
-                    scope,
-                    declaration,
-                    declaration_node.name.range(),
-                );
-            }
-            Statement::Namespace(namespace) => {
-                self.declare(
-                    self.identifier_text(&namespace.name),
-                    SymbolKind::Namespace,
-                    scope,
-                    declaration,
-                    namespace.name.range(),
-                );
-            }
-            Statement::Import(import) => self.bind_import(import, scope, declaration),
-            Statement::ImportEquals(import) => {
-                self.declare(
-                    self.identifier_text(&import.local),
-                    SymbolKind::Import,
-                    scope,
-                    declaration,
-                    import.local.range(),
-                );
-            }
-            Statement::Declare(inner) => self.bind_statement(inner, scope),
-            Statement::Export(crate::syntax::ExportDeclaration::Named(
-                crate::syntax::ExportNamedDeclaration::Declaration(inner),
-            )) => {
-                self.bind_statement(inner, scope);
-            }
-            _ => {}
+    fn cycle() -> Self {
+        Self {
+            candidates: HashSet::new(),
+            has_cycle: true,
         }
     }
 
-    fn bind_variable(
-        &mut self,
-        variable: &'src VariableDeclaration,
-        scope: ScopeId,
-        declaration: NodeId,
-    ) {
-        for declarator in &variable.declarations {
-            self.bind_pattern(
-                &declarator.data().binding,
-                variable.kind,
-                scope,
-                declaration,
-            );
-        }
+    fn extend(&mut self, other: Self) {
+        self.candidates.extend(other.candidates);
+        self.has_cycle |= other.has_cycle;
     }
 
-    fn bind_pattern(
-        &mut self,
-        pattern: &'src crate::syntax::Pattern,
-        kind: VariableKind,
-        scope: ScopeId,
-        declaration: NodeId,
-    ) {
-        match pattern.data() {
-            BindingPattern::Identifier(name) => {
-                self.declare(
-                    self.identifier_text(name),
-                    SymbolKind::Variable(kind),
-                    scope,
-                    declaration,
-                    name.range(),
-                );
-            }
-            BindingPattern::Object(object) => {
-                for property in &object.properties {
-                    self.bind_pattern(&property.binding, kind, scope, declaration);
-                }
-            }
-            BindingPattern::Array(array) => {
-                for element in &array.elements {
-                    if let crate::syntax::ArrayBindingElement::Binding(inner) = element {
-                        self.bind_pattern(inner, kind, scope, declaration);
-                    }
-                }
-            }
-            BindingPattern::Rest(rest) => {
-                self.bind_pattern(&rest.argument, kind, scope, declaration);
-            }
-            BindingPattern::Assignment(assignment) => {
-                self.bind_pattern(&assignment.left, kind, scope, declaration);
-            }
-            BindingPattern::Missing(_) => {}
-        }
-    }
-
-    fn bind_interface(
-        &mut self,
-        interface: &'src InterfaceDeclaration,
-        scope: ScopeId,
-        declaration: NodeId,
-    ) {
-        let id = self.declare(
-            self.identifier_text(&interface.name),
-            SymbolKind::Interface,
-            scope,
-            declaration,
-            interface.name.range(),
-        );
-        // Only the first interface of a mergeable set owns the definition slot;
-        // later merges keep their symbol but reuse the representative's shape.
-        self.type_defs.entry(id).or_insert(TypeDef::Interface {
-            scope,
-            extends: &interface.extends,
-            members: &interface.members,
-        });
-    }
-
-    fn bind_type_alias(
-        &mut self,
-        alias: &'src TypeAliasDeclaration,
-        scope: ScopeId,
-        declaration: NodeId,
-    ) {
-        let id = self.declare(
-            self.identifier_text(&alias.name),
-            SymbolKind::TypeAlias,
-            scope,
-            declaration,
-            alias.name.range(),
-        );
-        self.type_defs.insert(
-            id,
-            TypeDef::Alias {
-                scope,
-                node: &alias.type_node,
-            },
-        );
-    }
-
-    fn bind_import(
-        &mut self,
-        import: &'src crate::syntax::ImportDeclaration,
-        scope: ScopeId,
-        declaration: NodeId,
-    ) {
-        let Some(clause) = &import.clause else {
-            return;
-        };
-        if let Some(default) = &clause.default {
-            self.declare(
-                self.identifier_text(default),
-                SymbolKind::Import,
-                scope,
-                declaration,
-                default.range(),
-            );
-        }
-        match &clause.binding {
-            Some(ImportBinding::Namespace(name)) => {
-                self.declare(
-                    self.identifier_text(name),
-                    SymbolKind::Import,
-                    scope,
-                    declaration,
-                    name.range(),
-                );
-            }
-            Some(ImportBinding::Named(specifiers)) => {
-                for specifier in specifiers {
-                    let local = &specifier.data().local;
-                    self.declare(
-                        self.identifier_text(local),
-                        SymbolKind::Import,
-                        scope,
-                        declaration,
-                        local.range(),
-                    );
-                }
-            }
-            None => {}
-        }
-    }
-
-    // -- reference resolution and assignability --------------------------------
-
-    fn resolve_statements(&mut self, statements: &'src [crate::syntax::Stmt], scope: ScopeId) {
-        for statement in statements {
-            self.resolve_statement(statement, scope);
-        }
-    }
-
-    fn resolve_statement(&mut self, statement: &'src crate::syntax::Stmt, scope: ScopeId) {
-        match statement.data() {
-            Statement::Variable(variable) => self.resolve_variable(variable, scope),
-            Statement::Function(function) => self.resolve_function(&function.function, scope),
-            Statement::Class(class) => self.resolve_class(class, scope),
-            Statement::Interface(interface) => {
-                if let Some(id) = self.scopes[scope.0 as usize]
-                    .types
-                    .get(self.identifier_text(&interface.name))
-                    .copied()
-                {
-                    let _ = self.resolve_type_symbol(id);
-                }
-            }
-            Statement::TypeAlias(alias) => {
-                if let Some(id) = self.scopes[scope.0 as usize]
-                    .types
-                    .get(self.identifier_text(&alias.name))
-                    .copied()
-                {
-                    let _ = self.resolve_type_symbol(id);
-                }
-            }
-            Statement::Block(block) => {
-                let child = self.new_scope(ScopeKind::Block, Some(scope));
-                self.bind_statements(&block.data().statements, child);
-                self.resolve_statements(&block.data().statements, child);
-            }
-            Statement::Expression(statement) => self.resolve_expr(&statement.expression, scope),
-            Statement::If(statement) => {
-                self.resolve_expr(&statement.test, scope);
-                self.resolve_statement(&statement.consequent, scope);
-                if let Some(alternate) = &statement.alternate {
-                    self.resolve_statement(alternate, scope);
-                }
-            }
-            Statement::Switch(statement) => {
-                self.resolve_expr(&statement.discriminant, scope);
-                let child = self.new_scope(ScopeKind::Block, Some(scope));
-                for case in &statement.cases {
-                    if let Some(test) = &case.data().test {
-                        self.resolve_expr(test, child);
-                    }
-                    self.bind_statements(&case.data().consequent, child);
-                }
-                for case in &statement.cases {
-                    self.resolve_statements(&case.data().consequent, child);
-                }
-            }
-            Statement::For(statement) => {
-                let child = self.new_scope(ScopeKind::For, Some(scope));
-                if let Some(initializer) = &statement.initializer {
-                    self.resolve_for_initializer(initializer, child);
-                }
-                if let Some(test) = &statement.test {
-                    self.resolve_expr(test, child);
-                }
-                if let Some(update) = &statement.update {
-                    self.resolve_expr(update, child);
-                }
-                self.resolve_statement(&statement.body, child);
-            }
-            Statement::ForIn(statement) => {
-                let child = self.new_scope(ScopeKind::For, Some(scope));
-                self.resolve_for_binding(&statement.binding, child);
-                self.resolve_expr(&statement.object, child);
-                self.resolve_statement(&statement.body, child);
-            }
-            Statement::ForOf(statement) => {
-                let child = self.new_scope(ScopeKind::For, Some(scope));
-                self.resolve_for_binding(&statement.binding, child);
-                self.resolve_expr(&statement.iterable, child);
-                self.resolve_statement(&statement.body, child);
-            }
-            Statement::While(statement) => {
-                self.resolve_expr(&statement.test, scope);
-                self.resolve_statement(&statement.body, scope);
-            }
-            Statement::DoWhile(statement) => {
-                self.resolve_statement(&statement.body, scope);
-                self.resolve_expr(&statement.test, scope);
-            }
-            Statement::Try(statement) => {
-                let block = &statement.block;
-                let try_scope = self.new_scope(ScopeKind::Block, Some(scope));
-                self.bind_statements(&block.data().statements, try_scope);
-                self.resolve_statements(&block.data().statements, try_scope);
-                if let Some(handler) = &statement.handler {
-                    let catch_scope = self.new_scope(ScopeKind::Catch, Some(scope));
-                    if let Some(binding) = &handler.data().binding {
-                        self.bind_pattern(binding, VariableKind::Let, catch_scope, handler.id());
-                    }
-                    let body = &handler.data().body;
-                    self.bind_statements(&body.data().statements, catch_scope);
-                    self.resolve_statements(&body.data().statements, catch_scope);
-                }
-                if let Some(finalizer) = &statement.finalizer {
-                    let finally_scope = self.new_scope(ScopeKind::Block, Some(scope));
-                    self.bind_statements(&finalizer.data().statements, finally_scope);
-                    self.resolve_statements(&finalizer.data().statements, finally_scope);
-                }
-            }
-            Statement::With(statement) => {
-                self.resolve_expr(&statement.object, scope);
-                self.resolve_statement(&statement.body, scope);
-            }
-            Statement::Labeled(statement) => self.resolve_statement(&statement.body, scope),
-            Statement::Return(statement) => {
-                if let Some(argument) = &statement.argument {
-                    self.resolve_expr(argument, scope);
-                }
-            }
-            Statement::Throw(statement) => self.resolve_expr(&statement.argument, scope),
-            Statement::Enum(declaration) => {
-                for member in &declaration.members {
-                    if let Some(initializer) = &member.data().initializer {
-                        self.resolve_expr(initializer, scope);
-                    }
-                }
-            }
-            Statement::Namespace(namespace) => {
-                let child = self.new_scope(ScopeKind::Block, Some(scope));
-                let body = &namespace.body;
-                self.bind_statements(&body.data().statements, child);
-                self.resolve_statements(&body.data().statements, child);
-            }
-            Statement::Declare(inner) => self.resolve_statement(inner, scope),
-            Statement::Export(export) => self.resolve_export(export, scope),
-            _ => {}
-        }
-    }
-
-    fn resolve_export(&mut self, export: &'src crate::syntax::ExportDeclaration, scope: ScopeId) {
-        match export {
-            crate::syntax::ExportDeclaration::Named(
-                crate::syntax::ExportNamedDeclaration::Declaration(inner),
-            ) => self.resolve_statement(inner, scope),
-            crate::syntax::ExportDeclaration::Default(default) => match &default.value {
-                crate::syntax::ExportDefaultValue::Function(function) => {
-                    self.resolve_function(function, scope);
-                }
-                crate::syntax::ExportDefaultValue::Class(class) => self.resolve_class(class, scope),
-                crate::syntax::ExportDefaultValue::Expression(expression) => {
-                    self.resolve_expr(expression, scope);
-                }
-                crate::syntax::ExportDefaultValue::Missing(_) => {}
-            },
-            crate::syntax::ExportDeclaration::Assignment(expression) => {
-                self.resolve_expr(expression, scope);
-            }
-            _ => {}
-        }
-    }
-
-    fn resolve_for_initializer(&mut self, initializer: &'src ForInitializer, scope: ScopeId) {
-        match initializer {
-            ForInitializer::Variable(variable) => {
-                self.bind_variable(variable, scope, NodeId::default());
-                self.resolve_variable(variable, scope);
-            }
-            ForInitializer::Expression(expression) => self.resolve_expr(expression, scope),
-        }
-    }
-
-    fn resolve_for_binding(&mut self, binding: &'src ForBinding, scope: ScopeId) {
-        match binding {
-            ForBinding::Variable(variable) => {
-                self.bind_variable(variable, scope, NodeId::default());
-                self.resolve_variable(variable, scope);
-            }
-            ForBinding::Target(target) => self.resolve_assignment_target(target, scope),
-        }
-    }
-
-    fn resolve_variable(&mut self, variable: &'src VariableDeclaration, scope: ScopeId) {
-        for declarator in &variable.declarations {
-            let declarator = declarator.data();
-            if let Some(initializer) = &declarator.initializer {
-                self.resolve_expr(initializer, scope);
-            }
-            let annotation = declarator
-                .type_annotation
-                .as_ref()
-                .map(|annotation| self.resolve_type(&annotation.data().type_node, scope));
-            let initializer_type = declarator
-                .initializer
-                .as_ref()
-                .map(|initializer| self.type_of_expr(initializer));
-
-            // Only a plain identifier binding carries a checkable declared type.
-            if let BindingPattern::Identifier(name) = declarator.binding.data() {
-                let declared = annotation
-                    .or(initializer_type)
-                    .unwrap_or_else(|| self.types.any());
-                if let Some(symbol) = self.lookup_value(scope, self.identifier_text(name)) {
-                    self.symbol_types[symbol.get() as usize] = declared;
-                }
-                if let (Some(target), Some(source)) = (annotation, initializer_type)
-                    && !self.types.assignable(source, target)
-                {
-                    let range = declarator
-                        .initializer
-                        .as_ref()
-                        .map_or_else(|| name.range(), |initializer| initializer.range());
-                    self.emit(TYPE_NOT_ASSIGNABLE, range, NOT_ASSIGNABLE_MESSAGE);
-                }
-            }
-        }
-    }
-
-    fn resolve_function(&mut self, function: &'src FunctionLike, parent: ScopeId) {
-        let scope = self.new_scope(ScopeKind::Function, Some(parent));
-        self.bind_type_parameters(function.type_parameters.as_ref(), scope);
-        for parameter in &function.parameters {
-            self.resolve_parameter(parameter, scope);
-        }
-        if let Some(return_type) = &function.return_type {
-            let _ = self.resolve_type(&return_type.data().type_node, scope);
-        }
-        match &function.body {
-            Some(FunctionBody::Block(block)) => {
-                self.bind_statements(&block.data().statements, scope);
-                self.resolve_statements(&block.data().statements, scope);
-            }
-            Some(FunctionBody::Expression(expression)) => self.resolve_expr(expression, scope),
-            _ => {}
-        }
-    }
-
-    fn bind_type_parameters(
-        &mut self,
-        list: Option<&'src crate::syntax::TypeParameterList>,
-        scope: ScopeId,
-    ) {
-        let Some(list) = list else {
-            return;
-        };
-        for parameter in &list.parameters {
-            let data = parameter.data();
-            self.declare(
-                self.identifier_text(&data.name),
-                SymbolKind::TypeParameter,
-                scope,
-                parameter.id(),
-                data.name.range(),
-            );
-            if let Some(constraint) = &data.constraint {
-                let _ = self.resolve_type(constraint, scope);
-            }
-            if let Some(default) = &data.default {
-                let _ = self.resolve_type(default, scope);
-            }
-        }
-    }
-
-    fn resolve_parameter(&mut self, parameter: &'src crate::syntax::ParameterNode, scope: ScopeId) {
-        let data = parameter.data();
-        self.bind_pattern(&data.binding, VariableKind::Let, scope, parameter.id());
-        if let (BindingPattern::Identifier(name), Some(annotation)) =
-            (data.binding.data(), &data.type_annotation)
-        {
-            let resolved = self.resolve_type(&annotation.data().type_node, scope);
-            if let Some(symbol) = self.scopes[scope.0 as usize]
-                .values
-                .get(self.identifier_text(name))
-                .copied()
+    fn into_resolution(self) -> ExportResolution {
+        match self.candidates.len() {
+            0 if self.has_cycle => ExportResolution::Cycle,
+            0 => ExportResolution::Unresolved,
+            1 => match self
+                .candidates
+                .iter()
+                .next()
+                .expect("one export candidate exists")
             {
-                self.symbol_types[symbol.get() as usize] = resolved;
-            }
-        } else if let Some(annotation) = &data.type_annotation {
-            let _ = self.resolve_type(&annotation.data().type_node, scope);
-        }
-        if let Some(initializer) = &data.initializer {
-            self.resolve_expr(initializer, scope);
-        }
-    }
-
-    fn resolve_class(&mut self, class: &'src ClassDeclaration, parent: ScopeId) {
-        let scope = self.new_scope(ScopeKind::Class, Some(parent));
-        self.bind_type_parameters(class.type_parameters.as_ref(), scope);
-        if let Some(heritage) = &class.extends {
-            self.resolve_expr(&heritage.expression, parent);
-        }
-        for implemented in &class.implements {
-            let _ = self.resolve_type(implemented, scope);
-        }
-        for member in &class.members {
-            self.resolve_class_member(member.data(), scope);
-        }
-    }
-
-    fn resolve_class_member(&mut self, member: &'src ClassMember, scope: ScopeId) {
-        match member {
-            ClassMember::Method(method) => {
-                self.resolve_property_name(&method.name, scope);
-                self.resolve_function(&method.function, scope);
-            }
-            ClassMember::Constructor(constructor) => {
-                let child = self.new_scope(ScopeKind::Function, Some(scope));
-                for parameter in &constructor.parameters {
-                    self.resolve_parameter(parameter, child);
-                }
-                self.bind_statements(&constructor.body.data().statements, child);
-                self.resolve_statements(&constructor.body.data().statements, child);
-            }
-            ClassMember::Property(property) => {
-                self.resolve_property_name(&property.name, scope);
-                if let Some(annotation) = &property.type_annotation {
-                    let _ = self.resolve_type(&annotation.data().type_node, scope);
-                }
-                if let Some(initializer) = &property.initializer {
-                    self.resolve_expr(initializer, scope);
-                }
-            }
-            ClassMember::AutoAccessor(accessor) => {
-                self.resolve_property_name(&accessor.name, scope);
-                if let Some(initializer) = &accessor.initializer {
-                    self.resolve_expr(initializer, scope);
-                }
-            }
-            ClassMember::StaticBlock(block) => {
-                let child = self.new_scope(ScopeKind::Block, Some(scope));
-                self.bind_statements(&block.data().statements, child);
-                self.resolve_statements(&block.data().statements, child);
-            }
-            _ => {}
-        }
-    }
-
-    fn resolve_property_name(&mut self, name: &'src PropertyName, scope: ScopeId) {
-        if let PropertyName::Computed(expression) = name {
-            self.resolve_expr(expression, scope);
-        }
-    }
-
-    fn resolve_expr(&mut self, expression: &'src Expr, scope: ScopeId) {
-        match expression.data() {
-            Expression::Identifier(identifier) => self.resolve_value(identifier, scope),
-            Expression::Array(array) => {
-                for element in &array.elements {
-                    match element {
-                        ArrayElement::Expression(inner) => self.resolve_expr(inner, scope),
-                        ArrayElement::Spread(spread) => self.resolve_expr(&spread.argument, scope),
-                        _ => {}
-                    }
-                }
-            }
-            Expression::Object(object) => {
-                for member in &object.members {
-                    self.resolve_object_member(member.data(), scope);
-                }
-            }
-            Expression::Function(function) => self.resolve_function(&function.function, scope),
-            Expression::Class(class) => self.resolve_class(&class.class, scope),
-            Expression::Arrow(arrow) => {
-                let child = self.new_scope(ScopeKind::Function, Some(scope));
-                self.bind_type_parameters(arrow.type_parameters.as_ref(), child);
-                for parameter in &arrow.parameters {
-                    self.resolve_parameter(parameter, child);
-                }
-                if let Some(return_type) = &arrow.return_type {
-                    let _ = self.resolve_type(&return_type.data().type_node, child);
-                }
-                match &arrow.body {
-                    FunctionBody::Block(block) => {
-                        self.bind_statements(&block.data().statements, child);
-                        self.resolve_statements(&block.data().statements, child);
-                    }
-                    FunctionBody::Expression(inner) => self.resolve_expr(inner, child),
-                    FunctionBody::Missing(_) => {}
-                }
-            }
-            Expression::Call(call) => {
-                self.resolve_expr(&call.callee, scope);
-                self.resolve_type_arguments(call.type_arguments.as_ref(), scope);
-                self.resolve_arguments(&call.arguments, scope);
-            }
-            Expression::New(new) => {
-                self.resolve_expr(&new.callee, scope);
-                self.resolve_type_arguments(new.type_arguments.as_ref(), scope);
-                self.resolve_arguments(&new.arguments, scope);
-            }
-            Expression::Member(member) => {
-                self.resolve_expr(&member.object, scope);
-                if let MemberProperty::Computed(inner) = &member.property {
-                    self.resolve_expr(inner, scope);
-                }
-            }
-            Expression::Await(await_expression) => {
-                self.resolve_expr(&await_expression.argument, scope);
-            }
-            Expression::Yield(yield_expression) => {
-                if let Some(argument) = &yield_expression.argument {
-                    self.resolve_expr(argument, scope);
-                }
-            }
-            Expression::Unary(unary) => self.resolve_expr(&unary.argument, scope),
-            Expression::Update(update) => self.resolve_assignment_target(&update.argument, scope),
-            Expression::Binary(binary) => {
-                self.resolve_expr(&binary.left, scope);
-                self.resolve_expr(&binary.right, scope);
-            }
-            Expression::Logical(logical) => {
-                self.resolve_expr(&logical.left, scope);
-                self.resolve_expr(&logical.right, scope);
-            }
-            Expression::Conditional(conditional) => {
-                self.resolve_expr(&conditional.test, scope);
-                self.resolve_expr(&conditional.consequent, scope);
-                self.resolve_expr(&conditional.alternate, scope);
-            }
-            Expression::Assignment(assignment) => {
-                self.resolve_assignment_target(&assignment.left, scope);
-                self.resolve_expr(&assignment.right, scope);
-            }
-            Expression::Sequence(sequence) => {
-                for inner in &sequence.expressions {
-                    self.resolve_expr(inner, scope);
-                }
-            }
-            Expression::Parenthesized(inner) => self.resolve_expr(inner, scope),
-            Expression::As(cast) => {
-                self.resolve_expr(&cast.expression, scope);
-                let _ = self.resolve_type(&cast.type_node, scope);
-            }
-            Expression::Satisfies(satisfies) => {
-                self.resolve_expr(&satisfies.expression, scope);
-                let _ = self.resolve_type(&satisfies.type_node, scope);
-            }
-            Expression::TypeAssertion(assertion) => {
-                self.resolve_expr(&assertion.expression, scope);
-                let _ = self.resolve_type(&assertion.type_node, scope);
-            }
-            Expression::NonNull(non_null) => self.resolve_expr(&non_null.expression, scope),
-            Expression::TaggedTemplate(tagged) => {
-                self.resolve_expr(&tagged.tag, scope);
-                for inner in &tagged.template.expressions {
-                    self.resolve_expr(inner, scope);
-                }
-            }
-            Expression::Template(template) => {
-                for inner in &template.expressions {
-                    self.resolve_expr(inner, scope);
-                }
-            }
-            Expression::Import(import) => {
-                self.resolve_expr(&import.source, scope);
-                if let Some(options) = &import.options {
-                    self.resolve_expr(options, scope);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn resolve_object_member(&mut self, member: &'src ObjectMember, scope: ScopeId) {
-        match member {
-            ObjectMember::Property(property) => {
-                self.resolve_property_name(&property.name, scope);
-                self.resolve_expr(&property.value, scope);
-            }
-            ObjectMember::Method(method) => {
-                self.resolve_property_name(&method.name, scope);
-                self.resolve_function(&method.function, scope);
-            }
-            ObjectMember::Spread(spread) => self.resolve_expr(&spread.argument, scope),
-            ObjectMember::Missing(_) => {}
-        }
-    }
-
-    fn resolve_arguments(&mut self, arguments: &'src [CallArgument], scope: ScopeId) {
-        for argument in arguments {
-            match argument {
-                CallArgument::Expression(inner) => self.resolve_expr(inner, scope),
-                CallArgument::Spread(spread) => self.resolve_expr(&spread.argument, scope),
-                CallArgument::Missing(_) => {}
-            }
-        }
-    }
-
-    fn resolve_type_arguments(
-        &mut self,
-        arguments: Option<&'src crate::syntax::TypeArgumentList>,
-        scope: ScopeId,
-    ) {
-        if let Some(list) = arguments {
-            for argument in &list.arguments {
-                let _ = self.resolve_type(argument, scope);
-            }
-        }
-    }
-
-    fn resolve_assignment_target(
-        &mut self,
-        target: &'src crate::syntax::AssignmentTargetNode,
-        scope: ScopeId,
-    ) {
-        match target.data() {
-            AssignmentTarget::Identifier(identifier) => self.resolve_value(identifier, scope),
-            AssignmentTarget::Member(member) => {
-                self.resolve_expr(&member.object, scope);
-                if let MemberProperty::Computed(inner) = &member.property {
-                    self.resolve_expr(inner, scope);
-                }
-            }
-            AssignmentTarget::Object(object) => {
-                for property in &object.properties {
-                    self.resolve_property_name(&property.name, scope);
-                    self.resolve_assignment_target(&property.target, scope);
-                    if let Some(initializer) = &property.initializer {
-                        self.resolve_expr(initializer, scope);
-                    }
-                }
-            }
-            AssignmentTarget::Array(array) => {
-                for element in &array.elements {
-                    if let crate::syntax::AssignmentArrayElement::Target(inner) = element {
-                        self.resolve_assignment_target(inner, scope);
-                    }
-                }
-            }
-            AssignmentTarget::Missing(_) => {}
-        }
-    }
-
-    fn resolve_value(&mut self, identifier: &IdentifierNode, scope: ScopeId) {
-        let name = self.identifier_text(identifier);
-        if name.is_empty() {
-            return;
-        }
-        if let Some(symbol) = self.lookup_value(scope, name) {
-            self.references.insert(identifier.id(), symbol);
-        } else if !GLOBAL_VALUES.contains(&name) {
-            self.emit(
-                CANNOT_FIND_NAME,
-                identifier.range(),
-                CANNOT_FIND_NAME_MESSAGE,
-            );
-        }
-    }
-
-    fn lookup_value(&self, scope: ScopeId, name: &str) -> Option<SymbolId> {
-        let mut current = Some(scope);
-        while let Some(id) = current {
-            let scope = &self.scopes[id.0 as usize];
-            if let Some(symbol) = scope.values.get(name) {
-                return Some(*symbol);
-            }
-            current = scope.parent;
-        }
-        None
-    }
-
-    fn lookup_type(&self, scope: ScopeId, name: &str) -> Option<SymbolId> {
-        let mut current = Some(scope);
-        while let Some(id) = current {
-            let scope = &self.scopes[id.0 as usize];
-            if let Some(symbol) = scope.types.get(name) {
-                return Some(*symbol);
-            }
-            current = scope.parent;
-        }
-        None
-    }
-
-    // -- the named type algebra ------------------------------------------------
-
-    fn resolve_type(&mut self, node: &'src Ty, scope: ScopeId) -> TypeId {
-        match node.data() {
-            TypeNode::Keyword(keyword) => self.keyword_type(*keyword),
-            TypeNode::Literal(literal) => self.literal_type(literal),
-            TypeNode::Reference(reference) => {
-                self.resolve_type_reference(reference, scope, node.range())
-            }
-            TypeNode::Union(members) => {
-                let resolved: Vec<TypeId> = members
-                    .iter()
-                    .map(|member| self.resolve_type(member, scope))
-                    .collect();
-                self.types.union(&resolved)
-            }
-            TypeNode::Array(element) => {
-                let resolved = self.resolve_type(element, scope);
-                self.types.array(resolved)
-            }
-            TypeNode::Object(object) => self.resolve_object_type(&object.members, scope),
-            TypeNode::Function(function) => self.resolve_function_type(function, scope),
-            TypeNode::Parenthesized(inner) => self.resolve_type(inner, scope),
-            TypeNode::Tuple(tuple) => {
-                let element_types: Vec<TypeId> = tuple
-                    .elements
-                    .iter()
-                    .map(|element| self.resolve_type(&element.type_node, scope))
-                    .collect();
-                let element = self.types.union(&element_types);
-                self.types.array(element)
-            }
-            _ => self.types.error_type(),
-        }
-    }
-
-    fn keyword_type(&self, keyword: KeywordType) -> TypeId {
-        match keyword {
-            KeywordType::Any => self.types.any(),
-            KeywordType::Unknown => self.types.unknown(),
-            KeywordType::Never => self.types.never(),
-            KeywordType::Void => self.types.void(),
-            KeywordType::Undefined => self.types.undefined_type(),
-            KeywordType::Null => self.types.null_type(),
-            KeywordType::Boolean => self.types.boolean(),
-            KeywordType::Number => self.types.number(),
-            KeywordType::BigInt => self.types.bigint(),
-            KeywordType::String => self.types.string(),
-            KeywordType::Symbol => self.types.symbol_type(),
-            KeywordType::Object => self.types.object(),
-            KeywordType::Intrinsic => self.types.error_type(),
-        }
-    }
-
-    fn literal_type(&mut self, literal: &TypeLiteral) -> TypeId {
-        match literal {
-            TypeLiteral::String(token) => {
-                let text = self.text(token.data().token());
-                self.types.string_literal(text)
-            }
-            TypeLiteral::Number(token) => {
-                let text = self.text(token.data().token());
-                self.types.number_literal(text)
-            }
-            TypeLiteral::BigInt(token) => {
-                let text = self.text(token.data().token());
-                self.types.bigint_literal(text)
-            }
-            TypeLiteral::Boolean(token) => {
-                let value = self.text(token.data().token()) == "true";
-                self.types.boolean_literal(value)
-            }
-            TypeLiteral::Null(_) => self.types.null_type(),
-            TypeLiteral::Unary { .. } => self.types.number(),
-        }
-    }
-
-    fn resolve_type_reference(
-        &mut self,
-        reference: &'src TypeReference,
-        scope: ScopeId,
-        range: TextRange,
-    ) -> TypeId {
-        if let Some(argument_list) = &reference.type_arguments {
-            for argument in &argument_list.arguments {
-                let _ = self.resolve_type(argument, scope);
-            }
-        }
-        let EntityName::Identifier(identifier) = &reference.name else {
-            // Qualified and missing names are opaque in this slice.
-            return self.types.error_type();
-        };
-        let name = self.identifier_text(identifier);
-        match self.lookup_type(scope, name) {
-            Some(symbol) => match self.symbols[symbol.get() as usize].kind {
-                SymbolKind::Interface | SymbolKind::TypeAlias => self.resolve_type_symbol(symbol),
-                SymbolKind::Class | SymbolKind::Enum | SymbolKind::TypeParameter => {
-                    self.types.named(symbol)
-                }
-                _ => self.types.error_type(),
+                ExportCandidate::Const(linked) => ExportResolution::Const(*linked),
+                ExportCandidate::Value(_) => ExportResolution::NotConst,
+                ExportCandidate::Namespace(source) => ExportResolution::Namespace(*source),
             },
-            None => {
-                if !GLOBAL_TYPES.contains(&name) {
-                    self.emit(CANNOT_FIND_TYPE, range, CANNOT_FIND_TYPE_MESSAGE);
+            _ => ExportResolution::Ambiguous,
+        }
+    }
+}
+
+fn collect_imported_const_enum_facts(
+    sources: &[Recovered<SourceFile>],
+    edges: &[ResolvedModuleEdge],
+    files: &mut BTreeMap<SourceId, SemanticModel>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let edge_targets: HashMap<_, _> = edges
+        .iter()
+        .map(|edge| ((edge.from, edge.specifier), edge.to))
+        .collect();
+    let imports = collect_import_targets(sources, files, &edge_targets);
+    let exports = collect_export_targets(sources, files, &edge_targets);
+    let export_stars = collect_export_stars(sources, &edge_targets);
+
+    let mut sites: Vec<_> = files
+        .iter()
+        .flat_map(|(&source, model)| {
+            model
+                .enum_facts()
+                .imported_member_uses()
+                .map(move |(member, site)| (source, member, site.clone()))
+        })
+        .filter(|(source, _, site)| {
+            !matches!(site.base(), enum_plan::ImportedEnumMemberBase::Import(symbol) if matches!(imports.get(&(*source, symbol)), Some(ImportTarget::Namespace { .. })))
+        })
+        .collect();
+    sites.sort_by_key(|(source, member, _)| (source.get(), member.get()));
+
+    let mut values: BTreeMap<_, _> = sites
+        .iter()
+        .map(|(source, member, _)| {
+            (
+                (*source, *member),
+                enum_plan::ImportedConstEnumValue::Pending,
+            )
+        })
+        .collect();
+    loop {
+        let mut changed = false;
+        for (source, member, site) in &sites {
+            let value = resolve_imported_const_enum_value(
+                *source,
+                site,
+                &imports,
+                &exports,
+                &export_stars,
+                files,
+            );
+            let slot = values
+                .get_mut(&(*source, *member))
+                .expect("every imported member site has a value slot");
+            if matches!(slot, enum_plan::ImportedConstEnumValue::Pending)
+                && !matches!(value, enum_plan::ImportedConstEnumValue::Pending)
+            {
+                *slot = value;
+                changed = true;
+            }
+        }
+        if !changed {
+            let mut found_cycle = false;
+            for value in values.values_mut() {
+                if matches!(value, enum_plan::ImportedConstEnumValue::Pending) {
+                    *value = enum_plan::ImportedConstEnumValue::Cycle;
+                    found_cycle = true;
                 }
-                self.types.error_type()
+            }
+            if found_cycle {
+                rebuild_program_enum_facts(sources, files, &values, diagnostics);
+            }
+            break;
+        }
+        rebuild_program_enum_facts(sources, files, &values, diagnostics);
+    }
+    for ((source, _), target) in &imports {
+        let ImportTarget::Named {
+            specifier: Some(specifier),
+            ..
+        } = target
+        else {
+            continue;
+        };
+        if matches!(
+            resolve_import_target(
+                *source,
+                target,
+                &imports,
+                &exports,
+                &export_stars,
+                files,
+                &mut HashSet::new()
+            ),
+            ExportResolution::Const(_)
+        ) {
+            files
+                .get_mut(source)
+                .expect("every import source has a semantic model")
+                .enum_facts
+                .elide_import_specifier(*specifier);
+        }
+    }
+
+    for (source, member, site) in sites {
+        let is_const_enum_target = files
+            .get(&source)
+            .expect("every candidate source has a semantic model")
+            .enum_facts()
+            .is_imported_member_target(member)
+            && matches!(
+                resolve_imported_member_base(
+                    source,
+                    &site,
+                    &files
+                        .get(&source)
+                        .expect("every candidate source has a semantic model")
+                        .enum_facts()
+                        .imported_member_uses()
+                        .map(|(node, candidate)| (node, candidate.clone()))
+                        .collect(),
+                    &imports,
+                    &exports,
+                    &export_stars,
+                    files,
+                    &mut HashSet::new(),
+                ),
+                ImportedMemberBaseResolution::Export(ExportResolution::Const(_))
+            );
+        if is_const_enum_target {
+            files
+                .get_mut(&source)
+                .expect("every candidate source has a semantic model")
+                .enum_facts
+                .add_import_const_enum_member_target(member);
+        }
+        match values
+            .remove(&(source, member))
+            .expect("fixed point covers every imported member")
+        {
+            enum_plan::ImportedConstEnumValue::Constant(value) => files
+                .get_mut(&source)
+                .expect("candidate source has a semantic model")
+                .enum_facts
+                .add_import_const_use(member, value),
+            enum_plan::ImportedConstEnumValue::Nonconstant => {
+                diagnostics.push(imported_enum_error(
+                    source,
+                    IMPORTED_CONST_ENUM_NONCONSTANT,
+                    site.range(),
+                    "Imported const-enum member is not a constant.",
+                ))
+            }
+            enum_plan::ImportedConstEnumValue::Unresolved => diagnostics.push(imported_enum_error(
+                source,
+                IMPORTED_CONST_ENUM_UNRESOLVED,
+                site.range(),
+                "Imported const-enum member could not be resolved.",
+            )),
+            enum_plan::ImportedConstEnumValue::Ambiguous => diagnostics.push(imported_enum_error(
+                source,
+                IMPORTED_CONST_ENUM_AMBIGUOUS,
+                site.range(),
+                "Imported const-enum member is ambiguous.",
+            )),
+            enum_plan::ImportedConstEnumValue::Cycle => diagnostics.push(imported_enum_error(
+                source,
+                IMPORTED_CONST_ENUM_CYCLE,
+                site.range(),
+                "Imported const-enum dependency is cyclic.",
+            )),
+            enum_plan::ImportedConstEnumValue::NotConst => {}
+            enum_plan::ImportedConstEnumValue::Pending => {
+                unreachable!("fixed point classifies every pending dependency")
             }
         }
     }
+}
 
-    fn resolve_type_symbol(&mut self, symbol: SymbolId) -> TypeId {
-        match self.type_state[symbol.get() as usize] {
-            TypeState::Done(id) => return id,
-            TypeState::InProgress => return self.types.error_type(),
-            TypeState::Unresolved => {}
+fn resolve_imported_const_enum_value(
+    source: SourceId,
+    site: &enum_plan::ImportedEnumMemberUse,
+    imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
+    exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
+    export_stars: &ExportStars,
+    files: &BTreeMap<SourceId, SemanticModel>,
+) -> enum_plan::ImportedConstEnumValue {
+    let candidates: HashMap<_, _> = files
+        .get(&source)
+        .expect("every candidate source has a semantic model")
+        .enum_facts()
+        .imported_member_uses()
+        .map(|(node, candidate)| (node, candidate.clone()))
+        .collect();
+    match resolve_imported_member_base(
+        source,
+        site,
+        &candidates,
+        imports,
+        exports,
+        export_stars,
+        files,
+        &mut HashSet::new(),
+    ) {
+        ImportedMemberBaseResolution::Export(ExportResolution::Const(enum_id)) => files
+            .get(&enum_id.source)
+            .expect("resolved enum source has a semantic model")
+            .enum_facts()
+            .const_enum_members(enum_id.symbol)
+            .and_then(|members| members.member(site.name()))
+            .map_or(
+                enum_plan::ImportedConstEnumValue::Unresolved,
+                |member| match member {
+                    enum_plan::ConstEnumMember::Constant(value) => {
+                        enum_plan::ImportedConstEnumValue::Constant(value.clone())
+                    }
+                    enum_plan::ConstEnumMember::Nonconstant => {
+                        enum_plan::ImportedConstEnumValue::Nonconstant
+                    }
+                    enum_plan::ConstEnumMember::Pending => {
+                        enum_plan::ImportedConstEnumValue::Pending
+                    }
+                },
+            ),
+        ImportedMemberBaseResolution::Export(ExportResolution::NotConst)
+        | ImportedMemberBaseResolution::Export(ExportResolution::Namespace(_))
+        | ImportedMemberBaseResolution::Scalar => enum_plan::ImportedConstEnumValue::NotConst,
+        ImportedMemberBaseResolution::Export(ExportResolution::Unresolved) => {
+            enum_plan::ImportedConstEnumValue::Unresolved
         }
-        let Some(definition) = self.type_defs.get(&symbol).copied() else {
-            let id = self.types.error_type();
-            self.type_state[symbol.get() as usize] = TypeState::Done(id);
-            return id;
-        };
-        self.type_state[symbol.get() as usize] = TypeState::InProgress;
-        let resolved = match definition {
-            TypeDef::Alias { scope, node } => self.resolve_type(node, scope),
-            TypeDef::Interface {
-                scope,
-                extends,
-                members,
-            } => self.resolve_interface_type(scope, extends, members),
-        };
-        self.type_state[symbol.get() as usize] = TypeState::Done(resolved);
-        resolved
+        ImportedMemberBaseResolution::Export(ExportResolution::Ambiguous) => {
+            enum_plan::ImportedConstEnumValue::Ambiguous
+        }
+        ImportedMemberBaseResolution::Export(ExportResolution::Cycle) => {
+            enum_plan::ImportedConstEnumValue::Cycle
+        }
     }
+}
 
-    fn resolve_interface_type(
-        &mut self,
-        scope: ScopeId,
-        extends: &'src [TypeReference],
-        members: &'src [crate::syntax::TypeMemberNode],
-    ) -> TypeId {
-        let mut properties = self.type_member_properties(members, scope);
-        for base in extends {
-            let base_type = self.resolve_type_reference(base, scope, NodeId::default_range());
-            if let Type::ObjectType(base_props) = self.types.get(base_type) {
-                for base_prop in base_props.clone() {
-                    if !properties.iter().any(|prop| prop.name == base_prop.name) {
-                        properties.push(base_prop);
+fn rebuild_program_enum_facts(
+    sources: &[Recovered<SourceFile>],
+    files: &mut BTreeMap<SourceId, SemanticModel>,
+    values: &BTreeMap<(SourceId, NodeId), enum_plan::ImportedConstEnumValue>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for recovered in sources {
+        let source = recovered.product();
+        let source_id = source.source_id();
+        let imported_values: HashMap<_, _> = values
+            .iter()
+            .filter(|&(&(candidate_source, _node), _value)| candidate_source == source_id)
+            .map(|(&(_candidate_source, node), value)| (node, value.clone()))
+            .collect();
+        let model = files
+            .get_mut(&source_id)
+            .expect("every source has a semantic model");
+        let rebuilt_diagnostics = rebuild_file_enum_facts(source, model, &imported_values);
+        for diagnostic in rebuilt_diagnostics {
+            let duplicate = diagnostics.iter().any(|existing| {
+                existing.source_id() == diagnostic.source_id()
+                    && existing.range() == diagnostic.range()
+                    && existing.code() == diagnostic.code()
+            });
+            if !duplicate {
+                diagnostics.push(diagnostic);
+            }
+        }
+    }
+}
+
+fn rebuild_file_enum_facts(
+    source: &SourceFile,
+    model: &mut SemanticModel,
+    imported_values: &HashMap<NodeId, enum_plan::ImportedConstEnumValue>,
+) -> Vec<Diagnostic> {
+    let direct_member_uses: HashSet<_> = model.enum_facts().member_uses().collect();
+    let local_member_targets: HashMap<_, _> = model.enum_facts().local_member_targets().collect();
+    let imported_member_targets: HashSet<_> =
+        model.enum_facts().imported_member_targets().collect();
+    let imported_member_uses: HashMap<_, _> = model
+        .enum_facts()
+        .imported_member_uses()
+        .map(|(node, site)| (node, site.clone()))
+        .collect();
+    let mut bindings = Vec::new();
+    for statement in source.statements() {
+        collect_enum_rebuild_bindings(statement, model, false, &mut bindings);
+    }
+    let mut member_symbols = HashMap::new();
+    let mut member_names = HashMap::new();
+    for binding in &bindings {
+        for member in &binding.declaration.members {
+            if let Some(symbol) = model.enum_facts().member_symbol(member.id()) {
+                member_symbols.insert(member.id(), symbol);
+            }
+            if let Some(name) = enum_plan::cook_member_name(source, &member.data().name) {
+                member_names.insert(member.id(), name);
+            }
+        }
+    }
+    let (facts, diagnostics) = enum_plan::build_with_imports(
+        model,
+        source,
+        source.source_id(),
+        &bindings,
+        &member_symbols,
+        &member_names,
+        &direct_member_uses,
+        &local_member_targets,
+        &imported_member_uses,
+        &imported_member_targets,
+        imported_values,
+    );
+    model.enum_facts = facts;
+    diagnostics
+}
+
+fn collect_enum_rebuild_bindings<'src>(
+    statement: &'src crate::syntax::Stmt,
+    model: &SemanticModel,
+    ambient: bool,
+    bindings: &mut Vec<EnumDeclarationBinding<'src>>,
+) {
+    match statement.data() {
+        Statement::Enum(declaration) => {
+            if let Some(symbol) = model.enum_facts().declaration_symbol(statement.id()) {
+                bindings.push(EnumDeclarationBinding {
+                    declaration,
+                    declaration_id: statement.id(),
+                    symbol,
+                    ambient,
+                });
+            }
+        }
+        Statement::Declare(inner) => {
+            collect_enum_rebuild_bindings(inner, model, true, bindings);
+        }
+        Statement::Export(crate::syntax::ExportDeclaration::Named(
+            crate::syntax::ExportNamedDeclaration::Declaration(inner),
+        )) => {
+            collect_enum_rebuild_bindings(inner, model, ambient, bindings);
+        }
+        _ => {}
+    }
+}
+
+fn collect_import_targets(
+    sources: &[Recovered<SourceFile>],
+    files: &BTreeMap<SourceId, SemanticModel>,
+    edges: &HashMap<(SourceId, NodeId), SourceId>,
+) -> HashMap<(SourceId, SymbolId), ImportTarget> {
+    let mut targets = HashMap::new();
+    for recovered in sources {
+        let source = recovered.product();
+        let source_id = source.source_id();
+        let Some(model) = files.get(&source_id) else {
+            continue;
+        };
+        for statement in source.statements() {
+            let Statement::Import(import) = statement.data() else {
+                continue;
+            };
+            if import.type_only {
+                continue;
+            }
+            let Some(target_source) = edges
+                .get(&(source_id, statement.id()))
+                .or_else(|| edges.get(&(source_id, import.source.id())))
+                .copied()
+            else {
+                continue;
+            };
+            let Some(clause) = &import.clause else {
+                continue;
+            };
+            if let Some(default) = &clause.default
+                && let Some(symbol) = lookup_identifier(model, source, default)
+            {
+                targets.insert(
+                    (source_id, symbol),
+                    ImportTarget::Named {
+                        source: target_source,
+                        name: EcmaString::from_utf8("default"),
+                        specifier: None,
+                    },
+                );
+            }
+            match &clause.binding {
+                Some(ImportBinding::Namespace(local)) => {
+                    if let Some(symbol) = lookup_identifier(model, source, local) {
+                        targets.insert(
+                            (source_id, symbol),
+                            ImportTarget::Namespace {
+                                source: target_source,
+                            },
+                        );
                     }
                 }
-            }
-        }
-        self.types.object_type(properties)
-    }
-
-    fn resolve_object_type(
-        &mut self,
-        members: &'src [crate::syntax::TypeMemberNode],
-        scope: ScopeId,
-    ) -> TypeId {
-        let properties = self.type_member_properties(members, scope);
-        self.types.object_type(properties)
-    }
-
-    fn type_member_properties(
-        &mut self,
-        members: &'src [crate::syntax::TypeMemberNode],
-        scope: ScopeId,
-    ) -> Vec<PropertyType> {
-        let mut properties = Vec::new();
-        for member in members {
-            match member.data() {
-                TypeMember::Property(property) => {
-                    if let Some(name) = self.property_key(&property.name) {
-                        let type_id = match &property.type_annotation {
-                            Some(annotation) => {
-                                self.resolve_type(&annotation.data().type_node, scope)
-                            }
-                            None => self.types.any(),
+                Some(ImportBinding::Named(specifiers)) => {
+                    for specifier in specifiers {
+                        let specifier_data = specifier.data();
+                        if specifier_data.mode == crate::syntax::ImportSpecifierMode::TypeOnly {
+                            continue;
+                        }
+                        let Some(symbol) = lookup_identifier(model, source, &specifier_data.local)
+                        else {
+                            continue;
                         };
-                        properties.push(PropertyType::new(name, property.optional, type_id));
+                        let Some(name) = module_export_name(source, &specifier_data.imported)
+                        else {
+                            continue;
+                        };
+                        targets.insert(
+                            (source_id, symbol),
+                            ImportTarget::Named {
+                                source: target_source,
+                                name,
+                                specifier: Some(specifier.id()),
+                            },
+                        );
                     }
                 }
-                TypeMember::Method(method) => {
-                    if let Some(name) = self.property_key(&method.name) {
-                        let type_id = self.resolve_function_type(&method.function, scope);
-                        properties.push(PropertyType::new(name, method.optional, type_id));
+                None => {}
+            }
+        }
+    }
+    targets
+}
+
+fn collect_export_targets(
+    sources: &[Recovered<SourceFile>],
+    files: &BTreeMap<SourceId, SemanticModel>,
+    edges: &HashMap<(SourceId, NodeId), SourceId>,
+) -> HashMap<(SourceId, EcmaString), ExportTarget> {
+    let mut targets = HashMap::new();
+    for recovered in sources {
+        let source = recovered.product();
+        let source_id = source.source_id();
+        let Some(model) = files.get(&source_id) else {
+            continue;
+        };
+        for statement in source.statements() {
+            let Statement::Export(crate::syntax::ExportDeclaration::Named(named)) =
+                statement.data()
+            else {
+                continue;
+            };
+            match named {
+                crate::syntax::ExportNamedDeclaration::Declaration(inner) => {
+                    if let Some((declaration, declaration_id)) = enum_plan::enum_declaration(inner)
+                    {
+                        let Some(symbol) = model.enum_facts().declaration_symbol(declaration_id)
+                        else {
+                            continue;
+                        };
+                        let Some(name) = source
+                            .identifier_text(declaration.name.data().token())
+                            .map(|name| EcmaString::from_utf8(name.as_ref()))
+                        else {
+                            continue;
+                        };
+                        targets.insert((source_id, name), ExportTarget::Local(symbol));
+                    } else {
+                        for name in crate::lower::declared_names(source, inner) {
+                            let Some(symbol) = model.lookup_value(model.module_scope(), &name)
+                            else {
+                                continue;
+                            };
+                            targets.insert(
+                                (source_id, EcmaString::from_utf8(&name)),
+                                ExportTarget::Local(symbol),
+                            );
+                        }
+                    }
+                }
+                crate::syntax::ExportNamedDeclaration::Specifiers {
+                    type_only,
+                    specifiers,
+                    source: reexport_source,
+                    ..
+                } if !type_only => {
+                    let target_source = reexport_source.as_ref().and_then(|source| {
+                        edges
+                            .get(&(source_id, statement.id()))
+                            .or_else(|| edges.get(&(source_id, source.id())))
+                            .copied()
+                    });
+                    for specifier in specifiers {
+                        let specifier = specifier.data();
+                        if specifier.mode == crate::syntax::ExportSpecifierMode::TypeOnly {
+                            continue;
+                        }
+                        let Some(exported) = module_export_name(source, &specifier.exported) else {
+                            continue;
+                        };
+                        let target = if let Some(target_source) = target_source {
+                            let Some(name) = module_export_name(source, &specifier.local) else {
+                                continue;
+                            };
+                            ExportTarget::Forward {
+                                source: target_source,
+                                name,
+                            }
+                        } else {
+                            let Some(symbol) =
+                                lookup_module_export_name(model, source, &specifier.local)
+                            else {
+                                continue;
+                            };
+                            ExportTarget::Local(symbol)
+                        };
+                        targets.insert((source_id, exported), target);
                     }
                 }
                 _ => {}
             }
         }
-        properties
     }
+    targets
+}
 
-    fn resolve_function_type(&mut self, function: &'src FunctionType, scope: ScopeId) -> TypeId {
-        let child = self.new_scope(ScopeKind::Function, Some(scope));
-        self.bind_type_parameters(function.type_parameters.as_ref(), child);
-        let parameters: Vec<TypeId> = function
-            .parameters
-            .iter()
-            .map(|parameter| self.resolve_type(&parameter.type_annotation.data().type_node, child))
-            .collect();
-        let return_type = self.resolve_type(&function.return_type, child);
-        self.types.function(parameters, return_type)
-    }
-
-    fn property_key(&self, name: &PropertyName) -> Option<String> {
-        match name {
-            PropertyName::Identifier(identifier) => {
-                Some(self.identifier_text(identifier).to_owned())
+fn collect_export_stars(
+    sources: &[Recovered<SourceFile>],
+    edges: &HashMap<(SourceId, NodeId), SourceId>,
+) -> ExportStars {
+    let mut stars = ExportStars::default();
+    for recovered in sources {
+        let source = recovered.product();
+        let source_id = source.source_id();
+        for statement in source.statements() {
+            let Statement::Export(crate::syntax::ExportDeclaration::All(all)) = statement.data()
+            else {
+                continue;
+            };
+            if all.type_only {
+                continue;
             }
-            PropertyName::String(string) => {
-                let text = self.text(string.data().token());
-                Some(
-                    text.trim_matches(|c| c == '"' || c == '\'' || c == '`')
-                        .to_owned(),
-                )
+            let Some(target) = edges
+                .get(&(source_id, statement.id()))
+                .or_else(|| edges.get(&(source_id, all.source.id())))
+                .copied()
+            else {
+                continue;
+            };
+            if let Some(exported) = all
+                .exported
+                .as_ref()
+                .and_then(|name| module_export_name(source, name))
+            {
+                stars
+                    .namespace_exports
+                    .insert((source_id, exported), target);
+            } else {
+                stars.targets.entry(source_id).or_default().push(target);
             }
-            PropertyName::Number(number) => Some(self.text(number.data().token()).to_owned()),
-            _ => None,
         }
     }
+    stars
+}
 
-    // -- expression typing (bounded, permissive) -------------------------------
-
-    fn type_of_expr(&mut self, expression: &'src Expr) -> TypeId {
-        match expression.data() {
-            Expression::Identifier(identifier) => {
-                self.references.get(&identifier.id()).map_or_else(
-                    || self.types.any(),
-                    |symbol| self.symbol_types[symbol.get() as usize],
-                )
-            }
-            Expression::Literal(literal) => self.type_of_literal(literal),
-            Expression::Parenthesized(inner) => self.type_of_expr(inner),
-            Expression::NonNull(non_null) => self.type_of_expr(&non_null.expression),
-            Expression::As(cast) => self.type_of_type_node(&cast.type_node),
-            Expression::TypeAssertion(assertion) => self.type_of_type_node(&assertion.type_node),
-            Expression::Array(array) => {
-                let mut element_types = Vec::new();
-                for element in &array.elements {
-                    if let ArrayElement::Expression(inner) = element {
-                        let inner_type = self.type_of_expr(inner);
-                        element_types.push(inner_type);
-                    }
-                }
-                let element = if element_types.is_empty() {
-                    self.types.never()
-                } else {
-                    self.types.union(&element_types)
-                };
-                self.types.array(element)
-            }
-            Expression::Object(object) => {
-                let mut properties = Vec::new();
-                for member in &object.members {
-                    if let ObjectMember::Property(property) = member.data()
-                        && let Some(name) = self.property_key(&property.name)
-                    {
-                        let value_type = self.type_of_expr(&property.value);
-                        properties.push(PropertyType::new(name, false, value_type));
-                    }
-                }
-                self.types.object_type(properties)
-            }
-            _ => self.types.any(),
+#[expect(
+    clippy::too_many_arguments,
+    reason = "imported member base resolution threads the shared import/export lookup tables"
+)]
+fn resolve_imported_member_base(
+    source: SourceId,
+    site: &enum_plan::ImportedEnumMemberUse,
+    candidates: &HashMap<NodeId, enum_plan::ImportedEnumMemberUse>,
+    imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
+    exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
+    export_stars: &ExportStars,
+    files: &BTreeMap<SourceId, SemanticModel>,
+    visited: &mut HashSet<(SourceId, EcmaString)>,
+) -> ImportedMemberBaseResolution {
+    match site.base() {
+        enum_plan::ImportedEnumMemberBase::Import(symbol) => {
+            let Some(target) = imports.get(&(source, symbol)) else {
+                // No in-program target means an external runtime import. `Unresolved` is
+                // reserved for an import target whose export/member lookup fails.
+                return ImportedMemberBaseResolution::Export(ExportResolution::NotConst);
+            };
+            ImportedMemberBaseResolution::Export(resolve_import_target(
+                source,
+                target,
+                imports,
+                exports,
+                export_stars,
+                files,
+                visited,
+            ))
         }
+        enum_plan::ImportedEnumMemberBase::MemberResult(member) => candidates.get(&member).map_or(
+            ImportedMemberBaseResolution::Export(ExportResolution::Unresolved),
+            |candidate| {
+                resolve_imported_member_result(
+                    source,
+                    candidate,
+                    candidates,
+                    imports,
+                    exports,
+                    export_stars,
+                    files,
+                    visited,
+                )
+            },
+        ),
     }
+}
 
-    fn type_of_type_node(&mut self, node: &'src Ty) -> TypeId {
-        // Cast targets are resolved in module scope; a value cast expression does
-        // not introduce new type bindings.
-        let scope = self.module_scope;
-        self.resolve_type(node, scope)
-    }
-
-    fn type_of_literal(&mut self, literal: &Literal) -> TypeId {
-        match literal {
-            Literal::String(token) => {
-                let text = self.text(token.data().token());
-                self.types.string_literal(text)
-            }
-            Literal::Number(token) => {
-                let text = self.text(token.data().token());
-                self.types.number_literal(text)
-            }
-            Literal::BigInt(token) => {
-                let text = self.text(token.data().token());
-                self.types.bigint_literal(text)
-            }
-            Literal::Boolean(token) => {
-                let value = self.text(token.data().token()) == "true";
-                self.types.boolean_literal(value)
-            }
-            Literal::Null(_) => self.types.null_type(),
-            Literal::Regex(_) => self.types.object(),
+#[expect(
+    clippy::too_many_arguments,
+    reason = "imported member result resolution threads the shared import/export lookup tables"
+)]
+fn resolve_imported_member_result(
+    source: SourceId,
+    site: &enum_plan::ImportedEnumMemberUse,
+    candidates: &HashMap<NodeId, enum_plan::ImportedEnumMemberUse>,
+    imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
+    exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
+    export_stars: &ExportStars,
+    files: &BTreeMap<SourceId, SemanticModel>,
+    visited: &mut HashSet<(SourceId, EcmaString)>,
+) -> ImportedMemberBaseResolution {
+    match resolve_imported_member_base(
+        source,
+        site,
+        candidates,
+        imports,
+        exports,
+        export_stars,
+        files,
+        visited,
+    ) {
+        ImportedMemberBaseResolution::Export(
+            ExportResolution::Const(_) | ExportResolution::NotConst,
+        )
+        | ImportedMemberBaseResolution::Scalar => ImportedMemberBaseResolution::Scalar,
+        ImportedMemberBaseResolution::Export(ExportResolution::Namespace(source)) => {
+            ImportedMemberBaseResolution::Export(resolve_export(
+                source,
+                site.name(),
+                imports,
+                exports,
+                export_stars,
+                files,
+                visited,
+            ))
+        }
+        ImportedMemberBaseResolution::Export(resolution) => {
+            ImportedMemberBaseResolution::Export(resolution)
         }
     }
 }
 
-/// A default zero range for synthesized diagnostics anchored on missing syntax.
-trait DefaultRange {
-    fn default_range() -> TextRange;
+fn resolve_import_target(
+    _source: SourceId,
+    target: &ImportTarget,
+    imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
+    exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
+    export_stars: &ExportStars,
+    files: &BTreeMap<SourceId, SemanticModel>,
+    visited: &mut HashSet<(SourceId, EcmaString)>,
+) -> ExportResolution {
+    resolve_import_target_candidates(target, imports, exports, export_stars, files, visited)
+        .into_resolution()
 }
 
-impl DefaultRange for NodeId {
-    fn default_range() -> TextRange {
-        use crate::source::Utf16Pos;
-        TextRange::new(Utf16Pos::ZERO, Utf16Pos::ZERO).expect("zero range is ordered")
+fn resolve_import_target_candidates(
+    target: &ImportTarget,
+    imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
+    exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
+    export_stars: &ExportStars,
+    files: &BTreeMap<SourceId, SemanticModel>,
+    visited: &mut HashSet<(SourceId, EcmaString)>,
+) -> ExportResolutionSet {
+    match target {
+        ImportTarget::Named { source, name, .. } => resolve_export_candidates(
+            *source,
+            name,
+            imports,
+            exports,
+            export_stars,
+            files,
+            visited,
+        ),
+        ImportTarget::Namespace { source } => {
+            ExportResolutionSet::candidate(ExportCandidate::Namespace(*source))
+        }
     }
+}
+
+fn resolve_export(
+    source: SourceId,
+    name: &EcmaString,
+    imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
+    exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
+    export_stars: &ExportStars,
+    files: &BTreeMap<SourceId, SemanticModel>,
+    visited: &mut HashSet<(SourceId, EcmaString)>,
+) -> ExportResolution {
+    resolve_export_candidates(source, name, imports, exports, export_stars, files, visited)
+        .into_resolution()
+}
+
+fn resolve_export_candidates(
+    source: SourceId,
+    name: &EcmaString,
+    imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
+    exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
+    export_stars: &ExportStars,
+    files: &BTreeMap<SourceId, SemanticModel>,
+    visited: &mut HashSet<(SourceId, EcmaString)>,
+) -> ExportResolutionSet {
+    let key = (source, name.clone());
+    if !visited.insert(key.clone()) {
+        return ExportResolutionSet::cycle();
+    }
+    let result = match exports.get(&key) {
+        Some(ExportTarget::Forward { source, name }) => resolve_export_candidates(
+            *source,
+            name,
+            imports,
+            exports,
+            export_stars,
+            files,
+            visited,
+        ),
+        Some(ExportTarget::Local(symbol)) => resolve_exported_symbol_candidates(
+            source,
+            *symbol,
+            imports,
+            exports,
+            export_stars,
+            files,
+            visited,
+        ),
+        None => match export_stars.namespace_exports.get(&key) {
+            Some(source) => ExportResolutionSet::candidate(ExportCandidate::Namespace(*source)),
+            None => {
+                let mut candidates = ExportResolutionSet::default();
+                for target in export_stars.targets.get(&source).into_iter().flatten() {
+                    candidates.extend(resolve_export_candidates(
+                        *target,
+                        name,
+                        imports,
+                        exports,
+                        export_stars,
+                        files,
+                        visited,
+                    ));
+                }
+                candidates
+            }
+        },
+    };
+    visited.remove(&key);
+    result
+}
+
+fn resolve_exported_symbol_candidates(
+    source: SourceId,
+    symbol: SymbolId,
+    imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
+    exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
+    export_stars: &ExportStars,
+    files: &BTreeMap<SourceId, SemanticModel>,
+    visited: &mut HashSet<(SourceId, EcmaString)>,
+) -> ExportResolutionSet {
+    let Some(model) = files.get(&source) else {
+        return ExportResolutionSet::default();
+    };
+    if model.enum_facts().const_enum_members(symbol).is_some() {
+        return ExportResolutionSet::candidate(ExportCandidate::Const(LinkedEnum {
+            source,
+            symbol,
+        }));
+    }
+    let value = ExportCandidate::Value(LinkedExport { source, symbol });
+    match model.symbol(symbol).kind() {
+        SymbolKind::Import => {
+            imports
+                .get(&(source, symbol))
+                .map_or_else(ExportResolutionSet::default, |target| {
+                    resolve_import_target_candidates(
+                        target,
+                        imports,
+                        exports,
+                        export_stars,
+                        files,
+                        visited,
+                    )
+                })
+        }
+        _ => ExportResolutionSet::candidate(value),
+    }
+}
+
+fn lookup_identifier(
+    model: &SemanticModel,
+    source: &SourceFile,
+    identifier: &IdentifierNode,
+) -> Option<SymbolId> {
+    source
+        .identifier_text(identifier.data().token())
+        .and_then(|name| model.lookup_value(model.module_scope(), name.as_ref()))
+}
+
+fn module_export_name(source: &SourceFile, name: &ModuleExportName) -> Option<EcmaString> {
+    match name {
+        ModuleExportName::Identifier(identifier) => source
+            .identifier_text(identifier.data().token())
+            .map(|name| EcmaString::from_utf8(name.as_ref())),
+        ModuleExportName::String(string) => source
+            .token_text(string.data().token())
+            .and_then(crate::literal::string_value),
+        ModuleExportName::Missing(_) => None,
+    }
+}
+
+fn lookup_module_export_name(
+    model: &SemanticModel,
+    source: &SourceFile,
+    name: &ModuleExportName,
+) -> Option<SymbolId> {
+    match name {
+        ModuleExportName::Identifier(identifier) => lookup_identifier(model, source, identifier),
+        ModuleExportName::String(_) | ModuleExportName::Missing(_) => None,
+    }
+}
+
+fn imported_enum_error(
+    source: SourceId,
+    code: DiagnosticCode,
+    range: TextRange,
+    message: &'static str,
+) -> Diagnostic {
+    Diagnostic::error(code, source, range, message)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CANNOT_FIND_NAME, CANNOT_FIND_TYPE, DUPLICATE_DECLARATION, PropertyType, ScopeKind,
-        SymbolKind, TYPE_NOT_ASSIGNABLE, TypeTable, check,
+        BARE_SUPER_EXPRESSION, CANNOT_FIND_NAME, CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE,
+        CONSTRUCTOR_DECORATOR_NOT_SUPPORTED, DUPLICATE_DECLARATION, IMPORTED_CONST_ENUM_AMBIGUOUS,
+        IMPORTED_CONST_ENUM_CYCLE, IMPORTED_CONST_ENUM_NONCONSTANT, MIXED_EXPORT_ASSIGNMENT,
+        PARAMETER_DECORATOR_NOT_SUPPORTED, ProgramCheckInput, PropertyType, ResolvedModuleEdge,
+        SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
+        SUPER_REFERENCE_NON_DERIVED, ScopeKind, SymbolKind, TYPE_NOT_ASSIGNABLE, Type, TypeTable,
+        WITH_STATEMENT_NOT_ALLOWED, check, check_program,
     };
     use crate::diagnostic::{DiagnosticSeverity, Recovered};
+    use crate::namespace_plan::{ContainerAcquisition, ExportStorage};
     use crate::source::{ScriptKind, SourceId, SourceText, TextRange, Utf16Pos};
     use crate::syntax::{
-        ArrowFunction, BindingPattern, Block, EntityName, Expr, Expression, ExpressionStatement,
-        FunctionBody, Identifier, IdentifierNode, KeywordType, Literal, MissingNode, Node, NodeId,
-        NodeKind, NumericLiteral, Parameter, ParameterNode, SourceFile, Statement, Stmt,
-        StringLiteral, Token, TokenKind, TypeAnnotation, TypeNode,
+        ArrowFunction, BindingPattern, Block, ClassMember, Decorator, EntityName, Expr, Expression,
+        ExpressionStatement, FunctionBody, Identifier, IdentifierNode, KeywordType, Literal,
+        MissingNode, Node, NodeId, NodeKind, NumericLiteral, Parameter, ParameterNode, SourceFile,
+        Statement, Stmt, StringLiteral, Token, TokenKind, TypeAnnotation, TypeNode,
     };
+    use crate::{parser, scanner};
     use std::sync::Arc;
 
     // ---- direct algebra tests -------------------------------------------------
@@ -2170,10 +1604,107 @@ mod tests {
         assert_ne!(animal, dog);
     }
 
+    #[test]
+    fn relation_retains_optional_callback_void_and_enum_hazards() {
+        let mut table = TypeTable::new();
+        let source_object =
+            table.object_type(vec![PropertyType::new("x", false, table.undefined_type())]);
+        let target_object = table.object_type(vec![PropertyType::new("x", true, table.number())]);
+        let optional = table.relation(source_object, target_object);
+        assert!(optional.compatible());
+        assert!(
+            optional
+                .hazards()
+                .contains(&super::RelationHazard::ExplicitUndefinedForOptional)
+        );
+
+        let source_function = table.function(Vec::new(), table.number());
+        let target_function = table.function(vec![table.number()], table.void());
+        let callback = table.relation(source_function, target_function);
+        assert!(
+            callback
+                .hazards()
+                .contains(&super::RelationHazard::FewerCallbackParameters)
+        );
+        assert!(
+            callback
+                .hazards()
+                .contains(&super::RelationHazard::ValueReturnedToVoid)
+        );
+
+        let enum_type = table.numeric_enum(super::SymbolId::new(200));
+        let enum_boundary = table.relation(enum_type, table.number());
+        assert!(enum_boundary.compatible());
+        assert!(
+            enum_boundary
+                .hazards()
+                .contains(&super::RelationHazard::NumericEnumNumber)
+        );
+    }
+
+    #[test]
+    fn optional_any_and_unknown_already_contain_undefined() {
+        for value_type in [TypeTable::new().any(), TypeTable::new().unknown()] {
+            let mut table = TypeTable::new();
+            let source =
+                table.object_type(vec![PropertyType::new("x", false, table.undefined_type())]);
+            let target = table.object_type(vec![PropertyType::new("x", true, value_type)]);
+            assert!(
+                !table
+                    .relation(source, target)
+                    .hazards()
+                    .contains(&super::RelationHazard::ExplicitUndefinedForOptional)
+            );
+        }
+    }
+
     // ---- checker behavior tests ----------------------------------------------
 
     fn source(text: &str) -> Arc<SourceText> {
-        Arc::new(SourceText::new(text))
+        Arc::new(SourceText::new(text).expect("test source fits the per-file budget"))
+    }
+
+    fn check_text(text: &str) -> Recovered<super::SemanticModel> {
+        let parsed = parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            source(text),
+        ));
+        check(&parsed)
+    }
+
+    fn parsed(source_id: u32, text: &str) -> Recovered<SourceFile> {
+        parser::parse(scanner::scan(
+            SourceId::new(source_id),
+            ScriptKind::TypeScript,
+            source(text),
+        ))
+    }
+
+    fn linked(
+        texts: &[&str],
+        edges: &[(usize, usize, usize)],
+    ) -> Recovered<super::ProgramSemanticModel> {
+        let files: Vec<_> = texts
+            .iter()
+            .enumerate()
+            .map(|(index, text)| parsed(index as u32, text))
+            .collect();
+        let edges: Vec<_> = edges
+            .iter()
+            .map(|&(from, statement, to)| ResolvedModuleEdge {
+                from: SourceId::new(from as u32),
+                specifier: files[from].product().statements()[statement].id(),
+                to: SourceId::new(to as u32),
+            })
+            .collect();
+        check_program(
+            ProgramCheckInput {
+                files: &files,
+                edges: &edges,
+            },
+            &crate::lint::LintTable::new(crate::lint::LintProfile::Default),
+        )
     }
 
     fn range(start: usize, end: usize) -> TextRange {
@@ -2257,6 +1788,7 @@ mod tests {
             NodeId::new(id),
             range(0, text.len()),
             Statement::Variable(crate::syntax::VariableDeclaration {
+                range: range(0, text.len()),
                 kind: crate::syntax::VariableKind::Const,
                 declarations: vec![declarator],
             }),
@@ -2315,6 +1847,92 @@ mod tests {
             .collect()
     }
 
+    fn checker_codes(result: &Recovered<super::SemanticModel>) -> Vec<&'static str> {
+        result
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| diagnostic.code().as_str())
+            .filter(|code| code.starts_with("BAMTS-C"))
+            .collect()
+    }
+
+    fn program_codes(model: &Recovered<super::ProgramSemanticModel>) -> Vec<&'static str> {
+        model
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| diagnostic.code().as_str())
+            .filter(|code| code.starts_with("BAMTS-C"))
+            .collect()
+    }
+
+    fn program_codes_for_source(
+        model: &Recovered<super::ProgramSemanticModel>,
+        source_id: SourceId,
+    ) -> Vec<&'static str> {
+        model
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.source_id() == source_id)
+            .map(|diagnostic| diagnostic.code().as_str())
+            .filter(|code| code.starts_with("BAMTS-C"))
+            .collect()
+    }
+
+    fn member_expression_id(source_id: u32, text: &str, statement: usize) -> NodeId {
+        let parsed = parsed(source_id, text);
+        let Statement::Expression(expression) = parsed.product().statements()[statement].data()
+        else {
+            panic!("selected statement is a member expression");
+        };
+        expression.expression.id()
+    }
+
+    fn member_chain_ids(file: &SourceFile, statement: usize) -> (NodeId, NodeId) {
+        let Statement::Expression(statement) = file.statements()[statement].data() else {
+            panic!("selected statement is an expression");
+        };
+        let outer = statement.expression.as_ref();
+        let Expression::Member(outer_member) = outer.data() else {
+            panic!("selected expression is a member chain");
+        };
+        let inner = outer_member.object.as_ref();
+        let Expression::Member(_) = inner.data() else {
+            panic!("selected expression has a member base");
+        };
+        (inner.id(), outer.id())
+    }
+
+    fn binary_member_expression_ids(
+        source_id: u32,
+        text: &str,
+        statement: usize,
+    ) -> (NodeId, NodeId) {
+        let parsed = parsed(source_id, text);
+        let Statement::Expression(expression) = parsed.product().statements()[statement].data()
+        else {
+            panic!("selected statement is an expression");
+        };
+        let Expression::Binary(binary) = expression.expression.data() else {
+            panic!("selected expression is binary");
+        };
+        (binary.left.id(), binary.right.id())
+    }
+
+    fn import_specifier_id(source_id: u32, text: &str) -> NodeId {
+        let parsed = parsed(source_id, text);
+        let Statement::Import(import) = parsed.product().statements()[0].data() else {
+            panic!("first statement is an import");
+        };
+        let Some(crate::syntax::ImportBinding::Named(specifiers)) = import
+            .clause
+            .as_ref()
+            .and_then(|clause| clause.binding.as_ref())
+        else {
+            panic!("import has a named specifier");
+        };
+        specifiers[0].id()
+    }
+
     #[test]
     fn binds_a_variable_and_resolves_its_later_reference() {
         let statements = vec![
@@ -2354,6 +1972,124 @@ mod tests {
         let statements = vec![expression_statement(30, identifier_expr(31, "console", 0))];
         let result = check(&file("console;", statements));
         assert!(semantic_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn standard_global_families_bind_as_intrinsics() {
+        let names = [
+            // ECMAScript values and constructors.
+            "JSON",
+            "Math",
+            "Object",
+            "Array",
+            "Promise",
+            "Error",
+            "TypeError",
+            "escape",
+            "unescape",
+            // Collections, reflection, shared-memory, and typed-array families.
+            "Map",
+            "Set",
+            "Symbol",
+            "Reflect",
+            "Atomics",
+            "Int8Array",
+            "BigUint64Array",
+            // Timers and URL/text host APIs.
+            "setTimeout",
+            "clearInterval",
+            "queueMicrotask",
+            "URL",
+            "URLSearchParams",
+            "TextEncoder",
+            "TextDecoder",
+            // Node host globals that the runtime installs.
+            "console",
+            "process",
+            "globalThis",
+        ];
+        let text = names.join(";");
+        let mut start = 0;
+        let statements = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let statement = expression_statement(
+                    u32::try_from(index * 2 + 30).expect("test node id fits u32"),
+                    identifier_expr(
+                        u32::try_from(index * 2 + 31).expect("test node id fits u32"),
+                        name,
+                        start,
+                    ),
+                );
+                start += name.len() + 1;
+                statement
+            })
+            .collect();
+        let result = check(&file(&text, statements));
+        assert!(
+            semantic_codes(&result).is_empty(),
+            "intrinsic diagnostics: {:?}",
+            result.diagnostics()
+        );
+        assert_eq!(result.product().resolved_reference_count(), names.len());
+    }
+
+    #[test]
+    fn primitive_wrapper_names_bind_in_type_position() {
+        let result = check_text(
+            "let a: Boolean; let b: Number; let c: String; let d: Symbol; let e: BigInt;",
+        );
+        assert!(
+            !checker_codes(&result).contains(&CANNOT_FIND_TYPE.as_str()),
+            "primitive wrappers must be checker-visible types: {:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn source_enum_references_construct_numeric_enum_types() {
+        let result = check_text("enum E { A } let e: E = E.A;");
+        let model = result.product();
+        let symbol = model
+            .lookup_value(model.module_scope(), "e")
+            .expect("enum-typed binding is present");
+        assert!(matches!(
+            model.types().get(model.symbol_type(symbol)),
+            Type::NumericEnum(_)
+        ));
+    }
+
+    #[test]
+    fn local_bindings_shadow_intrinsics() {
+        let statements = vec![
+            variable(
+                10,
+                "const console = 1;",
+                "console",
+                6,
+                None,
+                Some(number_expr(20, "1", 16)),
+            ),
+            expression_statement(30, identifier_expr(31, "console", 19)),
+        ];
+        let result = check(&file("const console = 1; console;", statements));
+        assert!(semantic_codes(&result).is_empty());
+        let model = result.product();
+        let local = model
+            .lookup_value(model.module_scope(), "console")
+            .expect("local console binding exists");
+        assert_eq!(model.reference(NodeId::new(32)), Some(local));
+    }
+
+    #[test]
+    fn reports_an_unknown_name_even_with_intrinsics() {
+        let statements = vec![expression_statement(
+            30,
+            identifier_expr(31, "notAGlobal", 0),
+        )];
+        let result = check(&file("notAGlobal;", statements));
+        assert_eq!(semantic_codes(&result), [CANNOT_FIND_NAME.as_str()]);
     }
 
     #[test]
@@ -2477,6 +2213,518 @@ mod tests {
     }
 
     #[test]
+    fn generic_declarations_bind_their_type_parameters() {
+        let result = check_text(
+            "type Box<T> = { value: T };\
+             interface Pair<T> { left: T; map<U>(value: U): T; }\
+             class Store<T> { value: T; method<U>(value: U): T { return this.value; } }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn imported_names_bind_in_the_type_namespace_through_exports() {
+        let result = check_text(
+            "import type { Remote } from './remote.ts';\
+             export type Local<T> = Remote;\
+             export interface Public<T> { value: Local<T>; remote: Remote; }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn standard_iterator_and_generator_interfaces_are_bound() {
+        let result = check_text(
+            "declare let iterator: IterableIterator<number>;\
+             async function* values(): AsyncGenerator<number> { yield 1; }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn functions_bind_arguments_this_and_their_local_name() {
+        let result = check_text(
+            "const recursive = function self(this: void) { arguments; return self; };\
+             class C { method() { arguments; return this; } }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn named_class_expression_binds_its_internal_name() {
+        let result = check_text(
+            "const C = class Inner { static x = Inner; method() { return Inner; } }; Inner;",
+        );
+        assert_eq!(checker_codes(&result), [CANNOT_FIND_NAME.as_str()]);
+    }
+
+    #[test]
+    fn decorated_named_class_expression_static_block_binds_its_internal_name() {
+        let result = check_text(
+            "function deco(_value: unknown, _context: unknown) {}\
+             const C = @deco class Inner { static { Inner; } }; Inner;",
+        );
+        assert_eq!(checker_codes(&result), [CANNOT_FIND_NAME.as_str()]);
+    }
+
+    #[test]
+    fn named_class_expression_heritage_resolves_internal_name() {
+        let result = check_text("const C = class C extends C {};");
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
+    }
+
+    #[test]
+    fn named_class_expression_heritage_keeps_outer_internal_name_unbound() {
+        let result = check_text("const C = class Inner extends Inner {}; Inner;");
+        assert_eq!(checker_codes(&result), [CANNOT_FIND_NAME.as_str()]);
+    }
+
+    #[test]
+    fn class_declaration_heritage_resolves_outer_name() {
+        let result = check_text("class C extends C {}");
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
+    }
+
+    #[test]
+    fn decorated_named_class_expression_heritage_resolves_internal_name() {
+        let result = check_text(
+            "function deco(_value: unknown, _context: unknown) {}\
+             const C = @deco class Inner extends Inner {}; Inner;",
+        );
+        assert_eq!(checker_codes(&result), [CANNOT_FIND_NAME.as_str()]);
+    }
+
+    #[test]
+    fn ambient_declarations_bind_before_their_uses() {
+        let result = check_text(
+            "const before: Box<number> = make<number>();\
+             declare interface Box<T> { value: T; }\
+             declare function make<T>(): Box<T>;",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn local_generic_casts_resolve_in_the_enclosing_function() {
+        let result = check_text(
+            "function copy<T>(value: T): T { const result = value as T; return result; }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn const_assertions_preserve_literal_expression_types() {
+        let result = check_text("const state: \"ready\" = \"ready\" as const;");
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn generic_object_literal_mismatched_type_parameters_report_argument_error() {
+        let result = check_text(
+            "function foo<T>(x: { bar: T; baz: T }): T { return x.bar; }\n\
+             var r = foo({ bar: 1, baz: '' });",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C053"]);
+    }
+
+    #[test]
+    fn explicit_type_arguments_instantiate_generic_call_signature() {
+        let result = check_text(
+            "function foo<T>(x: { bar: T; baz: T }): T { return x.bar; }\n\
+             var r = foo<Object>({ bar: 1, baz: '' });",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn object_methods_satisfy_structural_function_members() {
+        let result = check_text(
+            "interface Service { compute(value: number): Promise<number>; }\
+             const service: Service = { async compute(value: number) { return value; } };",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn export_assignment_rejects_mixed_value_exports() {
+        let result = check_text("export = {}; export const helper = 1;");
+        assert_eq!(checker_codes(&result), [MIXED_EXPORT_ASSIGNMENT.as_str()]);
+
+        let result = check_text("export = {}; export default {};");
+        assert_eq!(checker_codes(&result), [MIXED_EXPORT_ASSIGNMENT.as_str()]);
+
+        let result = check_text("export = {}; export { value }; const value = 1;");
+        assert_eq!(checker_codes(&result), [MIXED_EXPORT_ASSIGNMENT.as_str()]);
+    }
+
+    #[test]
+    fn export_assignment_allows_type_only_exports() {
+        let result =
+            check_text("interface Shape { value: number } export type { Shape }; export = {};");
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
+    }
+
+    #[test]
+    fn export_assignment_allows_per_specifier_type_only_exports() {
+        let result =
+            check_text("interface Shape { value: number } export { type Shape }; export = {};");
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
+    }
+
+    #[test]
+    fn export_assignment_rejects_mixed_per_specifier_exports() {
+        let result = check_text(
+            "interface Shape {} const value = 1; export { type Shape, value }; export = {};",
+        );
+        assert_eq!(checker_codes(&result), [MIXED_EXPORT_ASSIGNMENT.as_str()]);
+    }
+
+    #[test]
+    fn function_parameter_decorators_are_rejected() {
+        let result = check_text(
+            "function deco(_target: unknown, _key: unknown, _index: unknown) {}\
+             function f(@deco x: number) { return x; }",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            [PARAMETER_DECORATOR_NOT_SUPPORTED.as_str()]
+        );
+    }
+
+    #[test]
+    fn method_parameter_decorators_are_rejected() {
+        let result = check_text(
+            "function deco(_target: unknown, _key: unknown, _index: unknown) {}\
+             class C { method(@deco x: number) { return x; } }",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            [PARAMETER_DECORATOR_NOT_SUPPORTED.as_str()]
+        );
+    }
+
+    #[test]
+    fn constructor_parameter_decorators_are_rejected() {
+        let result = check_text(
+            "function deco(_target: unknown, _key: unknown, _index: unknown) {}\
+             class C { constructor(@deco x: number) {} }",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            [PARAMETER_DECORATOR_NOT_SUPPORTED.as_str()]
+        );
+    }
+
+    #[test]
+    fn constructor_decorators_are_rejected() {
+        let result = check_text(
+            "function deco(_target: unknown, _key: unknown) {}\
+             class C { @deco constructor() {} }",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            [CONSTRUCTOR_DECORATOR_NOT_SUPPORTED.as_str()]
+        );
+    }
+
+    #[test]
+    fn constructor_decorators_emit_one_error_per_decorator_with_decorator_range() {
+        let text = "function deco(_target: unknown, _key: unknown) {}\
+                    class C { @first @second constructor() {} }";
+        let parsed = parsed(0, text);
+        let Statement::Class(class) = parsed.product().statements()[1].data() else {
+            panic!("expected a class declaration");
+        };
+        let ClassMember::Constructor(constructor) = class.members[0].data() else {
+            panic!("expected a constructor");
+        };
+        let decorator_ranges: Vec<_> = constructor
+            .decorators
+            .iter()
+            .map(|decorator| decorator.range())
+            .collect();
+        assert_eq!(decorator_ranges.len(), 2);
+        let result = check(&parsed);
+        let diagnostics: Vec<_> = result
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code() == CONSTRUCTOR_DECORATOR_NOT_SUPPORTED)
+            .collect();
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].range(), decorator_ranges[0]);
+        assert_eq!(diagnostics[1].range(), decorator_ranges[1]);
+    }
+
+    #[test]
+    fn arrow_parameter_decorators_are_rejected() {
+        let result = check_text(
+            "function deco(_target: unknown, _key: unknown, _index: unknown) {}\
+             const f = (@deco x: number) => x;",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            [PARAMETER_DECORATOR_NOT_SUPPORTED.as_str()]
+        );
+    }
+
+    #[test]
+    fn plain_parameters_do_not_report_parameter_decorator_errors() {
+        let result = check_text(
+            "function f(x: number) { return x; }\
+             class C { constructor(y: number) {} method(z: number) { return z; } }\
+             const arrow = (w: number) => w;",
+        );
+        let codes = checker_codes(&result);
+        assert!(
+            !codes.contains(&PARAMETER_DECORATOR_NOT_SUPPORTED.as_str()),
+            "{codes:?}"
+        );
+        assert!(
+            !codes.contains(&CONSTRUCTOR_DECORATOR_NOT_SUPPORTED.as_str()),
+            "{codes:?}"
+        );
+    }
+
+    #[test]
+    fn parameter_decorator_expressions_still_resolve_names() {
+        let result = check_text("function f(@missing x: number) { return x; }");
+        assert_eq!(
+            checker_codes(&result),
+            [
+                PARAMETER_DECORATOR_NOT_SUPPORTED.as_str(),
+                CANNOT_FIND_NAME.as_str(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parameter_decorators_emit_one_error_per_decorator_with_decorator_range() {
+        let text = "function deco(_target: unknown, _key: unknown, _index: unknown) {}\
+                    function f(@first @second x: number) { return x; }";
+        let parsed = parsed(0, text);
+        let Statement::Function(declaration) = parsed.product().statements()[1].data() else {
+            panic!("expected a function declaration");
+        };
+        let decorator_ranges: Vec<_> = declaration.function.parameters[0]
+            .data()
+            .decorators
+            .iter()
+            .map(|decorator| decorator.range())
+            .collect();
+        assert_eq!(decorator_ranges.len(), 2);
+        let result = check(&parsed);
+        let diagnostics: Vec<_> = result
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code() == PARAMETER_DECORATOR_NOT_SUPPORTED)
+            .collect();
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].range(), decorator_ranges[0]);
+        assert_eq!(diagnostics[1].range(), decorator_ranges[1]);
+    }
+
+    #[test]
+    fn unknown_names_and_real_initializer_mismatches_remain_errors() {
+        let result =
+            check_text("missingValue; let missing: MissingType; const count: number = 'wrong';");
+        assert_eq!(
+            checker_codes(&result),
+            [
+                CANNOT_FIND_NAME.as_str(),
+                CANNOT_FIND_TYPE.as_str(),
+                TYPE_NOT_ASSIGNABLE.as_str(),
+            ]
+        );
+    }
+
+    #[test]
+    fn qualified_import_equals_records_value_type_missing_and_nested_paths() {
+        let value = check_text(
+            "namespace A { export namespace B { export const value = 1; } } import X = A.B; X.value;",
+        );
+        assert!(checker_codes(&value).is_empty());
+        let model = value.product();
+        let declaration = model
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name() == "X")
+            .expect("import alias is declared")
+            .declaration();
+        let path = model
+            .namespace_facts()
+            .qualified_import_path(declaration)
+            .expect("qualified import records a SymbolId path");
+        assert_eq!(
+            path.iter()
+                .map(|symbol| model.symbol(*symbol).name())
+                .collect::<Vec<_>>(),
+            ["A", "B"]
+        );
+
+        let ty = check_text(
+            "namespace A { export interface B { value: number; } } import X = A.B; let value: X;",
+        );
+        assert!(checker_codes(&ty).is_empty());
+        let ty_model = ty.product();
+        let value_symbol = ty_model
+            .lookup_value(ty_model.module_scope(), "value")
+            .expect("value is bound");
+        assert_ne!(
+            ty_model.symbol_type(value_symbol),
+            ty_model.types().error_type()
+        );
+        assert!(matches!(
+            ty_model.types().get(ty_model.symbol_type(value_symbol)),
+            Type::ObjectType(properties)
+                if properties.iter().any(|property| property.name() == "value")
+        ));
+
+        let missing = check_text("namespace A {} import X = A.B;");
+        assert_eq!(checker_codes(&missing), [CANNOT_FIND_NAME.as_str()]);
+
+        let nested = check_text(
+            "namespace A { export namespace B { export namespace C { export const value = 1; } } } import X = A.B.C; X.value;",
+        );
+        assert!(checker_codes(&nested).is_empty());
+        let nested_declaration = nested
+            .product()
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name() == "X")
+            .expect("nested import alias is declared")
+            .declaration();
+        assert_eq!(
+            nested
+                .product()
+                .namespace_facts()
+                .qualified_import_path(nested_declaration)
+                .expect("nested qualified import records a SymbolId path")
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn self_referential_import_equals_type_terminates() {
+        let result = check_text("import X = X; let value: X;");
+        let model = result.product();
+        let value_symbol = model
+            .lookup_value(model.module_scope(), "value")
+            .expect("value is bound");
+        assert_eq!(model.symbol_type(value_symbol), model.types().error_type());
+    }
+
+    #[test]
+    fn import_equals_chases_aliases_for_qualified_type_members() {
+        let result = check_text(
+            "namespace A { export namespace B { export interface T { value: number } } }              import X = A.B; type U = X.T; let value: U;",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
+        let model = result.product();
+        let value_symbol = model
+            .lookup_value(model.module_scope(), "value")
+            .expect("value is bound");
+        assert_ne!(model.symbol_type(value_symbol), model.types().error_type());
+        assert!(matches!(
+            model.types().get(model.symbol_type(value_symbol)),
+            Type::ObjectType(properties)
+                if properties.iter().any(|property| property.name() == "value")
+        ));
+    }
+
+    #[test]
+    fn import_equals_chases_aliases_for_nested_import_equals_types() {
+        let result = check_text(
+            "namespace A { export namespace B { export interface Shape { value: number } } }              import X = A.B; import Y = X.Shape; let v: Y;",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
+        let model = result.product();
+        let value_symbol = model
+            .lookup_value(model.module_scope(), "v")
+            .expect("v is bound");
+        assert_ne!(model.symbol_type(value_symbol), model.types().error_type());
+        assert!(matches!(
+            model.types().get(model.symbol_type(value_symbol)),
+            Type::ObjectType(properties)
+                if properties.iter().any(|property| property.name() == "value")
+        ));
+    }
+
+    #[test]
+    fn import_equals_keeps_separate_value_and_type_targets() {
+        let result = check_text(
+            "function Both() {} interface Both { value: number }              import Alias = Both; Alias(); let typed: Alias;",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
+        let model = result.product();
+        let module = model.module_scope();
+        let value_both = model
+            .lookup_value(module, "Both")
+            .expect("Both value symbol");
+        let type_both = model.lookup_type(module, "Both").expect("Both type symbol");
+        assert_ne!(value_both, type_both);
+        let declaration = model
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name() == "Alias")
+            .expect("import alias is declared")
+            .declaration();
+        let path = model
+            .namespace_facts()
+            .qualified_import_path(declaration)
+            .expect("import equals records a SymbolId path");
+        assert_eq!(path, &[value_both]);
+        let typed = model.lookup_value(module, "typed").expect("typed is bound");
+        assert_ne!(model.symbol_type(typed), model.types().error_type());
+        assert!(matches!(
+            model.types().get(model.symbol_type(typed)),
+            Type::ObjectType(properties)
+                if properties.iter().any(|property| property.name() == "value")
+        ));
+    }
+
+    #[test]
+    fn cyclic_import_equals_member_scope_terminates() {
+        let result = check_text("import X = Y; import Y = X; import Z = X.Member; let value: Z;");
+        // Cycle-safe chase terminates without hanging; unresolved member lookup
+        // currently yields no diagnostic codes and an error type for `value`.
+        assert_eq!(checker_codes(&result), [] as [&str; 0]);
+        let model = result.product();
+        let value_symbol = model
+            .lookup_value(model.module_scope(), "value")
+            .expect("value is bound");
+        assert_eq!(model.symbol_type(value_symbol), model.types().error_type());
+    }
+
+    #[test]
     fn hard_warnings_merge_into_ordered_diagnostics() {
         // A single-string source that triggers hard-warning W005 plus an
         // unresolved reference should yield both, canonically ordered.
@@ -2519,14 +2767,14 @@ mod tests {
                 modifiers: crate::syntax::ParameterModifiers::default(),
                 binding,
                 optional: false,
-                type_annotation: None,
+                type_annotation: Some(keyword_annotation(84, KeywordType::Unknown, 14, 21)),
                 initializer: None,
             },
         );
-        let body = identifier_expr(90, "p", 17);
+        let body = identifier_expr(90, "p", 26);
         let arrow = Node::new(
             NodeId::new(80),
-            range(10, 18),
+            range(10, 27),
             Expression::Arrow(ArrowFunction {
                 is_async: false,
                 type_parameters: None,
@@ -2537,13 +2785,13 @@ mod tests {
         );
         let statements = vec![variable(
             10,
-            "const f = (p) => p;",
+            "const f = (p: unknown) => p;",
             "f",
             6,
             None,
             Some(Box::new(arrow)),
         )];
-        let result = check(&file("const f = (p) => p;", statements));
+        let result = check(&file("const f = (p: unknown) => p;", statements));
         assert!(semantic_codes(&result).is_empty());
         // Scope tree contains a function scope for the arrow.
         let model = result.product();
@@ -2552,6 +2800,69 @@ mod tests {
                 .scopes()
                 .iter()
                 .any(|scope| scope.kind() == ScopeKind::Function)
+        );
+    }
+
+    #[test]
+    fn an_ast_parameter_decorator_emits_the_typed_error_on_its_range() {
+        let decorator_expression = identifier_expr(95, "deco", 12);
+        let decorator = Node::new(
+            NodeId::new(94),
+            range(11, 16),
+            Decorator {
+                expression: decorator_expression,
+            },
+        );
+        let parameter_name = identifier(81, "p", 17);
+        let binding = Node::new(
+            NodeId::new(82),
+            parameter_name.range(),
+            BindingPattern::Identifier(parameter_name),
+        );
+        let parameter: ParameterNode = Node::new(
+            NodeId::new(83),
+            range(11, 27),
+            Parameter {
+                decorators: vec![decorator.clone()],
+                modifiers: crate::syntax::ParameterModifiers::default(),
+                binding,
+                optional: false,
+                type_annotation: Some(keyword_annotation(84, KeywordType::Unknown, 20, 27)),
+                initializer: None,
+            },
+        );
+        let body = identifier_expr(90, "p", 32);
+        let arrow = Node::new(
+            NodeId::new(80),
+            range(10, 33),
+            Expression::Arrow(ArrowFunction {
+                is_async: false,
+                type_parameters: None,
+                parameters: vec![parameter],
+                return_type: None,
+                body: FunctionBody::Expression(body),
+            }),
+        );
+        let statements = vec![variable(
+            10,
+            "const f = (@deco p: unknown) => p;",
+            "f",
+            6,
+            None,
+            Some(Box::new(arrow)),
+        )];
+        let result = check(&file("const f = (@deco p: unknown) => p;", statements));
+        let diagnostics: Vec<_> = result
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code() == PARAMETER_DECORATOR_NOT_SUPPORTED)
+            .collect();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].range(), decorator.range());
+        assert!(
+            checker_codes(&result).contains(&CANNOT_FIND_NAME.as_str()),
+            "{:?}",
+            checker_codes(&result)
         );
     }
 
@@ -2614,6 +2925,7 @@ mod tests {
             },
         );
         crate::syntax::VariableDeclaration {
+            range: range(name_start, name_start + name.len()),
             kind,
             declarations: vec![declarator],
         }
@@ -2672,6 +2984,25 @@ mod tests {
             SymbolKind::Variable(crate::syntax::VariableKind::Var)
         ));
         assert_eq!(model.resolved_reference_count(), 1);
+    }
+
+    #[test]
+    fn a_var_in_a_nested_block_binds_before_its_declaration() {
+        let inner = variable_kind(
+            crate::syntax::VariableKind::Var,
+            40,
+            "var a = 1;",
+            "a",
+            9,
+            Some(number_expr(50, "1", 13)),
+        );
+        let statements = vec![
+            expression_statement(30, identifier_expr(31, "a", 0)),
+            block_statement(60, vec![inner]),
+        ];
+        let result = check(&file("a; { var a = 1; }", statements));
+        assert!(semantic_codes(&result).is_empty());
+        assert_eq!(result.product().resolved_reference_count(), 1);
     }
 
     #[test]
@@ -2755,7 +3086,7 @@ mod tests {
     fn a_function_declaration_in_a_block_hoists_to_the_module() {
         let function = crate::syntax::FunctionLike {
             decorators: Vec::new(),
-            name: Some(identifier(81, "g", 11)),
+            name: Some(identifier(81, "g", 14)),
             is_async: false,
             is_generator: false,
             type_parameters: None,
@@ -2775,10 +3106,10 @@ mod tests {
             Statement::Function(crate::syntax::FunctionDeclaration { function }),
         );
         let statements = vec![
+            expression_statement(70, identifier_expr(71, "g", 0)),
             block_statement(90, vec![declaration]),
-            expression_statement(100, identifier_expr(101, "g", 20)),
         ];
-        let result = check(&file("{ function g() {} } g;", statements));
+        let result = check(&file("g; { function g() {} }", statements));
         assert!(semantic_codes(&result).is_empty());
         let model = result.product();
         assert!(
@@ -2809,6 +3140,1233 @@ mod tests {
         assert!(
             model.lookup_value(model.module_scope(), "b").is_none(),
             "let stays block-scoped and never reaches the module scope"
+        );
+    }
+
+    #[test]
+    fn namespace_vars_stay_inside_the_namespace_iife_scope() {
+        let result = check_text("namespace N { export var x = 1; x; } N.x; x;");
+        assert_eq!(checker_codes(&result), [CANNOT_FIND_NAME.as_str()]);
+        let model = result.product();
+        assert!(model.lookup_value(model.module_scope(), "N").is_some());
+        assert!(model.lookup_value(model.module_scope(), "x").is_none());
+    }
+
+    #[test]
+    fn merged_namespaces_share_one_symbol_but_variables_remain_duplicates() {
+        let merged = check_text("namespace N {} namespace N {}");
+        assert!(checker_codes(&merged).is_empty());
+        let model = merged.product();
+        let symbol = model
+            .lookup_value(model.module_scope(), "N")
+            .expect("merged namespace has a value symbol");
+        assert_eq!(model.namespace_facts().merged_declarations(symbol).len(), 2);
+
+        let duplicate = check_text("namespace N {} namespace N {} var N;");
+        assert_eq!(checker_codes(&duplicate), [DUPLICATE_DECLARATION.as_str()]);
+    }
+
+    #[test]
+    fn namespace_merging_is_declaration_order_sensitive() {
+        for source in [
+            "function F() {} namespace F {}",
+            "class C {} namespace C {}",
+            "enum E { A } namespace E {}",
+        ] {
+            let result = check_text(source);
+            assert!(
+                checker_codes(&result).is_empty(),
+                "{source}: {:?}",
+                checker_codes(&result)
+            );
+        }
+
+        for source in [
+            "namespace F {} function F() {}",
+            "namespace C {} class C {}",
+            "namespace E {} enum E { A }",
+        ] {
+            let result = check_text(source);
+            assert_eq!(
+                checker_codes(&result),
+                [DUPLICATE_DECLARATION.as_str()],
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn interface_namespace_merging_remains_bidirectional() {
+        for source in [
+            "interface I {} namespace I {}",
+            "namespace I {} interface I {}",
+        ] {
+            let result = check_text(source);
+            assert!(
+                checker_codes(&result).is_empty(),
+                "{source}: {:?}",
+                checker_codes(&result)
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_namespace_variable_conflicts_remain_distinct() {
+        let duplicate = check_text("namespace N {} var N; var N;");
+        assert_eq!(
+            checker_codes(&duplicate),
+            [
+                DUPLICATE_DECLARATION.as_str(),
+                DUPLICATE_DECLARATION.as_str(),
+            ]
+        );
+    }
+
+    #[test]
+    fn exported_namespace_variable_records_property_storage_and_outer_use_id() {
+        let parsed = parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            source("namespace N { export let value = 1; value; }"),
+        ));
+        let declaration = &parsed.product().statements()[0];
+        let Statement::Namespace(namespace) = declaration.data() else {
+            panic!("first statement is a namespace");
+        };
+        let Statement::Expression(expression) = namespace.body.data().statements[1].data() else {
+            panic!("second namespace statement is an expression");
+        };
+        let reference = expression.expression.id();
+        let checked = check(&parsed);
+        assert!(checker_codes(&checked).is_empty());
+        let facts = checked.product().namespace_facts();
+        let plan = facts
+            .declaration(declaration.id())
+            .expect("namespace declaration has a plan");
+        assert_eq!(plan.exports().len(), 1);
+        assert_eq!(plan.exports()[0].name().to_utf8_lossy(), "value");
+        assert_eq!(plan.exports()[0].storage(), ExportStorage::Property);
+        let member = facts
+            .member_use(reference)
+            .expect("exported-variable read is container-backed");
+        assert_eq!(member.container(), plan.container());
+        assert_eq!(member.name().to_utf8_lossy(), "value");
+    }
+
+    #[test]
+    fn dotted_namespace_records_nested_container_and_qualified_type_path() {
+        let parsed = parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            source(
+                "namespace Outer.Inner { export interface T {} } \
+                 type Alias = Outer.Inner.T;",
+            ),
+        ));
+        let outer_statement = &parsed.product().statements()[0];
+        let Statement::Namespace(outer) = outer_statement.data() else {
+            panic!("first statement is the outer namespace");
+        };
+        let inner_statement = &outer.body.data().statements[0];
+        let Statement::TypeAlias(alias) = parsed.product().statements()[1].data() else {
+            panic!("second statement is a type alias");
+        };
+        let checked = check(&parsed);
+        assert!(checker_codes(&checked).is_empty());
+        let facts = checked.product().namespace_facts();
+        let outer_symbol = facts
+            .declaration_symbol(outer_statement.id())
+            .expect("outer namespace has a symbol");
+        let inner_symbol = facts
+            .declaration_symbol(inner_statement.id())
+            .expect("inner namespace has a symbol");
+        assert_eq!(
+            facts
+                .declaration(inner_statement.id())
+                .expect("inner namespace has a plan")
+                .acquisition(),
+            ContainerAcquisition::Member {
+                parent: outer_symbol
+            }
+        );
+        let path = facts
+            .qualified_type_path(alias.type_node.id())
+            .expect("qualified type records its symbol path");
+        assert_eq!(path.len(), 3);
+        assert_eq!(path[0], outer_symbol);
+        assert_eq!(path[1], inner_symbol);
+    }
+
+    #[test]
+    fn qualified_namespace_type_requires_an_exported_member() {
+        let hidden = check_text("namespace N { interface T {} } type Alias = N.T;");
+        assert_eq!(checker_codes(&hidden), [CANNOT_FIND_TYPE.as_str()]);
+
+        let ambient = check_text("declare namespace N { interface T {} } type Alias = N.T;");
+        assert!(checker_codes(&ambient).is_empty());
+
+        let non_namespace = check_text("const value = {}; type Alias = value.T;");
+        assert_eq!(
+            checker_codes(&non_namespace),
+            [CANNOT_FIND_NAMESPACE.as_str()]
+        );
+    }
+
+    #[test]
+    fn qualified_enum_member_types_use_the_enum_container_scope() {
+        let checked = check_text("namespace N { export enum E { A } } type Value = N.E.A;");
+        assert_eq!(checker_codes(&checked), [CANNOT_FIND_TYPE.as_str()]);
+
+        let checked = check_text("namespace N { export const enum E { A } } type Value = N.E.A;");
+        assert_eq!(checker_codes(&checked), [CANNOT_FIND_TYPE.as_str()]);
+
+        let checked = check_text("namespace N { export enum E { A } } type Value = N.E;");
+        assert!(checker_codes(&checked).is_empty());
+    }
+
+    #[test]
+    fn qualified_value_only_exports_are_not_types() {
+        let checked = check_text("namespace N { export const Value = 1; } type Alias = N.Value;");
+        assert_eq!(checker_codes(&checked), [CANNOT_FIND_TYPE.as_str()]);
+
+        let checked =
+            check_text("namespace N { export function Value() {} } type Alias = N.Value;");
+        assert_eq!(checker_codes(&checked), [CANNOT_FIND_TYPE.as_str()]);
+    }
+
+    #[test]
+    fn qualified_type_queries_resolve_namespace_value_members() {
+        let checked =
+            check_text("namespace N { export const Value = 1; } type Alias = typeof N.Value;");
+        assert!(checker_codes(&checked).is_empty());
+
+        let ambient = check_text("type Alias = typeof NodeJS.Timeout;");
+        assert_eq!(checker_codes(&ambient), [CANNOT_FIND_NAME.as_str()]);
+
+        let external = check_text(
+            "import * as External from 'external'; type Alias = typeof External.Timeout;",
+        );
+        assert!(checker_codes(&external).is_empty());
+    }
+
+    #[test]
+    fn merged_namespace_exports_resolve_across_declaration_blocks() {
+        let checked = check_text(
+            "namespace N { export interface Visible {} } namespace N { export interface Later {} } type Alias = N.Later;",
+        );
+        assert!(checker_codes(&checked).is_empty());
+
+        let hidden = check_text(
+            "namespace N { export interface Visible {} } namespace N { interface Hidden {} } type Alias = N.Hidden;",
+        );
+        assert_eq!(checker_codes(&hidden), [CANNOT_FIND_TYPE.as_str()]);
+    }
+
+    #[test]
+    fn visible_nested_type_references_record_the_symbol_path() {
+        let parsed = parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            source(
+                "namespace Outer { export namespace Inner { export type T = number; } } type Alias = Outer.Inner.T;",
+            ),
+        ));
+        let Statement::TypeAlias(alias) = parsed.product().statements()[1].data() else {
+            panic!("second statement is a type alias");
+        };
+        let checked = check(&parsed);
+        assert!(checker_codes(&checked).is_empty());
+        assert!(
+            checked
+                .product()
+                .namespace_facts()
+                .qualified_type_path(alias.type_node.id())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn qualified_type_roots_distinguish_unknowns_from_local_non_namespaces() {
+        let nested_missing_member = check_text("namespace N {} type Alias = N.M.T;");
+        assert_eq!(
+            checker_codes(&nested_missing_member),
+            [CANNOT_FIND_TYPE.as_str()]
+        );
+
+        let missing_inner_member =
+            check_text("namespace N { export namespace M {} } type Alias = N.M.T;");
+        assert_eq!(
+            checker_codes(&missing_inner_member),
+            [CANNOT_FIND_TYPE.as_str()]
+        );
+
+        let ambient = check_text("type Alias = NodeJS.Timeout;");
+        assert!(checker_codes(&ambient).is_empty());
+
+        let external =
+            check_text("import * as External from 'external'; type Alias = External.Timeout;");
+        assert!(checker_codes(&external).is_empty());
+
+        let non_namespace = check_text("let X = 1; type T = X.Y;");
+        assert_eq!(
+            checker_codes(&non_namespace),
+            [CANNOT_FIND_NAMESPACE.as_str()]
+        );
+    }
+    #[test]
+    fn local_const_enum_member_access_has_scalar_facts_for_numbers_and_templates() {
+        let parsed = parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            source("const enum K { X = 2, Y = X + 3 } K.Y;"),
+        ));
+        let Statement::Enum(declaration) = parsed.product().statements()[0].data() else {
+            panic!("first statement is a const enum");
+        };
+        let Some(initializer) = &declaration.members[1].data().initializer else {
+            panic!("Y has an initializer");
+        };
+        let Expression::Binary(binary) = initializer.data() else {
+            panic!("Y uses a binary initializer");
+        };
+        let internal = binary.left.id();
+        let Statement::Expression(statement) = parsed.product().statements()[1].data() else {
+            panic!("second statement is an expression");
+        };
+        let expression = &statement.expression;
+        assert_ne!(internal, expression.id());
+        let checked = check(&parsed);
+        let facts = checked.product().enum_facts();
+        let internal_value = facts
+            .const_use(internal)
+            .and_then(|scalar| scalar.number())
+            .expect("X has an internal const-enum scalar fact");
+        assert_eq!(internal_value.to_f64(), 2.0);
+        let value = facts
+            .const_use(expression.id())
+            .and_then(|scalar| scalar.number())
+            .expect("K.Y has a local const-enum scalar fact");
+        assert_eq!(value.to_f64(), 5.0);
+
+        let parsed = parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            source("const enum K { X = `line\\n\\u{1F603}` } K.X;"),
+        ));
+        let Statement::Expression(statement) = parsed.product().statements()[1].data() else {
+            panic!("second statement is a const-enum member expression");
+        };
+        let checked = check(&parsed);
+        assert!(
+            checker_codes(&checked).is_empty(),
+            "{:?}",
+            checker_codes(&checked)
+        );
+        let value = checked
+            .product()
+            .enum_facts()
+            .const_use(statement.expression.id())
+            .expect("K.X has a local const-enum scalar fact");
+        let crate::enum_plan::EnumScalar::String(value) = value else {
+            panic!("K.X must have a string scalar fact");
+        };
+        assert_eq!(value.as_units(), [108, 105, 110, 101, 10, 0xD83D, 0xDE03]);
+
+        let checked = check_text("const enum K { X = `${1}` }");
+        assert_eq!(
+            checker_codes(&checked),
+            [crate::enum_plan::CONST_OR_AMBIENT_ENUM_NONCONSTANT.as_str()]
+        );
+    }
+
+    #[test]
+    fn imported_declared_const_enum_member_inlines_without_runtime_value() {
+        let importer = "import { K } from './declarations'; K.X;";
+        let checked = linked(
+            &["export declare const enum K { X = 7 }", importer],
+            &[(1, 0, 0)],
+        );
+        assert!(
+            !program_codes(&checked).contains(&super::IMPORTED_CONST_ENUM_UNRESOLVED.as_str()),
+            "{:?}",
+            program_codes(&checked)
+        );
+        let file = checked.product().file(SourceId::new(1)).unwrap();
+        assert_eq!(
+            file.enum_facts()
+                .const_use(member_expression_id(1, importer, 1))
+                .and_then(|value| value.number())
+                .unwrap()
+                .to_f64(),
+            7.0
+        );
+        assert!(
+            file.enum_facts()
+                .is_elided_import_specifier(import_specifier_id(1, importer))
+        );
+    }
+
+    #[test]
+    fn imported_const_enum_direct_and_alias_access_inline_by_symbol_identity() {
+        let direct = "import { K } from './a'; K.X;";
+        let alias = "import { K as Alias } from './a'; Alias.X;";
+        let checked = linked(
+            &["export const enum K { X = 2 }", direct, alias],
+            &[(1, 0, 0), (2, 0, 0)],
+        );
+        assert!(
+            program_codes(&checked).is_empty(),
+            "{:?}",
+            program_codes(&checked)
+        );
+        for (source, text) in [(1, direct), (2, alias)] {
+            let member = member_expression_id(source, text, 1);
+            let file = checked.product().file(SourceId::new(source)).unwrap();
+            assert_eq!(
+                file.enum_facts()
+                    .const_use(member)
+                    .and_then(|value| value.number())
+                    .unwrap()
+                    .to_f64(),
+                2.0
+            );
+            assert!(
+                file.enum_facts()
+                    .is_elided_import_specifier(import_specifier_id(source, text))
+            );
+        }
+    }
+
+    #[test]
+    fn transparent_wrappers_preserve_const_enum_member_identity() {
+        let direct = "const enum E { A = 7 } E.A; E.A; E.A; E.A; E.A;";
+        let wrapped = "const enum E { A = 7 } (E).A; (E as unknown).A; (E satisfies unknown).A; (<unknown>E).A; E!.A;";
+        let direct_model = check_text(direct);
+        let checked = check_text(wrapped);
+        assert!(
+            checker_codes(&checked).is_empty(),
+            "{:?}",
+            checker_codes(&checked)
+        );
+        let model = checked.product();
+        assert_eq!(
+            model.resolved_reference_count(),
+            direct_model.product().resolved_reference_count(),
+            "transparent wrappers must not become canonical references"
+        );
+        for statement in 1..=5 {
+            let member = member_expression_id(0, wrapped, statement);
+            assert_eq!(
+                model
+                    .enum_facts()
+                    .const_use(member)
+                    .and_then(|value| value.number())
+                    .map(|value| value.to_f64()),
+                Some(7.0),
+                "wrapper statement {statement}"
+            );
+        }
+
+        let direct_importer = "import { E } from './a'; E.A; E.A; E.A; E.A; E.A;";
+        let wrapped_importer = "import { E } from './a'; (E).A; (E as unknown).A; (E satisfies unknown).A; (<unknown>E).A; E!.A;";
+        let direct_program = linked(
+            &["export const enum E { A = 7 }", direct_importer],
+            &[(1, 0, 0)],
+        );
+        let wrapped_program = linked(
+            &["export const enum E { A = 7 }", wrapped_importer],
+            &[(1, 0, 0)],
+        );
+        assert!(
+            program_codes(&wrapped_program).is_empty(),
+            "{:?}",
+            program_codes(&wrapped_program)
+        );
+        let direct_file = direct_program.product().file(SourceId::new(1)).unwrap();
+        let wrapped_file = wrapped_program.product().file(SourceId::new(1)).unwrap();
+        assert_eq!(
+            wrapped_file.resolved_reference_count(),
+            direct_file.resolved_reference_count(),
+            "transparent wrappers must not become canonical import references"
+        );
+        for statement in 1..=5 {
+            let member = member_expression_id(1, wrapped_importer, statement);
+            assert_eq!(
+                wrapped_file
+                    .enum_facts()
+                    .const_use(member)
+                    .and_then(|value| value.number())
+                    .map(|value| value.to_f64()),
+                Some(7.0),
+                "imported wrapper statement {statement}"
+            );
+        }
+    }
+
+    #[test]
+    fn transparent_wrappers_preserve_namespace_imported_const_enum_identity() {
+        let direct = "import * as Ns from './a'; Ns.E.A; Ns.E.A; Ns.E.A; Ns.E.A; Ns.E.A;";
+        let wrapped = "import * as Ns from './a'; (Ns.E).A; (Ns.E as unknown).A; (Ns.E satisfies unknown).A; (<unknown>Ns.E).A; (Ns.E)!.A;";
+        let direct_program = linked(&["export const enum E { A = 7 }", direct], &[(1, 0, 0)]);
+        let wrapped_program = linked(&["export const enum E { A = 7 }", wrapped], &[(1, 0, 0)]);
+        assert!(
+            program_codes(&wrapped_program).is_empty(),
+            "{:?}",
+            program_codes(&wrapped_program)
+        );
+        let direct_file = direct_program.product().file(SourceId::new(1)).unwrap();
+        let wrapped_file = wrapped_program.product().file(SourceId::new(1)).unwrap();
+        assert_eq!(
+            wrapped_file.resolved_reference_count(),
+            direct_file.resolved_reference_count(),
+            "transparent wrappers must not become canonical namespace references"
+        );
+        for statement in 1..=5 {
+            let member = member_expression_id(1, wrapped, statement);
+            assert_eq!(
+                wrapped_file
+                    .enum_facts()
+                    .const_use(member)
+                    .and_then(|value| value.number())
+                    .map(|value| value.to_f64()),
+                Some(7.0),
+                "namespace imported wrapper statement {statement}"
+            );
+        }
+    }
+
+    #[test]
+    fn imported_const_enum_reexport_and_namespace_access_inline() {
+        let importer = "import * as Ns from './b'; Ns.Alias.X;";
+        let checked = linked(
+            &[
+                "export const enum K { X = 3 }",
+                "export { K as Alias } from './a';",
+                importer,
+            ],
+            &[(1, 0, 0), (2, 0, 1)],
+        );
+        assert!(
+            program_codes(&checked).is_empty(),
+            "{:?}",
+            program_codes(&checked)
+        );
+        let file = checked.product().file(SourceId::new(2)).unwrap();
+        assert_eq!(
+            file.enum_facts()
+                .const_use(member_expression_id(2, importer, 1))
+                .and_then(|value| value.number())
+                .unwrap()
+                .to_f64(),
+            3.0
+        );
+    }
+
+    #[test]
+    fn scalar_member_chains_do_not_restart_const_enum_resolution() {
+        let local = parsed(0, "const enum E { A = 7, B = 9 } E.A.B;");
+        let (local_member, local_chain) = member_chain_ids(local.product(), 1);
+        let checked_local = check(&local);
+        let local_facts = checked_local.product().enum_facts();
+        assert_eq!(
+            local_facts
+                .const_use(local_member)
+                .and_then(|value| value.number())
+                .map(|value| value.to_f64()),
+            Some(7.0)
+        );
+        assert!(local_facts.const_use(local_chain).is_none());
+
+        let direct = "import { E } from './a'; E.A.B;";
+        let namespace = "import * as Ns from './a'; Ns.E.A; Ns.E.A.B;";
+        let files = [
+            parsed(0, "export const enum E { A = 7, B = 9 }"),
+            parsed(1, direct),
+            parsed(2, namespace),
+        ];
+        let (direct_member, direct_chain) = member_chain_ids(files[1].product(), 1);
+        let (_, namespace_member) = member_chain_ids(files[2].product(), 1);
+        let (_, namespace_chain) = member_chain_ids(files[2].product(), 2);
+        let edges = [
+            ResolvedModuleEdge {
+                from: SourceId::new(1),
+                specifier: files[1].product().statements()[0].id(),
+                to: SourceId::new(0),
+            },
+            ResolvedModuleEdge {
+                from: SourceId::new(2),
+                specifier: files[2].product().statements()[0].id(),
+                to: SourceId::new(0),
+            },
+        ];
+        let checked = check_program(
+            ProgramCheckInput {
+                files: &files,
+                edges: &edges,
+            },
+            &crate::lint::LintTable::new(crate::lint::LintProfile::Default),
+        );
+        assert!(
+            program_codes(&checked).is_empty(),
+            "{:?}",
+            program_codes(&checked)
+        );
+
+        let direct_facts = checked
+            .product()
+            .file(SourceId::new(1))
+            .expect("direct importer is checked")
+            .enum_facts();
+        assert_eq!(
+            direct_facts
+                .const_use(direct_member)
+                .and_then(|value| value.number())
+                .map(|value| value.to_f64()),
+            Some(7.0)
+        );
+        assert!(direct_facts.const_use(direct_chain).is_none());
+
+        let namespace_facts = checked
+            .product()
+            .file(SourceId::new(2))
+            .expect("namespace importer is checked")
+            .enum_facts();
+        assert_eq!(
+            namespace_facts
+                .const_use(namespace_member)
+                .and_then(|value| value.number())
+                .map(|value| value.to_f64()),
+            Some(7.0)
+        );
+        assert!(namespace_facts.const_use(namespace_chain).is_none());
+    }
+
+    #[test]
+    fn imported_const_enum_reexport_cycle_is_diagnosed() {
+        let checked = linked(
+            &[
+                "export { K } from './b';",
+                "export { K } from './a';",
+                "import { K } from './a'; K.X;",
+            ],
+            &[(0, 0, 1), (1, 0, 0), (2, 0, 0)],
+        );
+        assert!(program_codes(&checked).contains(&IMPORTED_CONST_ENUM_CYCLE.as_str()));
+    }
+
+    #[test]
+    fn imported_nonconstant_const_enum_member_is_diagnosed() {
+        let checked = linked(
+            &[
+                "declare function f(): number; export const enum K { X = f() }",
+                "import { K } from './a'; K.X;",
+            ],
+            &[(1, 0, 0)],
+        );
+        let producer_codes = program_codes_for_source(&checked, SourceId::new(0));
+        let importer_codes = program_codes_for_source(&checked, SourceId::new(1));
+        assert_eq!(
+            producer_codes,
+            [crate::enum_plan::CONST_OR_AMBIENT_ENUM_NONCONSTANT.as_str()]
+        );
+        assert_eq!(
+            importer_codes,
+            [IMPORTED_CONST_ENUM_NONCONSTANT.as_str()],
+            "{importer_codes:?}"
+        );
+    }
+
+    #[test]
+    fn external_import_members_stay_runtime_while_internal_missing_members_keep_c012() {
+        let external = concat!(
+            "import vm, { runInThisContext } from 'node:vm'; ",
+            "vm.runInThisContext; runInThisContext.call;",
+        );
+        let checked = linked(&[external], &[]);
+        assert!(
+            program_codes(&checked).is_empty(),
+            "{:?}",
+            program_codes(&checked)
+        );
+        let facts = checked
+            .product()
+            .file(SourceId::new(0))
+            .expect("external importer is checked")
+            .enum_facts();
+        for statement in [1, 2] {
+            assert!(
+                facts
+                    .const_use(member_expression_id(0, external, statement))
+                    .is_none(),
+                "external member statement {statement} must remain runtime"
+            );
+        }
+        assert!(
+            !facts.is_elided_import_specifier(import_specifier_id(0, external)),
+            "external named imports must remain emitted"
+        );
+
+        let internal = "import { K } from './a'; K.Missing;";
+        let unresolved = linked(
+            &["export const enum K { Present = 1 }", internal],
+            &[(1, 0, 0)],
+        );
+        assert!(
+            program_codes(&unresolved).contains(&super::IMPORTED_CONST_ENUM_UNRESOLVED.as_str()),
+            "{:?}",
+            program_codes(&unresolved)
+        );
+    }
+
+    #[test]
+    fn imported_const_enum_initializers_inline_transitively() {
+        let importer = "import { B } from './b'; B.X;";
+        let checked = linked(
+            &[
+                "export const enum A { Y = 2 }",
+                "import { A } from './a'; export const enum B { X = A.Y + 1 }",
+                importer,
+            ],
+            &[(1, 0, 0), (2, 0, 1)],
+        );
+        assert!(
+            program_codes(&checked).is_empty(),
+            "{:?}",
+            program_codes(&checked)
+        );
+        let file = checked.product().file(SourceId::new(2)).unwrap();
+        assert_eq!(
+            file.enum_facts()
+                .const_use(member_expression_id(2, importer, 1))
+                .and_then(|value| value.number())
+                .map(|value| value.to_f64()),
+            Some(3.0)
+        );
+    }
+
+    #[test]
+    fn imported_const_enum_initializer_cycle_keeps_c014() {
+        let checked = linked(
+            &[
+                "import { B } from './b'; export const enum A { X = B.Y }",
+                "import { A } from './a'; export const enum B { Y = A.X }",
+            ],
+            &[(0, 0, 1), (1, 0, 0)],
+        );
+        let codes = program_codes(&checked);
+        assert!(codes.contains(&IMPORTED_CONST_ENUM_CYCLE.as_str()));
+        assert!(!codes.contains(&crate::enum_plan::CONST_OR_AMBIENT_ENUM_NONCONSTANT.as_str()));
+    }
+
+    #[test]
+    fn imported_const_enum_initializer_nonconstant_keeps_the_producer_c007() {
+        let checked = linked(
+            &[
+                "declare function f(): number; export const enum A { Y = f() }",
+                "import { A } from './a'; export const enum B { X = A.Y }",
+            ],
+            &[(1, 0, 0)],
+        );
+        let producer_codes = program_codes_for_source(&checked, SourceId::new(0));
+        let importer_codes = program_codes_for_source(&checked, SourceId::new(1));
+        assert_eq!(
+            producer_codes,
+            [crate::enum_plan::CONST_OR_AMBIENT_ENUM_NONCONSTANT.as_str()]
+        );
+        assert_eq!(
+            importer_codes,
+            [IMPORTED_CONST_ENUM_NONCONSTANT.as_str()],
+            "{importer_codes:?}"
+        );
+    }
+
+    #[test]
+    fn imported_const_enum_initializer_keeps_operator_c007() {
+        for importer in [
+            "import { A } from './a'; export const enum B { X = !A.Y }",
+            "import { A } from './a'; export const enum B { X = A.Y < 1 }",
+        ] {
+            let checked = linked(
+                &[
+                    "declare function source(): number; export const enum A { Y = source() }",
+                    importer,
+                ],
+                &[(1, 0, 0)],
+            );
+            let importer_codes = program_codes_for_source(&checked, SourceId::new(1));
+            assert!(
+                importer_codes.contains(&IMPORTED_CONST_ENUM_NONCONSTANT.as_str()),
+                "{importer_codes:?}"
+            );
+            assert_eq!(
+                importer_codes
+                    .iter()
+                    .filter(|&&code| {
+                        code == crate::enum_plan::CONST_OR_AMBIENT_ENUM_NONCONSTANT.as_str()
+                    })
+                    .count(),
+                1,
+                "{importer_codes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_named_imported_enums_remain_distinct_across_modules() {
+        let importer =
+            "import { K as Left } from './a'; import { K as Right } from './b'; Left.X + Right.X;";
+        let checked = linked(
+            &[
+                "export const enum K { X = 1 }",
+                "export const enum K { X = 9 }",
+                importer,
+            ],
+            &[(2, 0, 0), (2, 1, 1)],
+        );
+        assert!(
+            program_codes(&checked).is_empty(),
+            "{:?}",
+            program_codes(&checked)
+        );
+        let file = checked.product().file(SourceId::new(2)).unwrap();
+        let (left, right) = binary_member_expression_ids(2, importer, 2);
+        assert_eq!(
+            file.enum_facts()
+                .const_use(left)
+                .and_then(|value| value.number())
+                .unwrap()
+                .to_f64(),
+            1.0
+        );
+        assert_eq!(
+            file.enum_facts()
+                .const_use(right)
+                .and_then(|value| value.number())
+                .unwrap()
+                .to_f64(),
+            9.0
+        );
+    }
+
+    #[test]
+    fn const_enum_nonfinite_intrinsics_take_precedence_over_nonconstant() {
+        for text in ["const enum E { A = NaN }", "const enum E { A = Infinity }"] {
+            let parsed = parsed(0, text);
+            let Statement::Enum(declaration) = parsed.product().statements()[0].data() else {
+                panic!("first statement is a const enum");
+            };
+            let initializer = declaration.members[0]
+                .data()
+                .initializer
+                .as_ref()
+                .expect("A has an initializer");
+            let checked = check(&parsed);
+            let model = checked.product();
+
+            assert_eq!(
+                checker_codes(&checked),
+                [crate::enum_plan::CONST_ENUM_NONFINITE.as_str()],
+                "{text}"
+            );
+            assert!(
+                model.reference(initializer.id()).is_some(),
+                "{text} keeps an outer expression alias"
+            );
+            assert_eq!(model.resolved_reference_count(), 1, "{text}");
+            assert!(model.enum_facts().member_use(initializer.id()).is_none());
+        }
+    }
+
+    #[test]
+    fn imported_const_enum_diamond_export_star_inlines_once() {
+        let importer = "import { K } from './barrel'; K.X;";
+        let checked = linked(
+            &[
+                "export const enum K { X = 4 }",
+                "export { K } from './source';",
+                "export * from './source'; export * from './forwarder';",
+                importer,
+            ],
+            &[(1, 0, 0), (2, 0, 0), (2, 1, 1), (3, 0, 2)],
+        );
+        assert!(
+            program_codes(&checked).is_empty(),
+            "{:?}",
+            program_codes(&checked)
+        );
+        let file = checked.product().file(SourceId::new(3)).unwrap();
+        assert_eq!(
+            file.enum_facts()
+                .const_use(member_expression_id(3, importer, 1))
+                .and_then(|value| value.number())
+                .map(|value| value.to_f64()),
+            Some(4.0)
+        );
+        assert!(
+            file.enum_facts()
+                .is_elided_import_specifier(import_specifier_id(3, importer))
+        );
+    }
+
+    #[test]
+    fn namespace_export_star_forwards_const_enum() {
+        let importer = "import { Enums } from './barrel'; Enums.K.X;";
+        let checked = linked(
+            &[
+                "export const enum K { X = 5 }",
+                "export * as Enums from './source';",
+                importer,
+            ],
+            &[(1, 0, 0), (2, 0, 1)],
+        );
+        assert!(
+            program_codes(&checked).is_empty(),
+            "{:?}",
+            program_codes(&checked)
+        );
+        let file = checked.product().file(SourceId::new(2)).unwrap();
+        assert_eq!(
+            file.enum_facts()
+                .const_use(member_expression_id(2, importer, 1))
+                .and_then(|value| value.number())
+                .map(|value| value.to_f64()),
+            Some(5.0)
+        );
+    }
+
+    #[test]
+    fn ambiguous_const_enum_export_star_is_diagnosed_without_inlining() {
+        let importer = "import { K } from './barrel'; K.X;";
+        let checked = linked(
+            &[
+                "export const enum K { X = 1 }",
+                "export const enum K { X = 2 }",
+                "export * from './left'; export * from './right';",
+                importer,
+            ],
+            &[(2, 0, 0), (2, 1, 1), (3, 0, 2)],
+        );
+        assert!(program_codes(&checked).contains(&IMPORTED_CONST_ENUM_AMBIGUOUS.as_str()));
+        let file = checked.product().file(SourceId::new(3)).unwrap();
+        assert!(
+            file.enum_facts()
+                .const_use(member_expression_id(3, importer, 1))
+                .is_none()
+        );
+        assert!(
+            !file
+                .enum_facts()
+                .is_elided_import_specifier(import_specifier_id(3, importer))
+        );
+    }
+
+    #[test]
+    fn cyclic_const_enum_export_star_is_diagnosed() {
+        let checked = linked(
+            &[
+                "export * from './right';",
+                "export * from './left';",
+                "import { K } from './left'; K.X;",
+            ],
+            &[(0, 0, 1), (1, 0, 0), (2, 0, 0)],
+        );
+        assert!(program_codes(&checked).contains(&IMPORTED_CONST_ENUM_CYCLE.as_str()));
+    }
+
+    #[test]
+    fn with_statement_context_matrix() {
+        fn check_js(text: &str) -> Recovered<super::SemanticModel> {
+            let parsed = parser::parse(scanner::scan(
+                SourceId::new(0),
+                ScriptKind::JavaScript,
+                source(text),
+            ));
+            check(&parsed)
+        }
+        fn has_with(result: &Recovered<super::SemanticModel>) -> bool {
+            result
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code() == WITH_STATEMENT_NOT_ALLOWED)
+        }
+
+        // Sloppy classic script: accepted.
+        assert!(
+            !has_with(&check_js("with ({}) {}")),
+            "sloppy classic script accepts with"
+        );
+
+        // Explicit use strict at top level: rejected.
+        assert!(
+            has_with(&check_js("'use strict'; with ({}) {}")),
+            "top-level use strict rejects with"
+        );
+
+        // Module goal: rejected.
+        assert!(
+            has_with(&check_js("import { x } from './x'; with ({}) {}")),
+            "module goal rejects with"
+        );
+
+        // TypeScript: rejected.
+        assert!(
+            has_with(&check_text("with ({}) {}")),
+            "typescript rejects with"
+        );
+
+        // Nested function with use strict: rejected.
+        assert!(
+            has_with(&check_js("function f() { 'use strict'; with ({}) {} }")),
+            "nested strict function rejects with"
+        );
+
+        // Nested sloppy function inside classic script: accepted.
+        assert!(
+            !has_with(&check_js("function f() { with ({}) {} }")),
+            "sloppy nested function accepts with"
+        );
+    }
+
+    #[test]
+    fn super_call_context_matrix() {
+        const SUPER_CODES: [&str; 4] = [
+            BARE_SUPER_EXPRESSION.as_str(),
+            SUPER_REFERENCE_NON_DERIVED.as_str(),
+            SUPER_CALL_OUTSIDE_CONSTRUCTOR.as_str(),
+            SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS.as_str(),
+        ];
+        fn super_codes(text: &str) -> Vec<&'static str> {
+            let result = check_text(text);
+            SUPER_CODES
+                .into_iter()
+                .filter(|code| checker_codes(&result).contains(code))
+                .collect()
+        }
+
+        // Valid: a direct `super(...)` call in a derived constructor body.
+        for valid in [
+            "class A extends Object { constructor() { super(); } }",
+            "class A extends Object {}",
+            "const C = class extends Object { constructor() { super(); } };",
+            // A derived class nested inside a constructor keeps its own
+            // super-call legality.
+            "class A extends Object { constructor() { super(); class B extends Object { constructor() { super(); } } new B(); } }",
+            // Member access on `super` is not a bare super expression.
+            "class A extends Object { m() { super.m(); } }",
+            "class A extends Object { m() { super.m = 1; } }",
+        ] {
+            assert_eq!(super_codes(valid), Vec::<&'static str>::new(), "{valid}");
+        }
+
+        // TS2335: `super` in a class with no base class.
+        for non_derived in [
+            "class A { constructor() { super(); } }",
+            "class A { constructor(x = super()) {} }",
+        ] {
+            assert_eq!(
+                super_codes(non_derived),
+                [SUPER_REFERENCE_NON_DERIVED.as_str()],
+                "{non_derived}"
+            );
+        }
+
+        // TS2337: `super(...)` outside a constructor or nested inside one.
+        for outside in [
+            "function f() { super(); }",
+            "super();",
+            "const o = { m() { super(); } };",
+            "class A extends Object { m() { super(); } }",
+            "class A extends Object { static m() { super(); } }",
+            "class A extends Object { constructor() { super(); const g = () => super(); } }",
+            "class A extends Object { constructor() { super(); function g() { super(); } } }",
+            "class A extends Object { x = super(); constructor() { super(); } }",
+            "class A extends Object { static { super(); } }",
+            "function f(x = super()) {}",
+        ] {
+            assert_eq!(
+                super_codes(outside),
+                [SUPER_CALL_OUTSIDE_CONSTRUCTOR.as_str()],
+                "{outside}"
+            );
+        }
+
+        // TS2336: `super(...)` in derived-constructor parameter initializers.
+        assert_eq!(
+            super_codes("class A extends Object { constructor(x = super()) { super(); } }"),
+            [SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS.as_str()]
+        );
+
+        // TS1034: a bare `super` expression, including parenthesized callees
+        // and template tags.
+        for bare in [
+            "let x = super;",
+            "super;",
+            "class A extends Object { constructor() { (super)(); } }",
+            "class A extends Object { constructor() { super`x`; } }",
+        ] {
+            assert_eq!(
+                super_codes(bare),
+                [BARE_SUPER_EXPRESSION.as_str()],
+                "{bare}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_statement_missing_name_suppression() {
+        fn check_js(text: &str) -> Recovered<super::SemanticModel> {
+            let parsed = parser::parse(scanner::scan(
+                SourceId::new(0),
+                ScriptKind::JavaScript,
+                source(text),
+            ));
+            check(&parsed)
+        }
+        fn name_errors(result: &Recovered<super::SemanticModel>) -> bool {
+            result
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code() == CANNOT_FIND_NAME)
+        }
+
+        // Sloppy `with` bodies may resolve names dynamically at runtime.
+        assert!(
+            !name_errors(&check_js("with ({}) { dynamic; }")),
+            "direct sloppy with suppresses unresolved names"
+        );
+        assert!(
+            !name_errors(&check_js("with ({}) { with ({}) { nested; } }")),
+            "nested sloppy with suppresses unresolved names"
+        );
+        assert!(
+            name_errors(&check_js("outside; with ({}) { }")),
+            "names outside with are still unresolved"
+        );
+
+        // Hoisted `var` bindings still resolve normally inside `with`.
+        let hoisted = check_js("var kept; with ({}) { kept; }");
+        assert!(!name_errors(&hoisted));
+        assert_eq!(hoisted.product().resolved_reference_count(), 1);
+
+        // Forbidden contexts keep ordinary missing-name diagnostics.
+        assert!(
+            name_errors(&check_js("'use strict'; with ({}) { strictMissing; }")),
+            "strict with keeps missing-name errors"
+        );
+        assert!(
+            name_errors(&check_text("with ({}) { tsMissing; }")),
+            "typescript with keeps missing-name errors"
+        );
+
+        // Free names in nested functions lexically inside `with` may bind dynamically.
+        assert!(
+            !name_errors(&check_js(
+                "var captured = {}; with (captured) { capturedGetter = function(){ return prop; }; }"
+            )),
+            "closure free names inside sloppy with suppress unresolved names"
+        );
+        assert!(
+            !name_errors(&check_js("with ({}) { function f() { fnMissing; } }")),
+            "nested function declarations inside sloppy with suppress unresolved names"
+        );
+
+        // Local parameters still resolve before any `with` suppression applies.
+        let param = check_js("with ({}) { (function(prop) { prop; })(); }");
+        assert!(!name_errors(&param));
+        assert_eq!(param.product().resolved_reference_count(), 1);
+    }
+
+    #[test]
+    fn ambient_string_module_registers_without_lexical_pollution() {
+        let result = check_text("declare module \"express\" {}\nconst y = express;");
+        assert!(
+            result.product().ambient_modules().contains_key("express"),
+            "ambient module registry should record express"
+        );
+        assert_eq!(
+            result
+                .product()
+                .scope(result.product().module_scope())
+                .value("express"),
+            None,
+            "string ambient modules must not pollute the file scope"
+        );
+        assert!(
+            checker_codes(&result).contains(&CANNOT_FIND_NAME.as_str()),
+            "express must remain unresolved in file scope: {:?}",
+            checker_codes(&result)
+        );
+    }
+
+    #[test]
+    fn declare_global_binds_members_into_global_scope() {
+        let result = check_text(
+            "declare global { interface Window { x: number } }\nconst w: Window = 1 as any;",
+        );
+        let model = result.product();
+        assert_eq!(
+            model.scope(model.module_scope()).value("global"),
+            None,
+            "declare global must not introduce a lexical global binding"
+        );
+        assert!(
+            model.lookup_type(model.module_scope(), "Window").is_some(),
+            "Window should resolve through the global scope"
+        );
+        let missing_type = CANNOT_FIND_TYPE.as_str();
+        assert!(
+            checker_codes(&result)
+                .iter()
+                .all(|code| *code != missing_type),
+            "Window must not be a missing type: {:?}",
+            checker_codes(&result)
+        );
+    }
+
+    #[test]
+    fn identifier_namespace_binding_is_unchanged() {
+        let result = check_text("namespace N { export const x = 1; }\nconst y = N.x;");
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
+        assert!(
+            result
+                .product()
+                .lookup_value(result.product().module_scope(), "N")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn nested_global_inside_declare_namespace_does_not_augment_global_scope() {
+        let result = check_text(
+            "declare namespace N { global { interface Leaked {} } }\nconst w: Leaked = 1 as any;",
+        );
+        assert!(
+            checker_codes(&result).contains(&CANNOT_FIND_TYPE.as_str()),
+            "Leaked must not bind into the true global scope: {:?}",
+            checker_codes(&result)
+        );
+    }
+
+    #[test]
+    fn bare_string_module_is_not_value_bearing() {
+        let parsed = parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            source("module \"pkg\" { export const x = 1; }"),
+        ));
+        let checked = check(&parsed);
+        let facts = checked.product().namespace_facts();
+        let id = parsed.product().statements()[0].id();
+        let plan = facts
+            .declaration(id)
+            .expect("namespace plan for bare string module");
+        assert!(
+            !plan.is_value_bearing(),
+            "non-identifier namespace names must never be value-bearing"
         );
     }
 }
