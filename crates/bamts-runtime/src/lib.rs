@@ -201,8 +201,8 @@ pub trait Host {
     /// This host's timer scheduler, or `None` when it provides none.
     ///
     /// Presence MUST remain stable for the lifetime of one machine because it
-    /// determines whether `setTimeout`/`clearTimeout` are installed during
-    /// construction.
+    /// determines whether `setTimeout`/`clearTimeout` and
+    /// `setInterval`/`clearInterval` are installed during construction.
     fn timers(&mut self) -> Option<&mut (dyn TimerProvider + 'static)> {
         None
     }
@@ -1582,6 +1582,9 @@ struct TimerRecord {
     context: Option<Value>,
     deadline_ms: u64,
     sequence: u64,
+    /// `Some(delay)` marks a repeating `setInterval` timer that re-arms with
+    /// `delay` milliseconds after each fire; `None` is a one-shot `setTimeout`.
+    interval_delay: Option<u32>,
 }
 
 /// The production bytecode interpreter.
@@ -1856,9 +1859,7 @@ impl<'a, H: Host> Machine<'a, H> {
         let argv_text = host.argv().to_vec();
         let argv_values: Vec<Value> = argv_text
             .into_iter()
-            .map(|text| {
-                intrinsics::push(&mut heap, HeapEntry::String(EcmaString::encode(&text)))
-            })
+            .map(|text| intrinsics::push(&mut heap, HeapEntry::String(EcmaString::encode(&text))))
             .collect();
         let process = intrinsics
             .global("process")
@@ -2123,6 +2124,50 @@ impl<'a, H: Host> Machine<'a, H> {
                     report.uncaught.push(CallbackException { value, origin });
                 }
             }
+            // Re-arm a repeating interval with the same id and handle so
+            // JavaScript retains its original Timeout reference. A new
+            // sequence orders the next fire behind any timer armed during the
+            // callback. A provider failure here is fatal to the checkpoint.
+            if let Some(delay_ms) = timer.interval_delay {
+                let sequence = self
+                    .next_timer_sequence
+                    .take()
+                    .ok_or(
+                        self.checkpoint_error(RuntimeErrorKind::TimerCapacityExceeded {
+                            limit: self.limits.max_timers,
+                        }),
+                    )?;
+                self.next_timer_sequence = sequence.checked_add(1);
+                let deadline_ms = match self.host.timers() {
+                    Some(provider) => provider.schedule(id, delay_ms).map_err(|error| {
+                        self.checkpoint_error(RuntimeErrorKind::TimerProviderFailure {
+                            message: error.to_string(),
+                        })
+                    })?,
+                    None => {
+                        return Err(self.checkpoint_error(
+                            RuntimeErrorKind::TimerProviderFailure {
+                                message: "timer capability is unavailable".to_owned(),
+                            },
+                        ));
+                    }
+                };
+                if deadline_ms <= self.timer_watermark.unwrap_or(0) {
+                    self.ready_timers.insert((deadline_ms, sequence));
+                }
+                self.timers.insert(
+                    id,
+                    TimerRecord {
+                        callback: timer.callback,
+                        arguments: timer.arguments,
+                        handle: timer.handle,
+                        context: timer.context,
+                        deadline_ms,
+                        sequence,
+                        interval_delay: Some(delay_ms),
+                    },
+                );
+            }
             Ok(report)
         })();
         self.timer_checkpoint_active = false;
@@ -2222,6 +2267,25 @@ impl<'a, H: Host> Machine<'a, H> {
         delay_ms: u32,
         arguments: Vec<Value>,
     ) -> Result<Value, EvalFailure> {
+        self.schedule_timer(callback, delay_ms, arguments, None)
+    }
+
+    pub(crate) fn schedule_interval(
+        &mut self,
+        callback: Value,
+        delay_ms: u32,
+        arguments: Vec<Value>,
+    ) -> Result<Value, EvalFailure> {
+        self.schedule_timer(callback, delay_ms, arguments, Some(delay_ms))
+    }
+
+    fn schedule_timer(
+        &mut self,
+        callback: Value,
+        delay_ms: u32,
+        arguments: Vec<Value>,
+        interval_delay: Option<u32>,
+    ) -> Result<Value, EvalFailure> {
         if self.timers.len() >= self.limits.max_timers {
             return Err(EvalFailure::Runtime(
                 RuntimeErrorKind::TimerCapacityExceeded {
@@ -2278,6 +2342,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 context: self.context_global,
                 deadline_ms,
                 sequence,
+                interval_delay,
             },
         );
         Ok(handle)
@@ -6610,11 +6675,7 @@ impl<'a, H: Host> Machine<'a, H> {
         name: &str,
         value: Value,
     ) -> Result<(), EvalFailure> {
-        self.set_data_property_key(
-            object,
-            PropertyKey::Named(EcmaString::encode(name)),
-            value,
-        )
+        self.set_data_property_key(object, PropertyKey::Named(EcmaString::encode(name)), value)
     }
 
     pub(crate) fn set_data_property_key(
@@ -11039,9 +11100,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         | HeapEntry::ProcessEnv { .. }
                         | HeapEntry::Iterator { .. }
                         | HeapEntry::Timeout { .. }
-                        | HeapEntry::HashState { .. } => {
-                            Ok(EcmaString::encode("[object Object]"))
-                        }
+                        | HeapEntry::HashState { .. } => Ok(EcmaString::encode("[object Object]")),
                         HeapEntry::RegExp { pattern, flags, .. } => {
                             let mut builder = EcmaStringBuilder::with_capacity(
                                 pattern
@@ -15612,9 +15671,7 @@ mod tests {
                 boxed_primitive: None,
             })
             .unwrap();
-        machine
-            .globals
-            .insert(EcmaString::encode("sealed"), sealed);
+        machine.globals.insert(EcmaString::encode("sealed"), sealed);
         let error = machine
             .run()
             .expect_err("DefineDataProperty on a non-extensible object must throw");
@@ -17292,10 +17349,7 @@ mod tests {
             ("decodeURIComponent", EcmaString::encode("%E2%82")),
             ("decodeURIComponent", EcmaString::encode("%ED%A0%80")),
             ("decodeURIComponent", EcmaString::encode("%F4%90%80%80")),
-            (
-                "decodeURIComponent",
-                EcmaString::encode("%F8%80%80%80%80"),
-            ),
+            ("decodeURIComponent", EcmaString::encode("%F8%80%80%80%80")),
         ] {
             assert_uri_error(global, argument);
         }
@@ -17364,14 +17418,8 @@ mod tests {
         for (argument, expected) in [
             (exact.clone(), exact),
             (EcmaString::encode("%2F"), EcmaString::encode("/")),
-            (
-                EcmaString::encode("%F0%9F%98%80"),
-                EcmaString::encode("😀"),
-            ),
-            (
-                EcmaString::encode("%E4%B8%ADA"),
-                EcmaString::encode("中A"),
-            ),
+            (EcmaString::encode("%F0%9F%98%80"), EcmaString::encode("😀")),
+            (EcmaString::encode("%E4%B8%ADA"), EcmaString::encode("中A")),
             (EcmaString::encode("%00"), EcmaString::from_units(&[0])),
         ] {
             assert_uri_decode(argument, expected);
@@ -19312,10 +19360,7 @@ mod tests {
             );
             assert!(
                 machine
-                    .delete_property(
-                        env,
-                        &PropertyKey::Named(EcmaString::encode("BAMTS_MODE"))
-                    )
+                    .delete_property(env, &PropertyKey::Named(EcmaString::encode("BAMTS_MODE")))
                     .unwrap()
             );
             assert_eq!(
@@ -21907,12 +21952,8 @@ mod tests {
                 length_writable: true,
             })
             .unwrap();
-        machine
-            .globals
-            .insert(EcmaString::encode("order"), order);
-        machine
-            .globals
-            .insert(EcmaString::encode("third"), third);
+        machine.globals.insert(EcmaString::encode("order"), order);
+        machine.globals.insert(EcmaString::encode("third"), third);
         let queue = machine.intrinsics.global("queueMicrotask").unwrap();
         machine
             .call_value(queue, Value::UNDEFINED, &[first])
@@ -22412,6 +22453,8 @@ mod tests {
         machine.live_registers = 0;
         assert!(machine.intrinsics.global("setTimeout").is_none());
         assert!(machine.intrinsics.global("clearTimeout").is_none());
+        assert!(machine.intrinsics.global("setInterval").is_none());
+        assert!(machine.intrinsics.global("clearInterval").is_none());
         assert!(!machine.has_pending_timers());
         assert_eq!(
             machine.run_one_expired_timer().unwrap(),
@@ -22877,13 +22920,13 @@ mod tests {
         verified(
             vec![
                 Constant::String(EcmaString::encode("order")), // 0
-                Constant::Int32(1),                               // 1
-                Constant::Int32(2),                               // 2
-                Constant::Int32(3),                               // 3
-                Constant::Int32(4),                               // 4
+                Constant::Int32(1),                            // 1
+                Constant::Int32(2),                            // 2
+                Constant::Int32(3),                            // 3
+                Constant::Int32(4),                            // 4
                 Constant::String(EcmaString::encode("queueMicrotask")), // 5
                 Constant::String(EcmaString::encode("job")),   // 6
-                Constant::Undefined,                              // 7
+                Constant::Undefined,                           // 7
             ],
             vec![
                 function(
@@ -23027,10 +23070,10 @@ mod tests {
     fn promise_throw_program() -> Program<Verified> {
         verified(
             vec![
-                Constant::String(EcmaString::encode("resolve")), // 0
-                Constant::String(EcmaString::encode("reject")),  // 1
+                Constant::String(EcmaString::encode("resolve")),  // 0
+                Constant::String(EcmaString::encode("reject")),   // 1
                 Constant::String(EcmaString::encode("observed")), // 2
-                Constant::Int32(7),                                 // 3
+                Constant::Int32(7),                               // 3
             ],
             vec![
                 function(0, 1, vec![Instruction::Halt], Vec::new()),
@@ -23088,9 +23131,7 @@ mod tests {
                 length_writable: true,
             })
             .unwrap();
-        machine
-            .globals
-            .insert(EcmaString::encode("order"), order);
+        machine.globals.insert(EcmaString::encode("order"), order);
         order
     }
 
@@ -23171,9 +23212,7 @@ mod tests {
         first.live_registers = 0;
         install_order_array(&mut first);
         let first_job = timer_fn(&mut first, 2);
-        first
-            .globals
-            .insert(EcmaString::encode("job"), first_job);
+        first.globals.insert(EcmaString::encode("job"), first_job);
         let snapshot = first.evaluate().unwrap();
         assert!(order_markers(&first).is_empty());
         first.run_to_quiescence().unwrap();
@@ -23186,9 +23225,7 @@ mod tests {
         second.live_registers = 0;
         install_order_array(&mut second);
         let second_job = timer_fn(&mut second, 2);
-        second
-            .globals
-            .insert(EcmaString::encode("job"), second_job);
+        second.globals.insert(EcmaString::encode("job"), second_job);
         let execution = second.run().unwrap();
         assert_eq!(execution, snapshot);
     }
@@ -23233,9 +23270,7 @@ mod tests {
         let first = timer_fn(&mut machine, 1); // pushes 1, queues "job"
         let second = timer_fn(&mut machine, 3); // pushes 3
         let microtask = timer_fn(&mut machine, 2); // pushes 2
-        machine
-            .globals
-            .insert(EcmaString::encode("job"), microtask);
+        machine.globals.insert(EcmaString::encode("job"), microtask);
         let set_timeout = set_timeout_global(&machine);
         machine
             .call_value(set_timeout, Value::UNDEFINED, &[first, Value::int32(5)])
@@ -23348,6 +23383,165 @@ mod tests {
         assert!(!machine.timer_checkpoint_active);
     }
 
+    fn set_interval_global(machine: &Machine<'_, TimerTestHost>) -> Value {
+        machine
+            .intrinsics
+            .global("setInterval")
+            .expect("setInterval is installed")
+    }
+
+    fn clear_interval_global(machine: &Machine<'_, TimerTestHost>) -> Value {
+        machine
+            .intrinsics
+            .global("clearInterval")
+            .expect("clearInterval is installed")
+    }
+
+    fn increment_count(
+        machine: &mut Machine<'_, TimerTestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let current = machine
+            .globals
+            .get(&EcmaString::encode("count"))
+            .copied()
+            .and_then(|v| match v.decode() {
+                Some(Decoded::Int32(i)) => Some(i),
+                _ => None,
+            })
+            .unwrap_or(0);
+        machine
+            .globals
+            .insert(EcmaString::encode("count"), Value::int32(current + 1));
+        Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+    }
+
+    #[test]
+    fn set_interval_fires_repeatedly_and_stays_live() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_interval = set_interval_global(&machine);
+        let callback = timer_native(&mut machine, "increment", increment_count);
+        machine
+            .call_value(set_interval, Value::UNDEFINED, &[callback, Value::int32(5)])
+            .unwrap();
+        assert!(machine.has_pending_timers());
+
+        // First fire: the callback runs and the interval re-arms.
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 5,
+        });
+        assert_eq!(machine.run_one_expired_timer().unwrap().executed, 1);
+        assert_eq!(read_global(&machine, "count"), Some(Value::int32(1)));
+        assert!(machine.has_pending_timers());
+
+        // Second fire: the callback runs again and the interval is still live.
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 10,
+        });
+        assert_eq!(machine.run_one_expired_timer().unwrap().executed, 1);
+        assert_eq!(read_global(&machine, "count"), Some(Value::int32(2)));
+        assert!(machine.has_pending_timers());
+    }
+
+    #[test]
+    fn clear_interval_cancels_a_repeating_callback() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_interval = set_interval_global(&machine);
+        let clear_interval = clear_interval_global(&machine);
+        let callback = timer_native(&mut machine, "increment", increment_count);
+        let handle = machine
+            .call_value(set_interval, Value::UNDEFINED, &[callback, Value::int32(5)])
+            .unwrap();
+        // setInterval returns the Timeout handle object, not a raw id.
+        assert!(matches!(handle.decode(), Some(Decoded::HeapRef(_))));
+        assert!(machine.has_pending_timers());
+
+        // Fire once to confirm the interval is live, then clear it.
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 5,
+        });
+        assert_eq!(machine.run_one_expired_timer().unwrap().executed, 1);
+        assert!(machine.has_pending_timers());
+
+        machine
+            .call_value(clear_interval, Value::UNDEFINED, &[handle])
+            .unwrap();
+        assert!(!machine.has_pending_timers());
+        // A late report for the cleared interval does not fire.
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 10,
+        });
+        assert_eq!(machine.run_one_expired_timer().unwrap().executed, 0);
+        assert_eq!(read_global(&machine, "count"), Some(Value::int32(1)));
+    }
+
+    #[test]
+    fn set_interval_rejects_a_non_callable_callback_before_coercion() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_interval = set_interval_global(&machine);
+        let failure = machine
+            .call_value(
+                set_interval,
+                Value::UNDEFINED,
+                &[Value::int32(3), Value::int32(5)],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            failure,
+            EvalFailure::Throw(ThrowOrigin::TypeError { .. })
+        ));
+        // Nothing was armed, so no delay coercion or provider call happened.
+        assert!(shared.borrow().scheduled.is_empty());
+        assert!(!machine.has_pending_timers());
+    }
+
+    #[test]
+    fn set_interval_clamps_and_truncates_like_node() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_interval = set_interval_global(&machine);
+        let callback = timer_fn(&mut machine, 1);
+        for delay in [
+            Value::int32(0),
+            Value::number(-5.0),
+            Value::number(f64::NAN),
+            Value::number(2_147_483_648.0),
+            Value::int32(2_147_483_647),
+            Value::number(3.9),
+        ] {
+            machine
+                .call_value(set_interval, Value::UNDEFINED, &[callback, delay])
+                .unwrap();
+        }
+        let delays: Vec<u32> = shared.borrow().scheduled.iter().map(|(_, d)| *d).collect();
+        assert_eq!(delays, vec![1, 1, 1, 1, 2_147_483_647, 3]);
+    }
+
     #[test]
     fn automatic_loop_maps_the_first_uncaught_microtask_throw_and_stops() {
         let program = timer_program();
@@ -23388,10 +23582,9 @@ mod tests {
         machine.frames.clear();
         machine.live_registers = 0;
         let suppressed_microtask = timer_fn(&mut machine, 2); // stores b = 1
-        machine.globals.insert(
-            EcmaString::encode("nestedCallback"),
-            suppressed_microtask,
-        );
+        machine
+            .globals
+            .insert(EcmaString::encode("nestedCallback"), suppressed_microtask);
         let thrower = timer_native(&mut machine, "queue then throw", queue_job_then_throw);
         let later_timer = timer_fn(&mut machine, 1); // stores a = 1
         let set_timeout = set_timeout_global(&machine);
