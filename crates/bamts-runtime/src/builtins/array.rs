@@ -214,6 +214,20 @@ fn elements<H: Host>(machine: &Machine<'_, H>, this: Value) -> Result<Vec<Value>
         .array_elements(this)?
         .ok_or_else(|| type_error("Array method called on incompatible receiver"))
 }
+/// Validates that `this` is an Array receiver without materializing its
+/// elements. The iterator factories only need receiver validation — the
+/// actual elements are read lazily by `iterator_next` — so cloning the
+/// whole `Vec<Value>` (as `elements` does) is wasted allocation. Mirrors
+/// `collection_slot` in `collections.rs`.
+fn array_slot<H: Host>(machine: &Machine<'_, H>, object: Value) -> Result<(), EvalFailure> {
+    let Some(index) = machine.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
+        return Err(type_error("Array method called on incompatible receiver"));
+    };
+    if !matches!(machine.heap[index], HeapEntry::Array { .. }) {
+        return Err(type_error("Array method called on incompatible receiver"));
+    }
+    Ok(())
+}
 fn write_elements<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
@@ -885,7 +899,7 @@ fn keys_iterator<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    elements(machine, this)?;
+    array_slot(machine, this)?;
     Ok(BuiltinOutcome::Value(super::collections::iterator(
         machine,
         this,
@@ -899,7 +913,7 @@ fn values_iterator<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    elements(machine, this)?;
+    array_slot(machine, this)?;
     Ok(BuiltinOutcome::Value(super::collections::iterator(
         machine,
         this,
@@ -913,7 +927,7 @@ fn entries_iterator<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    elements(machine, this)?;
+    array_slot(machine, this)?;
     Ok(BuiltinOutcome::Value(super::collections::iterator(
         machine,
         this,
@@ -1174,5 +1188,175 @@ mod tests {
             expected,
             "unscopables own keys must be exactly the standard entry set"
         );
+    }
+
+    // ---- iterator factory regression tests --------------------------------
+
+    /// Calls an `Array.prototype` method (e.g. `keys`, `values`, `entries`)
+    /// on `this_array` and returns the result.
+    fn call_proto(
+        machine: &mut Machine<'_, TestHost>,
+        method_name: &str,
+        this_array: Value,
+    ) -> Value {
+        let proto = machine.intrinsics.array_prototype;
+        let method = machine.get_named_property(proto, method_name).unwrap();
+        machine.call_value(method, this_array, &[]).unwrap()
+    }
+
+    /// Drives `iterator`'s `next()` once and returns `(done, value)`.
+    fn iter_next(machine: &mut Machine<'_, TestHost>, iterator: Value) -> (bool, Value) {
+        let next_fn = machine.get_named_property(iterator, "next").unwrap();
+        let result = machine.call_value(next_fn, iterator, &[]).unwrap();
+        let done = machine.get_named_property(result, "done").unwrap();
+        let value = machine.get_named_property(result, "value").unwrap();
+        let is_done = matches!(done.decode(), Some(Decoded::Boolean(true)));
+        (is_done, value)
+    }
+
+    #[test]
+    fn keys_iterator_order_and_holes() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        // [1, <hole>, 3] — holes still produce a key index.
+        let array = allocate_array(
+            &mut machine,
+            vec![Value::int32(1), Value::HOLE, Value::int32(3)],
+        )
+        .unwrap();
+
+        let iter = call_proto(&mut machine, "keys", array);
+        let (done, v0) = iter_next(&mut machine, iter);
+        assert!(!done);
+        assert!(matches!(v0.decode(), Some(Decoded::Int32(n)) if n == 0));
+        let (done, v1) = iter_next(&mut machine, iter);
+        assert!(!done);
+        assert!(matches!(v1.decode(), Some(Decoded::Int32(n)) if n == 1));
+        let (done, v2) = iter_next(&mut machine, iter);
+        assert!(!done);
+        assert!(matches!(v2.decode(), Some(Decoded::Int32(n)) if n == 2));
+        let (done, _) = iter_next(&mut machine, iter);
+        assert!(done);
+    }
+
+    #[test]
+    fn values_iterator_order_and_holes() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        // [1, <hole>, 3] — the hole yields `undefined`, not skipped.
+        let array = allocate_array(
+            &mut machine,
+            vec![Value::int32(1), Value::HOLE, Value::int32(3)],
+        )
+        .unwrap();
+
+        let iter = call_proto(&mut machine, "values", array);
+        let (done, v0) = iter_next(&mut machine, iter);
+        assert!(!done);
+        assert_eq!(v0, Value::int32(1));
+        let (done, v1) = iter_next(&mut machine, iter);
+        assert!(!done);
+        assert_eq!(v1, Value::UNDEFINED);
+        let (done, v2) = iter_next(&mut machine, iter);
+        assert!(!done);
+        assert_eq!(v2, Value::int32(3));
+        let (done, _) = iter_next(&mut machine, iter);
+        assert!(done);
+    }
+
+    #[test]
+    fn entries_iterator_order_and_holes() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        // [1, <hole>, 3] — entries yield [index, value] including the hole.
+        let array = allocate_array(
+            &mut machine,
+            vec![Value::int32(1), Value::HOLE, Value::int32(3)],
+        )
+        .unwrap();
+
+        let iter = call_proto(&mut machine, "entries", array);
+
+        let (done, entry) = iter_next(&mut machine, iter);
+        assert!(!done);
+        let pair = machine.array_elements(entry).unwrap().unwrap();
+        assert!(matches!(pair[0].decode(), Some(Decoded::Int32(n)) if n == 0));
+        assert_eq!(pair[1], Value::int32(1));
+
+        let (done, entry) = iter_next(&mut machine, iter);
+        assert!(!done);
+        let pair = machine.array_elements(entry).unwrap().unwrap();
+        assert!(matches!(pair[0].decode(), Some(Decoded::Int32(n)) if n == 1));
+        assert_eq!(pair[1], Value::UNDEFINED);
+
+        let (done, entry) = iter_next(&mut machine, iter);
+        assert!(!done);
+        let pair = machine.array_elements(entry).unwrap().unwrap();
+        assert!(matches!(pair[0].decode(), Some(Decoded::Int32(n)) if n == 2));
+        assert_eq!(pair[1], Value::int32(3));
+
+        let (done, _) = iter_next(&mut machine, iter);
+        assert!(done);
+    }
+
+    #[test]
+    fn iterator_rejects_non_array_receiver() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let obj = ordinary_object(&mut machine);
+        let proto = machine.intrinsics.array_prototype;
+        let method = machine.get_named_property(proto, "keys").unwrap();
+        let result = machine.call_value(method, obj, &[]);
+        assert!(result.is_err(), "keys() on a non-array must throw");
+    }
+
+    /// Spec: `%ArrayIteratorPrototype%.next` reads the source array live on
+    /// each call, so mutations between `next()` calls are visible. The
+    /// iterator captures the original length at creation time; elements
+    /// added beyond that length are not visited, but in-bounds mutations
+    /// are observed. Our `BuiltinIterator` reads `elements` by cursor each
+    /// step, so in-bounds replacement is visible immediately.
+    #[test]
+    fn values_iterator_observes_mutation_during_iteration() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let array = allocate_array(
+            &mut machine,
+            vec![Value::int32(10), Value::int32(20), Value::int32(30)],
+        )
+        .unwrap();
+
+        let iter = call_proto(&mut machine, "values", array);
+
+        // Consume first element (10).
+        let (done, v0) = iter_next(&mut machine, iter);
+        assert!(!done);
+        assert_eq!(v0, Value::int32(10));
+
+        // Mutate index 1 from 20 to 99 — the iterator must see 99, not 20.
+        machine
+            .set_data_property(array, "1", Value::int32(99))
+            .unwrap();
+
+        let (done, v1) = iter_next(&mut machine, iter);
+        assert!(!done);
+        assert_eq!(v1, Value::int32(99));
+
+        let (done, v2) = iter_next(&mut machine, iter);
+        assert!(!done);
+        assert_eq!(v2, Value::int32(30));
+
+        let (done, _) = iter_next(&mut machine, iter);
+        assert!(done);
     }
 }
