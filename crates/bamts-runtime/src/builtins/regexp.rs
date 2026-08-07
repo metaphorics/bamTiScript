@@ -25,6 +25,10 @@ pub(super) fn install<H: Host>(
         let function = install_function(heap, builtins, name, length, handler);
         define_data(heap, prototype, name, function);
     }
+    let source_get = install_function(heap, builtins, "get source", 0, source_getter::<H>);
+    define_getter(heap, prototype, "source", source_get);
+    let flags_get = install_function(heap, builtins, "get flags", 0, flags_getter::<H>);
+    define_getter(heap, prototype, "flags", flags_get);
     builtins.set_regexp_prototype(prototype);
     globals.insert(EcmaString::from_utf8("RegExp"), constructor);
 }
@@ -56,35 +60,15 @@ fn constructor<H: Host>(
     };
     compile(machine, &pattern, &flags)?;
     let mut properties = PropertyMap::default();
-    for (name, value, writable) in [
-        (
-            "source",
-            allocate_string(machine, canonical_source(&pattern))?,
-            false,
-        ),
-        (
-            "flags",
-            allocate_string(
-                machine,
-                Regex::compile(&pattern, &flags)
-                    .expect("validated")
-                    .flags()
-                    .canonical(),
-            )?,
-            false,
-        ),
-        ("lastIndex", Value::int32(0), true),
-    ] {
-        properties.insert(
-            PropertyKey::Named(EcmaString::from_utf8(name)),
-            Property::Data {
-                value,
-                writable,
-                enumerable: false,
-                configurable: false,
-            },
-        );
-    }
+    properties.insert(
+        PropertyKey::Named(EcmaString::from_utf8("lastIndex")),
+        Property::Data {
+            value: Value::int32(0),
+            writable: true,
+            enumerable: false,
+            configurable: false,
+        },
+    );
     let prototype = machine.intrinsics.regexp_prototype();
     let value = machine
         .allocate(HeapEntry::RegExp {
@@ -192,6 +176,52 @@ fn to_string<H: Host>(
         machine,
         output.finish(),
     )?))
+}
+
+fn source_getter<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let (pattern, _) = regexp_parts(machine, this).ok_or_else(|| {
+        type_error("RegExp.prototype.source getter called on incompatible receiver")
+    })?;
+    Ok(BuiltinOutcome::Value(allocate_string(
+        machine,
+        canonical_source(&pattern),
+    )?))
+}
+
+fn flags_getter<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let (pattern, flags) = regexp_parts(machine, this).ok_or_else(|| {
+        type_error("RegExp.prototype.flags getter called on incompatible receiver")
+    })?;
+    let regex = compile(machine, &pattern, &flags)?;
+    Ok(BuiltinOutcome::Value(allocate_string(
+        machine,
+        regex.flags().canonical(),
+    )?))
+}
+
+fn define_getter(heap: &mut [HeapEntry], object: Value, name: &str, getter: Value) {
+    let HeapEntry::Object { properties, .. } = &mut heap[super::heap_index(object)] else {
+        panic!("accessor target must be an ordinary object");
+    };
+    properties.insert(
+        PropertyKey::Named(EcmaString::from_utf8(name)),
+        Property::Accessor {
+            getter: Some(getter),
+            setter: None,
+            enumerable: false,
+            configurable: true,
+        },
+    );
 }
 
 pub(super) fn match_array<H: Host>(
@@ -526,5 +556,58 @@ mod tests {
             machine.to_string(source).unwrap(),
             EcmaString::from_utf8("\\/")
         );
+    }
+
+    #[test]
+    fn literal_and_constructed_regexp_have_same_own_properties() {
+        // ECMA-262 §22.2.6 defines `source` and `flags` as accessor properties
+        // on RegExp.prototype, not own data properties on instances. Only
+        // `lastIndex` is an own data property. Both construction paths
+        // (`new RegExp("x")` and `/x/`) must produce the same own-property set.
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let constructed = construct_regexp(&mut machine, "x", "i");
+
+        // The literal bytecode path (`Instruction::CreateRegExp`) must install
+        // the same own properties as the constructor: `lastIndex` alone.
+        let mut properties = PropertyMap::default();
+        properties.insert(
+            PropertyKey::Named(EcmaString::from_utf8("lastIndex")),
+            Property::Data {
+                value: Value::int32(0),
+                writable: true,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        let literal = machine
+            .allocate(HeapEntry::RegExp {
+                pattern: EcmaString::from_utf8("x"),
+                flags: EcmaString::from_utf8("i"),
+                properties,
+                prototype: Some(machine.intrinsics.regexp_prototype()),
+                extensible: true,
+            })
+            .unwrap();
+
+        let constructed_keys = machine.own_property_keys(constructed).unwrap();
+        let literal_keys = machine.own_property_keys(literal).unwrap();
+        assert_eq!(
+            constructed_keys, literal_keys,
+            "new RegExp('x') and /x/ must have the same own-property set"
+        );
+
+        // Neither should own `source` or `flags` — those are prototype accessors.
+        for key in &constructed_keys {
+            if let PropertyKey::Named(name) = key {
+                let text = name.to_utf8_lossy();
+                assert!(
+                    text != "source" && text != "flags",
+                    "constructed RegExp must not own '{text}'"
+                );
+            }
+        }
     }
 }
