@@ -1059,14 +1059,17 @@ fn directory_size(path: &Path) -> Result<u64> {
         let entries = fs::read_dir(&current).map_err(|e| io_err(&current, &e))?;
         for entry in entries {
             let entry = entry.map_err(|e| io_err(&current, &e))?;
-            let meta = entry.metadata().map_err(|e| io_err(&entry.path(), &e))?;
+            let meta = fs::symlink_metadata(entry.path()).map_err(|e| io_err(&entry.path(), &e))?;
+            // Check the link itself before following: `entry.metadata()` would
+            // resolve the target, making `is_symlink()` always false and the
+            // guard below unreachable — letting the walk escape the scratch dir.
+            if meta.file_type().is_symlink() {
+                return Err(VerificationError::new(
+                    ErrorCode::ProvenanceMismatch,
+                    format!("symlink rejected in scratch `{}`", entry.path().display()),
+                ));
+            }
             if meta.is_dir() {
-                if meta.file_type().is_symlink() {
-                    return Err(VerificationError::new(
-                        ErrorCode::ProvenanceMismatch,
-                        format!("symlink rejected in scratch `{}`", entry.path().display()),
-                    ));
-                }
                 stack.push(entry.path());
             } else if meta.is_file() {
                 total = total.saturating_add(meta.len());
@@ -2249,7 +2252,7 @@ fn single_archive_root(extract_root: &Path) -> Result<PathBuf> {
     let mut dirs = Vec::new();
     for entry in fs::read_dir(extract_root).map_err(|e| io_err(extract_root, &e))? {
         let entry = entry.map_err(|e| io_err(extract_root, &e))?;
-        let meta = entry.metadata().map_err(|e| io_err(&entry.path(), &e))?;
+        let meta = fs::symlink_metadata(entry.path()).map_err(|e| io_err(&entry.path(), &e))?;
         if meta.is_dir() {
             dirs.push(entry.path());
         }
