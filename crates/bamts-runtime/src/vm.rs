@@ -267,13 +267,17 @@ fn script_run_in_this_context<H: Host>(
             "Script.prototype.runInThisContext is not a constructor",
         ));
     }
-    if let Some(options) = args
+    let options = args
         .first()
         .copied()
-        .filter(|value| *value != Value::UNDEFINED)
+        .filter(|value| *value != Value::UNDEFINED);
+    if let Some(options) = options
         && (!machine.is_object(options) || machine.is_callable(options)?)
     {
         return Err(type_error("The \"options\" argument must be an object"));
+    }
+    if let Some(options) = options {
+        reject_unsupported_timeout(machine, options)?;
     }
     let Some(index) = machine.runtime_slot(this).map_err(EvalFailure::Runtime)? else {
         return Err(type_error(
@@ -286,6 +290,23 @@ fn script_run_in_this_context<H: Host>(
         ));
     };
     call_entry(machine, entry, None, None)
+}
+
+// The runtime has no execution-timeout enforcement point, so a caller-supplied
+// `timeout` cannot be honored. Reject it loudly instead of silently dropping a
+// safety-relevant option — accepting it would let callers believe guest
+// execution is bounded when it is not.
+fn reject_unsupported_timeout<H: Host>(
+    machine: &mut Machine<'_, H>,
+    options: Value,
+) -> Result<(), EvalFailure> {
+    let timeout = machine.get_named_property(options, "timeout")?;
+    if timeout != Value::UNDEFINED {
+        return Err(type_error(
+            "The \"timeout\" option is not supported by this runtime",
+        ));
+    }
+    Ok(())
 }
 
 fn source_arguments<H: Host>(
@@ -303,6 +324,7 @@ fn source_arguments<H: Host>(
     if !machine.is_object(options) || machine.is_callable(options)? {
         return Err(type_error("The \"options\" argument must be an object"));
     }
+    reject_unsupported_timeout(machine, options)?;
     let filename = machine.get_named_property(options, "filename")?;
     if filename == Value::UNDEFINED {
         return Ok((code, EcmaString::from_utf8("evalmachine.<anonymous>")));
@@ -1029,5 +1051,113 @@ mod tests {
             unreachable!();
         };
         assert_eq!(properties.iter().count(), 0);
+    }
+
+    fn options_with_timeout<H: Host>(machine: &mut Machine<'_, H>, timeout: Value) -> Value {
+        let options = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .expect("options allocation succeeds");
+        machine
+            .set_data_property(options, "timeout", timeout)
+            .expect("timeout property is writable");
+        options
+    }
+
+    #[test]
+    fn timeout_option_is_rejected_not_silently_dropped() {
+        let program = program_returning(0);
+        let mut host = compiler_host();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.instantiate_modules().unwrap();
+        let (script_constructor, run) = vm_exports(&machine);
+        let run_new = machine.registry.external[&EcmaString::from_utf8("node:vm")].exports
+            [&EcmaString::from_utf8("runInNewContext")]
+            .value;
+        let source = machine
+            .allocate(HeapEntry::String(EcmaString::from_utf8("ignored")))
+            .unwrap();
+
+        // Script.prototype.runInThisContext rejects a timeout it cannot honor.
+        let script = match machine
+            .call_builtin(
+                builtin_id(&machine, script_constructor),
+                Value::UNDEFINED,
+                &[source],
+                true,
+            )
+            .unwrap()
+        {
+            BuiltinOutcome::Value(script) => script,
+            _ => unreachable!(),
+        };
+        let script_run = machine
+            .get_named_property(script, "runInThisContext")
+            .unwrap();
+        let timeout_opts = options_with_timeout(&mut machine, Value::int32(50));
+        let error = machine
+            .call_value(script_run, script, &[timeout_opts])
+            .expect_err("timeout must be rejected, not silently dropped");
+        assert!(matches!(
+            error,
+            EvalFailure::Throw(ThrowOrigin::TypeError { .. })
+        ));
+
+        // runInThisContext(code, { timeout }) rejects.
+        let timeout_opts = options_with_timeout(&mut machine, Value::int32(50));
+        let error = machine
+            .call_value(run, Value::UNDEFINED, &[source, timeout_opts])
+            .expect_err("timeout must be rejected, not silently dropped");
+        assert!(matches!(
+            error,
+            EvalFailure::Throw(ThrowOrigin::TypeError { .. })
+        ));
+
+        // runInNewContext(code, ctx, { timeout }) rejects.
+        let context = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        let timeout_opts = options_with_timeout(&mut machine, Value::int32(50));
+        let error = machine
+            .call_value(run_new, Value::UNDEFINED, &[source, context, timeout_opts])
+            .expect_err("timeout must be rejected, not silently dropped");
+        assert!(matches!(
+            error,
+            EvalFailure::Throw(ThrowOrigin::TypeError { .. })
+        ));
+
+        // An options object without timeout still runs (happy path intact).
+        let plain_options = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        assert_eq!(
+            machine
+                .call_value(run, Value::UNDEFINED, &[source, plain_options])
+                .unwrap(),
+            Value::int32(42)
+        );
+
+        // `timeout: undefined` is accepted — absence is not a request to bound.
+        let absent_timeout_opts = options_with_timeout(&mut machine, Value::UNDEFINED);
+        assert_eq!(
+            machine
+                .call_value(run, Value::UNDEFINED, &[source, absent_timeout_opts])
+                .unwrap(),
+            Value::int32(42)
+        );
     }
 }
