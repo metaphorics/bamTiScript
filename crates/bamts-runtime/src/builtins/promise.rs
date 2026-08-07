@@ -161,12 +161,12 @@ fn intrinsic_target<H: Host>(
     machine: &mut Machine<'_, H>,
     name: &str,
 ) -> Result<Value, EvalFailure> {
-    let constructor = machine
-        .intrinsics
-        .global("Promise")
-        .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
-            operation: "Promise constructor",
-        }))?;
+    // Resolve the Promise constructor from the immutable prototype slot in
+    // the intrinsics table, not from the script-mutable global map.  A script
+    // that reassigns the global `Promise` must not be able to redirect the
+    // internal lookups for capability/then/finally target functions.
+    let prototype = machine.intrinsics.builtins.promise_prototype();
+    let constructor = machine.get_named_property(prototype, "constructor")?;
     machine.get_named_property(constructor, name)
 }
 
@@ -274,12 +274,12 @@ fn species_constructor<H: Host>(
     machine: &mut Machine<'_, H>,
     object: Value,
 ) -> Result<Value, EvalFailure> {
-    let default = machine
-        .intrinsics
-        .global("Promise")
-        .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
-            operation: "Promise constructor",
-        }))?;
+    // The default constructor is the original Promise constructor.  Resolve
+    // it from the immutable prototype slot in the intrinsics table, not from
+    // the script-mutable global map, so reassigning the global `Promise`
+    // cannot change the species fallback.
+    let prototype = machine.intrinsics.builtins.promise_prototype();
+    let default = machine.get_named_property(prototype, "constructor")?;
     let constructor = machine.get_named_property(object, "constructor")?;
     if matches!(constructor.decode(), Some(bamts_native::Decoded::Undefined)) {
         return Ok(default);
@@ -988,21 +988,15 @@ mod tests {
         machine.drain_microtasks().unwrap();
 
         assert_eq!(
-            machine
-                .globals
-                .get(&EcmaString::encode("resolveGetCount")),
+            machine.globals.get(&EcmaString::encode("resolveGetCount")),
             Some(&Value::int32(1))
         );
         assert_eq!(
-            machine
-                .globals
-                .get(&EcmaString::encode("resolveReceiver")),
+            machine.globals.get(&EcmaString::encode("resolveReceiver")),
             Some(&constructor)
         );
         assert_eq!(
-            machine
-                .globals
-                .get(&EcmaString::encode("iteratorClosed")),
+            machine.globals.get(&EcmaString::encode("iteratorClosed")),
             Some(&Value::TRUE)
         );
         assert!(
@@ -1201,5 +1195,56 @@ mod tests {
         Ok(BuiltinOutcome::Value(
             machine.intrinsics.global("Promise").unwrap(),
         ))
+    }
+
+    fn record_value(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        machine.globals.insert(
+            EcmaString::encode("recordedValue"),
+            args.first().copied().unwrap_or(Value::UNDEFINED),
+        );
+        Ok(BuiltinOutcome::Value(
+            args.first().copied().unwrap_or(Value::UNDEFINED),
+        ))
+    }
+
+    #[test]
+    fn then_survives_global_promise_reassignment() {
+        let module = blank_program("<promise-global-reassign>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        // Create and fulfill a promise before clobbering the global.
+        let promise = machine.create_promise().unwrap();
+        machine.fulfill_promise(promise, Value::int32(42)).unwrap();
+
+        // Simulate script code reassigning the global `Promise`.  Before the
+        // fix, `intrinsic_target` and `species_constructor` re-read this global
+        // to resolve internal target functions, so the reassignment would
+        // redirect those lookups and break `then`.
+        machine
+            .intrinsics
+            .globals
+            .insert(EcmaString::encode("Promise"), Value::UNDEFINED);
+
+        let then = machine.get_named_property(promise, "then").unwrap();
+        let on_fulfilled = callback(&mut machine, "record value", record_value);
+        let derived = machine.call_value(then, promise, &[on_fulfilled]).unwrap();
+        machine.drain_microtasks().unwrap();
+
+        // The fulfillment reaction ran and forwarded the value.
+        assert_eq!(
+            machine.globals.get(&EcmaString::encode("recordedValue")),
+            Some(&Value::int32(42))
+        );
+        let derived_state = state(&machine, derived);
+        assert!(
+            matches!(derived_state, PromiseState::Fulfilled { value } if value == Value::int32(42)),
+            "derived promise should be fulfilled with 42, got {derived_state:?}"
+        );
     }
 }
