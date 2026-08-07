@@ -606,7 +606,7 @@ pub(crate) fn build_with_imports(
                         value: EnumValue::Constant(value),
                     },
                     Evaluated::Runtime
-                        if const_enum || binding.ambient && entry.initializer.is_some() =>
+                        if const_enum || (binding.ambient && entry.initializer.is_some()) =>
                     {
                         diagnostics.push(error(
                             source_id,
@@ -925,7 +925,20 @@ fn evaluate(
             );
             // `+` is the only binary operator that accepts string operands;
             // `-`, `*`, etc. require numeric/bigint/enum operands.
-            if binary.operator != BinaryOperator::Add {
+            if matches!(
+                binary.operator,
+                BinaryOperator::Subtract
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Remainder
+                    | BinaryOperator::Exponentiate
+                    | BinaryOperator::LeftShift
+                    | BinaryOperator::SignedRightShift
+                    | BinaryOperator::UnsignedRightShift
+                    | BinaryOperator::BitAnd
+                    | BinaryOperator::BitOr
+                    | BinaryOperator::BitXor
+            ) {
                 let left_error = matches!(left, Evaluated::Constant(EnumScalar::String(_)));
                 let right_error = matches!(right, Evaluated::Constant(EnumScalar::String(_)));
                 if left_error {
@@ -1149,4 +1162,58 @@ pub(crate) fn enum_declaration(statement: &Stmt) -> Option<(&EnumDeclaration, No
         return None;
     };
     Some((declaration, statement.id()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ENUM_ARITHMETIC_LEFT_NOT_NUMBER, ENUM_ARITHMETIC_RIGHT_NOT_NUMBER};
+    use crate::checker::{SemanticModel, check};
+    use crate::diagnostic::Recovered;
+    use crate::source::{ScriptKind, SourceId, SourceText};
+    use crate::{parser, scanner};
+    use std::sync::Arc;
+
+    fn check_text(text: &str) -> Recovered<SemanticModel> {
+        let source = Arc::new(SourceText::new(text).expect("test source fits the per-file budget"));
+        let parsed = parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            source,
+        ));
+        check(&parsed)
+    }
+
+    fn arithmetic_codes(result: &Recovered<SemanticModel>) -> Vec<&'static str> {
+        result
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| diagnostic.code().as_str())
+            .filter(|code| {
+                *code == ENUM_ARITHMETIC_LEFT_NOT_NUMBER.as_str()
+                    || *code == ENUM_ARITHMETIC_RIGHT_NOT_NUMBER.as_str()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn relational_operator_with_string_operand_does_not_trigger_arithmetic_diagnostic() {
+        // `<` is relational, not arithmetic — a string operand is legal, so
+        // C042/C043 must not fire even though the operand is a string constant.
+        let checked = check_text(r#"enum E { A = "x" < "y" }"#);
+        assert!(
+            arithmetic_codes(&checked).is_empty(),
+            "relational operator should not trigger C042/C043: {:?}",
+            arithmetic_codes(&checked)
+        );
+    }
+
+    #[test]
+    fn arithmetic_operator_with_string_operand_still_triggers_diagnostic() {
+        // `-` is arithmetic — a string left operand is invalid, so C042 fires.
+        let checked = check_text(r#"enum E { A = "x" - 1 }"#);
+        assert_eq!(
+            arithmetic_codes(&checked),
+            [ENUM_ARITHMETIC_LEFT_NOT_NUMBER.as_str()]
+        );
+    }
 }
