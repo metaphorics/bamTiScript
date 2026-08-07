@@ -448,8 +448,6 @@ pub struct BudgetPolicy {
     pub wall_ratio: WallRatioPolicy,
     /// Peak RSS budgets.
     pub rss: RssPolicy,
-    /// Artifact-byte budgets.
-    pub artifact_bytes: ArtifactPolicy,
     /// Release scorecard comparator.
     pub release: ReleasePolicy,
 }
@@ -481,6 +479,12 @@ pub struct RssPolicy {
 }
 
 /// Artifact-byte budgets: `C <= B + max(abs, rel * B)`.
+///
+/// Not currently wired into [`BudgetPolicy`] or [`evaluate_budgets`]: the
+/// harness does not yet measure emitted artifact size, so the budget is
+/// removed from the policy to avoid advertising a gate it cannot perform.
+/// Retained as a pub type so downstream re-exports remain valid until the
+/// measurement lands and it can be re-wired.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactPolicy {
@@ -562,8 +566,6 @@ pub struct Baseline {
     pub wall_ms: Quantiles,
     /// Base peak RSS (bytes) quantiles.
     pub rss_bytes: Quantiles,
-    /// Base artifact bytes.
-    pub artifact_bytes: u64,
     /// Optional release comparator baseline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release: Option<ReleaseBaseline>,
@@ -605,8 +607,6 @@ pub struct MeasureResult {
     pub phases: BTreeMap<String, Quantiles>,
     /// Peak RSS (bytes) quantiles.
     pub rss_bytes: Quantiles,
-    /// Artifact bytes emitted by the benchmark.
-    pub artifact_bytes: u64,
     /// Optional baseline for ratio comparison.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline: Option<Baseline>,
@@ -715,6 +715,7 @@ pub fn measure(options: &MeasureOptions) -> Result<MeasureResult> {
     let mut bind_samples = Vec::with_capacity(repeats as usize);
     let mut check_samples = Vec::with_capacity(repeats as usize);
     let mut emit_samples = Vec::with_capacity(repeats as usize);
+    let mut rss_samples = Vec::with_capacity(repeats as usize);
     for _ in 0..repeats {
         let started = Instant::now();
         let (_report, telemetry) = run_suite_with_telemetry(
@@ -734,6 +735,7 @@ pub fn measure(options: &MeasureOptions) -> Result<MeasureResult> {
         bind_samples.push(telemetry.millis(Phase::Bind));
         check_samples.push(telemetry.millis(Phase::Check));
         emit_samples.push(telemetry.millis(Phase::Emit));
+        rss_samples.push(read_peak_rss_bytes().unwrap_or(0) as f64);
     }
 
     // `total` is the whole measured seam wall; the phase split is the compiler's
@@ -748,12 +750,7 @@ pub fn measure(options: &MeasureOptions) -> Result<MeasureResult> {
     phases.insert("total".to_owned(), Quantiles::from_samples(&wall_samples));
     require_phase_keys(&phases)?;
 
-    let rss = read_peak_rss_bytes().unwrap_or(0);
-    let rss_bytes = Quantiles {
-        p50: rss as f64,
-        p95: rss as f64,
-        p99: rss as f64,
-    };
+    let rss_bytes = Quantiles::from_samples(&rss_samples);
 
     let conditions_observed = ObservedConditions {
         governor: machine.governor.clone(),
@@ -773,7 +770,6 @@ pub fn measure(options: &MeasureOptions) -> Result<MeasureResult> {
         repeats,
         phases,
         rss_bytes,
-        artifact_bytes: 0,
         baseline,
     };
 
@@ -811,16 +807,16 @@ fn load_baseline(path: Option<&Path>) -> Result<Option<Baseline>> {
         .map_err(|error| PerfError::harness(format!("{}: {error}", path.display())))?;
     let base: MeasureResult = serde_json::from_str(&text)
         .map_err(|error| PerfError::harness(format!("{}: {error}", path.display())))?;
-    let wall_ms = base
-        .phases
-        .get("total")
-        .copied()
-        .unwrap_or_else(Quantiles::zero);
+    let wall_ms = base.phases.get("total").copied().ok_or_else(|| {
+        PerfError::new(
+            PerfErrorCode::NoBaseline,
+            format!("{}: baseline has no `total` phase", path.display()),
+        )
+    })?;
     Ok(Some(Baseline {
         source: path.display().to_string(),
         wall_ms,
         rss_bytes: base.rss_bytes,
-        artifact_bytes: base.artifact_bytes,
         release: None,
     }))
 }
@@ -928,14 +924,6 @@ pub fn evaluate_budgets(result: &MeasureResult, policy: &BudgetPolicy) -> Result
         policy.rss.p95_rel,
     )?;
 
-    check_abs_rel(
-        "artifact.p50",
-        result.artifact_bytes as f64,
-        baseline.artifact_bytes as f64,
-        policy.artifact_bytes.p50_abs_bytes as f64,
-        policy.artifact_bytes.p50_rel,
-    )?;
-
     if let Some(release) = &baseline.release {
         if release.wall_p95_ratio > policy.release.p95_ratio {
             return Err(budget_breach(
@@ -1027,10 +1015,6 @@ mod tests {
                 p95_abs_bytes: 32 << 20,
                 p95_rel: 0.10,
             },
-            artifact_bytes: ArtifactPolicy {
-                p50_abs_bytes: 64 << 10,
-                p50_rel: 0.05,
-            },
             release: ReleasePolicy {
                 comparator: "typescript@7.0.2".to_owned(),
                 p95_ratio: 1.25,
@@ -1072,7 +1056,6 @@ mod tests {
                 p95: 100_000_000.0,
                 p99: 100_000_000.0,
             },
-            artifact_bytes: 0,
             baseline: Some(Baseline {
                 source: "perf/baselines/s0.json".to_owned(),
                 wall_ms: base,
@@ -1081,7 +1064,6 @@ mod tests {
                     p95: 100_000_000.0,
                     p99: 100_000_000.0,
                 },
-                artifact_bytes: 0,
                 release: None,
             }),
         }
@@ -1291,5 +1273,24 @@ mod tests {
         assert_eq!(error.code, PerfErrorCode::HarnessError);
         assert_eq!(error.code.exit_code(), 6);
         assert!(error.detail.contains("check"));
+    }
+
+    #[test]
+    fn load_baseline_rejects_missing_total_phase() {
+        // A baseline JSON that parsed successfully but has no `total` phase key
+        // must fail loudly with NoBaseline, not silently fall back to zero and
+        // pass every wall-time budget.
+        let mut result = result_with_baseline(Quantiles::zero(), Quantiles::zero());
+        result.phases.remove("total");
+        let json = serde_json::to_string_pretty(&result).expect("serialize baseline");
+        let dir = std::env::temp_dir();
+        let path = dir.join("bamts_perf_baseline_no_total.json");
+        std::fs::write(&path, &json).expect("write temp baseline");
+        let error = load_baseline(Some(&path))
+            .expect_err("baseline missing `total` must be rejected")
+            .code;
+        assert_eq!(error, PerfErrorCode::NoBaseline);
+        assert_eq!(error.exit_code(), 4);
+        let _ = std::fs::remove_file(&path);
     }
 }

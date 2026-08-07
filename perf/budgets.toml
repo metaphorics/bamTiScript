@@ -1,8 +1,8 @@
 # Budget policy (U0.8 / PB-1).
 #
 # Thresholds evaluated by `perf_budget compare` against a measured result. Wall
-# ratios are candidate/base (C/B). RSS and artifact-byte budgets are absolute
-# floor OR relative percentage, whichever is larger: C <= B + max(abs, rel*B).
+# ratios are candidate/base (C/B). RSS budgets are absolute floor OR relative
+# percentage, whichever is larger: C <= B + max(abs, rel*B).
 # The release comparator gates candidate against official `typescript@7.0.2`.
 # Sources: `.outline/wayfinder/decisions/performance-resource-budgets.md` §4,
 # `.outline/sdd/briefs/U0.8.md` contract §3.
@@ -20,11 +20,6 @@ p50_abs_bytes = 16777216  # 16 MiB
 p50_rel = 0.05
 p95_abs_bytes = 33554432  # 32 MiB
 p95_rel = 0.10
-
-# Artifact / frame bytes: C <= B + max(abs_bytes, rel * B).
-[artifact_bytes]
-p50_abs_bytes = 65536  # 64 KiB
-p50_rel = 0.05
 
 # Release scorecard comparator vs official upstream TypeScript.
 [release]
