@@ -356,6 +356,16 @@ impl<'table> InferenceContext<'table> {
     pub fn infer_from_arguments(&mut self, signature: &FunctionSignature, arguments: &[TypeId]) {
         for (argument_index, parameter) in signature.parameters().iter().enumerate() {
             if parameter.rest() {
+                // A rest parameter collects arguments[argument_index..], but
+                // argument_index is the *parameter* index, not an argument
+                // index. When fixed parameters before the rest are unsupplied
+                // (e.g. f<T>(a: number, ...rest: T[]) called as f()), the
+                // parameter index can exceed arguments.len() and the slice
+                // would panic. Guard here, mirroring the non-rest bounds check
+                // below.
+                if argument_index >= arguments.len() {
+                    break;
+                }
                 if let Type::Array(element) = self.table.get(parameter.type_id()).clone() {
                     for (offset, &argument_type) in arguments[argument_index..].iter().enumerate() {
                         self.infer_from_argument(
@@ -687,6 +697,29 @@ mod tests {
         let expected = table.function(vec![numbers, expected_callback], booleans);
         assert_eq!(contextual, expected);
     }
+    #[test]
+    fn rest_parameter_with_unsupplied_fixed_params_does_not_panic() {
+        // f<T>(a: number, ...rest: T[]) called as f() — the rest branch must not
+        // slice arguments[1..] when arguments.len() == 0. With no candidates,
+        // T remains unconstrained and resolves to `unknown`.
+        let mut table = TypeTable::new();
+        let t = table.named(parameter(1));
+        let number = table.number();
+        let rest_array = table.array(t);
+        let a = FunctionParameter::new("a".to_owned(), number, false, false);
+        let rest = FunctionParameter::new("rest".to_owned(), rest_array, false, true);
+        let sig_type = table.function_with_parameters(vec![parameter(1)], vec![a, rest], t);
+        let Type::Function(sig) = table.get(sig_type).clone() else {
+            panic!("function type");
+        };
+        let mut ctx = InferenceContext::new(&mut table, &[InferenceParameter::new(parameter(1))]);
+        // No arguments supplied — fixed param and rest both unsupplied.
+        ctx.infer_from_arguments(&sig, &[]);
+        let inferred = ctx.resolve();
+        // No panic, and T has no candidates so it falls back to `unknown`.
+        assert_eq!(inferred.get(parameter(1)), Some(table.unknown()));
+    }
+
 
     /// Two distinct top-priority candidates with no common supertype resolve
     /// to their union.
