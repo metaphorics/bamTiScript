@@ -6712,6 +6712,24 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
+    /// `CreateDataProperty` — defines an own data property directly, bypassing
+    /// the prototype chain and any inherited setters. Used by JSON.parse and
+    /// JSON.stringify where the spec mandates `[[DefineOwnProperty]]` semantics
+    /// rather than `[[Set]]`.
+    pub(crate) fn create_data_property_key(
+        &mut self,
+        object: Value,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<(), EvalFailure> {
+        match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
+            Some(index) => self.set_own_data(index, key, value),
+            None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "set property on primitive",
+            })),
+        }
+    }
+
     pub(crate) fn is_callable(&self, value: Value) -> Result<bool, EvalFailure> {
         Ok(!matches!(
             self.callee_kind(value).map_err(EvalFailure::Runtime)?,

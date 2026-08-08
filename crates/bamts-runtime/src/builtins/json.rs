@@ -72,7 +72,7 @@ fn parse<H: Host>(
             })
             .map_err(EvalFailure::Runtime)?;
         let key = EcmaString::default();
-        machine.set_data_property_key(root, PropertyKey::Named(key.clone()), value)?;
+        machine.create_data_property_key(root, PropertyKey::Named(key.clone()), value)?;
         return Ok(BuiltinOutcome::Value(walk_reviver(
             machine, root, key, reviver, 0,
         )?));
@@ -100,7 +100,7 @@ fn walk_reviver<H: Host>(
             if child == Value::UNDEFINED {
                 machine.delete_property(value, &key)?;
             } else {
-                machine.set_data_property_key(value, key, child)?;
+                machine.create_data_property_key(value, key, child)?;
             }
         }
     } else if machine.is_object(value) {
@@ -113,7 +113,7 @@ fn walk_reviver<H: Host>(
             if child == Value::UNDEFINED {
                 machine.delete_property(value, &key)?;
             } else {
-                machine.set_data_property_key(value, key, child)?;
+                machine.create_data_property_key(value, key, child)?;
             }
         }
     }
@@ -182,7 +182,7 @@ fn stringify<H: Host>(
         })
         .map_err(EvalFailure::Runtime)?;
     let root_key = EcmaString::default();
-    machine.set_data_property_key(wrapper, PropertyKey::Named(root_key.clone()), value)?;
+    machine.create_data_property_key(wrapper, PropertyKey::Named(root_key.clone()), value)?;
     let options = SerializeOptions {
         replacer: callable_replacer,
         property_list: property_list.as_deref(),
@@ -677,7 +677,7 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             let value = self.value(machine, depth + 1)?;
             machine
-                .set_data_property_key(object, PropertyKey::Named(key), value)
+                .create_data_property_key(object, PropertyKey::Named(key), value)
                 .map_err(ParseFailure::Runtime)?;
             self.ws();
             match self.peek() {
@@ -729,7 +729,7 @@ mod tests {
     use super::super::test_support::{TestHost, blank_program};
     use super::*;
     use crate::intrinsics::{BuiltinDef, BuiltinHandler, native_function};
-    use crate::{Limits, RuntimeErrorKind};
+    use crate::{Limits, RuntimeErrorKind, ThrowOrigin};
 
     fn call_json(machine: &mut Machine<'_, TestHost>, method: &str, source: EcmaString) -> Value {
         let json = machine.intrinsics.global("JSON").expect("JSON exists");
@@ -933,7 +933,7 @@ mod tests {
             .expect("wrapper allocation succeeds");
         let key = EcmaString::default();
         machine
-            .set_data_property_key(wrapper, PropertyKey::Named(key.clone()), value)
+            .create_data_property_key(wrapper, PropertyKey::Named(key.clone()), value)
             .expect("wrapper property set succeeds");
         let reviver = native(&mut machine, "identityReviver", identity_reviver);
         assert!(matches!(
@@ -969,5 +969,36 @@ mod tests {
                 .unwrap()
                 .eq_ascii("\"\\ud800\"")
         );
+    }
+
+    #[test]
+    fn parse_creates_own_property_ignoring_prototype_setter() {
+        use bamts_bytecode::AccessorKind;
+
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        // Install a throwing setter on Object.prototype for "x".
+        // If JSON.parse used [[Set]], parsing {"x":1} would invoke this setter and throw.
+        // With CreateDataProperty ([[DefineOwnProperty]]) it must create an own data property.
+        let setter = native(&mut machine, "evilSetter", |_, _, _, _| {
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "prototype setter called",
+            }))
+        });
+        machine
+            .define_accessor(
+                machine.intrinsics.object_prototype,
+                PropertyKey::Named(EcmaString::encode("x")),
+                setter,
+                AccessorKind::Setter,
+            )
+            .expect("define setter succeeds");
+        let value = call_json(&mut machine, "parse", EcmaString::encode("{\"x\":1}"));
+        assert!(machine.is_object(value));
+        let x = machine
+            .get_property_key(value, &PropertyKey::Named(EcmaString::encode("x")))
+            .expect("get succeeds");
+        assert_eq!(x, Value::int32(1));
     }
 }
