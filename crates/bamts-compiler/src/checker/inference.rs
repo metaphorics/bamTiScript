@@ -272,7 +272,9 @@ impl InferredTypeArguments {
                     .collect();
                 table.object_type(properties)
             }
-            Type::Function(signature) => self.instantiate_signature(table, &signature),
+            Type::Function(signature) => {
+                self.instantiate_function(table, signature.type_parameters(), &signature)
+            }
             _ => ty,
         }
     }
@@ -283,6 +285,21 @@ impl InferredTypeArguments {
     pub fn instantiate_signature(
         &self,
         table: &mut TypeTable,
+        signature: &FunctionSignature,
+    ) -> TypeId {
+        self.instantiate_function(table, &[], signature)
+    }
+
+    /// Shared core of [`Self::instantiate`] and [`Self::instantiate_signature`]:
+    /// substitutes the inferred arguments through `signature`'s parameters and
+    /// return type, preserving `type_parameters` on the interned result. The
+    /// top-level contextual signature passes `&[]` (its own generics are
+    /// resolved); nested function types pass their own `type_parameters` so
+    /// inner generics survive instantiation.
+    fn instantiate_function(
+        &self,
+        table: &mut TypeTable,
+        type_parameters: &[SymbolId],
         signature: &FunctionSignature,
     ) -> TypeId {
         let parameters: Vec<FunctionParameter> = signature
@@ -298,7 +315,7 @@ impl InferredTypeArguments {
             })
             .collect();
         let return_type = self.instantiate(table, signature.return_type());
-        table.function_with_parameters(Vec::new(), parameters, return_type)
+        table.function_with_parameters(type_parameters.to_vec(), parameters, return_type)
     }
 }
 
@@ -719,6 +736,41 @@ mod tests {
         // No panic, and T has no candidates so it falls back to `unknown`.
         assert_eq!(inferred.get(parameter(1)), Some(table.unknown()));
     }
+    #[test]
+    fn nested_generic_signature_is_preserved_through_instantiation() {
+        // Outer: <T>(value: T): <U>(x: U) => T
+        // Inner: <U>(x: U) => T  — inner <U> must survive instantiation of outer T.
+        let mut table = TypeTable::new();
+        let t = table.named(parameter(1));
+        let u = table.named(parameter(2));
+        let inner = table.function_with_parameters(
+            vec![parameter(2)],
+            vec![FunctionParameter::new("x".to_owned(), u, false, false)],
+            t,
+        );
+        let outer = table.function_with_parameters(
+            vec![parameter(1)],
+            vec![FunctionParameter::new("value".to_owned(), t, false, false)],
+            inner,
+        );
+        let Type::Function(outer_sig) = table.get(outer).clone() else {
+            panic!("function type");
+        };
+        let string = table.string();
+        let mut ctx = InferenceContext::new(&mut table, &[InferenceParameter::new(parameter(1))]);
+        ctx.infer_from_arguments(&outer_sig, &[string]);
+        let inferred = ctx.resolve();
+        assert_eq!(inferred.get(parameter(1)), Some(string));
+        // Instantiate the outer return type (the inner function) — T -> string, U preserved.
+        let instantiated = inferred.instantiate(&mut table, inner);
+        let expected = table.function_with_parameters(
+            vec![parameter(2)],
+            vec![FunctionParameter::new("x".to_owned(), u, false, false)],
+            string,
+        );
+        assert_eq!(instantiated, expected);
+    }
+
 
 
     /// Two distinct top-priority candidates with no common supertype resolve
