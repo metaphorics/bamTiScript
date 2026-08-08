@@ -753,14 +753,20 @@ mod tests {
                 .finalize(BranchProtection::None)
                 .expect_err("injected fault prevents finalization");
 
-            // No receipt; the module is poisoned and Freed.
-            assert_eq!(memory.phase(), WxPhase::Freed);
-
-            assert_eq!(memory.released_mappings(), 3);
+            // No receipt; the module is poisoned. Mappings are retained
+            // until Drop to avoid dangling CompiledBlob pointers — see
+            // WxMemoryProvider::finalize.
+            assert_eq!(memory.phase(), WxPhase::Writable);
+            assert_eq!(memory.released_mappings(), 0);
 
             // A poisoned module is never retried.
             assert!(provider.finalize(BranchProtection::None).is_err());
             assert!(provider.allocate(16, 8, JITMemoryKind::Writable).is_err());
+
+            // Drop releases the retained mappings and moves to Freed.
+            drop(provider);
+            assert_eq!(memory.phase(), WxPhase::Freed);
+            assert_eq!(memory.released_mappings(), 3);
         }
     }
 
