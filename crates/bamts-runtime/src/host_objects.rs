@@ -464,7 +464,7 @@ pub(crate) fn text_bytes_lossy(text: &EcmaString) -> Vec<u8> {
 }
 
 pub(crate) fn env_value_text_lossy(text: &EcmaString) -> String {
-    String::from_utf8(text_bytes_lossy(text)).expect("lossy UTF-8 conversion is valid")
+    text.to_utf8_lossy()
 }
 
 #[cfg(test)]
