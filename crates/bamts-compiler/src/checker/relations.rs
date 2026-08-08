@@ -80,10 +80,27 @@ pub struct TypeRelations<'table> {
     cache: RefCell<HashMap<(TypeId, TypeId, Strictness), bool>>,
     /// Pairs currently being compared, to break recursive structural types.
     visiting: RefCell<HashSet<(TypeId, TypeId, Strictness)>>,
+    coinductive_depth: std::cell::Cell<usize>,
     /// Type parameters paired positionally by the generic signatures currently
     /// being compared, so `<T>(x: T) => T` relates to `<U>(x: U) => U`.
     /// Non-empty only inside such a comparison.
     parameter_aliases: RefCell<Vec<(SymbolId, SymbolId)>>,
+}
+struct DepthGuard<'a> {
+    cell: &'a std::cell::Cell<usize>,
+    previous: usize,
+}
+impl<'a> DepthGuard<'a> {
+    fn new(cell: &'a std::cell::Cell<usize>) -> Self {
+        let previous = cell.get();
+        cell.set(previous + 1);
+        Self { cell, previous }
+    }
+}
+impl<'a> Drop for DepthGuard<'a> {
+    fn drop(&mut self) {
+        self.cell.set(self.previous);
+    }
 }
 
 impl<'table> TypeRelations<'table> {
@@ -93,6 +110,7 @@ impl<'table> TypeRelations<'table> {
             table,
             cache: RefCell::new(HashMap::new()),
             visiting: RefCell::new(HashSet::new()),
+            coinductive_depth: std::cell::Cell::new(0),
             parameter_aliases: RefCell::new(Vec::new()),
         }
     }
@@ -213,9 +231,10 @@ impl<'table> TypeRelations<'table> {
                 return true;
             }
         }
+        let _guard = DepthGuard::new(&self.coinductive_depth);
         let result = self.relates_uncached(source, target, strictness);
         self.visiting.borrow_mut().remove(&key);
-        if cacheable {
+        if cacheable && self.coinductive_depth.get() == 1 {
             let mut cache = self.cache.borrow_mut();
             if cache.len() < RELATION_CACHE_CAPACITY {
                 cache.insert(key, result);
@@ -607,17 +626,18 @@ mod tests {
         // Identity short-circuits before the cache is consulted.
         assert!(relations.assignable(outer, outer));
         assert_eq!(relations.cached_pairs(), 0);
-        // The first distinct query memoizes its structural sub-queries.
+        // The first distinct query memoizes only the outermost pair (depth 1),
+        // not its nested structural sub-queries which run at depth >1.
         assert!(relations.assignable(literal_outer, outer));
         let grown = relations.cached_pairs();
-        assert!(grown > 0);
+        assert_eq!(grown, 1);
         // Repeating the same pair returns the identical result from the cache.
         assert!(relations.assignable(literal_outer, outer));
         assert_eq!(relations.cached_pairs(), grown);
         // The strict mode memoizes under its own key.
         assert!(relations.subtype(literal_outer, outer));
         let after_strict = relations.cached_pairs();
-        assert!(after_strict > grown);
+        assert_eq!(after_strict, 2);
         assert!(relations.subtype(literal_outer, outer));
         assert_eq!(relations.cached_pairs(), after_strict);
     }
