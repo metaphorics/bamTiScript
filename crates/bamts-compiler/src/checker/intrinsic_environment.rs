@@ -193,6 +193,7 @@ const STANDARD_TYPES: &[&str] = &[
     "SyntaxError",
     "TypeError",
     "URIError",
+    "SuppressedError",
     "Object",
     "Function",
     "CallableFunction",
