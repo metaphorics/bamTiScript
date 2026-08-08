@@ -1928,6 +1928,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires real workspace root with node_modules/typescript installed"]
     fn verify_oracle_pins_succeeds_on_real_root() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let root = root.canonicalize().expect("workspace root");
