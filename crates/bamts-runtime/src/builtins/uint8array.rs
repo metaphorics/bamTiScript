@@ -110,7 +110,18 @@ fn constructor<H: Host>(
         }
         None => bytes.resize(length, 0),
     }
-    let prototype = constructor_prototype(machine)?;
+    let default_prototype = machine.intrinsics.builtins.uint8array_prototype();
+    let new_target = machine.current_new_target();
+    let prototype = if new_target != Value::UNDEFINED {
+        let candidate = machine.get_named_property(new_target, "prototype")?;
+        if machine.is_object(candidate) {
+            candidate
+        } else {
+            default_prototype
+        }
+    } else {
+        default_prototype
+    };
     let value = machine
         .allocate(HeapEntry::Uint8Array {
             bytes,
@@ -266,9 +277,6 @@ fn values<H: Host>(
         source,
         IterationKind::Value,
     )?))
-}
-fn constructor_prototype<H: Host>(machine: &Machine<'_, H>) -> Result<Value, EvalFailure> {
-    Ok(machine.intrinsics.builtins.uint8array_prototype())
 }
 
 #[cfg(test)]
@@ -878,6 +886,93 @@ mod tests {
                 .get_named_property(proto_val, "constructor")
                 .expect("prototype has constructor");
             assert_eq!(ctor, ctor_before);
+        });
+    }
+
+    #[test]
+    fn uint8array_constructor_honors_new_target_for_subclass_prototype() {
+        let module = blank_program("<uint8array-subclass-test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let uint8array_prototype = machine.intrinsics.builtins.uint8array_prototype();
+
+        // Build a subclass prototype that inherits from Uint8Array.prototype.
+        let subclass_prototype =
+            super::super::ordinary_runtime(&mut machine, Some(uint8array_prototype)).unwrap();
+        machine
+            .set_data_property(subclass_prototype, "myMethod", Value::int32(42))
+            .unwrap();
+
+        // Build a new_target whose .prototype is the subclass prototype.
+        let new_target = super::super::ordinary_runtime(&mut machine, None).unwrap();
+        machine
+            .set_data_property(new_target, "prototype", subclass_prototype)
+            .unwrap();
+
+        let uint8array_id = machine.intrinsics.builtins.id_named("Uint8Array").unwrap();
+        let BuiltinOutcome::Value(typed) = machine
+            .call_builtin_with_new_target(
+                uint8array_id,
+                Value::UNDEFINED,
+                &[Value::int32(4)],
+                true,
+                new_target,
+            )
+            .unwrap()
+        else {
+            panic!("Uint8Array construct returns a value");
+        };
+
+        // The typed array must inherit from the subclass prototype, not the intrinsic one.
+        let idx = machine
+            .runtime_slot(typed)
+            .expect("typed array has slot")
+            .expect("slot exists");
+        let HeapEntry::Uint8Array { prototype, .. } = &machine.heap[idx] else {
+            panic!("typed array brand");
+        };
+        assert_eq!(*prototype, Some(subclass_prototype));
+        // Subclass methods are visible on the instance.
+        assert_eq!(
+            machine.get_named_property(typed, "myMethod").unwrap(),
+            Value::int32(42)
+        );
+        assert_eq!(int(&mut machine, typed, "length"), 4);
+    }
+
+    #[test]
+    fn uint8array_new_target_primitive_prototype_falls_back_to_default() {
+        // When newTarget.prototype is not an object, constructed_prototype
+        // must fall back to the intrinsic %Uint8Array.prototype%.
+        with_machine(|machine| {
+            let new_target = super::super::ordinary_runtime(machine, None).unwrap();
+            machine
+                .set_data_property(new_target, "prototype", Value::int32(42))
+                .unwrap();
+            let uint8array_id = machine.intrinsics.builtins.id_named("Uint8Array").unwrap();
+            let BuiltinOutcome::Value(typed) = machine
+                .call_builtin_with_new_target(
+                    uint8array_id,
+                    Value::UNDEFINED,
+                    &[Value::int32(1)],
+                    true,
+                    new_target,
+                )
+                .unwrap()
+            else {
+                panic!("Uint8Array construct returns a value");
+            };
+            let idx = machine
+                .runtime_slot(typed)
+                .expect("typed array has slot")
+                .expect("slot exists");
+            let HeapEntry::Uint8Array { prototype, .. } = &machine.heap[idx] else {
+                panic!("typed array brand");
+            };
+            assert_eq!(
+                *prototype,
+                Some(machine.intrinsics.builtins.uint8array_prototype())
+            );
         });
     }
 }
