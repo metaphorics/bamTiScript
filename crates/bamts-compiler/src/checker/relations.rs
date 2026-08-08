@@ -412,11 +412,11 @@ impl<'table> TypeRelations<'table> {
     ) -> bool {
         self.with_parameter_aliases(source, target, || {
             // A source signature is only too narrow when it *requires* more than the
-            // target can ever supply. A trailing rest parameter supplies any count,
-            // so `arity` reports `usize::MAX` and no fixed source arity exceeds it.
+            // target *requires*. Optional parameters on the target may be left
+            // unsupplied, so only the required counts are compared.
             let (source_required, _, _) = source.arity();
-            let (_, target_total, _) = target.arity();
-            if source_required > target_total {
+            let (target_required, _, _) = target.arity();
+            if source_required > target_required {
                 return false;
             }
             let positions = source.parameters().len().max(target.parameters().len());
@@ -674,5 +674,40 @@ mod tests {
         // But not into a union that does not contain it
         assert!(!relations.assignable_with_strict_null(undefined, union_number_only));
         assert!(!relations.assignable_with_strict_null(null, union_number_only));
+    }
+
+    #[test]
+    fn function_arity_compares_required_to_required() {
+        // A source requiring more than the target requires is too narrow,
+        // even if the target could accept more via optional params.
+        // Old: source_required > target_total (2 > 2 false, would pass)
+        // New: source_required > target_required (2 > 1 true, correctly fails)
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let void = table.void();
+        // target: (a: number, b?: number) => void  => required 1, total 2
+        let target = table.function_with_parameters(
+            vec![],
+            vec![
+                crate::checker::binder::FunctionParameter::new(
+                    "a".to_string(),
+                    number,
+                    false,
+                    false,
+                ),
+                crate::checker::binder::FunctionParameter::new(
+                    "b".to_string(),
+                    number,
+                    true,
+                    false,
+                ),
+            ],
+            void,
+        );
+        // source: (a: number, b: number) => void  => required 2
+        let source = table.function(vec![number, number], void);
+        let relations = TypeRelations::new(&table);
+        assert!(!relations.subtype(source, target));
+        assert!(relations.subtype(target, source));
     }
 }
