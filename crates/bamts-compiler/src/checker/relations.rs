@@ -433,9 +433,11 @@ impl<'table> TypeRelations<'table> {
             // A source signature is only too narrow when it *requires* more than the
             // target *requires*. Optional parameters on the target may be left
             // unsupplied, so only the required counts are compared.
+            // But a rest parameter target accepts any arity, so skip the check when
+            // target has a rest.
             let (source_required, _, _) = source.arity();
-            let (target_required, _, _) = target.arity();
-            if source_required > target_required {
+            let (target_required, _, target_rest) = target.arity();
+            if target_rest.is_none() && source_required > target_required {
                 return false;
             }
             let positions = source.parameters().len().max(target.parameters().len());
