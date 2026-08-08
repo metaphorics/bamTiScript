@@ -159,14 +159,11 @@ impl EcmaString {
     }
 }
 
-/// Encodes a Rust string as ECMAScript UTF-16 code units.
-///
-/// This is a `From` impl rather than an inherent `from_utf8` or `from_str`: the
-/// input is an already-validated `&str` so the conversion cannot fail, which
-/// both of those names would imply.
+/// Delegates to [`EcmaString::encode`]; see that method for why the conversion
+/// is named `encode` rather than `from_utf8` or `from_str`.
 impl From<&str> for EcmaString {
     fn from(value: &str) -> Self {
-        Self(Arc::from(value.encode_utf16().collect::<Vec<_>>()))
+        Self::encode(value)
     }
 }
 
