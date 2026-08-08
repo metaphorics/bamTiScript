@@ -364,7 +364,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Use a function-property callback with a contravariant parameter.",
         examples!(
             "interface H { handle(x: Dog): void }",
-            "const safe: number = 1;"
+            "interface H { handle: (x: Dog) => void }"
         )
     ),
     rule!(
@@ -424,7 +424,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Validate the input and return a concrete checked type.",
         examples!(
             "function f<T>(x:any):T{return x as T}",
-            "const safe: number = 1;"
+            "function f<T>(x:T):T{return x}"
         )
     ),
     rule!(
@@ -460,7 +460,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Omit the property or include undefined in its declared type.",
         examples!(
             "const o: {x?: number} = {x: undefined};",
-            "const safe: number = 1;"
+            "const o: {x?: number} = {};"
         )
     ),
     rule!(
@@ -470,7 +470,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "Extracting a receiver-dependent method loses the this binding it requires.",
         "Bind the method or call it through its receiver.",
-        examples!("const f = obj.method; f();", "const safe: number = 1;")
+        examples!("const f = obj.method; f();", "obj.method();")
     ),
     rule!(
         "BAMTS-W011",
@@ -481,7 +481,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Use one compatible property type or an explicit conversion method.",
         examples!(
             "class C { get x(): number { return 1 } set x(v: string | number) {} }",
-            "const safe: number = 1;"
+            "class C { get x(): number { return 1 } set x(v: number) {} }"
         )
     ),
     rule!(
@@ -493,7 +493,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Keep the mutable value private and expose a readonly view.",
         examples!(
             "const r: {readonly x:number}=m; m.x=2;",
-            "const safe: number = 1;"
+            "const r: {readonly x:number}={x:1}; r.x;"
         )
     ),
     rule!(
@@ -505,7 +505,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Declare the callback parameters you intentionally receive.",
         examples!(
             "const f: (x:number,y:string)=>void = () => {};",
-            "const safe: number = 1;"
+            "const f: (x:number,y:string)=>void = (x, y) => {};"
         )
     ),
     rule!(
@@ -515,7 +515,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "A value returned from a void callback is silently discarded.",
         "Use a block body when the return value is intentionally ignored.",
-        examples!("const f: () => void = () => 42;", "const safe: number = 1;")
+        examples!("const f: () => void = () => 42;", "const f: () => void = () => {};")
     ),
     rule!(
         "BAMTS-W015",
@@ -526,7 +526,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Validate keys at runtime or work from a closed key list.",
         examples!(
             "const ks = Object.keys(x) as (keyof typeof x)[];",
-            "const safe: number = 1;"
+            "const ks = Object.keys(x) as string[];"
         )
     ),
     rule!(
@@ -548,7 +548,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "Explicit any disables type checking at the annotated boundary.",
         "Use unknown and narrow it before use.",
-        examples!("let value: any;", "const safe: number = 1;")
+        examples!("let value: any;", "let value: unknown;")
     ),
     rule!(
         "BAMTS-W018",
@@ -557,7 +557,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "An inferred any lets an untyped value flow without an explicit boundary.",
         "Add an explicit checked type or unknown annotation.",
-        examples!("function f(x) { return x; }", "const safe: number = 1;")
+        examples!("function f(x) { return x; }", "function f(x: number) { return x; }")
     ),
     rule!(
         "BAMTS-W019",
@@ -566,7 +566,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "A type assertion claims a narrower type without runtime proof.",
         "Narrow with a guard or validate with a decoder.",
-        examples!("const n = value as number;", "const safe: number = 1;")
+        examples!("const n = value as number;", "if (typeof value === \"number\") { const n = value; }")
     ),
     rule!(
         "BAMTS-W020",
@@ -577,7 +577,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Convert or validate the value at the boundary.",
         examples!(
             "const n = value as unknown as number;",
-            "const safe: number = 1;"
+            "const n = Number(value);"
         )
     ),
     rule!(
@@ -587,7 +587,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "A non-null assertion erases a possible null or undefined value.",
         "Narrow the value before accessing it.",
-        examples!("node!.textContent;", "const safe: number = 1;")
+        examples!("node!.textContent;", "if (node !== null) node.textContent;")
     ),
     rule!(
         "BAMTS-W022",
@@ -596,7 +596,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "A definite-assignment assertion skips proof that a field is initialized.",
         "Initialize the field or assign it in every constructor path.",
-        examples!("class C { value!: string }", "const safe: number = 1;")
+        examples!("class C { value!: string }", "class C { value: string = \"\"; }")
     ),
     rule!(
         "BAMTS-W023",
@@ -605,7 +605,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "A TypeScript diagnostic directive hides a compiler check instead of resolving it.",
         "Fix the diagnostic or make the boundary explicit.",
-        examples!("// @ts-ignore", "const safe: number = 1;")
+        examples!("// @ts-ignore", "const n: number = typeof value === \"number\" ? value : 0;")
     ),
     rule!(
         "BAMTS-W024",
@@ -616,7 +616,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Use ES modules or an ambient namespace.",
         examples!(
             "namespace N { export const x = 1 }",
-            "const safe: number = 1;"
+            "import { x } from \"./mod.js\";"
         )
     ),
     rule!(
@@ -628,7 +628,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Declare the field and assign the constructor parameter explicitly.",
         examples!(
             "class C { constructor(public x: number) {} }",
-            "const safe: number = 1;"
+            "class C { x: number; constructor(x: number) { this.x = x; } }"
         )
     ),
     rule!(
@@ -647,7 +647,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "Angle-bracket assertions are ambiguous with JSX syntax.",
         "Use the `as T` assertion spelling.",
-        examples!("const n = <number>value;", "const safe: number = 1;")
+        examples!("const n = <number>value;", "const n = value as number;")
     ),
     rule!(
         "BAMTS-W028",
@@ -681,7 +681,7 @@ pub static RULES: [RuleDefinition; 88] = [
         examples!(
             TypeScriptReact,
             "const el = <Widget value={1} />;",
-            "const safe = 1;"
+            "const el = Widget({ value: 1 });"
         )
     ),
     rule!(
@@ -691,7 +691,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "TypeScript import-equals and export-equals require target-specific module rewriting.",
         "Use standard ESM import and export syntax.",
-        examples!("import fs = require(\"fs\");", "const safe: number = 1;")
+        examples!("import fs = require(\"fs\");", "import fs from \"fs\";")
     ),
     rule!(
         "BAMTS-W031",
@@ -804,7 +804,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "Relative ESM imports need a runtime file extension in Node-style resolution.",
         "Write the explicit runtime extension.",
-        examples!("import {x} from \"./util\";", "const safe: number = 1;")
+        examples!("import {x} from \"./util\";", "import {x} from \"./util.js\";")
     ),
     rule!(
         "BAMTS-W037",
@@ -847,7 +847,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Defer the hook until construction is complete.",
         examples!(
             "class B { constructor(){ this.init() } }",
-            "const safe: number = 1;"
+            "class B { init(){} } const b = new B(); b.init();"
         )
     ),
     rule!(
@@ -857,7 +857,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Allow,
         "An uninitialized field has different runtime presence under competing emit modes.",
         "Initialize it or use `declare` when no own field is intended.",
-        examples!("class C { value: string; }", "const safe: number = 1;")
+        examples!("class C { value: string; }", "class C { value: string = \"\"; }")
     ),
     rule!(
         "BAMTS-W040",
@@ -890,7 +890,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Allow,
         "A TypeScript private modifier erases and does not provide runtime privacy.",
         "Use an ECMAScript `#private` field for runtime privacy.",
-        examples!("class C { private secret = 1 }", "const safe: number = 1;")
+        examples!("class C { private secret = 1 }", "class C { #secret = 1 }")
     ),
     rule!(
         "BAMTS-W043",
@@ -899,7 +899,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "A non-const enum creates a runtime object with non-erasable behavior.",
         "Use a union or a const object when a runtime object is intentional.",
-        examples!("enum Color { Red, Blue }", "const safe: number = 1;")
+        examples!("enum Color { Red, Blue }", "type Color = \"Red\" | \"Blue\";")
     ),
     rule!(
         "BAMTS-W044",
@@ -908,7 +908,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "A const enum relies on compile-time inlining across compilation boundaries.",
         "Use a union or a const object.",
-        examples!("const enum Code { Ok = 200 }", "const safe: number = 1;")
+        examples!("const enum Code { Ok = 200 }", "const Code = { Ok: 200 } as const;")
     ),
     rule!(
         "BAMTS-W045",
@@ -931,7 +931,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Use one representation or a discriminated union.",
         examples!(
             "enum Answer { No = 0, Yes = \"YES\" }",
-            "const safe: number = 1;"
+            "enum Answer { No = 0, Yes = 1 }"
         )
     ),
     rule!(
@@ -941,7 +941,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "A computed enum member depends on runtime evaluation rather than a stable constant.",
         "Use a constant initializer or a separate runtime value.",
-        examples!("enum E { X = getValue() }", "const safe: number = 1;")
+        examples!("enum E { X = getValue() }", "enum E { X = 1 }")
     ),
     rule!(
         "BAMTS-W048",
@@ -964,7 +964,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Declare one complete interface or use a closed type alias.",
         examples!(
             "interface Box {x:number} interface Box {y:number}",
-            "const safe: number = 1;"
+            "type Box = {x:number; y:number}"
         )
     ),
     rule!(
@@ -976,7 +976,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Use an explicit object or separate module export.",
         examples!(
             "function f(){} namespace f { export const x=1 }",
-            "const safe: number = 1;"
+            "function f(){} const x=1;"
         )
     ),
     rule!(
@@ -988,7 +988,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Expose a local wrapper or explicit global installation boundary.",
         examples!(
             "declare global { interface Window { x: number } }",
-            "const safe: number = 1;"
+            "const w: { x: number } = { x: 1 };"
         )
     ),
     rule!(
@@ -1000,7 +1000,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Wrap or extend the module through an explicit local API.",
         examples!(
             "declare module \"lib\" { interface X { y: number } }",
-            "const safe: number = 1;"
+            "interface LocalX { y: number } const x: LocalX = { y: 1 };"
         )
     ),
     rule!(
@@ -1010,7 +1010,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "An ambient value declaration cannot prove that the runtime provides the value.",
         "Pass the value explicitly or install it through a checked host API.",
-        examples!("declare const injected: string;", "const safe: number = 1;")
+        examples!("declare const injected: string;", "const injected: string = \"value\";")
     ),
     rule!(
         "BAMTS-W054",
@@ -1021,7 +1021,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Convert the source to TypeScript or isolate it behind typed declarations.",
         RuleExamples::new(
             source_example!(JavaScript, "const legacy = 1;"),
-            source_example!(TypeScript, "const safe: number = 1;")
+            source_example!(TypeScript, "const typed: number = 1; export {};")
         )
     ),
     rule!(
@@ -1034,7 +1034,7 @@ pub static RULES: [RuleDefinition; 88] = [
         examples!(
             JavaScript,
             "/** @type {number} */ let n = 1;",
-            "const safe = 1;"
+            "let n = 1;"
         )
     ),
     rule!(
@@ -1047,7 +1047,7 @@ pub static RULES: [RuleDefinition; 88] = [
         examples!(
             JavaScript,
             "Ctor.prototype.run = function() {};",
-            "const safe = 1;"
+            "class C { run() {} }"
         )
     ),
     rule!(
@@ -1057,7 +1057,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Allow,
         "A per-file ts-check directive makes type-checking policy non-uniform.",
         "Use project-wide checkJs or convert the file to TypeScript.",
-        examples!(JavaScript, "// @ts-check", "const safe = 1;")
+        examples!(JavaScript, "// @ts-check", "const n = 1;")
     ),
     rule!(
         "BAMTS-W058",
@@ -1066,7 +1066,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Allow,
         "An interface can merge later, leaving an API shape open unintentionally.",
         "Use a type alias for a closed shape.",
-        examples!("interface Point { x: number }", "const safe: number = 1;")
+        examples!("interface Point { x: number }", "type Point = { x: number };")
     ),
     rule!(
         "BAMTS-W059",
@@ -1075,7 +1075,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Allow,
         "A mutable array type advertises mutation where a read-only view may suffice.",
         "Accept `readonly T[]` unless mutation is required.",
-        examples!("function f(xs: string[]) {}", "const safe: number = 1;")
+        examples!("function f(xs: string[]) {}", "function f(xs: readonly string[]) {}")
     ),
     rule!(
         "BAMTS-W060",
@@ -1086,7 +1086,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Use a function-property signature for callback members.",
         examples!(
             "interface H { run(x: Animal): void }",
-            "const safe: number = 1;"
+            "interface H { run: (x: Animal) => void }"
         )
     ),
     rule!(
@@ -1098,7 +1098,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Re-export the intended names explicitly.",
         examples!(
             "export * from \"./internal.js\";",
-            "const safe: number = 1;"
+            "export { foo } from \"./internal.js\";"
         )
     ),
     rule!(
@@ -1110,7 +1110,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Use a named export.",
         examples!(
             "export default function run() {}",
-            "const safe: number = 1;"
+            "export function run() {}"
         )
     ),
     rule!(
@@ -1122,7 +1122,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Handle every variant and assert never in the default branch.",
         examples!(
             "type S = { kind: \"a\" } | { kind: \"b\" }; function f(s: S) { switch (s.kind) { case \"a\": break; } }",
-            "const safe: number = 1;"
+            "type S = { kind: \"a\" } | { kind: \"b\" }; function f(s: S) { switch (s.kind) { case \"a\": break; case \"b\": break; default: s; } }"
         )
     ),
     rule!(
@@ -1134,7 +1134,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Use a parameter object or smaller cohesive functions.",
         examples!(
             "function f(a:number,b:number,c:number,d:number,e:number) {}",
-            "const safe: number = 1;"
+            "function f(opts: {a:number;b:number;c:number;d:number;e:number}) {}"
         )
     ),
     rule!(
@@ -1158,7 +1158,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Add break, return, throw, or an explicit fallthrough marker.",
         examples!(
             "switch(x){case 1: work(); case 2: stop();}",
-            "const safe: number = 1;"
+            "switch(x){case 1: work(); break; case 2: stop();}"
         )
     ),
     rule!(
@@ -1168,7 +1168,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "A statement is unreachable under the program's control flow.",
         "Remove it or restructure the surrounding control flow.",
-        examples!("function f(){ return; work(); }", "const safe: number = 1;")
+        examples!("function f(){ return; work(); }", "function f(){ work(); return; }")
     ),
     rule!(
         "BAMTS-W068",
@@ -1213,7 +1213,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "Known number-formatting arguments lie outside the ECMAScript-supported range.",
         "Validate or clamp the argument before calling the method.",
-        examples!("(42).toString(1);", "const safe: number = 1;")
+        examples!("(42).toString(1);", "(42).toString(2);")
     ),
     rule!(
         "BAMTS-W072",
@@ -1222,7 +1222,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "Integer-like object keys are ordered before other keys, not purely by insertion.",
         "Avoid insertion-order dependence or sort the keys explicitly.",
-        examples!("Object.keys({b: 1, \"2\": 2});", "const safe: number = 1;")
+        examples!("Object.keys({b: 1, \"2\": 2});", "Object.keys({a: 1, b: 2});")
     ),
     rule!(
         "BAMTS-W073",
@@ -1231,7 +1231,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "JSON.stringify can throw for BigInt or return undefined for a top-level value.",
         "Validate serializability and handle the undefined result.",
-        examples!("JSON.stringify(10n);", "const safe: number = 1;")
+        examples!("JSON.stringify(10n);", "JSON.stringify(10);")
     ),
     rule!(
         "BAMTS-W074",
@@ -1242,7 +1242,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Parse to unknown and validate with a decoder.",
         examples!(
             "const u: User = JSON.parse(text);",
-            "const safe: number = 1;"
+            "const u: unknown = JSON.parse(text);"
         )
     ),
     rule!(
@@ -1252,7 +1252,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "Comparator-free sort coerces elements to strings rather than numeric order.",
         "Pass an explicit numeric or domain comparator.",
-        examples!("[10, 2, 5].sort();", "const safe: number = 1;")
+        examples!("[10, 2, 5].sort();", "[10, 2, 5].sort((a, b) => a - b);")
     ),
     rule!(
         "BAMTS-W076",
@@ -1261,7 +1261,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "Loose equality can depend on implicit abstract coercion.",
         "Use strict equality or an explicit conversion.",
-        examples!("\"0\" == false;", "const safe: number = 1;")
+        examples!("\"0\" == false;", "\"0\" === false;")
     ),
     rule!(
         "BAMTS-W077",
@@ -1270,7 +1270,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "Implicit object-to-primitive conversion can call surprising coercion hooks.",
         "Call String, Number, or an explicit conversion method.",
-        examples!("\"key_\" + Object.create(null);", "const safe: number = 1;")
+        examples!("\"key_\" + Object.create(null);", "\"key_\" + String(Object.create(null));")
     ),
     rule!(
         "BAMTS-W078",
@@ -1279,7 +1279,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "Interpolating a symbol directly into a template literal throws.",
         "Wrap it with String or use its description.",
-        examples!("`ID: ${Symbol(\"x\")}`", "const safe: number = 1;")
+        examples!("`ID: ${Symbol(\"x\")}`", "`ID: ${String(Symbol(\"x\"))}`")
     ),
     rule!(
         "BAMTS-W079",
@@ -1288,7 +1288,7 @@ pub static RULES: [RuleDefinition; 88] = [
         Warn,
         "NaN is never strictly equal to itself, so a direct comparison is ineffective.",
         "Use Number.isNaN.",
-        examples!("if (value === NaN) {}", "const safe: number = 1;")
+        examples!("if (value === NaN) {}", "if (Number.isNaN(value)) {}")
     ),
     rule!(
         "BAMTS-W080",
@@ -1299,7 +1299,7 @@ pub static RULES: [RuleDefinition; 88] = [
         "Use a string tag and validate the actual value shape.",
         examples!(
             "({ [Symbol.toStringTag]: 123 });",
-            "const safe: number = 1;"
+            "({ [Symbol.toStringTag]: \"MyType\" });"
         )
     ),
     rule!(
@@ -1369,7 +1369,7 @@ pub static RULES: [RuleDefinition; 88] = [
         examples!(
             JavaScript,
             "interface Point { x: number }",
-            "const safe = 1;"
+            "const point = { x: 1 };"
         )
     ),
     rule!(
@@ -2324,6 +2324,10 @@ mod tests {
         assert_eq!(
             table.level_for_source(rule("no-with"), SourceDialect::JavaScript),
             LintLevel::Deny
+        );
+        assert_eq!(
+            table.level_for_source(rule("no-debugger"), SourceDialect::JavaScript),
+            LintLevel::Warn
         );
         assert_eq!(
             LintTable::new(LintProfile::Default)
