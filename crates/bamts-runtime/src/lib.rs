@@ -6590,9 +6590,19 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
+    /// Returns the array length without cloning the element vector.
+    pub(crate) fn array_len(&self, value: Value) -> Result<Option<usize>, EvalFailure> {
+        let Some(index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
+            return Ok(None);
+        };
+        match &self.heap[index] {
+            HeapEntry::Array { elements, .. } => Ok(Some(elements.len())),
+            _ => Ok(None),
+        }
+    }
+
     pub(crate) fn array_length(&self, value: Value) -> Result<usize, EvalFailure> {
-        self.array_elements(value)?
-            .map(|elements| elements.len())
+        self.array_len(value)?
             .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
                 operation: "array method called on incompatible receiver",
             }))
