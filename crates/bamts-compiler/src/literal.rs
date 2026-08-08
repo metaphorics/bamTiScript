@@ -67,17 +67,17 @@ pub(crate) fn cook_escapes(input: &str) -> EcmaString {
             'f' => output.push_unit(0x000C),
             'v' => output.push_unit(0x000B),
             '0' if !chars.peek().is_some_and(|c| c.is_ascii_digit()) => output.push_unit(0),
-'\n' => {}
-'\r' => {
-    if chars.peek() == Some(&'\n') {
-        chars.next();
-    }
-}
-// U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are LineTerminator
-// characters per spec; after a backslash they act as line continuations
-// (the character is consumed and emits nothing), like \n and \r above.
-'\u{2028}' => {}
-'\u{2029}' => {}
+            '\n' => {}
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+            }
+            // U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are LineTerminator
+            // characters per spec; after a backslash they act as line continuations
+            // (the character is consumed and emits nothing), like \n and \r above.
+            '\u{2028}' => {}
+            '\u{2029}' => {}
             'x' => {
                 let hi = chars.next();
                 let lo = chars.next();
@@ -174,7 +174,13 @@ mod tests {
     }
     #[test]
     fn cooks_line_continuations() {
-        assert_eq!(cook_escapes("a\\\u{2028}b").as_units(), [b'a'.into(), b'b'.into()]);
-        assert_eq!(cook_escapes("a\\\u{2029}b").as_units(), [b'a'.into(), b'b'.into()]);
+        assert_eq!(
+            cook_escapes("a\\\u{2028}b").as_units(),
+            [b'a'.into(), b'b'.into()]
+        );
+        assert_eq!(
+            cook_escapes("a\\\u{2029}b").as_units(),
+            [b'a'.into(), b'b'.into()]
+        );
     }
 }

@@ -771,8 +771,6 @@ mod tests {
         assert_eq!(instantiated, expected);
     }
 
-
-
     /// Two distinct top-priority candidates with no common supertype resolve
     /// to their union.
     #[test]
