@@ -255,18 +255,18 @@ impl<'table> TypeRelations<'table> {
             (Type::Null | Type::Undefined, _) if strictness == Strictness::Assignable => {
                 !matches!(to, Type::Never)
             }
-            (Type::Undefined, _) if strictness == Strictness::StrictNull => {
-                matches!(to, Type::Any | Type::Unknown | Type::Void | Type::Undefined)
-            }
-            (Type::Null, _) if strictness == Strictness::StrictNull => {
-                matches!(to, Type::Any | Type::Unknown | Type::Null)
-            }
             (Type::Union(sources), _) => sources
                 .iter()
                 .all(|member| self.relates(*member, target, strictness)),
             (_, Type::Union(targets)) => targets
                 .iter()
                 .any(|member| self.relates(source, *member, strictness)),
+            (Type::Undefined, _) if strictness == Strictness::StrictNull => {
+                matches!(to, Type::Any | Type::Unknown | Type::Void | Type::Undefined)
+            }
+            (Type::Null, _) if strictness == Strictness::StrictNull => {
+                matches!(to, Type::Any | Type::Unknown | Type::Null)
+            }
             // Array elements are covariant, matching TypeScript's accepted
             // unsoundness for mutable arrays.
             (Type::Array(source_element), Type::Array(target_element)) => {
@@ -652,5 +652,27 @@ mod tests {
                 assert_eq!(relations.assignable(source, target), expected);
             }
         }
+    }
+
+    #[test]
+    fn union_distributes_before_strict_null_leaf() {
+        // Under StrictNull, a union target must be checked before the scalar
+        // strict-null leaf. Old order: (Undefined, _) matched before
+        // (_, Type::Union) and rejected `undefined -> number|undefined`.
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let undefined = table.undefined_type();
+        let null = table.null_type();
+        let union_undefined = table.union(&[number, undefined]);
+        let union_null = table.union(&[number, null]);
+        let string = table.string();
+        let union_number_only = table.union(&[number, string]);
+        let relations = TypeRelations::new(&table);
+        // Scalar undefined/null must flow into a union that contains it (strict mode)
+        assert!(relations.assignable_with_strict_null(undefined, union_undefined));
+        assert!(relations.assignable_with_strict_null(null, union_null));
+        // But not into a union that does not contain it
+        assert!(!relations.assignable_with_strict_null(undefined, union_number_only));
+        assert!(!relations.assignable_with_strict_null(null, union_number_only));
     }
 }
