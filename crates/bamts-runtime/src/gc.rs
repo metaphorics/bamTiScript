@@ -229,7 +229,6 @@ impl GcState {
 
     fn ephemeron_fixed_point(&mut self, heap: &[HeapEntry]) {
         loop {
-            let marked_before = self.marks.iter().filter(|marked| **marked).count();
             let weak_count = self.weak_collections.len();
             for list_index in 0..weak_count {
                 let slot = self.weak_collections[list_index];
@@ -247,10 +246,10 @@ impl GcState {
                     }
                 }
             }
-            self.drain(heap);
-            if self.marks.iter().filter(|marked| **marked).count() == marked_before {
+            if self.work.is_empty() {
                 break;
             }
+            self.drain(heap);
         }
     }
 
