@@ -1583,7 +1583,22 @@ fn visit_callable_signature(
     for parameter in parameters {
         let data = parameter.data();
         if data.type_annotation.as_ref().is_some_and(|annotation| {
-            matches!(annotation.data().type_node.data(), TypeNode::Array(_))
+            let ty = annotation.data().type_node.data();
+            // Only flag mutable arrays: `string[]` but not `readonly string[]`.
+            // `readonly string[]` is `Array(Operator::Readonly)` as element.
+            if let TypeNode::Array(element) = ty {
+                // Check if the array element is `readonly` — if so, it's a
+                // readonly array and should not be flagged.
+                !matches!(
+                    element.data(),
+                    TypeNode::Operator {
+                        operator: crate::syntax::TypeOperator::Readonly,
+                        ..
+                    }
+                )
+            } else {
+                false
+            }
         }) {
             findings.push((
                 "BAMTS-W059",

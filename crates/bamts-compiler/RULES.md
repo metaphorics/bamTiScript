@@ -10,7 +10,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Use a function-property callback with a contravariant parameter.
 - Silence: `-A method-parameter-bivariance`
 - Trigger: <code>TypeScript: interface H { handle(x: Dog): void }</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: interface H { handle: (x: Dog) =&gt; void }</code>
 
 ## `BAMTS-W002`: `mutable-array-covariance`
 
@@ -60,7 +60,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Validate the input and return a concrete checked type.
 - Silence: `-A generic-any-downcast`
 - Trigger: <code>TypeScript: function f&lt;T&gt;(x:any):T{return x as T}</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: function f&lt;T&gt;(x:T):T{return x}</code>
 
 ## `BAMTS-W007`: `dynamic-tuple-index`
 
@@ -90,7 +90,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Omit the property or include undefined in its declared type.
 - Silence: `-A explicit-undefined-for-optional`
 - Trigger: <code>TypeScript: const o: {x?: number} = {x: undefined};</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: const o: {x?: number} = {};</code>
 
 ## `BAMTS-W010`: `detached-this-method`
 
@@ -100,7 +100,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Bind the method or call it through its receiver.
 - Silence: `-A detached-this-method`
 - Trigger: <code>TypeScript: const f = obj.method; f();</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: obj.method();</code>
 
 ## `BAMTS-W011`: `divergent-accessor-types`
 
@@ -110,7 +110,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Use one compatible property type or an explicit conversion method.
 - Silence: `-A divergent-accessor-types`
 - Trigger: <code>TypeScript: class C { get x(): number { return 1 } set x(v: string | number) {} }</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: class C { get x(): number { return 1 } set x(v: number) {} }</code>
 
 ## `BAMTS-W012`: `readonly-alias-mutation`
 
@@ -120,7 +120,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Keep the mutable value private and expose a readonly view.
 - Silence: `-A readonly-alias-mutation`
 - Trigger: <code>TypeScript: const r: {readonly x:number}=m; m.x=2;</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: const r: {readonly x:number}={x:1}; r.x;</code>
 
 ## `BAMTS-W013`: `fewer-callback-parameters`
 
@@ -130,7 +130,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Declare the callback parameters you intentionally receive.
 - Silence: `-A fewer-callback-parameters`
 - Trigger: <code>TypeScript: const f: (x:number,y:string)=&gt;void = () =&gt; {};</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: const f: (x:number,y:string)=&gt;void = (x, y) =&gt; {};</code>
 
 ## `BAMTS-W014`: `value-returning-void-callback`
 
@@ -140,7 +140,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Use a block body when the return value is intentionally ignored.
 - Silence: `-A value-returning-void-callback`
 - Trigger: <code>TypeScript: const f: () =&gt; void = () =&gt; 42;</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: const f: () =&gt; void = () =&gt; {};</code>
 
 ## `BAMTS-W015`: `open-object-keys-assumption`
 
@@ -150,7 +150,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Validate keys at runtime or work from a closed key list.
 - Silence: `-A open-object-keys-assumption`
 - Trigger: <code>TypeScript: const ks = Object.keys(x) as (keyof typeof x)[];</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: const ks = Object.keys(x) as string[];</code>
 
 ## `BAMTS-W016`: `index-signature-dot-access`
 
@@ -170,7 +170,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Use unknown and narrow it before use.
 - Silence: `-A explicit-any`
 - Trigger: <code>TypeScript: let value: any;</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: let value: unknown;</code>
 
 ## `BAMTS-W018`: `implicit-any`
 
@@ -180,7 +180,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Add an explicit checked type or unknown annotation.
 - Silence: `-A implicit-any`
 - Trigger: <code>TypeScript: function f(x) { return x; }</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: function f(x: number) { return x; }</code>
 
 ## `BAMTS-W019`: `unchecked-type-assertion`
 
@@ -190,7 +190,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Narrow with a guard or validate with a decoder.
 - Silence: `-A unchecked-type-assertion`
 - Trigger: <code>TypeScript: const n = value as number;</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: if (typeof value === "number") { const n = value; }</code>
 
 ## `BAMTS-W020`: `double-assertion`
 
@@ -200,7 +200,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Convert or validate the value at the boundary.
 - Silence: `-A double-assertion`
 - Trigger: <code>TypeScript: const n = value as unknown as number;</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: const n = Number(value);</code>
 
 ## `BAMTS-W021`: `non-null-assertion`
 
@@ -210,7 +210,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Narrow the value before accessing it.
 - Silence: `-A non-null-assertion`
 - Trigger: <code>TypeScript: node!.textContent;</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: if (node !== null) node.textContent;</code>
 
 ## `BAMTS-W022`: `definite-assignment-assertion`
 
@@ -220,7 +220,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Initialize the field or assign it in every constructor path.
 - Silence: `-A definite-assignment-assertion`
 - Trigger: <code>TypeScript: class C { value!: string }</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: class C { value: string = ""; }</code>
 
 ## `BAMTS-W023`: `diagnostic-suppression-directive`
 
@@ -230,7 +230,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Fix the diagnostic or make the boundary explicit.
 - Silence: `-A diagnostic-suppression-directive`
 - Trigger: <code>TypeScript: // @ts-ignore</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: const n: number = typeof value === "number" ? value : 0;</code>
 
 ## `BAMTS-W024`: `runtime-namespace`
 
@@ -240,7 +240,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Use ES modules or an ambient namespace.
 - Silence: `-A runtime-namespace`
 - Trigger: <code>TypeScript: namespace N { export const x = 1 }</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: import { x } from "./mod.js";</code>
 
 ## `BAMTS-W025`: `parameter-property`
 
@@ -250,7 +250,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Declare the field and assign the constructor parameter explicitly.
 - Silence: `-A parameter-property`
 - Trigger: <code>TypeScript: class C { constructor(public x: number) {} }</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: class C { x: number; constructor(x: number) { this.x = x; } }</code>
 
 ## `BAMTS-W026`: `legacy-decorator-semantics`
 
@@ -270,7 +270,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Use the `as T` assertion spelling.
 - Silence: `-A angle-bracket-assertion`
 - Trigger: <code>TypeScript: const n = &lt;number&gt;value;</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: const n = value as number;</code>
 
 ## `BAMTS-W028`: `declaration-inference-dependency`
 
@@ -290,7 +290,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Configure a JSX runtime or use ordinary function calls.
 - Silence: `-A jsx-transform-required`
 - Trigger: <code>TypeScriptReact: const el = &lt;Widget value={1} /&gt;;</code>
-- Clean: <code>TypeScriptReact: const safe = 1;</code>
+- Clean: <code>TypeScriptReact: const el = Widget({ value: 1 });</code>
 
 ## `BAMTS-W030`: `import-export-equals`
 
@@ -300,7 +300,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Use standard ESM import and export syntax.
 - Silence: `-A import-export-equals`
 - Trigger: <code>TypeScript: import fs = require("fs");</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: import fs from "fs";</code>
 
 ## `BAMTS-W031`: `type-imported-as-value`
 
@@ -360,7 +360,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Write the explicit runtime extension.
 - Silence: `-A extensionless-relative-import`
 - Trigger: <code>TypeScript: import {x} from "./util";</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: import {x} from "./util.js";</code>
 
 ## `BAMTS-W037`: `interop-dependent-default-import`
 
@@ -380,7 +380,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Defer the hook until construction is complete.
 - Silence: `-A virtual-call-in-constructor`
 - Trigger: <code>TypeScript: class B { constructor(){ this.init() } }</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: class B { init(){} } const b = new B(); b.init();</code>
 
 ## `BAMTS-W039`: `uninitialized-field-emit-split`
 
@@ -390,7 +390,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Initialize it or use `declare` when no own field is intended.
 - Silence: `-A uninitialized-field-emit-split`
 - Trigger: <code>TypeScript: class C { value: string; }</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: class C { value: string = ""; }</code>
 
 ## `BAMTS-W040`: `field-overrides-accessor`
 
@@ -420,7 +420,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Use an ECMAScript `#private` field for runtime privacy.
 - Silence: `-A typescript-private-field`
 - Trigger: <code>TypeScript: class C { private secret = 1 }</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: class C { #secret = 1 }</code>
 
 ## `BAMTS-W043`: `runtime-enum`
 
@@ -430,7 +430,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Use a union or a const object when a runtime object is intentional.
 - Silence: `-A runtime-enum`
 - Trigger: <code>TypeScript: enum Color { Red, Blue }</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: type Color = "Red" | "Blue";</code>
 
 ## `BAMTS-W044`: `const-enum`
 
@@ -440,7 +440,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Use a union or a const object.
 - Silence: `-A const-enum`
 - Trigger: <code>TypeScript: const enum Code { Ok = 200 }</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: const Code = { Ok: 200 } as const;</code>
 
 ## `BAMTS-W045`: `numeric-enum-number-flow`
 
@@ -460,7 +460,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Use one representation or a discriminated union.
 - Silence: `-A heterogeneous-enum`
 - Trigger: <code>TypeScript: enum Answer { No = 0, Yes = "YES" }</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: enum Answer { No = 0, Yes = 1 }</code>
 
 ## `BAMTS-W047`: `computed-enum-member`
 
@@ -470,7 +470,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Use a constant initializer or a separate runtime value.
 - Silence: `-A computed-enum-member`
 - Trigger: <code>TypeScript: enum E { X = getValue() }</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: enum E { X = 1 }</code>
 
 ## `BAMTS-W048`: `numeric-enum-reverse-lookup`
 
@@ -490,7 +490,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Declare one complete interface or use a closed type alias.
 - Silence: `-A interface-declaration-merge`
 - Trigger: <code>TypeScript: interface Box {x:number} interface Box {y:number}</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: type Box = {x:number; y:number}</code>
 
 ## `BAMTS-W050`: `namespace-value-merge`
 
@@ -500,7 +500,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Use an explicit object or separate module export.
 - Silence: `-A namespace-value-merge`
 - Trigger: <code>TypeScript: function f(){} namespace f { export const x=1 }</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: function f(){} const x=1;</code>
 
 ## `BAMTS-W051`: `global-augmentation`
 
@@ -510,7 +510,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Expose a local wrapper or explicit global installation boundary.
 - Silence: `-A global-augmentation`
 - Trigger: <code>TypeScript: declare global { interface Window { x: number } }</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: const w: { x: number } = { x: 1 };</code>
 
 ## `BAMTS-W052`: `module-augmentation`
 
@@ -520,7 +520,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Wrap or extend the module through an explicit local API.
 - Silence: `-A module-augmentation`
 - Trigger: <code>TypeScript: declare module "lib" { interface X { y: number } }</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: interface LocalX { y: number } const x: LocalX = { y: 1 };</code>
 
 ## `BAMTS-W053`: `ambient-value-declaration`
 
@@ -530,7 +530,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Pass the value explicitly or install it through a checked host API.
 - Silence: `-A ambient-value-declaration`
 - Trigger: <code>TypeScript: declare const injected: string;</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: const injected: string = "value";</code>
 
 ## `BAMTS-W054`: `javascript-input`
 
@@ -540,7 +540,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Convert the source to TypeScript or isolate it behind typed declarations.
 - Silence: `-A javascript-input`
 - Trigger: <code>JavaScript: const legacy = 1;</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: const typed: number = 1; export {};</code>
 
 ## `BAMTS-W055`: `jsdoc-type-syntax`
 
@@ -550,7 +550,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Move the file to TypeScript with native type syntax.
 - Silence: `-A jsdoc-type-syntax`
 - Trigger: <code>JavaScript: /** @type {number} */ let n = 1;</code>
-- Clean: <code>JavaScript: const safe = 1;</code>
+- Clean: <code>JavaScript: let n = 1;</code>
 
 ## `BAMTS-W056`: `prototype-class-pattern`
 
@@ -560,7 +560,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Use class syntax or an explicit factory object.
 - Silence: `-A prototype-class-pattern`
 - Trigger: <code>JavaScript: Ctor.prototype.run = function() {};</code>
-- Clean: <code>JavaScript: const safe = 1;</code>
+- Clean: <code>JavaScript: class C { run() {} }</code>
 
 ## `BAMTS-W057`: `ts-check-directive`
 
@@ -570,7 +570,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Use project-wide checkJs or convert the file to TypeScript.
 - Silence: `-A ts-check-directive`
 - Trigger: <code>JavaScript: // @ts-check</code>
-- Clean: <code>JavaScript: const safe = 1;</code>
+- Clean: <code>JavaScript: const n = 1;</code>
 
 ## `BAMTS-W058`: `prefer-type-alias`
 
@@ -580,7 +580,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Use a type alias for a closed shape.
 - Silence: `-A prefer-type-alias`
 - Trigger: <code>TypeScript: interface Point { x: number }</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: type Point = { x: number };</code>
 
 ## `BAMTS-W059`: `prefer-readonly-array`
 
@@ -590,7 +590,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Accept `readonly T[]` unless mutation is required.
 - Silence: `-A prefer-readonly-array`
 - Trigger: <code>TypeScript: function f(xs: string[]) {}</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: function f(xs: readonly string[]) {}</code>
 
 ## `BAMTS-W060`: `prefer-function-property`
 
@@ -600,7 +600,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Use a function-property signature for callback members.
 - Silence: `-A prefer-function-property`
 - Trigger: <code>TypeScript: interface H { run(x: Animal): void }</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: interface H { run: (x: Animal) =&gt; void }</code>
 
 ## `BAMTS-W061`: `no-barrel-star-export`
 
@@ -610,7 +610,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Re-export the intended names explicitly.
 - Silence: `-A no-barrel-star-export`
 - Trigger: <code>TypeScript: export * from "./internal.js";</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: export { foo } from "./internal.js";</code>
 
 ## `BAMTS-W062`: `no-default-export`
 
@@ -620,7 +620,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Use a named export.
 - Silence: `-A no-default-export`
 - Trigger: <code>TypeScript: export default function run() {}</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: export function run() {}</code>
 
 ## `BAMTS-W063`: `exhaustive-discriminated-switch`
 
@@ -630,7 +630,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Handle every variant and assert never in the default branch.
 - Silence: `-A exhaustive-discriminated-switch`
 - Trigger: <code>TypeScript: type S = { kind: "a" } | { kind: "b" }; function f(s: S) { switch (s.kind) { case "a": break; } }</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: type S = { kind: "a" } | { kind: "b" }; function f(s: S) { switch (s.kind) { case "a": break; case "b": break; default: s; } }</code>
 
 ## `BAMTS-W064`: `long-parameter-list`
 
@@ -640,7 +640,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Use a parameter object or smaller cohesive functions.
 - Silence: `-A long-parameter-list`
 - Trigger: <code>TypeScript: function f(a:number,b:number,c:number,d:number,e:number) {}</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: function f(opts: {a:number;b:number;c:number;d:number;e:number}) {}</code>
 
 ## `BAMTS-W065`: `implicit-return-path`
 
@@ -660,7 +660,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Add break, return, throw, or an explicit fallthrough marker.
 - Silence: `-A switch-fallthrough`
 - Trigger: <code>TypeScript: switch(x){case 1: work(); case 2: stop();}</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: switch(x){case 1: work(); break; case 2: stop();}</code>
 
 ## `BAMTS-W067`: `unreachable-code`
 
@@ -670,7 +670,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Remove it or restructure the surrounding control flow.
 - Silence: `-A unreachable-code`
 - Trigger: <code>TypeScript: function f(){ return; work(); }</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: function f(){ work(); return; }</code>
 
 ## `BAMTS-W068`: `unused-label`
 
@@ -710,7 +710,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Validate or clamp the argument before calling the method.
 - Silence: `-A invalid-number-formatting-options`
 - Trigger: <code>TypeScript: (42).toString(1);</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: (42).toString(2);</code>
 
 ## `BAMTS-W072`: `unsound-numeric-key-order-assumption`
 
@@ -720,7 +720,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Avoid insertion-order dependence or sort the keys explicitly.
 - Silence: `-A unsound-numeric-key-order-assumption`
 - Trigger: <code>TypeScript: Object.keys({b: 1, "2": 2});</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: Object.keys({a: 1, b: 2});</code>
 
 ## `BAMTS-W073`: `json-stringify-unserializable-type`
 
@@ -730,7 +730,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Validate serializability and handle the undefined result.
 - Silence: `-A json-stringify-unserializable-type`
 - Trigger: <code>TypeScript: JSON.stringify(10n);</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: JSON.stringify(10);</code>
 
 ## `BAMTS-W074`: `unchecked-json-parse-any`
 
@@ -740,7 +740,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Parse to unknown and validate with a decoder.
 - Silence: `-A unchecked-json-parse-any`
 - Trigger: <code>TypeScript: const u: User = JSON.parse(text);</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: const u: unknown = JSON.parse(text);</code>
 
 ## `BAMTS-W075`: `numeric-array-default-sort`
 
@@ -750,7 +750,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Pass an explicit numeric or domain comparator.
 - Silence: `-A numeric-array-default-sort`
 - Trigger: <code>TypeScript: [10, 2, 5].sort();</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: [10, 2, 5].sort((a, b) =&gt; a - b);</code>
 
 ## `BAMTS-W076`: `loose-equality-coercion`
 
@@ -760,7 +760,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Use strict equality or an explicit conversion.
 - Silence: `-A loose-equality-coercion`
 - Trigger: <code>TypeScript: "0" == false;</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: "0" === false;</code>
 
 ## `BAMTS-W077`: `object-implicit-toprimitive-coercion`
 
@@ -770,7 +770,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Call String, Number, or an explicit conversion method.
 - Silence: `-A object-implicit-toprimitive-coercion`
 - Trigger: <code>TypeScript: "key_" + Object.create(null);</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: "key_" + String(Object.create(null));</code>
 
 ## `BAMTS-W078`: `symbol-template-interpolation-throw`
 
@@ -780,7 +780,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Wrap it with String or use its description.
 - Silence: `-A symbol-template-interpolation-throw`
 - Trigger: <code>TypeScript: `ID: ${Symbol("x")}`</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: `ID: ${String(Symbol("x"))}`</code>
 
 ## `BAMTS-W079`: `nan-strict-comparison`
 
@@ -790,7 +790,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Use Number.isNaN.
 - Silence: `-A nan-strict-comparison`
 - Trigger: <code>TypeScript: if (value === NaN) {}</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: if (Number.isNaN(value)) {}</code>
 
 ## `BAMTS-W080`: `unsafe-tostringtag-override`
 
@@ -800,7 +800,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Use a string tag and validate the actual value shape.
 - Silence: `-A unsafe-tostringtag-override`
 - Trigger: <code>TypeScript: ({ [Symbol.toStringTag]: 123 });</code>
-- Clean: <code>TypeScript: const safe: number = 1;</code>
+- Clean: <code>TypeScript: ({ [Symbol.toStringTag]: "MyType" });</code>
 
 ## `BAMTS-W081`: `uninitialized-class-field-shadowing`
 
@@ -850,7 +850,7 @@ This file is generated from `bamts_compiler::lint::RULES`; do not edit it manual
 - Sound alternative: Rename the file to TypeScript or remove the type syntax.
 - Silence: `-A javascript-syntax-rejection`
 - Trigger: <code>JavaScript: interface Point { x: number }</code>
-- Clean: <code>JavaScript: const safe = 1;</code>
+- Clean: <code>JavaScript: const point = { x: 1 };</code>
 
 ## `BAMTS-W086`: `cjs-esm-named-export-mismatch`
 
