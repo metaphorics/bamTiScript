@@ -34,5 +34,8 @@ host-jit = ["dep:cranelift-jit", "dep:bamts-native", "dep:region", "dep:wasmtime
 # `unsafe_code` is downgraded from the workspace `forbid` to `deny` so a single
 # `#[allow(unsafe_code)]` may cover the one module that requires it: the W^X
 # host-JIT memory provider (`jit_memory`), which owns the OS mapping syscalls.
+# Note: this crate intentionally does not use `lints.workspace = true` because
+# Cargo forbids mixing `workspace = true` with per-lint overrides. Any new
+# `workspace.lints` added in the root must be manually mirrored here.
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"

@@ -416,9 +416,15 @@ impl JITMemoryProvider for WxMemoryProvider {
                 Ok(())
             }
             Err(error) => {
-                // Any partial finalization failure poisons the module: release
-                // every mapping, leave the phase Freed, and never publish.
-                self.release();
+                // A partial finalization failure poisons the module:
+                // `finalization_started` is already true, so no further
+                // allocation or finalization can occur, and the publication
+                // receipt checks `phase() == Executable` and will refuse.
+                // Retain the mappings until `Drop` releases them —
+                // `JITModule` still holds `CompiledBlob` pointers that
+                // reference this memory, and unmapping here would leave
+                // dangling pointers that later `get_finalized_*` calls
+                // could dereference.
                 Err(*error)
             }
         }
