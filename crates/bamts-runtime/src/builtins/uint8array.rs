@@ -18,6 +18,7 @@ pub(super) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
+    builtins.set_uint8array_prototype(prototype);
     let constructor = install_function(heap, builtins, "Uint8Array", 1, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     define_data(heap, prototype, "constructor", constructor);
@@ -267,21 +268,7 @@ fn values<H: Host>(
     )?))
 }
 fn constructor_prototype<H: Host>(machine: &Machine<'_, H>) -> Result<Value, EvalFailure> {
-    let constructor = machine
-        .intrinsics
-        .global("Uint8Array")
-        .ok_or_else(|| type_error("missing Uint8Array constructor"))?;
-    let index = machine
-        .runtime_slot(constructor)
-        .map_err(EvalFailure::Runtime)?
-        .ok_or_else(|| type_error("invalid Uint8Array constructor"))?;
-    let HeapEntry::NativeFunction { properties, .. } = &machine.heap[index] else {
-        return Err(type_error("invalid Uint8Array constructor"));
-    };
-    match properties.get(&PropertyKey::Named(EcmaString::encode("prototype"))) {
-        Some(Property::Data { value, .. }) => Ok(*value),
-        _ => Err(type_error("missing Uint8Array prototype")),
-    }
+    Ok(machine.intrinsics.builtins.uint8array_prototype())
 }
 
 #[cfg(test)]
@@ -838,6 +825,59 @@ mod tests {
                 machine.call_value(iterator_fn, plain, &[]),
                 Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
             ));
+        });
+    }
+
+    #[test]
+    fn uint8array_prototype_is_cached_not_global_lookup() {
+        // The prototype must be read from BuiltinTable, not via a mutable
+        // globals map lookup, so deleting the global does not break construction.
+        with_machine(|machine| {
+            let ctor_before = machine
+                .intrinsics
+                .global("Uint8Array")
+                .expect("Uint8Array global exists before removal");
+            machine
+                .intrinsics
+                .globals
+                .remove(&EcmaString::encode("Uint8Array"));
+            // Construct via the saved constructor value, not via global lookup
+            let idx = machine
+                .runtime_slot(ctor_before)
+                .expect("valid constructor")
+                .expect("heap");
+            let HeapEntry::NativeFunction {
+                callable: NativeCallable::Builtin(id),
+                ..
+            } = machine.heap[idx]
+            else {
+                panic!("Uint8Array is native");
+            };
+            let BuiltinOutcome::Value(typed) = machine
+                .call_builtin(id, Value::UNDEFINED, &[Value::int32(2)], true)
+                .expect("constructor succeeds")
+            else {
+                panic!("constructor returns an object");
+            };
+            assert_eq!(int(machine, typed, "length"), 2);
+            // Verify the typed array's internal prototype slot is the cached prototype
+            let idx = machine
+                .runtime_slot(typed)
+                .expect("typed array has slot")
+                .expect("slot exists");
+            let HeapEntry::Uint8Array { prototype, .. } = &machine.heap[idx] else {
+                panic!("typed array brand");
+            };
+            assert_eq!(
+                *prototype,
+                Some(machine.intrinsics.builtins.uint8array_prototype())
+            );
+            // And the cached prototype's "constructor" is still the Uint8Array constructor
+            let proto_val = machine.intrinsics.builtins.uint8array_prototype();
+            let ctor = machine
+                .get_named_property(proto_val, "constructor")
+                .expect("prototype has constructor");
+            assert_eq!(ctor, ctor_before);
         });
     }
 }

@@ -73,6 +73,7 @@ pub(crate) struct BuiltinTable<H: Host> {
     promise_resolver_targets: Option<(Value, Value)>,
     promise_all_targets: Option<(Value, Value)>,
     promise_prototype: Option<Value>,
+    uint8array_prototype: Option<Value>,
     marker: PhantomData<fn() -> H>,
 }
 
@@ -111,6 +112,7 @@ impl<H: Host> BuiltinTable<H> {
             promise_resolver_targets: None,
             promise_all_targets: None,
             promise_prototype: None,
+            uint8array_prototype: None,
             marker: PhantomData,
         }
     }
@@ -280,6 +282,15 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn promise_prototype(&self) -> Value {
         self.promise_prototype
             .expect("Promise builtins install their prototype")
+    }
+
+    pub(crate) fn set_uint8array_prototype(&mut self, prototype: Value) {
+        self.uint8array_prototype = Some(prototype);
+    }
+
+    pub(crate) fn uint8array_prototype(&self) -> Value {
+        self.uint8array_prototype
+            .expect("Uint8Array builtins install their prototype")
     }
 
     pub(crate) fn set_promise_resolver_targets(&mut self, resolve: Value, reject: Value) {
