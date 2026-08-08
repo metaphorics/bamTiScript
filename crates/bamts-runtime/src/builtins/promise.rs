@@ -105,18 +105,13 @@ pub(super) fn install<H: Host>(
     define_static(heap, constructor, "resolve", resolve);
     define_static(heap, constructor, "reject", reject);
     define_static(heap, constructor, "all", all);
-    define_static(
-        heap,
-        constructor,
-        "\0capabilityExecutor",
-        capability_executor,
-    );
-    define_static(heap, constructor, "\0finallyValue", finally_value);
-    define_static(heap, constructor, "\0finallyThrow", finally_throw);
-    define_static(heap, constructor, "\0finallyReturn", finally_return);
-    define_static(heap, constructor, "\0finallyRethrow", finally_rethrow);
-    define_static(heap, constructor, "\0thenFulfill", then_fulfill);
-    define_static(heap, constructor, "\0thenReject", then_reject);
+    builtins.set_promise_capability_executor(capability_executor);
+    builtins.set_promise_finally_value(finally_value);
+    builtins.set_promise_finally_throw(finally_throw);
+    builtins.set_promise_finally_return(finally_return);
+    builtins.set_promise_finally_rethrow(finally_rethrow);
+    builtins.set_promise_then_fulfill(then_fulfill);
+    builtins.set_promise_then_reject(then_reject);
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[super::heap_index(constructor)]
     else {
         unreachable!("Promise constructor is native")
@@ -157,19 +152,6 @@ struct PromiseCapability {
     reject: Value,
 }
 
-fn intrinsic_target<H: Host>(
-    machine: &mut Machine<'_, H>,
-    name: &str,
-) -> Result<Value, EvalFailure> {
-    // Resolve the Promise constructor from the immutable prototype slot in
-    // the intrinsics table, not from the script-mutable global map.  A script
-    // that reassigns the global `Promise` must not be able to redirect the
-    // internal lookups for capability/then/finally target functions.
-    let prototype = machine.intrinsics.builtins.promise_prototype();
-    let constructor = machine.get_named_property(prototype, "constructor")?;
-    machine.get_named_property(constructor, name)
-}
-
 fn new_promise_capability<H: Host>(
     machine: &mut Machine<'_, H>,
     constructor: Value,
@@ -180,7 +162,7 @@ fn new_promise_capability<H: Host>(
         }));
     }
     let record = super::ordinary_runtime(machine, None)?;
-    let target = intrinsic_target(machine, "\0capabilityExecutor")?;
+    let target = machine.intrinsics.builtins.promise_capability_executor();
     let executor = machine.create_promise_resolver_function(target, record)?;
     let promise = machine.construct_value(constructor, &[executor])?;
     let resolve = machine.get_named_property(record, "resolve")?;
@@ -421,8 +403,8 @@ fn then<H: Host>(
     )?;
     machine.set_data_property(record, "resolve", capability.resolve)?;
     machine.set_data_property(record, "reject", capability.reject)?;
-    let fulfill_target = intrinsic_target(machine, "\0thenFulfill")?;
-    let reject_target = intrinsic_target(machine, "\0thenReject")?;
+    let fulfill_target = machine.intrinsics.builtins.promise_then_fulfill();
+    let reject_target = machine.intrinsics.builtins.promise_then_reject();
     let fulfill = machine.create_promise_resolver_function(fulfill_target, record)?;
     let reject = machine.create_promise_resolver_function(reject_target, record)?;
     let ignored = machine.promise_then(this, fulfill, reject)?;
@@ -547,8 +529,8 @@ fn finally<H: Host>(
         let record = super::ordinary_runtime(machine, None)?;
         machine.set_data_property(record, "handler", handler)?;
         machine.set_data_property(record, "constructor", species)?;
-        let fulfill = intrinsic_target(machine, "\0finallyValue")?;
-        let reject = intrinsic_target(machine, "\0finallyThrow")?;
+        let fulfill = machine.intrinsics.builtins.promise_finally_value();
+        let reject = machine.intrinsics.builtins.promise_finally_throw();
         (
             machine.create_promise_resolver_function(fulfill, record)?,
             machine.create_promise_resolver_function(reject, record)?,
@@ -646,14 +628,11 @@ fn finally_wait<H: Host>(
     let promise = promise_resolve_with_constructor(machine, constructor, result)?;
     let continuation_record = super::ordinary_runtime(machine, None)?;
     machine.set_data_property(continuation_record, "value", original)?;
-    let target = intrinsic_target(
-        machine,
-        if rejected {
-            "\0finallyRethrow"
-        } else {
-            "\0finallyReturn"
-        },
-    )?;
+    let target = if rejected {
+        machine.intrinsics.builtins.promise_finally_rethrow()
+    } else {
+        machine.intrinsics.builtins.promise_finally_return()
+    };
     let continuation = machine.create_promise_resolver_function(target, continuation_record)?;
     let then = machine.get_named_property(promise, "then")?;
     machine.call_value(then, promise, &[continuation, Value::UNDEFINED])
@@ -1246,5 +1225,60 @@ mod tests {
             matches!(derived_state, PromiseState::Fulfilled { value } if value == Value::int32(42)),
             "derived promise should be fulfilled with 42, got {derived_state:?}"
         );
+    }
+
+    #[test]
+    fn promise_has_no_nul_prefixed_own_keys() {
+        // The 7 internal target functions must live in BuiltinTable, not as
+        // script-reachable \0-prefixed properties on %Promise% or its prototype.
+        let module = blank_program("<promise-nul-keys>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let promise_ctor = machine.intrinsics.global("Promise").unwrap();
+        let idx = machine
+            .runtime_slot(promise_ctor)
+            .expect("Promise has slot")
+            .expect("slot exists");
+        let HeapEntry::NativeFunction { properties, .. } = &machine.heap[idx] else {
+            panic!("Promise constructor is native");
+        };
+        for (key, _) in properties.iter() {
+            if let PropertyKey::Named(name) = key {
+                assert!(
+                    !name.as_units().starts_with(&[0]),
+                    "Promise should have no NUL-prefixed own keys, found {:?}",
+                    name
+                );
+            }
+        }
+        // Also check prototype
+        let proto = machine.intrinsics.builtins.promise_prototype();
+        let proto_idx = machine
+            .runtime_slot(proto)
+            .expect("prototype has slot")
+            .expect("slot exists");
+        let HeapEntry::Object { properties, .. } = &machine.heap[proto_idx] else {
+            panic!("Promise prototype is object");
+        };
+        for (key, _) in properties.iter() {
+            if let PropertyKey::Named(name) = key {
+                assert!(
+                    !name.as_units().starts_with(&[0]),
+                    "Promise.prototype should have no NUL-prefixed own keys, found {:?}",
+                    name
+                );
+            }
+        }
+        // And verify capability/then/finally still work via BuiltinTable
+        let promise = machine.create_promise().unwrap();
+        machine.fulfill_promise(promise, Value::int32(1)).unwrap();
+        let then = machine.get_named_property(promise, "then").unwrap();
+        let on_fulfilled = callback(&mut machine, "noop", return_undefined);
+        let derived = machine.call_value(then, promise, &[on_fulfilled]).unwrap();
+        machine.drain_microtasks().unwrap();
+        assert!(matches!(
+            state(&machine, derived),
+            PromiseState::Fulfilled { .. }
+        ));
     }
 }

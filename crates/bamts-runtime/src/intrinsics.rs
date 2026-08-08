@@ -74,6 +74,13 @@ pub(crate) struct BuiltinTable<H: Host> {
     promise_all_targets: Option<(Value, Value)>,
     promise_prototype: Option<Value>,
     uint8array_prototype: Option<Value>,
+    promise_capability_executor: Option<Value>,
+    promise_finally_value: Option<Value>,
+    promise_finally_throw: Option<Value>,
+    promise_finally_return: Option<Value>,
+    promise_finally_rethrow: Option<Value>,
+    promise_then_fulfill: Option<Value>,
+    promise_then_reject: Option<Value>,
     marker: PhantomData<fn() -> H>,
 }
 
@@ -113,6 +120,13 @@ impl<H: Host> BuiltinTable<H> {
             promise_all_targets: None,
             promise_prototype: None,
             uint8array_prototype: None,
+            promise_capability_executor: None,
+            promise_finally_value: None,
+            promise_finally_throw: None,
+            promise_finally_return: None,
+            promise_finally_rethrow: None,
+            promise_then_fulfill: None,
+            promise_then_reject: None,
             marker: PhantomData,
         }
     }
@@ -291,6 +305,69 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn uint8array_prototype(&self) -> Value {
         self.uint8array_prototype
             .expect("Uint8Array builtins install their prototype")
+    }
+
+    pub(crate) fn set_promise_capability_executor(&mut self, value: Value) {
+        self.promise_capability_executor = Some(value);
+    }
+
+    pub(crate) fn promise_capability_executor(&self) -> Value {
+        self.promise_capability_executor
+            .expect("Promise builtins install capability executor")
+    }
+
+    pub(crate) fn set_promise_finally_value(&mut self, value: Value) {
+        self.promise_finally_value = Some(value);
+    }
+
+    pub(crate) fn promise_finally_value(&self) -> Value {
+        self.promise_finally_value
+            .expect("Promise builtins install finally value")
+    }
+
+    pub(crate) fn set_promise_finally_throw(&mut self, value: Value) {
+        self.promise_finally_throw = Some(value);
+    }
+
+    pub(crate) fn promise_finally_throw(&self) -> Value {
+        self.promise_finally_throw
+            .expect("Promise builtins install finally throw")
+    }
+
+    pub(crate) fn set_promise_finally_return(&mut self, value: Value) {
+        self.promise_finally_return = Some(value);
+    }
+
+    pub(crate) fn promise_finally_return(&self) -> Value {
+        self.promise_finally_return
+            .expect("Promise builtins install finally return")
+    }
+
+    pub(crate) fn set_promise_finally_rethrow(&mut self, value: Value) {
+        self.promise_finally_rethrow = Some(value);
+    }
+
+    pub(crate) fn promise_finally_rethrow(&self) -> Value {
+        self.promise_finally_rethrow
+            .expect("Promise builtins install finally rethrow")
+    }
+
+    pub(crate) fn set_promise_then_fulfill(&mut self, value: Value) {
+        self.promise_then_fulfill = Some(value);
+    }
+
+    pub(crate) fn promise_then_fulfill(&self) -> Value {
+        self.promise_then_fulfill
+            .expect("Promise builtins install then fulfill")
+    }
+
+    pub(crate) fn set_promise_then_reject(&mut self, value: Value) {
+        self.promise_then_reject = Some(value);
+    }
+
+    pub(crate) fn promise_then_reject(&self) -> Value {
+        self.promise_then_reject
+            .expect("Promise builtins install then reject")
     }
 
     pub(crate) fn set_promise_resolver_targets(&mut self, resolve: Value, reject: Value) {
