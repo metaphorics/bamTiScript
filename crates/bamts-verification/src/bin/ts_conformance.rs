@@ -150,6 +150,15 @@ fn run() -> Result<()> {
             workspace_root,
             snapshot_root,
         } => {
+            if !snapshot_root.join("snapshot.sha256").exists() {
+                sync_suite(&SyncOptions {
+                    verify_pin: true,
+                    write_snapshot: true,
+                    workspace_root: workspace_root.clone(),
+                    snapshot_root: snapshot_root.clone(),
+                    extracted_suite_root: None,
+                })?;
+            }
             let report = run_suite(&workspace_root, &snapshot_root, &filters)?;
             print_run_report(&report);
             Ok(())
