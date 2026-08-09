@@ -2680,6 +2680,7 @@ mod formatting_tests {
     fn formats_check_failure_with_its_first_diagnostic_code() {
         let failure = CorpusFailure::from_driver_error(&DriverError::Diagnostics {
             rendered: "error BAMTS-C004: unresolved name".to_owned(),
+            truncation: None,
         });
 
         assert_eq!(failure.stage, CorpusStage::Check);

@@ -1175,6 +1175,7 @@ fn execute_interpreter_request(request: &WorkerRequest) -> Result<WorkerResponse
             stdout,
             stderr: host.stderr().to_vec(),
             exit_code,
+            ..driver::CommandOutcome::default()
         },
         started.elapsed() >= request.spec.timeout(),
         request.max_output_bytes,
@@ -1283,6 +1284,7 @@ fn process_rejection_outcome(stdout: Vec<u8>, stderr: Vec<u8>, cap: usize) -> Or
             stdout,
             stderr,
             exit_code: 1,
+            ..driver::CommandOutcome::default()
         },
         false,
         cap,

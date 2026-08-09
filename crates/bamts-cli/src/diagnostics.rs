@@ -73,11 +73,11 @@ pub fn render(
 /// A typed indicator that the rendered diagnostic count exceeded the limit.
 ///
 /// Rendering never panics when the limit is exceeded: the surplus diagnostics
-/// are dropped in canonical order and this notice is rendered in their place
-/// so the user can see that output was truncated and how to raise the cap.
-/// This is the typed, non-panicking equivalent of an "error limit reached"
-/// signal — callers receive a value they can inspect rather than a panic or a
-/// silent drop.
+/// are dropped in canonical order and a [`TruncationNotice`] line is emitted
+/// (for the line-oriented formats) so the user can see that output was
+/// truncated and how to raise the cap. The same notice is returned from
+/// [`render_report`] when the limit is exceeded so callers can react
+/// programmatically rather than panicking or silently dropping diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TruncationNotice {
     /// The number of diagnostics dropped after applying the limit.
@@ -116,17 +116,20 @@ impl TruncationNotice {
 /// Renders a compiler-prepared report without reimplementing its deduplication,
 /// poisoning, per-rule cap, or summary accounting.
 ///
-/// When the report carries more diagnostics than `error_limit`, the surplus is
-/// dropped in canonical order and a [`TruncationNotice`] line is emitted (for
-/// the line-oriented formats) so truncation is observable rather than silent.
-/// Rendering never panics at the limit boundary.
+/// Diagnostics are ordered canonically and capped at `error_limit`; any surplus
+/// is dropped and a [`TruncationNotice`] is returned describing how many were
+/// elided and which limit was in effect. For the line-oriented formats the
+/// notice is rendered as an extra line in the returned string; JSON and GitHub
+/// omit it from the text because they have structured schemas, but the caller
+/// still receives the typed notice. Rendering never panics at the limit
+/// boundary.
 #[must_use]
 pub fn render_report(
     format: DiagnosticsFormat,
     report: &DiagnosticReport,
     sources: &[DiagnosticSource<'_>],
     error_limit: usize,
-) -> String {
+) -> (String, Option<TruncationNotice>) {
     // Apply the compiler's canonical total order to the complete report, then
     // enforce the limit so the earliest canonical diagnostics are preserved
     // regardless of the order the pipeline reported them in.
@@ -138,20 +141,16 @@ pub fn render_report(
         .collect();
     let elided = total.saturating_sub(diagnostics.len());
     let mut rendered = render(format, &diagnostics, sources);
+    let notice = (elided > 0).then_some(TruncationNotice {
+        elided,
+        limit: error_limit,
+    });
     if matches!(
         format,
         DiagnosticsFormat::Text | DiagnosticsFormat::Pretty | DiagnosticsFormat::Compact
     ) {
-        if elided > 0 {
-            let _ = writeln!(
-                rendered,
-                "{}",
-                TruncationNotice {
-                    elided,
-                    limit: error_limit
-                }
-                .render()
-            );
+        if let Some(notice) = notice {
+            let _ = writeln!(rendered, "{}", notice.render());
         }
         for summary in report.summaries() {
             let _ = writeln!(
@@ -163,7 +162,7 @@ pub fn render_report(
             );
         }
     }
-    rendered
+    (rendered, notice)
 }
 
 /// Returns the diagnostics in the compiler's canonical total order.
@@ -998,7 +997,17 @@ mod tests {
             Diagnostic::lint(LintLevel::Warn, rule, FILE, range(1, 2), "second").expect("warns"),
         ];
         let report = DiagnosticReport::new(&diagnostics);
-        let out = render_report(DiagnosticsFormat::Text, &report, &sources("a.ts", &text), 1);
+        let (out, notice) = render_report(
+            DiagnosticsFormat::Text,
+            &report,
+            &sources("a.ts", &text),
+            1,
+        );
+        assert_eq!(
+            notice,
+            Some(TruncationNotice { elided: 1, limit: 1 }),
+            "one-diagnostic limit should elide the second warn"
+        );
         assert!(out.contains("first"));
         assert!(!out.contains("second"));
         assert!(out.contains("2 diagnostic(s); silence with `-A explicit-any`"));
@@ -1032,7 +1041,13 @@ mod tests {
             Diagnostic::error(code("BTS0004"), src_a, range(0, 1), "a-earliest"),
         ];
         let report = DiagnosticReport::new(&diagnostics);
-        let out = render_report(DiagnosticsFormat::Text, &report, &catalog, 3);
+        let (out, notice) = render_report(DiagnosticsFormat::Text, &report, &catalog, 3);
+
+        assert_eq!(
+            notice,
+            Some(TruncationNotice { elided: 1, limit: 3 }),
+            "limit 3 should elide one diagnostic"
+        );
 
         let pos_earliest = out.find("a-earliest").expect("earliest A diagnostic");
         let pos_second = out.find("a-second").expect("second A diagnostic");
@@ -1068,11 +1083,15 @@ mod tests {
         let limit = 4;
         let diagnostics = offset_diagnostics(limit - 1, 5);
         let report = DiagnosticReport::new(&diagnostics);
-        let out = render_report(
+        let (out, notice) = render_report(
             DiagnosticsFormat::Text,
             &report,
             &sources("a.ts", &text),
             limit,
+        );
+        assert!(
+            notice.is_none(),
+            "unexpected truncation notice below limit: {notice:?}"
         );
         assert!(
             !out.contains("elided"),
@@ -1093,11 +1112,15 @@ mod tests {
         let limit = 4;
         let diagnostics = offset_diagnostics(limit, 5);
         let report = DiagnosticReport::new(&diagnostics);
-        let out = render_report(
+        let (out, notice) = render_report(
             DiagnosticsFormat::Text,
             &report,
             &sources("a.ts", &text),
             limit,
+        );
+        assert!(
+            notice.is_none(),
+            "unexpected truncation notice at limit: {notice:?}"
         );
         assert!(
             !out.contains("elided"),
@@ -1118,7 +1141,7 @@ mod tests {
         let limit = 4;
         let diagnostics = offset_diagnostics(limit + 1, 6);
         let report = DiagnosticReport::new(&diagnostics);
-        let out = render_report(
+        let (out, notice) = render_report(
             DiagnosticsFormat::Text,
             &report,
             &sources("a.ts", &text),
@@ -1135,11 +1158,15 @@ mod tests {
         );
 
         // The typed truncation notice is present and reports the elided count.
-        let notice = TruncationNotice { elided: 1, limit };
+        assert_eq!(
+            notice,
+            Some(TruncationNotice { elided: 1, limit }),
+            "wrong truncation notice: {notice:?}"
+        );
         assert!(
-            out.contains(&notice.render()),
+            out.contains(&notice.expect("notice").render()),
             "missing truncation notice `{}`: {out}",
-            notice.render(),
+            notice.expect("notice").render(),
         );
         assert!(
             out.contains("1 diagnostic(s) elided after limit 4"),
@@ -1181,28 +1208,31 @@ mod tests {
             DiagnosticsFormat::Pretty,
             DiagnosticsFormat::Compact,
         ] {
-            let out = render_report(format, &report, &sources("a.ts", &text), limit);
+            let (out, notice) = render_report(format, &report, &sources("a.ts", &text), limit);
+            assert!(notice.is_some(), "{format:?} should return a truncation notice");
             assert!(
                 out.contains("elided"),
                 "{format:?} missing truncation notice: {out}",
             );
         }
-        let json = render_report(
+        let (json, notice) = render_report(
             DiagnosticsFormat::Json,
             &report,
             &sources("a.ts", &text),
             limit,
         );
+        assert!(notice.is_some(), "JSON should still return a truncation notice");
         assert!(
             !json.contains("elided"),
             "JSON must not carry a free-form truncation note: {json}",
         );
-        let gh = render_report(
+        let (gh, notice) = render_report(
             DiagnosticsFormat::Github,
             &report,
             &sources("a.ts", &text),
             limit,
         );
+        assert!(notice.is_some(), "GitHub should still return a truncation notice");
         assert!(
             !gh.contains("elided"),
             "GitHub format must not carry a free-form truncation note: {gh}",

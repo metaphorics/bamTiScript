@@ -24,7 +24,7 @@ use bamts_compiler::{
 use bamts_runtime::{Limits, run_linked_program};
 
 use crate::args::{ArgsError, CliArgs, ExecutionTarget, Mode};
-use crate::diagnostics::{self, DiagnosticSource};
+use crate::diagnostics::{self, DiagnosticSource, TruncationNotice};
 
 const NODE_STATICLIB: &[u8] = include_bytes!(env!("BAMTS_NODE_STATICLIB"));
 const HOST_TARGET: &str = env!("BAMTS_HOST_TARGET");
@@ -32,11 +32,23 @@ const BUILD_TARGET: &str = env!("BAMTS_BUILD_TARGET");
 static NEXT_CACHE_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// Bytes and process status produced by one successful CLI command.
+///
+/// When diagnostics were rendered with a limit that caused some to be elided,
+/// the [`truncation`][CommandOutcome::truncation] field carries the typed
+/// notice. For the line-oriented formats the rendered `stderr` already contains
+/// the human-readable note; JSON and GitHub omit it from the text because they
+/// have structured schemas, but the typed notice is still available here.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct CommandOutcome {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub exit_code: i32,
+    /// The truncation notice, if diagnostics were elided by the renderer.
+    ///
+    /// This is `Some` exactly when the rendered diagnostic count reached the
+    /// configured `--error-limit`. It is `None` for commands that do not render
+    /// diagnostics, or when all diagnostics fit under the cap.
+    pub truncation: Option<TruncationNotice>,
 }
 
 /// A typed failure from compilation, execution, artifact publication, or linking.
@@ -49,8 +61,16 @@ pub enum DriverError {
     UnsupportedSourceExtension {
         path: PathBuf,
     },
+    /// Source contains diagnostics that cannot pass the check/compile/run gate.
+    ///
+    /// `rendered` is the human-readable output that should be written to stderr.
+    /// `truncation` is the typed notice when the `--error-limit` capped the
+    /// report; it is already embedded in `rendered` for the line-oriented
+    /// formats and omitted from JSON/GitHub, but is preserved for programmatic
+    /// consumers.
     Diagnostics {
         rendered: String,
+        truncation: Option<TruncationNotice>,
     },
     Usage(ArgsError),
     LintConfig {
@@ -405,17 +425,21 @@ fn lower_options(args: &CliArgs) -> LowerOptions {
 }
 
 fn check(args: &CliArgs, frontend: &LoadedProgramFrontend) -> Result<CommandOutcome, DriverError> {
-    let rendered = render_program_diagnostics(args, frontend);
+    let (rendered, truncation) = render_program_diagnostics(args, frontend);
     if frontend
         .output
         .modules()
         .iter()
         .any(|module| module.has_errors())
     {
-        return Err(DriverError::Diagnostics { rendered });
+        return Err(DriverError::Diagnostics {
+            rendered,
+            truncation,
+        });
     }
     Ok(CommandOutcome {
         stderr: rendered.into_bytes(),
+        truncation,
         ..CommandOutcome::default()
     })
 }
@@ -438,7 +462,7 @@ fn compile(
     }
 
     let entrypoint = required_entrypoint(args)?;
-    let warnings = require_clean_frontend(args, frontend)?;
+    let (warnings, truncation) = require_clean_frontend(args, frontend)?;
     let executable = lower_program(&frontend.program, &frontend.output, lower_options(args))
         .map_err(DriverError::Lower)?;
     if BUILD_TARGET != HOST_TARGET {
@@ -453,6 +477,7 @@ fn compile(
     link_executable(&object.bytes, &destination)?;
     Ok(CommandOutcome {
         stderr: warnings.into_bytes(),
+        truncation,
         ..CommandOutcome::default()
     })
 }
@@ -462,13 +487,17 @@ fn run(
     frontend: &LoadedProgramFrontend,
 ) -> Result<(CommandOutcome, Option<AotPhaseTelemetry>), DriverError> {
     let entrypoint = required_entrypoint(args)?;
-    let warnings = require_clean_frontend(args, frontend)?;
+    let (warnings, truncation) = require_clean_frontend(args, frontend)?;
     let executable = lower_program(&frontend.program, &frontend.output, lower_options(args))
         .map_err(DriverError::Lower)?;
     match args.target {
-        ExecutionTarget::Jit => Ok((run_jit(args, entrypoint, warnings, &executable)?, None)),
+        ExecutionTarget::Jit => Ok((
+            run_jit(args, entrypoint, warnings, truncation, &executable)?,
+            None,
+        )),
         ExecutionTarget::Aot => {
-            let (outcome, telemetry) = run_aot(args, entrypoint, warnings, &executable)?;
+            let (outcome, telemetry) =
+                run_aot(args, entrypoint, warnings, truncation, &executable)?;
             Ok((outcome, Some(telemetry)))
         }
     }
@@ -478,6 +507,7 @@ fn run_jit(
     args: &CliArgs,
     entrypoint: &Path,
     warnings: String,
+    truncation: Option<TruncationNotice>,
     executable: &bamts_compiler::program::ExecutableProgram,
 ) -> Result<CommandOutcome, DriverError> {
     let program = bamts_codegen::compile_jit(executable.wire()).map_err(DriverError::Jit)?;
@@ -503,6 +533,7 @@ fn run_jit(
         stdout,
         stderr,
         exit_code,
+        truncation,
     })
 }
 
@@ -510,6 +541,7 @@ fn run_aot(
     args: &CliArgs,
     entrypoint: &Path,
     warnings: String,
+    truncation: Option<TruncationNotice>,
     executable: &bamts_compiler::program::ExecutableProgram,
 ) -> Result<(CommandOutcome, AotPhaseTelemetry), DriverError> {
     if BUILD_TARGET != HOST_TARGET {
@@ -565,6 +597,7 @@ fn run_aot(
             stdout: output.stdout,
             stderr,
             exit_code: output.status.code().unwrap_or(1),
+            truncation,
         },
         telemetry,
     ))
@@ -1051,7 +1084,10 @@ fn load_program_frontend(args: &CliArgs) -> Result<LoadedProgramFrontend, Driver
     })
 }
 
-fn render_program_diagnostics(args: &CliArgs, frontend: &LoadedProgramFrontend) -> String {
+fn render_program_diagnostics(
+    args: &CliArgs,
+    frontend: &LoadedProgramFrontend,
+) -> (String, Option<TruncationNotice>) {
     let diagnostics = frontend
         .output
         .modules()
@@ -1086,17 +1122,20 @@ fn render_program_diagnostics(args: &CliArgs, frontend: &LoadedProgramFrontend) 
 fn require_clean_frontend(
     args: &CliArgs,
     frontend: &LoadedProgramFrontend,
-) -> Result<String, DriverError> {
-    let rendered = render_program_diagnostics(args, frontend);
+) -> Result<(String, Option<TruncationNotice>), DriverError> {
+    let (rendered, truncation) = render_program_diagnostics(args, frontend);
     if frontend
         .output
         .modules()
         .iter()
         .any(|module| module.has_errors())
     {
-        Err(DriverError::Diagnostics { rendered })
+        Err(DriverError::Diagnostics {
+            rendered,
+            truncation,
+        })
     } else {
-        Ok(rendered)
+        Ok((rendered, truncation))
     }
 }
 
