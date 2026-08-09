@@ -171,11 +171,6 @@ impl NamespaceExport {
     pub(crate) const fn storage(&self) -> ExportStorage {
         self.storage
     }
-
-    #[must_use]
-    pub(crate) const fn declaration(&self) -> NodeId {
-        self.declaration
-    }
 }
 
 /// Whether an exported declaration is represented only by a property or also
