@@ -548,6 +548,7 @@ impl<'src> Binder<'src> {
         scope: ScopeId,
     ) -> TypeId {
         let mut properties: Vec<PropertyType> = Vec::new();
+        let mut has_opaque_spread = false;
         for attribute in attributes {
             match attribute {
                 JsxAttributeItem::Attribute(attribute) => {
@@ -576,6 +577,8 @@ impl<'src> Binder<'src> {
                         for property in spread_properties {
                             upsert_property(&mut properties, property);
                         }
+                    } else {
+                        has_opaque_spread = true;
                     }
                 }
             }
@@ -586,7 +589,11 @@ impl<'src> Binder<'src> {
                 PropertyType::new("children", false, children),
             );
         }
-        self.types.object_type(properties)
+        if has_opaque_spread {
+            self.types.any()
+        } else {
+            self.types.object_type(properties)
+        }
     }
 
     /// Checks the synthesized props object against the element's expected
@@ -914,6 +921,17 @@ mod tests {
             "{JSX_PREAMBLE} const fix = {{ id: \"s\" }}; const x = <div id={{1}} {{...fix}} />;"
         );
         assert_clean(codes(&source));
+    }
+
+    #[test]
+    fn opaque_spread_skips_element_props_assignability() {
+        let source = "namespace JSX { \
+            interface Element {} \
+            interface IntrinsicElements { div: { id: string } } \
+        } \
+        const opaque: any = {}; \
+        const element = <div {...opaque} />;";
+        assert_clean(codes(source));
     }
 
     // -- factory function inference ----------------------------------------------------
