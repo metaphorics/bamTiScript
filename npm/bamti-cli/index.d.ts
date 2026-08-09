@@ -14,6 +14,8 @@ export interface RunOptions extends ResolveBinaryOptions {
   stdio?: "inherit" | "ignore" | "pipe";
 }
 
+export const ARTIFACTS: Map<string, string>;
+
 export function artifactPackage(platform?: string, arch?: string): string;
 export function resolveBinary(options?: ResolveBinaryOptions): string;
 export function run(args?: readonly string[], options?: RunOptions): Promise<number>;

@@ -1,5 +1,8 @@
 {
   "name": "bamti-npm-packaging",
   "private": true,
-  "type": "module"
+  "type": "module",
+  "scripts": {
+    "preflight": "node scripts/preflight.mjs"
+  }
 }

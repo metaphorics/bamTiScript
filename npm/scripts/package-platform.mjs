@@ -4,6 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
+import { preflightRelease } from "./preflight.mjs";
 
 const npmRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryRoot = resolve(npmRoot, "..");
@@ -77,7 +78,17 @@ async function packageTarget(target) {
     await rm(stagingRoot, { recursive: true, force: true });
   }
 }
+const requestedTargets = parseTargets(process.argv.slice(2));
 
-for (const target of parseTargets(process.argv.slice(2))) {
+for (const target of requestedTargets) {
   await packageTarget(target);
+}
+
+const allTargets = [...platformArtifacts.keys()];
+const isFullRelease =
+  allTargets.length === requestedTargets.length &&
+  allTargets.every((target) => requestedTargets.includes(target));
+
+if (isFullRelease) {
+  preflightRelease();
 }

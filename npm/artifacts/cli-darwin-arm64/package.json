@@ -1,5 +1,5 @@
 {
-  "name": "bamti-cli-darwin-arm64",
+  "name": "@bamti/cli-darwin-arm64",
   "version": "0.1.0",
   "description": "BamTS CLI binary for macOS arm64",
   "license": "MIT",
@@ -9,6 +9,9 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "os": ["darwin"],
   "cpu": ["arm64"],

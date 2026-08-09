@@ -8,12 +8,20 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 import {
+  ARTIFACTS,
   ArtifactNotFoundError,
   UnsupportedPlatformError,
+  artifactPackage,
   resolveBinary,
 } from "../bamti-cli/index.js";
+import { preflight, preflightRelease, tarballName } from "../scripts/preflight.mjs";
 
-const packagingScript = join(dirname(fileURLToPath(import.meta.url)), "..", "scripts", "package-platform.mjs");
+const packagingScript = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "scripts",
+  "package-platform.mjs",
+);
 
 async function withTemporaryDirectory(callback) {
   const directory = await mkdtemp(join(tmpdir(), "bamti-cli-test-"));
@@ -24,9 +32,54 @@ async function withTemporaryDirectory(callback) {
   }
 }
 
+async function createTarball(distRoot, packageName, version, binaryName) {
+  const [scope, unscoped] = packageName.split("/");
+  const packageDir = join(distRoot, "package");
+  const binDir = join(packageDir, "bin");
+  await mkdir(binDir, { recursive: true });
+  const pkg = {
+    name: packageName,
+    version,
+    description: `test ${unscoped}`,
+    files: ["README.md"],
+  };
+  if (binaryName !== null) {
+    pkg.files.push(`bin/${binaryName}`);
+  }
+  await writeFile(join(packageDir, "package.json"), JSON.stringify(pkg));
+  if (binaryName !== null) {
+    await writeFile(join(binDir, binaryName), "binary\n");
+  }
+  const tarball = tarballName(packageName, version);
+  const result = spawnSync("tar", ["-czf", tarball, "package"], {
+    cwd: distRoot,
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, `tar failed: ${result.stderr}`);
+  await rm(packageDir, { recursive: true, force: true });
+  return tarball;
+}
+
+async function createAllTarballs(distRoot, version, mutator) {
+  for (const [key, packageName] of ARTIFACTS) {
+    const platform = key.slice(0, key.lastIndexOf("-"));
+    const binaryName = platform === "win32" ? "bamts.exe" : "bamts";
+    await createTarball(distRoot, packageName, version, binaryName);
+  }
+  if (mutator) {
+    await mutator(distRoot);
+  }
+}
+
+test("ARTIFACTS, manifests, and optionalDependencies agree", () => {
+  // Throws if any of the three call sites disagree.
+  preflight();
+});
+
 test("the bamts shim resolves a present Linux artifact", async () => {
   await withTemporaryDirectory(async (directory) => {
-    const artifactDirectory = join(directory, "node_modules", "bamti-cli-linux-x64");
+    const packageName = artifactPackage("linux", "x64");
+    const artifactDirectory = join(directory, "node_modules", ...packageName.split("/"));
     const binary = join(artifactDirectory, "bin", "bamts");
     await mkdir(dirname(binary), { recursive: true });
     await writeFile(join(artifactDirectory, "package.json"), "{}\n");
@@ -46,12 +99,13 @@ test("the bamts shim resolves a present Linux artifact", async () => {
 
 test("the bamts shim reports a missing platform artifact", async () => {
   await withTemporaryDirectory(async (directory) => {
+    const packageName = artifactPackage("linux", "x64");
     const consumerRequire = createRequire(join(directory, "consumer.cjs"));
     assert.throws(
       () => resolveBinary({ platform: "linux", arch: "x64", resolvePackage: consumerRequire.resolve }),
       (error) =>
         error instanceof ArtifactNotFoundError &&
-        error.message.includes("bamti-cli-linux-x64") &&
+        error.message.includes(packageName) &&
         error.message.includes("optional dependencies enabled"),
     );
   });
@@ -87,5 +141,65 @@ test("the platform packager refuses an empty Cargo build", { skip: process.platf
 
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /cargo completed without .*bamts/);
+  });
+});
+
+test("preflight rejects a release when a platform artifact is missing", async () => {
+  await withTemporaryDirectory(async (directory) => {
+    const dist = join(directory, "dist");
+    const version = "0.1.0";
+    await mkdir(dist, { recursive: true });
+    // Create only four of the five required tarballs.
+    const entries = [...ARTIFACTS.entries()];
+    for (let i = 0; i < 4; i += 1) {
+      const [key, packageName] = entries[i];
+      const platform = key.slice(0, key.lastIndexOf("-"));
+      const binary = platform === "win32" ? "bamts.exe" : "bamts";
+      await createTarball(dist, packageName, version, binary);
+    }
+    assert.throws(
+      () => preflightRelease(dist),
+      (error) => error.message.includes("missing release artifact"),
+    );
+  });
+});
+
+test("preflight accepts a complete, consistent release", async () => {
+  await withTemporaryDirectory(async (directory) => {
+    const dist = join(directory, "dist");
+    await mkdir(dist, { recursive: true });
+    await createAllTarballs(dist, "0.1.0");
+    assert.doesNotThrow(() => preflightRelease(dist));
+  });
+});
+
+test("preflight rejects a tarball with the wrong package name", async () => {
+  await withTemporaryDirectory(async (directory) => {
+    const dist = join(directory, "dist");
+    await mkdir(dist, { recursive: true });
+    await createAllTarballs(dist, "0.1.0", async () => {
+      // Overwrite the Linux x64 tarball with an unscoped-name tarball.
+      await createTarball(dist, "bamti-cli-linux-x64", "0.1.0", "bamts");
+    });
+    assert.throws(
+      () => preflightRelease(dist),
+      (error) =>
+        error.message.includes("expected name @bamti/cli-linux-x64") &&
+        error.message.includes("got bamti-cli-linux-x64"),
+    );
+  });
+});
+
+test("preflight rejects a tarball with a missing binary", async () => {
+  await withTemporaryDirectory(async (directory) => {
+    const dist = join(directory, "dist");
+    await mkdir(dist, { recursive: true });
+    await createAllTarballs(dist, "0.1.0", async () => {
+      await createTarball(dist, "@bamti/cli-linux-x64", "0.1.0", null);
+    });
+    assert.throws(
+      () => preflightRelease(dist),
+      (error) => error.message.includes("missing package/bin/bamts"),
+    );
   });
 });

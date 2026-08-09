@@ -5,12 +5,12 @@ import { createRequire } from "node:module";
 
 const resolveFromHere = createRequire(import.meta.url).resolve;
 
-const ARTIFACTS = new Map([
-  ["linux-x64", "bamti-cli-linux-x64"],
-  ["linux-arm64", "bamti-cli-linux-arm64"],
-  ["darwin-x64", "bamti-cli-darwin-x64"],
-  ["darwin-arm64", "bamti-cli-darwin-arm64"],
-  ["win32-x64", "bamti-cli-win32-x64"],
+export const ARTIFACTS = new Map([
+  ["linux-x64", "@bamti/cli-linux-x64"],
+  ["linux-arm64", "@bamti/cli-linux-arm64"],
+  ["darwin-x64", "@bamti/cli-darwin-x64"],
+  ["darwin-arm64", "@bamti/cli-darwin-arm64"],
+  ["win32-x64", "@bamti/cli-win32-x64"],
 ]);
 
 export class UnsupportedPlatformError extends Error {

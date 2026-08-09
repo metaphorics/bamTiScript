@@ -1,4 +1,5 @@
 export {
+  ARTIFACTS,
   ArtifactNotFoundError,
   UnsupportedPlatformError,
   artifactPackage,
