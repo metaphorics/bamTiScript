@@ -9,7 +9,7 @@
 //! This module owns no filesystem, CLI, lowerer, runtime, or backend. It only
 //! composes the existing scanner, parser, checker, and emitter surfaces.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::checker::{
@@ -414,15 +414,17 @@ fn resolved_checker_edges(
     program: &ResolvedProgram,
     files: &[Recovered<SourceFile>],
 ) -> Vec<ResolvedModuleEdge> {
+    let files_by_source_id: HashMap<SourceId, &SourceFile> = files
+        .iter()
+        .map(|file| (file.product().source_id(), file.product()))
+        .collect();
     program
         .modules()
         .iter()
         .flat_map(|module| {
-            let source = files
-                .iter()
-                .find(|file| file.product().source_id() == module.source_id())
-                .expect("resolved module has one parsed source")
-                .product();
+            let source = *files_by_source_id
+                .get(&module.source_id())
+                .expect("resolved module has one parsed source");
             let nodes = SourceEdgeNodeIndex::new(source);
             module.dependencies().iter().filter_map(move |edge| {
                 let ModuleTarget::Local(to) = edge.target() else {
@@ -430,7 +432,9 @@ fn resolved_checker_edges(
                 };
                 Some(ResolvedModuleEdge {
                     from: module.source_id(),
-                    specifier: nodes.node_for(edge.range())?,
+                    specifier: nodes
+                        .node_for(edge.range())
+                        .expect("every resolved edge specifier range belongs to its parsed source"),
                     to: *to,
                 })
             })
@@ -738,6 +742,107 @@ mod tests {
                 .iter()
                 .any(|edge| edge.specifier == body.data().statements[0].id())
         );
+
+        fs::remove_dir_all(root_path).unwrap();
+    }
+
+    #[test]
+    fn resolved_edge_specifier_always_maps_to_node() {
+        use std::{
+            fs,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+
+        use crate::{
+            parser,
+            program::{ModuleTarget, ProgramLoader},
+            project::{ProjectConfig, ProjectRoot},
+            scanner,
+        };
+
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let root_path = std::env::temp_dir().join(format!(
+            "bamts-pipeline-edge-map-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root_path).unwrap();
+        let write = |name: &str, source: &str| fs::write(root_path.join(name), source).unwrap();
+        write(
+            "main.ts",
+            "import { a } from \"./a\"; import b = require(\"./b\"); export { c } from \"./c\"; async function d() { return import(\"./d\"); }",
+        );
+        write("a.ts", "export const a = 1;");
+        write("b.ts", "export = 1;");
+        write("c.ts", "export const c = 1;");
+        write("d.ts", "export default 1;");
+
+        let root = ProjectRoot::new(fs::canonicalize(&root_path).unwrap()).unwrap();
+        let config = ProjectConfig::parse(&root, root_path.join("tsconfig.json"), "{}").unwrap();
+        let program = ProgramLoader::new(&root, config.options())
+            .unwrap()
+            .load("main.ts")
+            .unwrap();
+
+        let files = program
+            .modules()
+            .iter()
+            .map(|module| {
+                parser::parse(scanner::scan(
+                    module.source_id(),
+                    module.script_kind(),
+                    Arc::clone(module.source()),
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        let edges = super::resolved_checker_edges(&program, &files);
+
+        // Count local dependencies to ensure no resolved edge is silently dropped.
+        let expected_local_edges: usize = program
+            .modules()
+            .iter()
+            .map(|module| {
+                module
+                    .dependencies()
+                    .iter()
+                    .filter(|edge| matches!(edge.target(), ModuleTarget::Local(_)))
+                    .count()
+            })
+            .sum();
+        assert_eq!(
+            edges.len(),
+            expected_local_edges,
+            "every resolved local edge must produce an output edge"
+        );
+
+        // Build the same source index the production code uses.
+        let files_by_source_id: std::collections::HashMap<SourceId, &super::SourceFile> = files
+            .iter()
+            .map(|file| (file.product().source_id(), file.product()))
+            .collect();
+
+        let mut edge_iter = edges.iter();
+        for module in program.modules() {
+            let source = files_by_source_id[&module.source_id()];
+            let nodes = super::SourceEdgeNodeIndex::new(source);
+            for dependency in module.dependencies() {
+                let ModuleTarget::Local(to) = dependency.target() else {
+                    continue;
+                };
+                let resolved = edge_iter
+                    .next()
+                    .expect("output edge exists for every local dependency");
+                assert_eq!(resolved.from, module.source_id());
+                assert_eq!(resolved.to, *to);
+                assert_eq!(
+                    Some(resolved.specifier),
+                    nodes.node_for(dependency.range()),
+                    "resolved edge specifier must map from the dependency's source range"
+                );
+            }
+        }
+        assert!(edge_iter.next().is_none(), "no extra output edges");
 
         fs::remove_dir_all(root_path).unwrap();
     }
