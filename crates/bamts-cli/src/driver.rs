@@ -139,7 +139,7 @@ impl DriverError {
     #[must_use]
     pub const fn rendered_diagnostic(&self) -> Option<&str> {
         match self {
-            Self::Diagnostics { rendered } => Some(rendered.as_str()),
+            Self::Diagnostics { rendered, .. } => Some(rendered.as_str()),
             _ => None,
         }
     }

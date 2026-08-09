@@ -997,15 +997,14 @@ mod tests {
             Diagnostic::lint(LintLevel::Warn, rule, FILE, range(1, 2), "second").expect("warns"),
         ];
         let report = DiagnosticReport::new(&diagnostics);
-        let (out, notice) = render_report(
-            DiagnosticsFormat::Text,
-            &report,
-            &sources("a.ts", &text),
-            1,
-        );
+        let (out, notice) =
+            render_report(DiagnosticsFormat::Text, &report, &sources("a.ts", &text), 1);
         assert_eq!(
             notice,
-            Some(TruncationNotice { elided: 1, limit: 1 }),
+            Some(TruncationNotice {
+                elided: 1,
+                limit: 1
+            }),
             "one-diagnostic limit should elide the second warn"
         );
         assert!(out.contains("first"));
@@ -1045,7 +1044,10 @@ mod tests {
 
         assert_eq!(
             notice,
-            Some(TruncationNotice { elided: 1, limit: 3 }),
+            Some(TruncationNotice {
+                elided: 1,
+                limit: 3
+            }),
             "limit 3 should elide one diagnostic"
         );
 
@@ -1209,7 +1211,10 @@ mod tests {
             DiagnosticsFormat::Compact,
         ] {
             let (out, notice) = render_report(format, &report, &sources("a.ts", &text), limit);
-            assert!(notice.is_some(), "{format:?} should return a truncation notice");
+            assert!(
+                notice.is_some(),
+                "{format:?} should return a truncation notice"
+            );
             assert!(
                 out.contains("elided"),
                 "{format:?} missing truncation notice: {out}",
@@ -1221,7 +1226,10 @@ mod tests {
             &sources("a.ts", &text),
             limit,
         );
-        assert!(notice.is_some(), "JSON should still return a truncation notice");
+        assert!(
+            notice.is_some(),
+            "JSON should still return a truncation notice"
+        );
         assert!(
             !json.contains("elided"),
             "JSON must not carry a free-form truncation note: {json}",
@@ -1232,7 +1240,10 @@ mod tests {
             &sources("a.ts", &text),
             limit,
         );
-        assert!(notice.is_some(), "GitHub should still return a truncation notice");
+        assert!(
+            notice.is_some(),
+            "GitHub should still return a truncation notice"
+        );
         assert!(
             !gh.contains("elided"),
             "GitHub format must not carry a free-form truncation note: {gh}",
