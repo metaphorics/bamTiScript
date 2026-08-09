@@ -774,7 +774,7 @@ fn native_stage(error: &bamts_runtime::NativeError) -> CorpusStage {
 
 fn driver_error_evidence(error: &driver::DriverError) -> String {
     match error {
-        driver::DriverError::Diagnostics { rendered } => {
+        driver::DriverError::Diagnostics { rendered, .. } => {
             let code = first_diagnostic_code(rendered);
             match code {
                 Some(code) => format!("diagnostic={code}; rendered={}", bounded_text(rendered)),
