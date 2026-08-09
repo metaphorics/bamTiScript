@@ -423,6 +423,9 @@ pub struct Benchmark {
     pub backends: Vec<String>,
     /// Baseline-artifact path.
     pub expected: String,
+    /// Whether this slice is selected for the budget gate.
+    #[serde(default)]
+    pub selected: bool,
     /// Independent runs per measurement.
     #[serde(default = "default_repeats")]
     pub repeats: u32,
@@ -610,6 +613,9 @@ pub struct MeasureResult {
     /// Optional baseline for ratio comparison.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline: Option<Baseline>,
+    /// Whether this slice is selected for the budget gate.
+    #[serde(default)]
+    pub selected: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -775,6 +781,7 @@ pub fn measure(options: &MeasureOptions) -> Result<MeasureResult> {
         phases,
         rss_bytes,
         baseline,
+        selected: benchmark.selected,
     };
 
     write_result(&options.out_path, &result)?;
@@ -916,6 +923,7 @@ pub fn load_result(path: &Path) -> Result<MeasureResult> {
 ///
 /// # Errors
 /// - [`PerfErrorCode::InvalidHost`] if the machine no longer matches.
+/// - [`PerfErrorCode::NoBaseline`] if the slice is selected but the result has no baseline.
 /// - [`PerfErrorCode::BudgetBreach`] if any threshold is exceeded.
 pub fn compare(
     result: &MeasureResult,
@@ -929,10 +937,21 @@ pub fn compare(
 /// Evaluates only the budget thresholds (host identity assumed checked).
 ///
 /// # Errors
-/// Returns [`PerfErrorCode::BudgetBreach`] naming the first exceeded threshold.
+/// - [`PerfErrorCode::NoBaseline`] if the slice is selected but the result has no baseline.
+/// - [`PerfErrorCode::BudgetBreach`] naming the first exceeded threshold.
 pub fn evaluate_budgets(result: &MeasureResult, policy: &BudgetPolicy) -> Result<()> {
+    if result.selected && result.baseline.is_none() {
+        return Err(PerfError::new(
+            PerfErrorCode::NoBaseline,
+            format!(
+                "selected slice `{}` (benchmark `{}`) is missing a baseline for the budget gate",
+                result.slice, result.benchmark_id
+            ),
+        ));
+    }
+
     let Some(baseline) = &result.baseline else {
-        // No baseline in scope (S0): correctness-first, nothing to ratio-gate.
+        // Unselected informational slice: nothing to ratio-gate.
         return Ok(());
     };
 
@@ -1118,6 +1137,7 @@ mod tests {
                 },
                 release: None,
             }),
+            selected: false,
         }
     }
 
@@ -1252,6 +1272,63 @@ mod tests {
         let mut result = result_with_baseline(base, candidate);
         result.baseline = None;
         assert!(evaluate_budgets(&result, &budget_policy()).is_ok());
+    }
+
+    #[test]
+    fn perf_budget_rejects_slice_without_baseline() {
+        let manifest: BenchmarkManifest =
+            toml::from_str(include_str!("../../../perf/benchmarks.toml"))
+                .expect("parse benchmarks fixture");
+        let s11 = manifest
+            .find_slice("s11")
+            .expect("s11 placeholder fixture must exist");
+        assert!(
+            s11.selected,
+            "s11 placeholder must be selected for the budget gate"
+        );
+
+        let mut phases = BTreeMap::new();
+        for key in PHASE_KEYS {
+            phases.insert(key.to_owned(), Quantiles::zero());
+        }
+
+        let result = MeasureResult {
+            schema: PERF_SCHEMA_VERSION,
+            host: "BH1".to_owned(),
+            slice: s11.slice.clone(),
+            benchmark_id: s11.id.clone(),
+            fingerprint: host_fingerprint_from_machine(&sample_machine()),
+            conditions_expected: HostConditions {
+                governor: "performance".to_owned(),
+                swap_total_kib: 0,
+                numa_node0_cpus: "0-19".to_owned(),
+            },
+            conditions_observed: ObservedConditions {
+                governor: "performance".to_owned(),
+                swap_total_kib: 0,
+            },
+            conditions_match: true,
+            repeats: 3,
+            phases,
+            rss_bytes: Quantiles::zero(),
+            baseline: None,
+            selected: true,
+        };
+
+        let error = compare(&result, &budget_policy(), &sample_machine()).expect_err(
+            "selected slice without baseline must fail the budget gate",
+        );
+        assert_eq!(error.code, PerfErrorCode::NoBaseline);
+        assert_eq!(error.code.exit_code(), 4);
+        assert!(error.detail.contains("s11"), "error must name the slice");
+        assert!(
+            error.detail.contains("s11-language-service"),
+            "error must name the benchmark"
+        );
+        assert!(
+            error.detail.contains("baseline"),
+            "error must name the missing baseline"
+        );
     }
 
     #[test]

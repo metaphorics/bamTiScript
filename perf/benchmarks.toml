@@ -124,6 +124,7 @@ slice = "s11"
 input = "tests/cases/compiler/2dArrays.ts"
 facets = ["languageService"]
 backends = ["check"]
+selected = true
 expected = "perf/baselines/s11.json"
 repeats = 3
 timeout_ms = 30000
