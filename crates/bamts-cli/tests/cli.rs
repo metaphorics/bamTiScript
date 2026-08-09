@@ -722,7 +722,14 @@ impl ScratchDirectory {
         for _ in 0..128 {
             let index = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
             let path = root.join(format!("bamts-cli-test-{}-{index}", std::process::id()));
-            match fs::create_dir(&path) {
+            #[cfg(unix)]
+            let created = {
+                use std::os::unix::fs::DirBuilderExt;
+                fs::DirBuilder::new().mode(0o700).create(&path)
+            };
+            #[cfg(not(unix))]
+            let created = fs::create_dir(&path);
+            match created {
                 Ok(()) => return Self { path },
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => panic!("could not create `{}`: {error}", path.display()),
