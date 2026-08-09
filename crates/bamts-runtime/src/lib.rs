@@ -1218,7 +1218,8 @@ enum HeapEntry {
         used: bool,
     },
     PromiseAll {
-        promise: Value,
+        resolve: Value,
+        reject: Value,
         values: Vec<Value>,
         remaining: usize,
         settled: bool,
@@ -3145,13 +3146,15 @@ impl<'a, H: Host> Machine<'a, H> {
     pub(crate) fn promise_all_with_resolve(
         &mut self,
         iterable: Value,
-        resolve: Value,
+        resolve_method: Value,
         receiver: Value,
-    ) -> Result<Value, EvalFailure> {
-        let promise = self.create_promise()?;
+        capability_resolve: Value,
+        capability_reject: Value,
+    ) -> Result<(), EvalFailure> {
         let aggregate = self
             .allocate(HeapEntry::PromiseAll {
-                promise,
+                resolve: capability_resolve,
+                reject: capability_reject,
                 values: Vec::new(),
                 remaining: 1,
                 settled: false,
@@ -3161,8 +3164,8 @@ impl<'a, H: Host> Machine<'a, H> {
             Ok(iterator) => iterator,
             Err(failure) => {
                 self.mark_promise_all_settled(aggregate)?;
-                self.reject_promise_failure(promise, failure)?;
-                return Ok(promise);
+                self.call_promise_reject(capability_reject, failure)?;
+                return Ok(());
             }
         };
         loop {
@@ -3170,13 +3173,23 @@ impl<'a, H: Host> Machine<'a, H> {
                 Ok((true, _)) => break,
                 Ok((false, value)) => value,
                 Err(failure) => {
-                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                    return self.reject_promise_all_abrupt(
+                        aggregate,
+                        capability_reject,
+                        iterator,
+                        failure,
+                    );
                 }
             };
             let index = match self.add_promise_all_element(aggregate) {
                 Ok(index) => index,
                 Err(failure) => {
-                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                    return self.reject_promise_all_abrupt(
+                        aggregate,
+                        capability_reject,
+                        iterator,
+                        failure,
+                    );
                 }
             };
             let element = match self
@@ -3189,60 +3202,81 @@ impl<'a, H: Host> Machine<'a, H> {
             {
                 Ok(element) => element,
                 Err(failure) => {
-                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                    return self.reject_promise_all_abrupt(
+                        aggregate,
+                        capability_reject,
+                        iterator,
+                        failure,
+                    );
                 }
             };
-            let (fulfill_target, reject_target) = self.intrinsics.builtins.promise_all_targets();
+            let fulfill_target = self.intrinsics.builtins.promise_all_target();
             let on_fulfilled = match self.create_promise_resolver_function(fulfill_target, element)
             {
                 Ok(callback) => callback,
                 Err(failure) => {
-                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                    return self.reject_promise_all_abrupt(
+                        aggregate,
+                        capability_reject,
+                        iterator,
+                        failure,
+                    );
                 }
             };
-            let on_rejected = match self.create_promise_resolver_function(reject_target, element) {
-                Ok(callback) => callback,
-                Err(failure) => {
-                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
-                }
-            };
-            let resolved = match self.call_value(resolve, receiver, &[value]) {
+            let resolved = match self.call_value(resolve_method, receiver, &[value]) {
                 Ok(resolved) => resolved,
                 Err(failure) => {
-                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                    return self.reject_promise_all_abrupt(
+                        aggregate,
+                        capability_reject,
+                        iterator,
+                        failure,
+                    );
                 }
             };
             let then = match self.get_named_property(resolved, "then") {
                 Ok(then) => then,
                 Err(failure) => {
-                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                    return self.reject_promise_all_abrupt(
+                        aggregate,
+                        capability_reject,
+                        iterator,
+                        failure,
+                    );
                 }
             };
-            if let Err(failure) = self.call_value(then, resolved, &[on_fulfilled, on_rejected]) {
-                return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+            if let Err(failure) =
+                self.call_value(then, resolved, &[on_fulfilled, capability_reject])
+            {
+                return self.reject_promise_all_abrupt(
+                    aggregate,
+                    capability_reject,
+                    iterator,
+                    failure,
+                );
             }
         }
         if self.finish_promise_all(aggregate)? {
             let array = self.move_promise_all_values_to_array(aggregate)?;
-            self.fulfill_promise(promise, array)
-                .map_err(EvalFailure::Runtime)?;
+            if let Err(failure) = self.call_value(capability_resolve, Value::UNDEFINED, &[array]) {
+                self.call_promise_reject(capability_reject, failure)?;
+            }
         }
-        Ok(promise)
+        Ok(())
     }
 
     fn reject_promise_all_abrupt(
         &mut self,
         aggregate: Value,
-        promise: Value,
+        reject: Value,
         iterator: Value,
         failure: EvalFailure,
-    ) -> Result<Value, EvalFailure> {
+    ) -> Result<(), EvalFailure> {
         self.mark_promise_all_settled(aggregate)?;
         if let Err(EvalFailure::Runtime(kind)) = self.close_iterator(iterator) {
             return Err(EvalFailure::Runtime(kind));
         }
-        self.reject_promise_failure(promise, failure)?;
-        Ok(promise)
+        self.call_promise_reject(reject, failure)
     }
 
     pub(crate) fn iterator_close_target(
@@ -3576,12 +3610,13 @@ impl<'a, H: Host> Machine<'a, H> {
             .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
                 operation: "Promise.all target",
             }))?;
-        let (promise, completed) = {
+        let (resolve, completed) = {
             let HeapEntry::PromiseAll {
-                promise,
+                resolve,
                 values,
                 remaining,
                 settled,
+                ..
             } = &mut self.heap[aggregate_index]
             else {
                 return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
@@ -3597,59 +3632,13 @@ impl<'a, H: Host> Machine<'a, H> {
             if completed {
                 *settled = true;
             }
-            (*promise, completed)
+            (*resolve, completed)
         };
         if completed {
             let array = self.move_promise_all_values_to_array(aggregate)?;
-            self.fulfill_promise(promise, array)
-                .map_err(EvalFailure::Runtime)?;
+            let _ = self.call_value(resolve, Value::UNDEFINED, &[array])?;
         }
         Ok(())
-    }
-
-    pub(crate) fn reject_promise_all_element(
-        &mut self,
-        element: Value,
-        reason: Value,
-    ) -> Result<(), EvalFailure> {
-        let index = self
-            .runtime_slot(element)
-            .map_err(EvalFailure::Runtime)?
-            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "Promise.all target",
-            }))?;
-        let aggregate = {
-            let HeapEntry::PromiseAllElement {
-                aggregate, called, ..
-            } = &mut self.heap[index]
-            else {
-                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                    operation: "Promise.all target",
-                }));
-            };
-            if *called {
-                return Ok(());
-            }
-            *called = true;
-            *aggregate
-        };
-        let aggregate_index = self
-            .runtime_slot(aggregate)
-            .map_err(EvalFailure::Runtime)?
-            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "Promise.all target",
-            }))?;
-        let HeapEntry::PromiseAll { promise, .. } = &self.heap[aggregate_index] else {
-            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "Promise.all target",
-            }));
-        };
-        let promise = *promise;
-        if !self.mark_promise_all_settled(aggregate)? {
-            return Ok(());
-        }
-        self.reject_promise(promise, reason, ThrowOrigin::Bytecode)
-            .map_err(EvalFailure::Runtime)
     }
 
     fn create_array(&mut self, elements: Vec<Value>) -> Result<Value, EvalFailure> {
@@ -3829,6 +3818,16 @@ impl<'a, H: Host> Machine<'a, H> {
         let (reason, origin) = self.promise_rejection_value(failure)?;
         self.reject_promise(promise, reason, origin)
             .map_err(EvalFailure::Runtime)
+    }
+
+    fn call_promise_reject(
+        &mut self,
+        reject: Value,
+        failure: EvalFailure,
+    ) -> Result<(), EvalFailure> {
+        let (reason, _) = self.promise_rejection_value(failure)?;
+        let _ = self.call_value(reject, Value::UNDEFINED, &[reason])?;
+        Ok(())
     }
 
     fn promise_rejection_value(
@@ -12712,9 +12711,19 @@ mod tests {
     fn promise_all_values_charge_moves_to_output_before_aggregate_collection() {
         with_machine(Limits::default(), |machine| {
             let promise = machine.create_promise().unwrap();
+            let record = machine.create_promise_resolver(promise).unwrap();
+            let (resolve_target, reject_target) =
+                machine.intrinsics.builtins.promise_resolver_targets();
+            let resolve = machine
+                .create_promise_resolver_function(resolve_target, record)
+                .unwrap();
+            let reject = machine
+                .create_promise_resolver_function(reject_target, record)
+                .unwrap();
             let aggregate = machine
                 .allocate(HeapEntry::PromiseAll {
-                    promise,
+                    resolve,
+                    reject,
                     values: Vec::new(),
                     remaining: 1,
                     settled: false,

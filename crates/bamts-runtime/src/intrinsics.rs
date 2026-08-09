@@ -71,7 +71,7 @@ pub(crate) struct BuiltinTable<H: Host> {
     generator_prototype: Option<Value>,
     async_generator_prototype: Option<Value>,
     promise_resolver_targets: Option<(Value, Value)>,
-    promise_all_targets: Option<(Value, Value)>,
+    promise_all_target: Option<Value>,
     promise_prototype: Option<Value>,
     uint8array_prototype: Option<Value>,
     promise_capability_executor: Option<Value>,
@@ -117,7 +117,7 @@ impl<H: Host> BuiltinTable<H> {
             generator_prototype: None,
             async_generator_prototype: None,
             promise_resolver_targets: None,
-            promise_all_targets: None,
+            promise_all_target: None,
             promise_prototype: None,
             uint8array_prototype: None,
             promise_capability_executor: None,
@@ -379,13 +379,13 @@ impl<H: Host> BuiltinTable<H> {
             .expect("Promise builtins install resolver targets")
     }
 
-    pub(crate) fn set_promise_all_targets(&mut self, fulfill: Value, reject: Value) {
-        self.promise_all_targets = Some((fulfill, reject));
+    pub(crate) fn set_promise_all_target(&mut self, fulfill: Value) {
+        self.promise_all_target = Some(fulfill);
     }
 
-    pub(crate) fn promise_all_targets(&self) -> (Value, Value) {
-        self.promise_all_targets
-            .expect("Promise builtins install all targets")
+    pub(crate) fn promise_all_target(&self) -> Value {
+        self.promise_all_target
+            .expect("Promise builtins install the all target")
     }
 
     pub(crate) fn set_constructor_prototype(
@@ -494,7 +494,7 @@ impl<H: Host> BuiltinTable<H> {
             generator_prototype,
             async_generator_prototype,
             promise_resolver_targets,
-            promise_all_targets,
+            promise_all_target,
             promise_prototype,
             uint8array_prototype,
             promise_capability_executor,
@@ -535,6 +535,7 @@ impl<H: Host> BuiltinTable<H> {
             *async_iterator_prototype,
             *generator_prototype,
             *async_generator_prototype,
+            *promise_all_target,
             *promise_prototype,
             *uint8array_prototype,
             *promise_capability_executor,
@@ -550,12 +551,9 @@ impl<H: Host> BuiltinTable<H> {
         {
             visit(value);
         }
-        for (first, second) in [*promise_resolver_targets, *promise_all_targets]
-            .into_iter()
-            .flatten()
-        {
-            visit(first);
-            visit(second);
+        if let Some((resolve, reject)) = *promise_resolver_targets {
+            visit(resolve);
+            visit(reject);
         }
     }
 }

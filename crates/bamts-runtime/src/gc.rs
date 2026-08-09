@@ -773,9 +773,13 @@ fn trace_entry(
             mark_value(heap, marks, work, *promise);
         }
         HeapEntry::PromiseAll {
-            promise, values, ..
+            resolve,
+            reject,
+            values,
+            ..
         } => {
-            mark_value(heap, marks, work, *promise);
+            mark_value(heap, marks, work, *resolve);
+            mark_value(heap, marks, work, *reject);
             trace_values(heap, marks, work, values);
         }
         HeapEntry::PromiseAllElement { aggregate, .. } => {

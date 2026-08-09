@@ -39,8 +39,7 @@ pub(super) fn install<H: Host>(
     );
     builtins.set_promise_resolver_targets(resolve_target, reject_target);
     let all_fulfill = install_function(heap, builtins, "Promise all fulfill", 1, all_fulfill::<H>);
-    let all_reject = install_function(heap, builtins, "Promise all reject", 1, all_reject::<H>);
-    builtins.set_promise_all_targets(all_fulfill, all_reject);
+    builtins.set_promise_all_target(all_fulfill);
     let capability_executor = install_function(
         heap,
         builtins,
@@ -475,13 +474,13 @@ fn all<H: Host>(
         Err(failure) => return reject_capability_failure(machine, &capability, failure),
     };
     let iterable = args.first().copied().unwrap_or(Value::UNDEFINED);
-    let aggregate = machine.promise_all_with_resolve(iterable, resolve, this)?;
-    let then = machine.get_named_property(aggregate, "then")?;
-    if let Err(failure) =
-        machine.call_value(then, aggregate, &[capability.resolve, capability.reject])
-    {
-        return reject_capability_failure(machine, &capability, failure);
-    }
+    machine.promise_all_with_resolve(
+        iterable,
+        resolve,
+        this,
+        capability.resolve,
+        capability.reject,
+    )?;
     Ok(BuiltinOutcome::Value(capability.promise))
 }
 
@@ -730,28 +729,6 @@ fn all_fulfill<H: Host>(
     Ok(BuiltinOutcome::Value(Value::UNDEFINED))
 }
 
-fn all_reject<H: Host>(
-    machine: &mut Machine<'_, H>,
-    _this: Value,
-    args: &[Value],
-    constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    if constructing {
-        return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-            operation: "Promise all target",
-        }));
-    }
-    let element = args
-        .first()
-        .copied()
-        .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
-            operation: "Promise all target",
-        }))?;
-    machine
-        .reject_promise_all_element(element, args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
-    Ok(BuiltinOutcome::Value(Value::UNDEFINED))
-}
-
 fn queue_microtask<H: Host>(
     machine: &mut Machine<'_, H>,
     _this: Value,
@@ -810,6 +787,69 @@ mod tests {
         _constructing: bool,
     ) -> Result<BuiltinOutcome, EvalFailure> {
         Err(EvalFailure::ThrowValue(Value::int32(99)))
+    }
+
+    fn return_hostile_thenable(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Ok(BuiltinOutcome::Value(
+            machine.globals[&EcmaString::encode("hostileThenable")],
+        ))
+    }
+
+    fn fulfill_then_reject(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let fulfill = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let reject = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+        machine.call_value(fulfill, Value::UNDEFINED, &[Value::int32(1)])?;
+        machine.call_value(reject, Value::UNDEFINED, &[Value::int32(99)])?;
+        Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+    }
+
+    fn record_capability_reject(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        machine.globals.insert(
+            EcmaString::encode("capabilityRejectReason"),
+            args.first().copied().unwrap_or(Value::UNDEFINED),
+        );
+        Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+    }
+
+    fn throwing_capability_constructor(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        args: &[Value],
+        constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        if !constructing {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "test Promise constructor",
+            }));
+        }
+        let executor = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let promise = super::super::ordinary_runtime(machine, None)?;
+        let resolve = callback(machine, "throwing capability resolve", throw_99);
+        let reject = callback(
+            machine,
+            "record capability reject",
+            record_capability_reject,
+        );
+        machine.call_value(executor, Value::UNDEFINED, &[resolve, reject])?;
+        machine
+            .globals
+            .insert(EcmaString::encode("capabilityPromise"), promise);
+        Ok(BuiltinOutcome::Value(promise))
     }
 
     fn resolve_88(
@@ -980,6 +1020,132 @@ mod tests {
         );
         assert!(
             matches!(state(&machine, promise), PromiseState::Rejected { reason, .. } if reason == Value::int32(99))
+        );
+    }
+
+    #[test]
+    fn all_does_not_read_mutable_promise_prototype_then() {
+        let module = blank_program("<promise-all-test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let prototype = machine.intrinsics.builtins.promise_prototype();
+        let throwing_getter = callback(&mut machine, "throwing then getter", throw_99);
+        machine
+            .define_accessor(
+                prototype,
+                PropertyKey::Named(EcmaString::encode("then")),
+                throwing_getter,
+                crate::AccessorKind::Getter,
+            )
+            .unwrap();
+        let iterable = super::super::allocate_array(&mut machine, Vec::new()).unwrap();
+        let all = machine.get_named_property(constructor, "all").unwrap();
+
+        let promise = machine
+            .call_value(all, constructor, &[iterable])
+            .expect("Promise.all returns its capability");
+
+        assert!(matches!(
+            state(&machine, promise),
+            PromiseState::Fulfilled { .. }
+        ));
+    }
+
+    #[test]
+    fn all_retains_capability_callbacks_until_pending_input_settles() {
+        let module = blank_program("<promise-all-test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let source = machine.create_promise().unwrap();
+        let iterable = super::super::allocate_array(&mut machine, vec![source]).unwrap();
+        let all = machine.get_named_property(constructor, "all").unwrap();
+
+        let promise = machine
+            .call_value(all, constructor, &[iterable])
+            .expect("Promise.all returns its capability");
+        assert!(matches!(
+            state(&machine, promise),
+            PromiseState::Pending { .. }
+        ));
+
+        machine.push_native_roots(0, &[source, promise]);
+        machine.collect_garbage();
+        machine.fulfill_promise(source, Value::int32(7)).unwrap();
+        machine.drain_microtasks().unwrap();
+        machine.pop_native_roots(0);
+
+        assert!(matches!(
+            state(&machine, promise),
+            PromiseState::Fulfilled { .. }
+        ));
+    }
+
+    #[test]
+    fn all_rejects_when_hostile_thenable_fulfills_then_rejects() {
+        let module = blank_program("<promise-all-test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let thenable = super::super::ordinary_runtime(&mut machine, None).unwrap();
+        let then = callback(&mut machine, "fulfill then reject", fulfill_then_reject);
+        machine.set_data_property(thenable, "then", then).unwrap();
+        machine
+            .globals
+            .insert(EcmaString::encode("hostileThenable"), thenable);
+        let resolve = callback(
+            &mut machine,
+            "return hostile thenable",
+            return_hostile_thenable,
+        );
+        machine
+            .set_data_property(constructor, "resolve", resolve)
+            .unwrap();
+        let iterable = super::super::allocate_array(&mut machine, vec![Value::int32(1)]).unwrap();
+        let all = machine.get_named_property(constructor, "all").unwrap();
+
+        let promise = machine.call_value(all, constructor, &[iterable]).unwrap();
+
+        assert!(matches!(
+            state(&machine, promise),
+            PromiseState::Rejected { reason, .. } if reason == Value::int32(99)
+        ));
+    }
+
+    #[test]
+    fn all_rejects_when_empty_capability_resolve_throws() {
+        let module = blank_program("<promise-all-test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let promise_constructor = machine.intrinsics.global("Promise").unwrap();
+        let all = machine
+            .get_named_property(promise_constructor, "all")
+            .unwrap();
+        let constructor = callback(
+            &mut machine,
+            "throwing capability constructor",
+            throwing_capability_constructor,
+        );
+        let resolve = callback(&mut machine, "unused resolve", return_undefined);
+        machine
+            .set_data_property(constructor, "resolve", resolve)
+            .unwrap();
+        let iterable = super::super::allocate_array(&mut machine, Vec::new()).unwrap();
+
+        let promise = machine.call_value(all, constructor, &[iterable]).unwrap();
+
+        assert_eq!(
+            machine
+                .globals
+                .get(&EcmaString::encode("capabilityPromise")),
+            Some(&promise)
+        );
+        assert_eq!(
+            machine
+                .globals
+                .get(&EcmaString::encode("capabilityRejectReason")),
+            Some(&Value::int32(99))
         );
     }
 
