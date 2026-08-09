@@ -1315,9 +1315,8 @@ mod tests {
             selected: true,
         };
 
-        let error = compare(&result, &budget_policy(), &sample_machine()).expect_err(
-            "selected slice without baseline must fail the budget gate",
-        );
+        let error = compare(&result, &budget_policy(), &sample_machine())
+            .expect_err("selected slice without baseline must fail the budget gate");
         assert_eq!(error.code, PerfErrorCode::NoBaseline);
         assert_eq!(error.code.exit_code(), 4);
         assert!(error.detail.contains("s11"), "error must name the slice");
