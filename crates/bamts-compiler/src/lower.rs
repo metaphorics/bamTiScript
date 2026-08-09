@@ -9744,20 +9744,6 @@ fn collect_immediate_declaration<'a>(
                 });
             }
         }
-        Statement::Namespace(declaration) => {
-            if let Some(name) = declaration
-                .name
-                .as_identifier()
-                .and_then(|n| identifier_name(file, n))
-            {
-                declarations.push(ImmediateDeclaration {
-                    name,
-                    site: binding_site(declaration.name.range()),
-                    range: declaration.name.range(),
-                    kind: ImmediateDeclarationKind::Lexical,
-                });
-            }
-        }
         Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
             declaration,
         ))) => collect_immediate_declaration(file, declaration, declarations),

@@ -382,6 +382,41 @@ process.stdout.write(String(increment(alias)) + "\n");
 }
 
 #[test]
+fn aot_and_jit_keep_non_exported_nested_namespaces_local() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        r#"namespace A {
+    namespace B {
+        export const x = 1;
+    }
+    export namespace C {
+        export const x = 2;
+    }
+    export const localValue = B.x;
+}
+if (A.localValue !== 1 || "B" in A || A.C.x !== 2) {
+    throw "nested namespace visibility mismatch";
+}
+process.stdout.write("ok\n");
+"#,
+    );
+
+    for target in ["jit", "aot"] {
+        let output = project
+            .command()
+            .args(["run", "--target", target, "main.ts"])
+            .current_dir(&project.path)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("bamts {target} nested-namespace program starts: {error}")
+            });
+        assert_success(&output, &format!("bamts {target} nested-namespace program"));
+        assert_eq!(output.stdout, b"ok\n", "{target}");
+    }
+}
+
+#[test]
 fn aot_fixture_matches_jit_stdout_and_exit_code() {
     let directory = ScratchDirectory::new();
     let executable = directory
