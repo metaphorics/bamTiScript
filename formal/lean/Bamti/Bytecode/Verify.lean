@@ -103,11 +103,12 @@ theorem decode_total (wire : Wire) :
 
 theorem decode_encode_canonical (program : ProgramEnvelope) (h : envelopeCanonical program) :
     decode (encode program) = .accepted program := by
-  rcases h with ⟨entryCanonical, modulesCanonical⟩
+  rcases h with ⟨entryInRange, entryCanonical, modulesCanonical⟩
   have versionBound : formatVersion < FieldLimit := by decide
   simp [decode, encode, decodeField_encodeField formatVersion versionBound,
     decodeField_encodeField program.entry entryCanonical,
-    decodeProgramModules_encodeProgramModules program.modules modulesCanonical]
+    decodeProgramModules_encodeProgramModules program.modules modulesCanonical,
+    if_pos entryInRange]
 
 theorem encode_decode_identity (wire : Wire) (program : ProgramEnvelope)
     (hdecode : decode wire = .accepted program) (hcanonical : wireCanonical wire) :

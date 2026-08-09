@@ -518,7 +518,9 @@ def decode (wire : Wire) : DecodeResult :=
         if version ≠ formatVersion then .rejected .unsupportedVersion
         else
           match decodeField wire.entry, decodeProgramModules wire.modules with
-          | .ok entry, .ok modules => .accepted ⟨modules, entry⟩
+          | .ok entry, .ok modules =>
+              if entry < modules.length then .accepted ⟨modules, entry⟩
+              else .rejected .malformedModule
           | .error error, _ => .rejected error
           | _, .error error => .rejected error
 theorem decode_rejects_bad_magic (wire : Wire) (badMagic : wire.magic ≠ programMagicBytes) :
@@ -550,8 +552,9 @@ def programModuleCanonical (module : ProgramModule) : Prop :=
   module.name < FieldLimit ∧ moduleCanonical module.code
 
 def envelopeCanonical (program : ProgramEnvelope) : Prop :=
+  program.entry < program.modules.length ∧
   program.entry < FieldLimit ∧
-    ∀ module ∈ program.modules, programModuleCanonical module
+  ∀ module ∈ program.modules, programModuleCanonical module
 
 def wireCanonical (wire : Wire) : Prop :=
   ∃ program, envelopeCanonical program ∧ wire = encode program
@@ -728,4 +731,66 @@ theorem decodeProgramModules_encodeProgramModules (modules : List ProgramModule)
         exact h remaining (by simp [hRemaining])
       simp [decodeProgramModules, decodeProgramModule_encodeProgramModule module hModule, ih hRest]
 
+/-- A minimal canonical function body with no instructions and no handlers. -/
+def emptyFunction : Function :=
+  ⟨[], []⟩
+
+private theorem functionCanonical_empty : functionCanonical emptyFunction := by
+  simp [functionCanonical, emptyFunction, instructionCanonical, handlerCanonical]
+
+/-- A minimal canonical module with one empty function and entry at zero. -/
+def emptyModule : Module :=
+  ⟨[], [emptyFunction], 0⟩
+
+private theorem moduleCanonical_emptyModule : moduleCanonical emptyModule := by
+  simp [moduleCanonical, emptyModule, functionCanonical_empty, FieldLimit]
+
+/-- A canonical program module carrying only a bounded name and the empty module. -/
+def exampleProgramModule (name : Nat) : ProgramModule :=
+  ⟨name, emptyModule, [], [], []⟩
+
+private theorem programModuleCanonical_example_zero :
+    programModuleCanonical (exampleProgramModule 0) := by
+  simp [programModuleCanonical, exampleProgramModule, moduleCanonical_emptyModule, FieldLimit]
+
+private theorem programModuleCanonical_example_one :
+    programModuleCanonical (exampleProgramModule 1) := by
+  simp [programModuleCanonical, exampleProgramModule, moduleCanonical_emptyModule, FieldLimit]
+
+private theorem programModulesCanonical_two :
+    ∀ module ∈ [exampleProgramModule 0, exampleProgramModule 1], programModuleCanonical module := by
+  intro module h
+  simp at h
+  rcases h with (rfl | rfl)
+  · exact programModuleCanonical_example_zero
+  · exact programModuleCanonical_example_one
+
+/-- A two-module envelope whose entry points to the first module. -/
+def twoModuleValidEnvelope : ProgramEnvelope :=
+  ⟨[exampleProgramModule 0, exampleProgramModule 1], 0⟩
+
+/-- A two-module envelope whose entry index names no module (127 >= 2). -/
+def twoModuleMissingEnvelope : ProgramEnvelope :=
+  ⟨[exampleProgramModule 0, exampleProgramModule 1], 127⟩
+
+theorem twoModuleValidEnvelope_canonical :
+    envelopeCanonical twoModuleValidEnvelope := by
+  simp [envelopeCanonical, twoModuleValidEnvelope, programModuleCanonical_example_zero,
+    programModuleCanonical_example_one, FieldLimit]
+  <;> try { decide }
+
+theorem twoModuleMissingEnvelope_not_canonical :
+    ¬ envelopeCanonical twoModuleMissingEnvelope := by
+  simp [envelopeCanonical, twoModuleMissingEnvelope, FieldLimit]
+  <;> try { decide }
+
+theorem twoModuleValidEnvelope_accepted :
+    decode (encode twoModuleValidEnvelope) = .accepted twoModuleValidEnvelope := by
+  simp [decode, encode, twoModuleValidEnvelope]
+  <;> try { rfl }
+
+theorem twoModuleMissingEnvelope_not_accepted :
+    decode (encode twoModuleMissingEnvelope) = .rejected .malformedModule := by
+  simp [decode, encode, twoModuleMissingEnvelope]
+  <;> try { rfl }
 end Bamti.Bytecode
