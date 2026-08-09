@@ -223,7 +223,8 @@ impl<'src> Binder<'src> {
         };
         let intrinsics = self.resolve_type_symbol(intrinsics_symbol);
         let target = match self.types.get(intrinsics) {
-            Type::ObjectType(members) => members
+            Type::ObjectType(object) => object
+                .properties
                 .iter()
                 .find(|member| member.name() == tag_name)
                 .map(|member| member.type_id()),
@@ -533,10 +534,10 @@ impl<'src> Binder<'src> {
                 }
                 JsxAttributeItem::Spread(spread) => {
                     let spread_type = self.type_of_expr(&spread.data().expression, scope);
-                    if let Type::ObjectType(members) = self.types.get(spread_type) {
-                        let members = members.clone();
-                        for member in members {
-                            upsert_property(&mut properties, member);
+                    if let Type::ObjectType(object) = self.types.get(spread_type) {
+                        let spread_properties = object.properties.clone();
+                        for property in spread_properties {
+                            upsert_property(&mut properties, property);
                         }
                     }
                 }

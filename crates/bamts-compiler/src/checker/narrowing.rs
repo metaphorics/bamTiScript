@@ -526,8 +526,11 @@ impl<'a> NarrowingContext<'a> {
     #[must_use]
     pub fn narrow_in(&mut self, ty: TypeId, property: &str, negated: bool) -> TypeId {
         self.filter(ty, &|candidate| match candidate {
-            Type::ObjectType(properties) => {
-                let declares = properties.iter().any(|member| member.name() == property);
+            Type::ObjectType(object) => {
+                let declares = object
+                    .properties
+                    .iter()
+                    .any(|member| member.name() == property);
                 if declares != negated {
                     Narrow::Keep
                 } else {
@@ -1025,12 +1028,16 @@ impl<'a> NarrowingContext<'a> {
         literal: TypeId,
         negated: bool,
     ) -> bool {
-        let Type::ObjectType(properties) = self.table.get(member) else {
+        let Type::ObjectType(object) = self.table.get(member) else {
             // Members without modeled properties cannot be discriminated;
             // conservatively pass both polarities.
             return true;
         };
-        let Some(candidate) = properties.iter().find(|member| member.name() == property) else {
+        let Some(candidate) = object
+            .properties
+            .iter()
+            .find(|member| member.name() == property)
+        else {
             // A member lacking the discriminant cannot have produced the
             // tested value positively; it always survives the negative.
             return negated;
@@ -1974,15 +1981,21 @@ mod tests {
         };
         let _ = member_type;
         // The root discriminates to the circle variant only.
-        let Type::ObjectType(properties) = table.get(narrowed_root) else {
+        let Type::ObjectType(object) = table.get(narrowed_root) else {
             panic!("circle variant is an object type");
         };
         assert!(
-            properties
+            object
+                .properties
                 .iter()
                 .any(|property| property.name() == "radius")
         );
-        assert!(!properties.iter().any(|property| property.name() == "side"));
+        assert!(
+            !object
+                .properties
+                .iter()
+                .any(|property| property.name() == "side")
+        );
     }
 
     #[test]

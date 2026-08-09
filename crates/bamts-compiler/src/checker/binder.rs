@@ -365,6 +365,23 @@ impl PropertyType {
         self.type_id
     }
 }
+
+/// One index signature retained by an interned object type.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct IndexSignature {
+    pub(crate) readonly: bool,
+    pub(crate) parameters: Vec<FunctionParameter>,
+    pub(crate) value_type: TypeId,
+}
+
+/// The members retained by an interned structural object type.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ObjectType {
+    pub(crate) properties: Vec<PropertyType>,
+    pub(crate) call_signatures: Vec<FunctionSignature>,
+    pub(crate) index_signatures: Vec<IndexSignature>,
+}
+
 /// One parameter of an interned function signature.
 #[derive(Clone, Debug)]
 pub struct FunctionParameter {
@@ -514,7 +531,7 @@ pub enum Type {
     BigIntLiteral(Box<str>),
     Array(TypeId),
     Union(Vec<TypeId>),
-    ObjectType(Vec<PropertyType>),
+    ObjectType(ObjectType),
     Function(FunctionSignature),
     /// A nominal named type (type parameter, class, or enum) compared by identity.
     Named(SymbolId),
@@ -615,7 +632,8 @@ impl TypeTable {
     /// over unions. `None` means the property is not present on the type.
     pub fn property_type(&mut self, ty: TypeId, name: &str) -> Option<TypeId> {
         match self.get(ty).clone() {
-            Type::ObjectType(properties) => properties
+            Type::ObjectType(object) => object
+                .properties
                 .iter()
                 .find(|property| property.name() == name)
                 .map(|property| property.type_id()),
@@ -739,10 +757,22 @@ impl TypeTable {
     }
 
     /// Interns an object type after canonically ordering its members by name.
-    pub fn object_type(&mut self, mut properties: Vec<PropertyType>) -> TypeId {
-        properties.sort_by(|left, right| left.name.cmp(&right.name));
-        properties.dedup_by(|left, right| left.name == right.name);
-        self.intern(Type::ObjectType(properties))
+    pub fn object_type(&mut self, properties: Vec<PropertyType>) -> TypeId {
+        self.object_type_with_members(ObjectType {
+            properties,
+            call_signatures: Vec::new(),
+            index_signatures: Vec::new(),
+        })
+    }
+
+    pub(crate) fn object_type_with_members(&mut self, mut object: ObjectType) -> TypeId {
+        object
+            .properties
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        object
+            .properties
+            .dedup_by(|left, right| left.name == right.name);
+        self.intern(Type::ObjectType(object))
     }
 
     /// Interns a function type from bare parameter types.
@@ -828,8 +858,9 @@ impl TypeTable {
                 let widened = self.widen(element, false);
                 self.array(widened)
             }
-            Type::ObjectType(properties) => {
-                let widened: Vec<_> = properties
+            Type::ObjectType(object) => {
+                let properties = object
+                    .properties
                     .iter()
                     .map(|property| {
                         PropertyType::new(
@@ -840,7 +871,11 @@ impl TypeTable {
                         .with_readonly(property.readonly)
                     })
                     .collect();
-                self.object_type(widened)
+                self.object_type_with_members(ObjectType {
+                    properties,
+                    call_signatures: object.call_signatures,
+                    index_signatures: object.index_signatures,
+                })
             }
             Type::Union(members) => {
                 let widened: Vec<_> = members
@@ -3630,7 +3665,7 @@ impl<'src> Binder<'src> {
             && let Some(&base_instance) = self.class_instance_types.get(&base_symbol)
             && let Type::ObjectType(base_props) = self.types.get(base_instance).clone()
         {
-            for base_prop in base_props {
+            for base_prop in base_props.properties {
                 if seen.insert(base_prop.name.to_string()) {
                     properties.push(base_prop);
                 }
@@ -4560,8 +4595,8 @@ impl<'src> Binder<'src> {
                     self.collect_type_parameter_symbols(*member, out);
                 }
             }
-            Type::ObjectType(properties) => {
-                for property in properties {
+            Type::ObjectType(object) => {
+                for property in &object.properties {
                     self.collect_type_parameter_symbols(property.type_id(), out);
                 }
             }
@@ -5574,7 +5609,7 @@ impl<'src> Binder<'src> {
         extends: &'src [TypeReference],
         members: &'src [crate::syntax::TypeMemberNode],
     ) -> TypeId {
-        let mut properties = self.type_member_properties(members, scope);
+        let mut object = self.resolve_type_members(members, scope);
         for base in extends {
             let base_type = self.resolve_type_reference(
                 base,
@@ -5582,15 +5617,29 @@ impl<'src> Binder<'src> {
                 NodeId::default(),
                 NodeId::default_range(),
             );
-            if let Type::ObjectType(base_props) = self.types.get(base_type) {
-                for base_prop in base_props.clone() {
-                    if !properties.iter().any(|prop| prop.name == base_prop.name) {
-                        properties.push(base_prop);
+            if let Type::ObjectType(base_object) = self.types.get(base_type) {
+                for base_property in &base_object.properties {
+                    if !object
+                        .properties
+                        .iter()
+                        .any(|property| property.name == base_property.name)
+                    {
+                        object.properties.push(base_property.clone());
+                    }
+                }
+                for base_signature in &base_object.call_signatures {
+                    if !object.call_signatures.contains(base_signature) {
+                        object.call_signatures.push(base_signature.clone());
+                    }
+                }
+                for base_signature in &base_object.index_signatures {
+                    if !object.index_signatures.contains(base_signature) {
+                        object.index_signatures.push(base_signature.clone());
                     }
                 }
             }
         }
-        self.types.object_type(properties)
+        self.types.object_type_with_members(object)
     }
 
     fn resolve_object_type(
@@ -5598,16 +5647,20 @@ impl<'src> Binder<'src> {
         members: &'src [crate::syntax::TypeMemberNode],
         scope: ScopeId,
     ) -> TypeId {
-        let properties = self.type_member_properties(members, scope);
-        self.types.object_type(properties)
+        let object = self.resolve_type_members(members, scope);
+        self.types.object_type_with_members(object)
     }
 
-    fn type_member_properties(
+    fn resolve_type_members(
         &mut self,
         members: &'src [crate::syntax::TypeMemberNode],
         scope: ScopeId,
-    ) -> Vec<PropertyType> {
-        let mut properties = Vec::new();
+    ) -> ObjectType {
+        let mut object = ObjectType {
+            properties: Vec::new(),
+            call_signatures: Vec::new(),
+            index_signatures: Vec::new(),
+        };
         for member in members {
             match member.data() {
                 TypeMember::Property(property) => {
@@ -5619,7 +5672,9 @@ impl<'src> Binder<'src> {
                             }
                             None => self.types.any(),
                         };
-                        properties.push(PropertyType::new(name, property.optional, type_id));
+                        object
+                            .properties
+                            .push(PropertyType::new(name, property.optional, type_id));
                     }
                 }
                 TypeMember::Method(method) => {
@@ -5633,7 +5688,9 @@ impl<'src> Binder<'src> {
                             );
                         }
                         let type_id = self.resolve_function_type(&method.function, scope);
-                        properties.push(PropertyType::new(name, method.optional, type_id));
+                        object
+                            .properties
+                            .push(PropertyType::new(name, method.optional, type_id));
                     }
                 }
                 TypeMember::Call(call) => {
@@ -5644,7 +5701,9 @@ impl<'src> Binder<'src> {
                             MISSING_METHOD_RETURN_TYPE_MESSAGE,
                         );
                     }
-                    let _ = self.resolve_function_type(&call.function, scope);
+                    object
+                        .call_signatures
+                        .push(self.resolve_function_signature(&call.function, scope));
                 }
                 TypeMember::Construct(construct) => {
                     if self.no_implicit_any && construct.function.function.return_type_missing {
@@ -5656,13 +5715,46 @@ impl<'src> Binder<'src> {
                     }
                     let _ = self.resolve_function_type(&construct.function.function, scope);
                 }
-                _ => {}
+                TypeMember::Index(index) => {
+                    let parameters = index
+                        .parameters
+                        .iter()
+                        .map(|parameter| {
+                            FunctionParameter::new(
+                                self.identifier_text(&parameter.name).into_owned(),
+                                self.resolve_type(
+                                    &parameter.type_annotation.data().type_node,
+                                    scope,
+                                ),
+                                parameter.optional,
+                                parameter.rest,
+                            )
+                        })
+                        .collect();
+                    let value_type =
+                        self.resolve_type(&index.type_annotation.data().type_node, scope);
+                    object.index_signatures.push(IndexSignature {
+                        readonly: index.readonly,
+                        parameters,
+                        value_type,
+                    });
+                }
+                TypeMember::Missing(_) => {}
             }
         }
-        properties
+        object
     }
 
     fn resolve_function_type(&mut self, function: &'src FunctionType, scope: ScopeId) -> TypeId {
+        let signature = self.resolve_function_signature(function, scope);
+        self.types.intern(Type::Function(signature))
+    }
+
+    fn resolve_function_signature(
+        &mut self,
+        function: &'src FunctionType,
+        scope: ScopeId,
+    ) -> FunctionSignature {
         let child = self.new_scope(ScopeKind::Function, Some(scope));
         self.bind_type_parameters(function.type_parameters.as_ref(), child);
         let mut parameters: Vec<FunctionParameter> = Vec::with_capacity(function.parameters.len());
@@ -5692,8 +5784,11 @@ impl<'src> Binder<'src> {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        self.types
-            .function_with_parameters(type_parameters, parameters, return_type)
+        FunctionSignature {
+            type_parameters,
+            parameters,
+            return_type,
+        }
     }
 
     fn property_key(&self, name: &PropertyName) -> Option<String> {
@@ -6427,12 +6522,12 @@ mod tests {
             PropertyType::new("b", false, table.string()),
             PropertyType::new("a", true, table.number()),
         ]);
-        let Type::ObjectType(properties) = table.get(object) else {
+        let Type::ObjectType(object) = table.get(object) else {
             panic!("object_type interns an object type");
         };
-        assert_eq!(properties[0].name.as_ref(), "a");
-        assert_eq!(properties[1].name.as_ref(), "b");
-        assert!(properties[0].optional);
+        assert_eq!(object.properties[0].name.as_ref(), "a");
+        assert_eq!(object.properties[1].name.as_ref(), "b");
+        assert!(object.properties[0].optional);
     }
 
     fn value_symbol(model: &super::SemanticModel, name: &str) -> SymbolId {
@@ -7089,13 +7184,14 @@ mod tests {
             .position(|s| s.name() == "o")
             .expect("object symbol");
         let object_type = model.symbol_type(SymbolId::new(index as u32));
-        let Type::ObjectType(properties) = model.types().get(object_type) else {
+        let Type::ObjectType(object) = model.types().get(object_type) else {
             panic!(
                 "object literal type expected, got {:?}",
                 model.types().get(object_type)
             );
         };
-        let x = properties
+        let x = object
+            .properties
             .iter()
             .find(|p| p.name() == "x")
             .expect("x property");

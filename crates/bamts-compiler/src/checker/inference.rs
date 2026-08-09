@@ -50,7 +50,8 @@
 //! diagnostics can attribute a type argument to its source.
 
 use super::binder::{
-    FunctionParameter, FunctionSignature, PropertyType, SymbolId, Type, TypeId, TypeTable,
+    FunctionParameter, FunctionSignature, IndexSignature, ObjectType, PropertyType, SymbolId, Type,
+    TypeId, TypeTable,
 };
 use super::relations::TypeRelations;
 
@@ -258,8 +259,9 @@ impl InferredTypeArguments {
                     .collect();
                 table.union(&members)
             }
-            Type::ObjectType(properties) => {
-                let properties: Vec<PropertyType> = properties
+            Type::ObjectType(object) => {
+                let properties: Vec<PropertyType> = object
+                    .properties
                     .iter()
                     .map(|property| {
                         PropertyType::new(
@@ -270,7 +272,46 @@ impl InferredTypeArguments {
                         .with_readonly(property.readonly())
                     })
                     .collect();
-                table.object_type(properties)
+                let call_signatures = object
+                    .call_signatures
+                    .iter()
+                    .map(|signature| {
+                        let type_id = self.instantiate_function(
+                            table,
+                            signature.type_parameters(),
+                            signature,
+                        );
+                        let Type::Function(signature) = table.get(type_id).clone() else {
+                            unreachable!("function instantiation must produce a function type");
+                        };
+                        signature
+                    })
+                    .collect();
+                let index_signatures = object
+                    .index_signatures
+                    .iter()
+                    .map(|signature| IndexSignature {
+                        readonly: signature.readonly,
+                        parameters: signature
+                            .parameters
+                            .iter()
+                            .map(|parameter| {
+                                FunctionParameter::new(
+                                    parameter.name().to_owned(),
+                                    self.instantiate(table, parameter.type_id()),
+                                    parameter.optional(),
+                                    parameter.rest(),
+                                )
+                            })
+                            .collect(),
+                        value_type: self.instantiate(table, signature.value_type),
+                    })
+                    .collect();
+                table.object_type_with_members(ObjectType {
+                    properties,
+                    call_signatures,
+                    index_signatures,
+                })
             }
             Type::Function(signature) => {
                 self.instantiate_function(table, signature.type_parameters(), &signature)
@@ -497,11 +538,11 @@ impl<'table> InferenceContext<'table> {
                     self.infer_types(member, argument_type, false, variance, source);
                 }
             }
-            Type::ObjectType(properties) => {
-                if let Type::ObjectType(argument_properties) = self.table.get(argument_type).clone()
-                {
-                    for property in properties {
-                        if let Some(argument_property) = argument_properties
+            Type::ObjectType(object) => {
+                if let Type::ObjectType(argument_object) = self.table.get(argument_type).clone() {
+                    for property in object.properties {
+                        if let Some(argument_property) = argument_object
+                            .properties
                             .iter()
                             .find(|candidate| candidate.name() == property.name())
                         {
@@ -1070,17 +1111,19 @@ mod tests {
             InferenceContext::new(&mut table, &[InferenceParameter::new(parameter(1))]);
         context.infer_from_argument(t, number, 0);
         let inferred = context.resolve();
-
         let instantiated = inferred.instantiate(&mut table, composite);
-        let Type::ObjectType(properties) = table.get(instantiated).clone() else {
+
+        let Type::ObjectType(object) = table.get(instantiated).clone() else {
             panic!("object type");
         };
-        let locked = properties
+        let locked = object
+            .properties
             .iter()
             .find(|property| property.name() == "locked")
             .expect("locked property");
         assert!(locked.readonly(), "readonly survives instantiation");
-        let mutable = properties
+        let mutable = object
+            .properties
             .iter()
             .find(|property| property.name() == "mutable")
             .expect("mutable property");

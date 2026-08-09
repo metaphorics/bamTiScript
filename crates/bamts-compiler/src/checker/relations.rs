@@ -188,8 +188,9 @@ impl<'table> TypeRelations<'table> {
         if let (Type::ObjectType(from), Type::ObjectType(to)) =
             (self.table.get(source), self.table.get(target))
         {
-            for target_property in to.iter().filter(|property| property.optional()) {
+            for target_property in to.properties.iter().filter(|property| property.optional()) {
                 let Some(source_property) = from
+                    .properties
                     .iter()
                     .find(|property| property.name() == target_property.name())
                 else {
@@ -291,8 +292,8 @@ impl<'table> TypeRelations<'table> {
             (Type::Array(source_element), Type::Array(target_element)) => {
                 self.relates(*source_element, *target_element, strictness)
             }
-            (Type::ObjectType(source_props), Type::ObjectType(target_props)) => {
-                self.object_relates(source_props, target_props, strictness)
+            (Type::ObjectType(source), Type::ObjectType(target)) => {
+                self.object_relates(&source.properties, &target.properties, strictness)
             }
             (Type::Function(source_sig), Type::Function(target_sig)) => {
                 self.function_relates(source_sig, target_sig, strictness)
@@ -322,8 +323,8 @@ impl<'table> TypeRelations<'table> {
             ) if self.is_object_symbol(*symbol) => true,
             // `object` can be assigned to an empty or all-optional object type,
             // but not to a type that requires specific properties.
-            (Type::Object, Type::ObjectType(target_props)) => {
-                target_props.iter().all(|property| property.optional())
+            (Type::Object, Type::ObjectType(target)) => {
+                target.properties.iter().all(|property| property.optional())
             }
             // Two generic signatures under comparison pair their type parameters
             // positionally, which is what makes them relate up to renaming.

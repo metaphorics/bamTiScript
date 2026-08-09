@@ -1687,6 +1687,82 @@ mod tests {
         }
     }
 
+    #[test]
+    fn object_types_retain_inherited_call_and_index_signatures() {
+        let text = "interface CallableBase {\
+                        (value: number): string;\
+                        readonly [key: string]: number;\
+                    }\
+                    interface CallableDerived extends CallableBase { own: boolean; }\
+                    declare const base: CallableBase;\
+                    declare const derived: CallableDerived;";
+        let parsed_source = parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            source(text),
+        ));
+        let Statement::Interface(base_declaration) = parsed_source.product().statements()[0].data()
+        else {
+            panic!("first statement is an interface");
+        };
+        assert_eq!(base_declaration.members.len(), 2, "{base_declaration:?}");
+        let result = check(&parsed_source);
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
+
+        let model = result.product();
+        let base_symbol = model
+            .lookup_value(model.module_scope(), "base")
+            .expect("base value symbol");
+        let Type::ObjectType(base) = model.types().get(model.symbol_type(base_symbol)) else {
+            panic!("base resolves to an object type");
+        };
+        assert_eq!(
+            base.call_signatures.len(),
+            1,
+            "Base retains its call signature: {base:?}"
+        );
+        assert_eq!(
+            base.index_signatures.len(),
+            1,
+            "Base retains its index signature: {base:?}"
+        );
+        let symbol = model
+            .lookup_value(model.module_scope(), "derived")
+            .expect("derived value symbol");
+        let Type::ObjectType(object) = model.types().get(model.symbol_type(symbol)) else {
+            panic!("derived resolves to an object type");
+        };
+        assert!(
+            object
+                .properties
+                .iter()
+                .any(|property| property.name() == "own")
+        );
+
+        let [call] = object.call_signatures.as_slice() else {
+            panic!("Derived inherits one call signature");
+        };
+        let [parameter] = call.parameters() else {
+            panic!("call signature has one parameter");
+        };
+        assert_eq!(parameter.type_id(), model.types().number());
+        assert_eq!(call.return_type(), model.types().string());
+
+        let [index] = object.index_signatures.as_slice() else {
+            panic!("Derived inherits one index signature");
+        };
+        let [parameter] = index.parameters.as_slice() else {
+            panic!("index signature has one parameter");
+        };
+        assert!(index.readonly);
+        assert_eq!(parameter.type_id(), model.types().string());
+        assert_eq!(index.value_type, model.types().number());
+    }
+
     // ---- checker behavior tests ----------------------------------------------
 
     fn source(text: &str) -> Arc<SourceText> {
@@ -2735,8 +2811,11 @@ mod tests {
         );
         assert!(matches!(
             ty_model.types().get(ty_model.symbol_type(value_symbol)),
-            Type::ObjectType(properties)
-                if properties.iter().any(|property| property.name() == "value")
+            Type::ObjectType(object)
+                if object
+                    .properties
+                    .iter()
+                    .any(|property| property.name() == "value")
         ));
 
         let missing = check_text("namespace A {} import X = A.B;");
@@ -2791,8 +2870,11 @@ mod tests {
         assert_ne!(model.symbol_type(value_symbol), model.types().error_type());
         assert!(matches!(
             model.types().get(model.symbol_type(value_symbol)),
-            Type::ObjectType(properties)
-                if properties.iter().any(|property| property.name() == "value")
+            Type::ObjectType(object)
+                if object
+                    .properties
+                    .iter()
+                    .any(|property| property.name() == "value")
         ));
     }
 
@@ -2813,8 +2895,11 @@ mod tests {
         assert_ne!(model.symbol_type(value_symbol), model.types().error_type());
         assert!(matches!(
             model.types().get(model.symbol_type(value_symbol)),
-            Type::ObjectType(properties)
-                if properties.iter().any(|property| property.name() == "value")
+            Type::ObjectType(object)
+                if object
+                    .properties
+                    .iter()
+                    .any(|property| property.name() == "value")
         ));
     }
 
@@ -2850,8 +2935,11 @@ mod tests {
         assert_ne!(model.symbol_type(typed), model.types().error_type());
         assert!(matches!(
             model.types().get(model.symbol_type(typed)),
-            Type::ObjectType(properties)
-                if properties.iter().any(|property| property.name() == "value")
+            Type::ObjectType(object)
+                if object
+                    .properties
+                    .iter()
+                    .any(|property| property.name() == "value")
         ));
     }
 
@@ -4543,8 +4631,11 @@ mod tests {
         assert!(
             matches!(
                 model.types().get(prototype_type),
-                Type::ObjectType(properties)
-                    if properties.iter().any(|property| property.name() == "greet")
+                Type::ObjectType(object)
+                    if object
+                        .properties
+                        .iter()
+                        .any(|property| property.name() == "greet")
             ),
             "C.prototype must be the instance type carrying `greet`"
         );
