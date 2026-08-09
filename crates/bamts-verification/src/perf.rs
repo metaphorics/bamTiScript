@@ -716,7 +716,11 @@ pub fn measure(options: &MeasureOptions) -> Result<MeasureResult> {
     let mut check_samples = Vec::with_capacity(repeats as usize);
     let mut emit_samples = Vec::with_capacity(repeats as usize);
     let mut rss_samples = Vec::with_capacity(repeats as usize);
+    // Reset the peak RSS high-water mark before every repeat so each sample
+    // measures only that run's allocation peak, not the cumulative peak of
+    // every prior repeat and the harness.
     for _ in 0..repeats {
+        reset_peak_rss()?;
         let started = Instant::now();
         let (_report, telemetry) = run_suite_with_telemetry(
             &options.workspace_root,
@@ -735,7 +739,7 @@ pub fn measure(options: &MeasureOptions) -> Result<MeasureResult> {
         bind_samples.push(telemetry.millis(Phase::Bind));
         check_samples.push(telemetry.millis(Phase::Check));
         emit_samples.push(telemetry.millis(Phase::Emit));
-        rss_samples.push(read_peak_rss_bytes().unwrap_or(0) as f64);
+        rss_samples.push(read_peak_rss_bytes()? as f64);
     }
 
     // `total` is the whole measured seam wall; the phase split is the compiler's
@@ -821,16 +825,62 @@ fn load_baseline(path: Option<&Path>) -> Result<Option<Baseline>> {
     }))
 }
 
-/// Reads current process peak RSS (`VmHWM`) in bytes from `/proc/self/status`.
-fn read_peak_rss_bytes() -> Option<u64> {
-    let content = fs::read_to_string("/proc/self/status").ok()?;
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("VmHWM:") {
-            let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
-            return Some(kib * 1024);
-        }
+/// Resets the process peak RSS high-water mark (`VmHWM`) so each benchmark
+/// repeat measures its own allocation peak.
+///
+/// On Linux this writes `5` to `/proc/self/clear_refs`, which the kernel
+/// documents as resetting the high-water mark to the current resident set
+/// size. On other platforms this returns a contextual error instead of
+/// silently producing fake data.
+fn reset_peak_rss() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        fs::write("/proc/self/clear_refs", "5")
+            .map_err(|error| PerfError::harness(format!("/proc/self/clear_refs: {error}")))
     }
-    None
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(PerfError::harness(
+            "peak RSS reset requires /proc/self/clear_refs and is only available on Linux",
+        ))
+    }
+}
+
+/// Reads the current process peak RSS high-water mark (`VmHWM`) in bytes.
+///
+/// After a [`reset_peak_rss`] call this is the peak since that reset, so the
+/// benchmark can attribute peak memory to each measured repeat. On non-Linux
+/// hosts this returns a contextual error instead of a fake zero.
+fn read_peak_rss_bytes() -> Result<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let content = fs::read_to_string("/proc/self/status")
+            .map_err(|error| PerfError::harness(format!("/proc/self/status: {error}")))?;
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("VmHWM:") {
+                let kib: u64 = rest
+                    .split_whitespace()
+                    .next()
+                    .ok_or_else(|| PerfError::harness("/proc/self/status: VmHWM has no value"))?
+                    .parse()
+                    .map_err(|error| {
+                        PerfError::harness(format!(
+                            "/proc/self/status: VmHWM is not a number: {error}"
+                        ))
+                    })?;
+                return Ok(kib * 1024);
+            }
+        }
+        Err(PerfError::harness("/proc/self/status: VmHWM field not found"))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(PerfError::harness(
+            "peak RSS read requires /proc/self/status and is only available on Linux",
+        ))
+    }
 }
 
 fn write_result(path: &Path, result: &MeasureResult) -> Result<()> {
@@ -1292,5 +1342,95 @@ mod tests {
         assert_eq!(error, PerfErrorCode::NoBaseline);
         assert_eq!(error.exit_code(), 4);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn parse_proc_status_value(rest: &str, field: &str) -> Result<u64> {
+        let kib: u64 = rest
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| PerfError::harness(format!("/proc/self/status: {field} has no value")))?
+            .parse()
+            .map_err(|error| {
+                PerfError::harness(format!(
+                    "/proc/self/status: {field} is not a number: {error}"
+                ))
+            })?;
+        Ok(kib * 1024)
+    }
+
+    #[cfg(target_os = "linux")]
+    /// Reads the current `(VmHWM, VmRSS)` pair from a single `/proc/self/status`
+    /// snapshot so the test compares the two fields atomically.
+    fn read_hwm_and_rss() -> Result<(u64, u64)> {
+        let content = std::fs::read_to_string("/proc/self/status")
+            .map_err(|error| PerfError::harness(format!("/proc/self/status: {error}")))?;
+        let mut hwm = None;
+        let mut rss = None;
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("VmHWM:") {
+                hwm = Some(parse_proc_status_value(rest, "VmHWM")?);
+            } else if let Some(rest) = line.strip_prefix("VmRSS:") {
+                rss = Some(parse_proc_status_value(rest, "VmRSS")?);
+            }
+        }
+        match (hwm, rss) {
+            (Some(h), Some(r)) => Ok((h, r)),
+            (None, _) => Err(PerfError::harness("/proc/self/status: VmHWM not found")),
+            (_, None) => Err(PerfError::harness("/proc/self/status: VmRSS not found")),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reset_peak_rss_resets_hwm_to_current_rss() {
+        // Raise the high-water mark by faulting in a large allocation.
+        let (hwm_before, _rss_before) =
+            read_hwm_and_rss().expect("read /proc/self/status before allocation");
+        let big = {
+            let mut v = vec![0u8; 64 * 1024 * 1024];
+            for i in (0..v.len()).step_by(4096) {
+                v[i] = 1;
+            }
+            std::hint::black_box(v)
+        };
+        let (hwm_during, _rss_during) =
+            read_hwm_and_rss().expect("read /proc/self/status during allocation");
+        assert!(hwm_during >= hwm_before, "allocation must not lower VmHWM");
+
+        // Dropping the allocation returns the mapped pages to the OS on glibc,
+        // lowering current RSS while leaving the lifetime HWM high.
+        drop(big);
+
+        reset_peak_rss().expect("reset VmHWM");
+
+        let (hwm_after, rss_after) =
+            read_hwm_and_rss().expect("read /proc/self/status after reset");
+        assert!(hwm_after > 0, "VmHWM after reset must be positive, not fake");
+        assert!(
+            hwm_after >= rss_after,
+            "VmHWM cannot be below current VmRSS (hwm={hwm_after}, rss={rss_after})"
+        );
+        assert!(
+            hwm_after <= rss_after + 8 * 1024 * 1024,
+            "VmHWM after reset must be near current VmRSS (within test overhead); \
+             got hwm={hwm_after}, rss={rss_after}"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn peak_rss_sampling_is_unsupported_outside_linux() {
+        // Resetting and reading VmHWM are platform-specific; on non-Linux they
+        // must fail with a typed, contextual error rather than return fake data.
+        let reset = reset_peak_rss()
+            .expect_err("reset should fail on non-Linux with a contextual error");
+        assert_eq!(reset.code, PerfErrorCode::HarnessError);
+        assert!(reset.detail.contains("Linux"), "reset error must name the platform");
+
+        let read = read_peak_rss_bytes()
+            .expect_err("read should fail on non-Linux with a contextual error");
+        assert_eq!(read.code, PerfErrorCode::HarnessError);
+        assert!(read.detail.contains("Linux"), "read error must name the platform");
     }
 }
