@@ -14,7 +14,7 @@
 //! because every JSON object key is sorted lexicographically, the `entries` array
 //! is sorted before writing, and line endings are LF with no trailing whitespace.
 
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{collections::BTreeSet, fs, io, path::Path};
 
 use serde::{Deserialize, Serialize};
 
@@ -785,42 +785,52 @@ impl TsLedgerReader {
 pub struct TsLedgerWriter;
 
 impl TsLedgerWriter {
-    /// Serialize a ledger to a stable, deterministic JSON string.
+    /// Write a sorted, validated ledger as pretty JSON into any `io::Write` sink.
     ///
     /// The `to_value` step is load-bearing, not a formality: `serde_json` is
     /// built without `preserve_order`, so a `Value` object is a `BTreeMap` and
     /// converting through it is what puts object keys in lexicographic order.
     /// Serializing the typed ledger directly would emit struct-declaration
-    /// order instead. Writing that tree into a byte buffer avoids the extra
-    /// full-document `String` that `to_string_pretty` would allocate.
-    pub fn to_string(ledger: &TsLedger) -> Result<String> {
+    /// order instead.
+    fn write_to(mut writer: impl io::Write, ledger: &TsLedger) -> Result<()> {
         let mut sorted = ledger.clone();
         sorted.sort_and_recompute();
         sorted.validate()?;
 
         let value = serde_json::to_value(&sorted)
             .map_err(|error| VerificationError::new(ErrorCode::Json, format!("{error}")))?;
-        // `to_writer_pretty` needs an `io::Write`, which `String` is not; a byte
-        // buffer converts back by moving the same allocation.
-        let mut buf = Vec::with_capacity(1 << 20);
-        serde_json::to_writer_pretty(&mut buf, &value)
+        serde_json::to_writer_pretty(&mut writer, &value)
             .map_err(|error| VerificationError::new(ErrorCode::Json, format!("{error}")))?;
+        Ok(())
+    }
+
+    /// Serialize a ledger to a stable, deterministic JSON string.
+    pub fn to_string(ledger: &TsLedger) -> Result<String> {
+        let mut buf = Vec::with_capacity(1 << 20);
+        Self::write_to(&mut buf, ledger)?;
         String::from_utf8(buf)
             .map_err(|error| VerificationError::new(ErrorCode::Json, format!("{error}")))
     }
 
-    /// Serialize a ledger to a file.
+    /// Serialize a ledger to a file, using a buffered writer and an explicit flush.
     pub fn to_file(path: impl AsRef<Path>, ledger: &TsLedger) -> Result<()> {
         let path = path.as_ref();
-        let bytes = Self::to_string(ledger)?;
-        fs::write(path, bytes.as_bytes()).map_err(|error| {
+        let file = fs::File::create(path).map_err(|error| {
             VerificationError::new(ErrorCode::Io, format!("{}: {error}", path.display()))
-        })
+        })?;
+        let mut writer = io::BufWriter::new(file);
+        Self::write_to(&mut writer, ledger)?;
+        writer.flush().map_err(|error| {
+            VerificationError::new(ErrorCode::Io, format!("{}: {error}", path.display()))
+        })?;
+        Ok(())
     }
 
     /// Serialize a ledger to stable JSON bytes.
     pub fn to_vec(ledger: &TsLedger) -> Result<Vec<u8>> {
-        Self::to_string(ledger).map(|s| s.into_bytes())
+        let mut buf = Vec::with_capacity(1 << 20);
+        Self::write_to(&mut buf, ledger)?;
+        Ok(buf)
     }
 }
 
@@ -1594,4 +1604,32 @@ mod tests {
         assert_eq!(seen_backends.len(), 4);
         assert_eq!(seen_timeouts.len(), 4);
     }
+
+    #[test]
+    fn to_file_bytes_match_to_string_bytes() {
+        let ledger = valid_ledger();
+        let path = std::env::temp_dir().join("bamts_ts_ledger_to_file_bytes.json");
+        let _ = fs::remove_file(&path);
+
+        TsLedgerWriter::to_file(&path, &ledger).expect("to_file");
+        let from_file = fs::read(&path).expect("read file");
+        let from_string = TsLedgerWriter::to_string(&ledger).expect("to_string").into_bytes();
+        assert_eq!(from_file, from_string, "to_file must emit the same bytes as to_string");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn to_file_round_trip_through_reader() {
+        let ledger = valid_ledger();
+        let path = std::env::temp_dir().join("bamts_ts_ledger_to_file_round_trip.json");
+        let _ = fs::remove_file(&path);
+
+        TsLedgerWriter::to_file(&path, &ledger).expect("to_file");
+        let round = TsLedgerReader::from_file(&path).expect("from_file");
+        assert_eq!(round, ledger);
+
+        let _ = fs::remove_file(&path);
+    }
+
 }
