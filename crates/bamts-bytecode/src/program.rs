@@ -309,13 +309,29 @@ impl Program<Verified> {
     /// hops `verify_export_resolutions` walks when detecting cycles. Any new
     /// hop kind added here must also be covered there, or the bound below
     /// turns the divergence into a `None` instead of a hang.
+    ///
+    /// The bound is the total number of export entries across every module,
+    /// not the module count. Re-export chains may re-enter the same module
+    /// under a different exported name on each hop -- for example,
+    /// `m0.a -> m1.b -> m0.c -> m1.d -> m0.e`. A module-count bound would
+    /// treat the re-entries as already visited and stop short. Because
+    /// `verify_export_resolutions` rejects cycles, any walk that reaches this
+    /// point follows a strict partial order on (module, exported name) pairs
+    /// and can visit each export at most once. The saturating sum makes the
+    /// bound safe even when the module list is large.
     #[must_use]
     pub fn resolve_export(&self, module: ModuleId, name: &EcmaString) -> Option<ResolvedExport> {
         let mut module_id = module;
         let mut linked_name = None;
-        // Bound by the module count: an acyclic walk visits at most every
-        // module once, so this is unreachable while the invariant above holds.
-        for _ in 0..=self.modules.len() {
+        let export_count = self
+            .modules
+            .iter()
+            .map(|module| module.exports.len())
+            .fold(0usize, |total, len| total.saturating_add(len));
+        // Bound by the saturating sum of all export counts: an acyclic walk
+        // can consume at most one export entry per step, so this is
+        // unreachable while the invariant above holds.
+        for _ in 0..=export_count {
             let current = self.module(module_id)?;
             let export_name = linked_name.unwrap_or(name);
             let export = current
@@ -3042,6 +3058,131 @@ mod tests {
                 .kind,
             ProgramVerifyErrorKind::MissingImportedExport { .. }
         ));
+    }
+
+    #[test]
+    fn resolve_export_bound_counts_exports_not_modules() {
+        // Only two modules are involved, but the re-export chain has five
+        // export entries. A bound based on the module count would stop after
+        // `self.modules.len() + 1` hops and return `None`, missing the leaf.
+        let m0 = {
+            let code = Module::new(
+                vec![
+                    Constant::String(EcmaString::encode("m0")),
+                    Constant::String(EcmaString::encode("a")),
+                    Constant::String(EcmaString::encode("b")),
+                    Constant::String(EcmaString::encode("c")),
+                    Constant::String(EcmaString::encode("d")),
+                    Constant::String(EcmaString::encode("e")),
+                    Constant::String(EcmaString::encode("m1")),
+                ],
+                vec![Function::new(
+                    None,
+                    0,
+                    0,
+                    1,
+                    FunctionFlags::default(),
+                    vec![Instruction::Halt],
+                    Vec::new(),
+                )],
+                FunctionId::new(0),
+            )
+            .verify()
+            .unwrap();
+            ProgramModule {
+                name: ConstantId::new(0),
+                code,
+                edges: vec![Edge {
+                    specifier: ConstantId::new(6),
+                    target: EdgeTarget::Local(ModuleId::new(1)),
+                    kind: EdgeKind::Static,
+                }],
+                bindings: vec![Binding {
+                    name: ConstantId::new(5),
+                    kind: BindingKind::Hoisted,
+                }],
+                exports: vec![
+                    Export {
+                        name: ConstantId::new(1),
+                        source: ExportSource::Indirect {
+                            edge: EdgeId::new(0),
+                            name: ConstantId::new(2),
+                        },
+                    },
+                    Export {
+                        name: ConstantId::new(3),
+                        source: ExportSource::Indirect {
+                            edge: EdgeId::new(0),
+                            name: ConstantId::new(4),
+                        },
+                    },
+                    Export {
+                        name: ConstantId::new(5),
+                        source: ExportSource::Local(BindingId::new(0)),
+                    },
+                ],
+            }
+        };
+
+        let m1 = {
+            let code = Module::new(
+                vec![
+                    Constant::String(EcmaString::encode("m1")),
+                    Constant::String(EcmaString::encode("b")),
+                    Constant::String(EcmaString::encode("c")),
+                    Constant::String(EcmaString::encode("d")),
+                    Constant::String(EcmaString::encode("e")),
+                    Constant::String(EcmaString::encode("m0")),
+                ],
+                vec![Function::new(
+                    None,
+                    0,
+                    0,
+                    1,
+                    FunctionFlags::default(),
+                    vec![Instruction::Halt],
+                    Vec::new(),
+                )],
+                FunctionId::new(0),
+            )
+            .verify()
+            .unwrap();
+            ProgramModule {
+                name: ConstantId::new(0),
+                code,
+                edges: vec![Edge {
+                    specifier: ConstantId::new(5),
+                    target: EdgeTarget::Local(ModuleId::new(0)),
+                    kind: EdgeKind::Static,
+                }],
+                bindings: Vec::new(),
+                exports: vec![
+                    Export {
+                        name: ConstantId::new(1),
+                        source: ExportSource::Indirect {
+                            edge: EdgeId::new(0),
+                            name: ConstantId::new(2),
+                        },
+                    },
+                    Export {
+                        name: ConstantId::new(3),
+                        source: ExportSource::Indirect {
+                            edge: EdgeId::new(0),
+                            name: ConstantId::new(4),
+                        },
+                    },
+                ],
+            }
+        };
+
+        let program = Program::link(vec![m0, m1], ModuleId::new(0)).unwrap();
+        assert_eq!(
+            program.resolve_export(ModuleId::new(0), &EcmaString::encode("a")),
+            Some(ResolvedExport::Local {
+                module: ModuleId::new(0),
+                binding: BindingId::new(0),
+            })
+        );
     }
 
     #[test]
