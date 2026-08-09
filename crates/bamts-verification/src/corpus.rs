@@ -699,6 +699,7 @@ impl CorpusFailure {
             bamts::Error::Lower(error) => program_lower_stage(error),
             bamts::Error::Runtime(_) => CorpusStage::Evaluate,
             bamts::Error::Aot(error) => aot_stage(error),
+            _ => CorpusStage::Load,
         };
         Self {
             stage,

@@ -41,7 +41,24 @@ pub struct ProgramOutput {
 }
 
 /// A failure at the facade boundary.
+///
+/// This enum is `#[non_exhaustive]`. Downstream matches must include a
+/// wildcard arm so that future variants can be added without a major bump.
+///
+/// ```compile_fail
+/// fn classify(err: bamts::Error) -> &'static str {
+///     match err {
+///         bamts::Error::ReadConfig { .. } => "read",
+///         bamts::Error::ProjectConfig { .. } => "project",
+///         bamts::Error::ProgramLoad(_) => "load",
+///         bamts::Error::Diagnostics { .. } => "diagnostics",
+///         bamts::Error::Lower(_) => "lower",
+///         bamts::Error::Runtime(_) => "runtime",
+///     }
+/// }
+/// ```
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// The project configuration could not be read.
     ReadConfig {
@@ -311,7 +328,22 @@ pub struct ResolvedProject {
 }
 
 /// A failure while selecting a project root and loading its module graph.
+///
+/// This enum is `#[non_exhaustive]`. Downstream matches must include a
+/// wildcard arm so that future variants can be added without a major bump.
+///
+/// ```compile_fail
+/// fn classify(err: bamts::ResolutionError) -> &'static str {
+///     match err {
+///         bamts::ResolutionError::InvalidRoot(_) => "root",
+///         bamts::ResolutionError::ReadConfig { .. } => "read",
+///         bamts::ResolutionError::Config { .. } => "config",
+///         bamts::ResolutionError::Load(_) => "load",
+///     }
+/// }
+/// ```
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ResolutionError {
     /// The project root could not be canonicalized or is not absolute.
     InvalidRoot(std::io::Error),

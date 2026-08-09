@@ -391,6 +391,10 @@ fn map_resolution_error(error: ResolutionError) -> DriverError {
             message: source.to_string(),
         },
         ResolutionError::Load(load_error) => DriverError::ProgramLoad(load_error),
+        _ => DriverError::ProjectConfig {
+            path: PathBuf::from("<unknown>"),
+            message: error.to_string(),
+        },
     }
 }
 
