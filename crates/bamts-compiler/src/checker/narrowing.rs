@@ -605,7 +605,25 @@ impl<'a> NarrowingContext<'a> {
                 self.table.union(&kept)
             }
             _ if self.discriminant_keeps(ty, property, literal, negated) => ty,
-            _ => self.table.never(),
+            Type::Never
+            | Type::Void
+            | Type::Null
+            | Type::Undefined
+            | Type::Boolean
+            | Type::Number
+            | Type::BigInt
+            | Type::String
+            | Type::Symbol
+            | Type::Object
+            | Type::BooleanLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::StringLiteral(_)
+            | Type::BigIntLiteral(_)
+            | Type::Array(_)
+            | Type::ObjectType(_)
+            | Type::Function(_)
+            | Type::Named(_)
+            | Type::NumericEnum(_) => self.table.never(),
         }
     }
 
@@ -626,7 +644,28 @@ impl<'a> NarrowingContext<'a> {
     ) -> TypeId {
         let contextual_signature = match self.table.get(contextual) {
             Type::Function(signature) => Some(signature.clone()),
-            _ => None,
+            Type::Error
+            | Type::Any
+            | Type::Unknown
+            | Type::Never
+            | Type::Void
+            | Type::Null
+            | Type::Undefined
+            | Type::Boolean
+            | Type::Number
+            | Type::BigInt
+            | Type::String
+            | Type::Symbol
+            | Type::Object
+            | Type::BooleanLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::StringLiteral(_)
+            | Type::BigIntLiteral(_)
+            | Type::Array(_)
+            | Type::Union(_)
+            | Type::ObjectType(_)
+            | Type::Named(_)
+            | Type::NumericEnum(_) => None,
         };
         let parameters: Vec<FunctionParameter> = parameters
             .iter()
@@ -677,7 +716,27 @@ impl<'a> NarrowingContext<'a> {
                 }
                 Some(self.table.union(&elements))
             }
-            _ => None,
+            Type::Error
+            | Type::Any
+            | Type::Unknown
+            | Type::Never
+            | Type::Void
+            | Type::Null
+            | Type::Undefined
+            | Type::Boolean
+            | Type::Number
+            | Type::BigInt
+            | Type::String
+            | Type::Symbol
+            | Type::Object
+            | Type::BooleanLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::StringLiteral(_)
+            | Type::BigIntLiteral(_)
+            | Type::ObjectType(_)
+            | Type::Function(_)
+            | Type::Named(_)
+            | Type::NumericEnum(_) => None,
         }
     }
 
@@ -701,7 +760,28 @@ impl<'a> NarrowingContext<'a> {
                     .collect();
                 self.table.union(&awaited)
             }
-            _ => ty,
+            Type::Error
+            | Type::Any
+            | Type::Unknown
+            | Type::Never
+            | Type::Void
+            | Type::Null
+            | Type::Undefined
+            | Type::Boolean
+            | Type::Number
+            | Type::BigInt
+            | Type::String
+            | Type::Symbol
+            | Type::Object
+            | Type::BooleanLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::StringLiteral(_)
+            | Type::BigIntLiteral(_)
+            | Type::Array(_)
+            | Type::ObjectType(_)
+            | Type::Function(_)
+            | Type::Named(_)
+            | Type::NumericEnum(_) => ty,
         }
     }
 
@@ -775,7 +855,25 @@ impl<'a> NarrowingContext<'a> {
                 }
                 self.table.union(&kept)
             }
-            _ => match decide(self.table.get(ty)) {
+            Type::Never
+            | Type::Void
+            | Type::Null
+            | Type::Undefined
+            | Type::Boolean
+            | Type::Number
+            | Type::BigInt
+            | Type::String
+            | Type::Symbol
+            | Type::Object
+            | Type::BooleanLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::StringLiteral(_)
+            | Type::BigIntLiteral(_)
+            | Type::Array(_)
+            | Type::ObjectType(_)
+            | Type::Function(_)
+            | Type::Named(_)
+            | Type::NumericEnum(_) => match decide(self.table.get(ty)) {
                 Narrow::Keep => ty,
                 Narrow::Drop => self.table.never(),
                 Narrow::Replace(replacement) => replacement,
@@ -827,7 +925,31 @@ impl<'a> NarrowingContext<'a> {
                     .collect();
                 self.table.union(&parts)
             }
-            _ => self.table.never(),
+            (
+                Type::Error
+                | Type::Any
+                | Type::Unknown
+                | Type::Never
+                | Type::Void
+                | Type::Null
+                | Type::Undefined
+                | Type::Boolean
+                | Type::Number
+                | Type::BigInt
+                | Type::String
+                | Type::Symbol
+                | Type::Object
+                | Type::BooleanLiteral(_)
+                | Type::NumberLiteral(_)
+                | Type::StringLiteral(_)
+                | Type::BigIntLiteral(_)
+                | Type::Array(_)
+                | Type::ObjectType(_)
+                | Type::Function(_)
+                | Type::Named(_)
+                | Type::NumericEnum(_),
+                _,
+            ) => self.table.never(),
         }
     }
 
@@ -840,7 +962,26 @@ impl<'a> NarrowingContext<'a> {
     fn subtract(&mut self, ty: TypeId, excluded: TypeId) -> TypeId {
         match self.table.get(excluded) {
             Type::Error | Type::Any | Type::Unknown => return ty,
-            _ => {}
+            Type::Never
+            | Type::Void
+            | Type::Null
+            | Type::Undefined
+            | Type::Boolean
+            | Type::Number
+            | Type::BigInt
+            | Type::String
+            | Type::Symbol
+            | Type::Object
+            | Type::BooleanLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::StringLiteral(_)
+            | Type::BigIntLiteral(_)
+            | Type::Array(_)
+            | Type::Union(_)
+            | Type::ObjectType(_)
+            | Type::Function(_)
+            | Type::Named(_)
+            | Type::NumericEnum(_) => {},
         }
         match self.table.get(ty).clone() {
             Type::Error | Type::Any | Type::Unknown | Type::Never => ty,
@@ -856,7 +997,24 @@ impl<'a> NarrowingContext<'a> {
                 self.table.union(&kept)
             }
             _ if self.table.assignable(ty, excluded) => self.table.never(),
-            _ => ty,
+            Type::Void
+            | Type::Null
+            | Type::Undefined
+            | Type::Boolean
+            | Type::Number
+            | Type::BigInt
+            | Type::String
+            | Type::Symbol
+            | Type::Object
+            | Type::BooleanLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::StringLiteral(_)
+            | Type::BigIntLiteral(_)
+            | Type::Array(_)
+            | Type::ObjectType(_)
+            | Type::Function(_)
+            | Type::Named(_)
+            | Type::NumericEnum(_) => ty,
         }
     }
 

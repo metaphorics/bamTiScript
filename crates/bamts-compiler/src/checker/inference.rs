@@ -275,7 +275,24 @@ impl InferredTypeArguments {
             Type::Function(signature) => {
                 self.instantiate_function(table, signature.type_parameters(), &signature)
             }
-            _ => ty,
+            Type::Error
+            | Type::Any
+            | Type::Unknown
+            | Type::Never
+            | Type::Void
+            | Type::Null
+            | Type::Undefined
+            | Type::Boolean
+            | Type::Number
+            | Type::BigInt
+            | Type::String
+            | Type::Symbol
+            | Type::Object
+            | Type::BooleanLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::StringLiteral(_)
+            | Type::BigIntLiteral(_)
+            | Type::NumericEnum(_) => ty,
         }
     }
 

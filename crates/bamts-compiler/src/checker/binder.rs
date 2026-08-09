@@ -4451,7 +4451,27 @@ impl<'src> Binder<'src> {
         let signature = match self.types.get(callee_type).clone() {
             Type::Function(signature) => Some(signature),
             Type::Union(members) => self.union_call_signature(&members),
-            _ => None,
+            Type::Error
+            | Type::Any
+            | Type::Unknown
+            | Type::Never
+            | Type::Void
+            | Type::Null
+            | Type::Undefined
+            | Type::Boolean
+            | Type::Number
+            | Type::BigInt
+            | Type::String
+            | Type::Symbol
+            | Type::Object
+            | Type::BooleanLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::StringLiteral(_)
+            | Type::BigIntLiteral(_)
+            | Type::Array(_)
+            | Type::ObjectType(_)
+            | Type::Named(_)
+            | Type::NumericEnum(_) => None,
         };
 
         let Some(signature) = signature else {
@@ -4551,7 +4571,24 @@ impl<'src> Binder<'src> {
                 }
                 self.collect_type_parameter_symbols(signature.return_type(), out);
             }
-            _ => {}
+            Type::Error
+            | Type::Any
+            | Type::Unknown
+            | Type::Never
+            | Type::Void
+            | Type::Null
+            | Type::Undefined
+            | Type::Boolean
+            | Type::Number
+            | Type::BigInt
+            | Type::String
+            | Type::Symbol
+            | Type::Object
+            | Type::BooleanLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::StringLiteral(_)
+            | Type::BigIntLiteral(_)
+            | Type::NumericEnum(_) => {},
         }
     }
     fn union_call_signature(&self, members: &[TypeId]) -> Option<FunctionSignature> {
@@ -4606,7 +4643,27 @@ impl<'src> Binder<'src> {
                         return false;
                     }
                 }
-                _ => return false,
+            Type::Error
+            | Type::Any
+            | Type::Unknown
+            | Type::Never
+            | Type::Void
+            | Type::Null
+            | Type::Undefined
+            | Type::Boolean
+            | Type::Number
+            | Type::BigInt
+            | Type::String
+            | Type::Symbol
+            | Type::Object
+            | Type::BooleanLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::StringLiteral(_)
+            | Type::BigIntLiteral(_)
+            | Type::Array(_)
+            | Type::ObjectType(_)
+            | Type::Named(_)
+            | Type::NumericEnum(_) => return false,
             }
         }
         true
@@ -4747,7 +4804,26 @@ impl<'src> Binder<'src> {
                     Some(self.types.union(&found))
                 }
             }
-            _ => None,
+            Type::Error
+            | Type::Any
+            | Type::Unknown
+            | Type::Never
+            | Type::Void
+            | Type::Null
+            | Type::Undefined
+            | Type::Boolean
+            | Type::Number
+            | Type::BigInt
+            | Type::String
+            | Type::Symbol
+            | Type::Object
+            | Type::BooleanLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::StringLiteral(_)
+            | Type::BigIntLiteral(_)
+            | Type::Array(_)
+            | Type::Function(_)
+            | Type::NumericEnum(_) => None,
         }
     }
 
@@ -5938,7 +6014,27 @@ impl<'src> Binder<'src> {
             Type::Union(members) => self
                 .union_call_signature(&members)
                 .map(|sig| sig.return_type()),
-            _ => None,
+            Type::Error
+            | Type::Any
+            | Type::Unknown
+            | Type::Never
+            | Type::Void
+            | Type::Null
+            | Type::Undefined
+            | Type::Boolean
+            | Type::Number
+            | Type::BigInt
+            | Type::String
+            | Type::Symbol
+            | Type::Object
+            | Type::BooleanLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::StringLiteral(_)
+            | Type::BigIntLiteral(_)
+            | Type::Array(_)
+            | Type::ObjectType(_)
+            | Type::Named(_)
+            | Type::NumericEnum(_) => None,
         }
     }
 

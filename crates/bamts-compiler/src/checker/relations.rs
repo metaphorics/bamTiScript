@@ -346,7 +346,27 @@ impl<'table> TypeRelations<'table> {
                 let instance = self.table.class_instance(*symbol).unwrap_or(target);
                 instance != target && self.relates(source, instance, strictness)
             }
-            _ => false,
+            (
+                Type::Void
+                | Type::Null
+                | Type::Undefined
+                | Type::Boolean
+                | Type::Number
+                | Type::BigInt
+                | Type::String
+                | Type::Symbol
+                | Type::Object
+                | Type::BooleanLiteral(_)
+                | Type::NumberLiteral(_)
+                | Type::StringLiteral(_)
+                | Type::BigIntLiteral(_)
+                | Type::Array(_)
+                | Type::ObjectType(_)
+                | Type::Function(_)
+                | Type::Named(_)
+                | Type::NumericEnum(_),
+                _,
+            ) => false,
         }
     }
     fn is_object_symbol(&self, symbol: SymbolId) -> bool {
@@ -398,7 +418,25 @@ impl<'table> TypeRelations<'table> {
             Type::Union(members) => members
                 .iter()
                 .any(|member| self.contains_undefined(*member)),
-            _ => false,
+            Type::Error
+            | Type::Never
+            | Type::Void
+            | Type::Null
+            | Type::Boolean
+            | Type::Number
+            | Type::BigInt
+            | Type::String
+            | Type::Symbol
+            | Type::Object
+            | Type::BooleanLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::StringLiteral(_)
+            | Type::BigIntLiteral(_)
+            | Type::Array(_)
+            | Type::ObjectType(_)
+            | Type::Function(_)
+            | Type::Named(_)
+            | Type::NumericEnum(_) => false,
         }
     }
 
@@ -485,7 +523,28 @@ impl<'table> TypeRelations<'table> {
     fn rest_element(&self, type_id: TypeId) -> TypeId {
         match self.table.get(type_id) {
             Type::Array(element) => *element,
-            _ => type_id,
+            Type::Error
+            | Type::Any
+            | Type::Unknown
+            | Type::Never
+            | Type::Void
+            | Type::Null
+            | Type::Undefined
+            | Type::Boolean
+            | Type::Number
+            | Type::BigInt
+            | Type::String
+            | Type::Symbol
+            | Type::Object
+            | Type::BooleanLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::StringLiteral(_)
+            | Type::BigIntLiteral(_)
+            | Type::Union(_)
+            | Type::ObjectType(_)
+            | Type::Function(_)
+            | Type::Named(_)
+            | Type::NumericEnum(_) => type_id,
         }
     }
 }

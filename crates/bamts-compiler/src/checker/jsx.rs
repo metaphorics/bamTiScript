@@ -227,7 +227,28 @@ impl<'src> Binder<'src> {
                 .iter()
                 .find(|member| member.name() == tag_name)
                 .map(|member| member.type_id()),
-            _ => None,
+            Type::Error
+            | Type::Any
+            | Type::Unknown
+            | Type::Never
+            | Type::Void
+            | Type::Null
+            | Type::Undefined
+            | Type::Boolean
+            | Type::Number
+            | Type::BigInt
+            | Type::String
+            | Type::Symbol
+            | Type::Object
+            | Type::BooleanLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::StringLiteral(_)
+            | Type::BigIntLiteral(_)
+            | Type::Array(_)
+            | Type::Union(_)
+            | Type::Function(_)
+            | Type::Named(_)
+            | Type::NumericEnum(_) => None,
         };
         let Some(target) = target else {
             self.emit(
@@ -285,7 +306,23 @@ impl<'src> Binder<'src> {
             // type parameters) have no visible construct/call side in this
             // type space and are accepted unchecked.
             Type::Any | Type::Error | Type::Unknown | Type::Named(_) | Type::Union(_) => None,
-            _ => {
+            Type::Never
+            | Type::Void
+            | Type::Null
+            | Type::Undefined
+            | Type::Boolean
+            | Type::Number
+            | Type::BigInt
+            | Type::String
+            | Type::Symbol
+            | Type::Object
+            | Type::BooleanLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::StringLiteral(_)
+            | Type::BigIntLiteral(_)
+            | Type::Array(_)
+            | Type::ObjectType(_)
+            | Type::NumericEnum(_) => {
                 self.emit(
                     JSX_ELEMENT_TYPE_NOT_CALLABLE,
                     range,
