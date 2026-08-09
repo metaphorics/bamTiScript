@@ -15,6 +15,7 @@ pub(super) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
+    builtins.set_date_prototype(prototype);
     let constructor = install_function(heap, builtins, "Date", 7, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     let now = install_function(heap, builtins, "now", 0, now::<H>);
@@ -78,13 +79,15 @@ fn constructor<H: Host>(
         }
         date_from_components(components)
     };
-    let date_constructor = machine.intrinsics.global("Date").expect("Date installed");
-    let default_prototype = machine.get_named_property(date_constructor, "prototype")?;
+    let default_prototype = machine.intrinsics.builtins.date_prototype();
     let new_target = machine.current_new_target();
     let prototype = if new_target != Value::UNDEFINED {
-        machine
-            .constructed_prototype(new_target)
-            .unwrap_or(default_prototype)
+        let candidate = machine.get_named_property(new_target, "prototype")?;
+        if machine.is_object(candidate) {
+            candidate
+        } else {
+            default_prototype
+        }
     } else {
         default_prototype
     };
@@ -815,5 +818,53 @@ mod tests {
             "Date valueOf must not be called when copying"
         );
         assert_eq!(date_time(&machine, copy).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn date_prototype_is_cached_not_global_lookup() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let ctor_before = machine
+            .intrinsics
+            .global("Date")
+            .expect("Date global exists");
+        let date_id = machine
+            .intrinsics
+            .builtins
+            .id_named("Date")
+            .expect("Date builtin id");
+
+        // Delete and overwrite the global name. Construction through the saved
+        // builtin id must still use the cached intrinsic prototype.
+        machine.intrinsics.globals.remove(&EcmaString::encode("Date"));
+        machine
+            .intrinsics
+            .globals
+            .insert(EcmaString::encode("Date"), Value::int32(99));
+
+        let BuiltinOutcome::Value(instance) = machine
+            .call_builtin(date_id, Value::UNDEFINED, &[], true)
+            .expect("Date construct succeeds")
+        else {
+            panic!("Date construct returns a value");
+        };
+
+        let index = machine
+            .runtime_slot(instance)
+            .expect("valid instance")
+            .expect("slot");
+        let HeapEntry::Date { prototype, .. } = &machine.heap[index] else {
+            panic!("Date instance");
+        };
+        assert_eq!(*prototype, Some(machine.intrinsics.builtins.date_prototype()));
+
+        // The cached prototype's "constructor" is still the original Date constructor.
+        let proto_val = machine.intrinsics.builtins.date_prototype();
+        let ctor = machine
+            .get_named_property(proto_val, "constructor")
+            .expect("prototype has constructor");
+        assert_eq!(ctor, ctor_before);
     }
 }

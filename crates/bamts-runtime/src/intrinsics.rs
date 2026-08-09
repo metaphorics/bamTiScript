@@ -74,6 +74,11 @@ pub(crate) struct BuiltinTable<H: Host> {
     promise_all_target: Option<Value>,
     promise_prototype: Option<Value>,
     uint8array_prototype: Option<Value>,
+    date_prototype: Option<Value>,
+    map_prototype: Option<Value>,
+    set_prototype: Option<Value>,
+    weak_map_prototype: Option<Value>,
+    weak_set_prototype: Option<Value>,
     promise_capability_executor: Option<Value>,
     promise_finally_value: Option<Value>,
     promise_finally_throw: Option<Value>,
@@ -120,6 +125,11 @@ impl<H: Host> BuiltinTable<H> {
             promise_all_target: None,
             promise_prototype: None,
             uint8array_prototype: None,
+            date_prototype: None,
+            map_prototype: None,
+            set_prototype: None,
+            weak_map_prototype: None,
+            weak_set_prototype: None,
             promise_capability_executor: None,
             promise_finally_value: None,
             promise_finally_throw: None,
@@ -305,6 +315,51 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn uint8array_prototype(&self) -> Value {
         self.uint8array_prototype
             .expect("Uint8Array builtins install their prototype")
+    }
+
+    pub(crate) fn set_date_prototype(&mut self, prototype: Value) {
+        self.date_prototype = Some(prototype);
+    }
+
+    pub(crate) fn date_prototype(&self) -> Value {
+        self.date_prototype
+            .expect("Date builtins install their prototype")
+    }
+
+    pub(crate) fn set_map_prototype(&mut self, prototype: Value) {
+        self.map_prototype = Some(prototype);
+    }
+
+    pub(crate) fn map_prototype(&self) -> Value {
+        self.map_prototype
+            .expect("Map builtins install their prototype")
+    }
+
+    pub(crate) fn set_set_prototype(&mut self, prototype: Value) {
+        self.set_prototype = Some(prototype);
+    }
+
+    pub(crate) fn set_prototype(&self) -> Value {
+        self.set_prototype
+            .expect("Set builtins install their prototype")
+    }
+
+    pub(crate) fn set_weak_map_prototype(&mut self, prototype: Value) {
+        self.weak_map_prototype = Some(prototype);
+    }
+
+    pub(crate) fn weak_map_prototype(&self) -> Value {
+        self.weak_map_prototype
+            .expect("WeakMap builtins install their prototype")
+    }
+
+    pub(crate) fn set_weak_set_prototype(&mut self, prototype: Value) {
+        self.weak_set_prototype = Some(prototype);
+    }
+
+    pub(crate) fn weak_set_prototype(&self) -> Value {
+        self.weak_set_prototype
+            .expect("WeakSet builtins install their prototype")
     }
 
     pub(crate) fn set_promise_capability_executor(&mut self, value: Value) {
@@ -497,6 +552,11 @@ impl<H: Host> BuiltinTable<H> {
             promise_all_target,
             promise_prototype,
             uint8array_prototype,
+            date_prototype,
+            map_prototype,
+            set_prototype,
+            weak_map_prototype,
+            weak_set_prototype,
             promise_capability_executor,
             promise_finally_value,
             promise_finally_throw,
@@ -538,6 +598,11 @@ impl<H: Host> BuiltinTable<H> {
             *promise_all_target,
             *promise_prototype,
             *uint8array_prototype,
+            *date_prototype,
+            *map_prototype,
+            *set_prototype,
+            *weak_map_prototype,
+            *weak_set_prototype,
             *promise_capability_executor,
             *promise_finally_value,
             *promise_finally_throw,
@@ -970,6 +1035,11 @@ mod tests {
             Value::int32(106),
             Value::int32(107),
             Value::int32(108),
+            Value::int32(109),
+            Value::int32(110),
+            Value::int32(111),
+            Value::int32(112),
+            Value::int32(113),
         ];
         table.uint8array_prototype = Some(roots[0]);
         table.promise_capability_executor = Some(roots[1]);
@@ -979,6 +1049,11 @@ mod tests {
         table.promise_finally_rethrow = Some(roots[5]);
         table.promise_then_fulfill = Some(roots[6]);
         table.promise_then_reject = Some(roots[7]);
+        table.date_prototype = Some(roots[8]);
+        table.map_prototype = Some(roots[9]);
+        table.set_prototype = Some(roots[10]);
+        table.weak_map_prototype = Some(roots[11]);
+        table.weak_set_prototype = Some(roots[12]);
 
         let mut visited = Vec::new();
         table.for_each_value(|value| visited.push(value));

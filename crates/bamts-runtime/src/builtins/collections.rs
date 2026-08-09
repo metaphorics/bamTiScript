@@ -29,6 +29,7 @@ fn install_map<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
+    builtins.set_map_prototype(prototype);
     let constructor = install_function(heap, builtins, "Map", 0, map_constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     for (name, length, handler) in [
@@ -60,6 +61,7 @@ fn install_set<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
+    builtins.set_set_prototype(prototype);
     let constructor = install_function(heap, builtins, "Set", 0, set_constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     for (name, length, handler) in [
@@ -90,6 +92,7 @@ fn install_weak_map<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
+    builtins.set_weak_map_prototype(prototype);
     let constructor = install_function(heap, builtins, "WeakMap", 0, weak_map_constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     for (name, length, handler) in [
@@ -110,6 +113,7 @@ fn install_weak_set<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
+    builtins.set_weak_set_prototype(prototype);
     let constructor = install_function(heap, builtins, "WeakSet", 0, weak_set_constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     for (name, length, handler) in [
@@ -1079,27 +1083,13 @@ fn constructor_prototype<H: Host>(
     machine: &Machine<'_, H>,
     kind: CollectionKind,
 ) -> Result<Value, EvalFailure> {
-    let name = match kind {
-        CollectionKind::Map => "Map",
-        CollectionKind::Set => "Set",
-        CollectionKind::WeakMap => "WeakMap",
-        CollectionKind::WeakSet => "WeakSet",
+    let prototype = match kind {
+        CollectionKind::Map => machine.intrinsics.builtins.map_prototype(),
+        CollectionKind::Set => machine.intrinsics.builtins.set_prototype(),
+        CollectionKind::WeakMap => machine.intrinsics.builtins.weak_map_prototype(),
+        CollectionKind::WeakSet => machine.intrinsics.builtins.weak_set_prototype(),
     };
-    let constructor = machine
-        .intrinsics
-        .global(name)
-        .ok_or_else(|| type_error("missing collection constructor"))?;
-    let index = machine
-        .runtime_slot(constructor)
-        .map_err(EvalFailure::Runtime)?
-        .ok_or_else(|| type_error("invalid collection constructor"))?;
-    let HeapEntry::NativeFunction { properties, .. } = &machine.heap[index] else {
-        return Err(type_error("invalid collection constructor"));
-    };
-    match properties.get(&PropertyKey::Named(EcmaString::encode("prototype"))) {
-        Some(Property::Data { value, .. }) => Ok(*value),
-        _ => Err(type_error("missing collection prototype")),
-    }
+    Ok(prototype)
 }
 fn ordinary(heap: &mut Vec<HeapEntry>, prototype: Option<Value>) -> Value {
     super::super::push(
@@ -2472,5 +2462,83 @@ mod tests {
             .is_ok(),
             "local Symbol must be a valid weak key"
         );
+    }
+
+    #[test]
+    fn collection_prototypes_are_cached_not_global_lookup() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let cases = [
+            ("Map", CollectionKind::Map, machine.intrinsics.builtins.map_prototype()),
+            ("Set", CollectionKind::Set, machine.intrinsics.builtins.set_prototype()),
+            (
+                "WeakMap",
+                CollectionKind::WeakMap,
+                machine.intrinsics.builtins.weak_map_prototype(),
+            ),
+            (
+                "WeakSet",
+                CollectionKind::WeakSet,
+                machine.intrinsics.builtins.weak_set_prototype(),
+            ),
+        ];
+
+        let saved: Vec<(&str, CollectionKind, Value, Value, crate::intrinsics::BuiltinId)> = cases
+            .iter()
+            .map(|(name, kind, cached)| {
+                let ctor = machine
+                    .intrinsics
+                    .global(name)
+                    .expect("global exists");
+                let id = machine
+                    .intrinsics
+                    .builtins
+                    .id_named(name)
+                    .expect("builtin id");
+                (*name, *kind, *cached, ctor, id)
+            })
+            .collect();
+
+        // Delete and overwrite every collection global. Construction through the
+        // saved builtin ids must still use the cached intrinsic prototypes.
+        for &(name, _, _, _, _) in &saved {
+            machine.intrinsics.globals.remove(&EcmaString::encode(name));
+            machine
+                .intrinsics
+                .globals
+                .insert(EcmaString::encode(name), Value::int32(99));
+        }
+
+        for (name, kind, cached, ctor_before, id) in saved {
+            let BuiltinOutcome::Value(instance) = machine
+                .call_builtin(id, Value::UNDEFINED, &[], true)
+                .expect("collection construct succeeds")
+            else {
+                panic!("{name} construct returns a value");
+            };
+
+            let slot = machine
+                .runtime_slot(instance)
+                .expect("valid instance")
+                .expect("slot");
+            let HeapEntry::Collection {
+                prototype,
+                kind: actual_kind,
+                ..
+            } = &machine.heap[slot]
+            else {
+                panic!("{name} instance");
+            };
+            assert_eq!(*prototype, Some(cached));
+            assert_eq!(*actual_kind, kind);
+
+            // The cached prototype's "constructor" is still the original constructor.
+            let ctor = machine
+                .get_named_property(cached, "constructor")
+                .expect("prototype has constructor");
+            assert_eq!(ctor, ctor_before);
+        }
     }
 }
