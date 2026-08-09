@@ -4588,7 +4588,7 @@ impl<'src> Binder<'src> {
             | Type::NumberLiteral(_)
             | Type::StringLiteral(_)
             | Type::BigIntLiteral(_)
-            | Type::NumericEnum(_) => {},
+            | Type::NumericEnum(_) => {}
         }
     }
     fn union_call_signature(&self, members: &[TypeId]) -> Option<FunctionSignature> {
@@ -4643,27 +4643,27 @@ impl<'src> Binder<'src> {
                         return false;
                     }
                 }
-            Type::Error
-            | Type::Any
-            | Type::Unknown
-            | Type::Never
-            | Type::Void
-            | Type::Null
-            | Type::Undefined
-            | Type::Boolean
-            | Type::Number
-            | Type::BigInt
-            | Type::String
-            | Type::Symbol
-            | Type::Object
-            | Type::BooleanLiteral(_)
-            | Type::NumberLiteral(_)
-            | Type::StringLiteral(_)
-            | Type::BigIntLiteral(_)
-            | Type::Array(_)
-            | Type::ObjectType(_)
-            | Type::Named(_)
-            | Type::NumericEnum(_) => return false,
+                Type::Error
+                | Type::Any
+                | Type::Unknown
+                | Type::Never
+                | Type::Void
+                | Type::Null
+                | Type::Undefined
+                | Type::Boolean
+                | Type::Number
+                | Type::BigInt
+                | Type::String
+                | Type::Symbol
+                | Type::Object
+                | Type::BooleanLiteral(_)
+                | Type::NumberLiteral(_)
+                | Type::StringLiteral(_)
+                | Type::BigIntLiteral(_)
+                | Type::Array(_)
+                | Type::ObjectType(_)
+                | Type::Named(_)
+                | Type::NumericEnum(_) => return false,
             }
         }
         true

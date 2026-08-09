@@ -2471,8 +2471,16 @@ mod tests {
         let mut machine = Machine::new(&module, &mut host, Limits::default());
 
         let cases = [
-            ("Map", CollectionKind::Map, machine.intrinsics.builtins.map_prototype()),
-            ("Set", CollectionKind::Set, machine.intrinsics.builtins.set_prototype()),
+            (
+                "Map",
+                CollectionKind::Map,
+                machine.intrinsics.builtins.map_prototype(),
+            ),
+            (
+                "Set",
+                CollectionKind::Set,
+                machine.intrinsics.builtins.set_prototype(),
+            ),
             (
                 "WeakMap",
                 CollectionKind::WeakMap,
@@ -2485,13 +2493,16 @@ mod tests {
             ),
         ];
 
-        let saved: Vec<(&str, CollectionKind, Value, Value, crate::intrinsics::BuiltinId)> = cases
+        let saved: Vec<(
+            &str,
+            CollectionKind,
+            Value,
+            Value,
+            crate::intrinsics::BuiltinId,
+        )> = cases
             .iter()
             .map(|(name, kind, cached)| {
-                let ctor = machine
-                    .intrinsics
-                    .global(name)
-                    .expect("global exists");
+                let ctor = machine.intrinsics.global(name).expect("global exists");
                 let id = machine
                     .intrinsics
                     .builtins

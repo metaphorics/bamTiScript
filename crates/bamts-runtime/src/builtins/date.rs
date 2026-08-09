@@ -838,7 +838,10 @@ mod tests {
 
         // Delete and overwrite the global name. Construction through the saved
         // builtin id must still use the cached intrinsic prototype.
-        machine.intrinsics.globals.remove(&EcmaString::encode("Date"));
+        machine
+            .intrinsics
+            .globals
+            .remove(&EcmaString::encode("Date"));
         machine
             .intrinsics
             .globals
@@ -858,7 +861,10 @@ mod tests {
         let HeapEntry::Date { prototype, .. } = &machine.heap[index] else {
             panic!("Date instance");
         };
-        assert_eq!(*prototype, Some(machine.intrinsics.builtins.date_prototype()));
+        assert_eq!(
+            *prototype,
+            Some(machine.intrinsics.builtins.date_prototype())
+        );
 
         // The cached prototype's "constructor" is still the original Date constructor.
         let proto_val = machine.intrinsics.builtins.date_prototype();

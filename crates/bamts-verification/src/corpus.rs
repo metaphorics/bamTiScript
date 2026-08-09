@@ -2594,7 +2594,10 @@ mod tests {
         }
 
         assert!(child_gone, "child {child_pid} should be dead");
-        assert!(grandchild_gone, "grandchild {grandchild_pid} should be dead");
+        assert!(
+            grandchild_gone,
+            "grandchild {grandchild_pid} should be dead"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

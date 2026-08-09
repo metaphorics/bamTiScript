@@ -981,7 +981,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::ObjectType(_)
             | Type::Function(_)
             | Type::Named(_)
-            | Type::NumericEnum(_) => {},
+            | Type::NumericEnum(_) => {}
         }
         match self.table.get(ty).clone() {
             Type::Error | Type::Any | Type::Unknown | Type::Never => ty,
