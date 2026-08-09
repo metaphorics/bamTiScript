@@ -1412,8 +1412,19 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         loop {
             let kind = self.machine.borrow().callee_kind(callee);
             match kind {
-                Ok(CalleeKind::Runtime { target, captures }) => {
-                    return self.invoke_runtime(target, &captures, this, new_target, args.as_ref());
+                Ok(CalleeKind::Runtime {
+                    target,
+                    captures,
+                    context,
+                }) => {
+                    return self.invoke_runtime(
+                        target,
+                        &captures,
+                        context,
+                        this,
+                        new_target,
+                        args.as_ref(),
+                    );
                 }
                 Ok(CalleeKind::Builtin { id }) => {
                     let result = {
@@ -1510,6 +1521,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         &self,
         target: crate::RuntimeFunction,
         captures: &[Value],
+        context: Option<Value>,
         this: Value,
         new_target: Value,
         args: &[Value],
@@ -1524,6 +1536,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 .create_async_generator(GeneratorStart {
                     target,
                     captures: captures.to_vec(),
+                    context,
                     this_value: this,
                     new_target,
                     args: args.to_vec(),
@@ -1540,6 +1553,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             let created = self.machine.borrow_mut().create_generator(GeneratorStart {
                 target,
                 captures: captures.to_vec(),
+                context,
                 this_value: this,
                 new_target,
                 args: args.to_vec(),
@@ -1560,14 +1574,19 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             let outcome = self
                 .machine
                 .borrow_mut()
-                .start_async_call(target, captures, this, new_target, args);
+                .start_async_call(target, captures, context, this, new_target, args);
             return match outcome {
                 Ok(promise) => InvokeOutcome::Value(promise),
                 Err(failure) => self.failure_outcome(failure),
             };
         }
-        if self.backend == Backend::Reference || self.is_dynamic_module(target.module) {
-            return match self.execute(
+        let previous = {
+            let mut machine = self.machine.borrow_mut();
+            std::mem::replace(&mut machine.context_global, context)
+        };
+        let outcome = if self.backend == Backend::Reference || self.is_dynamic_module(target.module)
+        {
+            match self.execute(
                 target.module,
                 index,
                 this,
@@ -1589,9 +1608,12 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     self.pending_error.set(Some(error));
                     InvokeOutcome::Fatal
                 }
-            };
-        }
-        self.invoke_linked(target, captures, this, new_target, args)
+            }
+        } else {
+            self.invoke_linked(target, captures, this, new_target, args)
+        };
+        self.machine.borrow_mut().context_global = previous;
+        outcome
     }
 
     fn resume_generator(&self, generator: Value, resume_value: Value) -> InvokeOutcome {
@@ -2023,6 +2045,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
 
     fn start_reference_generator(&self, start: GeneratorStart) -> Option<GeneratorResume> {
         let target = start.target;
+        let context = start.context;
         let index = target.function.get() as usize;
         let handle = self.code_ref(target.module);
         let code = handle.code(target.module);
@@ -2052,6 +2075,10 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             target,
         });
         self.push_native_roots(&registers);
+        let previous = {
+            let mut machine = self.machine.borrow_mut();
+            std::mem::replace(&mut machine.context_global, context)
+        };
         let completion = self.run_frame(
             target.module,
             index,
@@ -2059,6 +2086,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             &mut registers,
             FrameDrive::GeneratorStart,
         );
+        self.machine.borrow_mut().context_global = previous;
         self.pop_native_roots();
         let activation = self
             .activations
@@ -2066,7 +2094,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             .pop()
             .expect("generator activation exists");
         self.machine.borrow_mut().leave_native_generator();
-        self.finish_reference_generator(target, registers, activation, completion)
+        self.finish_reference_generator(target, registers, activation, context, completion)
     }
 
     fn resume_reference_generator(
@@ -2075,6 +2103,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         sent: Value,
     ) -> Option<GeneratorResume> {
         let target = suspended.target;
+        let context = suspended.context;
         let index = target.function.get() as usize;
         let handle = self.code_ref(target.module);
         let code = handle.code(target.module);
@@ -2095,6 +2124,10 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             target,
         });
         self.push_native_roots(&suspended.registers);
+        let previous = {
+            let mut machine = self.machine.borrow_mut();
+            std::mem::replace(&mut machine.context_global, context)
+        };
         let completion = self.run_frame(
             target.module,
             index,
@@ -2105,6 +2138,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 sent,
             },
         );
+        self.machine.borrow_mut().context_global = previous;
         self.pop_native_roots();
         let activation = self
             .activations
@@ -2112,7 +2146,13 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             .pop()
             .expect("generator activation exists");
         self.machine.borrow_mut().leave_native_generator();
-        self.finish_reference_generator(target, suspended.registers, activation, completion)
+        self.finish_reference_generator(
+            target,
+            suspended.registers,
+            activation,
+            context,
+            completion,
+        )
     }
 
     fn finish_reference_generator(
@@ -2120,6 +2160,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         target: crate::RuntimeFunction,
         registers: Vec<Value>,
         activation: Activation,
+        context: Option<Value>,
         completion: Result<FrameCompletion, RuntimeError>,
     ) -> Option<GeneratorResume> {
         let register_count = registers.len();
@@ -2133,6 +2174,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     new_target: activation.new_target,
                     args: activation.args,
                     arguments_object: activation.arguments_object,
+                    context,
                     resume_token,
                 },
             }),
@@ -2179,6 +2221,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 new_target: start.new_target,
                 args: start.args,
                 arguments_object: None,
+                context: start.context,
                 resume_token: 0,
             },
             None,
@@ -2230,6 +2273,10 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         });
         self.push_native_roots(&suspended.registers);
         let handles = suspended.registers.as_mut_ptr();
+        let previous = {
+            let mut machine = self.machine.borrow_mut();
+            std::mem::replace(&mut machine.context_global, suspended.context)
+        };
         let (invoked, next_token, out) = {
             let mut shadow = ShadowFrame::new(
                 std::ptr::null_mut(),
@@ -2247,6 +2294,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             );
             (invoked, shadow.bytecode_pc, out)
         };
+        self.machine.borrow_mut().context_global = previous;
         self.pop_native_roots();
         let activation = self
             .activations
@@ -2421,6 +2469,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         let outcome = self.invoke_runtime(
             crate::RuntimeFunction { module, function },
             &[],
+            None,
             Value::UNDEFINED,
             Value::UNDEFINED,
             &[],
@@ -2645,7 +2694,11 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     Err(failure) => self.fail(failure),
                 }
             }
-            Ok(CalleeKind::Runtime { target, captures }) => {
+            Ok(CalleeKind::Runtime {
+                target,
+                captures,
+                context,
+            }) => {
                 let flags = {
                     let handle = self.code_ref(target.module);
                     handle.code(target.module).functions()[target.function.get() as usize].flags()
@@ -2672,6 +2725,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 let outcome = self.invoke_runtime(
                     target,
                     &captures,
+                    context,
                     instance,
                     new_target,
                     arguments.as_ref(),
@@ -2991,6 +3045,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                         .machine
                         .borrow()
                         .captures_from_array(module, captures, function);
+                    let context = self.machine.borrow().context_global;
                     match materialized {
                         Ok(captures) => {
                             let prototype = self.machine.borrow().intrinsics.function_prototype;
@@ -2998,6 +3053,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                                 module,
                                 function,
                                 captures,
+                                context,
                                 properties: PropertyMap::default(),
                                 prototype: Some(prototype),
                                 extensible: true,
@@ -4055,14 +4111,13 @@ mod tests {
             )],
             0,
         );
-        let observed = EcmaString::encode("observed");
 
         let mut interpreter_host = SilentHost;
         let mut interpreter = Machine::new(&program, &mut interpreter_host, Limits::default());
         interpreter.evaluate().unwrap();
-        assert!(!interpreter.globals.contains_key(&observed));
+        assert!(interpreter.test_global("observed").is_none());
         let interpreter_drain = interpreter.drain_microtasks().unwrap();
-        let interpreter_value = interpreter.globals.get(&observed).copied();
+        let interpreter_value = interpreter.test_global("observed");
 
         let mut native_host = SilentHost;
         let engine = NativeEngine::new(&program, &NoEntries, &mut native_host, Limits::default());
@@ -4071,9 +4126,9 @@ mod tests {
             .evaluate_reference_module(program.entry())
             .unwrap()
             .expect("native entry completes");
-        assert!(!engine.machine.borrow().globals.contains_key(&observed));
+        assert!(engine.machine.borrow().test_global("observed").is_none());
         let native_drain = engine.machine.borrow_mut().drain_microtasks().unwrap();
-        let native_value = engine.machine.borrow().globals.get(&observed).copied();
+        let native_value = engine.machine.borrow().test_global("observed");
 
         assert_eq!(interpreter_drain, native_drain);
         assert_eq!(interpreter_value, Some(Value::int32(7)));
@@ -4197,6 +4252,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function,
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(prototype),
                 extensible: true,
@@ -4436,14 +4492,13 @@ mod tests {
             )],
             0,
         );
-        let observed = EcmaString::encode("observed");
 
         let mut interpreter_host = SilentHost;
         let mut interpreter = Machine::new(&program, &mut interpreter_host, Limits::default());
         interpreter.evaluate().unwrap();
-        assert!(!interpreter.globals.contains_key(&observed));
+        assert!(interpreter.test_global("observed").is_none());
         let interpreter_drain = interpreter.drain_microtasks().unwrap();
-        let interpreter_value = interpreter.globals.get(&observed).copied();
+        let interpreter_value = interpreter.test_global("observed");
 
         let mut native_host = SilentHost;
         let engine = NativeEngine::new(&program, &NoEntries, &mut native_host, Limits::default());
@@ -4452,9 +4507,9 @@ mod tests {
             .evaluate_reference_module(program.entry())
             .unwrap()
             .expect("native entry completes");
-        assert!(!engine.machine.borrow().globals.contains_key(&observed));
+        assert!(engine.machine.borrow().test_global("observed").is_none());
         let native_drain = engine.machine.borrow_mut().drain_microtasks().unwrap();
-        let native_value = engine.machine.borrow().globals.get(&observed).copied();
+        let native_value = engine.machine.borrow().test_global("observed");
 
         let mut linked_host = SilentHost;
         let linked = NativeEngine::build(
@@ -4472,15 +4527,16 @@ mod tests {
                     function: FunctionId::new(1),
                 },
                 &[],
+                None,
                 Value::UNDEFINED,
                 Value::UNDEFINED,
                 &[],
             ),
             InvokeOutcome::Value(_)
         ));
-        assert!(!linked.machine.borrow().globals.contains_key(&observed));
+        assert!(linked.machine.borrow().test_global("observed").is_none());
         let linked_drain = linked.machine.borrow_mut().drain_microtasks().unwrap();
-        let linked_value = linked.machine.borrow().globals.get(&observed).copied();
+        let linked_value = linked.machine.borrow().test_global("observed");
 
         assert_eq!(interpreter_drain, native_drain);
         assert_eq!(interpreter_value, Some(Value::int32(7)));
@@ -5757,12 +5813,8 @@ mod tests {
 
         assert!(!entries.invoked.get(), "linked entry must not run");
         assert_eq!(
-            engine
-                .machine
-                .borrow()
-                .globals
-                .get(&EcmaString::encode("after")),
-            Some(&Value::int32(7)),
+            engine.machine.borrow().test_global("after"),
+            Some(Value::int32(7)),
         );
     }
 
@@ -5855,12 +5907,8 @@ mod tests {
             "the linked graph must not mix native and interpreter entries"
         );
         assert_eq!(
-            engine
-                .machine
-                .borrow()
-                .globals
-                .get(&EcmaString::encode("after")),
-            Some(&Value::int32(7)),
+            engine.machine.borrow().test_global("after"),
+            Some(Value::int32(7)),
         );
     }
 
@@ -5971,9 +6019,7 @@ mod tests {
             } if value == Value::int32(9)
         ));
         assert!(
-            !machine
-                .globals
-                .contains_key(&EcmaString::encode("root-ran")),
+            machine.test_global("root-ran").is_none(),
             "the root body must not run after a dependency rejects"
         );
 
@@ -6019,11 +6065,7 @@ mod tests {
             "the rejected async graph must not run a linked entry"
         );
         assert!(
-            !engine
-                .machine
-                .borrow()
-                .globals
-                .contains_key(&EcmaString::encode("root-ran")),
+            engine.machine.borrow().test_global("root-ran").is_none(),
             "the linked root body must not run after a dependency rejects"
         );
     }
@@ -7304,6 +7346,7 @@ mod tests {
                     module: ModuleId::new(0),
                     function: FunctionId::new(1),
                     captures: Vec::new(),
+                    context: None,
                     properties: PropertyMap::default(),
                     prototype: Some(function_prototype),
                     extensible: true,
@@ -7498,6 +7541,7 @@ mod tests {
                 function: FunctionId::new(1),
             },
             &[],
+            None,
             Value::UNDEFINED,
             Value::UNDEFINED,
             &[],
@@ -7577,6 +7621,7 @@ mod tests {
                 function: FunctionId::new(0),
             },
             &[],
+            None,
             Value::UNDEFINED,
             Value::UNDEFINED,
             &[],
@@ -7637,6 +7682,7 @@ mod tests {
                 function: FunctionId::new(1),
             },
             &[],
+            None,
             Value::UNDEFINED,
             Value::UNDEFINED,
             &[],
@@ -9387,6 +9433,7 @@ mod tests {
                     module: ModuleId::new(0),
                     function: FunctionId::new(1),
                     captures: Vec::new(),
+                    context: None,
                     properties: PropertyMap::default(),
                     prototype: Some(prototype),
                     extensible: true,

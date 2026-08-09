@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 
 use bamts_bytecode::EcmaString;
-use bamts_native::Value;
+use bamts_native::{Decoded, Value};
 
 use crate::external_modules::InstalledModule;
 use crate::intrinsics::{self, BuiltinDef, BuiltinOutcome, BuiltinTable};
 use crate::{
-    EvalFailure, HeapEntry, Host, Machine, PropertyMap, ScriptCompileError, ScriptSource,
-    ThrowOrigin,
+    EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap, ScriptCompileError,
+    ScriptSource, ThrowOrigin,
 };
 
 pub(crate) fn install<H: Host>(
@@ -157,7 +157,7 @@ fn script_constructor<H: Host>(
     let code = args.first().copied().unwrap_or(Value::UNDEFINED);
     let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
     let (code, name) = source_arguments(machine, code, options)?;
-    let entry = compile_entry(machine, code, name, ScriptAllocation::Object)?;
+    let entry = compile_entry(machine, code, name, ScriptAllocation::Object, None)?;
     let script = machine
         .allocate(HeapEntry::Script {
             entry,
@@ -199,7 +199,7 @@ fn run_in_this_context<H: Host>(
     } else {
         ScriptAllocation::Call
     };
-    let entry = compile_entry(machine, code, name, allocation)?;
+    let entry = compile_entry(machine, code, name, allocation, None)?;
     call_entry(machine, entry, prototype, None)
 }
 
@@ -258,7 +258,7 @@ fn run_in_new_context<H: Host>(
     } else {
         ScriptAllocation::Call
     };
-    let entry = compile_entry(machine, code, name, allocation)?;
+    let entry = compile_entry(machine, code, name, allocation, Some(context))?;
     call_entry(machine, entry, prototype, Some(context))
 }
 
@@ -346,6 +346,7 @@ fn compile_entry<H: Host>(
     code: EcmaString,
     name: EcmaString,
     allocation: ScriptAllocation,
+    context: Option<Value>,
 ) -> Result<Value, EvalFailure> {
     let compiled = {
         let provider = machine
@@ -367,6 +368,7 @@ fn compile_entry<H: Host>(
             module,
             function: machine.module_code(module).entry(),
             captures: Vec::new(),
+            context,
             properties: PropertyMap::default(),
             prototype: Some(machine.intrinsics.function_prototype),
             extensible: true,
@@ -402,18 +404,63 @@ fn script_prototype<H: Host>(machine: &Machine<'_, H>) -> Value {
         .expect("node:vm installs Script.prototype")
 }
 
+fn contextify_global<H: Host>(
+    machine: &mut Machine<'_, H>,
+    context: Value,
+) -> Result<(), EvalFailure> {
+    let Some(Decoded::HeapRef(marker)) = machine.vm_context_marker.decode() else {
+        unreachable!("vm context marker is a private name");
+    };
+    let marker = PropertyKey::Private(marker.slot() - 1);
+    if machine.own_descriptor(context, &marker)?.is_some() {
+        return Ok(());
+    }
+
+    machine.define_descriptor_batch(
+        context,
+        [
+            (
+                PropertyKey::Named(EcmaString::encode("globalThis")),
+                Property::Data {
+                    value: context,
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                },
+            ),
+            (
+                PropertyKey::Named(EcmaString::encode("global")),
+                Property::Data {
+                    value: context,
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                },
+            ),
+            (
+                marker,
+                Property::Data {
+                    value: Value::TRUE,
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                },
+            ),
+        ],
+    )?;
+    Ok(())
+}
+
 fn call_entry<H: Host>(
     machine: &mut Machine<'_, H>,
     entry: Value,
     prototype: Option<Value>,
     context: Option<Value>,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let this_value = context.unwrap_or_else(|| {
-        machine
-            .intrinsics
-            .global("globalThis")
-            .expect("host objects install globalThis")
-    });
+    let this_value = context.unwrap_or(machine.global_object);
+    if let Some(context) = context {
+        contextify_global(machine, context)?;
+    }
     let previous = std::mem::replace(&mut machine.context_global, context);
     let result = machine.call_value(entry, this_value, &[]);
     machine.context_global = previous;
@@ -864,6 +911,170 @@ mod tests {
                 .sources
                 .len(),
             3
+        );
+    }
+
+    #[test]
+    fn contextification_runs_once_and_preserves_alias_mutations() {
+        let program = program_returning(0);
+        let mut host = compiler_host();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let context = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+
+        contextify_global(&mut machine, context).unwrap();
+        machine
+            .set_data_property(context, "globalThis", Value::int32(7))
+            .unwrap();
+        assert!(
+            machine
+                .delete_property(context, &PropertyKey::Named(EcmaString::encode("global")))
+                .unwrap()
+        );
+        contextify_global(&mut machine, context).unwrap();
+
+        assert_eq!(
+            machine.get_named_property(context, "globalThis").unwrap(),
+            Value::int32(7)
+        );
+        assert!(matches!(
+            machine
+                .own_descriptor(
+                    context,
+                    &PropertyKey::Named(EcmaString::encode("globalThis")),
+                )
+                .unwrap(),
+            Some(Property::Data {
+                value,
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            }) if value == Value::int32(7)
+        ));
+        assert!(
+            machine
+                .own_descriptor(context, &PropertyKey::Named(EcmaString::encode("global")),)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn failed_contextification_restores_every_descriptor() {
+        let program = program_returning(0);
+        let mut host = compiler_host();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let context = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        let global_this = PropertyKey::Named(EcmaString::encode("globalThis"));
+        let global = PropertyKey::Named(EcmaString::encode("global"));
+        machine
+            .define_descriptor(
+                context,
+                global_this.clone(),
+                Property::Data {
+                    value: Value::int32(7),
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                },
+            )
+            .unwrap();
+        machine
+            .define_descriptor(
+                context,
+                global.clone(),
+                Property::Data {
+                    value: Value::int32(8),
+                    writable: false,
+                    enumerable: true,
+                    configurable: false,
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            contextify_global(&mut machine, context),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+        assert!(matches!(
+            machine.own_descriptor(context, &global_this).unwrap(),
+            Some(Property::Data {
+                value,
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            }) if value == Value::int32(7)
+        ));
+        assert!(matches!(
+            machine.own_descriptor(context, &global).unwrap(),
+            Some(Property::Data {
+                value,
+                writable: false,
+                enumerable: true,
+                configurable: false,
+            }) if value == Value::int32(8)
+        ));
+        let Some(Decoded::HeapRef(marker)) = machine.vm_context_marker.decode() else {
+            unreachable!();
+        };
+        assert!(
+            machine
+                .own_descriptor(context, &PropertyKey::Private(marker.slot() - 1))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn heap_limit_failure_does_not_partially_contextify() {
+        let program = program_returning(0);
+        let mut host = compiler_host();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let context = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        let bytes = machine.heap_bytes;
+        machine.limits.max_heap_bytes = bytes;
+
+        assert!(matches!(
+            contextify_global(&mut machine, context),
+            Err(EvalFailure::Runtime(
+                RuntimeErrorKind::HeapByteLimitExceeded { .. }
+            ))
+        ));
+        assert_eq!(machine.heap_bytes, bytes);
+        for key in [
+            PropertyKey::Named(EcmaString::encode("globalThis")),
+            PropertyKey::Named(EcmaString::encode("global")),
+        ] {
+            assert!(machine.own_descriptor(context, &key).unwrap().is_none());
+        }
+        let Some(Decoded::HeapRef(marker)) = machine.vm_context_marker.decode() else {
+            unreachable!();
+        };
+        assert!(
+            machine
+                .own_descriptor(context, &PropertyKey::Private(marker.slot() - 1))
+                .unwrap()
+                .is_none()
         );
     }
 

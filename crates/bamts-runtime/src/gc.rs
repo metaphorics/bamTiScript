@@ -128,6 +128,12 @@ impl GcState {
             self.mark_value(&machine.heap, frame.this_value);
             self.mark_value(&machine.heap, frame.new_target);
             self.mark_values(&machine.heap, &frame.args);
+            if let Some(value) = frame.context {
+                self.mark_value(&machine.heap, value);
+            }
+            if let Some(value) = frame.outer_context {
+                self.mark_value(&machine.heap, value);
+            }
             if let Some(value) = frame.arguments_object {
                 self.mark_value(&machine.heap, value);
             }
@@ -135,9 +141,7 @@ impl GcState {
                 self.mark_value(&machine.heap, value);
             }
         }
-        for value in machine.globals.values().copied() {
-            self.mark_value(&machine.heap, value);
-        }
+        self.mark_value(&machine.heap, machine.global_object);
         if let Some(value) = machine.context_global {
             self.mark_value(&machine.heap, value);
         }
@@ -404,6 +408,9 @@ fn trace_activation(
     if let Some(value) = activation.arguments_object {
         mark_value(heap, marks, work, value);
     }
+    if let Some(value) = activation.context {
+        mark_value(heap, marks, work, value);
+    }
 }
 
 fn trace_generator_start(
@@ -416,6 +423,9 @@ fn trace_generator_start(
     mark_value(heap, marks, work, start.this_value);
     mark_value(heap, marks, work, start.new_target);
     trace_values(heap, marks, work, &start.args);
+    if let Some(value) = start.context {
+        mark_value(heap, marks, work, value);
+    }
 }
 
 fn trace_generator_state(
@@ -655,11 +665,15 @@ fn trace_entry(
         }
         HeapEntry::Function {
             captures,
+            context,
             properties,
             prototype,
             ..
         } => {
             trace_values(heap, marks, work, captures);
+            if let Some(value) = context {
+                mark_value(heap, marks, work, *value);
+            }
             trace_properties_and_prototype(properties, *prototype, heap, marks, work);
         }
         HeapEntry::Script {

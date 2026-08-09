@@ -611,6 +611,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(0),
                 captures: Vec::new(),
+                context: None,
                 properties,
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,

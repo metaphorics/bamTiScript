@@ -1957,7 +1957,7 @@ mod tests {
     }
 
     fn root(machine: &mut Machine<'_, TestHost>, name: &str, value: Value) {
-        machine.globals.insert(EcmaString::encode(name), value);
+        machine.test_set_global(name, value);
     }
 
     fn slot(machine: &Machine<'_, TestHost>, value: Value) -> usize {
@@ -1982,7 +1982,7 @@ mod tests {
 
         assert!(matches!(machine.heap[dead_slot], HeapEntry::Vacant));
         assert_eq!(slot(&machine, survivor), survivor_slot);
-        assert_eq!(machine.globals[&EcmaString::encode("survivor")], survivor);
+        assert_eq!(machine.test_global("survivor"), Some(survivor));
         assert!(matches!(
             machine.runtime_slot(dead),
             Err(RuntimeErrorKind::InvalidRuntimeHeapReference { .. })

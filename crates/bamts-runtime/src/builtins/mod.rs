@@ -1430,6 +1430,102 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(())
     }
 
+    /// Defines distinct ordinary properties as one transaction. All descriptor,
+    /// extensibility, and heap-budget checks finish before the first mutation.
+    pub(crate) fn define_descriptor_batch<const N: usize>(
+        &mut self,
+        object: Value,
+        descriptors: [(PropertyKey, Property); N],
+    ) -> Result<(), EvalFailure> {
+        let Some(index) = self.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
+            return Err(type_error("Object.defineProperty called on non-object"));
+        };
+        let extensible = match &self.heap[index] {
+            HeapEntry::Object { extensible, .. }
+            | HeapEntry::Function { extensible, .. }
+            | HeapEntry::Script { extensible, .. }
+            | HeapEntry::NativeFunction { extensible, .. }
+            | HeapEntry::RegExp { extensible, .. }
+            | HeapEntry::Date { extensible, .. }
+            | HeapEntry::BuiltinIterator { extensible, .. }
+            | HeapEntry::Collection { extensible, .. }
+            | HeapEntry::Uint8Array { extensible, .. }
+            | HeapEntry::Timeout { extensible, .. }
+            | HeapEntry::Array { extensible, .. } => *extensible,
+            _ => return Err(type_error("Object.defineProperty called on non-object")),
+        };
+        let mut growth = 0usize;
+        let mut refund = 0usize;
+        for (offset, (key, descriptor)) in descriptors.iter().enumerate() {
+            if descriptors[..offset]
+                .iter()
+                .any(|(existing, _)| existing == key)
+            {
+                return Err(type_error("duplicate property in atomic descriptor batch"));
+            }
+            if matches!(&self.heap[index], HeapEntry::Array { .. })
+                && matches!(key, PropertyKey::Named(name) if name.eq_ascii("length") || crate::array_index(name).is_some())
+            {
+                return Err(type_error(
+                    "atomic descriptor batch cannot contain array index properties",
+                ));
+            }
+            if matches!(&self.heap[index], HeapEntry::Uint8Array { .. })
+                && matches!(key, PropertyKey::Named(name) if crate::uint8array_index(name).is_some())
+            {
+                return Err(type_error(
+                    "atomic descriptor batch cannot contain typed array index properties",
+                ));
+            }
+            let current = self.own_descriptor(object, key)?;
+            if !extensible && current.is_none() {
+                return Err(type_error(
+                    "Cannot define property, object is not extensible",
+                ));
+            }
+            self.validate_property_redefinition(current.as_ref(), descriptor)?;
+            let (added, removed) = match &self.heap[index] {
+                HeapEntry::Object { properties, .. }
+                | HeapEntry::Function { properties, .. }
+                | HeapEntry::Script { properties, .. }
+                | HeapEntry::NativeFunction { properties, .. }
+                | HeapEntry::RegExp { properties, .. }
+                | HeapEntry::Date { properties, .. }
+                | HeapEntry::BuiltinIterator { properties, .. }
+                | HeapEntry::Collection { properties, .. }
+                | HeapEntry::Uint8Array { properties, .. }
+                | HeapEntry::Timeout { properties, .. }
+                | HeapEntry::Array { properties, .. } => {
+                    property_definition_charges(properties, key, descriptor)
+                }
+                _ => unreachable!("validated object cannot change heap entry kind"),
+            };
+            growth = growth.saturating_add(added);
+            refund = refund.saturating_add(removed);
+        }
+        self.charge_slot(index, growth)
+            .map_err(EvalFailure::Runtime)?;
+        let properties = match &mut self.heap[index] {
+            HeapEntry::Object { properties, .. }
+            | HeapEntry::Function { properties, .. }
+            | HeapEntry::Script { properties, .. }
+            | HeapEntry::NativeFunction { properties, .. }
+            | HeapEntry::RegExp { properties, .. }
+            | HeapEntry::Date { properties, .. }
+            | HeapEntry::BuiltinIterator { properties, .. }
+            | HeapEntry::Collection { properties, .. }
+            | HeapEntry::Uint8Array { properties, .. }
+            | HeapEntry::Timeout { properties, .. }
+            | HeapEntry::Array { properties, .. } => properties,
+            _ => unreachable!("validated object cannot change heap entry kind"),
+        };
+        for (key, descriptor) in descriptors {
+            properties.insert(key, descriptor);
+        }
+        self.refund_slot(index, refund);
+        Ok(())
+    }
+
     fn observable_property_key(&mut self, key: Value) -> Result<PropertyKey, EvalFailure> {
         let primitive = self.coerce_primitive_observable(key, true)?;
         Ok(

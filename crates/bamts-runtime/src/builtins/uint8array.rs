@@ -359,7 +359,9 @@ mod tests {
         _args: &[Value],
         _constructing: bool,
     ) -> Result<BuiltinOutcome, EvalFailure> {
-        let target = machine.globals[&EcmaString::encode("joinTarget")];
+        let target = machine
+            .test_global("joinTarget")
+            .expect("test installs join target");
         machine.set_data_property(target, "0", Value::int32(9))?;
         Ok(BuiltinOutcome::Value(allocate_string(
             machine,
@@ -884,9 +886,7 @@ mod tests {
         with_machine(|machine| {
             let source = array_of(machine, &[Value::int32(1), Value::int32(2)]);
             let typed = construct(machine, source);
-            machine
-                .globals
-                .insert(EcmaString::encode("joinTarget"), typed);
+            machine.test_set_global("joinTarget", typed);
             let separator = ordinary_object(machine);
             let to_string = native(machine, "separator toString", separator_mutates_first_byte);
             machine

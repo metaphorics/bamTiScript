@@ -779,6 +779,7 @@ pub(crate) struct GeneratorStart {
     pub(crate) this_value: Value,
     pub(crate) new_target: Value,
     pub(crate) args: Vec<Value>,
+    pub(crate) context: Option<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -790,6 +791,7 @@ pub(crate) struct SuspendedActivation {
     pub(crate) args: Vec<Value>,
     pub(crate) arguments_object: Option<Value>,
     pub(crate) resume_token: u32,
+    pub(crate) context: Option<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -1110,6 +1112,7 @@ enum HeapEntry {
         module: ModuleId,
         function: FunctionId,
         captures: Vec<Value>,
+        context: Option<Value>,
         properties: PropertyMap,
         prototype: Option<Value>,
         extensible: bool,
@@ -1419,6 +1422,8 @@ struct Frame {
     pc: usize,
     registers: Vec<Value>,
     return_to: Option<ReturnTo>,
+    context: Option<Value>,
+    outer_context: Option<Value>,
     this_value: Value,
     new_target: Value,
     args: Vec<Value>,
@@ -1433,6 +1438,7 @@ impl Frame {
         this_value: Value,
         new_target: Value,
         arguments: &[Value],
+        context: Option<Value>,
         return_to: Option<ReturnTo>,
     ) -> Self {
         let mut registers = vec![Value::UNINITIALIZED; metadata.register_count() as usize];
@@ -1454,6 +1460,8 @@ impl Frame {
             pc: 0,
             registers,
             return_to,
+            context,
+            outer_context: None,
             this_value,
             new_target,
             args: arguments.to_vec(),
@@ -1579,6 +1587,7 @@ enum CalleeKind {
     Runtime {
         target: RuntimeFunction,
         captures: Vec<Value>,
+        context: Option<Value>,
     },
     Builtin {
         id: intrinsics::BuiltinId,
@@ -1611,6 +1620,9 @@ pub struct Machine<'a, H: Host> {
     frames: Vec<Frame>,
     heap: Vec<HeapEntry>,
     slot_bytes: Vec<usize>,
+    /// Freed bootstrap bytes that runtime mutations can reuse before they
+    /// consume the runtime heap budget.
+    intrinsic_slot_credits: Vec<usize>,
     machine_bytes: usize,
     intrinsic_slots: usize,
     vacant_count: usize,
@@ -1618,7 +1630,8 @@ pub struct Machine<'a, H: Host> {
     live_registers: usize,
     native_depth: usize,
     fuel: u64,
-    globals: BTreeMap<EcmaString, Value>,
+    global_object: Value,
+    vm_context_marker: Value,
     /// The contextified global used only while executing `node:vm` code.
     ///
     /// `runInNewContext` creates a fresh `globalThis` for each call (or adopts
@@ -1865,17 +1878,27 @@ impl<'a, H: Host> Machine<'a, H> {
             Value::UNDEFINED,
             &[],
             None,
+            None,
         );
         let live_registers = frame.registers.len();
         let mut heap = Vec::new();
         let timers_available = host.timers().is_some();
         let mut intrinsics = intrinsics::Intrinsics::<H>::initialize(&mut heap, timers_available);
+        let global_object = intrinsics
+            .global("globalThis")
+            .expect("host objects install globalThis");
         let script_compiler = host.script_compiler().is_some();
         let installed_external = external_modules::install(
             &mut heap,
             &mut intrinsics.builtins,
             intrinsics.object_prototype,
             script_compiler,
+        );
+        let vm_context_marker = intrinsics::push(
+            &mut heap,
+            HeapEntry::PrivateName {
+                description: EcmaString::encode("vm context"),
+            },
         );
         let argv_text = host.argv().to_vec();
         let argv_values: Vec<Value> = argv_text
@@ -1905,6 +1928,7 @@ impl<'a, H: Host> Machine<'a, H> {
         *elements = argv_values;
         let intrinsic_slots = heap.len();
         let slot_bytes = vec![0; intrinsic_slots];
+        let intrinsic_slot_credits = vec![0; intrinsic_slots];
         let fuel = limits.fuel;
         Self {
             program,
@@ -1917,6 +1941,7 @@ impl<'a, H: Host> Machine<'a, H> {
             frames: vec![frame],
             heap,
             slot_bytes,
+            intrinsic_slot_credits,
             machine_bytes: 0,
             intrinsic_slots,
             vacant_count: 0,
@@ -1937,7 +1962,8 @@ impl<'a, H: Host> Machine<'a, H> {
             ready_timers: BTreeSet::new(),
             timer_watermark: None,
             timer_checkpoint_active: false,
-            globals: BTreeMap::new(),
+            global_object,
+            vm_context_marker,
             context_global: None,
             registry: ModuleRegistry {
                 external: installed_external
@@ -4415,6 +4441,7 @@ impl<'a, H: Host> Machine<'a, H> {
         if let Err(error) = self.push_frame(
             RuntimeFunction { module, function },
             &[],
+            None,
             Value::UNDEFINED,
             Value::UNDEFINED,
             &[],
@@ -4510,6 +4537,7 @@ impl<'a, H: Host> Machine<'a, H> {
         self.push_frame(
             RuntimeFunction { module, function },
             &[],
+            None,
             Value::UNDEFINED,
             Value::UNDEFINED,
             &[],
@@ -5093,6 +5121,7 @@ impl<'a, H: Host> Machine<'a, H> {
                                 module: module_id,
                                 function,
                                 captures,
+                                context: self.frames[frame_index].context,
                                 properties: PropertyMap::default(),
                                 prototype: Some(self.intrinsics.function_prototype),
                                 extensible: true,
@@ -5617,6 +5646,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 {
                     let awaited = self.read_register(frame_index, src.get());
                     let frame = self.frames.pop().expect("async activation is executing");
+                    self.context_global = frame.outer_context;
                     self.pending_async_suspend = Some((
                         awaited,
                         SuspendedActivation {
@@ -5628,6 +5658,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             this_value: frame.this_value,
                             new_target: frame.new_target,
                             args: frame.args,
+                            context: frame.context,
                             arguments_object: frame.arguments_object,
                             resume_token: pc as u32 + 1,
                         },
@@ -5645,6 +5676,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         .frames
                         .pop()
                         .expect("generator activation is executing");
+                    self.context_global = frame.outer_context;
                     self.pending_generator_resume = Some(GeneratorResume::Yield {
                         value,
                         activation: SuspendedActivation {
@@ -5657,6 +5689,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             new_target: frame.new_target,
                             args: frame.args,
                             arguments_object: frame.arguments_object,
+                            context: frame.context,
                             resume_token: pc as u32 + 1,
                         },
                     });
@@ -5802,15 +5835,37 @@ impl<'a, H: Host> Machine<'a, H> {
         bytes: usize,
     ) -> Result<(), RuntimeErrorKind> {
         self.sync_slot_ledger();
-        self.ensure_allocation_capacity(0, bytes)?;
-        self.slot_bytes[index] += bytes;
-        self.heap_bytes += bytes;
+        let credited = self
+            .intrinsic_slot_credits
+            .get(index)
+            .copied()
+            .unwrap_or(0)
+            .min(bytes);
+        let charged = bytes - credited;
+        self.ensure_allocation_capacity(0, charged)?;
+        if let Some(credit) = self.intrinsic_slot_credits.get_mut(index) {
+            *credit -= credited;
+        }
+        self.slot_bytes[index] += charged;
+        self.heap_bytes += charged;
         self.request_garbage_collection();
         Ok(())
     }
 
     pub(crate) fn refund_slot(&mut self, index: usize, bytes: usize) {
         self.sync_slot_ledger();
+        if let Some(credit) = self.intrinsic_slot_credits.get_mut(index) {
+            let refunded = self.slot_bytes[index].min(bytes);
+            self.slot_bytes[index] -= refunded;
+            self.heap_bytes = self
+                .heap_bytes
+                .checked_sub(refunded)
+                .expect("slot refund cannot exceed heap charge");
+            *credit = credit
+                .checked_add(bytes - refunded)
+                .expect("intrinsic slot credit cannot overflow");
+            return;
+        }
         debug_assert!(self.slot_bytes[index] >= bytes);
         debug_assert!(self.heap_bytes >= bytes);
         self.slot_bytes[index] = self.slot_bytes[index]
@@ -5930,23 +5985,15 @@ impl<'a, H: Host> Machine<'a, H> {
             return Ok(Some(value));
         }
         let name = self.constant_text(module, name).to_owned();
-        if let Some(context) = self.context_global {
-            if name.eq_ascii("globalThis") {
-                return Ok(Some(context));
-            }
-            let key = PropertyKey::Named(name.clone());
-            if self.own_descriptor(context, &key)?.is_some() {
-                return self.get_property_key(context, &key).map(Some);
-            }
-            return Ok(self
-                .intrinsics
-                .globals
-                .iter()
-                .find_map(|(candidate, value)| {
-                    (candidate == &name && !candidate.eq_ascii("globalThis")).then_some(*value)
-                }));
+        let key = PropertyKey::Named(name);
+        let global = self.context_global.unwrap_or(self.global_object);
+        if self.has_property(global, &key)? {
+            return self.get_property_key(global, &key).map(Some);
         }
-        Ok(self.resolve_global_binding(&name))
+        if global != self.global_object && self.has_property(self.global_object, &key)? {
+            return self.get_property_key(self.global_object, &key).map(Some);
+        }
+        Ok(None)
     }
 
     pub(crate) fn store_global(
@@ -5979,39 +6026,29 @@ impl<'a, H: Host> Machine<'a, H> {
             self.registry.cells[cell.0].value = value;
         } else {
             let name = self.constant_text(module, name).to_owned();
-            if let Some(context) = self.context_global {
-                self.set_data_property_key(context, PropertyKey::Named(name), value)?;
-                return Ok(());
-            }
-            if let Some(global_this) = self.intrinsics.global("globalThis") {
-                let key = PropertyKey::Named(name.clone());
-                if matches!(
-                    self.own_descriptor(global_this, &key)?,
-                    Some(
-                        Property::Data {
-                            writable: false,
-                            ..
-                        } | Property::Accessor { setter: None, .. }
-                    )
-                ) {
-                    return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                        operation: "assign to non-writable global property",
-                    }));
-                }
-            }
-            self.globals.insert(name, value);
+            let global = self.context_global.unwrap_or(self.global_object);
+            self.set_data_property_key(global, PropertyKey::Named(name), value)?;
         }
         Ok(())
     }
 
-    /// Resolves a true realm global after module bindings have been considered.
-    fn resolve_global_binding(&self, name: &EcmaString) -> Option<Value> {
-        self.globals.get(name).copied().or_else(|| {
-            self.intrinsics
-                .globals
-                .iter()
-                .find_map(|(candidate, value)| (candidate == name).then_some(*value))
-        })
+    #[cfg(test)]
+    fn test_set_global(&mut self, name: &str, value: Value) {
+        let global = self.global_object;
+        self.set_data_property(global, name, value)
+            .expect("test global is writable");
+    }
+
+    #[cfg(test)]
+    fn test_global(&self, name: &str) -> Option<Value> {
+        let key = PropertyKey::Named(EcmaString::encode(name));
+        match self
+            .own_descriptor(self.global_object, &key)
+            .expect("test global descriptor lookup succeeds")
+        {
+            Some(Property::Data { value, .. }) => Some(value),
+            _ => None,
+        }
     }
 
     /// Classifies a callee into the shared dispatch categories.
@@ -6022,6 +6059,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     module,
                     function,
                     captures,
+                    context,
                     ..
                 } => Ok(CalleeKind::Runtime {
                     target: RuntimeFunction {
@@ -6029,6 +6067,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         function: *function,
                     },
                     captures: captures.clone(),
+                    context: *context,
                 }),
                 HeapEntry::NativeFunction { callable, .. } => match callable {
                     NativeCallable::Builtin(id) => Ok(CalleeKind::Builtin { id: *id }),
@@ -6245,6 +6284,7 @@ impl<'a, H: Host> Machine<'a, H> {
         &mut self,
         target: RuntimeFunction,
         captures: &[Value],
+        context: Option<Value>,
         this_value: Value,
         new_target: Value,
         arguments: &[Value],
@@ -6270,9 +6310,10 @@ impl<'a, H: Host> Machine<'a, H> {
                 limit: self.limits.max_total_registers,
             }));
         }
-        let frame = Frame::new(
-            target, metadata, captures, this_value, new_target, arguments, return_to,
+        let mut frame = Frame::new(
+            target, metadata, captures, this_value, new_target, arguments, context, return_to,
         );
+        frame.outer_context = std::mem::replace(&mut self.context_global, context);
         self.live_registers += next_registers;
         self.frames.push(frame);
         Ok(())
@@ -6359,7 +6400,11 @@ impl<'a, H: Host> Machine<'a, H> {
         let mut arguments = Cow::Borrowed(arguments);
         loop {
             match self.callee_kind(callee) {
-                Ok(CalleeKind::Runtime { target, captures }) => {
+                Ok(CalleeKind::Runtime {
+                    target,
+                    captures,
+                    context,
+                }) => {
                     let flags = self.module_code(target.module).functions()
                         [target.function.get() as usize]
                         .flags();
@@ -6368,6 +6413,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             .create_async_generator(GeneratorStart {
                                 target,
                                 captures,
+                                context,
                                 this_value,
                                 new_target,
                                 args: arguments.as_ref().to_vec(),
@@ -6383,6 +6429,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             .create_generator(GeneratorStart {
                                 target,
                                 captures,
+                                context,
                                 this_value,
                                 new_target,
                                 args: arguments.as_ref().to_vec(),
@@ -6397,6 +6444,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         return match self.start_async_call(
                             target,
                             &captures,
+                            context,
                             this_value,
                             new_target,
                             arguments.as_ref(),
@@ -6413,6 +6461,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     return self.push_frame(
                         target,
                         &captures,
+                        context,
                         this_value,
                         new_target,
                         arguments.as_ref(),
@@ -6732,12 +6781,16 @@ impl<'a, H: Host> Machine<'a, H> {
         key: PropertyKey,
         value: Value,
     ) -> Result<(), EvalFailure> {
-        match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
-            Some(index) => self.set_own_data(index, key, value),
-            None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "set property on primitive",
-            })),
-        }
+        self.define_descriptor(
+            object,
+            key,
+            Property::Data {
+                value,
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            },
+        )
     }
 
     pub(crate) fn is_callable(&self, value: Value) -> Result<bool, EvalFailure> {
@@ -6899,7 +6952,11 @@ impl<'a, H: Host> Machine<'a, H> {
                     })),
                 }
             }
-            CalleeKind::Runtime { target, captures } => {
+            CalleeKind::Runtime {
+                target,
+                captures,
+                context,
+            } => {
                 let flags = self.module_code(target.module).functions()
                     [target.function.get() as usize]
                     .flags();
@@ -6917,8 +6974,10 @@ impl<'a, H: Host> Machine<'a, H> {
                     call_pc: frame.pc,
                     constructed: Some(object),
                 });
-                self.push_frame(target, &captures, object, callee, arguments, return_to)
-                    .map_err(|error| EvalFailure::Runtime(error.kind))?;
+                self.push_frame(
+                    target, &captures, context, object, callee, arguments, return_to,
+                )
+                .map_err(|error| EvalFailure::Runtime(error.kind))?;
                 self.callback_boundaries.push(stop_depth);
                 let result = self.run_loop(stop_depth);
                 self.callback_boundaries
@@ -6985,7 +7044,11 @@ impl<'a, H: Host> Machine<'a, H> {
                         } => return self.enqueue_async_generator_next(generator, resume_value),
                     }
                 }
-                CalleeKind::Runtime { target, captures } => {
+                CalleeKind::Runtime {
+                    target,
+                    captures,
+                    context,
+                } => {
                     let flags = self.module_code(target.module).functions()
                         [target.function.get() as usize]
                         .flags();
@@ -6994,6 +7057,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             .create_async_generator(GeneratorStart {
                                 target,
                                 captures,
+                                context,
                                 this_value,
                                 new_target: Value::UNDEFINED,
                                 args: arguments.as_ref().to_vec(),
@@ -7004,6 +7068,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         return self
                             .create_generator(GeneratorStart {
                                 target,
+                                context,
                                 captures,
                                 this_value,
                                 new_target: Value::UNDEFINED,
@@ -7015,6 +7080,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         return self.start_async_call(
                             target,
                             &captures,
+                            context,
                             this_value,
                             Value::UNDEFINED,
                             arguments.as_ref(),
@@ -7029,6 +7095,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     self.push_frame(
                         target,
                         &captures,
+                        context,
                         this_value,
                         Value::UNDEFINED,
                         arguments.as_ref(),
@@ -7078,12 +7145,14 @@ impl<'a, H: Host> Machine<'a, H> {
     fn unwind_frames_to(&mut self, depth: usize) {
         while self.frames.len() > depth {
             let frame = self.frames.pop().expect("frame depth was checked");
+            self.context_global = frame.outer_context;
             self.live_registers -= frame.registers.len();
         }
     }
 
     fn complete_frame(&mut self, returned: Value) -> Option<Execution> {
         let frame = self.frames.pop().expect("an activation is executing");
+        self.context_global = frame.outer_context;
         self.live_registers -= frame.registers.len();
         match frame.return_to {
             None => {
@@ -7178,6 +7247,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 return Ok(());
             }
             let frame = self.frames.pop().expect("throw walks live frames");
+            self.context_global = frame.outer_context;
             self.live_registers -= frame.registers.len();
             match frame.return_to {
                 Some(return_to) => search_pc = return_to.call_pc,
@@ -8275,15 +8345,26 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Uint8Array { properties, .. }
             | HeapEntry::Promise { properties, .. }
             | HeapEntry::Timeout { properties, .. } => {
-                properties.insert(
-                    key,
-                    Property::Data {
+                let descriptor = match properties.get(&key) {
+                    Some(Property::Data {
+                        writable,
+                        enumerable,
+                        configurable,
+                        ..
+                    }) => Property::Data {
+                        value,
+                        writable: *writable,
+                        enumerable: *enumerable,
+                        configurable: *configurable,
+                    },
+                    _ => Property::Data {
                         value,
                         writable: true,
                         enumerable: true,
                         configurable: true,
                     },
-                );
+                };
+                properties.insert(key, descriptor);
                 Ok(())
             }
             HeapEntry::Array {
@@ -8307,27 +8388,50 @@ impl<'a, H: Host> Machine<'a, H> {
                             }
                             elements[offset] = value;
                         } else {
-                            properties.insert(
-                                PropertyKey::Named(name),
-                                Property::Data {
+                            let key = PropertyKey::Named(name);
+                            let descriptor = match properties.get(&key) {
+                                Some(Property::Data {
+                                    writable,
+                                    enumerable,
+                                    configurable,
+                                    ..
+                                }) => Property::Data {
+                                    value,
+                                    writable: *writable,
+                                    enumerable: *enumerable,
+                                    configurable: *configurable,
+                                },
+                                _ => Property::Data {
                                     value,
                                     writable: true,
                                     enumerable: true,
                                     configurable: true,
                                 },
-                            );
+                            };
+                            properties.insert(key, descriptor);
                         }
                     }
                     identity @ (PropertyKey::Symbol(_) | PropertyKey::Private(_)) => {
-                        properties.insert(
-                            identity,
-                            Property::Data {
+                        let descriptor = match properties.get(&identity) {
+                            Some(Property::Data {
+                                writable,
+                                enumerable,
+                                configurable,
+                                ..
+                            }) => Property::Data {
+                                value,
+                                writable: *writable,
+                                enumerable: *enumerable,
+                                configurable: *configurable,
+                            },
+                            _ => Property::Data {
                                 value,
                                 writable: true,
                                 enumerable: true,
                                 configurable: true,
                             },
-                        );
+                        };
+                        properties.insert(identity, descriptor);
                     }
                 }
                 Ok(())
@@ -8810,6 +8914,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 .push_frame(
                     start.target,
                     &start.captures,
+                    start.context,
                     start.this_value,
                     start.new_target,
                     &start.args,
@@ -8880,8 +8985,11 @@ impl<'a, H: Host> Machine<'a, H> {
             new_target: activation.new_target,
             args: activation.args,
             arguments_object: activation.arguments_object,
+            context: activation.context,
+            outer_context: None,
         };
         frame.registers[dst.get() as usize] = resume_value;
+        frame.outer_context = std::mem::replace(&mut self.context_global, frame.context);
         self.frames.push(frame);
         Ok(())
     }
@@ -9012,6 +9120,7 @@ impl<'a, H: Host> Machine<'a, H> {
         &mut self,
         target: RuntimeFunction,
         captures: &[Value],
+        context: Option<Value>,
         this_value: Value,
         new_target: Value,
         arguments: &[Value],
@@ -9025,7 +9134,7 @@ impl<'a, H: Host> Machine<'a, H> {
             constructed: None,
         });
         self.push_frame(
-            target, captures, this_value, new_target, arguments, return_to,
+            target, captures, context, this_value, new_target, arguments, return_to,
         )
         .map_err(|error| EvalFailure::Runtime(error.kind))?;
         let step = self.drive_async_activation(stop_depth, None);
@@ -9085,6 +9194,8 @@ impl<'a, H: Host> Machine<'a, H> {
             new_target: activation.new_target,
             args: activation.args,
             arguments_object: activation.arguments_object,
+            context: activation.context,
+            outer_context: None,
         };
         let inject = match rejection {
             None => {
@@ -9093,6 +9204,7 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             Some(origin) => Some((value, origin, suspend_pc)),
         };
+        frame.outer_context = std::mem::replace(&mut self.context_global, frame.context);
         self.frames.push(frame);
         let step = self.drive_async_activation(stop_depth, inject);
         match self.settle_async_step(record, promise, step) {
@@ -9355,6 +9467,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     .push_frame(
                         start.target,
                         &start.captures,
+                        start.context,
                         start.this_value,
                         start.new_target,
                         &start.args,
@@ -12110,6 +12223,91 @@ mod tests {
     }
 
     #[test]
+    fn failed_intrinsic_slot_charge_preserves_credit_and_ledgers() {
+        with_machine(Limits::default(), |machine| {
+            let global = machine.global_object;
+            let index = machine.runtime_slot(global).unwrap().unwrap();
+            assert!(
+                machine
+                    .delete_property(
+                        global,
+                        &PropertyKey::Named(EcmaString::encode("globalThis")),
+                    )
+                    .unwrap()
+            );
+            let credit = machine.intrinsic_slot_credits[index];
+            assert!(credit > 0);
+            let slot_bytes = machine.slot_bytes[index];
+            let heap_bytes = machine.heap_bytes;
+            machine.limits.max_heap_bytes = heap_bytes;
+
+            assert!(matches!(
+                machine.charge_slot(index, credit + 1),
+                Err(RuntimeErrorKind::HeapByteLimitExceeded { .. })
+            ));
+            assert_eq!(machine.intrinsic_slot_credits[index], credit);
+            assert_eq!(machine.slot_bytes[index], slot_bytes);
+            assert_eq!(machine.heap_bytes, heap_bytes);
+            machine.assert_heap_ledger();
+        });
+    }
+
+    #[test]
+    fn intrinsic_property_churn_tracks_only_bytes_above_bootstrap() {
+        with_machine(Limits::default(), |machine| {
+            let global = machine.global_object;
+            let index = machine.runtime_slot(global).unwrap().unwrap();
+            let property_bytes = |machine: &Machine<'_, TestHost>| match &machine.heap[index] {
+                HeapEntry::Object { properties, .. } => properties.charge_bytes(),
+                _ => panic!("global object remains ordinary"),
+            };
+            let baseline = property_bytes(machine);
+            let assert_accounted = |machine: &Machine<'_, TestHost>| {
+                let current = property_bytes(machine);
+                assert_eq!(machine.slot_bytes[index], current.saturating_sub(baseline));
+                assert_eq!(
+                    machine.intrinsic_slot_credits[index],
+                    baseline.saturating_sub(current)
+                );
+                machine.assert_heap_ledger();
+            };
+            assert_accounted(machine);
+
+            let global_this = PropertyKey::Named(EcmaString::encode("globalThis"));
+            assert!(machine.delete_property(global, &global_this).unwrap());
+            assert_accounted(machine);
+
+            let replacement =
+                PropertyKey::Named(EcmaString::encode("global-replacement-with-a-long-name"));
+            machine
+                .set_data_property_key(global, replacement.clone(), Value::int32(1))
+                .unwrap();
+            assert_accounted(machine);
+
+            machine
+                .define_descriptor(
+                    global,
+                    replacement.clone(),
+                    Property::Accessor {
+                        getter: None,
+                        setter: None,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                )
+                .unwrap();
+            assert_accounted(machine);
+
+            assert!(machine.delete_property(global, &replacement).unwrap());
+            assert_accounted(machine);
+            machine
+                .set_data_property_key(global, global_this, global)
+                .unwrap();
+            assert_accounted(machine);
+        });
+    }
+
+    #[test]
     fn gc_pending_arms_after_successful_mutations_without_preflight_side_effects() {
         with_machine(Limits::default(), |machine| {
             machine.set_gc_watermarks_for_test(usize::MAX, 1);
@@ -12162,7 +12360,7 @@ mod tests {
             let value = machine
                 .allocate(HeapEntry::String(EcmaString::encode("x")))
                 .unwrap();
-            machine.globals.insert(EcmaString::encode("live"), value);
+            machine.test_set_global("live", value);
 
             machine.collect_garbage();
 
@@ -12289,6 +12487,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(0),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -12770,9 +12969,7 @@ mod tests {
             );
             machine.assert_heap_ledger();
 
-            machine
-                .globals
-                .insert(EcmaString::encode("promiseAllOutput"), output);
+            machine.test_set_global("promiseAllOutput", output);
             machine.collect_garbage();
             assert!(matches!(machine.heap[aggregate_index], HeapEntry::Vacant));
             assert_eq!(machine.slot_bytes[aggregate_index], 0);
@@ -13158,6 +13355,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(function),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -13552,6 +13750,8 @@ mod tests {
             new_target: Value::UNDEFINED,
             args: Vec::new(),
             arguments_object: None,
+            context: None,
+            outer_context: None,
         });
         machine.limits.max_call_depth = machine.frames.len();
 
@@ -13731,7 +13931,7 @@ mod tests {
         let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
 
         assert_eq!(machine.live_registers, 0, "calling must not start the body");
-        assert_eq!(machine.globals.get(&EcmaString::encode("started")), None);
+        assert_eq!(machine.test_global("started"), None);
         let index = machine.runtime_slot(generator).unwrap().unwrap();
         assert!(matches!(
             machine.heap[index],
@@ -13753,10 +13953,7 @@ mod tests {
         let capability = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
         assert!(pending_promise(&machine, capability));
         machine.drain_microtasks().unwrap();
-        assert_eq!(
-            machine.globals.get(&EcmaString::encode("started")),
-            Some(&Value::int32(1)),
-        );
+        assert_eq!(machine.test_global("started"), Some(Value::int32(1)));
         assert_eq!(
             settled_iterator_result(&mut machine, capability),
             (Value::int32(1), true),
@@ -13858,7 +14055,7 @@ mod tests {
         machine.live_registers = 0;
         let awaited = machine.create_promise().unwrap();
         machine.resolve_promise(awaited, Value::int32(9)).unwrap();
-        machine.globals.insert(EcmaString::encode("p"), awaited);
+        machine.test_set_global("p", awaited);
         let callable = generator_callable(&mut machine, 1);
         let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
 
@@ -13908,7 +14105,7 @@ mod tests {
         machine.frames.clear();
         machine.live_registers = 0;
         let awaited = machine.create_promise().unwrap();
-        machine.globals.insert(EcmaString::encode("p"), awaited);
+        machine.test_set_global("p", awaited);
         let callable = generator_callable(&mut machine, 1);
         let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
         async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
@@ -13957,7 +14154,7 @@ mod tests {
         machine.live_registers = 0;
         let yielded = machine.create_promise().unwrap();
         machine.resolve_promise(yielded, Value::int32(41)).unwrap();
-        machine.globals.insert(EcmaString::encode("p"), yielded);
+        machine.test_set_global("p", yielded);
         let callable = generator_callable(&mut machine, 1);
         let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
 
@@ -14161,7 +14358,7 @@ mod tests {
         machine.live_registers = 0;
         let returned = machine.create_promise().unwrap();
         machine.resolve_promise(returned, Value::int32(1)).unwrap();
-        machine.globals.insert(EcmaString::encode("p"), returned);
+        machine.test_set_global("p", returned);
         let callable = generator_callable(&mut machine, 1);
         let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
 
@@ -14204,7 +14401,7 @@ mod tests {
         machine
             .reject_promise(returned, Value::int32(5), ThrowOrigin::Bytecode)
             .unwrap();
-        machine.globals.insert(EcmaString::encode("p"), returned);
+        machine.test_set_global("p", returned);
         let callable = generator_callable(&mut machine, 1);
         let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
 
@@ -14438,6 +14635,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(1),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -14477,6 +14675,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(1),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -14599,6 +14798,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(1),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -14609,6 +14809,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(2),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -15512,6 +15713,59 @@ mod tests {
     }
 
     #[test]
+    fn set_preserves_attributes_but_create_data_property_resets_them() {
+        with_machine(Limits::default(), |machine| {
+            let object = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let key = PropertyKey::Named(EcmaString::encode("x"));
+            machine
+                .define_descriptor(
+                    object,
+                    key.clone(),
+                    Property::Data {
+                        value: Value::int32(1),
+                        writable: true,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                )
+                .unwrap();
+
+            machine
+                .set_data_property_key(object, key.clone(), Value::int32(2))
+                .unwrap();
+            assert!(matches!(
+                machine.own_descriptor(object, &key).unwrap(),
+                Some(Property::Data {
+                    value,
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                }) if value == Value::int32(2)
+            ));
+
+            machine
+                .create_data_property_key(object, key.clone(), Value::int32(3))
+                .unwrap();
+            assert!(matches!(
+                machine.own_descriptor(object, &key).unwrap(),
+                Some(Property::Data {
+                    value,
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                }) if value == Value::int32(3)
+            ));
+        });
+    }
+
+    #[test]
     fn accessor_getter_is_invoked_on_property_read() {
         // Define a getter returning 99, then read the property.
         let entry = function(
@@ -15728,7 +15982,7 @@ mod tests {
                 boxed_primitive: None,
             })
             .unwrap();
-        machine.globals.insert(EcmaString::encode("sealed"), sealed);
+        machine.test_set_global("sealed", sealed);
         let error = machine
             .run()
             .expect_err("DefineDataProperty on a non-extensible object must throw");
@@ -16353,7 +16607,7 @@ mod tests {
                 extensible: true,
             })
             .unwrap();
-        machine.globals.insert(EcmaString::encode("o"), object);
+        machine.test_set_global("o", object);
         let execution = machine.evaluate().unwrap();
         assert_eq!(execution.value, sentinel);
         assert_ne!(
@@ -16515,12 +16769,8 @@ mod tests {
         };
         let allowed = mk(&mut machine, false);
         let blocked = mk(&mut machine, true);
-        machine
-            .globals
-            .insert(EcmaString::encode("allowed"), allowed);
-        machine
-            .globals
-            .insert(EcmaString::encode("blocked"), blocked);
+        machine.test_set_global("allowed", allowed);
+        machine.test_set_global("blocked", blocked);
         let execution = machine.evaluate().unwrap();
         assert_eq!(execution.value, Value::TRUE);
         assert_eq!(execution.entry_registers[3], Value::TRUE);
@@ -16963,6 +17213,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(1),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -18817,6 +19068,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(1),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -18930,6 +19182,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(2),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -20528,10 +20781,7 @@ mod tests {
 
         assert_eq!(execution.value, Value::int32(7));
         assert_eq!(execution.entry_registers[1], Value::int32(7));
-        assert_eq!(
-            machine.globals.get(&EcmaString::encode("after")),
-            Some(&Value::int32(7)),
-        );
+        assert_eq!(machine.test_global("after"), Some(Value::int32(7)));
     }
 
     #[test]
@@ -21489,6 +21739,7 @@ mod tests {
                 module,
                 function: FunctionId::new(0),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -21636,6 +21887,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(1),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -21646,6 +21898,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(2),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -21670,16 +21923,8 @@ mod tests {
         machine
             .call_value(then, promise, &[observer])
             .expect("then returns a derived Promise");
-        let resolve = machine
-            .globals
-            .get(&EcmaString::encode("resolve"))
-            .copied()
-            .unwrap();
-        let reject = machine
-            .globals
-            .get(&EcmaString::encode("reject"))
-            .copied()
-            .unwrap();
+        let resolve = machine.test_global("resolve").unwrap();
+        let reject = machine.test_global("reject").unwrap();
         assert_eq!(
             machine
                 .call_value(resolve, Value::UNDEFINED, &[Value::int32(1)])
@@ -21692,22 +21937,12 @@ mod tests {
                 .unwrap(),
             Value::UNDEFINED
         );
-        assert!(
-            !machine
-                .globals
-                .contains_key(&EcmaString::encode("observed"))
-        );
+        assert!(machine.test_global("observed").is_none());
 
         let drain = machine.drain_microtasks().unwrap();
         assert_eq!(drain.executed, 1);
         assert!(drain.uncaught.is_empty());
-        assert_eq!(
-            machine
-                .globals
-                .get(&EcmaString::encode("observed"))
-                .copied(),
-            Some(Value::int32(1))
-        );
+        assert_eq!(machine.test_global("observed"), Some(Value::int32(1)));
     }
 
     #[test]
@@ -21810,6 +22045,7 @@ mod tests {
                     module: ModuleId::new(0),
                     function: FunctionId::new(function),
                     captures: Vec::new(),
+                    context: None,
                     properties: PropertyMap::default(),
                     prototype: Some(machine.intrinsics.function_prototype),
                     extensible: true,
@@ -21846,16 +22082,8 @@ mod tests {
         else {
             panic!("Promise construction returns a Promise");
         };
-        let resolve = machine
-            .globals
-            .get(&EcmaString::encode("resolve"))
-            .copied()
-            .unwrap();
-        let reject = machine
-            .globals
-            .get(&EcmaString::encode("reject"))
-            .copied()
-            .unwrap();
+        let resolve = machine.test_global("resolve").unwrap();
+        let reject = machine.test_global("reject").unwrap();
         machine
             .call_value(resolve, Value::UNDEFINED, &[thenable])
             .unwrap();
@@ -21864,22 +22092,12 @@ mod tests {
         machine
             .call_value(reject, Value::UNDEFINED, &[Value::int32(9)])
             .unwrap();
-        assert!(
-            !machine
-                .globals
-                .contains_key(&EcmaString::encode("observed"))
-        );
+        assert!(machine.test_global("observed").is_none());
 
         let drain = machine.drain_microtasks().unwrap();
         assert_eq!(drain.executed, 2);
         assert!(drain.uncaught.is_empty());
-        assert_eq!(
-            machine
-                .globals
-                .get(&EcmaString::encode("observed"))
-                .copied(),
-            Some(Value::int32(7))
-        );
+        assert_eq!(machine.test_global("observed"), Some(Value::int32(7)));
     }
 
     #[test]
@@ -21991,6 +22209,7 @@ mod tests {
                     module: ModuleId::new(0),
                     function: FunctionId::new(function),
                     captures: Vec::new(),
+                    context: None,
                     properties: PropertyMap::default(),
                     prototype: Some(machine.intrinsics.function_prototype),
                     extensible: true,
@@ -22009,8 +22228,8 @@ mod tests {
                 length_writable: true,
             })
             .unwrap();
-        machine.globals.insert(EcmaString::encode("order"), order);
-        machine.globals.insert(EcmaString::encode("third"), third);
+        machine.test_set_global("order", order);
+        machine.test_set_global("third", third);
         let queue = machine.intrinsics.global("queueMicrotask").unwrap();
         machine
             .call_value(queue, Value::UNDEFINED, &[first])
@@ -22082,6 +22301,7 @@ mod tests {
                     module: ModuleId::new(0),
                     function: FunctionId::new(function),
                     captures: Vec::new(),
+                    context: None,
                     properties: PropertyMap::default(),
                     prototype: Some(machine.intrinsics.function_prototype),
                     extensible: true,
@@ -22107,13 +22327,7 @@ mod tests {
                 origin: ThrowOrigin::Bytecode,
             }]
         );
-        assert_eq!(
-            machine
-                .globals
-                .get(&EcmaString::encode("observed"))
-                .copied(),
-            Some(Value::int32(1))
-        );
+        assert_eq!(machine.test_global("observed"), Some(Value::int32(1)));
     }
 
     #[test]
@@ -22152,6 +22366,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(1),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -22347,11 +22562,20 @@ mod tests {
     }
 
     fn timer_fn(machine: &mut Machine<'_, TimerTestHost>, index: u32) -> Value {
+        timer_fn_in_context(machine, index, None)
+    }
+
+    fn timer_fn_in_context(
+        machine: &mut Machine<'_, TimerTestHost>,
+        index: u32,
+        context: Option<Value>,
+    ) -> Value {
         machine
             .allocate(HeapEntry::Function {
                 module: ModuleId::new(0),
                 function: FunctionId::new(index),
                 captures: Vec::new(),
+                context,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -22360,7 +22584,7 @@ mod tests {
     }
 
     fn read_global(machine: &Machine<'_, TimerTestHost>, name: &str) -> Option<Value> {
-        machine.globals.get(&EcmaString::encode(name)).copied()
+        machine.test_global(name)
     }
 
     fn set_timeout_global(machine: &Machine<'_, TimerTestHost>) -> Value {
@@ -22382,7 +22606,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_jobs_restore_their_captured_contexts() {
+    fn deferred_jobs_do_not_override_callback_lexical_context() {
         let program = timer_program();
         let mut host = TimerTestHost::default();
         let shared = host.provider.state.clone();
@@ -22391,19 +22615,23 @@ mod tests {
         machine.live_registers = 0;
         let first = test_context(&mut machine);
         let second = test_context(&mut machine);
-        let write_a = timer_fn(&mut machine, 1);
-        let write_b = timer_fn(&mut machine, 2);
+        let write_root_a = timer_fn(&mut machine, 1);
+        let write_first_b = timer_fn_in_context(&mut machine, 2, Some(first));
+        let write_second_a = timer_fn_in_context(&mut machine, 1, Some(second));
 
         machine.context_global = Some(first);
-        machine.enqueue_microtask_callback(write_a).unwrap();
-        let promise = machine.create_promise().unwrap();
-        machine
-            .promise_then(promise, write_b, Value::UNDEFINED)
-            .unwrap();
+        machine.enqueue_microtask_callback(write_root_a).unwrap();
 
         machine.context_global = Some(second);
-        machine.enqueue_microtask_callback(write_b).unwrap();
-        machine.schedule_timeout(write_a, 1, Vec::new()).unwrap();
+        let promise = machine.create_promise().unwrap();
+        machine
+            .promise_then(promise, write_first_b, Value::UNDEFINED)
+            .unwrap();
+
+        machine.context_global = Some(first);
+        machine
+            .schedule_timeout(write_second_a, 1, Vec::new())
+            .unwrap();
         machine.context_global = None;
 
         machine.fulfill_promise(promise, Value::UNDEFINED).unwrap();
@@ -22414,9 +22642,11 @@ mod tests {
         });
         machine.run_one_expired_timer().unwrap();
 
+        assert_eq!(read_global(&machine, "a"), Some(Value::int32(1)));
+        assert_eq!(read_global(&machine, "b"), None);
         assert_eq!(
             machine.get_named_property(first, "a").unwrap(),
-            Value::int32(1)
+            Value::UNDEFINED
         );
         assert_eq!(
             machine.get_named_property(first, "b").unwrap(),
@@ -22428,10 +22658,8 @@ mod tests {
         );
         assert_eq!(
             machine.get_named_property(second, "b").unwrap(),
-            Value::int32(1)
+            Value::UNDEFINED
         );
-        assert_eq!(read_global(&machine, "a"), None);
-        assert_eq!(read_global(&machine, "b"), None);
         assert_eq!(machine.context_global, None);
     }
 
@@ -22460,9 +22688,7 @@ mod tests {
         _constructing: bool,
     ) -> Result<BuiltinOutcome, EvalFailure> {
         let callback = machine
-            .globals
-            .get(&EcmaString::encode("nestedCallback"))
-            .copied()
+            .test_global("nestedCallback")
             .expect("test installs nested callback");
         let set_timeout = set_timeout_global(machine);
         machine.call_value(set_timeout, Value::UNDEFINED, &[callback, Value::int32(1)])?;
@@ -22476,9 +22702,7 @@ mod tests {
         _constructing: bool,
     ) -> Result<BuiltinOutcome, EvalFailure> {
         let callback = machine
-            .globals
-            .get(&EcmaString::encode("recursiveTimerCallback"))
-            .copied()
+            .test_global("recursiveTimerCallback")
             .expect("test installs recursive timer callback");
         let set_timeout = set_timeout_global(machine);
         machine.call_value(set_timeout, Value::UNDEFINED, &[callback, Value::int32(0)])?;
@@ -22760,9 +22984,7 @@ mod tests {
         machine.live_registers = 0;
         let set_timeout = set_timeout_global(&machine);
         let nested = timer_fn(&mut machine, 2);
-        machine
-            .globals
-            .insert(EcmaString::encode("nestedCallback"), nested);
+        machine.test_set_global("nestedCallback", nested);
         let creator = timer_native(&mut machine, "schedule nested", schedule_nested_timer);
         machine
             .call_value(set_timeout, Value::UNDEFINED, &[creator, Value::int32(1)])
@@ -23188,15 +23410,13 @@ mod tests {
                 length_writable: true,
             })
             .unwrap();
-        machine.globals.insert(EcmaString::encode("order"), order);
+        machine.test_set_global("order", order);
         order
     }
 
     fn order_markers(machine: &Machine<'_, TimerTestHost>) -> Vec<Value> {
         let order = machine
-            .globals
-            .get(&EcmaString::encode("order"))
-            .copied()
+            .test_global("order")
             .expect("order array is installed");
         let index = machine
             .runtime_slot(order)
@@ -23213,9 +23433,7 @@ mod tests {
         global: &str,
     ) -> Result<BuiltinOutcome, EvalFailure> {
         let job = machine
-            .globals
-            .get(&EcmaString::encode(global))
-            .copied()
+            .test_global(global)
             .unwrap_or_else(|| panic!("test installs the {global} job"));
         let queue = machine
             .intrinsics
@@ -23269,7 +23487,7 @@ mod tests {
         first.live_registers = 0;
         install_order_array(&mut first);
         let first_job = timer_fn(&mut first, 2);
-        first.globals.insert(EcmaString::encode("job"), first_job);
+        first.test_set_global("job", first_job);
         let snapshot = first.evaluate().unwrap();
         assert!(order_markers(&first).is_empty());
         first.run_to_quiescence().unwrap();
@@ -23282,7 +23500,7 @@ mod tests {
         second.live_registers = 0;
         install_order_array(&mut second);
         let second_job = timer_fn(&mut second, 2);
-        second.globals.insert(EcmaString::encode("job"), second_job);
+        second.test_set_global("job", second_job);
         let execution = second.run().unwrap();
         assert_eq!(execution, snapshot);
     }
@@ -23298,7 +23516,7 @@ mod tests {
         let first = timer_fn(&mut machine, 1); // pushes 1, queues "job"
         let second = timer_fn(&mut machine, 2); // pushes 2
         let third = timer_fn(&mut machine, 3); // pushes 3
-        machine.globals.insert(EcmaString::encode("job"), third);
+        machine.test_set_global("job", third);
         let queue = machine.intrinsics.global("queueMicrotask").unwrap();
         machine
             .call_value(queue, Value::UNDEFINED, &[first])
@@ -23327,7 +23545,7 @@ mod tests {
         let first = timer_fn(&mut machine, 1); // pushes 1, queues "job"
         let second = timer_fn(&mut machine, 3); // pushes 3
         let microtask = timer_fn(&mut machine, 2); // pushes 2
-        machine.globals.insert(EcmaString::encode("job"), microtask);
+        machine.test_set_global("job", microtask);
         let set_timeout = set_timeout_global(&machine);
         machine
             .call_value(set_timeout, Value::UNDEFINED, &[first, Value::int32(5)])
@@ -23363,9 +23581,7 @@ mod tests {
         machine.frames.clear();
         machine.live_registers = 0;
         let nested = timer_fn(&mut machine, 2);
-        machine
-            .globals
-            .insert(EcmaString::encode("nestedCallback"), nested);
+        machine.test_set_global("nestedCallback", nested);
         let creator = timer_native(&mut machine, "schedule nested", schedule_nested_timer);
         let set_timeout = set_timeout_global(&machine);
         shared.borrow_mut().auto_report = true;
@@ -23461,17 +23677,13 @@ mod tests {
         _constructing: bool,
     ) -> Result<BuiltinOutcome, EvalFailure> {
         let current = machine
-            .globals
-            .get(&EcmaString::encode("count"))
-            .copied()
+            .test_global("count")
             .and_then(|v| match v.decode() {
                 Some(Decoded::Int32(i)) => Some(i),
                 _ => None,
             })
             .unwrap_or(0);
-        machine
-            .globals
-            .insert(EcmaString::encode("count"), Value::int32(current + 1));
+        machine.test_set_global("count", Value::int32(current + 1));
         Ok(BuiltinOutcome::Value(Value::UNDEFINED))
     }
 
@@ -23639,9 +23851,7 @@ mod tests {
         machine.frames.clear();
         machine.live_registers = 0;
         let suppressed_microtask = timer_fn(&mut machine, 2); // stores b = 1
-        machine
-            .globals
-            .insert(EcmaString::encode("nestedCallback"), suppressed_microtask);
+        machine.test_set_global("nestedCallback", suppressed_microtask);
         let thrower = timer_native(&mut machine, "queue then throw", queue_job_then_throw);
         let later_timer = timer_fn(&mut machine, 1); // stores a = 1
         let set_timeout = set_timeout_global(&machine);
@@ -23707,11 +23917,7 @@ mod tests {
         else {
             panic!("Promise construction returns a Promise");
         };
-        let resolve = machine
-            .globals
-            .get(&EcmaString::encode("resolve"))
-            .copied()
-            .unwrap();
+        let resolve = machine.test_global("resolve").unwrap();
         machine
             .call_value(resolve, Value::UNDEFINED, &[Value::int32(1)])
             .unwrap();
@@ -23725,13 +23931,7 @@ mod tests {
         machine.run_to_quiescence().unwrap();
         // The thrown handler rejects the derived promise, whose rejection
         // observer runs instead of aborting the loop.
-        assert_eq!(
-            machine
-                .globals
-                .get(&EcmaString::encode("observed"))
-                .copied(),
-            Some(Value::int32(7))
-        );
+        assert_eq!(machine.test_global("observed"), Some(Value::int32(7)));
         assert!(machine.microtasks.is_empty());
     }
 
@@ -23743,9 +23943,7 @@ mod tests {
         machine.frames.clear();
         machine.live_registers = 0;
         let respawn = timer_native(&mut machine, "respawn", respawn_job);
-        machine
-            .globals
-            .insert(EcmaString::encode("nestedCallback"), respawn);
+        machine.test_set_global("nestedCallback", respawn);
         let queue = machine.intrinsics.global("queueMicrotask").unwrap();
         machine
             .call_value(queue, Value::UNDEFINED, &[respawn])
@@ -23769,9 +23967,7 @@ mod tests {
         machine.live_registers = 0;
         shared.borrow_mut().auto_report = true;
         let respawn = timer_native(&mut machine, "respawn timer", schedule_recursive_timer);
-        machine
-            .globals
-            .insert(EcmaString::encode("recursiveTimerCallback"), respawn);
+        machine.test_set_global("recursiveTimerCallback", respawn);
         let set_timeout = set_timeout_global(&machine);
         machine
             .call_value(set_timeout, Value::UNDEFINED, &[respawn, Value::int32(0)])
@@ -24259,9 +24455,7 @@ mod tests {
                 description: EcmaString::encode("specifier"),
             })
             .unwrap();
-        coercion_machine
-            .globals
-            .insert(EcmaString::encode("specifier"), symbol);
+        coercion_machine.test_set_global("specifier", symbol);
         let coercion_promise = coercion_machine
             .evaluate()
             .expect("uncoercible dynamic import returns a rejected promise")

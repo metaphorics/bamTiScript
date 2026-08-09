@@ -417,6 +417,130 @@ process.stdout.write("ok\n");
 }
 
 #[test]
+fn aot_and_jit_share_one_live_global_object() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        r#"const root: any = globalThis;
+const stdout = process.stdout;
+const originalConsole = console;
+const replacementConsole = { marker: 1 };
+
+root.console = replacementConsole;
+if (console !== replacementConsole) throw "property-to-identifier mismatch";
+console = originalConsole;
+if (root.console !== originalConsole) throw "identifier-to-property mismatch";
+
+let lexicalBinding = 14;
+root.lexicalBinding = 99;
+if (lexicalBinding !== 14 || root.lexicalBinding !== 99) {
+    throw "module binding leaked into the global object";
+}
+
+root.globalThis = { fake: true };
+root.global = { fake: true };
+console = replacementConsole;
+if (root.console !== replacementConsole) throw "global alias redirected storage";
+delete root.globalThis;
+delete root.global;
+console = originalConsole;
+if (root.console !== originalConsole) throw "global alias deletion redirected storage";
+
+root.removable = 1;
+if (!delete root.removable || "removable" in root) {
+    throw "global property deletion mismatch";
+}
+
+let ownReceiver = false;
+let ownSet: unknown;
+Object.defineProperty(root, "console", {
+    get() { return replacementConsole; },
+    set(value) { ownReceiver = this === root; ownSet = value; },
+    configurable: true,
+});
+if (console !== replacementConsole) throw "own global getter mismatch";
+console = originalConsole;
+if (!ownReceiver || ownSet !== originalConsole) throw "own global setter mismatch";
+Object.defineProperty(root, "console", {
+    value: originalConsole,
+    writable: true,
+    configurable: true,
+});
+
+const originalQueueMicrotask = queueMicrotask;
+delete root.queueMicrotask;
+let prototypeReceiver = false;
+let prototypeSet: unknown;
+Object.defineProperty(Object.prototype, "queueMicrotask", {
+    get() { return originalQueueMicrotask; },
+    set(value) { prototypeReceiver = this === root; prototypeSet = value; },
+    configurable: true,
+});
+if (queueMicrotask !== originalQueueMicrotask) throw "prototype global getter mismatch";
+queueMicrotask = originalQueueMicrotask;
+if (!prototypeReceiver || prototypeSet !== originalQueueMicrotask) {
+    throw "prototype global setter mismatch";
+}
+delete Object.prototype.queueMicrotask;
+root.queueMicrotask = originalQueueMicrotask;
+
+let infinityFailed = false;
+let nanFailed = false;
+try { root.Infinity = 1; } catch { infinityFailed = true; }
+try { root.NaN = 1; } catch { nanFailed = true; }
+if (!infinityFailed || !nanFailed || root.Infinity !== Infinity || root.NaN === root.NaN) {
+    throw "frozen global constant mismatch";
+}
+
+stdout.write("ok\n");
+"#,
+    );
+
+    for target in ["jit", "aot"] {
+        let output = project
+            .command()
+            .args(["run", "--target", target, "main.ts"])
+            .current_dir(&project.path)
+            .output()
+            .unwrap_or_else(|error| panic!("bamts {target} global-object program starts: {error}"));
+        assert_success(&output, &format!("bamts {target} global-object program"));
+        assert_eq!(output.stdout, b"ok\n", "{target}");
+    }
+}
+
+#[test]
+fn aot_and_jit_preserve_vm_context_for_escaped_closures() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        r#"import { runInNewContext } from "node:vm";
+
+const context: any = { secret: 41 };
+const readSecret: any = runInNewContext(
+    "(function () { return secret + 1; })",
+    context,
+);
+context.secret = 99;
+if (readSecret() !== 100) {
+    throw "escaped closure lost its VM context";
+}
+process.stdout.write("ok\n");
+"#,
+    );
+
+    for target in ["jit", "aot"] {
+        let output = project
+            .command()
+            .args(["run", "--target", target, "main.ts"])
+            .current_dir(&project.path)
+            .output()
+            .unwrap_or_else(|error| panic!("bamts {target} VM-context program starts: {error}"));
+        assert_success(&output, &format!("bamts {target} VM-context program"));
+        assert_eq!(output.stdout, b"ok\n", "{target}");
+    }
+}
+
+#[test]
 fn aot_fixture_matches_jit_stdout_and_exit_code() {
     let directory = ScratchDirectory::new();
     let executable = directory
