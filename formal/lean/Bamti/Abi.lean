@@ -252,22 +252,23 @@ def u64LE (word : Word64) : List Byte :=
     littleByte (Word64.toNat word) 6, littleByte (Word64.toNat word) 7]
 
 def zeroByte : Byte := ⟨0, by omega⟩
-def padding4 : List Byte := [zeroByte, zeroByte, zeroByte, zeroByte]
 def padding6 : List Byte := [zeroByte, zeroByte, zeroByte, zeroByte, zeroByte, zeroByte]
 
-/-- The native frame stores pointers as modeled 64-bit words and uses a u32 PC
-and u16 handle length exactly as specified by the shared executor ABI. -/
+/-- The native frame stores pointers as modeled 64-bit words and uses a u32 PC,
+a u32 module id, and a u16 handle length exactly as specified by the shared
+executor ABI. -/
 structure ShadowFrame where
   previous : Word64
   bytecodePc : U32
+  moduleId : U32
   handles : Word64
   handleLen : U16
 
-/-- Bytes 0..31 of `ShadowFrame`: 8 + (4 + 4 pad) + 8 + (2 + 6 pad). -/
+/-- Bytes 0..31 of `ShadowFrame`: 8 + 4 + 4 + 8 + 2 + 6. -/
 def shadowFrameBytes (frame : ShadowFrame) : List Byte :=
   u64LE frame.previous ++
     u32LE frame.bytecodePc ++
-      padding4 ++
+      u32LE frame.moduleId ++
         u64LE frame.handles ++
           u16LE frame.handleLen ++ padding6
 
@@ -277,11 +278,18 @@ theorem shadow_frame_layout (frame : ShadowFrame) :
     (shadowFrameBytes frame).length = 32 ∧
       (shadowFrameBytes frame).take 8 = u64LE frame.previous ∧
       ((shadowFrameBytes frame).drop 8).take 4 = u32LE frame.bytecodePc ∧
-      ((shadowFrameBytes frame).drop 12).take 4 = padding4 ∧
+      ((shadowFrameBytes frame).drop 12).take 4 = u32LE frame.moduleId ∧
       ((shadowFrameBytes frame).drop 16).take 8 = u64LE frame.handles ∧
       ((shadowFrameBytes frame).drop 24).take 2 = u16LE frame.handleLen ∧
       ((shadowFrameBytes frame).drop 26).take 6 = padding6 := by
-  simp [shadowFrameBytes, u64LE, u32LE, u16LE, padding4, padding6]
+  simp [shadowFrameBytes, u64LE, u32LE, u16LE, padding6]
+
+/-- The bytes from offset 12 are exactly the encoded module id, the handle
+pointer, the handle length, and the trailing padding. -/
+theorem shadow_frame_module_id_offset (frame : ShadowFrame) :
+    (shadowFrameBytes frame).drop 12 =
+      u32LE frame.moduleId ++ u64LE frame.handles ++ u16LE frame.handleLen ++ padding6 := by
+  simp [shadowFrameBytes, u32LE, u64LE, u16LE, padding6]
 
 /-- A generation is an actual u32 value. The largest value is retained, rather
 than incremented modulo 2^32. -/
