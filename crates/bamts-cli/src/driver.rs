@@ -1181,6 +1181,8 @@ pub fn compile_program(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
     use bamts_compiler::lint::{LintLevel, SourceDialect, rule_by_name};
