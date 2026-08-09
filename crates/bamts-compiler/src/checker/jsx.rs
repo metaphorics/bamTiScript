@@ -229,6 +229,7 @@ impl<'src> Binder<'src> {
                 .find(|member| member.name() == tag_name)
                 .map(|member| member.type_id()),
             Type::Error
+            | Type::Intersection(_)
             | Type::Any
             | Type::Unknown
             | Type::Never
@@ -307,7 +308,12 @@ impl<'src> Binder<'src> {
             // Opaque recovery types must not cascade; nominal types (classes,
             // type parameters) have no visible construct/call side in this
             // type space and are accepted unchecked.
-            Type::Any | Type::Error | Type::Unknown | Type::Named(_) | Type::Union(_) => None,
+            Type::Any
+            | Type::Error
+            | Type::Intersection(_)
+            | Type::Unknown
+            | Type::Named(_)
+            | Type::Union(_) => None,
             Type::Never
             | Type::Void
             | Type::Null

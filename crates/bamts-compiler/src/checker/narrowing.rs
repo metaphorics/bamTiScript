@@ -597,7 +597,7 @@ impl<'a> NarrowingContext<'a> {
         negated: bool,
     ) -> TypeId {
         match self.table.get(ty).clone() {
-            Type::Error | Type::Any | Type::Unknown => ty,
+            Type::Error | Type::Intersection(_) | Type::Any | Type::Unknown => ty,
             Type::Union(members) => {
                 let mut kept = Vec::with_capacity(members.len());
                 for member in members {
@@ -649,6 +649,7 @@ impl<'a> NarrowingContext<'a> {
         let contextual_signature = match self.table.get(contextual) {
             Type::Function(signature) => Some(signature.clone()),
             Type::Error
+            | Type::Intersection(_)
             | Type::Any
             | Type::Unknown
             | Type::Never
@@ -722,6 +723,7 @@ impl<'a> NarrowingContext<'a> {
                 Some(self.table.union(&elements))
             }
             Type::Error
+            | Type::Intersection(_)
             | Type::Any
             | Type::Unknown
             | Type::Never
@@ -767,6 +769,7 @@ impl<'a> NarrowingContext<'a> {
                 self.table.union(&awaited)
             }
             Type::Error
+            | Type::Intersection(_)
             | Type::Any
             | Type::Unknown
             | Type::Never
@@ -846,7 +849,7 @@ impl<'a> NarrowingContext<'a> {
     /// types and as union members.
     fn filter(&mut self, ty: TypeId, decide: &dyn Fn(&Type) -> Narrow) -> TypeId {
         match self.table.get(ty).clone() {
-            Type::Error | Type::Any | Type::Unknown => ty,
+            Type::Error | Type::Intersection(_) | Type::Any | Type::Unknown => ty,
             Type::Union(members) => {
                 let mut kept = Vec::with_capacity(members.len());
                 for member in members {
@@ -935,6 +938,7 @@ impl<'a> NarrowingContext<'a> {
             }
             (
                 Type::Error
+                | Type::Intersection(_)
                 | Type::Any
                 | Type::Unknown
                 | Type::Never
@@ -970,7 +974,7 @@ impl<'a> NarrowingContext<'a> {
     /// members are never dropped.
     fn subtract(&mut self, ty: TypeId, excluded: TypeId) -> TypeId {
         match self.table.get(excluded) {
-            Type::Error | Type::Any | Type::Unknown => return ty,
+            Type::Error | Type::Intersection(_) | Type::Any | Type::Unknown => return ty,
             Type::Never
             | Type::Void
             | Type::Null
@@ -994,7 +998,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::NumericEnum(_) => {}
         }
         match self.table.get(ty).clone() {
-            Type::Error | Type::Any | Type::Unknown | Type::Never => ty,
+            Type::Error | Type::Intersection(_) | Type::Any | Type::Unknown | Type::Never => ty,
             Type::Union(members) => {
                 let mut kept = Vec::with_capacity(members.len());
                 for member in members {

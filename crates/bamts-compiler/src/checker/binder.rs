@@ -532,6 +532,7 @@ pub enum Type {
     Array(TypeId),
     Tuple(Vec<TypeId>),
     Union(Vec<TypeId>),
+    Intersection(Vec<TypeId>),
     ObjectType(ObjectType),
     Function(FunctionSignature),
     /// A nominal named type (type parameter, class, or enum) compared by identity.
@@ -760,6 +761,13 @@ impl TypeTable {
     /// Interns a fixed-length tuple type.
     pub fn tuple(&mut self, elements: Vec<TypeId>) -> TypeId {
         self.intern(Type::Tuple(elements))
+    }
+
+    /// Interns an intersection type without assigning source syntax semantics.
+    pub fn intersection(&mut self, mut members: Vec<TypeId>) -> TypeId {
+        members.sort_by_key(|member| member.get());
+        members.dedup();
+        self.intern(Type::Intersection(members))
     }
 
     /// Interns an object type after canonically ordering its members by name.
@@ -4500,6 +4508,7 @@ impl<'src> Binder<'src> {
             Type::Function(signature) => Some(signature),
             Type::Union(members) => self.union_call_signature(&members),
             Type::Error
+            | Type::Intersection(_)
             | Type::Any
             | Type::Unknown
             | Type::Never
@@ -4626,6 +4635,7 @@ impl<'src> Binder<'src> {
                 self.collect_type_parameter_symbols(signature.return_type(), out);
             }
             Type::Error
+            | Type::Intersection(_)
             | Type::Any
             | Type::Unknown
             | Type::Never
@@ -4698,6 +4708,7 @@ impl<'src> Binder<'src> {
                     }
                 }
                 Type::Error
+                | Type::Intersection(_)
                 | Type::Any
                 | Type::Unknown
                 | Type::Never
@@ -4860,6 +4871,7 @@ impl<'src> Binder<'src> {
                 }
             }
             Type::Error
+            | Type::Intersection(_)
             | Type::Any
             | Type::Unknown
             | Type::Never
@@ -6131,6 +6143,7 @@ impl<'src> Binder<'src> {
                 .union_call_signature(&members)
                 .map(|sig| sig.return_type()),
             Type::Error
+            | Type::Intersection(_)
             | Type::Any
             | Type::Unknown
             | Type::Never

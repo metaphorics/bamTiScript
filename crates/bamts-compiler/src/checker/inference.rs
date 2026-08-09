@@ -324,6 +324,7 @@ impl InferredTypeArguments {
                 self.instantiate_function(table, signature.type_parameters(), &signature)
             }
             Type::Error
+            | Type::Intersection(_)
             | Type::Any
             | Type::Unknown
             | Type::Never

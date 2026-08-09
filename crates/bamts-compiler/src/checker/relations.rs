@@ -247,7 +247,9 @@ impl<'table> TypeRelations<'table> {
     fn relates_uncached(&self, source: TypeId, target: TypeId, strictness: Strictness) -> bool {
         let (from, to) = (self.table.get(source), self.table.get(target));
         match (from, to) {
-            (Type::Error, _) | (_, Type::Error) => true,
+            (Type::Error | Type::Intersection(_), _) | (_, Type::Error | Type::Intersection(_)) => {
+                true
+            }
             // `any` is the deliberate escape hatch in both directions for
             // assignability and for strict-null assignability; it is not a
             // subtype of anything.
@@ -429,6 +431,7 @@ impl<'table> TypeRelations<'table> {
                 .iter()
                 .any(|member| self.contains_undefined(*member)),
             Type::Error
+            | Type::Intersection(_)
             | Type::Never
             | Type::Void
             | Type::Null
@@ -535,6 +538,7 @@ impl<'table> TypeRelations<'table> {
         match self.table.get(type_id) {
             Type::Array(element) => *element,
             Type::Error
+            | Type::Intersection(_)
             | Type::Any
             | Type::Unknown
             | Type::Never

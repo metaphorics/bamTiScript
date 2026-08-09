@@ -1599,6 +1599,18 @@ mod tests {
     }
 
     #[test]
+    fn intersection_representation_preserves_canonical_members() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let string = table.string();
+        let intersection = table.intersection(vec![string, number, string]);
+        assert_eq!(
+            table.get(intersection),
+            &Type::Intersection(vec![number, string])
+        );
+    }
+
+    #[test]
     fn objects_are_structural_with_optional_and_excess_rules() {
         let mut table = TypeTable::new();
         let required = table.object_type(vec![PropertyType::new("x", false, table.number())]);
