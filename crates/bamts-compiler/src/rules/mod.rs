@@ -2124,55 +2124,62 @@ mod tests {
 
     #[test]
     fn w085_fires_in_jsx_attribute_value() {
-        assert!(codes(
-            "<Foo onClick={(x: number) => x} />",
-            ScriptKind::JavaScriptReact,
-        )
-        .contains(&"BAMTS-W085"),
-        "BAMTS-W085 must fire for TypeScript-only arrow parameter syntax in a JSX attribute",);
+        assert!(
+            codes(
+                "<Foo onClick={(x: number) => x} />",
+                ScriptKind::JavaScriptReact,
+            )
+            .contains(&"BAMTS-W085"),
+            "BAMTS-W085 must fire for TypeScript-only arrow parameter syntax in a JSX attribute",
+        );
     }
 
     #[test]
     fn w085_fires_in_jsx_child_expression() {
-        assert!(codes(
-            "<Foo>{(x: number) => x}</Foo>;",
-            ScriptKind::JavaScriptReact,
-        )
-        .contains(&"BAMTS-W085"),
-        "BAMTS-W085 must fire for TypeScript-only arrow parameter syntax in a JSX child",);
+        assert!(
+            codes(
+                "<Foo>{(x: number) => x}</Foo>;",
+                ScriptKind::JavaScriptReact,
+            )
+            .contains(&"BAMTS-W085"),
+            "BAMTS-W085 must fire for TypeScript-only arrow parameter syntax in a JSX child",
+        );
     }
 
     #[test]
     fn w085_fires_in_jsx_fragment_child() {
-        assert!(codes(
-            "<>{(x: number) => x}</>;",
-            ScriptKind::JavaScriptReact,
-        )
-        .contains(&"BAMTS-W085"),
-        "BAMTS-W085 must fire for TypeScript-only arrow parameter syntax in a JSX fragment",);
+        assert!(
+            codes("<>{(x: number) => x}</>;", ScriptKind::JavaScriptReact,).contains(&"BAMTS-W085"),
+            "BAMTS-W085 must fire for TypeScript-only arrow parameter syntax in a JSX fragment",
+        );
     }
 
     #[test]
     fn w085_fires_in_jsx_spread_attribute() {
-        assert!(codes(
-            "<Foo {...((x: number) => x)} />",
-            ScriptKind::JavaScriptReact,
-        )
-        .contains(&"BAMTS-W085"),
-        "BAMTS-W085 must fire for TypeScript-only arrow parameter syntax in a JSX spread attribute",);
+        assert!(
+            codes(
+                "<Foo {...((x: number) => x)} />",
+                ScriptKind::JavaScriptReact,
+            )
+            .contains(&"BAMTS-W085"),
+            "BAMTS-W085 must fire for TypeScript-only arrow parameter syntax in a JSX spread attribute",
+        );
     }
 
     #[test]
     fn w085_does_not_fire_in_tsx() {
-        assert!(!codes(
-            "<Foo onClick={(x: number) => x} />",
-            ScriptKind::TypeScriptReact,
-        )
-        .contains(&"BAMTS-W085"),
-        "BAMTS-W085 must not fire for TypeScript-only syntax in TSX",);
-        assert!(!codes("<>{x as number}</>;", ScriptKind::TypeScriptReact)
+        assert!(
+            !codes(
+                "<Foo onClick={(x: number) => x} />",
+                ScriptKind::TypeScriptReact,
+            )
             .contains(&"BAMTS-W085"),
-        "BAMTS-W085 must not fire for `as` assertions in TSX",);
+            "BAMTS-W085 must not fire for TypeScript-only syntax in TSX",
+        );
+        assert!(
+            !codes("<>{x as number}</>;", ScriptKind::TypeScriptReact).contains(&"BAMTS-W085"),
+            "BAMTS-W085 must not fire for `as` assertions in TSX",
+        );
     }
 
     #[test]
@@ -2181,8 +2188,10 @@ mod tests {
             "<Foo onClick={() => { debugger; }} />",
             ScriptKind::TypeScriptReact,
         );
-        assert!(diagnostics.contains(&"BAMTS-W087"),
-        "BAMTS-W087 must fire for a debugger statement inside a JSX attribute arrow body",);
+        assert!(
+            diagnostics.contains(&"BAMTS-W087"),
+            "BAMTS-W087 must fire for a debugger statement inside a JSX attribute arrow body",
+        );
     }
 
     #[test]
@@ -2191,8 +2200,10 @@ mod tests {
             "<Foo onClick={(a,b,c,d,e,f) => a} />",
             ScriptKind::TypeScriptReact,
         );
-        assert!(diagnostics.contains(&"BAMTS-W064"),
-        "BAMTS-W064 must fire for a six-parameter arrow inside a JSX attribute",);
+        assert!(
+            diagnostics.contains(&"BAMTS-W064"),
+            "BAMTS-W064 must fire for a six-parameter arrow inside a JSX attribute",
+        );
     }
 
     #[test]
@@ -2201,12 +2212,18 @@ mod tests {
             "const el = <My.Component ns:attr=\"value\">text</My.Component>;",
             ScriptKind::TypeScriptReact,
         );
-        assert!(!diagnostics.contains(&"BAMTS-W085"),
-        "JSX names and text must not trigger TypeScript-only syntax rules",);
-        assert!(!diagnostics.contains(&"BAMTS-W064"),
-        "JSX names and text must not trigger the long-parameter-list rule",);
-        assert!(!diagnostics.contains(&"BAMTS-W087"),
-        "JSX names and text must not trigger the no-debugger rule",);
+        assert!(
+            !diagnostics.contains(&"BAMTS-W085"),
+            "JSX names and text must not trigger TypeScript-only syntax rules",
+        );
+        assert!(
+            !diagnostics.contains(&"BAMTS-W064"),
+            "JSX names and text must not trigger the long-parameter-list rule",
+        );
+        assert!(
+            !diagnostics.contains(&"BAMTS-W087"),
+            "JSX names and text must not trigger the no-debugger rule",
+        );
     }
 
     #[test]
@@ -2215,24 +2232,30 @@ mod tests {
             "<Foo onClick={(a,b,c,d,e,f) => a} />",
             ScriptKind::TypeScriptReact,
         );
-        assert_eq!(attribute.iter().filter(|c| **c == "BAMTS-W064").count(),
-        1,
-        "a single arrow attribute must produce exactly one W064",);
+        assert_eq!(
+            attribute.iter().filter(|c| **c == "BAMTS-W064").count(),
+            1,
+            "a single arrow attribute must produce exactly one W064",
+        );
 
         let nested = codes(
             "<Foo>{<Bar onClick={(a,b,c,d,e,f) => a} />}</Foo>;",
             ScriptKind::TypeScriptReact,
         );
-        assert_eq!(nested.iter().filter(|c| **c == "BAMTS-W064").count(),
-        1,
-        "a nested JSX element inside a child expression must produce exactly one W064",);
+        assert_eq!(
+            nested.iter().filter(|c| **c == "BAMTS-W064").count(),
+            1,
+            "a nested JSX element inside a child expression must produce exactly one W064",
+        );
 
         let js = codes(
             "<Foo {...((x: number) => x)} />",
             ScriptKind::JavaScriptReact,
         );
-        assert_eq!(js.iter().filter(|c| **c == "BAMTS-W085").count(),
-        1,
-        "a single spread expression must produce exactly one W085",);
+        assert_eq!(
+            js.iter().filter(|c| **c == "BAMTS-W085").count(),
+            1,
+            "a single spread expression must produce exactly one W085",
+        );
     }
 }
