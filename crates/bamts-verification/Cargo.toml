@@ -24,6 +24,9 @@ serde_json = "=1.0.151"
 sha2 = "=0.10.9"
 toml = "=0.9.12"
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [[bin]]
 name = "ts_conformance"
 path = "src/bin/ts_conformance.rs"
@@ -32,5 +35,8 @@ path = "src/bin/ts_conformance.rs"
 name = "perf_budget"
 path = "src/bin/perf_budget.rs"
 
-[lints]
-workspace = true
+[lints.rust]
+# `unsafe_code` is downgraded from the workspace `forbid` to `deny` so a
+# single `#[allow(unsafe_code)]` may cover the `libc::killpg` call in
+# `terminate_process_group`.
+unsafe_code = "deny"

@@ -1538,6 +1538,8 @@ pub(crate) fn run_process(
         .stderr(Stdio::piped());
     #[cfg(unix)]
     {
+        // Place the worker in a new process group so `libc::killpg` can
+        // terminate the whole tree on timeout, not just the immediate child.
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
@@ -1597,25 +1599,30 @@ pub(crate) fn run_process(
 }
 
 #[cfg(unix)]
+#[allow(unsafe_code)]
 fn terminate_process_group(child: &mut std::process::Child, label: &str) -> Result<()> {
-    // In-process SIGKILL via the std Child handle — no PATH-dependent `kill`
-    // subprocess, no inherited stdout.  The child is the group leader because
-    // `process_group(0)` was set in `run_process` before spawning, so killing
-    // the leader delivers SIGKILL to the whole group.
-    match child.kill() {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            // The process already exited between `try_wait` and here — that
-            // is success, not a harness failure.
-            Ok(())
-        }
-        Err(error) => Err(VerificationError::new(
+    // The child is the group leader because `process_group(0)` was set in
+    // `run_process` before spawning, so `libc::killpg` on the leader's group
+    // ID sends SIGKILL to the whole group, not just the child.
+    let pgid = child.id() as i32;
+    // SAFETY: `killpg` is called with the valid process group ID that this
+    // process just created via `CommandExt::process_group(0)` and the
+    // `SIGKILL` signal constant. It is an ABI call with no pointer arguments,
+    // so there are no aliasing or lifetime concerns.
+    let result = unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        // The process group already exited between `try_wait` and here —
+        // that is success, not a harness failure.
+        Ok(())
+    } else {
+        Err(VerificationError::new(
             ErrorCode::ToolFailed,
-            format!(
-                "cannot terminate {label} process group {}: {error}",
-                child.id()
-            ),
-        )),
+            format!("cannot terminate {label} process group {pgid}: {error}"),
+        ))
     }
 }
 
@@ -2521,6 +2528,74 @@ mod tests {
         );
         assert!(outcome.timed_out);
         assert_eq!(outcome.exit_code, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn terminate_process_group_kills_grandchild() {
+        let dir = scratch("killpg-grandchild");
+        let script = "echo $$ > child.pid\n\
+                      sh -c 'while :; do sleep 0.1; done' &\n\
+                      echo $! > grandchild.pid\n\
+                      while :; do sleep 0.1; done\n";
+        fs::write(dir.join("child.sh"), script).expect("write child script");
+
+        let outcome = run_process(
+            "killpg test",
+            Path::new("/bin/sh"),
+            &dir,
+            &[("PATH".to_string(), "/usr/bin:/bin".to_string())],
+            &[OsString::from("child.sh")],
+            &OracleLimits {
+                timeout: Duration::from_millis(1000),
+                max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            },
+        )
+        .expect("run process");
+
+        assert!(outcome.timed_out, "process group should time out");
+        assert_eq!(outcome.signal, Some(9), "process group should be SIGKILLed");
+
+        let child_pid = fs::read_to_string(dir.join("child.pid"))
+            .expect("child pid file")
+            .trim()
+            .parse::<i32>()
+            .expect("child pid is numeric");
+        let grandchild_pid = fs::read_to_string(dir.join("grandchild.pid"))
+            .expect("grandchild pid file")
+            .trim()
+            .parse::<i32>()
+            .expect("grandchild pid is numeric");
+
+        fn process_exists(pid: i32) -> bool {
+            std::process::Command::new("kill")
+                .arg("-0")
+                .arg(pid.to_string())
+                .status()
+                .expect("kill -0")
+                .success()
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut child_gone = false;
+        let mut grandchild_gone = false;
+        while Instant::now() < deadline {
+            if !child_gone && !process_exists(child_pid) {
+                child_gone = true;
+            }
+            if !grandchild_gone && !process_exists(grandchild_pid) {
+                grandchild_gone = true;
+            }
+            if child_gone && grandchild_gone {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        assert!(child_gone, "child {child_pid} should be dead");
+        assert!(grandchild_gone, "grandchild {grandchild_pid} should be dead");
+
         let _ = fs::remove_dir_all(&dir);
     }
 
