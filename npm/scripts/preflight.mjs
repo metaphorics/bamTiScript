@@ -84,6 +84,54 @@ export function assertManifestConsistency(root = npmRoot) {
   }
 }
 
+function npmRegistryVersion(packageName, version) {
+  const spec = `${packageName}@${version}`;
+  const result = spawnSync(
+    "npm",
+    ["view", spec, "version", "--json"],
+    { encoding: "utf8" },
+  );
+  if (result.error || result.status !== 0) {
+    throw new Error(
+      `${spec} is unavailable: ${
+        result.stderr?.trim() || result.error?.message || `npm view exited ${result.status}`
+      }`,
+    );
+  }
+
+  let published;
+  try {
+    published = JSON.parse(result.stdout);
+  } catch (cause) {
+    throw new Error(`${spec} returned invalid registry metadata`, { cause });
+  }
+  if (published !== version) {
+    throw new Error(`${spec} returned version ${JSON.stringify(published)}`);
+  }
+  return published;
+}
+
+export function assertRegistryAvailability(
+  root = npmRoot,
+  lookupVersion = npmRegistryVersion,
+) {
+  assertManifestConsistency(root);
+  const cliManifest = readJson(join(root, "bamti-cli", "package.json"));
+  const errors = [];
+
+  for (const [packageName, version] of Object.entries(cliManifest.optionalDependencies ?? {})) {
+    try {
+      lookupVersion(packageName, version);
+    } catch (error) {
+      errors.push(error.message);
+    }
+  }
+
+  if (errors.length > 0) {
+    throw new Error("registry preflight failed:\n  - " + errors.join("\n  - "));
+  }
+}
+
 export function preflight(root = npmRoot) {
   // Local, deterministic check that the loader and the artifact manifests agree.
   assertManifestConsistency(root);
@@ -144,5 +192,9 @@ export function preflightRelease(distRoot, root = npmRoot) {
 }
 
 if (process.argv[1] === scriptPath) {
-  preflightRelease();
+  if (process.argv[2] === "--registry-only") {
+    assertRegistryAvailability();
+  } else {
+    preflightRelease();
+  }
 }

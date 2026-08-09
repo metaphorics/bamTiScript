@@ -14,7 +14,14 @@ import {
   artifactPackage,
   resolveBinary,
 } from "../bamti-cli/index.js";
-import { preflight, preflightRelease, tarballName } from "../scripts/preflight.mjs";
+import {
+  assertRegistryAvailability,
+  preflight,
+  preflightRelease,
+  tarballName,
+} from "../scripts/preflight.mjs";
+
+const availableVersion = (_packageName, version) => version;
 
 const packagingScript = join(
   dirname(fileURLToPath(import.meta.url)),
@@ -202,4 +209,28 @@ test("preflight rejects a tarball with a missing binary", async () => {
       (error) => error.message.includes("missing package/bin/bamts"),
     );
   });
+});
+
+test("registry preflight accepts every published optional dependency", () => {
+  assert.doesNotThrow(() => assertRegistryAvailability(undefined, availableVersion));
+});
+
+test("registry preflight names every unavailable optional dependency", () => {
+  const unavailable = new Set([
+    "@bamti/cli-linux-x64",
+    "@bamti/cli-win32-x64",
+  ]);
+  assert.throws(
+    () =>
+      assertRegistryAvailability(undefined, (packageName, version) => {
+        if (unavailable.has(packageName)) {
+          throw new Error(`${packageName}@${version} returned 404`);
+        }
+        return version;
+      }),
+    (error) =>
+      error.message.includes("registry preflight failed") &&
+      error.message.includes("@bamti/cli-linux-x64@0.1.0 returned 404") &&
+      error.message.includes("@bamti/cli-win32-x64@0.1.0 returned 404"),
+  );
 });

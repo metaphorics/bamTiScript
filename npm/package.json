@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "preflight": "node scripts/preflight.mjs"
+    "preflight": "node scripts/preflight.mjs",
+    "preflight:registry": "node scripts/preflight.mjs --registry-only"
   }
 }
