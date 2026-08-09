@@ -301,7 +301,11 @@ impl<'table> TypeRelations<'table> {
             // `object` is the non-primitive type: object literals, arrays,
             // functions, and class instances all flow into it.
             (
-                Type::ObjectType(_) | Type::Array(_) | Type::Function(_) | Type::Named(_),
+                Type::ObjectType(_)
+                | Type::Array(_)
+                | Type::Tuple(_)
+                | Type::Function(_)
+                | Type::Named(_),
                 Type::Object,
             ) => true,
             // `Object` (capital O, the boxed object type) is the top object
@@ -362,6 +366,7 @@ impl<'table> TypeRelations<'table> {
                 | Type::StringLiteral(_)
                 | Type::BigIntLiteral(_)
                 | Type::Array(_)
+                | Type::Tuple(_)
                 | Type::ObjectType(_)
                 | Type::Function(_)
                 | Type::Named(_)
@@ -409,7 +414,11 @@ impl<'table> TypeRelations<'table> {
     fn is_structural(&self, type_id: TypeId) -> bool {
         matches!(
             self.table.get(type_id),
-            Type::Union(_) | Type::Array(_) | Type::ObjectType(_) | Type::Function(_)
+            Type::Union(_)
+                | Type::Array(_)
+                | Type::Tuple(_)
+                | Type::ObjectType(_)
+                | Type::Function(_)
         )
     }
 
@@ -434,6 +443,7 @@ impl<'table> TypeRelations<'table> {
             | Type::StringLiteral(_)
             | Type::BigIntLiteral(_)
             | Type::Array(_)
+            | Type::Tuple(_)
             | Type::ObjectType(_)
             | Type::Function(_)
             | Type::Named(_)
@@ -541,6 +551,7 @@ impl<'table> TypeRelations<'table> {
             | Type::NumberLiteral(_)
             | Type::StringLiteral(_)
             | Type::BigIntLiteral(_)
+            | Type::Tuple(_)
             | Type::Union(_)
             | Type::ObjectType(_)
             | Type::Function(_)

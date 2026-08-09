@@ -530,6 +530,7 @@ pub enum Type {
     StringLiteral(Box<str>),
     BigIntLiteral(Box<str>),
     Array(TypeId),
+    Tuple(Vec<TypeId>),
     Union(Vec<TypeId>),
     ObjectType(ObjectType),
     Function(FunctionSignature),
@@ -756,6 +757,11 @@ impl TypeTable {
         self.intern(Type::Array(element))
     }
 
+    /// Interns a fixed-length tuple type.
+    pub fn tuple(&mut self, elements: Vec<TypeId>) -> TypeId {
+        self.intern(Type::Tuple(elements))
+    }
+
     /// Interns an object type after canonically ordering its members by name.
     pub fn object_type(&mut self, properties: Vec<PropertyType>) -> TypeId {
         self.object_type_with_members(ObjectType {
@@ -857,6 +863,13 @@ impl TypeTable {
             Type::Array(element) => {
                 let widened = self.widen(element, false);
                 self.array(widened)
+            }
+            Type::Tuple(elements) => {
+                let widened = elements
+                    .iter()
+                    .map(|element| self.widen(*element, false))
+                    .collect();
+                self.tuple(widened)
             }
             Type::ObjectType(object) => {
                 let properties = object
@@ -4504,6 +4517,7 @@ impl<'src> Binder<'src> {
             | Type::StringLiteral(_)
             | Type::BigIntLiteral(_)
             | Type::Array(_)
+            | Type::Tuple(_)
             | Type::ObjectType(_)
             | Type::Named(_)
             | Type::NumericEnum(_) => None,
@@ -4590,6 +4604,11 @@ impl<'src> Binder<'src> {
                 }
             }
             Type::Array(element) => self.collect_type_parameter_symbols(*element, out),
+            Type::Tuple(elements) => {
+                for element in elements {
+                    self.collect_type_parameter_symbols(*element, out);
+                }
+            }
             Type::Union(members) => {
                 for member in members {
                     self.collect_type_parameter_symbols(*member, out);
@@ -4696,6 +4715,7 @@ impl<'src> Binder<'src> {
                 | Type::StringLiteral(_)
                 | Type::BigIntLiteral(_)
                 | Type::Array(_)
+                | Type::Tuple(_)
                 | Type::ObjectType(_)
                 | Type::Named(_)
                 | Type::NumericEnum(_) => return false,
@@ -4705,10 +4725,10 @@ impl<'src> Binder<'src> {
     }
 
     fn array_element_type(&self, array_type: TypeId) -> Option<TypeId> {
-        if let Type::Array(element) = self.types.get(array_type) {
-            Some(*element)
-        } else {
-            None
+        match self.types.get(array_type) {
+            Type::Array(element) => Some(*element),
+            Type::Tuple(_) => None,
+            _ => None,
         }
     }
 
@@ -4857,6 +4877,7 @@ impl<'src> Binder<'src> {
             | Type::StringLiteral(_)
             | Type::BigIntLiteral(_)
             | Type::Array(_)
+            | Type::Tuple(_)
             | Type::Function(_)
             | Type::NumericEnum(_) => None,
         }
@@ -6127,6 +6148,7 @@ impl<'src> Binder<'src> {
             | Type::StringLiteral(_)
             | Type::BigIntLiteral(_)
             | Type::Array(_)
+            | Type::Tuple(_)
             | Type::ObjectType(_)
             | Type::Named(_)
             | Type::NumericEnum(_) => None,

@@ -623,6 +623,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::StringLiteral(_)
             | Type::BigIntLiteral(_)
             | Type::Array(_)
+            | Type::Tuple(_)
             | Type::ObjectType(_)
             | Type::Function(_)
             | Type::Named(_)
@@ -665,6 +666,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::StringLiteral(_)
             | Type::BigIntLiteral(_)
             | Type::Array(_)
+            | Type::Tuple(_)
             | Type::Union(_)
             | Type::ObjectType(_)
             | Type::Named(_)
@@ -736,6 +738,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::NumberLiteral(_)
             | Type::StringLiteral(_)
             | Type::BigIntLiteral(_)
+            | Type::Tuple(_)
             | Type::ObjectType(_)
             | Type::Function(_)
             | Type::Named(_)
@@ -781,6 +784,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::StringLiteral(_)
             | Type::BigIntLiteral(_)
             | Type::Array(_)
+            | Type::Tuple(_)
             | Type::ObjectType(_)
             | Type::Function(_)
             | Type::Named(_)
@@ -873,6 +877,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::StringLiteral(_)
             | Type::BigIntLiteral(_)
             | Type::Array(_)
+            | Type::Tuple(_)
             | Type::ObjectType(_)
             | Type::Function(_)
             | Type::Named(_)
@@ -947,6 +952,7 @@ impl<'a> NarrowingContext<'a> {
                 | Type::StringLiteral(_)
                 | Type::BigIntLiteral(_)
                 | Type::Array(_)
+                | Type::Tuple(_)
                 | Type::ObjectType(_)
                 | Type::Function(_)
                 | Type::Named(_)
@@ -980,6 +986,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::StringLiteral(_)
             | Type::BigIntLiteral(_)
             | Type::Array(_)
+            | Type::Tuple(_)
             | Type::Union(_)
             | Type::ObjectType(_)
             | Type::Function(_)
@@ -1014,6 +1021,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::StringLiteral(_)
             | Type::BigIntLiteral(_)
             | Type::Array(_)
+            | Type::Tuple(_)
             | Type::ObjectType(_)
             | Type::Function(_)
             | Type::Named(_)
@@ -1256,7 +1264,10 @@ fn typeof_matches(ty: &Type, name: TypeofName) -> bool {
         TypeofName::Boolean => matches!(ty, Type::Boolean | Type::BooleanLiteral(_)),
         TypeofName::Symbol => matches!(ty, Type::Symbol),
         TypeofName::Undefined => matches!(ty, Type::Undefined | Type::Void),
-        TypeofName::Object => matches!(ty, Type::ObjectType(_) | Type::Array(_) | Type::Null),
+        TypeofName::Object => matches!(
+            ty,
+            Type::ObjectType(_) | Type::Array(_) | Type::Tuple(_) | Type::Null
+        ),
         TypeofName::Function => matches!(ty, Type::Function(_)),
     }
 }

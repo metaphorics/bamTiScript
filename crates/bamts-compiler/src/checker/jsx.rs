@@ -246,6 +246,7 @@ impl<'src> Binder<'src> {
             | Type::StringLiteral(_)
             | Type::BigIntLiteral(_)
             | Type::Array(_)
+            | Type::Tuple(_)
             | Type::Union(_)
             | Type::Function(_)
             | Type::Named(_)
@@ -322,6 +323,7 @@ impl<'src> Binder<'src> {
             | Type::StringLiteral(_)
             | Type::BigIntLiteral(_)
             | Type::Array(_)
+            | Type::Tuple(_)
             | Type::ObjectType(_)
             | Type::NumericEnum(_) => {
                 self.emit(

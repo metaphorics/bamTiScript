@@ -1590,6 +1590,15 @@ mod tests {
     }
 
     #[test]
+    fn tuple_representation_preserves_fixed_elements() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let string = table.string();
+        let tuple = table.tuple(vec![number, string]);
+        assert_eq!(table.get(tuple), &Type::Tuple(vec![number, string]));
+    }
+
+    #[test]
     fn objects_are_structural_with_optional_and_excess_rules() {
         let mut table = TypeTable::new();
         let required = table.object_type(vec![PropertyType::new("x", false, table.number())]);

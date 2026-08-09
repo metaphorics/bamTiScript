@@ -252,6 +252,13 @@ impl InferredTypeArguments {
                 let element = self.instantiate(table, element);
                 table.array(element)
             }
+            Type::Tuple(elements) => {
+                let elements = elements
+                    .iter()
+                    .map(|element| self.instantiate(table, *element))
+                    .collect();
+                table.tuple(elements)
+            }
             Type::Union(members) => {
                 let members: Vec<TypeId> = members
                     .iter()
