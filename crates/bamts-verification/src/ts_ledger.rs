@@ -1613,8 +1613,13 @@ mod tests {
 
         TsLedgerWriter::to_file(&path, &ledger).expect("to_file");
         let from_file = fs::read(&path).expect("read file");
-        let from_string = TsLedgerWriter::to_string(&ledger).expect("to_string").into_bytes();
-        assert_eq!(from_file, from_string, "to_file must emit the same bytes as to_string");
+        let from_string = TsLedgerWriter::to_string(&ledger)
+            .expect("to_string")
+            .into_bytes();
+        assert_eq!(
+            from_file, from_string,
+            "to_file must emit the same bytes as to_string"
+        );
 
         let _ = fs::remove_file(&path);
     }
@@ -1631,5 +1636,4 @@ mod tests {
 
         let _ = fs::remove_file(&path);
     }
-
 }
