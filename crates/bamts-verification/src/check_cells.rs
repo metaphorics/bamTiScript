@@ -1140,12 +1140,28 @@ fn render_type_grouped(model: &SemanticModel, type_id: TypeId, group: bool) -> S
         Type::NumberLiteral(text) | Type::BigIntLiteral(text) => text.to_string(),
         Type::StringLiteral(text) => render_string_literal(text),
         Type::Array(element) => format!("{}[]", render_type_grouped(model, *element, true)),
+        Type::Tuple(elements) => {
+            let body = elements
+                .iter()
+                .map(|element| render_type_grouped(model, *element, false))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("[{body}]")
+        }
         Type::Union(members) => {
             let body = members
                 .iter()
                 .map(|member| render_type_grouped(model, *member, true))
                 .collect::<Vec<_>>()
                 .join(" | ");
+            if group { format!("({body})") } else { body }
+        }
+        Type::Intersection(members) => {
+            let body = members
+                .iter()
+                .map(|member| render_type_grouped(model, *member, true))
+                .collect::<Vec<_>>()
+                .join(" & ");
             if group { format!("({body})") } else { body }
         }
         Type::Function(signature) => {
@@ -1178,11 +1194,12 @@ fn render_type_grouped(model: &SemanticModel, type_id: TypeId, group: bool) -> S
             );
             if group { format!("({body})") } else { body }
         }
-        Type::ObjectType(properties) => {
-            if properties.is_empty() {
+        Type::ObjectType(object) => {
+            if object.properties().is_empty() {
                 "{}".to_owned()
             } else {
-                let body = properties
+                let body = object
+                    .properties()
                     .iter()
                     .map(|property| {
                         format!(

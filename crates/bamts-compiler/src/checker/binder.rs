@@ -382,6 +382,13 @@ pub struct ObjectType {
     pub(crate) index_signatures: Vec<IndexSignature>,
 }
 
+impl ObjectType {
+    #[must_use]
+    pub fn properties(&self) -> &[PropertyType] {
+        &self.properties
+    }
+}
+
 /// One parameter of an interned function signature.
 #[derive(Clone, Debug)]
 pub struct FunctionParameter {
