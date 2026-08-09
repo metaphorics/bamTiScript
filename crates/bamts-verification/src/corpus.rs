@@ -844,6 +844,12 @@ fn bounded_text(text: &str) -> String {
 }
 
 /// Runs validated corpus cases through the public `bamts_cli` driver.
+///
+/// # Precondition
+///
+/// The repository root contains a valid `corpus/manifest.toml`, the pinned
+/// Node interpreter is discoverable, and `load_corpus` has already validated
+/// the requested case.
 #[derive(Debug, Clone)]
 pub struct BamtsRunner {
     root: PathBuf,
@@ -1231,6 +1237,18 @@ fn run_worker(
             format!(
                 "BamTS corpus worker exited with {:?}: stdout={}; stderr={}",
                 process.exit_code,
+                bounded_text(&String::from_utf8_lossy(&process.stdout)),
+                bounded_text(&String::from_utf8_lossy(&process.stderr))
+            ),
+        ));
+    }
+    if !response_path.exists() {
+        return Err(VerificationError::new(
+            ErrorCode::ToolFailed,
+            format!(
+                "BamTS corpus worker `{}` (test `{}`, entry point `run_corpus_worker_from_env`) exited with code 0 but wrote no response; captured stdout: {}; stderr: {}",
+                current_exe.display(),
+                CORPUS_WORKER_TEST,
                 bounded_text(&String::from_utf8_lossy(&process.stdout)),
                 bounded_text(&String::from_utf8_lossy(&process.stderr))
             ),
@@ -2685,6 +2703,41 @@ mod tests {
         assert!(
             outcome.stdout.windows(6).any(|window| window == b"truthy"),
             "stdout should contain project-derived output"
+        );
+    }
+
+    #[test]
+    fn worker_exit_zero_without_response_fails_with_tool_failed() {
+        let root = repo_root();
+        let spec = aot_case("missing-response", 10_000);
+        let artifacts = ArtifactDirectory::create(&root, &spec, ExecutionMode::Jit)
+            .expect("create scratch artifacts");
+        let request = WorkerRequest {
+            root,
+            spec,
+            operation: WorkerOperation::Jit,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            executable: None,
+        };
+        let error = run_worker(&artifacts, &request, Duration::from_secs(5))
+            .expect_err("worker without response must fail");
+        assert_eq!(error.code(), ErrorCode::ToolFailed);
+        let message = error.to_string();
+        assert!(
+            message.contains("wrote no response"),
+            "error should report missing response: {message}"
+        );
+        assert!(
+            message.contains(CORPUS_WORKER_TEST),
+            "error should name the worker test: {message}"
+        );
+        assert!(
+            message.contains("run_corpus_worker_from_env"),
+            "error should name the worker entry point: {message}"
+        );
+        assert!(
+            !message.contains("No such file or directory"),
+            "error must not leak a filesystem I/O message: {message}"
         );
     }
 }
