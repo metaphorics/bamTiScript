@@ -193,7 +193,10 @@ pub trait Host {
     /// This host's script compiler, or `None` when it provides none.
     ///
     /// Presence MUST remain stable for the lifetime of one machine because it
-    /// determines whether `node:vm` is installed during construction.
+    /// determines whether `node:vm` is installed during construction. When
+    /// present, `runInNewContext` provides a fresh `globalThis` per call but
+    /// still shares this machine's intrinsic objects and prototype graph; guest
+    /// code can mutate shared objects such as `Object.prototype`.
     fn script_compiler(&mut self) -> Option<&mut (dyn CompileProvider + 'static)> {
         None
     }
@@ -1617,6 +1620,14 @@ pub struct Machine<'a, H: Host> {
     fuel: u64,
     globals: BTreeMap<EcmaString, Value>,
     /// The contextified global used only while executing `node:vm` code.
+    ///
+    /// `runInNewContext` creates a fresh `globalThis` for each call (or adopts
+    /// the supplied context object) but the new context still shares this
+    /// machine's intrinsic objects and prototype graph with the outer
+    /// environment. `Object`, `Array`, `Object.prototype`, and similar builtins
+    /// are identical across contexts, so guest code can mutate shared objects
+    /// such as `Object.prototype`. This is not a separate realm and is not a
+    /// security boundary.
     context_global: Option<Value>,
     last_completion: Option<Value>,
     /// Frame depths owned by native-to-runtime callback evaluations. A throw

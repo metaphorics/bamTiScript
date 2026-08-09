@@ -203,6 +203,19 @@ fn run_in_this_context<H: Host>(
     call_entry(machine, entry, prototype, None)
 }
 
+/// `runInNewContext(code, contextObject?, options?)`
+///
+/// Compiles `code` as a classic script and executes it with a fresh
+/// `globalThis`. When `contextObject` is omitted, a fresh object is allocated
+/// and becomes `globalThis` for the duration of the call. The new context still
+/// shares this machine's intrinsic objects and prototype graph with the outer
+/// environment, so `Object`, `Array`, `Object.prototype`, and similar builtins
+/// are identical across contexts. Guest code can mutate shared objects such as
+/// `Object.prototype`; this is not a separate realm and is not a security
+/// boundary.
+///
+/// An unsupported `timeout` in `options` is rejected rather than silently
+/// ignored; see `reject_unsupported_timeout`.
 fn run_in_new_context<H: Host>(
     machine: &mut Machine<'_, H>,
     _this: Value,
@@ -498,6 +511,110 @@ mod tests {
         .expect("test program links")
     }
 
+    fn program_checking_intrinsics() -> Program<Verified> {
+        let constants = vec![
+            Constant::String(EcmaString::encode("Object")),
+            Constant::String(EcmaString::encode("Array")),
+            Constant::String(EcmaString::encode("prototype")),
+            Constant::String(EcmaString::encode("shared_marker")),
+            Constant::String(EcmaString::encode("<test>")),
+            Constant::Int32(1),
+        ];
+        let code = Module::new(
+            constants,
+            vec![Function::new(
+                None,
+                0,
+                0,
+                11,
+                FunctionFlags::default(),
+                vec![
+                    Instruction::LoadThis { dst: Register::new(0) },
+                    Instruction::LoadConst {
+                        dst: Register::new(8),
+                        constant: ConstantId::new(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: Register::new(9),
+                        constant: ConstantId::new(3),
+                    },
+                    Instruction::LoadConst {
+                        dst: Register::new(10),
+                        constant: ConstantId::new(5),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: Register::new(1),
+                        name: ConstantId::new(0),
+                    },
+                    Instruction::GetProperty {
+                        dst: Register::new(2),
+                        object: Register::new(1),
+                        key: Register::new(8),
+                    },
+                    Instruction::DefineDataProperty {
+                        object: Register::new(2),
+                        key: Register::new(9),
+                        value: Register::new(10),
+                    },
+                    Instruction::CreateObject { dst: Register::new(5) },
+                    Instruction::GetProperty {
+                        dst: Register::new(6),
+                        object: Register::new(5),
+                        key: Register::new(9),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: Register::new(3),
+                        name: ConstantId::new(1),
+                    },
+                    Instruction::GetProperty {
+                        dst: Register::new(4),
+                        object: Register::new(3),
+                        key: Register::new(8),
+                    },
+                    Instruction::CreateArray { dst: Register::new(7) },
+                    Instruction::ArrayPush {
+                        array: Register::new(7),
+                        value: Register::new(0),
+                    },
+                    Instruction::ArrayPush {
+                        array: Register::new(7),
+                        value: Register::new(1),
+                    },
+                    Instruction::ArrayPush {
+                        array: Register::new(7),
+                        value: Register::new(2),
+                    },
+                    Instruction::ArrayPush {
+                        array: Register::new(7),
+                        value: Register::new(4),
+                    },
+                    Instruction::ArrayPush {
+                        array: Register::new(7),
+                        value: Register::new(6),
+                    },
+                    Instruction::Return {
+                        value: Register::new(7),
+                    },
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("test bytecode is verified");
+        Program::link(
+            vec![ProgramModule {
+                name: ConstantId::new(4),
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect("test program links")
+    }
+
     fn compiler_host() -> ScriptHost {
         ScriptHost {
             compiler: Some(FakeCompiler {
@@ -741,6 +858,102 @@ mod tests {
                 .sources
                 .len(),
             3
+        );
+    }
+
+    #[test]
+    fn run_in_new_context_shares_intrinsics_and_prototypes() {
+        let program = program_returning(0);
+        let mut host = ScriptHost {
+            compiler: Some(FakeCompiler {
+                program: Arc::new(program_checking_intrinsics()),
+                sources: Vec::new(),
+            }),
+        };
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.instantiate_modules().unwrap();
+        let run = machine
+            .registry
+            .external
+            .get(&EcmaString::encode("node:vm"))
+            .expect("node:vm is installed")
+            .exports
+            .get(&EcmaString::encode("runInNewContext"))
+            .expect("runInNewContext is exported")
+            .value;
+        let source = machine
+            .allocate(HeapEntry::String(EcmaString::encode("intrinsics check")))
+            .unwrap();
+
+        let first = machine
+            .call_value(run, Value::UNDEFINED, &[source])
+            .expect("first runInNewContext call succeeds");
+        let outer_global_this = machine
+            .intrinsics
+            .global("globalThis")
+            .expect("outer globalThis exists");
+        let outer_object = machine.intrinsics.global("Object").expect("Object exists");
+        let outer_object_prototype = machine.intrinsics.object_prototype;
+        let outer_array_prototype = machine.intrinsics.array_prototype;
+
+        assert_ne!(
+            machine.get_named_property(first, "0").unwrap(),
+            outer_global_this,
+            "runInNewContext provides a fresh globalThis"
+        );
+        assert_eq!(
+            machine.get_named_property(first, "1").unwrap(),
+            outer_object,
+            "Object is shared across contexts"
+        );
+        assert_eq!(
+            machine.get_named_property(first, "2").unwrap(),
+            outer_object_prototype,
+            "Object.prototype is shared across contexts"
+        );
+        assert_eq!(
+            machine.get_named_property(first, "3").unwrap(),
+            outer_array_prototype,
+            "Array.prototype is shared across contexts"
+        );
+        assert_eq!(
+            machine.get_named_property(first, "4").unwrap(),
+            Value::int32(1),
+            "mutations to the shared Object.prototype are visible to new objects"
+        );
+
+        let second = machine
+            .call_value(run, Value::UNDEFINED, &[source])
+            .expect("second runInNewContext call succeeds");
+        assert_ne!(
+            machine.get_named_property(second, "0").unwrap(),
+            outer_global_this,
+            "each new context has a fresh globalThis"
+        );
+        assert_ne!(
+            machine.get_named_property(second, "0").unwrap(),
+            machine.get_named_property(first, "0").unwrap(),
+            "each new context has a distinct globalThis"
+        );
+        assert_eq!(
+            machine.get_named_property(second, "1").unwrap(),
+            outer_object,
+            "Object is still shared across contexts"
+        );
+        assert_eq!(
+            machine.get_named_property(second, "2").unwrap(),
+            outer_object_prototype,
+            "Object.prototype is still shared across contexts"
+        );
+        assert_eq!(
+            machine.get_named_property(second, "3").unwrap(),
+            outer_array_prototype,
+            "Array.prototype is still shared across contexts"
+        );
+        assert_eq!(
+            machine.get_named_property(second, "4").unwrap(),
+            Value::int32(1),
+            "mutations to the shared prototype survive into a new context"
         );
     }
 
