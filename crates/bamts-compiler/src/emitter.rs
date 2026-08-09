@@ -27,10 +27,10 @@
 //! reference rewriting are the checker's responsibility and are intentionally
 //! out of scope here.
 
-use std::{fmt::Write as _, sync::Arc};
+use std::fmt::Write as _;
 
 use crate::checker::{self, SemanticModel};
-use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
+use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::enum_plan::{EnumFacts, EnumMemberPlan, EnumScalar};
 use crate::source::{SourceId, SourceText, TextRange};
 use crate::syntax::*;
@@ -179,18 +179,7 @@ impl EmitOutput {
 /// Prints `file` to JavaScript or a declaration file per `options`.
 #[must_use]
 pub fn emit(file: &SourceFile, options: EmitOptions) -> EmitOutput {
-    let checked_file = Recovered::clean(SourceFile::new(
-        file.id(),
-        file.source_id(),
-        file.script_kind(),
-        file.range(),
-        Arc::new(file.source_text().clone()),
-        file.tokens().to_vec(),
-        file.statements().to_vec(),
-        *file.eof(),
-        file.diagnostics().to_vec(),
-    ));
-    let checked = checker::check(&checked_file);
+    let checked = checker::check_source(file);
     emit_checked(file, checked.product(), options)
 }
 
@@ -4221,5 +4210,23 @@ export = answer;";
         assert_eq!(global_out.code, "");
         assert_eq!(global_out.diagnostics.len(), 1);
         assert_eq!(global_out.diagnostics[0].code(), codes::NAMESPACE_UNLOWERED);
+    }
+
+    #[test]
+    fn emit_and_emit_checked_produce_identical_output() {
+        let source = Arc::new(
+            SourceText::new("const x: number = 1;\nfunction f(y: string): number { return x; }")
+                .expect("test source fits the per-file budget"),
+        );
+        let scanned = crate::scanner::scan(SourceId::new(0), ScriptKind::TypeScript, source);
+        let parsed = crate::parser::parse(scanned);
+        let file = parsed.product();
+        let options = EmitOptions::javascript();
+
+        let from_emit = emit(file, options);
+        let checked = crate::checker::check_source(file);
+        let from_checked = emit_checked(file, checked.product(), options);
+
+        assert_eq!(from_emit, from_checked, "emit and emit_checked must agree");
     }
 }

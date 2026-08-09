@@ -336,7 +336,7 @@ impl AnalysisFacts {
 /// Analyzes one source with the default lint profile.
 #[must_use]
 pub fn check(source_file: &Recovered<SourceFile>) -> Recovered<SemanticModel> {
-    check_with_lints(source_file, &LintTable::new(LintProfile::Default))
+    check_source(source_file.product())
 }
 
 /// Analyzes one source using an already-resolved lint table.
@@ -345,11 +345,25 @@ pub fn check_with_lints(
     source_file: &Recovered<SourceFile>,
     levels: &LintTable,
 ) -> Recovered<SemanticModel> {
-    let source = source_file.product();
-    let (mut model, mut diagnostics) = bind_source(source);
-    model.replace_facts(crate::rules::semantic::collect_facts(source, &model));
+    check_source_with_lints(source_file.product(), levels)
+}
+
+/// Analyzes one source with the default lint profile, borrowing an existing product.
+#[must_use]
+pub fn check_source(source_file: &SourceFile) -> Recovered<SemanticModel> {
+    check_source_with_lints(source_file, &LintTable::new(LintProfile::Default))
+}
+
+/// Analyzes one source using an already-resolved lint table, borrowing an existing product.
+#[must_use]
+pub fn check_source_with_lints(
+    source_file: &SourceFile,
+    levels: &LintTable,
+) -> Recovered<SemanticModel> {
+    let (mut model, mut diagnostics) = bind_source(source_file);
+    model.replace_facts(crate::rules::semantic::collect_facts(source_file, &model));
     diagnostics.extend(analyze_warnings(source_file, levels));
-    diagnostics.extend(crate::rules::analyze_semantic(source, &model, None, levels));
+    diagnostics.extend(crate::rules::analyze_semantic(source_file, &model, None, levels));
     Recovered::new(model, diagnostics)
 }
 
@@ -510,7 +524,7 @@ pub fn check_program_with_options(
         );
         model.replace_facts(crate::rules::semantic::collect_facts(source, &model));
         diagnostics.extend(core_diagnostics);
-        diagnostics.extend(analyze_warnings(recovered, levels));
+        diagnostics.extend(analyze_warnings(source, levels));
         files.insert(source.source_id(), model);
     }
     crate::rules::semantic::collect_program_facts(input.files, input.edges, &mut files);
