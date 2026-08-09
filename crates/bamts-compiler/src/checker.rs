@@ -495,6 +495,15 @@ impl ProgramSemanticModel {
         self.files.get(&source_id)
     }
 
+    /// Removes and returns the semantic model for `source_id`, if present.
+    ///
+    /// This is destructive: the model is moved out of the program map so callers
+    /// can own it without cloning. A missing key returns `None`.
+    #[must_use]
+    pub fn remove_file(&mut self, source_id: SourceId) -> Option<SemanticModel> {
+        self.files.remove(&source_id)
+    }
+
     #[must_use]
     pub fn edges(&self) -> &[ResolvedModuleEdge] {
         &self.edges

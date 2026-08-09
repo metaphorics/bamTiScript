@@ -9,6 +9,7 @@
 //! This module owns no filesystem, CLI, lowerer, runtime, or backend. It only
 //! composes the existing scanner, parser, checker, and emitter surfaces.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::checker::{
@@ -360,28 +361,36 @@ pub fn compile_program_frontend_with_lints(
                 options,
             )
         });
-        let program_diagnostics = checked.diagnostics();
+        let (mut program_model, program_diagnostics) = checked.into_parts();
+        // Partition program diagnostics once into source-keyed buckets that
+        // preserve the canonical order from `Recovered`. The buckets are only
+        // looked up by module source id below; the module iteration order (not
+        // map iteration order) establishes output order, and diagnostics whose
+        // source id matches no module are left in the map and dropped, matching
+        // the previous per-module filter behavior.
+        let mut buckets: BTreeMap<SourceId, Vec<Diagnostic>> = BTreeMap::new();
+        for diagnostic in program_diagnostics {
+            buckets
+                .entry(diagnostic.source_id())
+                .or_default()
+                .push(diagnostic);
+        }
         let modules = parsed
             .into_iter()
             .map(|parsed| {
                 let source_id = parsed.product().source_id();
-                let semantic_model = checked
-                    .product()
-                    .file(source_id)
-                    .expect("whole-program checker returns every parsed module")
-                    .clone();
+                let semantic_model = program_model
+                    .remove_file(source_id)
+                    .expect("whole-program checker returns every parsed module");
                 let emit = mode.emit_options().map(|options| {
                     Telemetry::measure(Phase::Emit, || {
                         emitter::emit_checked(parsed.product(), &semantic_model, options)
                     })
                 });
                 let (source_file, mut diagnostics) = parsed.into_parts();
-                diagnostics.extend(
-                    program_diagnostics
-                        .iter()
-                        .filter(|diagnostic| diagnostic.source_id() == source_id)
-                        .cloned(),
-                );
+                if let Some(bucket) = buckets.remove(&source_id) {
+                    diagnostics.extend(bucket);
+                }
                 if let Some(output) = &emit {
                     diagnostics.extend(output.diagnostics.iter().cloned());
                 }
@@ -772,5 +781,98 @@ mod tests {
             "emit recorded"
         );
         assert!(!Telemetry::enabled());
+    }
+
+    #[test]
+    fn compile_program_frontend_attaches_one_model_and_ordered_unique_diagnostics_per_module() {
+        use std::{
+            fs,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+
+        use crate::{
+            program::ProgramLoader,
+            project::{ProjectConfig, ProjectRoot},
+        };
+
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let root_path = std::env::temp_dir().join(format!(
+            "bamts-pipeline-multi-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root_path).unwrap();
+        let write = |name: &str, source: &str| fs::write(root_path.join(name), source).unwrap();
+        write(
+            "main.ts",
+            "import { value } from \"./dep\";\nconst n: number = \"oops\";",
+        );
+        write("dep.ts", "export const value: number = \"oops\";");
+
+        let root = ProjectRoot::new(fs::canonicalize(&root_path).unwrap()).unwrap();
+        let config = ProjectConfig::parse(&root, root_path.join("tsconfig.json"), "{}").unwrap();
+        let program = ProgramLoader::new(&root, config.options())
+            .unwrap()
+            .load("main.ts")
+            .unwrap();
+
+        let expected_ids: Vec<SourceId> = program
+            .modules()
+            .iter()
+            .map(|module| module.source_id())
+            .collect();
+        assert!(
+            expected_ids.len() > 1,
+            "fixture must load multiple modules"
+        );
+
+        let output = super::compile_program_frontend(&program, FrontendMode::Check);
+
+        // Module order stays stable: outputs appear in the same dependency-first
+        // order as the resolved program.
+        let actual_ids: Vec<SourceId> = output
+            .modules()
+            .iter()
+            .map(|module| module.source_file().source_id())
+            .collect();
+        assert_eq!(actual_ids, expected_ids, "module order must match program order");
+
+        // One semantic model per module, and every diagnostic is attached to the
+        // module that owns its source id.
+        let mut seen: Vec<&Diagnostic> = Vec::new();
+        for module in output.modules() {
+            assert!(
+                module.semantic_model().scopes().len() >= 1,
+                "each module must carry its own semantic model"
+            );
+            assert!(
+                module
+                    .diagnostics()
+                    .iter()
+                    .any(|diagnostic| diagnostic.code().as_str() == "BAMTS-C004"),
+                "module {:?} missing its type-error diagnostic",
+                module.source_file().source_id(),
+            );
+            for diagnostic in module.diagnostics() {
+                assert_eq!(
+                    diagnostic.source_id(),
+                    module.source_file().source_id(),
+                    "diagnostic leaked across module boundaries",
+                );
+            }
+            assert!(
+                is_sorted_unique(module.diagnostics()),
+                "module diagnostics must be canonically ordered and unique",
+            );
+            seen.extend(module.diagnostics());
+        }
+
+        // No diagnostic is duplicated across modules.
+        let before = seen.len();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), before, "diagnostic duplicated across modules");
+
+        fs::remove_dir_all(root_path).unwrap();
     }
 }
