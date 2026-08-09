@@ -2719,8 +2719,10 @@ mod tests {
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             executable: None,
         };
-        let error = run_worker(&artifacts, &request, Duration::from_secs(5))
-            .expect_err("worker without response must fail");
+        let error = match run_worker(&artifacts, &request, Duration::from_secs(5)) {
+            Err(error) => error,
+            Ok(_) => panic!("worker without response must fail"),
+        };
         assert_eq!(error.code(), ErrorCode::ToolFailed);
         let message = error.to_string();
         assert!(
