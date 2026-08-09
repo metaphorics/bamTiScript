@@ -14,7 +14,12 @@
 //! because every JSON object key is sorted lexicographically, the `entries` array
 //! is sorted before writing, and line endings are LF with no trailing whitespace.
 
-use std::{collections::BTreeSet, fs, io, path::Path};
+use std::{
+    collections::BTreeSet,
+    fs,
+    io::{self, Write as _},
+    path::Path,
+};
 
 use serde::{Deserialize, Serialize};
 
