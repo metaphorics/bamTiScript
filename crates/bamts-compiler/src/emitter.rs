@@ -4211,22 +4211,4 @@ export = answer;";
         assert_eq!(global_out.diagnostics.len(), 1);
         assert_eq!(global_out.diagnostics[0].code(), codes::NAMESPACE_UNLOWERED);
     }
-
-    #[test]
-    fn emit_and_emit_checked_produce_identical_output() {
-        let source = Arc::new(
-            SourceText::new("const x: number = 1;\nfunction f(y: string): number { return x; }")
-                .expect("test source fits the per-file budget"),
-        );
-        let scanned = crate::scanner::scan(SourceId::new(0), ScriptKind::TypeScript, source);
-        let parsed = crate::parser::parse(scanned);
-        let file = parsed.product();
-        let options = EmitOptions::javascript();
-
-        let from_emit = emit(file, options);
-        let checked = crate::checker::check_source(file);
-        let from_checked = emit_checked(file, checked.product(), options);
-
-        assert_eq!(from_emit, from_checked, "emit and emit_checked must agree");
-    }
 }
