@@ -1593,9 +1593,7 @@ fn return_type_admits_absence(return_type: Option<&TypeAnnotationNode>) -> bool 
                     | KeywordType::Any
                     | KeywordType::Unknown
             ),
-            TypeNode::Union(members) => members
-                .iter()
-                .any(|member| admits_absence(member.data())),
+            TypeNode::Union(members) => members.iter().any(|member| admits_absence(member.data())),
             TypeNode::Parenthesized(inner) => admits_absence(inner.data()),
             _ => false,
         }
@@ -2316,5 +2314,4 @@ mod tests {
             "W065 must fire when no return type is declared"
         );
     }
-
 }
