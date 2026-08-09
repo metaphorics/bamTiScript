@@ -1513,9 +1513,10 @@ mod tests {
     use crate::source::{ScriptKind, SourceId, SourceText, TextRange, Utf16Pos};
     use crate::syntax::{
         ArrowFunction, BindingPattern, Block, ClassMember, Decorator, EntityName, Expr, Expression,
-        ExpressionStatement, FunctionBody, Identifier, IdentifierNode, KeywordType, Literal,
-        MissingNode, Node, NodeId, NodeKind, NumericLiteral, Parameter, ParameterNode, SourceFile,
-        Statement, Stmt, StringLiteral, Token, TokenKind, TypeAnnotation, TypeNode,
+        ExpressionStatement, ExportDeclaration, ExportNamedDeclaration, FunctionBody, Identifier,
+        IdentifierNode, KeywordType, Literal, MissingNode, Node, NodeId, NodeKind, NumericLiteral,
+        Parameter, ParameterNode, SourceFile, Statement, Stmt, StringLiteral, Token, TokenKind,
+        TypeAnnotation, TypeNode,
     };
     use crate::{parser, scanner};
     use std::sync::Arc;
@@ -4549,6 +4550,109 @@ mod tests {
             checker_codes(&result).contains(&PROPERTY_DOES_NOT_EXIST.as_str()),
             "C.nope must report PROPERTY_DOES_NOT_EXIST: {:?}",
             checker_codes(&result)
+        );
+    }
+
+    #[test]
+    fn exports_for_member_declaration_uses_index_and_preserves_order() {
+        // One declaration statement can yield multiple exports (e.g. several
+        // variable declarators), so the index must store a vector of positions
+        // and return them in the original source/plan order.
+        let parsed = parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            source("namespace N { export let first = 1, second = 2; }"),
+        ));
+        let checked = check(&parsed);
+        assert!(checker_codes(&checked).is_empty(), "{:?}", checker_codes(&checked));
+
+        let facts = checked.product().namespace_facts();
+        let namespace = &parsed.product().statements()[0];
+        let Statement::Namespace(namespace_decl) = namespace.data() else {
+            panic!("first statement is a namespace");
+        };
+        let export_statement = &namespace_decl.body.data().statements[0];
+        let Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner))) =
+            export_statement.data()
+        else {
+            panic!("namespace body statement is a declaration export");
+        };
+        let declaration_id = inner.as_ref().id();
+
+        let n_symbol = facts
+            .declaration_symbol(namespace.id())
+            .expect("namespace has a symbol");
+        let exports = facts.exports_for_member_declaration(declaration_id);
+        assert_eq!(
+            exports.len(),
+            2,
+            "one variable declaration with two declarators yields two exports"
+        );
+
+        let (container, first) = &exports[0];
+        assert_eq!(*container, n_symbol);
+        assert_eq!(first.name().to_utf8_lossy(), "first");
+        assert_eq!(first.storage(), ExportStorage::Property);
+
+        let (container, second) = &exports[1];
+        assert_eq!(*container, n_symbol);
+        assert_eq!(second.name().to_utf8_lossy(), "second");
+        assert_eq!(second.storage(), ExportStorage::Property);
+
+        // The index must key by the inner declaration, not the enclosing
+        // namespace declaration or any other node.
+        assert!(
+            facts.exports_for_member_declaration(namespace.id()).is_empty(),
+            "a namespace declaration is not itself an exported member"
+        );
+    }
+
+    #[test]
+    fn exports_for_member_declaration_keys_by_declaration_node_id() {
+        // Merged namespaces have multiple plans; the index must distinguish the
+        // declaration node id of each exported member instead of conflating by
+        // name or container symbol.
+        let parsed = parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            source("namespace N { export let a = 1; } namespace N { export let b = 2; }"),
+        ));
+        let checked = check(&parsed);
+        assert!(checker_codes(&checked).is_empty(), "{:?}", checker_codes(&checked));
+
+        let facts = checked.product().namespace_facts();
+        let first = &parsed.product().statements()[0];
+        let second = &parsed.product().statements()[1];
+        let Statement::Namespace(first_ns) = first.data() else {
+            panic!("first statement is a namespace");
+        };
+        let Statement::Namespace(second_ns) = second.data() else {
+            panic!("second statement is a namespace");
+        };
+        let first_export = &first_ns.body.data().statements[0];
+        let second_export = &second_ns.body.data().statements[0];
+
+        let extract_declaration = |statement: &Stmt| -> NodeId {
+            let Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner))) =
+                statement.data()
+            else {
+                panic!("expected a declaration export");
+            };
+            inner.as_ref().id()
+        };
+
+        let a_declaration = extract_declaration(first_export);
+        let b_declaration = extract_declaration(second_export);
+
+        let a_exports = facts.exports_for_member_declaration(a_declaration);
+        let b_exports = facts.exports_for_member_declaration(b_declaration);
+        assert_eq!(a_exports.len(), 1, "declaration a has one export");
+        assert_eq!(b_exports.len(), 1, "declaration b has one export");
+        assert_eq!(a_exports[0].1.name().to_utf8_lossy(), "a");
+        assert_eq!(b_exports[0].1.name().to_utf8_lossy(), "b");
+        assert!(
+            facts.exports_for_member_declaration(first.id()).is_empty(),
+            "namespace declaration itself has no member exports"
         );
     }
 }

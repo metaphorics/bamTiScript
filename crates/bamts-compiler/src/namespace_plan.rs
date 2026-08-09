@@ -20,6 +20,9 @@ pub struct NamespaceFacts {
     member_uses: HashMap<NodeId, NamespaceMemberUse>,
     qualified_type_paths: HashMap<NodeId, Box<[SymbolId]>>,
     qualified_import_paths: HashMap<NodeId, Box<[SymbolId]>>,
+    /// Built from the per-plan export lists so `exports_for_member_declaration`
+    /// is linear in the number of matching exports.
+    exports_by_declaration: HashMap<NodeId, Vec<(NodeId, u32)>>,
 }
 
 impl NamespaceFacts {
@@ -34,6 +37,7 @@ impl NamespaceFacts {
             member_uses: HashMap::new(),
             qualified_type_paths: HashMap::new(),
             qualified_import_paths: HashMap::new(),
+            exports_by_declaration: HashMap::new(),
         }
     }
 
@@ -60,15 +64,19 @@ impl NamespaceFacts {
         &self,
         declaration: NodeId,
     ) -> Vec<(SymbolId, &NamespaceExport)> {
-        let mut matched = Vec::new();
-        for plan in self.declarations.values() {
-            for export in plan.exports.iter() {
-                if export.declaration() == declaration {
-                    matched.push((plan.container, export));
-                }
-            }
-        }
-        matched
+        let Some(positions) = self.exports_by_declaration.get(&declaration) else {
+            return Vec::new();
+        };
+        positions
+            .iter()
+            .map(|(plan_id, index)| {
+                let plan = self
+                    .declarations
+                    .get(plan_id)
+                    .expect("export index entry must resolve to a built plan");
+                (plan.container, &plan.exports[*index as usize])
+            })
+            .collect()
     }
 
     #[must_use]
@@ -299,6 +307,19 @@ pub(crate) fn build(
             },
         );
     }
+    // Build an export-by-declaration index once, in the same plan-iteration
+    // order as the original full scan, so the lookup order is preserved and
+    // each query is proportional to its number of matches.
+    let mut exports_by_declaration: HashMap<NodeId, Vec<(NodeId, u32)>> = HashMap::new();
+    for (plan_id, plan) in &facts.declarations {
+        for (i, export) in plan.exports.iter().enumerate() {
+            exports_by_declaration
+                .entry(export.declaration)
+                .or_default()
+                .push((*plan_id, i as u32));
+        }
+    }
+    facts.exports_by_declaration = exports_by_declaration;
 
     facts
 }
