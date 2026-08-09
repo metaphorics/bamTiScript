@@ -652,16 +652,32 @@ impl<H: Host> Intrinsics<H> {
         self.builtins.object_to_string()
     }
     pub(crate) fn for_each_value(&self, mut visit: impl FnMut(Value)) {
-        for value in self.globals.values().chain(self.symbol_registry.values()) {
+        let Self {
+            globals,
+            symbol_registry,
+            object_prototype,
+            function_prototype,
+            array_prototype,
+            string_prototype,
+            number_prototype,
+            boolean_prototype,
+            builtins,
+        } = self;
+
+        for value in globals.values().chain(symbol_registry.values()) {
             visit(*value);
         }
-        visit(self.object_prototype);
-        visit(self.function_prototype);
-        visit(self.array_prototype);
-        visit(self.string_prototype);
-        visit(self.number_prototype);
-        visit(self.boolean_prototype);
-        self.builtins.for_each_value(visit);
+        for value in [
+            *object_prototype,
+            *function_prototype,
+            *array_prototype,
+            *string_prototype,
+            *number_prototype,
+            *boolean_prototype,
+        ] {
+            visit(value);
+        }
+        builtins.for_each_value(visit);
     }
 }
 
