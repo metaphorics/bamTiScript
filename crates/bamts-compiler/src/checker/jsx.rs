@@ -638,7 +638,12 @@ impl<'src> Binder<'src> {
                 }
                 JsxChild::Spread(spread) => {
                     self.resolve_expr(&spread.data().expression, scope);
-                    child_types.push(self.type_of_expr(&spread.data().expression, scope));
+                    let spread_type = self.type_of_expr(&spread.data().expression, scope);
+                    let child_type = match self.types.get(spread_type) {
+                        Type::Array(element) => *element,
+                        _ => self.types.any(),
+                    };
+                    child_types.push(child_type);
                 }
                 JsxChild::Element(expression) => {
                     child_types.push(self.check_jsx_nested(expression, scope));
@@ -899,6 +904,24 @@ mod tests {
         } \
         const x = <div>   </div>;";
         assert_clean(codes(source));
+    }
+
+    #[test]
+    fn spread_children_contribute_array_elements_and_keep_other_values_opaque() {
+        let strings = format!(
+            "{JSX_PREAMBLE} const items: string[] = []; const x = <div>{{...items}}</div>;"
+        );
+        assert_clean(codes(&strings));
+
+        let numbers = format!(
+            "{JSX_PREAMBLE} const items: number[] = []; const x = <div>{{...items}}</div>;"
+        );
+        assert_eq!(codes(&numbers), [JSX_ATTRIBUTES_NOT_ASSIGNABLE.as_str()]);
+
+        let opaque = format!(
+            "{JSX_PREAMBLE} const items: unknown = null; const x = <div>{{...items}}</div>;"
+        );
+        assert_clean(codes(&opaque));
     }
 
     // -- spread attributes -------------------------------------------------------------
