@@ -14,7 +14,7 @@
 //! caller keeps its own pending-ID set so empty waits return immediately and a
 //! timer that fires and is cancelled in the same window is reported to nobody.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::future;
 use std::sync::mpsc::{Receiver as StdReceiver, Sender as StdSender, TryRecvError};
 use std::task::Poll;
@@ -26,6 +26,12 @@ use tokio::runtime::Builder;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio_util::time::{DelayQueue, delay_queue};
 
+/// A timer wakeup paired with its private arming identity.
+struct ArmedWakeup {
+    wakeup: TimerWakeup,
+    generation: u64,
+}
+
 /// A command issued by the JS thread and consumed by the timer worker.
 enum Command {
     /// Insert a timer that expires after `delay`, echoing `deadline_ms` back in
@@ -33,6 +39,7 @@ enum Command {
     Schedule {
         id: u64,
         deadline_ms: u64,
+        generation: u64,
         delay: Duration,
     },
     /// Remove the timer with this ID if it is still armed.
@@ -42,14 +49,14 @@ enum Command {
 /// Either half of the worker's single-thread event loop can complete first.
 enum Event {
     Command(Option<Command>),
-    Expired(Option<delay_queue::Expired<TimerWakeup>>),
+    Expired(Option<delay_queue::Expired<ArmedWakeup>>),
 }
 
 /// The JS-side handle to a running timer worker thread.
 struct Worker {
     /// `None` only transiently while dropping, to signal shutdown before join.
     command_tx: Option<UnboundedSender<Command>>,
-    expiry_rx: StdReceiver<TimerWakeup>,
+    expiry_rx: StdReceiver<ArmedWakeup>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -60,7 +67,7 @@ impl Worker {
     /// as [`TimerError`]; none of them panic the calling thread.
     fn spawn() -> Result<Self, TimerError> {
         let (command_tx, command_rx) = unbounded_channel::<Command>();
-        let (expiry_tx, expiry_rx) = std::sync::mpsc::channel::<TimerWakeup>();
+        let (expiry_tx, expiry_rx) = std::sync::mpsc::channel::<ArmedWakeup>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
         let handle = std::thread::Builder::new()
@@ -113,7 +120,7 @@ impl Drop for Worker {
 /// Builds the worker runtime, reports readiness, and runs the event loop.
 fn run_worker(
     command_rx: UnboundedReceiver<Command>,
-    expiry_tx: StdSender<TimerWakeup>,
+    expiry_tx: StdSender<ArmedWakeup>,
     ready_tx: &StdSender<Result<(), String>>,
 ) {
     let runtime = match Builder::new_current_thread().enable_time().build() {
@@ -136,9 +143,9 @@ fn run_worker(
 /// in the same wake as an expiry is applied before the timer is delivered.
 async fn worker_loop(
     mut command_rx: UnboundedReceiver<Command>,
-    expiry_tx: StdSender<TimerWakeup>,
+    expiry_tx: StdSender<ArmedWakeup>,
 ) {
-    let mut queue: DelayQueue<TimerWakeup> = DelayQueue::new();
+    let mut queue: DelayQueue<ArmedWakeup> = DelayQueue::new();
     let mut keys: BTreeMap<u64, delay_queue::Key> = BTreeMap::new();
 
     loop {
@@ -159,12 +166,19 @@ async fn worker_loop(
             Event::Command(Some(Command::Schedule {
                 id,
                 deadline_ms,
+                generation,
                 delay,
             })) => {
                 if let Some(previous) = keys.remove(&id) {
                     queue.try_remove(&previous);
                 }
-                let key = queue.insert(TimerWakeup { id, deadline_ms }, delay);
+                let key = queue.insert(
+                    ArmedWakeup {
+                        wakeup: TimerWakeup { id, deadline_ms },
+                        generation,
+                    },
+                    delay,
+                );
                 keys.insert(id, key);
             }
             Event::Command(Some(Command::Cancel { id })) => {
@@ -177,7 +191,7 @@ async fn worker_loop(
             Event::Command(None) => break,
             Event::Expired(Some(expired)) => {
                 let wakeup = expired.into_inner();
-                keys.remove(&wakeup.id);
+                keys.remove(&wakeup.wakeup.id);
                 if expiry_tx.send(wakeup).is_err() {
                     // NodeHost is gone; stop serving.
                     break;
@@ -197,8 +211,10 @@ async fn worker_loop(
 pub(crate) struct NodeTimers {
     /// Monotonic base for provider deadlines, captured at construction.
     base: Instant,
-    /// IDs the caller still considers armed; the source of truth for delivery.
-    pending: BTreeSet<u64>,
+    /// Generation assigned to the next successful arming.
+    next_generation: u64,
+    /// Armed IDs mapped to the private generation of their current arming.
+    pending: BTreeMap<u64, u64>,
     worker: Option<Worker>,
 }
 
@@ -206,7 +222,8 @@ impl NodeTimers {
     pub(crate) fn new() -> Self {
         Self {
             base: Instant::now(),
-            pending: BTreeSet::new(),
+            next_generation: 1,
+            pending: BTreeMap::new(),
             worker: None,
         }
     }
@@ -228,6 +245,14 @@ impl NodeTimers {
             .expect("worker was just initialised above"))
     }
 
+    fn accept_wakeup(&mut self, armed: ArmedWakeup) -> Option<TimerWakeup> {
+        let id = armed.wakeup.id;
+        (self.pending.get(&id) == Some(&armed.generation)).then(|| {
+            self.pending.remove(&id);
+            armed.wakeup
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn worker_active(&self) -> bool {
         self.worker.is_some()
@@ -239,13 +264,19 @@ impl TimerProvider for NodeTimers {
         // Compute the deadline before touching the worker so the returned value
         // is stable even though the actual insert happens on the worker thread.
         let deadline_ms = self.deadline_ms(delay_ms);
+        let generation = self.next_generation;
+        let next_generation = generation
+            .checked_add(1)
+            .ok_or_else(|| TimerError::new("timer generation exhausted"))?;
         let worker = self.worker()?;
         worker.send(Command::Schedule {
             id,
             deadline_ms,
+            generation,
             delay: Duration::from_millis(u64::from(delay_ms)),
         })?;
-        self.pending.insert(id);
+        self.next_generation = next_generation;
+        self.pending.insert(id, generation);
         Ok(deadline_ms)
     }
 
@@ -253,7 +284,7 @@ impl TimerProvider for NodeTimers {
         // The caller-side pending set answers "was it armed?" and makes a
         // cancel that races a just-fired expiry safe: the worker `try_remove`
         // is a no-op and the stale wakeup is dropped at poll/wait time.
-        if !self.pending.remove(&id) {
+        if self.pending.remove(&id).is_none() {
             return Ok(false);
         }
         if let Some(worker) = self.worker.as_ref() {
@@ -263,13 +294,19 @@ impl TimerProvider for NodeTimers {
     }
 
     fn poll_expired(&mut self, output: &mut Vec<TimerWakeup>) -> Result<(), TimerError> {
-        let Some(worker) = self.worker.as_ref() else {
+        if self.worker.is_none() {
             return Ok(());
-        };
+        }
         loop {
-            match worker.expiry_rx.try_recv() {
-                Ok(wakeup) => {
-                    if self.pending.remove(&wakeup.id) {
+            let received = self
+                .worker
+                .as_ref()
+                .expect("worker presence checked before loop")
+                .expiry_rx
+                .try_recv();
+            match received {
+                Ok(armed) => {
+                    if let Some(wakeup) = self.accept_wakeup(armed) {
                         output.push(wakeup);
                     }
                 }
@@ -288,16 +325,17 @@ impl TimerProvider for NodeTimers {
             if self.pending.is_empty() {
                 return Ok(None);
             }
-            let Some(worker) = self.worker.as_ref() else {
-                return Ok(None);
+            let received = match self.worker.as_ref() {
+                Some(worker) => worker.expiry_rx.recv(),
+                None => return Ok(None),
             };
-            match worker.expiry_rx.recv() {
-                Ok(wakeup) => {
-                    if self.pending.remove(&wakeup.id) {
+            match received {
+                Ok(armed) => {
+                    if let Some(wakeup) = self.accept_wakeup(armed) {
                         return Ok(Some(wakeup));
                     }
-                    // Stale wakeup for a cancelled ID; keep waiting only while
-                    // live timers remain (re-checked at the top of the loop).
+                    // Stale wakeup for a cancelled or re-armed ID; keep waiting
+                    // while live timers remain (re-checked at the top of the loop).
                 }
                 Err(_) => {
                     return Err(TimerError::new("timer worker expiry channel disconnected"));
@@ -313,10 +351,11 @@ impl TimerProvider for NodeTimers {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, worker_loop};
+    use super::{ArmedWakeup, Command, NodeTimers, worker_loop};
     use std::sync::mpsc::TryRecvError;
     use std::time::Duration;
 
+    use bamts_runtime::{TimerProvider, TimerWakeup};
     use tokio::runtime::Builder;
     use tokio::sync::mpsc::unbounded_channel;
 
@@ -333,6 +372,7 @@ mod tests {
             .send(Command::Schedule {
                 id: 7,
                 deadline_ms: 10,
+                generation: 1,
                 delay: Duration::from_millis(10),
             })
             .expect("first timer command sends");
@@ -340,6 +380,7 @@ mod tests {
             .send(Command::Schedule {
                 id: 7,
                 deadline_ms: 500,
+                generation: 2,
                 delay: Duration::from_millis(500),
             })
             .expect("replacement timer command sends");
@@ -362,5 +403,37 @@ mod tests {
                 Err(TryRecvError::Disconnected)
             ));
         });
+    }
+
+    #[test]
+    fn same_deadline_rearm_rejects_stale_generation() {
+        let mut timers = NodeTimers::new();
+        timers.pending.insert(7, 2);
+
+        assert!(
+            timers
+                .accept_wakeup(ArmedWakeup {
+                    wakeup: TimerWakeup {
+                        id: 7,
+                        deadline_ms: 50,
+                    },
+                    generation: 1,
+                })
+                .is_none()
+        );
+        assert!(timers.has_pending());
+
+        let wakeup = timers
+            .accept_wakeup(ArmedWakeup {
+                wakeup: TimerWakeup {
+                    id: 7,
+                    deadline_ms: 50,
+                },
+                generation: 2,
+            })
+            .expect("current arming is delivered");
+        assert_eq!(wakeup.id, 7);
+        assert_eq!(wakeup.deadline_ms, 50);
+        assert!(!timers.has_pending());
     }
 }

@@ -1209,6 +1209,31 @@ mod timer_tests {
     }
 
     #[test]
+    fn rearmed_timer_drops_stale_wakeup_from_previous_arming() {
+        let mut host = NodeHost::new();
+        let timers = Host::timers(&mut host).unwrap();
+
+        let _first_deadline = timers.schedule(7, 1).expect("schedule id 7 (first)");
+        // Let the worker fire and queue the wakeup while the caller has not yet
+        // polled it.
+        std::thread::sleep(Duration::from_millis(40));
+
+        // Re-arm id 7 with a much longer delay before polling the expired wakeup.
+        let _second_deadline = timers.schedule(7, 1000).expect("schedule id 7 (re-arm)");
+
+        let mut output = Vec::new();
+        timers.poll_expired(&mut output).expect("poll");
+        assert!(
+            output.is_empty(),
+            "stale wakeup from previous arming must be dropped on re-arm"
+        );
+        assert!(
+            timers.has_pending(),
+            "re-armed timer 7 must remain pending for its new deadline"
+        );
+    }
+
+    #[test]
     fn worker_is_lazy_and_shuts_down_cleanly_on_drop() {
         let mut host = NodeHost::new();
         assert!(
