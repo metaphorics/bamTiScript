@@ -821,10 +821,7 @@ mod tests {
             .iter()
             .map(|module| module.source_id())
             .collect();
-        assert!(
-            expected_ids.len() > 1,
-            "fixture must load multiple modules"
-        );
+        assert!(expected_ids.len() > 1, "fixture must load multiple modules");
 
         let output = super::compile_program_frontend(&program, FrontendMode::Check);
 
@@ -835,7 +832,10 @@ mod tests {
             .iter()
             .map(|module| module.source_file().source_id())
             .collect();
-        assert_eq!(actual_ids, expected_ids, "module order must match program order");
+        assert_eq!(
+            actual_ids, expected_ids,
+            "module order must match program order"
+        );
 
         // One semantic model per module, and every diagnostic is attached to the
         // module that owns its source id.
