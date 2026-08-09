@@ -529,7 +529,9 @@ mod tests {
                 11,
                 FunctionFlags::default(),
                 vec![
-                    Instruction::LoadThis { dst: Register::new(0) },
+                    Instruction::LoadThis {
+                        dst: Register::new(0),
+                    },
                     Instruction::LoadConst {
                         dst: Register::new(8),
                         constant: ConstantId::new(2),
@@ -556,7 +558,9 @@ mod tests {
                         key: Register::new(9),
                         value: Register::new(10),
                     },
-                    Instruction::CreateObject { dst: Register::new(5) },
+                    Instruction::CreateObject {
+                        dst: Register::new(5),
+                    },
                     Instruction::GetProperty {
                         dst: Register::new(6),
                         object: Register::new(5),
@@ -571,7 +575,9 @@ mod tests {
                         object: Register::new(3),
                         key: Register::new(8),
                     },
-                    Instruction::CreateArray { dst: Register::new(7) },
+                    Instruction::CreateArray {
+                        dst: Register::new(7),
+                    },
                     Instruction::ArrayPush {
                         array: Register::new(7),
                         value: Register::new(0),
