@@ -1521,11 +1521,11 @@ mod tests {
     use crate::namespace_plan::{ContainerAcquisition, ExportStorage};
     use crate::source::{ScriptKind, SourceId, SourceText, TextRange, Utf16Pos};
     use crate::syntax::{
-        ArrowFunction, BindingPattern, Block, ClassMember, Decorator, EntityName, Expr, Expression,
-        ExpressionStatement, ExportDeclaration, ExportNamedDeclaration, FunctionBody, Identifier,
-        IdentifierNode, KeywordType, Literal, MissingNode, Node, NodeId, NodeKind, NumericLiteral,
-        Parameter, ParameterNode, SourceFile, Statement, Stmt, StringLiteral, Token, TokenKind,
-        TypeAnnotation, TypeNode,
+        ArrowFunction, BindingPattern, Block, ClassMember, Decorator, EntityName,
+        ExportDeclaration, ExportNamedDeclaration, Expr, Expression, ExpressionStatement,
+        FunctionBody, Identifier, IdentifierNode, KeywordType, Literal, MissingNode, Node, NodeId,
+        NodeKind, NumericLiteral, Parameter, ParameterNode, SourceFile, Statement, Stmt,
+        StringLiteral, Token, TokenKind, TypeAnnotation, TypeNode,
     };
     use crate::{parser, scanner};
     use std::sync::Arc;
@@ -4573,7 +4573,11 @@ mod tests {
             source("namespace N { export let first = 1, second = 2; }"),
         ));
         let checked = check(&parsed);
-        assert!(checker_codes(&checked).is_empty(), "{:?}", checker_codes(&checked));
+        assert!(
+            checker_codes(&checked).is_empty(),
+            "{:?}",
+            checker_codes(&checked)
+        );
 
         let facts = checked.product().namespace_facts();
         let namespace = &parsed.product().statements()[0];
@@ -4611,7 +4615,9 @@ mod tests {
         // The index must key by the inner declaration, not the enclosing
         // namespace declaration or any other node.
         assert!(
-            facts.exports_for_member_declaration(namespace.id()).is_empty(),
+            facts
+                .exports_for_member_declaration(namespace.id())
+                .is_empty(),
             "a namespace declaration is not itself an exported member"
         );
     }
@@ -4627,7 +4633,11 @@ mod tests {
             source("namespace N { export let a = 1; } namespace N { export let b = 2; }"),
         ));
         let checked = check(&parsed);
-        assert!(checker_codes(&checked).is_empty(), "{:?}", checker_codes(&checked));
+        assert!(
+            checker_codes(&checked).is_empty(),
+            "{:?}",
+            checker_codes(&checked)
+        );
 
         let facts = checked.product().namespace_facts();
         let first = &parsed.product().statements()[0];
@@ -4642,8 +4652,9 @@ mod tests {
         let second_export = &second_ns.body.data().statements[0];
 
         let extract_declaration = |statement: &Stmt| -> NodeId {
-            let Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner))) =
-                statement.data()
+            let Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
+                inner,
+            ))) = statement.data()
             else {
                 panic!("expected a declaration export");
             };
