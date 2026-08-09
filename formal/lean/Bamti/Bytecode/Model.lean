@@ -13,6 +13,7 @@ def formatVersion : Nat := 4
 abbrev EncodedField := List Nat
 abbrev EncodedInstr := List EncodedField
 abbrev EncodedHandler := List EncodedField
+abbrev EncodedConstant := List Nat
 
 inductive DecodeError where
   | badMagic
@@ -24,6 +25,7 @@ inductive DecodeError where
   | malformedInstruction
   | malformedHandler
   | malformedFunction
+  | malformedConstant
   | malformedModule
   deriving DecidableEq, Repr
 
@@ -177,7 +179,7 @@ structure EncodedFunction where
 structure EncodedModule where
   magic : List Nat
   version : EncodedField
-  constants : List Constant
+  constants : List EncodedConstant
   functions : List EncodedFunction
   entry : EncodedField
   deriving DecidableEq, Repr
@@ -341,8 +343,131 @@ def decodeFunctions : List EncodedFunction → Except DecodeError (List Function
       | .error error, _ => .error error
       | _, .error error => .error error
 
+/-- Encoded string payload: a length prefix followed by the exact UTF-16 code units. -/
+def encodeString (units : List Nat) : List Nat := units.length :: units
+
+def decodeString : List Nat → Except DecodeError (List Nat)
+  | len :: rest =>
+      if rest.length = len then .ok rest else .error .malformedConstant
+  | [] => .error .malformedConstant
+
+/-- BigInt text is encoded the same length-prefixed way as string units. -/
+def encodeBigint (text : List Nat) : List Nat := text.length :: text
+
+def decodeBigint : List Nat → Except DecodeError (List Nat)
+  | len :: rest =>
+      if rest.length = len then .ok rest else .error .malformedConstant
+  | [] => .error .malformedConstant
+
+/-- Int32 is encoded as sign and magnitude, preserving the two `Int` constructors. -/
+def encodeInt32 (value : Int) : List Nat :=
+  match value with
+  | .ofNat n => [0, n]
+  | .negSucc n => [1, n]
+
+def decodeInt32 : List Nat → Except DecodeError Int
+  | [0, n] => .ok (.ofNat n)
+  | [1, n] => .ok (.negSucc n)
+  | _ => .error .malformedConstant
+
+/-- v4 constant-pool wire encoding: each constructor carries a production tag. -/
+def encodeConstant : Constant → EncodedConstant
+  | .numberBits bits => [0, bits]
+  | .int32 value => 1 :: encodeInt32 value
+  | .string units => 2 :: encodeString units
+  | .boolean false => [3]
+  | .boolean true => [4]
+  | .null => [5]
+  | .undefined => [6]
+  | .bigint text => 7 :: encodeBigint text
+
+def decodeConstant : EncodedConstant → Except DecodeError Constant
+  | 0 :: bits :: [] => .ok (.numberBits bits)
+  | 1 :: intEncoded =>
+      match decodeInt32 intEncoded with
+      | .ok value => .ok (.int32 value)
+      | .error e => .error e
+  | 2 :: stringEncoded =>
+      match decodeString stringEncoded with
+      | .ok units => .ok (.string units)
+      | .error e => .error e
+  | 3 :: [] => .ok (.boolean false)
+  | 4 :: [] => .ok (.boolean true)
+  | 5 :: [] => .ok .null
+  | 6 :: [] => .ok .undefined
+  | 7 :: bigintEncoded =>
+      match decodeBigint bigintEncoded with
+      | .ok text => .ok (.bigint text)
+      | .error e => .error e
+  | _ => .error .malformedConstant
+
+def decodeConstants : List EncodedConstant → Except DecodeError (List Constant)
+  | [] => .ok []
+  | encoded :: rest =>
+      match decodeConstant encoded, decodeConstants rest with
+      | .ok constant, .ok constants => .ok (constant :: constants)
+      | .error error, _ => .error error
+      | _, .error error => .error error
+
+theorem decodeInt32_encodeInt32 (value : Int) :
+    decodeInt32 (encodeInt32 value) = .ok value := by
+  cases value with
+  | ofNat n => simp [encodeInt32, decodeInt32]
+  | negSucc n => simp [encodeInt32, decodeInt32]
+
+private theorem decodeString_cons (len : Nat) (rest : List Nat) (h : rest.length = len) :
+    decodeString (len :: rest) = .ok rest := by
+  simp only [decodeString]
+  split
+  · rfl
+  · contradiction
+
+private theorem decodeBigint_cons (len : Nat) (rest : List Nat) (h : rest.length = len) :
+    decodeBigint (len :: rest) = .ok rest := by
+  simp only [decodeBigint]
+  split
+  · rfl
+  · contradiction
+
+theorem decodeString_encodeString (units : List Nat) :
+    decodeString (encodeString units) = .ok units := by
+  simp only [encodeString]
+  exact decodeString_cons units.length units (by rfl)
+
+theorem decodeBigint_encodeBigint (text : List Nat) :
+    decodeBigint (encodeBigint text) = .ok text := by
+  simp only [encodeBigint]
+  exact decodeBigint_cons text.length text (by rfl)
+
+theorem decodeConstant_encodeConstant (constant : Constant) :
+    decodeConstant (encodeConstant constant) = .ok constant := by
+  cases constant with
+  | numberBits bits => simp [encodeConstant, decodeConstant]
+  | int32 value => simp [encodeConstant, decodeConstant, decodeInt32_encodeInt32 value]
+  | string units => simp [encodeConstant, decodeConstant, decodeString_encodeString units]
+  | boolean value =>
+      cases value <;> simp [encodeConstant, decodeConstant]
+  | null => simp [encodeConstant, decodeConstant]
+  | undefined => simp [encodeConstant, decodeConstant]
+  | bigint text => simp [encodeConstant, decodeConstant, decodeBigint_encodeBigint text]
+
+/-- Ordinary (0x0061), NUL (0x0000), and surrogate (0xD800, 0xDC00, 0xDFFF)
+code units round-trip through the constant codec exactly. -/
+theorem decodeConstant_string_roundTrip_sample :
+    decodeConstant (encodeConstant (Constant.string [97, 0, 55296, 56320, 57343])) =
+      .ok (Constant.string [97, 0, 55296, 56320, 57343]) := by
+  simp [encodeConstant, decodeConstant, decodeString_encodeString]
+
+theorem decodeConstants_encodeConstants (constants : List Constant) :
+    decodeConstants (constants.map encodeConstant) = .ok constants := by
+  induction constants with
+  | nil => rfl
+  | cons c cs ih =>
+      have hC := decodeConstant_encodeConstant c
+      simp [decodeConstants, hC, ih]
+
 def encodeModule (module : Module) : EncodedModule :=
-  ⟨moduleMagicBytes, encodeField formatVersion, module.constants,
+  ⟨moduleMagicBytes, encodeField formatVersion, module.constants.map encodeConstant,
     module.functions.map encodeFunction, encodeField module.entry⟩
 
 def decodeModule (encoded : EncodedModule) : Except DecodeError Module :=
@@ -353,10 +478,12 @@ def decodeModule (encoded : EncodedModule) : Except DecodeError Module :=
     | .ok version =>
         if version ≠ formatVersion then .error .unsupportedVersion
         else
-          match decodeFunctions encoded.functions, decodeField encoded.entry with
-          | .ok functions, .ok entry => .ok ⟨encoded.constants, functions, entry⟩
-          | .error error, _ => .error error
-          | _, .error error => .error error
+          match decodeConstants encoded.constants, decodeFunctions encoded.functions,
+                decodeField encoded.entry with
+          | .ok constants, .ok functions, .ok entry => .ok ⟨constants, functions, entry⟩
+          | .error error, _, _ => .error error
+          | _, .error error, _ => .error error
+          | _, _, .error error => .error error
 
 def encodeProgramModule (module : ProgramModule) : EncodedProgramModule :=
   ⟨encodeField module.name, encodeModule module.code, module.edges, module.bindings, module.exports⟩
@@ -578,6 +705,7 @@ theorem decodeModule_encodeModule (module : Module) (h : moduleCanonical module)
   have versionBound : formatVersion < FieldLimit := by decide
   simp [decodeModule, encodeModule, decodeField_encodeField formatVersion versionBound,
     decodeField_encodeField module.entry entryCanonical,
+    decodeConstants_encodeConstants module.constants,
     decodeFunctions_encodeFunctions module.functions functionsCanonical]
 
 theorem decodeProgramModule_encodeProgramModule
