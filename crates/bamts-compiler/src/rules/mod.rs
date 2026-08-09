@@ -14,9 +14,9 @@ use crate::{
         ArrayElement, AssignmentArrayElement, AssignmentTarget, CallArgument, ClassDeclaration,
         ClassMember, ExportDeclaration, ExportDefaultValue, Expr, Expression, ForBinding,
         ForInitializer, FunctionBody, FunctionLike, InterfaceDeclaration, JsxAttributeInitializer,
-        JsxAttributeItem, JsxChild, MemberProperty, ObjectMember, ParameterNode, PropertyName,
-        SourceFile, Statement, Stmt, TokenKind, TypeAnnotationNode, TypeMember, TypeNode,
-        TypeParameterList,
+        JsxAttributeItem, JsxChild, KeywordType, MemberProperty, ObjectMember, ParameterNode,
+        PropertyName, SourceFile, Statement, Stmt, TokenKind, TypeAnnotationNode, TypeMember,
+        TypeNode, TypeParameterList,
     },
 };
 
@@ -1580,6 +1580,29 @@ fn visit_interface(
     }
 }
 
+/// Returns `true` when the declared return type can represent a missing
+/// return value: `undefined`, `void`, `any`, `unknown`, or any union that
+/// contains one of them. Parenthesized wrappers are unwrapped.
+fn return_type_admits_absence(return_type: Option<&TypeAnnotationNode>) -> bool {
+    fn admits_absence(ty: &TypeNode) -> bool {
+        match ty {
+            TypeNode::Keyword(keyword) => matches!(
+                keyword,
+                KeywordType::Undefined
+                    | KeywordType::Void
+                    | KeywordType::Any
+                    | KeywordType::Unknown
+            ),
+            TypeNode::Union(members) => members
+                .iter()
+                .any(|member| admits_absence(member.data())),
+            TypeNode::Parenthesized(inner) => admits_absence(inner.data()),
+            _ => false,
+        }
+    }
+    return_type.is_some_and(|annotation| admits_absence(annotation.data().type_node.data()))
+}
+
 fn visit_function(
     range: TextRange,
     function: &FunctionLike,
@@ -1605,6 +1628,7 @@ fn visit_function(
                     .statements
                     .last()
                     .is_none_or(can_complete_normally)
+                && !return_type_admits_absence(function.return_type.as_ref())
             {
                 findings.push((
                     "BAMTS-W065",
@@ -2258,4 +2282,39 @@ mod tests {
             "a single spread expression must produce exactly one W085",
         );
     }
+    #[test]
+    fn w065_suppressed_when_return_type_admits_absence() {
+        let no_warn = [
+            "function f(x: boolean): number | undefined { if (x) return 1; }",
+            "function f(x: boolean): undefined | number { if (x) return 1; }",
+            "function f(x: boolean): void { if (x) return 1; }",
+            "function f(x: boolean): any { if (x) return 1; }",
+            "function f(x: boolean): unknown { if (x) return 1; }",
+            "function f(x: boolean): (number | undefined) { if (x) return 1; }",
+            "function f(x: boolean): number | any { if (x) return 1; }",
+        ];
+        for source in no_warn {
+            assert!(
+                !codes(source, ScriptKind::TypeScript).contains(&"BAMTS-W065"),
+                "W065 must not fire when the return type admits absence: {source:?}"
+            );
+        }
+        assert!(
+            codes(
+                "function f(x: boolean): number { if (x) return 1; }",
+                ScriptKind::TypeScript,
+            )
+            .contains(&"BAMTS-W065"),
+            "W065 must fire for a non-optional return type"
+        );
+        assert!(
+            codes(
+                "function f(x: boolean) { if (x) return 1; }",
+                ScriptKind::TypeScript,
+            )
+            .contains(&"BAMTS-W065"),
+            "W065 must fire when no return type is declared"
+        );
+    }
+
 }
