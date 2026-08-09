@@ -348,6 +348,7 @@ fn validate_spec(path: &Path, raw: RawSpec, project: &ManifestProject) -> Result
     }
 
     validate_node_args(path, &raw.node_args)?;
+    validate_compiler_args(path, &raw.compiler_args)?;
 
     if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&raw.expected_timeout_ms) {
         return Err(schema_error(
@@ -469,6 +470,42 @@ fn validate_node_args(path: &Path, args: &[String]) -> Result<()> {
             path,
             "node_args must not contain empty entries",
         ));
+    }
+    Ok(())
+}
+
+fn validate_compiler_args(path: &Path, args: &[String]) -> Result<()> {
+    const HARNESS_OWNED_ARGS: &[&str] = &[
+        "--target",
+        "-t",
+        "--output",
+        "-o",
+        "--out-dir",
+        "--output-dir",
+        "--aot",
+        "--jit",
+        "--compile",
+        "--run",
+        "--check",
+        "--js-compat",
+    ];
+
+    for argument in args {
+        if argument.is_empty() {
+            return Err(schema_error(
+                path,
+                "compiler_args must not contain empty entries",
+            ));
+        }
+        let name = argument
+            .split_once('=')
+            .map_or(argument.as_str(), |(name, _)| name);
+        if HARNESS_OWNED_ARGS.contains(&name) {
+            return Err(schema_error(
+                path,
+                format!("compiler_args contains harness-owned argument `{argument}`"),
+            ));
+        }
     }
     Ok(())
 }
@@ -2451,6 +2488,47 @@ mod tests {
             validate_spec(path, raw, &project).unwrap_err().code(),
             ErrorCode::Schema
         );
+    }
+
+    #[test]
+    fn spec_rejects_harness_owned_compiler_args() {
+        let path = Path::new("spec.toml");
+        let project = valid_project();
+        let owned = [
+            "--target",
+            "-t",
+            "--output",
+            "-o",
+            "--out-dir",
+            "--output-dir",
+            "--aot",
+            "--jit",
+            "--compile",
+            "--run",
+            "--check",
+            "--js-compat",
+        ];
+
+        for argument in owned
+            .iter()
+            .flat_map(|argument| [(*argument).to_owned(), format!("{argument}=value")])
+            .chain([String::new()])
+        {
+            let mut raw = valid_raw_spec();
+            raw.compiler_args = vec![argument.clone()];
+            let error = validate_spec(path, raw, &project).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Schema);
+            assert!(
+                error.to_string().contains(&format!("`{argument}`"))
+                    || argument.is_empty() && error.to_string().contains("empty"),
+                "{error}"
+            );
+        }
+
+        let mut raw = valid_raw_spec();
+        raw.compiler_args = vec!["-A".into(), "no-with".into()];
+        let spec = validate_spec(path, raw, &project).expect("unowned compiler args");
+        assert_eq!(spec.compiler_args, ["-A", "no-with"]);
     }
 
     // ---- oracle behavior --------------------------------------------------
