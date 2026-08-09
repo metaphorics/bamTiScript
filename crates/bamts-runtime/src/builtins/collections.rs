@@ -268,6 +268,20 @@ fn iterator_next<H: Host>(
                         })
                     })
                 }
+                HeapEntry::Uint8Array { bytes, .. } => {
+                    usize::try_from(cursor).ok().and_then(|index| {
+                        bytes.get(index).map(|byte| {
+                            let next = cursor
+                                .checked_add(1)
+                                .expect("typed-array bounds keep positions below u64::MAX");
+                            (
+                                next,
+                                crate::number_value(index as f64),
+                                Value::int32(u32::from(*byte)),
+                            )
+                        })
+                    })
+                }
                 HeapEntry::Collection { entries, .. } => {
                     debug_assert!(
                         entries.windows(2).all(|w| w[0].order <= w[1].order),

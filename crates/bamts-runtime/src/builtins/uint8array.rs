@@ -226,7 +226,9 @@ fn join<H: Host>(
         Some(value) => machine.coerce_string_observable(value)?,
     };
     let HeapEntry::Uint8Array { bytes, .. } = &machine.heap[slot] else {
-        unreachable!("Uint8Array brand was checked")
+        return Err(type_error(
+            "Uint8Array.prototype.join called on incompatible receiver",
+        ));
     };
     let mut output = EcmaStringBuilder::new();
     for (index, byte) in bytes.iter().copied().enumerate() {
@@ -243,10 +245,8 @@ fn join<H: Host>(
     )?))
 }
 
-/// `Uint8Array.prototype[Symbol.iterator]` — yields each byte as a Number in
-/// index order, matching `%TypedArray%.prototype.values` / the default
-/// iterator. Reuses the shared `collections::iterator` over a snapshot array
-/// of the bytes, the same mechanism `String.prototype[Symbol.iterator]` uses.
+/// `Uint8Array.prototype[Symbol.iterator]` — yields each current byte lazily in
+/// index order, matching `%TypedArray%.prototype.values`.
 fn values<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
@@ -263,18 +263,9 @@ fn values<H: Host>(
             "Uint8Array.prototype[Symbol.iterator] called on incompatible receiver",
         ));
     }
-    let elements: Vec<Value> = match &machine.heap[slot] {
-        HeapEntry::Uint8Array { bytes, .. } => bytes
-            .iter()
-            .copied()
-            .map(|byte| Value::int32(u32::from(byte)))
-            .collect(),
-        _ => unreachable!("Uint8Array brand was checked"),
-    };
-    let source = super::allocate_array(machine, elements)?;
     Ok(BuiltinOutcome::Value(super::collections::iterator(
         machine,
-        source,
+        this,
         IterationKind::Value,
     )?))
 }
@@ -360,6 +351,20 @@ mod tests {
             "Uint8Array must finish iterable collection before coercing elements"
         );
         Ok(BuiltinOutcome::Value(Value::int32(257)))
+    }
+
+    fn separator_mutates_first_byte(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let target = machine.globals[&EcmaString::encode("joinTarget")];
+        machine.set_data_property(target, "0", Value::int32(9))?;
+        Ok(BuiltinOutcome::Value(allocate_string(
+            machine,
+            EcmaString::encode("-"),
+        )?))
     }
 
     fn construct(machine: &mut Machine<'_, TestHost>, argument: Value) -> Value {
@@ -833,6 +838,70 @@ mod tests {
                 machine.call_value(iterator_fn, plain, &[]),
                 Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
             ));
+        });
+    }
+
+    #[test]
+    fn uint8array_iterator_is_lazy_and_observes_live_bytes() {
+        with_machine(|machine| {
+            let prototype = machine.intrinsics.builtins.uint8array_prototype();
+            let iterator_fn = machine
+                .get_property_key(
+                    prototype,
+                    &machine
+                        .to_property_key(machine.intrinsics.builtins.symbol_iterator())
+                        .unwrap(),
+                )
+                .unwrap();
+            let empty = construct(machine, Value::int32(0));
+            let before_probe = machine.heap_bytes;
+            machine.call_value(iterator_fn, empty, &[]).unwrap();
+            let iterator_charge = machine.heap_bytes - before_probe;
+
+            let typed = construct(machine, Value::int32(1024));
+            let before_iterator = machine.heap_bytes;
+            machine.limits.max_heap_bytes = before_iterator + iterator_charge;
+            let iterator = machine
+                .call_value(iterator_fn, typed, &[])
+                .expect("iterator creation has constant memory cost");
+            assert_eq!(machine.heap_bytes, before_iterator + iterator_charge);
+
+            machine.limits.max_heap_bytes = usize::MAX;
+            machine
+                .set_data_property(typed, "0", Value::int32(77))
+                .unwrap();
+            let next = machine.get_named_property(iterator, "next").unwrap();
+            let result = machine.call_value(next, iterator, &[]).unwrap();
+            assert_eq!(
+                machine.get_named_property(result, "value").unwrap(),
+                Value::int32(77)
+            );
+        });
+    }
+
+    #[test]
+    fn uint8array_join_rereads_bytes_after_separator_coercion() {
+        with_machine(|machine| {
+            let source = array_of(machine, &[Value::int32(1), Value::int32(2)]);
+            let typed = construct(machine, source);
+            machine
+                .globals
+                .insert(EcmaString::encode("joinTarget"), typed);
+            let separator = ordinary_object(machine);
+            let to_string = native(machine, "separator toString", separator_mutates_first_byte);
+            machine
+                .set_data_property(separator, "toString", to_string)
+                .unwrap();
+            let join = machine
+                .get_named_property(machine.intrinsics.builtins.uint8array_prototype(), "join")
+                .unwrap();
+
+            let output = machine.call_value(join, typed, &[separator]).unwrap();
+
+            assert_eq!(
+                machine.string_value(output),
+                Some(EcmaString::encode("9-2"))
+            );
         });
     }
 
