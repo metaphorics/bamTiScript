@@ -363,7 +363,12 @@ pub fn check_source_with_lints(
     let (mut model, mut diagnostics) = bind_source(source_file);
     model.replace_facts(crate::rules::semantic::collect_facts(source_file, &model));
     diagnostics.extend(analyze_warnings(source_file, levels));
-    diagnostics.extend(crate::rules::analyze_semantic(source_file, &model, None, levels));
+    diagnostics.extend(crate::rules::analyze_semantic(
+        source_file,
+        &model,
+        None,
+        levels,
+    ));
     Recovered::new(model, diagnostics)
 }
 

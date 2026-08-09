@@ -872,7 +872,9 @@ fn read_peak_rss_bytes() -> Result<u64> {
                 return Ok(kib * 1024);
             }
         }
-        Err(PerfError::harness("/proc/self/status: VmHWM field not found"))
+        Err(PerfError::harness(
+            "/proc/self/status: VmHWM field not found",
+        ))
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1406,7 +1408,10 @@ mod tests {
 
         let (hwm_after, rss_after) =
             read_hwm_and_rss().expect("read /proc/self/status after reset");
-        assert!(hwm_after > 0, "VmHWM after reset must be positive, not fake");
+        assert!(
+            hwm_after > 0,
+            "VmHWM after reset must be positive, not fake"
+        );
         assert!(
             hwm_after >= rss_after,
             "VmHWM cannot be below current VmRSS (hwm={hwm_after}, rss={rss_after})"
@@ -1423,14 +1428,20 @@ mod tests {
     fn peak_rss_sampling_is_unsupported_outside_linux() {
         // Resetting and reading VmHWM are platform-specific; on non-Linux they
         // must fail with a typed, contextual error rather than return fake data.
-        let reset = reset_peak_rss()
-            .expect_err("reset should fail on non-Linux with a contextual error");
+        let reset =
+            reset_peak_rss().expect_err("reset should fail on non-Linux with a contextual error");
         assert_eq!(reset.code, PerfErrorCode::HarnessError);
-        assert!(reset.detail.contains("Linux"), "reset error must name the platform");
+        assert!(
+            reset.detail.contains("Linux"),
+            "reset error must name the platform"
+        );
 
         let read = read_peak_rss_bytes()
             .expect_err("read should fail on non-Linux with a contextual error");
         assert_eq!(read.code, PerfErrorCode::HarnessError);
-        assert!(read.detail.contains("Linux"), "read error must name the platform");
+        assert!(
+            read.detail.contains("Linux"),
+            "read error must name the platform"
+        );
     }
 }
