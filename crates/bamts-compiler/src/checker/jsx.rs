@@ -88,6 +88,14 @@ impl<'src> JsxCallable<'src> {
     }
 }
 
+/// A declaration signature resolved once and instantiated independently for
+/// each JSX use.
+pub(crate) struct JsxFactorySignature {
+    inference_parameters: Vec<InferenceParameter>,
+    parameters: Vec<TypeId>,
+    return_type: TypeId,
+}
+
 impl<'src> Binder<'src> {
     /// Checks a balanced JSX element `<name attrs>children</name>` and
     /// returns its result type.
@@ -281,12 +289,10 @@ impl<'src> Binder<'src> {
         // A declared factory wins over the symbol's type: function symbols
         // intentionally keep `any` as their symbol type.
         if let Some(callable) = self.jsx_callables.get(&symbol).copied() {
-            let (type_parameters, parameters, return_type) = callable.parts();
             let declaration_scope = self.symbols[symbol.get() as usize].scope();
             return Some(self.check_factory_callable(
-                type_parameters,
-                parameters,
-                return_type,
+                symbol,
+                callable,
                 props,
                 range,
                 declaration_scope,
@@ -342,18 +348,56 @@ impl<'src> Binder<'src> {
         }
     }
 
-    /// Checks a factory recovered from its declaration: resolves the
-    /// signature, infers type arguments from the props object when the
-    /// factory is generic, and returns the (instantiated) return type.
+    /// Checks a factory recovered from its declaration. Declaration annotations
+    /// resolve once; each JSX use gets a fresh inference context.
     fn check_factory_callable(
         &mut self,
-        type_parameters: Option<&'src TypeParameterList>,
-        parameters: &'src [ParameterNode],
-        return_type: Option<&'src TypeAnnotationNode>,
+        symbol: SymbolId,
+        callable: JsxCallable<'src>,
         props: TypeId,
         range: TextRange,
         declaration_scope: ScopeId,
     ) -> TypeId {
+        if !self.jsx_factory_signatures.contains_key(&symbol) {
+            let signature = self.resolve_jsx_factory_signature(callable, declaration_scope);
+            self.jsx_factory_signatures.insert(symbol, signature);
+        }
+
+        let (target, result) = {
+            let signature = self
+                .jsx_factory_signatures
+                .get(&symbol)
+                .expect("JSX factory signature was cached");
+            if signature.inference_parameters.is_empty() {
+                (signature.parameters.first().copied(), signature.return_type)
+            } else {
+                let mut context =
+                    InferenceContext::new(&mut self.types, &signature.inference_parameters);
+                if let Some(first) = signature.parameters.first().copied() {
+                    context.infer_from_argument(first, props, 0);
+                }
+                let inferred = context.resolve();
+                let target = signature
+                    .parameters
+                    .first()
+                    .copied()
+                    .map(|first| inferred.instantiate(&mut self.types, first));
+                let result = inferred.instantiate(&mut self.types, signature.return_type);
+                (target, result)
+            }
+        };
+        if let Some(target) = target {
+            self.check_jsx_props_assignable(range, props, target);
+        }
+        result
+    }
+
+    fn resolve_jsx_factory_signature(
+        &mut self,
+        callable: JsxCallable<'src>,
+        declaration_scope: ScopeId,
+    ) -> JsxFactorySignature {
+        let (type_parameters, parameters, return_type) = callable.parts();
         let type_parameters = type_parameters.filter(|list| !list.parameters.is_empty());
         let scope = match type_parameters {
             Some(list) => {
@@ -363,63 +407,48 @@ impl<'src> Binder<'src> {
             }
             None => declaration_scope,
         };
-        let mut declared_parameters = Vec::with_capacity(parameters.len());
-        for parameter in parameters {
-            declared_parameters.push(match &parameter.data().type_annotation {
+        let parameters = parameters
+            .iter()
+            .map(|parameter| match &parameter.data().type_annotation {
                 Some(annotation) => self.resolve_type(&annotation.data().type_node, scope),
                 None => self.types.any(),
-            });
-        }
-        let declared_return = match return_type {
+            })
+            .collect();
+        let return_type = match return_type {
             Some(annotation) => self.resolve_type(&annotation.data().type_node, scope),
             None => self.types.any(),
         };
-        let Some(list) = type_parameters else {
-            if let Some(target) = declared_parameters.first().copied() {
-                self.check_jsx_props_assignable(range, props, target);
+        let inference_parameters = type_parameters.map_or_else(Vec::new, |list| {
+            let mut resolved = Vec::with_capacity(list.parameters.len());
+            for parameter in &list.parameters {
+                let data = parameter.data();
+                let name = self.identifier_text(&data.name).into_owned();
+                let Some(symbol) = self.scopes[scope.get() as usize].type_binding(&name) else {
+                    self.emit(
+                        CANNOT_FIND_NAME,
+                        data.name.range(),
+                        CANNOT_FIND_NAME_MESSAGE,
+                    );
+                    continue;
+                };
+                let mut inference_parameter = InferenceParameter::new(symbol);
+                if let Some(constraint) = &data.constraint {
+                    inference_parameter =
+                        inference_parameter.with_constraint(self.resolve_type(constraint, scope));
+                }
+                if let Some(default) = &data.default {
+                    inference_parameter =
+                        inference_parameter.with_default(self.resolve_type(default, scope));
+                }
+                resolved.push(inference_parameter);
             }
-            return declared_return;
-        };
-
-        // Generic factory: infer the type arguments from the props object,
-        // then check against the instantiated first parameter.
-        let mut inference_parameters = Vec::with_capacity(list.parameters.len());
-        for parameter in &list.parameters {
-            let data = parameter.data();
-            let name = self.identifier_text(&data.name).into_owned();
-            let Some(symbol) = self.scopes[scope.get() as usize].type_binding(&name) else {
-                // `bind_type_parameters` should have declared every name, but
-                // malformed JSX/TSX can yield an empty or merged name that the
-                // lookup misses. Degrade to `any` per the recovery contract at
-                // the top of this file instead of panicking.
-                self.emit(
-                    CANNOT_FIND_NAME,
-                    data.name.range(),
-                    CANNOT_FIND_NAME_MESSAGE,
-                );
-                continue;
-            };
-            let mut inference_parameter = InferenceParameter::new(symbol);
-            if let Some(constraint) = &data.constraint {
-                inference_parameter =
-                    inference_parameter.with_constraint(self.resolve_type(constraint, scope));
-            }
-            if let Some(default) = &data.default {
-                inference_parameter =
-                    inference_parameter.with_default(self.resolve_type(default, scope));
-            }
-            inference_parameters.push(inference_parameter);
+            resolved
+        });
+        JsxFactorySignature {
+            inference_parameters,
+            parameters,
+            return_type,
         }
-        let mut context = InferenceContext::new(&mut self.types, &inference_parameters);
-        if let Some(first) = declared_parameters.first().copied() {
-            context.infer_from_argument(first, props, 0);
-        }
-        let inferred = context.resolve();
-        if let Some(first) = declared_parameters.first().copied() {
-            let target = inferred.instantiate(&mut self.types, first);
-            self.check_jsx_props_assignable(range, props, target);
-        }
-        inferred.instantiate(&mut self.types, declared_return)
     }
 
     /// Resolves a JSX tag name through the value namespace, following dotted
@@ -919,6 +948,29 @@ mod tests {
              const bad: string = <Comp value={{1}} />;"
         );
         assert_eq!(codes(&source), [TYPE_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    #[test]
+    fn generic_factory_signature_resolution_is_cached_per_declaration() {
+        let one_use = format!(
+            "{JSX_PREAMBLE} \
+             function Comp<T>(props: {{ value: T }}): T {{ return props.value; }} \
+             const number_value: number = <Comp value={{1}} />;"
+        );
+        let two_uses = format!(
+            "{one_use} \
+             const string_value: string = <Comp value={{\"value\"}} />;"
+        );
+
+        let (one_model, one_diagnostics) = bound(&one_use);
+        let (two_model, two_diagnostics) = bound(&two_uses);
+        assert!(one_diagnostics.is_empty(), "{one_diagnostics:?}");
+        assert!(two_diagnostics.is_empty(), "{two_diagnostics:?}");
+        assert_eq!(
+            one_model.scopes().len(),
+            two_model.scopes().len(),
+            "a second JSX use must reuse the resolved declaration signature"
+        );
     }
 
     #[test]

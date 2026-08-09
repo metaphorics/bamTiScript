@@ -19,7 +19,7 @@ use super::inference::{
     InferredTypeArguments,
 };
 use super::intrinsic_environment::GlobalEnvironment;
-use super::jsx::JsxCallable;
+use super::jsx::{JsxCallable, JsxFactorySignature};
 use super::narrowing::{
     FlowFacts, FlowKey, FlowNodeId, GuardResolver, NarrowingContext, NarrowingGuard,
 };
@@ -1304,6 +1304,7 @@ pub(crate) struct Binder<'src> {
     /// initializers) by symbol, so [`super::jsx`] can factory-check
     /// value-based JSX elements whose symbol type stays `any`.
     pub(crate) jsx_callables: HashMap<SymbolId, JsxCallable<'src>>,
+    pub(crate) jsx_factory_signatures: HashMap<SymbolId, JsxFactorySignature>,
     /// Class instance structural types keyed by the class symbol, built lazily
     /// during class-body resolution so `new C()` and member access on class-typed
     /// values can resolve declared instance members.
@@ -1415,6 +1416,7 @@ impl<'src> Binder<'src> {
             hoisted_declaration_symbols: HashMap::new(),
             jsx_element_types: HashMap::new(),
             jsx_callables: HashMap::new(),
+            jsx_factory_signatures: HashMap::new(),
             class_instance_types: HashMap::new(),
             flow_facts: FlowFacts::new(),
             flow: FlowNodeId::ROOT,
