@@ -13,9 +13,10 @@ use crate::{
     syntax::{
         ArrayElement, AssignmentArrayElement, AssignmentTarget, CallArgument, ClassDeclaration,
         ClassMember, ExportDeclaration, ExportDefaultValue, Expr, Expression, ForBinding,
-        ForInitializer, FunctionBody, FunctionLike, InterfaceDeclaration, MemberProperty,
-        ObjectMember, ParameterNode, PropertyName, SourceFile, Statement, Stmt, TokenKind,
-        TypeAnnotationNode, TypeMember, TypeNode, TypeParameterList,
+        ForInitializer, FunctionBody, FunctionLike, InterfaceDeclaration, JsxAttributeInitializer,
+        JsxAttributeItem, JsxChild, MemberProperty, ObjectMember, ParameterNode, PropertyName,
+        SourceFile, Statement, Stmt, TokenKind, TypeAnnotationNode, TypeMember, TypeNode,
+        TypeParameterList,
     },
 };
 
@@ -1272,15 +1273,68 @@ fn visit_property_name(
     }
 }
 
+fn visit_jsx_attributes(
+    attributes: &[JsxAttributeItem],
+    script_kind: ScriptKind,
+    findings: &mut Vec<(&'static str, TextRange, &'static str)>,
+) {
+    for attribute in attributes {
+        match attribute {
+            JsxAttributeItem::Attribute(attribute) => {
+                if let Some(initializer) = &attribute.data().initializer {
+                    if let JsxAttributeInitializer::Expression(container) = initializer {
+                        if let Some(expression) = &container.data().expression {
+                            visit_expression(expression, script_kind, findings);
+                        }
+                    }
+                }
+            }
+            JsxAttributeItem::Spread(spread) => {
+                visit_expression(&spread.data().expression, script_kind, findings);
+            }
+        }
+    }
+}
+
+fn visit_jsx_children(
+    children: &[JsxChild],
+    script_kind: ScriptKind,
+    findings: &mut Vec<(&'static str, TextRange, &'static str)>,
+) {
+    for child in children {
+        match child {
+            JsxChild::Text(_) => {}
+            JsxChild::ExpressionContainer(container) => {
+                if let Some(expression) = &container.data().expression {
+                    visit_expression(expression, script_kind, findings);
+                }
+            }
+            JsxChild::Spread(spread) => {
+                visit_expression(&spread.data().expression, script_kind, findings);
+            }
+            JsxChild::Element(expression) => {
+                visit_expression(expression, script_kind, findings);
+            }
+        }
+    }
+}
+
 fn visit_expression(
     expression: &Expr,
     script_kind: ScriptKind,
     findings: &mut Vec<(&'static str, TextRange, &'static str)>,
 ) {
     match expression.data() {
-        Expression::JsxElement(_)
-        | Expression::JsxFragment(_)
-        | Expression::JsxSelfClosingElement(_) => {}
+        Expression::JsxElement(element) => {
+            visit_jsx_attributes(&element.opening.data().attributes, script_kind, findings);
+            visit_jsx_children(&element.children, script_kind, findings);
+        }
+        Expression::JsxFragment(fragment) => {
+            visit_jsx_children(&fragment.children, script_kind, findings);
+        }
+        Expression::JsxSelfClosingElement(element) => {
+            visit_jsx_attributes(&element.attributes, script_kind, findings);
+        }
         Expression::Template(template) => {
             for expression in &template.expressions {
                 visit_expression(expression, script_kind, findings);
@@ -2066,5 +2120,119 @@ mod tests {
             !codes(source, ScriptKind::TypeScript).contains(&"BAMTS-W065"),
             "a function whose only empty case label falls through to a returning case must not be flagged as missing a return"
         );
+    }
+
+    #[test]
+    fn w085_fires_in_jsx_attribute_value() {
+        assert!(codes(
+            "<Foo onClick={(x: number) => x} />",
+            ScriptKind::JavaScriptReact,
+        )
+        .contains(&"BAMTS-W085"),
+        "BAMTS-W085 must fire for TypeScript-only arrow parameter syntax in a JSX attribute",);
+    }
+
+    #[test]
+    fn w085_fires_in_jsx_child_expression() {
+        assert!(codes(
+            "<Foo>{(x: number) => x}</Foo>;",
+            ScriptKind::JavaScriptReact,
+        )
+        .contains(&"BAMTS-W085"),
+        "BAMTS-W085 must fire for TypeScript-only arrow parameter syntax in a JSX child",);
+    }
+
+    #[test]
+    fn w085_fires_in_jsx_fragment_child() {
+        assert!(codes(
+            "<>{(x: number) => x}</>;",
+            ScriptKind::JavaScriptReact,
+        )
+        .contains(&"BAMTS-W085"),
+        "BAMTS-W085 must fire for TypeScript-only arrow parameter syntax in a JSX fragment",);
+    }
+
+    #[test]
+    fn w085_fires_in_jsx_spread_attribute() {
+        assert!(codes(
+            "<Foo {...((x: number) => x)} />",
+            ScriptKind::JavaScriptReact,
+        )
+        .contains(&"BAMTS-W085"),
+        "BAMTS-W085 must fire for TypeScript-only arrow parameter syntax in a JSX spread attribute",);
+    }
+
+    #[test]
+    fn w085_does_not_fire_in_tsx() {
+        assert!(!codes(
+            "<Foo onClick={(x: number) => x} />",
+            ScriptKind::TypeScriptReact,
+        )
+        .contains(&"BAMTS-W085"),
+        "BAMTS-W085 must not fire for TypeScript-only syntax in TSX",);
+        assert!(!codes("<>{x as number}</>;", ScriptKind::TypeScriptReact)
+            .contains(&"BAMTS-W085"),
+        "BAMTS-W085 must not fire for `as` assertions in TSX",);
+    }
+
+    #[test]
+    fn w087_debugger_in_jsx_attribute() {
+        let diagnostics = codes(
+            "<Foo onClick={() => { debugger; }} />",
+            ScriptKind::TypeScriptReact,
+        );
+        assert!(diagnostics.contains(&"BAMTS-W087"),
+        "BAMTS-W087 must fire for a debugger statement inside a JSX attribute arrow body",);
+    }
+
+    #[test]
+    fn w064_six_parameter_arrow_in_jsx_attribute() {
+        let diagnostics = codes(
+            "<Foo onClick={(a,b,c,d,e,f) => a} />",
+            ScriptKind::TypeScriptReact,
+        );
+        assert!(diagnostics.contains(&"BAMTS-W064"),
+        "BAMTS-W064 must fire for a six-parameter arrow inside a JSX attribute",);
+    }
+
+    #[test]
+    fn jsx_names_and_text_are_not_traversed_as_expressions() {
+        let diagnostics = codes(
+            "const el = <My.Component ns:attr=\"value\">text</My.Component>;",
+            ScriptKind::TypeScriptReact,
+        );
+        assert!(!diagnostics.contains(&"BAMTS-W085"),
+        "JSX names and text must not trigger TypeScript-only syntax rules",);
+        assert!(!diagnostics.contains(&"BAMTS-W064"),
+        "JSX names and text must not trigger the long-parameter-list rule",);
+        assert!(!diagnostics.contains(&"BAMTS-W087"),
+        "JSX names and text must not trigger the no-debugger rule",);
+    }
+
+    #[test]
+    fn jsx_expressions_are_visited_exactly_once() {
+        let attribute = codes(
+            "<Foo onClick={(a,b,c,d,e,f) => a} />",
+            ScriptKind::TypeScriptReact,
+        );
+        assert_eq!(attribute.iter().filter(|c| **c == "BAMTS-W064").count(),
+        1,
+        "a single arrow attribute must produce exactly one W064",);
+
+        let nested = codes(
+            "<Foo>{<Bar onClick={(a,b,c,d,e,f) => a} />}</Foo>;",
+            ScriptKind::TypeScriptReact,
+        );
+        assert_eq!(nested.iter().filter(|c| **c == "BAMTS-W064").count(),
+        1,
+        "a nested JSX element inside a child expression must produce exactly one W064",);
+
+        let js = codes(
+            "<Foo {...((x: number) => x)} />",
+            ScriptKind::JavaScriptReact,
+        );
+        assert_eq!(js.iter().filter(|c| **c == "BAMTS-W085").count(),
+        1,
+        "a single spread expression must produce exactly one W085",);
     }
 }
