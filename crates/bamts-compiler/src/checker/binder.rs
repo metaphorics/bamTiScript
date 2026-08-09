@@ -1009,6 +1009,7 @@ pub struct SemanticModel {
     scopes: Vec<Scope>,
     symbols: Vec<Symbol>,
     symbol_types: Vec<TypeId>,
+    overload_signatures: Vec<Vec<FunctionSignature>>,
     references: HashMap<NodeId, SymbolId>,
     reference_aliases: HashMap<NodeId, SymbolId>,
     type_nodes: HashMap<NodeId, TypeId>,
@@ -1082,6 +1083,11 @@ impl SemanticModel {
     #[must_use]
     pub fn symbol_type(&self, id: SymbolId) -> TypeId {
         self.symbol_types[id.0 as usize]
+    }
+
+    #[must_use]
+    pub(crate) fn overload_signatures(&self, id: SymbolId) -> &[FunctionSignature] {
+        &self.overload_signatures[id.0 as usize]
     }
 
     /// Returns the interned type table.
@@ -1250,6 +1256,7 @@ pub(crate) struct Binder<'src> {
     pub(crate) scopes: Vec<Scope>,
     pub(crate) symbols: Vec<Symbol>,
     pub(crate) symbol_types: Vec<TypeId>,
+    overload_signatures: Vec<Vec<FunctionSignature>>,
     type_state: Vec<TypeState>,
     type_defs: HashMap<SymbolId, TypeDef<'src>>,
     pub(crate) references: HashMap<NodeId, SymbolId>,
@@ -1365,6 +1372,7 @@ impl<'src> Binder<'src> {
             scopes: Vec::new(),
             symbols: Vec::new(),
             symbol_types: Vec::new(),
+            overload_signatures: Vec::new(),
             type_state: Vec::new(),
             type_defs: HashMap::new(),
             references: HashMap::new(),
@@ -1559,6 +1567,7 @@ impl<'src> Binder<'src> {
             scopes: self.scopes,
             symbols: self.symbols,
             symbol_types: self.symbol_types,
+            overload_signatures: self.overload_signatures,
             references: self.references,
             reference_aliases: self.reference_aliases,
             type_nodes: self.type_nodes,
@@ -1803,6 +1812,7 @@ impl<'src> Binder<'src> {
             parent,
         });
         self.symbol_types.push(self.types.any());
+        self.overload_signatures.push(Vec::new());
         self.type_state.push(TypeState::Unresolved);
 
         let value_conflict = if kind.occupies_value() {
@@ -3185,6 +3195,12 @@ impl<'src> Binder<'src> {
                 return_type,
             );
             self.symbol_types[symbol.get() as usize] = function_type;
+            if is_declaration && function.body.is_none() {
+                let Type::Function(signature) = self.types.get(function_type) else {
+                    unreachable!("function type constructor must intern a function signature");
+                };
+                self.overload_signatures[symbol.get() as usize].push(signature.clone());
+            }
         }
         if let Some(body_id) = function.body.as_ref().and_then(FunctionBody::id) {
             let popped = self.function_body_stack.pop();
@@ -6968,6 +6984,36 @@ mod tests {
             1,
             "{diagnostics:?}"
         );
+    }
+
+    #[test]
+    fn free_function_overloads_are_retained_before_the_active_implementation() {
+        let (model, diagnostics) = bound(
+            "function f(value: string): string;\
+             function f(value: number): number;\
+             function f(value: any): any { return value; }",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        let symbol = value_symbol(&model, "f");
+        let overloads = model.overload_signatures(symbol);
+        assert_eq!(overloads.len(), 2);
+        assert_eq!(
+            overloads[0].parameters()[0].type_id(),
+            model.types().string()
+        );
+        assert_eq!(overloads[0].return_type(), model.types().string());
+        assert_eq!(
+            overloads[1].parameters()[0].type_id(),
+            model.types().number()
+        );
+        assert_eq!(overloads[1].return_type(), model.types().number());
+
+        let Type::Function(active) = model.types().get(model.symbol_type(symbol)) else {
+            panic!("function symbol has an active function type");
+        };
+        assert_eq!(active.parameters()[0].type_id(), model.types().any());
+        assert_eq!(active.return_type(), model.types().any());
     }
 
     #[test]
