@@ -470,38 +470,87 @@ impl<H: Host> BuiltinTable<H> {
             .map(BuiltinId)
     }
     fn for_each_value(&self, mut visit: impl FnMut(Value)) {
-        visit(self.object_prototype);
-        visit(self.function_prototype);
-        visit(self.array_prototype);
-        visit(self.string_prototype);
-        visit(self.number_prototype);
-        visit(self.boolean_prototype);
-        for (_, value) in &self.error_prototypes {
+        let Self {
+            defs: _,
+            object_prototype,
+            function_prototype,
+            array_prototype,
+            string_prototype,
+            number_prototype,
+            boolean_prototype,
+            error_prototypes,
+            symbol_iterator,
+            symbol_async_iterator,
+            symbol_to_string_tag,
+            symbol_species,
+            symbol_dispose,
+            symbol_async_dispose,
+            symbol_unscopables,
+            symbol_prototype,
+            object_to_string,
+            regexp_prototype,
+            iterator_prototype,
+            async_iterator_prototype,
+            generator_prototype,
+            async_generator_prototype,
+            promise_resolver_targets,
+            promise_all_targets,
+            promise_prototype,
+            uint8array_prototype,
+            promise_capability_executor,
+            promise_finally_value,
+            promise_finally_throw,
+            promise_finally_return,
+            promise_finally_rethrow,
+            promise_then_fulfill,
+            promise_then_reject,
+            marker: _,
+        } = self;
+
+        for value in [
+            *object_prototype,
+            *function_prototype,
+            *array_prototype,
+            *string_prototype,
+            *number_prototype,
+            *boolean_prototype,
+        ] {
+            visit(value);
+        }
+        for (_, value) in error_prototypes {
             visit(*value);
         }
         for value in [
-            self.symbol_iterator,
-            self.symbol_async_iterator,
-            self.symbol_to_string_tag,
-            self.symbol_species,
-            self.symbol_dispose,
-            self.symbol_async_dispose,
-            self.symbol_unscopables,
-            self.symbol_prototype,
-            self.object_to_string,
-            self.regexp_prototype,
-            self.iterator_prototype,
-            self.async_iterator_prototype,
-            self.generator_prototype,
-            self.async_generator_prototype,
-            self.promise_prototype,
+            *symbol_iterator,
+            *symbol_async_iterator,
+            *symbol_to_string_tag,
+            *symbol_species,
+            *symbol_dispose,
+            *symbol_async_dispose,
+            *symbol_unscopables,
+            *symbol_prototype,
+            *object_to_string,
+            *regexp_prototype,
+            *iterator_prototype,
+            *async_iterator_prototype,
+            *generator_prototype,
+            *async_generator_prototype,
+            *promise_prototype,
+            *uint8array_prototype,
+            *promise_capability_executor,
+            *promise_finally_value,
+            *promise_finally_throw,
+            *promise_finally_return,
+            *promise_finally_rethrow,
+            *promise_then_fulfill,
+            *promise_then_reject,
         ]
         .into_iter()
         .flatten()
         {
             visit(value);
         }
-        for (first, second) in [self.promise_resolver_targets, self.promise_all_targets]
+        for (first, second) in [*promise_resolver_targets, *promise_all_targets]
             .into_iter()
             .flatten()
         {
@@ -886,6 +935,46 @@ mod tests {
         machine
             .call_value(method, constructor, arguments)
             .expect("builtin call succeeds")
+    }
+
+    #[test]
+    fn builtin_table_root_walker_visits_every_cached_callback() {
+        let mut table = BuiltinTable::<TestHost>::new(
+            Value::int32(1),
+            Value::int32(2),
+            Value::int32(3),
+            Value::int32(4),
+            Value::int32(5),
+            Value::int32(6),
+        );
+        let roots = [
+            Value::int32(101),
+            Value::int32(102),
+            Value::int32(103),
+            Value::int32(104),
+            Value::int32(105),
+            Value::int32(106),
+            Value::int32(107),
+            Value::int32(108),
+        ];
+        table.uint8array_prototype = Some(roots[0]);
+        table.promise_capability_executor = Some(roots[1]);
+        table.promise_finally_value = Some(roots[2]);
+        table.promise_finally_throw = Some(roots[3]);
+        table.promise_finally_return = Some(roots[4]);
+        table.promise_finally_rethrow = Some(roots[5]);
+        table.promise_then_fulfill = Some(roots[6]);
+        table.promise_then_reject = Some(roots[7]);
+
+        let mut visited = Vec::new();
+        table.for_each_value(|value| visited.push(value));
+
+        for root in roots {
+            assert!(
+                visited.contains(&root),
+                "cached root {root:?} was not traced"
+            );
+        }
     }
 
     #[test]
