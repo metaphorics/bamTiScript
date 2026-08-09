@@ -128,6 +128,7 @@ dependencies = [
  "bamts-native",
  "bamts-node",
  "bamts-runtime",
+ "libc",
  "quint-connect",
  "serde",
  "serde_json",
