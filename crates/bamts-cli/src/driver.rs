@@ -522,11 +522,7 @@ fn run_jit(
         .map_err(DriverError::Native)?;
     let mut stdout = host.stdout().to_vec();
     stdout.extend_from_slice(&outcome.stdout);
-    let exit_code = if host.exit_code() == 0 {
-        outcome.exit_code
-    } else {
-        host.exit_code()
-    };
+    let exit_code = host.completion_exit_code(outcome.exit_code);
     let mut stderr = warnings.into_bytes();
     stderr.extend_from_slice(host.stderr());
     Ok(CommandOutcome {
@@ -1158,6 +1154,7 @@ mod tests {
     use std::path::Path;
 
     use bamts_compiler::lint::{LintLevel, SourceDialect, rule_by_name};
+    use bamts_runtime::Host;
 
     use crate::args::{ArgsError, parse_args};
 
@@ -1166,6 +1163,12 @@ mod tests {
     use super::{
         DriverError, content_hash, execute_with_telemetry, levels, lower_options, probe_toolchain,
     };
+    #[test]
+    fn jit_exit_code_prefers_host_zero() {
+        let mut host = bamts_node::NodeHost::new();
+        Host::set_exit_code(&mut host, 0);
+        assert_eq!(host.completion_exit_code(7), 0);
+    }
 
     #[test]
     fn content_hash_is_stable_and_sensitive() {

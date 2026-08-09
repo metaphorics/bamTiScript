@@ -214,7 +214,7 @@ pub fn run_program(path: impl AsRef<Path>) -> Result<ProgramOutput> {
     let executable = compile_source_file(path)?;
     let mut host = bamts_node::NodeHost::new();
     host.set_script_compiler(Box::new(ScriptCompiler));
-    bamts_runtime::run(
+    let outcome = bamts_runtime::run(
         executable.wire(),
         &mut host,
         &bamts_runtime::Limits::default(),
@@ -222,7 +222,7 @@ pub fn run_program(path: impl AsRef<Path>) -> Result<ProgramOutput> {
 
     Ok(ProgramOutput {
         stdout: host.stdout().to_vec(),
-        exit_code: host.exit_code(),
+        exit_code: host.completion_exit_code(outcome.exit_code),
     })
 }
 

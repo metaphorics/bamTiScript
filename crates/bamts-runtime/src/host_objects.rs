@@ -287,7 +287,7 @@ fn process_exit<H: Host>(
         .first()
         .copied()
         .and_then(Value::as_int32)
-        .map_or(machine.host.exit_code(), |raw| raw as i32);
+        .map_or_else(|| machine.host.exit_code().unwrap_or(0), |raw| raw as i32);
     machine.host.set_exit_code(code);
     Ok(BuiltinOutcome::Value(Value::UNDEFINED))
 }

@@ -92,7 +92,7 @@ fn map_script_compile_error(
 pub struct NodeHost {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
-    exit_code: i32,
+    exit_code: Option<i32>,
     argv: Vec<String>,
     env: BTreeMap<String, String>,
     started: Instant,
@@ -113,7 +113,7 @@ impl NodeHost {
         Self {
             stdout: Vec::new(),
             stderr: Vec::new(),
-            exit_code: 0,
+            exit_code: None,
             argv: Vec::new(),
             env: BTreeMap::new(),
             started: Instant::now(),
@@ -134,8 +134,16 @@ impl NodeHost {
     }
 
     #[must_use]
-    pub const fn exit_code(&self) -> i32 {
+    pub const fn exit_code(&self) -> Option<i32> {
         self.exit_code
+    }
+
+    #[must_use]
+    pub const fn completion_exit_code(&self, runtime_exit_code: i32) -> i32 {
+        match self.exit_code {
+            Some(exit_code) => exit_code,
+            None => runtime_exit_code,
+        }
     }
 
     pub fn set_argv(&mut self, argv: impl IntoIterator<Item = String>) {
@@ -174,12 +182,12 @@ impl Host for NodeHost {
         self.stderr.extend_from_slice(bytes);
     }
 
-    fn exit_code(&self) -> i32 {
+    fn exit_code(&self) -> Option<i32> {
         self.exit_code
     }
 
     fn set_exit_code(&mut self, exit_code: i32) {
-        self.exit_code = exit_code;
+        self.exit_code = Some(exit_code);
     }
 
     fn argv(&self) -> &[String] {
@@ -548,14 +556,7 @@ fn write_aot_completion(
     let (exit_code, failure) = match completion {
         AotCompletion::Success(outcome) => {
             stdout.write_all(&outcome.stdout)?;
-            (
-                if host.exit_code() == 0 {
-                    outcome.exit_code
-                } else {
-                    host.exit_code()
-                },
-                None,
-            )
+            (host.completion_exit_code(outcome.exit_code), None)
         }
         AotCompletion::Failure(error) => (1, Some(error)),
     };
@@ -749,7 +750,7 @@ mod tests {
         Host::set_env(&mut host, "NODE_ENV", "test");
         assert_eq!(host.stdout(), b"out");
         assert_eq!(host.stderr(), b"err");
-        assert_eq!(host.exit_code(), 23);
+        assert_eq!(host.exit_code(), Some(23));
         assert_eq!(host.argv(), ["bamts", "file.ts"]);
         assert_eq!(host.env("NODE_ENV"), Some("test"));
         assert!(Host::delete_env(&mut host, "NODE_ENV"));
@@ -929,7 +930,29 @@ mod tests {
     }
 
     #[test]
-    fn aot_success_preserves_host_and_runtime_output_and_exit_precedence() {
+    fn aot_exit_code_prefers_host_zero() {
+        let mut host = NodeHost::new();
+        Host::set_exit_code(&mut host, 0);
+        let outcome = bamts_runtime::ExecutionOutcome {
+            stdout: Vec::new(),
+            exit_code: 7,
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit_code = write_aot_completion(
+            &host,
+            AotCompletion::Success(&outcome),
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("completion writes");
+
+        assert_eq!(exit_code, 0);
+    }
+
+    #[test]
+    fn aot_success_writes_host_and_runtime_output() {
         let mut host = NodeHost::new();
         Host::write_stdout(&mut host, b"host stdout");
         Host::write_stderr(&mut host, b"host stderr");

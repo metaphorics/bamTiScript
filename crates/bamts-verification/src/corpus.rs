@@ -1171,11 +1171,7 @@ fn execute_interpreter_request(request: &WorkerRequest) -> Result<WorkerResponse
     };
     let mut stdout = host.stdout().to_vec();
     stdout.extend_from_slice(&outcome.stdout);
-    let exit_code = if host.exit_code() == 0 {
-        outcome.exit_code
-    } else {
-        host.exit_code()
-    };
+    let exit_code = host.completion_exit_code(outcome.exit_code);
     Ok(WorkerResponse::Outcome(driver_outcome(
         driver::CommandOutcome {
             stdout,
@@ -1959,9 +1955,16 @@ fn schema_error(path: &Path, detail: impl Into<String>) -> VerificationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bamts_runtime::Host;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+    #[test]
+    fn exit_code_merge_prefers_host_zero() {
+        let mut host = bamts_node::NodeHost::new();
+        Host::set_exit_code(&mut host, 0);
+        assert_eq!(host.completion_exit_code(7), 0);
+    }
 
     fn repo_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -148,8 +148,8 @@ pub trait Host {
 
     fn write_stderr(&mut self, _bytes: &[u8]) {}
 
-    fn exit_code(&self) -> i32 {
-        0
+    fn exit_code(&self) -> Option<i32> {
+        None
     }
 
     fn set_exit_code(&mut self, _exit_code: i32) {}
