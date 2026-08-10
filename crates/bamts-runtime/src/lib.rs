@@ -1418,6 +1418,17 @@ pub(crate) struct RuntimeFunction {
     pub(crate) function: FunctionId,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ActivationRequest<'a> {
+    target: RuntimeFunction,
+    captures: &'a [Value],
+    context: Option<Value>,
+    this_value: Value,
+    new_target: Value,
+    arguments: &'a [Value],
+    return_to: Option<ReturnTo>,
+}
+
 #[derive(Clone, Debug)]
 struct Frame {
     module: ModuleId,
@@ -1434,20 +1445,15 @@ struct Frame {
 }
 
 impl Frame {
-    fn new(
-        target: RuntimeFunction,
-        metadata: &Function,
-        captures: &[Value],
-        this_value: Value,
-        new_target: Value,
-        arguments: &[Value],
-        context: Option<Value>,
-        return_to: Option<ReturnTo>,
-    ) -> Self {
+    fn new(metadata: &Function, request: ActivationRequest<'_>) -> Self {
         let mut registers = vec![Value::UNINITIALIZED; metadata.register_count() as usize];
         let capture_count = metadata.capture_count() as usize;
         for (index, slot) in registers.iter_mut().take(capture_count).enumerate() {
-            *slot = captures.get(index).copied().unwrap_or(Value::UNDEFINED);
+            *slot = request
+                .captures
+                .get(index)
+                .copied()
+                .unwrap_or(Value::UNDEFINED);
         }
         for (index, slot) in registers
             .iter_mut()
@@ -1455,19 +1461,23 @@ impl Frame {
             .take(metadata.parameter_count() as usize)
             .enumerate()
         {
-            *slot = arguments.get(index).copied().unwrap_or(Value::UNDEFINED);
+            *slot = request
+                .arguments
+                .get(index)
+                .copied()
+                .unwrap_or(Value::UNDEFINED);
         }
         Self {
-            module: target.module,
-            function: target.function.get() as usize,
+            module: request.target.module,
+            function: request.target.function.get() as usize,
             pc: 0,
             registers,
-            return_to,
-            context,
+            return_to: request.return_to,
+            context: request.context,
             outer_context: None,
-            this_value,
-            new_target,
-            args: arguments.to_vec(),
+            this_value: request.this_value,
+            new_target: request.new_target,
+            args: request.arguments.to_vec(),
             arguments_object: None,
         }
     }
@@ -1873,17 +1883,19 @@ impl<'a, H: Host> Machine<'a, H> {
         let entry = module.entry().get() as usize;
         let module_id = program.map_or(ModuleId::new(0), Program::entry);
         let frame = Frame::new(
-            RuntimeFunction {
-                module: module_id,
-                function: FunctionId::new(entry as u32),
-            },
             &module.functions()[entry],
-            &[],
-            Value::UNDEFINED,
-            Value::UNDEFINED,
-            &[],
-            None,
-            None,
+            ActivationRequest {
+                target: RuntimeFunction {
+                    module: module_id,
+                    function: FunctionId::new(entry as u32),
+                },
+                captures: &[],
+                context: None,
+                this_value: Value::UNDEFINED,
+                new_target: Value::UNDEFINED,
+                arguments: &[],
+                return_to: None,
+            },
         );
         let live_registers = frame.registers.len();
         let mut heap = Vec::new();
@@ -4510,15 +4522,15 @@ impl<'a, H: Host> Machine<'a, H> {
         };
         let function = self.module_code(module).entry();
         let stop_depth = self.frames.len();
-        if let Err(error) = self.push_frame(
-            RuntimeFunction { module, function },
-            &[],
-            None,
-            Value::UNDEFINED,
-            Value::UNDEFINED,
-            &[],
-            None,
-        ) {
+        if let Err(error) = self.push_frame(ActivationRequest {
+            target: RuntimeFunction { module, function },
+            captures: &[],
+            context: None,
+            this_value: Value::UNDEFINED,
+            new_target: Value::UNDEFINED,
+            arguments: &[],
+            return_to: None,
+        }) {
             return ModuleStart::Settled(Err(error));
         }
         let step = self.drive_async_activation(stop_depth, None);
@@ -4606,15 +4618,15 @@ impl<'a, H: Host> Machine<'a, H> {
     fn run_sync_module_entry(&mut self, module: ModuleId) -> Result<Execution, RuntimeError> {
         let function = self.module_code(module).entry();
         let stop_depth = self.frames.len();
-        self.push_frame(
-            RuntimeFunction { module, function },
-            &[],
-            None,
-            Value::UNDEFINED,
-            Value::UNDEFINED,
-            &[],
-            None,
-        )?;
+        self.push_frame(ActivationRequest {
+            target: RuntimeFunction { module, function },
+            captures: &[],
+            context: None,
+            this_value: Value::UNDEFINED,
+            new_target: Value::UNDEFINED,
+            arguments: &[],
+            return_to: None,
+        })?;
         let result = self.run_loop(stop_depth).and_then(|execution| {
             execution.ok_or_else(|| {
                 self.program_error(
@@ -6352,16 +6364,9 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(value)
     }
 
-    fn push_frame(
-        &mut self,
-        target: RuntimeFunction,
-        captures: &[Value],
-        context: Option<Value>,
-        this_value: Value,
-        new_target: Value,
-        arguments: &[Value],
-        return_to: Option<ReturnTo>,
-    ) -> Result<(), RuntimeError> {
+    fn push_frame(&mut self, request: ActivationRequest<'_>) -> Result<(), RuntimeError> {
+        let target = request.target;
+        let return_to = request.return_to;
         let function_index = target.function.get() as usize;
         let metadata = &self.module_code(target.module).functions()[function_index];
         let limit_error = |kind| match (self.frames.last(), return_to) {
@@ -6382,10 +6387,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 limit: self.limits.max_total_registers,
             }));
         }
-        let mut frame = Frame::new(
-            target, metadata, captures, this_value, new_target, arguments, context, return_to,
-        );
-        frame.outer_context = std::mem::replace(&mut self.context_global, context);
+        let mut frame = Frame::new(metadata, request);
+        frame.outer_context = std::mem::replace(&mut self.context_global, request.context);
         self.live_registers += next_registers;
         self.frames.push(frame);
         Ok(())
@@ -6530,19 +6533,19 @@ impl<'a, H: Host> Machine<'a, H> {
                             Err(failure) => self.resolve_failure(failure, call_pc),
                         };
                     }
-                    return self.push_frame(
+                    return self.push_frame(ActivationRequest {
                         target,
-                        &captures,
+                        captures: &captures,
                         context,
                         this_value,
                         new_target,
-                        arguments.as_ref(),
-                        Some(ReturnTo {
+                        arguments: arguments.as_ref(),
+                        return_to: Some(ReturnTo {
                             destination: destination.map(|register| register as usize),
                             call_pc,
                             constructed,
                         }),
-                    );
+                    });
                 }
                 Ok(CalleeKind::Builtin { id }) => {
                     match self.call_builtin(id, this_value, arguments.as_ref(), false) {
@@ -7046,9 +7049,15 @@ impl<'a, H: Host> Machine<'a, H> {
                     call_pc: frame.pc,
                     constructed: Some(object),
                 });
-                self.push_frame(
-                    target, &captures, context, object, callee, arguments, return_to,
-                )
+                self.push_frame(ActivationRequest {
+                    target,
+                    captures: &captures,
+                    context,
+                    this_value: object,
+                    new_target: callee,
+                    arguments,
+                    return_to,
+                })
                 .map_err(|error| EvalFailure::Runtime(error.kind))?;
                 self.callback_boundaries.push(stop_depth);
                 let result = self.run_loop(stop_depth);
@@ -7164,15 +7173,15 @@ impl<'a, H: Host> Machine<'a, H> {
                         call_pc: frame.pc,
                         constructed: None,
                     });
-                    self.push_frame(
+                    self.push_frame(ActivationRequest {
                         target,
-                        &captures,
+                        captures: &captures,
                         context,
                         this_value,
-                        Value::UNDEFINED,
-                        arguments.as_ref(),
+                        new_target: Value::UNDEFINED,
+                        arguments: arguments.as_ref(),
                         return_to,
-                    )
+                    })
                     .map_err(|error| EvalFailure::Runtime(error.kind))?;
                     self.callback_boundaries.push(stop_depth);
                     let result = self.run_loop(stop_depth);
@@ -8983,15 +8992,15 @@ impl<'a, H: Host> Machine<'a, H> {
         });
         let prepared = match state {
             GeneratorState::SuspendedStart(start) => self
-                .push_frame(
-                    start.target,
-                    &start.captures,
-                    start.context,
-                    start.this_value,
-                    start.new_target,
-                    &start.args,
+                .push_frame(ActivationRequest {
+                    target: start.target,
+                    captures: &start.captures,
+                    context: start.context,
+                    this_value: start.this_value,
+                    new_target: start.new_target,
+                    arguments: &start.args,
                     return_to,
-                )
+                })
                 .map_err(|error| EvalFailure::Runtime(error.kind)),
             GeneratorState::Suspended(activation) => {
                 self.push_resumed_generator_frame(activation, resume_value, return_to)
@@ -9205,9 +9214,15 @@ impl<'a, H: Host> Machine<'a, H> {
             call_pc: frame.pc,
             constructed: None,
         });
-        self.push_frame(
-            target, captures, context, this_value, new_target, arguments, return_to,
-        )
+        self.push_frame(ActivationRequest {
+            target,
+            captures,
+            context,
+            this_value,
+            new_target,
+            arguments,
+            return_to,
+        })
         .map_err(|error| EvalFailure::Runtime(error.kind))?;
         let step = self.drive_async_activation(stop_depth, None);
         self.settle_async_step(record, promise, step)?;
@@ -9536,15 +9551,15 @@ impl<'a, H: Host> Machine<'a, H> {
             });
             let pushed = match taken {
                 AsyncGeneratorState::SuspendedStart(start) => self
-                    .push_frame(
-                        start.target,
-                        &start.captures,
-                        start.context,
-                        start.this_value,
-                        start.new_target,
-                        &start.args,
+                    .push_frame(ActivationRequest {
+                        target: start.target,
+                        captures: &start.captures,
+                        context: start.context,
+                        this_value: start.this_value,
+                        new_target: start.new_target,
+                        arguments: &start.args,
                         return_to,
-                    )
+                    })
                     .map_err(|error| EvalFailure::Runtime(error.kind)),
                 AsyncGeneratorState::SuspendedYield(activation) => {
                     self.push_resumed_generator_frame(activation, resume_value, return_to)
