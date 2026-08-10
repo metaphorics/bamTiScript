@@ -947,7 +947,7 @@ mod tests {
         let mut seen: Vec<&Diagnostic> = Vec::new();
         for module in output.modules() {
             assert!(
-                module.semantic_model().scopes().len() >= 1,
+                !module.semantic_model().scopes().is_empty(),
                 "each module must carry its own semantic model"
             );
             assert!(
