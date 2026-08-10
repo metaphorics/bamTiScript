@@ -448,6 +448,25 @@ fn contextify_global<H: Host>(
             ),
         ],
     )?;
+    // Populate the fresh context with the shared intrinsic globals so
+    // runInNewContext can resolve Object, Array, etc. without falling
+    // back to the outer global object. The intrinsic objects themselves
+    // remain shared (same Value); only the property bindings are copied.
+    let intrinsic_names: Vec<EcmaString> = machine
+        .intrinsics
+        .globals
+        .keys()
+        .filter(|name| !name.eq_ascii("globalThis") && !name.eq_ascii("global"))
+        .cloned()
+        .collect();
+    for name in intrinsic_names {
+        let key = PropertyKey::Named(name);
+        if machine.own_descriptor(context, &key)?.is_none()
+            && let Some(descriptor) = machine.own_descriptor(machine.global_object, &key)?
+        {
+            machine.define_descriptor(context, key, descriptor)?;
+        }
+    }
     Ok(())
 }
 
@@ -1171,6 +1190,128 @@ mod tests {
             machine.get_named_property(second, "4").unwrap(),
             Value::int32(1),
             "mutations to the shared prototype survive into a new context"
+        );
+    }
+
+    /// Program that checks global isolation: TypeOfGlobal on a host-only
+    /// name (should be "undefined") and on a standard intrinsic (should be
+    /// "function"), returning [typeof hostOnly, typeof Object].
+    fn program_checking_global_isolation() -> Program<Verified> {
+        let constants = vec![
+            Constant::String(EcmaString::encode("hostOnly")),
+            Constant::String(EcmaString::encode("Object")),
+            Constant::String(EcmaString::encode("<isolation>")),
+        ];
+        let code = Module::new(
+            constants,
+            vec![Function::new(
+                None,
+                0,
+                0,
+                3,
+                FunctionFlags::default(),
+                vec![
+                    Instruction::TypeOfGlobal {
+                        dst: Register::new(0),
+                        name: ConstantId::new(0),
+                    },
+                    Instruction::TypeOfGlobal {
+                        dst: Register::new(1),
+                        name: ConstantId::new(1),
+                    },
+                    Instruction::CreateArray {
+                        dst: Register::new(2),
+                    },
+                    Instruction::ArrayPush {
+                        array: Register::new(2),
+                        value: Register::new(0),
+                    },
+                    Instruction::ArrayPush {
+                        array: Register::new(2),
+                        value: Register::new(1),
+                    },
+                    Instruction::Return {
+                        value: Register::new(2),
+                    },
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("test bytecode is verified");
+        Program::link(
+            vec![ProgramModule {
+                name: ConstantId::new(2),
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect("test program links")
+    }
+
+    #[test]
+    fn run_in_new_context_does_not_leak_host_only_globals() {
+        let program = program_returning(0);
+        let mut host = ScriptHost {
+            compiler: Some(FakeCompiler {
+                program: Arc::new(program_checking_global_isolation()),
+                sources: Vec::new(),
+            }),
+        };
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.instantiate_modules().unwrap();
+
+        // Install a host-only global on the outer global object.
+        machine.test_set_global("hostOnly", Value::int32(42));
+        assert_eq!(
+            machine.test_global("hostOnly"),
+            Some(Value::int32(42)),
+            "host-only global is visible in the main context"
+        );
+
+        let run = machine
+            .registry
+            .external
+            .get(&EcmaString::encode("node:vm"))
+            .expect("node:vm is installed")
+            .exports
+            .get(&EcmaString::encode("runInNewContext"))
+            .expect("runInNewContext is exported")
+            .value;
+        let source = machine
+            .allocate(HeapEntry::String(EcmaString::encode("isolation check")))
+            .unwrap();
+
+        let result = machine
+            .call_value(run, Value::UNDEFINED, &[source])
+            .expect("runInNewContext call succeeds");
+
+        // The host-only global must NOT leak into the new context.
+        let typeof_host_only = machine.get_named_property(result, "0").unwrap();
+        assert!(
+            machine
+                .string_value(typeof_host_only)
+                .is_some_and(|text| text.eq_ascii("undefined")),
+            "host-only global is absent inside runInNewContext"
+        );
+        // Standard intrinsics must remain usable in the new context.
+        let typeof_object = machine.get_named_property(result, "1").unwrap();
+        assert!(
+            machine
+                .string_value(typeof_object)
+                .is_some_and(|text| text.eq_ascii("function")),
+            "standard intrinsics work inside runInNewContext"
+        );
+
+        // The main-context lookup is unchanged after the call.
+        assert_eq!(
+            machine.test_global("hostOnly"),
+            Some(Value::int32(42)),
+            "main-context lookup is unchanged"
         );
     }
 

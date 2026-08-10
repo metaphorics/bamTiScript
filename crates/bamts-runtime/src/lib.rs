@@ -6116,9 +6116,6 @@ impl<'a, H: Host> Machine<'a, H> {
         if self.has_property(global, &key)? {
             return self.get_property_key(global, &key).map(Some);
         }
-        if global != self.global_object && self.has_property(self.global_object, &key)? {
-            return self.get_property_key(self.global_object, &key).map(Some);
-        }
         Ok(None)
     }
 
