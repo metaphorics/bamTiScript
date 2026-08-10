@@ -5591,7 +5591,9 @@ impl Parser {
             let rest = self.eat(TokenKind::DotDotDot).is_some();
             // Named tuple element `name?: Type`.
             let (name, optional) = if is_identifier_like(self.kind())
-                && matches!(self.nth_kind(1), TokenKind::Colon | TokenKind::Question)
+                && (self.nth_kind(1) == TokenKind::Colon
+                    || (self.nth_kind(1) == TokenKind::Question
+                        && self.nth_kind(2) == TokenKind::Colon))
             {
                 let token = self.bump();
                 let name = Some(self.ident_from(token));
