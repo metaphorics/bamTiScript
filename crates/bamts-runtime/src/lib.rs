@@ -10700,26 +10700,40 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     pub(crate) fn iterable_values(&mut self, source: Value) -> Result<Vec<Value>, EvalFailure> {
+        let depth = self.native_roots.len();
         let iterator = self.create_iterator(source, IteratorKind::Sync)?;
-        let mut values = Vec::new();
-        loop {
-            let (done, value) = self.iterator_next(iterator)?;
-            if done {
-                return Ok(values);
+        self.push_native_roots(depth, &[iterator]);
+        let result: Result<Vec<Value>, EvalFailure> = (|| {
+            let mut values = Vec::new();
+            let mut roots = Vec::with_capacity(1);
+            loop {
+                roots.clear();
+                roots.push(iterator);
+                roots.extend_from_slice(&values);
+                self.refresh_native_roots(depth, &roots);
+                let (done, value) = self.iterator_next(iterator)?;
+                if done {
+                    return Ok(values);
+                }
+                values.push(value);
+                roots.clear();
+                roots.push(iterator);
+                roots.extend_from_slice(&values);
+                self.refresh_native_roots(depth, &roots);
+                let bytes = values
+                    .len()
+                    .checked_mul(std::mem::size_of::<Value>())
+                    .ok_or(EvalFailure::Runtime(
+                        RuntimeErrorKind::HeapByteLimitExceeded {
+                            limit: self.limits.max_heap_bytes,
+                        },
+                    ))?;
+                self.ensure_allocation_capacity(1, bytes)
+                    .map_err(EvalFailure::Runtime)?;
             }
-            let bytes = values
-                .len()
-                .checked_add(1)
-                .and_then(|length| length.checked_mul(std::mem::size_of::<Value>()))
-                .ok_or(EvalFailure::Runtime(
-                    RuntimeErrorKind::HeapByteLimitExceeded {
-                        limit: self.limits.max_heap_bytes,
-                    },
-                ))?;
-            self.ensure_allocation_capacity(1, bytes)
-                .map_err(EvalFailure::Runtime)?;
-            values.push(value);
-        }
+        })();
+        self.pop_native_roots(depth);
+        result
     }
 
     fn advance_iterator(&mut self, iterator_index: usize) {
@@ -11930,7 +11944,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::intrinsics::BuiltinOutcome;
+    use crate::intrinsics::{BuiltinDef, BuiltinOutcome};
     use bamts_bytecode::{
         Binding, DescriptorSlot, Edge, EdgeKind, ExceptionHandler, Export, ExportSource,
         FunctionFlags, NumberBits, ProgramModule, Register,
@@ -25088,5 +25102,134 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn iterable_values_roots_iterator_and_yields_across_collection() {
+        with_machine(Limits::default(), |machine| {
+            let next_id = machine.intrinsics.builtins.register(BuiltinDef {
+                name: "collecting iterator next",
+                length: 0,
+                handler: collecting_iterator_next,
+            });
+            let next_fn = super::intrinsics::native_function(
+                &mut machine.heap,
+                next_id,
+                "collecting iterator next",
+                0,
+            );
+
+            let create_id = machine.intrinsics.builtins.register(BuiltinDef {
+                name: "collecting iterator create",
+                length: 0,
+                handler: collecting_iterator_create,
+            });
+            let create_fn = super::intrinsics::native_function(
+                &mut machine.heap,
+                create_id,
+                "collecting iterator create",
+                0,
+            );
+
+            let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
+            let iterator_key = machine.to_property_key(iterator_symbol).unwrap();
+
+            let iterable = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .expect("iterable allocation succeeds");
+            machine
+                .set_data_property(iterable, "_next", next_fn)
+                .unwrap();
+            machine
+                .set_data_property_key(iterable, iterator_key, create_fn)
+                .unwrap();
+
+            let collected = machine
+                .iterable_values(iterable)
+                .expect("iteration succeeds");
+            assert_eq!(collected.len(), 3, "expected three yielded values");
+
+            for (index, value) in collected.into_iter().enumerate() {
+                let tag = machine
+                    .get_named_property(value, "tag")
+                    .expect("yielded object survived collection");
+                assert_eq!(tag, Value::int32(index as u32));
+            }
+        });
+    }
+
+    fn collecting_iterator_create(
+        machine: &mut Machine<'_, TestHost>,
+        this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let next = machine.get_named_property(this, "_next")?;
+        let iter = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .map_err(EvalFailure::Runtime)?;
+        machine.set_data_property(iter, "next", next)?;
+        machine.set_data_property(iter, "_index", Value::int32(0))?;
+        Ok(BuiltinOutcome::Value(iter))
+    }
+
+    fn collecting_iterator_next(
+        machine: &mut Machine<'_, TestHost>,
+        this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let index_val = machine.get_named_property(this, "_index")?;
+        let index = match index_val.decode() {
+            Some(Decoded::Int32(i)) => i as usize,
+            _ => 0,
+        };
+
+        let (value, done) = if index < 3 {
+            let obj = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .map_err(EvalFailure::Runtime)?;
+            machine.set_data_property(obj, "tag", Value::int32(index as u32))?;
+            (obj, false)
+        } else {
+            (Value::UNDEFINED, true)
+        };
+
+        let result = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .map_err(EvalFailure::Runtime)?;
+        machine.set_data_property(result, "done", Value::boolean(done))?;
+        machine.set_data_property(result, "value", value)?;
+        machine.set_data_property(this, "_index", Value::int32((index + 1) as u32))?;
+
+        // Force a collection between guest yields. The result is still on the
+        // native call stack, so root it temporarily; iterable_values must keep
+        // the iterator and all previously yielded values alive for the next step.
+        let depth = machine.native_roots.len();
+        machine.push_native_roots(depth, &[result]);
+        machine.collect_garbage();
+        machine.pop_native_roots(depth);
+
+        Ok(BuiltinOutcome::Value(result))
     }
 }
