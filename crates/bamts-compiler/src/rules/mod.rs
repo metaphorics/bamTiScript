@@ -1281,12 +1281,11 @@ fn visit_jsx_attributes(
     for attribute in attributes {
         match attribute {
             JsxAttributeItem::Attribute(attribute) => {
-                if let Some(initializer) = &attribute.data().initializer {
-                    if let JsxAttributeInitializer::Expression(container) = initializer {
-                        if let Some(expression) = &container.data().expression {
-                            visit_expression(expression, script_kind, findings);
-                        }
-                    }
+                if let Some(JsxAttributeInitializer::Expression(container)) =
+                    &attribute.data().initializer
+                    && let Some(expression) = &container.data().expression
+                {
+                    visit_expression(expression, script_kind, findings);
                 }
             }
             JsxAttributeItem::Spread(spread) => {
