@@ -1211,10 +1211,13 @@ enum HeapEntry {
         prototype: Option<Value>,
         extensible: bool,
     },
-    /// A Node-compatible `Timeout` handle carrying its monotonic timer id and
-    /// ordinary object property/prototype fields.
+    /// A Node-compatible `Timeout` handle carrying its monotonic timer id,
+    /// its active cancellation generation, and ordinary object property/prototype fields.
     Timeout {
         id: u64,
+        /// The active generation for this id. A stale handle with a different
+        /// generation cannot cancel a re-used id after an interval re-arms.
+        generation: u64,
         properties: PropertyMap,
         prototype: Option<Value>,
         extensible: bool,
@@ -1604,6 +1607,7 @@ struct TimerRecord {
     context: Option<Value>,
     deadline_ms: u64,
     sequence: u64,
+    generation: u64,
     /// `Some(delay)` marks a repeating `setInterval` timer that re-arms with
     /// `delay` milliseconds after each fire; `None` is a one-shot `setTimeout`.
     interval_delay: Option<u32>,
@@ -1655,6 +1659,7 @@ pub struct Machine<'a, H: Host> {
     microtask_drain_active: bool,
     next_timer_id: Option<u64>,
     next_timer_sequence: Option<u64>,
+    next_timer_generation: Option<u64>,
     timers: BTreeMap<u64, TimerRecord>,
     ready_timers: BTreeSet<(u64, u64)>,
     timer_watermark: Option<u64>,
@@ -1958,6 +1963,7 @@ impl<'a, H: Host> Machine<'a, H> {
             microtask_drain_active: false,
             next_timer_id: Some(1),
             next_timer_sequence: Some(0),
+            next_timer_generation: Some(0),
             timers: BTreeMap::new(),
             ready_timers: BTreeSet::new(),
             timer_watermark: None,
@@ -2140,8 +2146,9 @@ impl<'a, H: Host> Machine<'a, H> {
             self.ready_timers.remove(&order);
             let timer = self
                 .timers
-                .remove(&id)
-                .expect("ready timer remains live until after fuel charging");
+                .get(&id)
+                .expect("ready timer remains live until after fuel charging")
+                .clone();
             let mut report = TimerRun {
                 executed: 1,
                 uncaught: Vec::new(),
@@ -2152,17 +2159,24 @@ impl<'a, H: Host> Machine<'a, H> {
             match callback_result {
                 Ok(_) => {}
                 Err(EvalFailure::Runtime(kind)) => {
+                    self.timers.remove(&id);
                     return Err(self.checkpoint_error(kind));
                 }
                 Err(failure) => {
-                    let (value, origin) =
-                        self.promise_rejection_value(failure)
-                            .map_err(|failure| match failure {
-                                EvalFailure::Runtime(kind) => self.checkpoint_error(kind),
-                                _ => self.checkpoint_error(RuntimeErrorKind::InvalidValue {
-                                    value: timer.callback,
-                                }),
-                            })?;
+                    let rejection = self.promise_rejection_value(failure);
+                    let (value, origin) = match rejection {
+                        Ok(pair) => pair,
+                        Err(EvalFailure::Runtime(kind)) => {
+                            self.timers.remove(&id);
+                            return Err(self.checkpoint_error(kind));
+                        }
+                        Err(_) => {
+                            self.timers.remove(&id);
+                            return Err(self.checkpoint_error(RuntimeErrorKind::InvalidValue {
+                                value: timer.callback,
+                            }));
+                        }
+                    };
                     report.uncaught.try_reserve(1).map_err(|_| {
                         self.checkpoint_error(RuntimeErrorKind::HeapByteLimitExceeded {
                             limit: self.limits.max_heap_bytes,
@@ -2175,7 +2189,9 @@ impl<'a, H: Host> Machine<'a, H> {
             // JavaScript retains its original Timeout reference. A new
             // sequence orders the next fire behind any timer armed during the
             // callback. A provider failure here is fatal to the checkpoint.
-            if let Some(delay_ms) = timer.interval_delay {
+            if self.timers.remove(&id).is_some()
+                && let Some(delay_ms) = timer.interval_delay
+            {
                 let sequence = self
                     .next_timer_sequence
                     .take()
@@ -2185,6 +2201,15 @@ impl<'a, H: Host> Machine<'a, H> {
                         }),
                     )?;
                 self.next_timer_sequence = sequence.checked_add(1);
+                let generation = self
+                    .next_timer_generation
+                    .take()
+                    .ok_or(
+                        self.checkpoint_error(RuntimeErrorKind::TimerCapacityExceeded {
+                            limit: self.limits.max_timers,
+                        }),
+                    )?;
+                self.next_timer_generation = generation.checked_add(1);
                 let deadline_ms = match self.host.timers() {
                     Some(provider) => provider.schedule(id, delay_ms).map_err(|error| {
                         self.checkpoint_error(RuntimeErrorKind::TimerProviderFailure {
@@ -2202,6 +2227,28 @@ impl<'a, H: Host> Machine<'a, H> {
                 if deadline_ms <= self.timer_watermark.unwrap_or(0) {
                     self.ready_timers.insert((deadline_ms, sequence));
                 }
+                let handle_index = match self.runtime_slot(timer.handle) {
+                    Ok(Some(index)) => index,
+                    Ok(None) => {
+                        return Err(self.checkpoint_error(RuntimeErrorKind::InvalidValue {
+                            value: timer.handle,
+                        }));
+                    }
+                    Err(kind) => return Err(self.checkpoint_error(kind)),
+                };
+                match &mut self.heap[handle_index] {
+                    HeapEntry::Timeout {
+                        generation: handle_generation,
+                        ..
+                    } => {
+                        *handle_generation = generation;
+                    }
+                    _ => {
+                        return Err(self.checkpoint_error(RuntimeErrorKind::InvalidValue {
+                            value: timer.handle,
+                        }));
+                    }
+                }
                 self.timers.insert(
                     id,
                     TimerRecord {
@@ -2211,6 +2258,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         context: timer.context,
                         deadline_ms,
                         sequence,
+                        generation,
                         interval_delay: Some(delay_ms),
                     },
                 );
@@ -2352,6 +2400,15 @@ impl<'a, H: Host> Machine<'a, H> {
             },
         ))?;
         self.next_timer_sequence = sequence.checked_add(1);
+        let generation = self
+            .next_timer_generation
+            .take()
+            .ok_or(EvalFailure::Runtime(
+                RuntimeErrorKind::TimerCapacityExceeded {
+                    limit: self.limits.max_timers,
+                },
+            ))?;
+        self.next_timer_generation = generation.checked_add(1);
         let deadline_ms = self
             .host
             .timers()
@@ -2368,6 +2425,7 @@ impl<'a, H: Host> Machine<'a, H> {
             })?;
         let handle = match self.allocate(HeapEntry::Timeout {
             id,
+            generation,
             properties: PropertyMap::default(),
             prototype: Some(self.intrinsics.object_prototype),
             extensible: true,
@@ -2389,6 +2447,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 context: self.context_global,
                 deadline_ms,
                 sequence,
+                generation,
                 interval_delay,
             },
         );
@@ -2396,35 +2455,40 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     pub(crate) fn clear_timeout(&mut self, handle: Value) -> Result<(), EvalFailure> {
-        let id = match handle.decode() {
-            Some(Decoded::Int32(raw)) if (raw as i32) > 0 => Some(u64::from(raw)),
+        let (id, request_generation) = match handle.decode() {
+            Some(Decoded::Int32(raw)) if (raw as i32) > 0 => (u64::from(raw), None),
             Some(Decoded::Number(number))
                 if number.is_finite()
                     && number > 0.0
                     && number.fract() == 0.0
                     && number < u64::MAX as f64 =>
             {
-                Some(number as u64)
+                (number as u64, None)
             }
             Some(Decoded::HeapRef(_)) => {
-                self.runtime_slot(handle)
-                    .ok()
-                    .flatten()
-                    .and_then(|index| match &self.heap[index] {
-                        HeapEntry::Timeout { id, .. } => Some(*id),
+                match self.runtime_slot(handle).ok().flatten().and_then(|index| {
+                    match &self.heap[index] {
+                        HeapEntry::Timeout { id, generation, .. } => Some((*id, Some(*generation))),
                         _ => None,
-                    })
+                    }
+                }) {
+                    Some(pair) => pair,
+                    None => return Ok(()),
+                }
             }
-            _ => None,
+            _ => return Ok(()),
         };
-        let Some(id) = id else {
+        let Some(live_record) = self.timers.get(&id) else {
             return Ok(());
         };
-        let Some(timer) = self.timers.remove(&id) else {
+        if let Some(request_generation) = request_generation
+            && live_record.generation != request_generation
+        {
             return Ok(());
-        };
+        }
+        let record = self.timers.remove(&id).unwrap();
         self.ready_timers
-            .remove(&(timer.deadline_ms, timer.sequence));
+            .remove(&(record.deadline_ms, record.sequence));
         if let Some(provider) = self.host.timers() {
             provider.cancel(id).map_err(|error| {
                 EvalFailure::Runtime(RuntimeErrorKind::TimerProviderFailure {
@@ -23914,6 +23978,101 @@ mod tests {
         }
         let delays: Vec<u32> = shared.borrow().scheduled.iter().map(|(_, d)| *d).collect();
         assert_eq!(delays, vec![1, 1, 1, 1, 2_147_483_647, 3]);
+    }
+
+    fn clear_self_and_count(
+        machine: &mut Machine<'_, TimerTestHost>,
+        this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let current = machine
+            .test_global("count")
+            .and_then(|v| match v.decode() {
+                Some(Decoded::Int32(i)) => Some(i),
+                _ => None,
+            })
+            .unwrap_or(0);
+        machine.test_set_global("count", Value::int32(current + 1));
+        let clear_interval = machine.intrinsics.global("clearInterval").unwrap();
+        machine.call_value(clear_interval, Value::UNDEFINED, &[this])?;
+        Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+    }
+
+    #[test]
+    fn interval_self_cancel_runs_once_and_reaches_quiescence() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_interval = set_interval_global(&machine);
+        let callback = timer_native(&mut machine, "clearSelf", clear_self_and_count);
+        machine.test_set_global("count", Value::int32(0));
+        machine
+            .call_value(set_interval, Value::UNDEFINED, &[callback, Value::int32(5)])
+            .unwrap();
+        assert!(machine.has_pending_timers());
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 5,
+        });
+        machine.run_to_quiescence().unwrap();
+        assert_eq!(read_global(&machine, "count"), Some(Value::int32(1)));
+        assert!(!machine.has_pending_timers());
+        assert!(shared.borrow().cancelled.contains(&1));
+    }
+
+    #[test]
+    fn stale_interval_handle_cannot_cancel_a_reused_generation() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_interval = set_interval_global(&machine);
+        let clear_interval = clear_interval_global(&machine);
+        let callback = timer_native(&mut machine, "increment", increment_count);
+        let handle = machine
+            .call_value(set_interval, Value::UNDEFINED, &[callback, Value::int32(5)])
+            .unwrap();
+        machine.test_set_global("count", Value::int32(0));
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 5,
+        });
+        assert_eq!(machine.run_one_expired_timer().unwrap().executed, 1);
+        assert_eq!(read_global(&machine, "count"), Some(Value::int32(1)));
+        assert!(machine.has_pending_timers());
+
+        let stale = machine
+            .allocate(HeapEntry::Timeout {
+                id: 1,
+                generation: 0,
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        machine
+            .call_value(clear_interval, Value::UNDEFINED, &[stale])
+            .unwrap();
+        assert!(machine.has_pending_timers());
+
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 10,
+        });
+        assert_eq!(machine.run_one_expired_timer().unwrap().executed, 1);
+        assert_eq!(read_global(&machine, "count"), Some(Value::int32(2)));
+        assert!(machine.has_pending_timers());
+
+        machine
+            .call_value(clear_interval, Value::UNDEFINED, &[handle])
+            .unwrap();
+        assert!(!machine.has_pending_timers());
     }
 
     #[test]
