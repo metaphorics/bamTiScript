@@ -1077,6 +1077,10 @@ pub(crate) fn cook_member_property_name(
             Expression::Literal(Literal::String(string)) => source
                 .token_text(string.data().token())
                 .and_then(string_value),
+            Expression::Literal(Literal::Number(number)) => source
+                .token_text(number.data().token())
+                .and_then(number_value)
+                .map(|value| EcmaString::encode(&number_name(value))),
             _ => None,
         },
         MemberProperty::Private(_) => None,
@@ -1166,6 +1170,8 @@ pub(crate) fn enum_declaration(statement: &Stmt) -> Option<(&EnumDeclaration, No
 
 #[cfg(test)]
 mod tests {
+    use super::cook_member_property_name;
+    use crate::syntax::{Expression, MemberProperty, SourceFile, Statement};
     use super::{ENUM_ARITHMETIC_LEFT_NOT_NUMBER, ENUM_ARITHMETIC_RIGHT_NOT_NUMBER};
     use crate::checker::{SemanticModel, check};
     use crate::diagnostic::Recovered;
@@ -1215,5 +1221,56 @@ mod tests {
             arithmetic_codes(&checked),
             [ENUM_ARITHMETIC_LEFT_NOT_NUMBER.as_str()]
         );
+    }
+    fn source_text(text: &str) -> SourceFile {
+        let source = Arc::new(SourceText::new(text).expect("test source fits the per-file budget"));
+        let parsed = parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            source,
+        ));
+        assert!(
+            parsed.diagnostics().is_empty(),
+            "test source should parse cleanly: {:?}",
+            parsed.diagnostics()
+        );
+        parsed.into_product()
+    }
+
+    fn member_properties(source: &SourceFile) -> Vec<&MemberProperty> {
+        let mut properties = Vec::new();
+        for statement in source.statements() {
+            let Statement::Expression(statement) = statement.data() else {
+                continue;
+            };
+            let Expression::Member(member) = statement.expression.data() else {
+                continue;
+            };
+            properties.push(&member.property);
+        }
+        properties
+    }
+
+    #[test]
+    fn computed_numeric_member_property_name_normalizes_equivalent_spellings() {
+        // Decimal, exponent, separator, and hexadecimal spellings of the same
+        // numeric value must resolve to the same enum member name so computed
+        // access like `E[1e3]` finds the member declared as `1000`.
+        let source = source_text("o[1e3]; o[1_000]; o[0x3e8]; o[1000];");
+        let properties = member_properties(&source);
+        assert_eq!(properties.len(), 4, "expected four member expressions");
+        let names: Vec<_> = properties
+            .iter()
+            .map(|property| cook_member_property_name(&source, property))
+            .collect();
+        let first = names[0].as_ref().expect("first access should produce a name");
+        for name in &names[1..] {
+            assert_eq!(
+                name.as_ref().map(|n| n.to_utf8_lossy()),
+                Some(first.to_utf8_lossy()),
+                "all equivalent numeric spellings must normalize to the same member name"
+            );
+        }
+        assert_eq!(first.to_utf8_lossy(), "1000");
     }
 }
