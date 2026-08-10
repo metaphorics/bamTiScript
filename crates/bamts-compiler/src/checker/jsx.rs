@@ -182,7 +182,17 @@ impl<'src> Binder<'src> {
     /// namespace does not declare one.
     fn jsx_element_type(&mut self, scope: ScopeId) -> TypeId {
         match self.jsx_namespace_member(scope, "Element") {
-            Some(symbol) => self.resolve_type_symbol(symbol),
+            Some(symbol) => {
+                let element = self.resolve_type_symbol(symbol);
+                let view = self.types.named_structural_view(element);
+                if view != element {
+                    view
+                } else if let Some(class_view) = self.types.prepare_applied_class_view(element) {
+                    class_view
+                } else {
+                    element
+                }
+            }
             None => self.types.any(),
         }
     }
@@ -230,36 +240,29 @@ impl<'src> Binder<'src> {
             return;
         };
         let intrinsics = self.resolve_type_symbol(intrinsics_symbol);
-        let target = match self.types.get(intrinsics) {
-            Type::ObjectType(object) => object
+        let intrinsics = self.types.named_structural_view(intrinsics);
+        let target = if matches!(self.types.get(intrinsics), Type::AppliedClass { .. }) {
+            if let Some(view) = self.types.prepare_applied_class_view(intrinsics) {
+                if let Type::ObjectType(object) = self.types.get(view) {
+                    object
+                        .properties
+                        .iter()
+                        .find(|member| member.name() == tag_name)
+                        .map(|member| member.type_id())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else if let Type::ObjectType(object) = self.types.get(intrinsics) {
+            object
                 .properties
                 .iter()
                 .find(|member| member.name() == tag_name)
-                .map(|member| member.type_id()),
-            Type::Error
-            | Type::Intersection(_)
-            | Type::Any
-            | Type::Unknown
-            | Type::Never
-            | Type::Void
-            | Type::Null
-            | Type::Undefined
-            | Type::Boolean
-            | Type::Number
-            | Type::BigInt
-            | Type::String
-            | Type::Symbol
-            | Type::Object
-            | Type::BooleanLiteral(_)
-            | Type::NumberLiteral(_)
-            | Type::StringLiteral(_)
-            | Type::BigIntLiteral(_)
-            | Type::Array(_)
-            | Type::Tuple(_)
-            | Type::Union(_)
-            | Type::Function(_)
-            | Type::Named(_)
-            | Type::NumericEnum(_) => None,
+                .map(|member| member.type_id())
+        } else {
+            None
         };
         let Some(target) = target else {
             self.emit(
@@ -319,6 +322,9 @@ impl<'src> Binder<'src> {
             | Type::Intersection(_)
             | Type::Unknown
             | Type::Named(_)
+            | Type::AppliedClass { .. }
+            | Type::Keyof(_)
+            | Type::IndexedAccess { .. }
             | Type::Union(_) => None,
             Type::Never
             | Type::Void
@@ -729,8 +735,8 @@ mod tests {
 
     use super::super::binder::{SemanticModel, bind_source};
     use super::super::{
-        CANNOT_FIND_NAME, JSX_ATTRIBUTES_NOT_ASSIGNABLE, JSX_ELEMENT_TYPE_NOT_CALLABLE,
-        JSX_INTRINSIC_ELEMENT_NOT_FOUND, TYPE_NOT_ASSIGNABLE,
+        CANNOT_FIND_NAME, EXPRESSION_NOT_CALLABLE, JSX_ATTRIBUTES_NOT_ASSIGNABLE,
+        JSX_ELEMENT_TYPE_NOT_CALLABLE, JSX_INTRINSIC_ELEMENT_NOT_FOUND, TYPE_NOT_ASSIGNABLE,
     };
     use crate::diagnostic::Diagnostic;
     use crate::source::{ScriptKind, SourceId, SourceText};
@@ -777,6 +783,20 @@ mod tests {
         assert_clean(codes(&format!(
             "{JSX_PREAMBLE} const x = <div id=\"a\" />;"
         )));
+    }
+
+    #[test]
+    fn jsx_expression_writes_invalidate_captured_narrowing() {
+        let source = format!(
+            "{JSX_PREAMBLE} \
+             declare let f: (() => void) | undefined; \
+             if (f) {{ \
+               const read = () => f(); \
+               const node = <div id={{(f = undefined, \"value\")}} />; \
+               read(); \
+             }}"
+        );
+        assert_eq!(codes(&source), [EXPRESSION_NOT_CALLABLE.as_str()]);
     }
 
     #[test]

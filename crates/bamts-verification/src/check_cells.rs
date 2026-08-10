@@ -15,10 +15,12 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    fmt::Write as _,
     fs,
     path::Path,
 };
 
+use bamts_bytecode::EcmaString;
 use bamts_compiler::checker::{SemanticModel, SymbolId, SymbolKind, Type, TypeId};
 use bamts_compiler::diagnostic::DiagnosticSeverity;
 use bamts_compiler::pipeline::{
@@ -1140,13 +1142,29 @@ fn render_type_grouped(model: &SemanticModel, type_id: TypeId, group: bool) -> S
         Type::NumberLiteral(text) | Type::BigIntLiteral(text) => text.to_string(),
         Type::StringLiteral(text) => render_string_literal(text),
         Type::Array(element) => format!("{}[]", render_type_grouped(model, *element, true)),
-        Type::Tuple(elements) => {
-            let body = elements
-                .iter()
-                .map(|element| render_type_grouped(model, *element, false))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("[{body}]")
+        Type::Tuple(shape) => {
+            let mut elements = Vec::with_capacity(
+                shape.prefix.len() + usize::from(shape.rest.is_some()) + shape.suffix.len(),
+            );
+            elements.extend(shape.prefix.iter().enumerate().map(|(index, element)| {
+                let optional = index >= shape.required as usize;
+                let rendered = render_type_grouped(model, *element, optional);
+                if optional {
+                    format!("{rendered}?")
+                } else {
+                    rendered
+                }
+            }));
+            if let Some(rest) = shape.rest {
+                elements.push(format!("...{}[]", render_type_grouped(model, rest, true)));
+            }
+            elements.extend(
+                shape
+                    .suffix
+                    .iter()
+                    .map(|element| render_type_grouped(model, *element, false)),
+            );
+            format!("[{}]", elements.join(", "))
         }
         Type::Union(members) => {
             let body = members
@@ -1215,37 +1233,60 @@ fn render_type_grouped(model: &SemanticModel, type_id: TypeId, group: bool) -> S
                 format!("{{ {body}; }}")
             }
         }
+        Type::AppliedClass { symbol, arguments } => {
+            let name = model.symbol(*symbol).name();
+            if arguments.is_empty() {
+                name.to_owned()
+            } else {
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| render_type_grouped(model, *argument, false))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{name}<{arguments}>")
+            }
+        }
+        Type::Keyof(operand) => {
+            let body = format!("keyof {}", render_type_grouped(model, *operand, true));
+            if group { format!("({body})") } else { body }
+        }
+        Type::IndexedAccess { object, index } => format!(
+            "{}[{}]",
+            render_type_grouped(model, *object, true),
+            render_type_grouped(model, *index, false)
+        ),
         Type::Named(symbol) | Type::NumericEnum(symbol) => model.symbol(*symbol).name().to_owned(),
     }
 }
 
-/// Re-quote a stored string-literal lexeme (which keeps its source quotes) as
-/// a double-quoted TypeScript display literal.
-fn render_string_literal(raw: &str) -> String {
-    let inner = strip_string_quotes(raw);
-    let mut out = String::with_capacity(inner.len() + 2);
+/// Renders a semantic string value as one canonical TypeScript literal.
+fn render_string_literal(value: &EcmaString) -> String {
+    let mut out = String::with_capacity(value.len_units() + 2);
     out.push('"');
-    for ch in inner.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            _ => out.push(ch),
+    for (_, code_point) in value.code_points() {
+        match char::from_u32(code_point) {
+            Some('"') => out.push_str("\\\""),
+            Some('\\') => out.push_str("\\\\"),
+            Some('\n') => out.push_str("\\n"),
+            Some('\t') => out.push_str("\\t"),
+            Some('\r') => out.push_str("\\r"),
+            Some('\u{0008}') => out.push_str("\\b"),
+            Some('\u{000C}') => out.push_str("\\f"),
+            Some('\u{000B}') => out.push_str("\\v"),
+            Some(character) if character.is_control() && code_point < 0x20 => {
+                write!(out, "\\u{code_point:04X}").expect("writing to String cannot fail");
+            }
+            Some('\u{2028}' | '\u{2029}') => {
+                write!(out, "\\u{code_point:04X}").expect("writing to String cannot fail");
+            }
+            Some(character) => out.push(character),
+            None => {
+                write!(out, "\\u{code_point:04X}").expect("writing to String cannot fail");
+            }
         }
     }
     out.push('"');
     out
-}
-
-fn strip_string_quotes(raw: &str) -> &str {
-    let bytes = raw.as_bytes();
-    if bytes.len() >= 2 {
-        let first = bytes[0];
-        let last = bytes[bytes.len() - 1];
-        if matches!(first, b'\'' | b'"' | b'`') && first == last {
-            return &raw[1..raw.len() - 1];
-        }
-    }
-    raw
 }
 
 /// One `>display : type` record plus its underline, anchored to a source line.
@@ -2390,6 +2431,51 @@ export const a2 = 3;
         );
     }
 
+    #[test]
+    fn renders_canonical_string_literals_without_losing_surrogates() {
+        assert_eq!(
+            render_string_literal(&EcmaString::encode("a\n\"b")),
+            "\"a\\n\\\"b\""
+        );
+        assert_eq!(
+            render_string_literal(&EcmaString::from_units(&[0xD800])),
+            "\"\\uD800\""
+        );
+    }
+
+    #[test]
+    fn render_type_covers_tuple_shapes_and_applied_classes() {
+        with_model(
+            "declare class Box<T> {}\
+             declare let optionalTuple: [number, string?];\
+             declare let variadicTuple: [number, ...boolean[], bigint];\
+             declare let box: Box<string>;",
+            "tests/cases/compiler/composite.ts",
+            |model| {
+                let scope = model.scope(model.module_scope());
+                let optional = scope
+                    .value("optionalTuple")
+                    .expect("optional tuple binding");
+                assert_eq!(
+                    render_type(model, model.symbol_type(optional)),
+                    "[number, string?]"
+                );
+                let variadic = scope
+                    .value("variadicTuple")
+                    .expect("variadic tuple binding");
+                assert_eq!(
+                    render_type(model, model.symbol_type(variadic)),
+                    "[number, ...boolean[], bigint]"
+                );
+                let box_value = scope.value("box").expect("box binding");
+                assert_eq!(
+                    render_type(model, model.symbol_type(box_value)),
+                    "Box<string>"
+                );
+            },
+        );
+    }
+
     /// H4 pin: an annotated scalar case the checker fully types reproduces its
     /// upstream `.types` baseline (marker, section, source echo, `>expr : type`
     /// records, and underline widths) under `compare_types`.
@@ -2648,6 +2734,7 @@ class Board {\n\
             "this should be the Board instance shape\n{baseline}"
         );
     }
+
     #[test]
     fn infer_rest_argument_type_parameter_from_multiple_arguments() {
         let source = "// @strict: true\n// @target: es2015\n\n// Repro from #31204\n\nexport enum AppType {\n    HeaderDetail = 'HeaderDetail',\n    HeaderMultiDetail = 'HeaderMultiDetail',\n    AdvancedList = 'AdvancedList',\n    Standard = 'Standard',\n    Relationship = 'Relationship',\n    Report = 'Report',\n    Composite = 'Composite',\n    ListOnly = 'ListOnly',\n    ModuleSettings = 'ModuleSettings'\n}\n\nexport enum AppStyle {\n    Tree,\n    TreeEntity,\n    Standard,\n    MiniApp,\n    PivotTable\n}\n\nconst appTypeStylesWithError: Map<AppType, Array<AppStyle>> = new Map([\n    [AppType.Standard, [AppStyle.Standard, AppStyle.MiniApp]],\n    [AppType.Relationship, [AppStyle.Standard, AppStyle.Tree, AppStyle.TreeEntity]],\n    [AppType.AdvancedList, [AppStyle.Standard, AppStyle.MiniApp]]\n]);\n\n// Repro from #31204\n\ndeclare function foo<T>(...args: T[]): T[];\nlet b1: { x: boolean }[] = foo({ x: true }, { x: false });\nlet b2: boolean[][] = foo([true], [false]);\n";

@@ -35,12 +35,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use bamts_bytecode::EcmaString;
 
+pub(crate) use binder::{
+    ImportedSymbolType, bind_source, bind_source_with_environment,
+    bind_source_with_environment_and_imports, is_numeric_enum_initializer, source_is_module,
+};
 pub use binder::{
     PropertyType, Scope, ScopeId, ScopeKind, SemanticModel, Symbol, SymbolId, SymbolKind, Type,
     TypeId, TypeTable,
-};
-pub(crate) use binder::{
-    bind_source, bind_source_with_environment, is_numeric_enum_initializer, source_is_module,
 };
 pub use inference::{
     InferenceContext, InferenceParameter, InferencePriority, InferenceProvenance,
@@ -164,6 +165,8 @@ pub const ARGUMENT_COUNT_MISMATCH: DiagnosticCode = DiagnosticCode::new("BAMTS-C
 pub const PROPERTY_DOES_NOT_EXIST: DiagnosticCode = DiagnosticCode::new("BAMTS-C057");
 /// Diagnostic emitted when an expression with no call signatures is invoked.
 pub const EXPRESSION_NOT_CALLABLE: DiagnosticCode = DiagnosticCode::new("BAMTS-C055");
+/// Diagnostic emitted when an expression with no construct signatures is constructed.
+pub const EXPRESSION_NOT_CONSTRUCTABLE: DiagnosticCode = DiagnosticCode::new("BAMTS-C059");
 /// Diagnostic emitted when a function declaration appears inside a block-like
 /// scope in strict mode while targeting 'ES5'.
 pub const FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT: DiagnosticCode =
@@ -184,6 +187,16 @@ pub const GET_ACCESSOR_PARAMETERS: DiagnosticCode = DiagnosticCode::new("BAMTS-C
 pub const GET_ACCESSOR_NO_RETURN: DiagnosticCode = DiagnosticCode::new("BAMTS-C048");
 /// Diagnostic emitted when a 'get' or 'set' accessor declares a 'this' parameter.
 pub const ACCESSOR_THIS_PARAMETER: DiagnosticCode = DiagnosticCode::new("BAMTS-C058");
+/// Diagnostic emitted when an assignment target refers to a readonly or getter-only property.
+pub const ASSIGNMENT_TO_READONLY: DiagnosticCode = DiagnosticCode::new("BAMTS-C061");
+/// Diagnostic emitted when direct member access violates a class member's declared accessibility.
+pub const MEMBER_NOT_ACCESSIBLE: DiagnosticCode = DiagnosticCode::new("BAMTS-C063");
+/// Diagnostic emitted when direct member access targets `null` or `undefined` under `strictNullChecks`.
+pub const STRICT_NULL_MEMBER_ACCESS: DiagnosticCode = DiagnosticCode::new("BAMTS-C062");
+/// Diagnostic emitted when an assignment target resolves to a `const` variable.
+pub const ASSIGNMENT_TO_CONST: DiagnosticCode = DiagnosticCode::new("BAMTS-C060");
+/// Diagnostic emitted when an indexed access type uses a key that does not exist on the object type.
+pub const INVALID_INDEXED_ACCESS_KEY: DiagnosticCode = DiagnosticCode::new("BAMTS-C064");
 const PROPERTY_NOT_INITIALIZED_MESSAGE: &str =
     "Property has no initializer and is not definitely assigned in the constructor.";
 const ASSIGNMENT_TO_FUNCTION_MESSAGE: &str = "Cannot assign to a function.";
@@ -249,6 +262,13 @@ const ARGUMENT_COUNT_MISMATCH_MESSAGE: &str =
     "Supplied arguments do not match the expected parameter count.";
 const PROPERTY_DOES_NOT_EXIST_MESSAGE: &str = "Property does not exist on this type.";
 const EXPRESSION_NOT_CALLABLE_MESSAGE: &str = "This expression is not callable.";
+const EXPRESSION_NOT_CONSTRUCTABLE_MESSAGE: &str = "This expression is not constructable.";
+const ASSIGNMENT_TO_READONLY_MESSAGE: &str = "Cannot assign to a readonly or getter-only property.";
+const MEMBER_NOT_ACCESSIBLE_MESSAGE: &str = "Property is not accessible in this context.";
+const STRICT_NULL_MEMBER_ACCESS_MESSAGE: &str = "Object is possibly 'null' or 'undefined'.";
+const ASSIGNMENT_TO_CONST_MESSAGE: &str = "Cannot assign to a constant.";
+const INVALID_INDEXED_ACCESS_KEY_MESSAGE: &str =
+    "Type cannot be used to index the object type; the key does not match any property.";
 
 /// Compact identity for one allocated object literal and its aliases.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -526,21 +546,107 @@ pub fn check_program_with_options(
     levels: &LintTable,
     options: ProgramCheckOptions,
 ) -> Recovered<ProgramSemanticModel> {
+    let source_ids: Vec<SourceId> = input
+        .files
+        .iter()
+        .map(|recovered| recovered.product().source_id())
+        .collect();
+    let edge_targets: HashMap<_, _> = input
+        .edges
+        .iter()
+        .map(|edge| ((edge.from, edge.specifier), edge.to))
+        .collect();
+
     let mut files = BTreeMap::new();
-    let mut diagnostics = Vec::new();
     for recovered in input.files {
         let source = recovered.product();
-        let (mut model, core_diagnostics) = bind_source_with_environment(
+        let (model, _) = bind_source_with_environment(
             source,
             options.environment(),
             source_is_module(source),
             options,
         );
+        files.insert(source.source_id(), model);
+    }
+
+    let imports = collect_import_targets(input.files, &files, &edge_targets);
+    let exports = collect_export_targets(input.files, &files, &edge_targets);
+    let export_stars = collect_export_stars(input.files, &edge_targets);
+
+    let worklist: Vec<SourceId> = source_ids.clone();
+    for _ in 0..source_ids.len() {
+        let mut changed = false;
+        for &source_id in &worklist {
+            let Some(source) = input
+                .files
+                .iter()
+                .map(|recovered| recovered.product())
+                .find(|source| source.source_id() == source_id)
+            else {
+                continue;
+            };
+            let imported = collect_imported_types_for_source(
+                source_id,
+                source,
+                &imports,
+                &exports,
+                &export_stars,
+                &files,
+            );
+            if imported.is_empty() {
+                continue;
+            }
+            let (model, _) = bind_source_with_environment_and_imports(
+                source,
+                options.environment(),
+                source_is_module(source),
+                options,
+                &imported,
+            );
+            files.insert(source_id, model);
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut diagnostics = Vec::new();
+    let mut final_files = BTreeMap::new();
+    for recovered in input.files {
+        let source = recovered.product();
+        let source_id = source.source_id();
+        let imported = collect_imported_types_for_source(
+            source_id,
+            source,
+            &imports,
+            &exports,
+            &export_stars,
+            &files,
+        );
+        let (mut model, core_diagnostics) = if imported.is_empty() {
+            bind_source_with_environment(
+                source,
+                options.environment(),
+                source_is_module(source),
+                options,
+            )
+        } else {
+            bind_source_with_environment_and_imports(
+                source,
+                options.environment(),
+                source_is_module(source),
+                options,
+                &imported,
+            )
+        };
         model.replace_facts(crate::rules::semantic::collect_facts(source, &model));
         diagnostics.extend(core_diagnostics);
         diagnostics.extend(analyze_warnings(source, levels));
-        files.insert(source.source_id(), model);
+        final_files.insert(source_id, model);
     }
+    let mut files = final_files;
+
     crate::rules::semantic::collect_program_facts(input.files, input.edges, &mut files);
     collect_imported_const_enum_facts(input.files, input.edges, &mut files, &mut diagnostics);
     let program = ProgramSemanticModel {
@@ -668,6 +774,164 @@ impl ExportResolutionSet {
             _ => ExportResolution::Ambiguous,
         }
     }
+}
+/// Resolves one exported value name to its source [`LinkedExport`], following
+/// re-exports and export-star fallbacks through the shared export tables. A
+/// missing or ambiguous export yields `None`, preserving existing diagnostics.
+fn resolve_export_for_type(
+    source: SourceId,
+    name: &EcmaString,
+    imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
+    exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
+    export_stars: &ExportStars,
+    files: &BTreeMap<SourceId, SemanticModel>,
+) -> Option<LinkedExport> {
+    let resolution = resolve_export_candidates(
+        source,
+        name,
+        imports,
+        exports,
+        export_stars,
+        files,
+        &mut HashSet::new(),
+    );
+    let linked = resolution
+        .candidates
+        .iter()
+        .find_map(|candidate| match candidate {
+            ExportCandidate::Value(linked) => Some(*linked),
+            _ => None,
+        });
+    if matches!(resolution.into_resolution(), ExportResolution::NotConst) {
+        linked
+    } else {
+        None
+    }
+}
+
+/// Builds the [`ImportedSymbolType`] facts for one source file by translating
+/// each non-type-only import binding into the structural type of its resolved
+/// source export. Named, default, and namespace imports all follow existing
+/// symbol identities; cross-table types are copied through
+/// [`TypeTable::import_type`] at bind time. Missing exports are skipped so the
+/// binder retains its current diagnostics.
+fn collect_imported_types_for_source<'a>(
+    source_id: SourceId,
+    source: &SourceFile,
+    imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
+    exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
+    export_stars: &ExportStars,
+    files: &'a BTreeMap<SourceId, SemanticModel>,
+) -> Vec<ImportedSymbolType<'a>> {
+    let Some(model) = files.get(&source_id) else {
+        return Vec::new();
+    };
+    let mut imported_types = Vec::new();
+    for statement in source.statements() {
+        let Statement::Import(import) = statement.data() else {
+            continue;
+        };
+        if import.type_only {
+            continue;
+        }
+        let Some(clause) = &import.clause else {
+            continue;
+        };
+        if let Some(default) = &clause.default {
+            let Some(symbol) = lookup_identifier(model, source, default) else {
+                continue;
+            };
+            if let Some(imported) =
+                build_imported_symbol_type(source_id, symbol, imports, exports, export_stars, files)
+            {
+                imported_types.push(imported);
+            }
+        }
+        match &clause.binding {
+            Some(ImportBinding::Namespace(local)) => {
+                let Some(symbol) = lookup_identifier(model, source, local) else {
+                    continue;
+                };
+                let Some(target) = imports.get(&(source_id, symbol)) else {
+                    continue;
+                };
+                let ImportTarget::Namespace {
+                    source: target_source,
+                } = *target
+                else {
+                    continue;
+                };
+                let Some(target_model) = files.get(&target_source) else {
+                    continue;
+                };
+                let namespace_type = target_model.types().object();
+                imported_types.push(ImportedSymbolType {
+                    symbol,
+                    source_types: target_model.types(),
+                    type_id: namespace_type,
+                });
+            }
+            Some(ImportBinding::Named(specifiers)) => {
+                for specifier in specifiers {
+                    let specifier_data = specifier.data();
+                    if specifier_data.mode == crate::syntax::ImportSpecifierMode::TypeOnly {
+                        continue;
+                    }
+                    let Some(symbol) = lookup_identifier(model, source, &specifier_data.local)
+                    else {
+                        continue;
+                    };
+                    if let Some(imported) = build_imported_symbol_type(
+                        source_id,
+                        symbol,
+                        imports,
+                        exports,
+                        export_stars,
+                        files,
+                    ) {
+                        imported_types.push(imported);
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    imported_types
+}
+
+/// Resolves one imported binding to its source export's structural type fact.
+fn build_imported_symbol_type<'a>(
+    source_id: SourceId,
+    symbol: SymbolId,
+    imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
+    exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
+    export_stars: &ExportStars,
+    files: &'a BTreeMap<SourceId, SemanticModel>,
+) -> Option<ImportedSymbolType<'a>> {
+    let target = imports.get(&(source_id, symbol))?;
+    let (target_source, target_name) = match target {
+        ImportTarget::Named { source, name, .. } => (*source, name.clone()),
+        ImportTarget::Namespace { .. } => return None,
+    };
+    let linked = resolve_export_for_type(
+        target_source,
+        &target_name,
+        imports,
+        exports,
+        export_stars,
+        files,
+    )?;
+    let source_model = files.get(&linked.source)?;
+    let source_type_id = source_model.symbol_type(linked.symbol);
+    let source_type = source_model.types().get(source_type_id);
+    if matches!(source_type, Type::Error | Type::Any | Type::Unknown) {
+        return None;
+    }
+    Some(ImportedSymbolType {
+        symbol,
+        source_types: source_model.types(),
+        type_id: source_type_id,
+    })
 }
 
 fn collect_imported_const_enum_facts(
@@ -1109,77 +1373,101 @@ fn collect_export_targets(
             continue;
         };
         for statement in source.statements() {
-            let Statement::Export(crate::syntax::ExportDeclaration::Named(named)) =
-                statement.data()
-            else {
+            let Statement::Export(export) = statement.data() else {
                 continue;
             };
-            match named {
-                crate::syntax::ExportNamedDeclaration::Declaration(inner) => {
-                    if let Some((declaration, declaration_id)) = enum_plan::enum_declaration(inner)
-                    {
-                        let Some(symbol) = model.enum_facts().declaration_symbol(declaration_id)
-                        else {
-                            continue;
-                        };
-                        let Some(name) = source
-                            .identifier_text(declaration.name.data().token())
-                            .map(|name| EcmaString::encode(name.as_ref()))
-                        else {
-                            continue;
-                        };
-                        targets.insert((source_id, name), ExportTarget::Local(symbol));
-                    } else {
-                        for name in crate::lower::declared_names(source, inner) {
-                            let Some(symbol) = model.lookup_value(model.module_scope(), &name)
-                            else {
-                                continue;
-                            };
-                            targets.insert(
-                                (source_id, EcmaString::encode(&name)),
-                                ExportTarget::Local(symbol),
-                            );
-                        }
-                    }
-                }
-                crate::syntax::ExportNamedDeclaration::Specifiers {
-                    type_only,
-                    specifiers,
-                    source: reexport_source,
-                    ..
-                } if !type_only => {
-                    let target_source = reexport_source.as_ref().and_then(|source| {
-                        edges
-                            .get(&(source_id, statement.id()))
-                            .or_else(|| edges.get(&(source_id, source.id())))
-                            .copied()
-                    });
-                    for specifier in specifiers {
-                        let specifier = specifier.data();
-                        if specifier.mode == crate::syntax::ExportSpecifierMode::TypeOnly {
-                            continue;
-                        }
-                        let Some(exported) = module_export_name(source, &specifier.exported) else {
-                            continue;
-                        };
-                        let target = if let Some(target_source) = target_source {
-                            let Some(name) = module_export_name(source, &specifier.local) else {
-                                continue;
-                            };
-                            ExportTarget::Forward {
-                                source: target_source,
-                                name,
-                            }
-                        } else {
+            match export {
+                crate::syntax::ExportDeclaration::Named(named) => match named {
+                    crate::syntax::ExportNamedDeclaration::Declaration(inner) => {
+                        if let Some((declaration, declaration_id)) =
+                            enum_plan::enum_declaration(inner)
+                        {
                             let Some(symbol) =
-                                lookup_module_export_name(model, source, &specifier.local)
+                                model.enum_facts().declaration_symbol(declaration_id)
                             else {
                                 continue;
                             };
-                            ExportTarget::Local(symbol)
-                        };
-                        targets.insert((source_id, exported), target);
+                            let Some(name) = source
+                                .identifier_text(declaration.name.data().token())
+                                .map(|name| EcmaString::encode(name.as_ref()))
+                            else {
+                                continue;
+                            };
+                            targets.insert((source_id, name), ExportTarget::Local(symbol));
+                        } else {
+                            for name in crate::lower::declared_names(source, inner) {
+                                let Some(symbol) = model.lookup_value(model.module_scope(), &name)
+                                else {
+                                    continue;
+                                };
+                                targets.insert(
+                                    (source_id, EcmaString::encode(&name)),
+                                    ExportTarget::Local(symbol),
+                                );
+                            }
+                        }
                     }
+                    crate::syntax::ExportNamedDeclaration::Specifiers {
+                        type_only,
+                        specifiers,
+                        source: reexport_source,
+                        ..
+                    } if !type_only => {
+                        let target_source = reexport_source.as_ref().and_then(|source| {
+                            edges
+                                .get(&(source_id, statement.id()))
+                                .or_else(|| edges.get(&(source_id, source.id())))
+                                .copied()
+                        });
+                        for specifier in specifiers {
+                            let specifier = specifier.data();
+                            if specifier.mode == crate::syntax::ExportSpecifierMode::TypeOnly {
+                                continue;
+                            }
+                            let Some(exported) = module_export_name(source, &specifier.exported)
+                            else {
+                                continue;
+                            };
+                            let target = if let Some(target_source) = target_source {
+                                let Some(name) = module_export_name(source, &specifier.local)
+                                else {
+                                    continue;
+                                };
+                                ExportTarget::Forward {
+                                    source: target_source,
+                                    name,
+                                }
+                            } else {
+                                let Some(symbol) =
+                                    lookup_module_export_name(model, source, &specifier.local)
+                                else {
+                                    continue;
+                                };
+                                ExportTarget::Local(symbol)
+                            };
+                            targets.insert((source_id, exported), target);
+                        }
+                    }
+                    _ => {}
+                },
+                crate::syntax::ExportDeclaration::Default(default) => {
+                    let name = match &default.value {
+                        crate::syntax::ExportDefaultValue::Function(function) => {
+                            function.name.as_ref()
+                        }
+                        crate::syntax::ExportDefaultValue::Class(class) => class.name.as_ref(),
+                        _ => None,
+                    };
+                    let Some(name) = name else {
+                        continue;
+                    };
+                    let Some(symbol) = lookup_identifier(model, source, name) else {
+                        continue;
+                    };
+                    targets.insert(
+                        (source_id, EcmaString::encode("default")),
+                        ExportTarget::Local(symbol),
+                    );
                 }
                 _ => {}
             }
@@ -1509,13 +1797,15 @@ fn imported_enum_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        BARE_SUPER_EXPRESSION, CANNOT_FIND_NAME, CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE,
-        CONSTRUCTOR_DECORATOR_NOT_SUPPORTED, DUPLICATE_DECLARATION, IMPORTED_CONST_ENUM_AMBIGUOUS,
-        IMPORTED_CONST_ENUM_CYCLE, IMPORTED_CONST_ENUM_NONCONSTANT, MIXED_EXPORT_ASSIGNMENT,
+        ARGUMENT_NOT_ASSIGNABLE, BARE_SUPER_EXPRESSION, CANNOT_FIND_NAME, CANNOT_FIND_NAMESPACE,
+        CANNOT_FIND_TYPE, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED, DUPLICATE_DECLARATION,
+        EXPRESSION_NOT_CALLABLE, IMPORTED_CONST_ENUM_AMBIGUOUS, IMPORTED_CONST_ENUM_CYCLE,
+        IMPORTED_CONST_ENUM_NONCONSTANT, MIXED_EXPORT_ASSIGNMENT,
         PARAMETER_DECORATOR_NOT_SUPPORTED, PROPERTY_DOES_NOT_EXIST, ProgramCheckInput,
-        PropertyType, ResolvedModuleEdge, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS,
+        ProgramCheckOptions, PropertyType, ResolvedModuleEdge, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS,
         SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_REFERENCE_NON_DERIVED, ScopeKind, SymbolKind,
-        TYPE_NOT_ASSIGNABLE, Type, TypeTable, WITH_STATEMENT_NOT_ALLOWED, check, check_program,
+        TYPE_NOT_ASSIGNABLE, Type, TypeId, TypeTable, WITH_STATEMENT_NOT_ALLOWED, check,
+        check_program, check_program_with_options,
     };
     use crate::diagnostic::{DiagnosticSeverity, Recovered};
     use crate::namespace_plan::{ContainerAcquisition, ExportStorage};
@@ -1595,7 +1885,10 @@ mod tests {
         let number = table.number();
         let string = table.string();
         let tuple = table.tuple(vec![number, string]);
-        assert_eq!(table.get(tuple), &Type::Tuple(vec![number, string]));
+        assert_eq!(
+            table.get(tuple),
+            &Type::Tuple(super::binder::TupleShape::fixed(vec![number, string]))
+        );
     }
 
     #[test]
@@ -1799,6 +2092,22 @@ mod tests {
         check(&parsed)
     }
 
+    fn check_text_strict_null(text: &str) -> Recovered<super::ProgramSemanticModel> {
+        let parsed = [parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            source(text),
+        ))];
+        check_program_with_options(
+            ProgramCheckInput {
+                files: &parsed,
+                edges: &[],
+            },
+            &crate::lint::LintTable::new(crate::lint::LintProfile::Default),
+            ProgramCheckOptions::standard().with_strict_null_checks(true),
+        )
+    }
+
     fn parsed(source_id: u32, text: &str) -> Recovered<SourceFile> {
         parser::parse(scanner::scan(
             SourceId::new(source_id),
@@ -1973,7 +2282,7 @@ mod tests {
             .collect()
     }
 
-    fn checker_codes(result: &Recovered<super::SemanticModel>) -> Vec<&'static str> {
+    fn checker_codes<T>(result: &Recovered<T>) -> Vec<&'static str> {
         result
             .diagnostics()
             .iter()
@@ -2542,6 +2851,46 @@ mod tests {
              function unguarded(g: string | string[]): number { return takesStr(g); }",
         );
         assert_eq!(checker_codes(&result), ["BAMTS-C053"]);
+    }
+
+    #[test]
+    fn writes_invalidate_guard_narrowing() {
+        let assignment = check_text(
+            "declare function takesString(value: string): void;\
+             let value: string | number = \"ok\";\
+             if (typeof value === \"string\") {\
+               takesString(value); value = 1; takesString(value);\
+             }",
+        );
+        assert_eq!(checker_codes(&assignment), ["BAMTS-C053"]);
+
+        let update = check_text(
+            "declare function takesString(value: string): void;\
+             let value: string | number = \"ok\";\
+             if (typeof value === \"string\") { value++; takesString(value); }",
+        );
+        assert_eq!(checker_codes(&update), ["BAMTS-C053"]);
+    }
+
+    #[test]
+    fn zero_iteration_loops_do_not_leak_body_narrowing() {
+        let while_loop = check_text(
+            "declare function takesString(value: string): void;\
+             function run(value: string | number, condition: boolean): void {\
+               while (condition) { if (typeof value !== \"string\") return; }\
+               takesString(value);\
+             }",
+        );
+        assert_eq!(checker_codes(&while_loop), ["BAMTS-C053"]);
+
+        let for_loop = check_text(
+            "declare function takesString(value: string): void;\
+             function run(value: string | number, condition: boolean): void {\
+               for (; condition;) { if (typeof value !== \"string\") return; }\
+               takesString(value);\
+             }",
+        );
+        assert_eq!(checker_codes(&for_loop), ["BAMTS-C053"]);
     }
 
     #[test]
@@ -4785,6 +5134,2124 @@ mod tests {
         assert!(
             facts.exports_for_member_declaration(first.id()).is_empty(),
             "namespace declaration itself has no member exports"
+        );
+    }
+    #[test]
+    fn imported_named_function_retains_callable_type_across_modules() {
+        let valid = linked(
+            &[
+                "export function add(x: number, y: number): number { return x + y; }",
+                "import { add } from './a'; const result: number = add(1, 2);",
+            ],
+            &[(1, 0, 0)],
+        );
+        assert!(
+            program_codes(&valid).is_empty(),
+            "{:?}",
+            program_codes(&valid)
+        );
+
+        let wrong_arg = linked(
+            &[
+                "export function add(x: number, y: number): number { return x + y; }",
+                "import { add } from './a'; add('x', 2);",
+            ],
+            &[(1, 0, 0)],
+        );
+        assert!(
+            program_codes(&wrong_arg).contains(&super::ARGUMENT_NOT_ASSIGNABLE.as_str()),
+            "{:?}",
+            program_codes(&wrong_arg)
+        );
+
+        let wrong_count = linked(
+            &[
+                "export function add(x: number, y: number): number { return x + y; }",
+                "import { add } from './a'; add(1);",
+            ],
+            &[(1, 0, 0)],
+        );
+        assert!(
+            program_codes(&wrong_count).contains(&super::ARGUMENT_COUNT_MISMATCH.as_str()),
+            "{:?}",
+            program_codes(&wrong_count)
+        );
+    }
+
+    #[test]
+    fn imported_default_function_retains_callable_type_across_modules() {
+        let valid = linked(
+            &[
+                "export default function add(x: number, y: number): number { return x + y; }",
+                "import add from './a'; const result: number = add(1, 2);",
+            ],
+            &[(1, 0, 0)],
+        );
+        assert!(
+            program_codes(&valid).is_empty(),
+            "{:?}",
+            program_codes(&valid)
+        );
+
+        let wrong_arg = linked(
+            &[
+                "export default function add(x: number, y: number): number { return x + y; }",
+                "import add from './a'; add('x', 2);",
+            ],
+            &[(1, 0, 0)],
+        );
+        assert!(
+            program_codes(&wrong_arg).contains(&super::ARGUMENT_NOT_ASSIGNABLE.as_str()),
+            "{:?}",
+            program_codes(&wrong_arg)
+        );
+    }
+
+    #[test]
+    fn imported_named_object_retains_member_types_across_modules() {
+        let valid = linked(
+            &[
+                "export const obj = { count: 1, greet(name: string): string { return name; } };",
+                "import { obj } from './a'; const n: number = obj.count; const s: string = obj.greet('x');",
+            ],
+            &[(1, 0, 0)],
+        );
+        assert!(
+            program_codes(&valid).is_empty(),
+            "{:?}",
+            program_codes(&valid)
+        );
+
+        let wrong_member_arg = linked(
+            &[
+                "export const obj = { greet(name: string): string { return name; } };",
+                "import { obj } from './a'; obj.greet(1);",
+            ],
+            &[(1, 0, 0)],
+        );
+        assert!(
+            program_codes(&wrong_member_arg).contains(&super::ARGUMENT_NOT_ASSIGNABLE.as_str()),
+            "{:?}",
+            program_codes(&wrong_member_arg)
+        );
+    }
+
+    #[test]
+    fn imported_value_type_is_structurally_copied_not_any_or_error() {
+        let checked = linked(
+            &[
+                "export function add(x: number, y: number): number { return x + y; }",
+                "import { add } from './a'; add(1, 2);",
+            ],
+            &[(1, 0, 0)],
+        );
+        let model = checked
+            .product()
+            .file(SourceId::new(1))
+            .expect("importer model");
+        let symbol = model
+            .lookup_value(model.module_scope(), "add")
+            .expect("add import symbol");
+        assert!(
+            matches!(
+                model.types().get(model.symbol_type(symbol)),
+                Type::Function(_)
+            ),
+            "imported add retains a function type, got {:?}",
+            model.types().get(model.symbol_type(symbol))
+        );
+    }
+
+    #[test]
+    fn imported_reexported_function_retains_callable_type() {
+        let valid = linked(
+            &[
+                "export function f(x: number): number { return x; }",
+                "export { f } from './a';",
+                "import { f } from './b'; const result: number = f(1);",
+            ],
+            &[(1, 0, 0), (2, 0, 1)],
+        );
+        assert!(
+            program_codes(&valid).is_empty(),
+            "{:?}",
+            program_codes(&valid)
+        );
+
+        let wrong_arg = linked(
+            &[
+                "export function f(x: number): number { return x; }",
+                "export { f } from './a';",
+                "import { f } from './b'; f('x');",
+            ],
+            &[(1, 0, 0), (2, 0, 1)],
+        );
+        assert!(
+            program_codes(&wrong_arg).contains(&super::ARGUMENT_NOT_ASSIGNABLE.as_str()),
+            "{:?}",
+            program_codes(&wrong_arg)
+        );
+    }
+
+    #[test]
+    fn imported_value_cycle_terminates_deterministically() {
+        let checked = linked(
+            &[
+                "import { b } from './b'; export function a() { return b(); }",
+                "import { a } from './a'; export function b() { return a(); }",
+                "import { a } from './a'; a();",
+            ],
+            &[(0, 0, 1), (1, 0, 0), (2, 0, 0)],
+        );
+        assert!(
+            program_codes(&checked).is_empty(),
+            "{:?}",
+            program_codes(&checked)
+        );
+    }
+
+    #[test]
+    fn imported_missing_export_is_unchanged() {
+        let checked = linked(
+            &[
+                "export const existing = 1;",
+                "import { missing } from './a'; missing;",
+            ],
+            &[(1, 0, 0)],
+        );
+        assert!(
+            program_codes(&checked).is_empty(),
+            "{:?}",
+            program_codes(&checked)
+        );
+    }
+
+    fn function_return_type(model: &super::SemanticModel, name: &str) -> TypeId {
+        let symbol = model
+            .lookup_value(model.module_scope(), name)
+            .expect("symbol exists");
+        match model.types().get(model.symbol_type(symbol)) {
+            Type::Function(signature) => signature.return_type(),
+            other => panic!("{name} should be a function, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conditional_function_return_includes_undefined_when_block_completes_normally() {
+        let result = check_text(
+            "declare const flag: boolean;\n\
+             function f(flag: boolean) { if (flag) return 1; }",
+        );
+        let model = result.product();
+        let return_type_id = function_return_type(model, "f");
+        let return_type = model.types().get(return_type_id);
+        let undefined = model.types().undefined_type();
+        let number = model.types().number();
+        let Type::Union(members) = return_type else {
+            panic!("expected union, got {return_type:?}");
+        };
+        assert!(
+            members.contains(&undefined),
+            "return type must include undefined"
+        );
+        assert!(members.contains(&number), "return type must include number");
+    }
+
+    #[test]
+    fn conditional_block_arrow_return_includes_undefined_when_block_completes_normally() {
+        let result = check_text(
+            "declare const flag: boolean;\n\
+             const f = (flag: boolean) => { if (flag) return 1; };",
+        );
+        let model = result.product();
+        let return_type_id = function_return_type(model, "f");
+        let return_type = model.types().get(return_type_id);
+        let undefined = model.types().undefined_type();
+        let number = model.types().number();
+        let Type::Union(members) = return_type else {
+            panic!("expected union, got {return_type:?}");
+        };
+        assert!(
+            members.contains(&undefined),
+            "return type must include undefined"
+        );
+        assert!(members.contains(&number), "return type must include number");
+    }
+
+    #[test]
+    fn all_path_function_returns_remain_number() {
+        let result = check_text(
+            "declare const flag: boolean;\n\
+             function f(flag: boolean) { if (flag) return 1; return 2; }",
+        );
+        let model = result.product();
+        assert_eq!(
+            function_return_type(model, "f"),
+            model.types().number(),
+            "all-path return should be number"
+        );
+    }
+
+    #[test]
+    fn all_path_block_arrow_returns_remain_number() {
+        let result = check_text(
+            "declare const flag: boolean;\n\
+             const f = (flag: boolean) => { if (flag) return 1; return 2; };",
+        );
+        let model = result.product();
+        assert_eq!(
+            function_return_type(model, "f"),
+            model.types().number(),
+            "all-path arrow return should be number"
+        );
+    }
+
+    #[test]
+    fn annotated_returns_do_not_gain_undefined_from_incomplete_paths() {
+        let result = check_text(
+            "declare const flag: boolean;\n\
+             function f(flag: boolean): number { if (flag) return 1; }",
+        );
+        let model = result.product();
+        assert_eq!(
+            function_return_type(model, "f"),
+            model.types().number(),
+            "annotated return must stay number"
+        );
+    }
+
+    #[test]
+    fn annotated_block_arrows_do_not_gain_undefined_from_incomplete_paths() {
+        let result = check_text(
+            "declare const flag: boolean;\n\
+             const f = (flag: boolean): number => { if (flag) return 1; };",
+        );
+        let model = result.product();
+        assert_eq!(
+            function_return_type(model, "f"),
+            model.types().number(),
+            "annotated block arrow return must stay number"
+        );
+    }
+
+    #[test]
+    fn awaited_expressions_preserve_non_promise_types_and_unwrap_promise_payloads() {
+        let result = check_text(
+            "declare let p: Promise<number>;\
+             async function direct() { let direct = await 1; }\
+             async function unwrapped() { let payload = await p; return payload; }\
+             const wrapped: Promise<number> = unwrapped();",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
+
+        let model = result.product();
+        let number = model.types().number();
+        let local = |name: &str| -> super::SymbolId {
+            model
+                .scopes()
+                .iter()
+                .find(|scope| scope.kind() == ScopeKind::Function && scope.value(name).is_some())
+                .and_then(|scope| scope.value(name))
+                .unwrap_or_else(|| panic!("local `{name}` is bound"))
+        };
+        assert_eq!(
+            model.symbol_type(local("direct")),
+            number,
+            "await 1 should preserve the number operand"
+        );
+        assert_eq!(
+            model.symbol_type(local("payload")),
+            number,
+            "await Promise<number> should unwrap the payload"
+        );
+
+        let incompatible = check_text(
+            "declare let p: Promise<number>;\
+             async function mismatch() { const text: string = await p; }",
+        );
+        assert_eq!(checker_codes(&incompatible), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn annotated_class_field_initializer_is_type_checked() {
+        let invalid = check_text("class C { value: string = 1; }");
+        assert_eq!(checker_codes(&invalid), ["BAMTS-C004"]);
+
+        let valid = check_text("class C { value: string = \"ok\"; }");
+        assert!(checker_codes(&valid).is_empty());
+    }
+
+    #[test]
+    fn annotated_class_field_initializer_resolves_references() {
+        let valid = check_text("const n = 1; class C { value: number = n; }");
+        assert!(checker_codes(&valid).is_empty());
+
+        let unresolved = check_text("class C { value: number = missing; }");
+        assert!(checker_codes(&unresolved).contains(&CANNOT_FIND_NAME.as_str()));
+    }
+
+    #[test]
+    fn annotated_class_auto_accessor_initializer_is_type_checked() {
+        let invalid = check_text("class C { accessor value: string = 1; }");
+        assert_eq!(checker_codes(&invalid), ["BAMTS-C004"]);
+
+        let valid = check_text("class C { accessor value: string = \"ok\"; }");
+        assert!(checker_codes(&valid).is_empty());
+    }
+
+    #[test]
+    fn unannotated_readonly_class_property_preserves_literal_type() {
+        let result =
+            check_text("class C { readonly kind = \"a\"; } const item: { kind: \"a\" } = new C();");
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn read_property_type_unions_undefined_for_optional_properties() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let optional = table.object_type(vec![PropertyType::new("p", true, number)]);
+        let required = table.object_type(vec![PropertyType::new("p", false, number)]);
+
+        let read_optional = table
+            .read_property_type(optional, "p")
+            .expect("optional p exists");
+        let write_optional = table
+            .property_type(optional, "p")
+            .expect("optional p exists");
+        assert!(table.assignable(table.undefined_type(), read_optional));
+        assert!(table.assignable(number, read_optional));
+        assert!(!table.assignable_with_strict_null(read_optional, number));
+
+        assert_eq!(write_optional, number);
+        assert_eq!(table.read_property_type(required, "p"), Some(number));
+        assert_eq!(table.property_type(required, "p"), Some(number));
+    }
+
+    #[test]
+    fn optional_property_reads_are_undefined_and_narrow_on_guard() {
+        let unguarded =
+            check_text_strict_null("const obj: { p?: number } = {}; const n: number = obj.p;");
+        assert_eq!(checker_codes(&unguarded), ["BAMTS-C004"]);
+
+        let guarded = check_text_strict_null(
+            "const obj: { p?: number } = {}; const value = obj.p; if (value) { const n: number = value; }",
+        );
+        assert!(
+            checker_codes(&guarded).is_empty(),
+            "{:?}",
+            checker_codes(&guarded)
+        );
+
+        let write = check_text_strict_null("const obj: { p?: number } = {}; obj.p = undefined;");
+        assert_eq!(checker_codes(&write), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn const_narrowed_value_remains_narrowed_inside_nested_arrow() {
+        // A `const` binding narrowed by a guard before the arrow should stay
+        // narrowed inside the arrow body: `x` is `string` there, so assigning
+        // it to `number` must error.
+        let result = check_text(
+            "declare const x: string | number;\nif (typeof x !== \"string\") return;\nconst f = () => { const y: number = x; };\n",
+        );
+        assert!(
+            checker_codes(&result).contains(&TYPE_NOT_ASSIGNABLE.as_str()),
+            "expected x to be narrowed to string inside the arrow: {}",
+            checker_codes(&result).join(", ")
+        );
+    }
+
+    #[test]
+    fn reassigned_let_narrowing_does_not_cross_function_boundary() {
+        // A `let` binding that is narrowed before a function declaration is
+        // reassigned later in the same scope. The narrowing must NOT cross the
+        // function boundary because the variable could be changed between the
+        // guard and the deferred call.
+        let result = check_text(
+            "declare let x: string | number;\nif (typeof x !== \"string\") return;\nfunction f() { const y: number = x; }\nx = 1;\n",
+        );
+        assert!(
+            checker_codes(&result).contains(&TYPE_NOT_ASSIGNABLE.as_str()),
+            "expected x to remain string | number inside f because it is reassigned: {}",
+            checker_codes(&result).join(", ")
+        );
+    }
+
+    #[test]
+    fn later_nested_writer_invalidates_captured_narrowing() {
+        let result = check_text(
+            "declare let f: (() => void) | undefined;\
+             if (f) {\
+               const read = () => f();\
+               const clear = () => { f = undefined; };\
+               clear();\
+               read();\
+             }",
+        );
+        assert_eq!(checker_codes(&result), [EXPRESSION_NOT_CALLABLE.as_str()]);
+    }
+
+    #[test]
+    fn nested_write_inventory_respects_lexical_shadows() {
+        let parameter = check_text(
+            "declare let f: (() => void) | undefined;\
+             if (f) {\
+               const read = () => f();\
+               const clear = (f: (() => void) | undefined) => { f = undefined; };\
+               clear(undefined);\
+               read();\
+             }",
+        );
+        assert!(checker_codes(&parameter).is_empty());
+
+        let hoisted = check_text(
+            "declare let f: (() => void) | undefined;\
+             if (f) {\
+               const read = () => f();\
+               const clear = () => { f = undefined; var f: (() => void) | undefined; };\
+               clear();\
+               read();\
+             }",
+        );
+        assert!(checker_codes(&hoisted).is_empty());
+
+        let block_only = check_text(
+            "declare let f: (() => void) | undefined;\
+             if (f) {\
+               const read = () => f();\
+               const clear = () => {\
+                 { let f: (() => void) | undefined; f = undefined; }\
+               };\
+               clear();\
+               read();\
+             }",
+        );
+        assert!(checker_codes(&block_only).is_empty());
+
+        let restored = check_text(
+            "declare let f: (() => void) | undefined;\
+             if (f) {\
+               const read = () => f();\
+               const clear = () => {\
+                 { let f: (() => void) | undefined; f = undefined; }\
+                 f = undefined;\
+               };\
+               clear();\
+               read();\
+             }",
+        );
+        assert_eq!(checker_codes(&restored), [EXPRESSION_NOT_CALLABLE.as_str()]);
+
+        let nested = check_text(
+            "declare let f: (() => void) | undefined;\
+             if (f) {\
+               const read = () => f();\
+               const clear = () => {\
+                 const deeper = () => { f = undefined; };\
+                 deeper();\
+               };\
+               clear();\
+               read();\
+             }",
+        );
+        assert_eq!(checker_codes(&nested), [EXPRESSION_NOT_CALLABLE.as_str()]);
+
+        let static_block = check_text(
+            "declare let value: string | number;\
+             if (typeof value === \"string\") {\
+               class Holder { static { value = 1; var value; } }\
+               const read = () => { const narrowed: string = value; };\
+             }",
+        );
+        assert!(checker_codes(&static_block).is_empty());
+    }
+
+    #[test]
+    fn object_and_class_writers_invalidate_captured_narrowing() {
+        for source in [
+            "declare let f: (() => void) | undefined;\
+             if (f) {\
+               const read = () => f();\
+               const holder = { clear() { f = undefined; } };\
+               holder.clear();\
+               read();\
+             }",
+            "declare let f: (() => void) | undefined;\
+             if (f) {\
+               const read = () => f();\
+               const holder = { [(f = undefined, \"key\")]: 1 };\
+               read();\
+             }",
+            "declare let f: (() => void) | undefined;\
+             if (f) {\
+               const read = () => f();\
+               class Holder { clear() { f = undefined; } }\
+               new Holder().clear();\
+               read();\
+             }",
+            "declare let f: (() => void) | undefined;\
+             if (!f) { throw \"missing\"; }\
+             const read = () => f();\
+             export default class { clear() { f = undefined; } }\
+             read();",
+        ] {
+            let result = check_text(source);
+            assert_eq!(
+                checker_codes(&result),
+                [EXPRESSION_NOT_CALLABLE.as_str()],
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn enum_and_namespace_writers_invalidate_captured_narrowing() {
+        for source in [
+            "declare let f: (() => void) | undefined;\
+             if (!f) { throw \"missing\"; }\
+             const read = () => f();\
+             enum E { A = (f = undefined, 0) }\
+             read();",
+            "declare let f: (() => void) | undefined;\
+             if (!f) { throw \"missing\"; }\
+             const read = () => f();\
+             namespace N { f = undefined; }\
+             read();",
+        ] {
+            let result = check_text(source);
+            assert_eq!(
+                checker_codes(&result),
+                [EXPRESSION_NOT_CALLABLE.as_str()],
+                "{source}"
+            );
+        }
+
+        let shadow = check_text(
+            "declare let f: (() => void) | undefined;\
+             if (!f) { throw \"missing\"; }\
+             const read = () => f();\
+             namespace N { let f: (() => void) | undefined; f = undefined; }\
+             read();",
+        );
+        assert!(checker_codes(&shadow).is_empty());
+    }
+
+    #[test]
+    fn sibling_branch_narrowing_does_not_leak_into_nested_function() {
+        // A guard in one branch of an `if` narrows `x` to `string` only within
+        // that branch. A function declared in the sibling (else) branch must
+        // NOT see the narrowing.
+        let result = check_text(
+            "declare let x: string | number;\nif (typeof x === \"string\") {\nconst a: string = x;\n} else {\nconst f = () => { const y: string = x; };\n}\n",
+        );
+        assert!(
+            checker_codes(&result).contains(&TYPE_NOT_ASSIGNABLE.as_str()),
+            "expected x to remain string | number in the else-branch arrow: {}",
+            checker_codes(&result).join(", ")
+        );
+    }
+
+    #[test]
+    fn const_narrowing_passes_through_function_declaration() {
+        // A `const` binding narrowed before a function declaration: the
+        // function body should see the narrowed type because `const` cannot be
+        // reassigned. Assigning `x` (narrowed to `string`) to `number` inside
+        // the function must error.
+        let result = check_text(
+            "declare const x: string | number;\nif (typeof x !== \"string\") return;\nfunction f() { const y: number = x; }\n",
+        );
+        assert!(
+            checker_codes(&result).contains(&TYPE_NOT_ASSIGNABLE.as_str()),
+            "expected x to be narrowed to string inside f: {}",
+            checker_codes(&result).join(", ")
+        );
+    }
+
+    #[test]
+    fn for_of_array_binding_infers_element_type() {
+        let result = check_text(
+            "declare function takesNumber(value: number): void;\nfor (const x of [1, 2, 3]) { takesNumber(x); }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "for-of over number array should infer element type number: {}",
+            checker_codes(&result).join(", ")
+        );
+    }
+
+    #[test]
+    fn for_of_string_binding_infers_string_type() {
+        let result = check_text(
+            "declare function takesString(value: string): void;\nfor (const c of 'abc') { takesString(c); }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "for-of over string should infer element type string: {}",
+            checker_codes(&result).join(", ")
+        );
+    }
+
+    #[test]
+    fn for_of_tuple_binding_infers_union_element_type() {
+        let result = check_text(
+            "declare function takesString(value: string): void;\ndeclare function takesNumber(value: number): void;\ndeclare const pair: [string, number];\nfor (const x of pair) { takesString(x); }",
+        );
+        assert!(
+            checker_codes(&result).contains(&super::ARGUMENT_NOT_ASSIGNABLE.as_str()),
+            "for-of over tuple [string, number] should infer union and reject string argument: {}",
+            checker_codes(&result).join(", ")
+        );
+    }
+
+    #[test]
+    fn for_of_annotated_binding_checks_assignability() {
+        let result = check_text("for (const x: string of [1, 2, 3]) { x; }");
+        assert!(
+            checker_codes(&result).contains(&TYPE_NOT_ASSIGNABLE.as_str()),
+            "for-of with string annotation over number array should fail: {}",
+            checker_codes(&result).join(", ")
+        );
+    }
+    // ---- object-literal spread ------------------------------------------------
+
+    #[test]
+    fn object_spread_properties_exist_with_precise_types() {
+        let result = check_text("const o = { ...{ x: 1 } }; const x: number = o.x;");
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{}",
+            checker_codes(&result).join(", ")
+        );
+    }
+
+    #[test]
+    fn object_spread_assignment_to_typed_target_requires_merged_properties() {
+        // Public regression: old behavior ignored the spread and typed the
+        // literal as `{}`, so assigning to `{ x: number }` failed.
+        let result = check_text("const o: { x: number } = { ...{ x: 1 } };");
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{}",
+            checker_codes(&result).join(", ")
+        );
+    }
+
+    #[test]
+    fn object_spread_later_explicit_property_overrides_earlier_spread() {
+        // The later explicit `y: 'a'` overwrites the spread `y: 2`; the
+        // spread-only `x` must still be present.
+        let result = check_text(
+            "const o = { ...{ x: 1, y: 2 }, y: 'a' }; const x: number = o.x; const y: string = o.y;",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{}",
+            checker_codes(&result).join(", ")
+        );
+    }
+
+    #[test]
+    fn object_spread_later_spread_overrides_earlier_spread() {
+        let result = check_text(
+            "const o = { ...{ x: 1, y: 2 }, ...{ y: 'a' } }; const x: number = o.x; const y: string = o.y;",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{}",
+            checker_codes(&result).join(", ")
+        );
+    }
+
+    #[test]
+    fn object_spread_preserves_optional_and_clears_readonly_for_fresh_object() {
+        let result = check_text("declare const a: { readonly x?: number }; const o = { ...a };");
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{}",
+            checker_codes(&result).join(", ")
+        );
+        let model = result.product();
+        let symbol = model
+            .lookup_value(model.module_scope(), "o")
+            .expect("o binding");
+        let Type::ObjectType(object) = model.types().get(model.symbol_type(symbol)) else {
+            panic!("o is an object type")
+        };
+        let x = object
+            .properties
+            .iter()
+            .find(|property| property.name() == "x")
+            .expect("x property from spread");
+        assert!(x.optional(), "optional is preserved from the spread source");
+        assert!(!x.readonly(), "fresh object properties are not readonly");
+        assert_eq!(model.types().get(x.type_id()), &Type::Number);
+    }
+
+    #[test]
+    fn object_spread_of_non_object_is_silent_and_does_not_fallback_to_any() {
+        // The checker has no boundary for non-object spread, so this is silent.
+        let result = check_text("const o = { ...1 };");
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{}",
+            checker_codes(&result).join(", ")
+        );
+    }
+
+    #[test]
+    fn as_assertion_rejects_unrelated_types() {
+        let result = check_text("const x: string = 1 as string;");
+        assert_eq!(checker_codes(&result), [TYPE_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    #[test]
+    fn angle_bracket_assertion_rejects_unrelated_types() {
+        let result = check_text("const x: string = <string>1;");
+        assert_eq!(checker_codes(&result), [TYPE_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    #[test]
+    fn as_unknown_bridge_is_allowed() {
+        let result = check_text("const x: string = 1 as unknown as string;");
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
+    }
+
+    #[test]
+    fn angle_bracket_unknown_bridge_is_allowed() {
+        let result = check_text("const x: string = <string><unknown>1;");
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
+    }
+
+    #[test]
+    fn overlapping_structural_assertions_are_allowed() {
+        let result = check_text("const x: number = ({ a: 1, b: 2 } as { a: number }).a;");
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
+    }
+
+    #[test]
+    fn as_const_assertions_skip_compatibility_check() {
+        let result = check_text("const t = [1, 2] as const;");
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
+    }
+
+    #[test]
+    fn indexed_access_string_literal_key_resolves_property_type() {
+        let result = check_text(
+            "type Obj = { a: number; b: string };\
+             let x: Obj[\"a\"] = 1;",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "indexed access with valid key should not error: {:?}",
+            checker_codes(&result)
+        );
+        let model = result.product();
+        let x = model
+            .lookup_value(model.module_scope(), "x")
+            .expect("x binding");
+        assert_eq!(
+            model.symbol_type(x),
+            model.types().number(),
+            "Obj[\"a\"] should resolve to number"
+        );
+    }
+
+    #[test]
+    fn generic_inference_widens_only_unconstrained_primitive_candidates() {
+        let result = check_text(
+            "declare function infer<T>(value: T): T;\
+             declare function preserve<T extends string>(value: T): T;\
+             type Input = 'a' | 'b';\
+             declare function input(): Input;\
+             const declaredUnion: Input = infer(input());\
+             const widened = infer(1);\
+             const exact: 'x' = preserve('x');\
+             class Box<T> {\
+               readonly kind = 'box';\
+               readonly value: T;\
+               constructor(value: T) { this.value = value; }\
+             }\
+             function make<T>(value: T): { readonly kind: 'box'; readonly value: T } {\
+               return new Box(value);\
+             }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+        let widened = result
+            .product()
+            .lookup_value(result.product().module_scope(), "widened")
+            .expect("widened binding exists");
+        assert_eq!(
+            result.product().symbol_type(widened),
+            result.product().types().number()
+        );
+    }
+
+    #[test]
+    fn tagged_template_with_callable_tag_returns_signature_type() {
+        let result = check_text(
+            "function tag(strings: string[], ...values: number[]): string { return ''; }\
+             const s: string = tag`count: ${1 + 2}`;",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{}",
+            checker_codes(&result).join(", ")
+        );
+    }
+
+    #[test]
+    fn tagged_template_with_non_callable_tag_emits_not_callable() {
+        let result = check_text("const x: number = 1; x`hello`;");
+        assert_eq!(checker_codes(&result), [EXPRESSION_NOT_CALLABLE.as_str()]);
+    }
+
+    #[test]
+    fn tagged_template_argument_type_mismatch_is_reported() {
+        let result = check_text(
+            "function tag(strings: string[], ...values: number[]): string { return ''; }\
+             const s = tag`count: ${'not a number'}`;",
+        );
+        assert!(
+            checker_codes(&result).contains(&ARGUMENT_NOT_ASSIGNABLE.as_str()),
+            "{:?}",
+            checker_codes(&result)
+        );
+    }
+
+    #[test]
+    fn untagged_template_literal_is_string() {
+        let result = check_text("const s: string = `hello ${1 + 2}`;");
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{}",
+            checker_codes(&result).join(", ")
+        );
+    }
+
+    #[test]
+    fn rest_parameter_annotation_requires_array_or_tuple() {
+        let invalid = check_text(
+            "function f(...x: number) {}\
+            declare function g(...x: number): void;\
+            type H = (...x: number) => void;",
+        );
+        assert_eq!(
+            checker_codes(&invalid),
+            ["BAMTS-C004", "BAMTS-C004", "BAMTS-C004"]
+        );
+
+        let valid = check_text(
+            "declare function f(...x: number[]): void;\
+            declare function g(...x: [number, string]): void;\
+            declare function h(...x: [number, ...string[]]): void;\
+            type T = (...x: number[]) => void;",
+        );
+        assert!(checker_codes(&valid).is_empty());
+    }
+
+    #[test]
+    fn qualified_typeof_resolves_value_and_class_static_property_paths() {
+        let result = check_text(
+            "const obj = { x: 1, nested: { y: \"ok\" } };\
+             let a: typeof obj.x = 1;\
+             let b: typeof obj.nested.y = \"ok\";\
+             class C { static x = 1; }\
+             let c: typeof C.x = 1;\
+             class D { x = 1; }\
+             let d: typeof D.prototype.x = 1;\
+             namespace N { export const V = 1; }\
+             let e: typeof N.V = 1;",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+
+        let model = result.product();
+
+        let a = model.lookup_value(model.module_scope(), "a").expect("a");
+        assert_eq!(model.symbol_type(a), model.types().number());
+
+        let b = model.lookup_value(model.module_scope(), "b").expect("b");
+        assert_eq!(model.symbol_type(b), model.types().string());
+
+        let c = model.lookup_value(model.module_scope(), "c").expect("c");
+        assert_eq!(model.symbol_type(c), model.types().number());
+
+        let d = model.lookup_value(model.module_scope(), "d").expect("d");
+        assert_eq!(model.symbol_type(d), model.types().number());
+
+        let e = model.lookup_value(model.module_scope(), "e").expect("e");
+        assert_eq!(model.symbol_type(e), model.types().number());
+    }
+
+    #[test]
+    fn qualified_typeof_reports_missing_property() {
+        let result = check_text("const obj = { a: 1 }; let bad: typeof obj.missing = 1;");
+        assert_eq!(checker_codes(&result), [PROPERTY_DOES_NOT_EXIST.as_str()]);
+
+        let model = result.product();
+        let bad = model
+            .lookup_value(model.module_scope(), "bad")
+            .expect("bad");
+        assert_eq!(model.symbol_type(bad), model.types().error_type());
+    }
+
+    #[test]
+    fn self_recursive_interface_property_lookup_terminates() {
+        let result = check_text(
+            "interface Node { next: Node; value: number; }\
+             declare const n: Node;\
+             const next: Node = n.next;\
+             const value: number = n.value;",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn class_member_access_inside_declaring_class_is_allowed() {
+        let result = check_text(
+            "class Base {\
+                 private instancePrivate = 1; protected instanceProtected = 2;\
+                 private static staticPrivate = 3; protected static staticProtected = 4;\
+                 read(other: Base): number {\
+                     return other.instancePrivate + other.instanceProtected\
+                         + Base.staticPrivate + Base.staticProtected;\
+                 }\
+             }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn derived_class_can_access_protected_instance_and_static_members() {
+        let result = check_text(
+            "class Base { protected instanceValue = 1; protected static staticValue = 2; }\
+             class Middle extends Base {}\
+             class Derived extends Middle {\
+                 read(): number { return this.instanceValue + Base.staticValue; }\
+             }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn derived_class_cannot_access_private_instance_or_static_members() {
+        let result = check_text(
+            "class Base { private instanceValue = 1; private static staticValue = 2; }\
+             class Derived extends Base {\
+                 read(): number { return this.instanceValue + Base.staticValue; }\
+             }",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C063", "BAMTS-C063"]);
+    }
+
+    #[test]
+    fn outside_code_cannot_access_non_public_instance_or_static_members() {
+        let result = check_text(
+            "class Base { protected instanceValue = 1; private static staticValue = 2; }\
+             new Base().instanceValue; Base.staticValue;",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C063", "BAMTS-C063"]);
+    }
+
+    #[test]
+    fn unrelated_class_cannot_access_protected_or_private_members() {
+        let result = check_text(
+            "class Base { protected instanceValue = 1; protected static staticValue = 2; }\
+             class Unrelated {\
+                 read(base: Base): number { return base.instanceValue + Base.staticValue; }\
+             }",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C063", "BAMTS-C063"]);
+    }
+
+    #[test]
+    fn public_class_members_and_object_literals_remain_structural() {
+        let result = check_text(
+            "class PublicShape { value = 1; static label = 'class'; }\
+             const structural: PublicShape = { value: 2 };\
+             const value: number = structural.value;\
+             const label: string = PublicShape.label;",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn const_bindings_reject_reassignment() {
+        let result = check_text("const value: number = 1; value = 2;");
+        assert_eq!(checker_codes(&result), ["BAMTS-C060"]);
+    }
+
+    #[test]
+    fn const_object_bindings_allow_property_mutation() {
+        let result = check_text("const value = { count: 1 }; value.count = 2;");
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn satisfies_rejects_incompatible_source_type() {
+        let result = check_text("const value = 1 satisfies string;");
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn satisfies_preserves_source_type() {
+        let result =
+            check_text("const value = \"a\" satisfies string; const exact: \"a\" = value;");
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn self_recursive_interface_object_literal_assignment() {
+        let result = check_text(
+            "interface Node { next: Node; value: number; }\
+             declare const base: Node;\
+             const n: Node = { next: base, value: 1 };",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn self_recursive_interface_exact_member_type_rejects_mismatch() {
+        let result = check_text(
+            "interface Node { next: Node; value: number; }\
+             declare const n: Node;\
+             const wrong: string = n.next.next.value;",
+        );
+        assert_eq!(checker_codes(&result), [TYPE_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    #[test]
+    fn mutual_recursive_interface_property_lookup_terminates() {
+        let result = check_text(
+            "interface A { b: B; }\
+             interface B { a: A; value: string; }\
+             declare const a: A;\
+             const b: B = a.b;\
+             const a2: A = b.a;",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn mutual_recursive_interface_object_literal_assignment() {
+        let result = check_text(
+            "interface A { b: B; }\
+             interface B { a: A; value: string; }\
+             declare const base: A;\
+             const a: A = { b: { a: base, value: 'ok' } };",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn mutual_recursive_interface_rejects_incompatible_concrete_leaf() {
+        let result = check_text(
+            "interface A { b: B; }\
+             interface B { a: A; value: string; }\
+             declare const base: A;\
+             const a: A = { b: { a: base, value: 1 } };",
+        );
+        assert_eq!(checker_codes(&result), [TYPE_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    #[test]
+    fn unrelated_class_cannot_access_non_public_instance_or_static_members() {
+        let result = check_text(
+            "class Base { protected instanceValue = 1; protected static staticValue = 2; }\
+             class Unrelated {\
+                 read(base: Base): number { return base.instanceValue + Base.staticValue; }\
+             }",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C063", "BAMTS-C063"]);
+    }
+
+    #[test]
+    fn parameter_defaults_are_checked_against_annotations() {
+        let invalid = check_text("function f(value: string = 1) {}");
+        assert_eq!(checker_codes(&invalid), ["BAMTS-C004"]);
+
+        let valid = check_text("function f(value: string = \"ok\") {}");
+        assert!(checker_codes(&valid).is_empty());
+    }
+
+    #[test]
+    fn unannotated_parameter_defaults_contribute_signature_types() {
+        let result = check_text("function f(value = 1) {} f(\"wrong\");");
+        assert_eq!(checker_codes(&result), ["BAMTS-C053"]);
+    }
+
+    #[test]
+    fn annotated_returns_reject_incompatible_values_and_bare_returns() {
+        let value = check_text("function text(): string { return 1; }");
+        assert_eq!(checker_codes(&value), ["BAMTS-C004"]);
+
+        let bare = check_text("function text(): string { return; }");
+        assert_eq!(checker_codes(&bare), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn annotated_arrow_returns_are_validated() {
+        let result = check_text("const text = (): string => 1;");
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn inferred_async_returns_preserve_promise_value_types() {
+        let function = check_text(
+            "async function value() { return 1; }\
+             const valid: Promise<number> = value();\
+             const invalid: Promise<string> = value();",
+        );
+        assert_eq!(checker_codes(&function), ["BAMTS-C004"]);
+
+        let arrow = check_text(
+            "const value = async () => \"ok\";\
+             const invalid: Promise<number> = value();",
+        );
+        assert_eq!(checker_codes(&arrow), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn compatibility_block_arrows_preserve_return_types() {
+        let result = check_text(
+            "declare function accepts(callback: () => string): void;\
+             function outer(): number {\
+               accepts(() => { return 'ok'; });\
+               return 1;\
+             }\
+             type Debounced<R> = (() => Promise<R>) & {\
+               flush: () => Promise<R> | undefined;\
+             };\
+             declare const condition: boolean;\
+             declare function make<R>(): Promise<R>;\
+             function install<R>(debounced: Debounced<R>) {\
+               debounced.flush = () => {\
+                 if (condition) return;\
+                 return make<R>();\
+               };\
+             }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
+    }
+
+    #[test]
+    fn compatibility_bare_returns_accept_nullish_union_members() {
+        let result = check_text(
+            "function maybe(): number | undefined { return; }\
+             function optional(): number | void { return; }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn compatibility_nullish_assignment_excludes_nullish_result() {
+        let result = check_text(
+            "type Task = () => void;\
+             let task: Task | undefined;\
+             (task ??= () => {})();",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn compatibility_contextual_arrays_preserve_tuple_targets() {
+        let valid = check_text(
+            "const values: [string, unknown][] = [['x', { x: 1 }]];\
+             function tuple(): [string, number] | undefined { return ['x', 1]; }\
+             const callback = (): [number, string] => [1, 'x'];",
+        );
+        assert!(
+            checker_codes(&valid).is_empty(),
+            "{:?}",
+            checker_codes(&valid)
+        );
+
+        let invalid = check_text("const values: [string, number][] = [['x', 'wrong']];");
+        assert_eq!(checker_codes(&invalid), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn compatibility_readonly_class_properties_preserve_literal_discriminants() {
+        let result = check_text(
+            "interface Result { readonly ok: false; }\
+             class Failure implements Result { readonly ok = false; }\
+             function failure(): Result { return new Failure(); }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn compatibility_contextual_objects_preserve_literal_discriminants() {
+        let valid = check_text(
+            "interface Success { readonly ok: true; value: number; }\
+             function success(value: number): Success { return { ok: true, value }; }\
+             declare const condition: boolean;\
+             function maybe(value: number): Success | undefined {\
+               return condition ? { ok: true, value } : undefined;\
+             }",
+        );
+        assert!(checker_codes(&valid).is_empty());
+
+        let invalid = check_text(
+            "interface Success { readonly ok: true; value: number; }\
+             function failure(): Success { return { ok: true, value: 'wrong' }; }",
+        );
+        assert_eq!(checker_codes(&invalid), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn unknown_expression_is_not_callable() {
+        let result = check_text("declare const value: unknown; value();");
+        assert_eq!(checker_codes(&result), ["BAMTS-C055"]);
+    }
+
+    #[test]
+    fn generic_constraints_reject_incompatible_arguments() {
+        let result = check_text(
+            "function identity<T extends string>(value: T): T { return value; }\
+             identity(1);",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C053"]);
+    }
+
+    #[test]
+    fn generic_defaults_supply_missing_inference_candidates() {
+        let result = check_text(
+            "declare function value<T = string>(): T;\
+             const valid: string = value();\
+             const invalid: number = value();",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn nested_generic_parameters_remain_locally_quantified() {
+        let result = check_text(
+            "declare function apply<T>(callback: <U>(value: U) => T): T;\
+             const text: string = apply(<V>(value: V): string => \"ok\");",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn explicit_type_arguments_reject_missing_required_and_excess_arguments() {
+        let missing =
+            check_text("function pair<T, U>(left: T, right: U): void {} pair<number>(1, \"x\");");
+        assert_eq!(checker_codes(&missing), ["BAMTS-C054"]);
+
+        let excess = check_text(
+            "function identity<T>(value: T): T { return value; } identity<number, string>(1);",
+        );
+        assert_eq!(checker_codes(&excess), ["BAMTS-C054"]);
+    }
+
+    #[test]
+    fn explicit_type_arguments_allow_omitted_trailing_defaults() {
+        let result = check_text(
+            "function choose<T, U = string>(left: T, right: U): U { return right; }\
+             const text: string = choose<number>(1, \"ok\");",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn compatibility_constrained_type_parameters_remain_callable() {
+        let result = check_text(
+            "function invoke<T extends (value: number) => string>(callback: T) {\
+               const value: string = callback(1);\
+             }\
+             interface Constructor { new(value: number): { value: number }; }\
+             function build<T extends Constructor>(constructor: T) {\
+               const value: { value: number } = new constructor(1);\
+             }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn compatibility_generic_alias_defaults_apply_without_arguments() {
+        let result = check_text(
+            "type Matcher<Input = unknown> = (value: Input) => void;\
+             declare const matcher: Matcher;\
+             declare const value: unknown;\
+             matcher(value);",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn constrained_generic_signatures_respect_constraint_variance() {
+        let result = check_text(
+            "type Wide = <T extends string>(value: T) => T;\
+             type Same = <U extends string>(value: U) => U;\
+             type Narrow = <T extends 'x'>(value: T) => T;\
+             declare const wide: Wide;\
+             declare const same: Same;\
+             declare const narrow: Narrow;\
+             const renamed: Wide = same;\
+             const acceptsNarrowCalls: Narrow = wide;\
+             const rejectsWideCalls: Wide = narrow;",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn union_calls_validate_each_constituent_and_preserve_return_types() {
+        let valid = check_text(
+            "declare const value: ((input: number) => string) | ((input: number) => number);\
+             const result: string | number = value(1);",
+        );
+        assert!(checker_codes(&valid).is_empty());
+
+        let wrong_argument = check_text(
+            "declare const value: ((input: number) => string) | ((input: number) => number);\
+             value('wrong');",
+        );
+        assert_eq!(checker_codes(&wrong_argument), ["BAMTS-C053"]);
+
+        let non_callable_member =
+            check_text("declare const value: ((input: number) => string) | number; value(1);");
+        assert_eq!(checker_codes(&non_callable_member), ["BAMTS-C055"]);
+    }
+
+    #[test]
+    fn spread_calls_expand_tuples_and_retain_array_rest_returns() {
+        let valid = check_text(
+            "declare function pair(left: number, right: string): boolean;\
+             declare const tuple: [number, string];\
+             const paired: boolean = pair(...tuple);\
+             declare function sum(...values: number[]): number;\
+             declare const values: number[];\
+             const total: number = sum(...values);",
+        );
+        assert!(checker_codes(&valid).is_empty());
+
+        let invalid = check_text(
+            "declare function pair(left: number, right: string): boolean;\
+             declare const tuple: [string, number]; pair(...tuple);",
+        );
+        assert_eq!(checker_codes(&invalid), ["BAMTS-C053", "BAMTS-C053"]);
+    }
+
+    #[test]
+    fn overload_calls_use_only_exposed_signatures() {
+        let valid = check_text(
+            "function choose(value: string): string;\
+             function choose(value: number): number;\
+             function choose(value: string | number): string | number { return value; }\
+             const text: string = choose('x');\
+             const count: number = choose(1);",
+        );
+        assert!(checker_codes(&valid).is_empty());
+
+        let implementation_only = check_text(
+            "function choose(value: string): string;\
+             function choose(value: string | number): string { return ''; }\
+             choose(1);",
+        );
+        assert_eq!(checker_codes(&implementation_only), ["BAMTS-C053"]);
+    }
+
+    #[test]
+    fn numeric_operator_results_reject_string_annotations() {
+        let result = check_text(
+            "let count = 1;\
+             const subtraction: string = 1 - 2;\
+             const update: string = count++;",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004", "BAMTS-C004"]);
+    }
+
+    #[test]
+    fn representative_operator_results_have_concrete_types() {
+        let result = check_text(
+            "let count = 1;\
+             const subtraction: number = 1 - 2;\
+             const update: number = count++;\
+             const comparison: boolean = 1 < 2;\
+             const concatenation: string = \"x\" + 1;\
+             const kind: string = typeof count;\
+             const ignored: undefined = void count;\
+             const sequence: number = (count, 2);",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn compatibility_addition_with_any_preserves_any() {
+        let result = check_text(
+            "declare const dynamic: any;\
+             const value: string = dynamic + 1;",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn interface_call_signatures_drive_argument_and_return_types() {
+        let valid = check_text(
+            "interface Callable { (value: number): string; }\
+             declare const callable: Callable;\
+             const result: string = callable(1);",
+        );
+        assert!(checker_codes(&valid).is_empty());
+
+        let invalid = check_text(
+            "interface Callable { (value: number): string; }\
+             declare const callable: Callable; callable('wrong');",
+        );
+        assert_eq!(checker_codes(&invalid), ["BAMTS-C053"]);
+    }
+
+    #[test]
+    fn structural_relations_require_call_and_construct_signatures() {
+        let result = check_text(
+            "declare const value: {};\
+             const callable: { (): string } = value;\
+             const constructable: { new (): {} } = value;",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004", "BAMTS-C004"]);
+    }
+
+    #[test]
+    fn intersection_relations_preserve_signature_and_index_requirements() {
+        let result = check_text(
+            "declare const value: { a: string } & { b: number };\
+             const callable: { (): void } = value;\
+             const constructable: { new (): {} } = value;\
+             const dictionary: { [key: string]: number } = value;",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            ["BAMTS-C004", "BAMTS-C004", "BAMTS-C004"]
+        );
+    }
+
+    #[test]
+    fn destructuring_validates_annotations_and_projects_leaf_types() {
+        let mismatch = check_text("const { x }: { x: string } = { x: 1 };");
+        assert_eq!(checker_codes(&mismatch), ["BAMTS-C004"]);
+
+        let projected = check_text(
+            "const { nested: { value } } = { nested: { value: 1 } };\
+             const text: string = value;",
+        );
+        assert_eq!(checker_codes(&projected), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn tuple_types_preserve_positional_element_types() {
+        let result = check_text(
+            "declare const tuple: [string, number];\
+             const first: string = tuple[0];\
+             const second: number = tuple[1];\
+             const wrong: string = tuple[1];",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn tuple_types_reject_out_of_range_member_access() {
+        let result = check_text("declare const tuple: [string]; tuple[1];");
+        assert_eq!(checker_codes(&result), ["BAMTS-C057"]);
+    }
+
+    #[test]
+    fn index_signatures_supply_member_types_and_readonly_rules() {
+        let lookup = check_text(
+            "interface Dictionary { [key: string]: number }\
+             declare const values: Dictionary;\
+             const valid: number = values.answer;\
+             const wrong: string = values.answer;",
+        );
+        assert_eq!(checker_codes(&lookup), ["BAMTS-C004"]);
+
+        let numeric = check_text(
+            "interface Rows { [index: number]: string }\
+             declare const rows: Rows; const row: string = rows[0];",
+        );
+        assert!(checker_codes(&numeric).is_empty());
+
+        let readonly = check_text(
+            "interface Frozen { readonly [key: string]: number }\
+             declare let values: Frozen; values.answer = 1;",
+        );
+        assert_eq!(checker_codes(&readonly), ["BAMTS-C061"]);
+    }
+
+    #[test]
+    fn index_signature_assignability_respects_key_domains() {
+        let invalid = check_text(
+            "interface Numeric { [key: number]: number }\
+             interface Textual { [key: string]: number }\
+             declare const source: Numeric;\
+             const target: Textual = source;",
+        );
+        assert_eq!(checker_codes(&invalid), ["BAMTS-C004"]);
+
+        let valid = check_text(
+            "interface Textual { [key: string]: number }\
+             interface Numeric { [key: number]: number }\
+             declare const source: Textual;\
+             const target: Numeric = source;",
+        );
+        assert!(checker_codes(&valid).is_empty());
+    }
+
+    #[test]
+    fn tuple_rest_elements_preserve_minimum_arity() {
+        let result = check_text(
+            "type NonEmpty = [number, ...number[]];\
+             const one: NonEmpty = [1];\
+             const many: NonEmpty = [1, 2, 3];\
+             const empty: NonEmpty = [];",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn bindings_preserve_declared_composite_property_types() {
+        let result = check_text(
+            "type Mode = 'strict' | 'loose';\
+             declare function configured(): { mode: Mode };\
+             const config = configured();\
+             const configuredMode: Mode = config.mode;\
+             declare function modes(): Mode[];\
+             const list = modes();\
+             list[0] = 'other';\
+             const first: Mode = list[0];\
+             const fresh = { mode: 'strict' };\
+             fresh.mode = 'loose';\
+             const freshList = ['strict'];\
+             freshList[0] = 'loose';",
+        );
+        assert!(checker_codes(&result).is_empty());
+        let model = result.product();
+        let list = model
+            .lookup_value(model.module_scope(), "list")
+            .expect("list binding exists");
+        let Type::Array(list_element) = model.types().get(model.symbol_type(list)) else {
+            panic!("list is an array");
+        };
+        assert!(matches!(model.types().get(*list_element), Type::Union(_)));
+        let fresh_list = model
+            .lookup_value(model.module_scope(), "freshList")
+            .expect("fresh list binding exists");
+        let Type::Array(fresh_element) = model.types().get(model.symbol_type(fresh_list)) else {
+            panic!("fresh list is an array");
+        };
+        assert_eq!(*fresh_element, model.types().string());
+    }
+
+    #[test]
+    fn intersection_types_merge_members_and_require_every_target() {
+        let members = check_text(
+            "type Both = { left: string } & { right: number };\
+             declare const both: Both;\
+             const left: string = both.left;\
+             const right: number = both.right;\
+             const wrong: string = both.right;",
+        );
+        assert_eq!(checker_codes(&members), ["BAMTS-C004"]);
+
+        let assignment = check_text(
+            "type Both = { left: string } & { right: number };\
+             const incomplete: Both = { left: \"ok\" };",
+        );
+        assert_eq!(checker_codes(&assignment), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn class_static_and_instance_members_are_separate() {
+        let valid = check_text(
+            "class Item {\
+                 static count: number = 1; value: string = 'x';\
+                 static getCount(): number { return this.count; }\
+                 getValue(): string { return this.value; }\
+             }\
+             const count: number = Item.getCount();\
+             const value: string = new Item().getValue();",
+        );
+        assert!(checker_codes(&valid).is_empty());
+
+        let invalid = check_text(
+            "class Item { static count: number = 1; value: string = 'x'; }\
+             Item.value; new Item().count;\
+             let typed: Item = new Item(); typed.count; typed.prototype;",
+        );
+        assert_eq!(
+            checker_codes(&invalid),
+            ["BAMTS-C057", "BAMTS-C057", "BAMTS-C057", "BAMTS-C057"]
+        );
+    }
+
+    #[test]
+    fn class_methods_preserve_inferred_return_types() {
+        let result = check_text(
+            "class Counter {\
+                 value() { return 1; }\
+                 useValue() { const value: number = this.value(); return value; }\
+             }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
+    }
+
+    #[test]
+    fn generic_class_construction_instantiates_instance_members() {
+        let valid = check_text(
+            "class Box<T> { constructor(public value: T) {} }\
+             const explicit: string = new Box<string>('x').value;\
+             const inferred: number = new Box(1).value;",
+        );
+        assert!(checker_codes(&valid).is_empty());
+
+        let wrong_type = check_text(
+            "class Box<T> { constructor(public value: T) {} }\
+             new Box<number>('wrong');",
+        );
+        assert_eq!(checker_codes(&wrong_type), ["BAMTS-C053"]);
+
+        let wrong_count = check_text("class Box<T> { constructor(public value: T) {} } new Box();");
+        assert_eq!(checker_codes(&wrong_count), ["BAMTS-C054"]);
+    }
+
+    #[test]
+    fn applied_generic_classes_relate_through_substituted_public_shapes() {
+        let public = check_text(
+            "declare class A<T> { value: T; }\
+             declare class B<T> { value: T; }\
+             declare const source: B<number>;\
+             const target: A<number> = source;",
+        );
+        assert!(
+            checker_codes(&public).is_empty(),
+            "{:?}",
+            checker_codes(&public)
+        );
+
+        let recursive = check_text(
+            "declare class Box<T> { value: T; next: Box<T>; }\
+             declare const literal: Box<1>;\
+             const widened: Box<number> = literal;",
+        );
+        assert!(
+            checker_codes(&recursive).is_empty(),
+            "{:?}",
+            checker_codes(&recursive)
+        );
+
+        let incompatible = check_text(
+            "declare class A<T> { value: T; }\
+             declare class B<T> { value: T; }\
+             declare const source: B<number>;\
+             const wrong: A<string> = source;\
+             declare class Box<T> { value: T; next: Box<T>; }\
+             declare const widened: Box<number>;\
+             const narrow: Box<1> = widened;",
+        );
+        assert_eq!(checker_codes(&incompatible), ["BAMTS-C004", "BAMTS-C004"]);
+    }
+
+    #[test]
+    fn inherited_generic_constructor_uses_heritage_arguments() {
+        let result = check_text(
+            "class Base<T> { constructor(value: T) {} }\
+             class Derived extends Base<string> {}\
+             new Derived('ok'); new Derived(1);",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C053"]);
+    }
+
+    #[test]
+    fn construction_requires_construct_signatures() {
+        let non_constructable = check_text("const value = 1; new value();");
+        assert_eq!(checker_codes(&non_constructable), ["BAMTS-C059"]);
+
+        let valid = check_text(
+            "interface Factory { new (value: number): { value: number }; }\
+             declare const Factory: Factory;\
+             const value: number = new Factory(1).value;",
+        );
+        assert!(checker_codes(&valid).is_empty());
+
+        let wrong_argument = check_text(
+            "interface Factory { new (value: number): { value: number }; }\
+             declare const Factory: Factory; new Factory('wrong');",
+        );
+        assert_eq!(checker_codes(&wrong_argument), ["BAMTS-C053"]);
+    }
+
+    #[test]
+    fn class_construction_exposes_overloads_and_inherited_parameters() {
+        let overloads = check_text(
+            "class Choice {\
+                 constructor(value: string); constructor(value: number);\
+                 constructor(value: string | number) {}\
+             }\
+             new Choice('x'); new Choice(1); new Choice(true);",
+        );
+        assert_eq!(checker_codes(&overloads), ["BAMTS-C053"]);
+
+        let inherited = check_text(
+            "class Base { constructor(value: string) {} }\
+             class Derived extends Base {}\
+             new Derived('x'); new Derived(1);",
+        );
+        assert_eq!(checker_codes(&inherited), ["BAMTS-C053"]);
+    }
+
+    #[test]
+    fn implements_checks_final_inferred_property_types() {
+        let invalid = check_text(
+            "interface Named { name: string } class Item implements Named { name = 1; }",
+        );
+        assert_eq!(checker_codes(&invalid), ["BAMTS-C004"]);
+
+        let valid = check_text(
+            "interface Named { name: string } class Item implements Named { name = 'ok'; }",
+        );
+        assert!(checker_codes(&valid).is_empty());
+    }
+
+    #[test]
+    fn readonly_and_getter_only_properties_reject_writes() {
+        let getter = check_text("const value = { get x() { return 1; } }; value.x = 2;");
+        assert_eq!(checker_codes(&getter), ["BAMTS-C061"]);
+
+        let declared =
+            check_text("interface Item { readonly x: number } declare let item: Item; item.x = 2;");
+        assert_eq!(checker_codes(&declared), ["BAMTS-C061"]);
+    }
+
+    #[test]
+    fn getter_setter_pairs_allow_writes() {
+        let result = check_text(
+            "const value = { get x() { return 1; }, set x(next: number) {} }; value.x = 2;",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn class_readonly_properties_allow_only_constructor_initialization() {
+        let outside = check_text(
+            "class Item { readonly x: number; constructor() { this.x = 1; } }\
+             const item = new Item(); item.x = 2;",
+        );
+        assert_eq!(checker_codes(&outside), ["BAMTS-C061"]);
+
+        let constructor =
+            check_text("class Item { readonly x: number; constructor() { this.x = 1; } }");
+        assert!(checker_codes(&constructor).is_empty());
+    }
+
+    #[test]
+    fn readonly_parameter_properties_allow_only_constructor_initialization() {
+        let constructor =
+            check_text("class Item { constructor(readonly x: number) { this.x = 1; } }");
+        assert!(checker_codes(&constructor).is_empty());
+
+        let outside = check_text(
+            "class Item { constructor(readonly x: number) { this.x = 1; } }\
+             const item = new Item(0); item.x = 2;",
+        );
+        assert_eq!(checker_codes(&outside), ["BAMTS-C061"]);
+    }
+
+    #[test]
+    fn class_getter_only_properties_reject_writes() {
+        let outside = check_text("class Item { get x(): number { return 1; } } new Item().x = 2;");
+        assert_eq!(checker_codes(&outside), ["BAMTS-C061"]);
+
+        let constructor = check_text(
+            "class Item { get x(): number { return 1; } constructor() { this.x = 2; } }",
+        );
+        assert_eq!(checker_codes(&constructor), ["BAMTS-C061"]);
+    }
+
+    #[test]
+    fn inherited_readonly_properties_reject_constructor_writes() {
+        let result = check_text(
+            "class Base { readonly x = 1; }\
+             class Derived extends Base { constructor() { super(); this.x = 2; } }",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C061"]);
+    }
+
+    #[test]
+    fn nested_functions_cannot_initialize_readonly_properties() {
+        let result = check_text(
+            "class Item { readonly x = 1; constructor() { const assign = () => { this.x = 2; }; assign(); } }",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C061"]);
+    }
+
+    #[test]
+    fn class_implements_accepts_matching_instance_shape() {
+        let result = check_text(
+            "interface Shape { x: number; label: string }\
+             class Item implements Shape { x: number = 1; label: string = \"item\"; }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn class_implements_rejects_missing_and_incompatible_members() {
+        let missing = check_text(
+            "interface Shape { x: number; label: string }\
+             class Item implements Shape { x: number = 1; }",
+        );
+        assert_eq!(checker_codes(&missing), ["BAMTS-C004"]);
+
+        let incompatible = check_text(
+            "interface Shape { x: number }\
+             class Item implements Shape { x: string = \"wrong\"; }",
+        );
+        assert_eq!(checker_codes(&incompatible), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn generic_subclasses_relate_to_applied_base_types() {
+        let result = check_text(
+            "type Name = 'literal' | 'object';\
+             abstract class Base<Output = unknown> {\
+               abstract readonly name: Name;\
+               abstract parse(value: unknown): Output;\
+             }\
+             class Literal<Output> extends Base<Output> {\
+               readonly name = 'literal';\
+               readonly value: Output;\
+               constructor(value: Output) { super(); this.value = value; }\
+               parse(_value: unknown): Output { return this.value; }\
+             }\
+             const literal = <Value extends string>(value: Value): Base<Value> => {\
+               return new Literal(value);\
+             };\
+             type LazyName = 'lazy' | 'other';\
+             abstract class LazyBase<Output = unknown> {\
+               abstract readonly name: LazyName;\
+               abstract parse(value: unknown): Output;\
+             }\
+             class Lazy<Output> extends LazyBase<Output> {\
+               readonly name = 'lazy';\
+               readonly definition: () => LazyBase<Output>;\
+               constructor(definition: () => LazyBase<Output>) {\
+                 super(); this.definition = definition;\
+               }\
+               parse(value: unknown): Output { return this.definition().parse(value); }\
+             }\
+             const lazy = <Value>(definition: () => LazyBase<Value>): LazyBase<Value> => {\
+               return new Lazy(definition);\
+             };",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn later_generic_class_shape_is_published_before_an_earlier_method() {
+        let result = check_text(
+            "abstract class AbstractType<Output = unknown> {\n\
+                 abstract readonly name: string;\n\
+             }\n\
+             abstract class ValueType<Output = unknown> extends AbstractType<Output> {\n\
+                 abstract readonly name: \"unknown\";\n\
+                 visit(func: (value: Terminal) => void): void {\n\
+                     func(this as Terminal);\n\
+                 }\n\
+             }\n\
+             type Terminal =\n\
+                 | (ValueType & { name: \"unknown\" })\n\
+                 | Optional;\n\
+             class Optional<Output = unknown> extends AbstractType<Output | undefined> {\n\
+                 readonly name = \"optional\";\n\
+             }",
+        );
+
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
+    }
+
+    #[test]
+    fn later_unrelated_generic_class_remains_incompatible() {
+        let result = check_text(
+            "abstract class ValueType<Output = unknown> {\n\
+                 readonly name = \"value\";\n\
+                 check(): void { const impossible = this as Unrelated<number>; }\n\
+             }\n\
+             class Unrelated<T = unknown> {\n\
+                 readonly name = \"unrelated\";\n\
+                 readonly unrelated!: T;\n\
+             }",
+        );
+
+        assert_eq!(checker_codes(&result), [TYPE_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    #[test]
+    fn later_generic_class_literal_discriminant_narrows_an_earlier_function() {
+        let result = check_text(
+            "abstract class Base { abstract readonly name: string; }\n\
+             type Terminal =\n\
+                 | (Base & { readonly name: \"unknown\" | \"never\" | \"string\" })\n\
+                 | LiteralType<number>;\n\
+             function readLiteral(terminal: Terminal): number {\n\
+                 if (terminal.name === \"literal\") return terminal.value;\n\
+                 return 0;\n\
+             }\n\
+             class LiteralType<Out = unknown> extends Base {\n\
+                 readonly name = \"literal\";\n\
+                 readonly value!: Out;\n\
+             }",
+        );
+
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
+    }
+
+    #[test]
+    fn later_generic_class_negative_controls_remain_strict() {
+        let wrong_payload = check_text(
+            "abstract class Base { abstract readonly name: string; }\n\
+             type Terminal =\n\
+                 | (Base & { readonly name: \"unknown\" | \"never\" | \"string\" })\n\
+                 | LiteralType<number>;\n\
+             function wrongPayload(terminal: Terminal): void {\n\
+                 if (terminal.name === \"literal\") {\n\
+                     const wrong: string = terminal.value;\n\
+                 }\n\
+             }\n\
+             class LiteralType<Out = unknown> extends Base {\n\
+                 readonly name = \"literal\";\n\
+                 readonly value!: Out;\n\
+             }",
+        );
+        assert_eq!(
+            checker_codes(&wrong_payload),
+            [TYPE_NOT_ASSIGNABLE.as_str()]
+        );
+
+        let wrong_branch = check_text(
+            "abstract class Base { abstract readonly name: string; }\n\
+             type Terminal =\n\
+                 | (Base & { readonly name: \"unknown\" | \"never\" | \"string\" })\n\
+                 | LiteralType<number>;\n\
+             function wrongBranch(terminal: Terminal): void {\n\
+                 if (terminal.name === \"unknown\") terminal.value;\n\
+             }\n\
+             class LiteralType<Out = unknown> extends Base {\n\
+                 readonly name = \"literal\";\n\
+                 readonly value!: Out;\n\
+             }",
+        );
+        assert_eq!(
+            checker_codes(&wrong_branch),
+            [PROPERTY_DOES_NOT_EXIST.as_str()]
+        );
+    }
+
+    #[test]
+    fn derived_generic_class_views_follow_final_base_shapes() {
+        let result = check_text(
+            "abstract class AbstractType<Output = unknown> {\n\
+                 abstract optional<T>(defaultFn: () => T): Type<Output | T>;\n\
+                 abstract optional(): Optional<Output>;\n\
+                 map<T>(func: (value: Output) => T): Type<T> {\n\
+                     return new TransformType<T>(this);\n\
+                 }\n\
+             }\n\
+             abstract class Type<Output = unknown> extends AbstractType<Output> {\n\
+                 optional<T>(defaultFn: () => T): Type<Output | T>;\n\
+                 optional(): Optional<Output>;\n\
+                 optional(defaultFn?: () => unknown): unknown {\n\
+                     const optional = new Optional<Output>(this);\n\
+                     return new TransformType<Output>(optional);\n\
+                 }\n\
+             }\n\
+             class Optional<Output = unknown> extends AbstractType<Output | undefined> {\n\
+                 constructor(source: Type<Output>) { super(); }\n\
+                 optional<T>(defaultFn: () => T): Type<Output | T>;\n\
+                 optional(): Optional<Output>;\n\
+                 optional(defaultFn?: () => unknown): unknown { return this; }\n\
+             }\n\
+             class TransformType<Output = unknown> extends Type<Output> {\n\
+                 constructor(source: AbstractType<unknown>) { super(); }\n\
+                 check(): void {\n\
+                     const base: AbstractType<unknown> = this;\n\
+                 }\n\
+             }",
+        );
+
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn unrelated_classes_do_not_gain_generic_base_compatibility() {
+        let result = check_text(
+            "abstract class AbstractType<Output = unknown> {\n\
+                 abstract optional<T>(defaultFn: () => T): AbstractType<Output | T>;\n\
+             }\n\
+             class Unrelated {}\n\
+             function accept(value: AbstractType<unknown>): void {}\n\
+             function reject(value: Unrelated): void {\n\
+                 const base: AbstractType<unknown> = value;\n\
+                 accept(value);\n\
+             }",
+        );
+
+        assert_eq!(
+            checker_codes(&result),
+            [
+                TYPE_NOT_ASSIGNABLE.as_str(),
+                ARGUMENT_NOT_ASSIGNABLE.as_str()
+            ]
         );
     }
 }

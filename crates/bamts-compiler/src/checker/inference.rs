@@ -50,8 +50,8 @@
 //! diagnostics can attribute a type argument to its source.
 
 use super::binder::{
-    FunctionParameter, FunctionSignature, IndexSignature, ObjectType, PropertyType, SymbolId, Type,
-    TypeId, TypeTable,
+    FunctionParameter, FunctionSignature, IndexSignature, ObjectType, PropertyType, SymbolId,
+    TupleShape, Type, TypeId, TypeParameterBounds, TypeTable,
 };
 use super::relations::TypeRelations;
 
@@ -224,6 +224,36 @@ impl InferredTypeArguments {
         }
     }
 
+    /// Widens primitive-literal type arguments whose type parameter has no
+    /// `extends` constraint, in place. Constrained parameters and non-literal
+    /// arguments are untouched. The binder calls this after
+    /// [`InferenceContext::resolve`] so the inferred function signature
+    /// matches TypeScript's literal-widening for unconstrained generics
+    /// (`infer(1)` yields `number`), while raw inference preserves literals.
+    pub fn widen_unconstrained_literals(
+        &mut self,
+        table: &mut TypeTable,
+        parameters: &[InferenceParameter],
+    ) {
+        for argument in self.arguments.iter_mut() {
+            let unconstrained = parameters
+                .iter()
+                .find(|parameter| parameter.symbol() == argument.symbol())
+                .is_some_and(|parameter| parameter.constraint().is_none());
+            if unconstrained
+                && matches!(
+                    table.get(argument.type_id),
+                    Type::StringLiteral(_)
+                        | Type::NumberLiteral(_)
+                        | Type::BooleanLiteral(_)
+                        | Type::BigIntLiteral(_)
+                )
+            {
+                argument.type_id = table.widen(argument.type_id, false);
+            }
+        }
+    }
+
     /// The resolved type argument for `symbol`, if it was part of the session.
     #[must_use]
     pub fn get(&self, symbol: SymbolId) -> Option<TypeId> {
@@ -252,12 +282,24 @@ impl InferredTypeArguments {
                 let element = self.instantiate(table, element);
                 table.array(element)
             }
-            Type::Tuple(elements) => {
-                let elements = elements
+            Type::Tuple(shape) => {
+                let prefix = shape
+                    .prefix
                     .iter()
-                    .map(|element| self.instantiate(table, *element))
+                    .map(|&element| self.instantiate(table, element))
                     .collect();
-                table.tuple(elements)
+                let rest = shape.rest.map(|element| self.instantiate(table, element));
+                let suffix = shape
+                    .suffix
+                    .iter()
+                    .map(|&element| self.instantiate(table, element))
+                    .collect();
+                table.tuple_shape(TupleShape {
+                    prefix,
+                    rest,
+                    suffix,
+                    required: shape.required,
+                })
             }
             Type::Union(members) => {
                 let members: Vec<TypeId> = members
@@ -265,6 +307,13 @@ impl InferredTypeArguments {
                     .map(|member| self.instantiate(table, *member))
                     .collect();
                 table.union(&members)
+            }
+            Type::Intersection(members) => {
+                let members = members
+                    .iter()
+                    .map(|member| self.instantiate(table, *member))
+                    .collect();
+                table.intersection_ordered(members)
             }
             Type::ObjectType(object) => {
                 let properties: Vec<PropertyType> = object
@@ -277,6 +326,9 @@ impl InferredTypeArguments {
                             self.instantiate(table, property.type_id()),
                         )
                         .with_readonly(property.readonly())
+                        .with_getter_only(property.getter_only())
+                        .with_accessibility(property.access(), property.declaring_class())
+                        .with_method(property.is_method())
                     })
                     .collect();
                 let call_signatures = object
@@ -288,10 +340,25 @@ impl InferredTypeArguments {
                             signature.type_parameters(),
                             signature,
                         );
-                        let Type::Function(signature) = table.get(type_id).clone() else {
-                            unreachable!("function instantiation must produce a function type");
+                        let Type::Function(signature) = table.get(type_id) else {
+                            unreachable!("function instantiation returns a function type");
                         };
-                        signature
+                        signature.clone()
+                    })
+                    .collect();
+                let construct_signatures = object
+                    .construct_signatures
+                    .iter()
+                    .map(|signature| {
+                        let type_id = self.instantiate_function(
+                            table,
+                            signature.type_parameters(),
+                            signature,
+                        );
+                        let Type::Function(signature) = table.get(type_id) else {
+                            unreachable!("function instantiation returns a function type");
+                        };
+                        signature.clone()
                     })
                     .collect();
                 let index_signatures = object
@@ -317,14 +384,30 @@ impl InferredTypeArguments {
                 table.object_type_with_members(ObjectType {
                     properties,
                     call_signatures,
+                    construct_signatures,
                     index_signatures,
                 })
             }
             Type::Function(signature) => {
                 self.instantiate_function(table, signature.type_parameters(), &signature)
             }
+            Type::AppliedClass { symbol, arguments } => {
+                let arguments = arguments
+                    .iter()
+                    .map(|&argument| self.instantiate(table, argument))
+                    .collect();
+                table.applied_class(symbol, arguments)
+            }
+            Type::Keyof(operand) => {
+                let operand = self.instantiate(table, operand);
+                table.keyof(operand)
+            }
+            Type::IndexedAccess { object, index } => {
+                let object = self.instantiate(table, object);
+                let index = self.instantiate(table, index);
+                table.indexed_access(object, index)
+            }
             Type::Error
-            | Type::Intersection(_)
             | Type::Any
             | Type::Unknown
             | Type::Never
@@ -380,8 +463,30 @@ impl InferredTypeArguments {
                 )
             })
             .collect();
+        let mut bounds = Vec::with_capacity(type_parameters.len());
+        if !type_parameters.is_empty() {
+            debug_assert_eq!(
+                type_parameters.len(),
+                signature.type_parameter_bounds().len()
+            );
+            for bound in signature.type_parameter_bounds() {
+                let constraint = bound
+                    .constraint()
+                    .map(|constraint| self.instantiate(table, constraint));
+                let default = bound
+                    .default()
+                    .map(|default| self.instantiate(table, default));
+                bounds.push(TypeParameterBounds::new(constraint, default));
+            }
+        }
         let return_type = self.instantiate(table, signature.return_type());
-        table.function_with_parameters(type_parameters.to_vec(), parameters, return_type)
+        table.function_with_parameter_bounds(
+            type_parameters.to_vec(),
+            bounds,
+            parameters,
+            return_type,
+            signature.javascript(),
+        )
     }
 }
 
@@ -536,9 +641,121 @@ impl<'table> InferenceContext<'table> {
                 };
                 self.add_candidate(symbol, argument_type, priority, source);
             }
-            Type::Array(element) => {
-                if let Type::Array(argument_element) = self.table.get(argument_type).clone() {
-                    self.infer_types(element, argument_element, false, variance, source);
+            Type::Array(parameter_element) => match self.table.get(argument_type).clone() {
+                Type::Array(argument_element) => {
+                    self.infer_types(parameter_element, argument_element, false, variance, source);
+                }
+                Type::Tuple(argument_shape) => {
+                    let elements = argument_shape.all_element_types();
+                    if !elements.is_empty() {
+                        let unioned = if elements.len() == 1 {
+                            elements[0]
+                        } else {
+                            self.table.union(&elements)
+                        };
+                        self.infer_types(parameter_element, unioned, false, variance, source);
+                    }
+                }
+                _ => {}
+            },
+            Type::Tuple(parameter_shape) => {
+                match self.table.get(argument_type).clone() {
+                    Type::Tuple(argument_shape) => {
+                        // Back suffixes first; they bound how much of the
+                        // argument can be consumed from the front.
+                        let mut back_count = 0;
+                        if parameter_shape.rest.is_some() {
+                            let argument_suffix = if argument_shape.rest.is_some() {
+                                &argument_shape.suffix
+                            } else {
+                                &argument_shape.prefix
+                            };
+                            for (&parameter_element, &argument_element) in parameter_shape
+                                .suffix
+                                .iter()
+                                .rev()
+                                .zip(argument_suffix.iter().rev())
+                            {
+                                self.infer_types(
+                                    parameter_element,
+                                    argument_element,
+                                    false,
+                                    variance,
+                                    source,
+                                );
+                                back_count += 1;
+                            }
+                        }
+
+                        // Front prefix alignment.
+                        let argument_front_available = if argument_shape.rest.is_some() {
+                            argument_shape.prefix.len()
+                        } else {
+                            argument_shape
+                                .max_arity()
+                                .expect("fixed tuple has a maximum arity")
+                                .saturating_sub(back_count)
+                        };
+                        let front_count =
+                            parameter_shape.prefix.len().min(argument_front_available);
+                        for index in 0..front_count {
+                            self.infer_types(
+                                parameter_shape.prefix[index],
+                                argument_shape.prefix[index],
+                                false,
+                                variance,
+                                source,
+                            );
+                        }
+
+                        // Middle union of all argument element types that are
+                        // not consumed by the front/back alignment.
+                        let all_elements = argument_shape.all_element_types();
+                        let start = front_count.min(all_elements.len());
+                        let end = all_elements.len().saturating_sub(back_count);
+                        if start < end {
+                            let middle = if end - start == 1 {
+                                all_elements[start]
+                            } else {
+                                self.table.union(&all_elements[start..end])
+                            };
+
+                            for index in front_count..parameter_shape.prefix.len() {
+                                self.infer_types(
+                                    parameter_shape.prefix[index],
+                                    middle,
+                                    false,
+                                    variance,
+                                    source,
+                                );
+                            }
+                            if let Some(rest) = parameter_shape.rest {
+                                self.infer_types(rest, middle, false, variance, source);
+                            }
+                            for offset in (back_count + 1)..=parameter_shape.suffix.len() {
+                                let suffix_index = parameter_shape.suffix.len() - offset;
+                                self.infer_types(
+                                    parameter_shape.suffix[suffix_index],
+                                    middle,
+                                    false,
+                                    variance,
+                                    source,
+                                );
+                            }
+                        }
+                    }
+                    Type::Array(argument_element) => {
+                        for parameter_element in parameter_shape.all_element_types() {
+                            self.infer_types(
+                                parameter_element,
+                                argument_element,
+                                false,
+                                variance,
+                                source,
+                            );
+                        }
+                    }
+                    _ => {}
                 }
             }
             Type::Union(members) => {
@@ -567,11 +784,59 @@ impl<'table> InferenceContext<'table> {
             }
             Type::Function(signature) => {
                 if let Type::Function(argument_signature) = self.table.get(argument_type).clone() {
-                    for (declared, actual) in signature
-                        .parameters()
-                        .iter()
-                        .zip(argument_signature.parameters())
-                    {
+                    for (actual_index, declared) in signature.parameters().iter().enumerate() {
+                        if declared.rest() {
+                            let actual = &argument_signature.parameters()[actual_index..];
+                            match actual.first() {
+                                Some(first) if first.rest() => {
+                                    self.infer_types(
+                                        declared.type_id(),
+                                        first.type_id(),
+                                        false,
+                                        Variance::Contravariant,
+                                        source,
+                                    );
+                                }
+                                _ if !actual.is_empty() => {
+                                    let rest_index =
+                                        actual.iter().position(FunctionParameter::rest);
+                                    let fixed = rest_index.unwrap_or(actual.len());
+                                    let prefix = actual[..fixed]
+                                        .iter()
+                                        .map(FunctionParameter::type_id)
+                                        .collect::<Vec<_>>();
+                                    let required = actual[..fixed]
+                                        .iter()
+                                        .take_while(|parameter| !parameter.optional())
+                                        .count()
+                                        as u32;
+                                    let rest = rest_index.and_then(|index| {
+                                        match self.table.get(actual[index].type_id()) {
+                                            Type::Array(element) => Some(*element),
+                                            _ => None,
+                                        }
+                                    });
+                                    let tuple = self.table.tuple_shape(TupleShape {
+                                        prefix,
+                                        required,
+                                        rest,
+                                        suffix: Vec::new(),
+                                    });
+                                    self.infer_types(
+                                        declared.type_id(),
+                                        tuple,
+                                        false,
+                                        Variance::Contravariant,
+                                        source,
+                                    );
+                                }
+                                _ => {}
+                            }
+                            break;
+                        }
+                        let Some(actual) = argument_signature.parameters().get(actual_index) else {
+                            break;
+                        };
                         self.infer_types(
                             declared.type_id(),
                             actual.type_id(),
@@ -587,6 +852,27 @@ impl<'table> InferenceContext<'table> {
                         variance,
                         source,
                     );
+                }
+            }
+            Type::AppliedClass { symbol, arguments } => {
+                if let Type::AppliedClass {
+                    symbol: argument_symbol,
+                    arguments: argument_arguments,
+                } = self.table.get(argument_type).clone()
+                    && symbol == argument_symbol
+                    && arguments.len() == argument_arguments.len()
+                {
+                    for (&parameter_argument, &argument_argument) in
+                        arguments.iter().zip(argument_arguments.iter())
+                    {
+                        self.infer_types(
+                            parameter_argument,
+                            argument_argument,
+                            false,
+                            variance,
+                            source,
+                        );
+                    }
                 }
             }
             _ => {}

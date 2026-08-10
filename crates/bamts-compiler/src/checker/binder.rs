@@ -21,46 +21,50 @@ use super::inference::{
 use super::intrinsic_environment::GlobalEnvironment;
 use super::jsx::{JsxCallable, JsxFactorySignature};
 use super::narrowing::{
-    FlowFacts, FlowKey, FlowNodeId, GuardResolver, NarrowingContext, NarrowingGuard,
+    FlowFacts, FlowKey, FlowNodeId, GuardResolver, NarrowingContext, NarrowingGuard, flow_key_of,
 };
 use super::relations::{TypeRelation, TypeRelations};
 use super::{
     ACCESSOR_THIS_PARAMETER, AMBIENT_IMPLEMENTATION, ARGUMENT_COUNT_MISMATCH,
-    ARGUMENT_NOT_ASSIGNABLE, ASSIGNMENT_TO_FUNCTION, ASSIGNMENT_TO_NAMESPACE,
-    AWAIT_USING_DECLARATION_IN_FOR_IN, BARE_SUPER_EXPRESSION, CANNOT_FIND_NAME,
-    CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED,
+    ARGUMENT_NOT_ASSIGNABLE, ASSIGNMENT_TO_CONST, ASSIGNMENT_TO_FUNCTION, ASSIGNMENT_TO_NAMESPACE,
+    ASSIGNMENT_TO_READONLY, AWAIT_USING_DECLARATION_IN_FOR_IN, BARE_SUPER_EXPRESSION,
+    CANNOT_FIND_NAME, CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED,
     CONSTRUCTOR_TYPE_PARAMETERS, DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE,
-    FOR_IN_LEFT_HAND_SIDE_INVALID, FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT,
-    FUNCTION_IMPLEMENTATION_WRONG_NAME, FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION,
-    GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS, IMPORT_CONFLICTS_WITH_LOCAL,
-    INVALID_ASSIGNMENT_TARGET, MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT,
+    EXPRESSION_NOT_CONSTRUCTABLE, FOR_IN_LEFT_HAND_SIDE_INVALID,
+    FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT, FUNCTION_IMPLEMENTATION_WRONG_NAME,
+    FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS,
+    IMPORT_CONFLICTS_WITH_LOCAL, INVALID_ASSIGNMENT_TARGET, INVALID_INDEXED_ACCESS_KEY,
+    MEMBER_NOT_ACCESSIBLE, MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT,
     NEW_TARGET_OUTSIDE_FUNCTION, PARAMETER_DECORATOR_NOT_SUPPORTED, PROPERTY_DOES_NOT_EXIST,
     PROPERTY_NOT_INITIALIZED, SET_ACCESSOR_PARAMETER_INITIALIZER,
-    STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS,
-    SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_REFERENCE_NON_DERIVED, TYPE_NOT_ASSIGNABLE,
-    USED_BEFORE_ASSIGNED, USING_DECLARATION_BINDING_PATTERN, USING_DECLARATION_IN_FOR_IN,
+    STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT, STRICT_NULL_MEMBER_ACCESS,
+    SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
+    SUPER_REFERENCE_NON_DERIVED, TYPE_NOT_ASSIGNABLE, USED_BEFORE_ASSIGNED,
+    USING_DECLARATION_BINDING_PATTERN, USING_DECLARATION_IN_FOR_IN,
     USING_DECLARATION_MISSING_INITIALIZER, WITH_STATEMENT_NOT_ALLOWED,
 };
 use super::{
     ACCESSOR_THIS_PARAMETER_MESSAGE, AMBIENT_IMPLEMENTATION_MESSAGE,
-    ARGUMENT_COUNT_MISMATCH_MESSAGE, ARGUMENT_NOT_ASSIGNABLE_MESSAGE,
+    ARGUMENT_COUNT_MISMATCH_MESSAGE, ARGUMENT_NOT_ASSIGNABLE_MESSAGE, ASSIGNMENT_TO_CONST_MESSAGE,
     ASSIGNMENT_TO_FUNCTION_MESSAGE, ASSIGNMENT_TO_NAMESPACE_MESSAGE,
-    AWAIT_USING_DECLARATION_IN_FOR_IN_MESSAGE, BARE_SUPER_EXPRESSION_MESSAGE,
-    CANNOT_FIND_NAME_MESSAGE, CANNOT_FIND_NAMESPACE_MESSAGE, CANNOT_FIND_TYPE_MESSAGE,
-    CONSTRUCTOR_DECORATOR_NOT_SUPPORTED_MESSAGE, CONSTRUCTOR_TYPE_PARAMETERS_MESSAGE,
-    DUPLICATE_MESSAGE, EXPRESSION_NOT_CALLABLE_MESSAGE, FOR_IN_LEFT_HAND_SIDE_INVALID_MESSAGE,
+    ASSIGNMENT_TO_READONLY_MESSAGE, AWAIT_USING_DECLARATION_IN_FOR_IN_MESSAGE,
+    BARE_SUPER_EXPRESSION_MESSAGE, CANNOT_FIND_NAME_MESSAGE, CANNOT_FIND_NAMESPACE_MESSAGE,
+    CANNOT_FIND_TYPE_MESSAGE, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED_MESSAGE,
+    CONSTRUCTOR_TYPE_PARAMETERS_MESSAGE, DUPLICATE_MESSAGE, EXPRESSION_NOT_CALLABLE_MESSAGE,
+    EXPRESSION_NOT_CONSTRUCTABLE_MESSAGE, FOR_IN_LEFT_HAND_SIDE_INVALID_MESSAGE,
     FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT_MESSAGE, FUNCTION_IMPLEMENTATION_WRONG_NAME_MESSAGE,
     FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION_MESSAGE, GET_ACCESSOR_NO_RETURN_MESSAGE,
     GET_ACCESSOR_PARAMETERS_MESSAGE, IMPORT_CONFLICTS_WITH_LOCAL_MESSAGE,
-    INVALID_ASSIGNMENT_TARGET_MESSAGE, MISSING_METHOD_RETURN_TYPE_MESSAGE,
+    INVALID_ASSIGNMENT_TARGET_MESSAGE, INVALID_INDEXED_ACCESS_KEY_MESSAGE,
+    MEMBER_NOT_ACCESSIBLE_MESSAGE, MISSING_METHOD_RETURN_TYPE_MESSAGE,
     MIXED_EXPORT_ASSIGNMENT_MESSAGE, NEW_TARGET_OUTSIDE_FUNCTION_MESSAGE, NOT_ASSIGNABLE_MESSAGE,
     PARAMETER_DECORATOR_NOT_SUPPORTED_MESSAGE, PROPERTY_DOES_NOT_EXIST_MESSAGE,
     PROPERTY_NOT_INITIALIZED_MESSAGE, SET_ACCESSOR_PARAMETER_INITIALIZER_MESSAGE,
-    STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT_MESSAGE, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE,
-    SUPER_CALL_OUTSIDE_CONSTRUCTOR_MESSAGE, SUPER_REFERENCE_NON_DERIVED_MESSAGE,
-    USED_BEFORE_ASSIGNED_MESSAGE, USING_DECLARATION_BINDING_PATTERN_MESSAGE,
-    USING_DECLARATION_IN_FOR_IN_MESSAGE, USING_DECLARATION_MISSING_INITIALIZER_MESSAGE,
-    WITH_STATEMENT_NOT_ALLOWED_MESSAGE,
+    STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT_MESSAGE, STRICT_NULL_MEMBER_ACCESS_MESSAGE,
+    SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE, SUPER_CALL_OUTSIDE_CONSTRUCTOR_MESSAGE,
+    SUPER_REFERENCE_NON_DERIVED_MESSAGE, USED_BEFORE_ASSIGNED_MESSAGE,
+    USING_DECLARATION_BINDING_PATTERN_MESSAGE, USING_DECLARATION_IN_FOR_IN_MESSAGE,
+    USING_DECLARATION_MISSING_INITIALIZER_MESSAGE, WITH_STATEMENT_NOT_ALLOWED_MESSAGE,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::enum_plan::{self, EnumDeclarationBinding, EnumFacts};
@@ -68,13 +72,16 @@ use crate::literal::string_value;
 use crate::namespace_plan::{self, NamespaceDeclarationBinding, NamespaceFacts};
 use crate::source::{ScriptKind, TextRange};
 use crate::syntax::{
-    ArrayElement, ArrowFunction, AssignmentOperator, AssignmentTarget, BindingPattern,
-    CallArgument, CallExpression, ClassDeclaration, ClassMember, EntityName, Expr, Expression,
-    ForBinding, ForInitializer, FunctionBody, FunctionLike, FunctionType, IdentifierNode,
-    ImportBinding, InterfaceDeclaration, KeywordType, Literal, MemberProperty, MetaProperty,
-    NamespaceName, NodeId, ObjectMember, ParameterNode, PropertyModifier, PropertyName, SourceFile,
-    Statement, Stmt, Token, TokenKind, Ty, TypeAliasDeclaration, TypeAnnotationNode, TypeLiteral,
-    TypeMember, TypeNode, TypeReference, UnaryOperator, VariableDeclaration, VariableKind,
+    Accessibility, ArrayElement, ArrowFunction, AssignmentOperator, AssignmentTarget,
+    BinaryOperator, BindingPattern, CallArgument, CallExpression, ClassDeclaration, ClassMember,
+    ConditionalExpression, DeclarationModifiers, EntityName, Expr, Expression, ForBinding,
+    ForInitializer, ForOfMode, FunctionBody, FunctionLike, FunctionType, IdentifierNode,
+    ImportBinding, InterfaceDeclaration, JsxAttributeInitializer, JsxAttributeItem, JsxChild,
+    KeywordType, Literal, LogicalOperator, MemberProperty, MetaProperty, NamespaceName,
+    NewExpression, NodeId, ObjectLiteral, ObjectMember, ParameterNode, PropertyModifier,
+    PropertyName, SourceFile, Statement, Stmt, Token, TokenKind, Ty, TypeAliasDeclaration,
+    TypeAnnotationNode, TypeLiteral, TypeMember, TypeNode, TypeOperator, TypeReference,
+    UnaryOperator, VariableDeclaration, VariableKind,
 };
 
 /// A lexical scope's identity within a [`SemanticModel`].
@@ -320,12 +327,22 @@ struct HoistedDeclarationIdentity {
 }
 
 /// One member of an interned object type.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct PropertyType {
     name: Box<str>,
     optional: bool,
     readonly: bool,
+    getter_only: bool,
     type_id: TypeId,
+    /// Class member accessibility. Plain object/interface properties are
+    /// always [`Accessibility::Public`] with no declaring class.
+    access: Accessibility,
+    /// The class symbol that declared this property. `None` for structural
+    /// object/interface properties.
+    declaring_class: Option<SymbolId>,
+    /// Whether this property was declared as a method member. Used when
+    /// merging same-name overloads in object types.
+    is_method: bool,
 }
 
 impl PropertyType {
@@ -335,7 +352,11 @@ impl PropertyType {
             name: name.into(),
             optional,
             readonly: false,
+            getter_only: false,
             type_id,
+            access: Accessibility::Public,
+            declaring_class: None,
+            is_method: false,
         }
     }
 
@@ -343,6 +364,34 @@ impl PropertyType {
     pub fn with_readonly(mut self, readonly: bool) -> Self {
         self.readonly = readonly;
         self
+    }
+
+    #[must_use]
+    pub fn with_getter_only(mut self, getter_only: bool) -> Self {
+        self.getter_only = getter_only;
+        self
+    }
+
+    #[must_use]
+    pub fn with_accessibility(
+        mut self,
+        access: Accessibility,
+        declaring_class: Option<SymbolId>,
+    ) -> Self {
+        self.access = access;
+        self.declaring_class = declaring_class;
+        self
+    }
+
+    #[must_use]
+    pub fn with_method(mut self, is_method: bool) -> Self {
+        self.is_method = is_method;
+        self
+    }
+
+    #[must_use]
+    pub const fn is_method(&self) -> bool {
+        self.is_method
     }
 
     #[must_use]
@@ -361,8 +410,51 @@ impl PropertyType {
     }
 
     #[must_use]
+    pub const fn getter_only(&self) -> bool {
+        self.getter_only
+    }
+
+    #[must_use]
     pub const fn type_id(&self) -> TypeId {
         self.type_id
+    }
+
+    #[must_use]
+    pub const fn access(&self) -> Accessibility {
+        self.access
+    }
+
+    #[must_use]
+    pub const fn declaring_class(&self) -> Option<SymbolId> {
+        self.declaring_class
+    }
+}
+
+impl PartialEq for PropertyType {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.optional == other.optional
+            && self.readonly == other.readonly
+            && self.getter_only == other.getter_only
+            && self.type_id == other.type_id
+            && self.access == other.access
+            && self.declaring_class == other.declaring_class
+            && self.is_method == other.is_method
+    }
+}
+
+impl Eq for PropertyType {}
+
+impl std::hash::Hash for PropertyType {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.optional.hash(state);
+        self.readonly.hash(state);
+        self.getter_only.hash(state);
+        self.type_id.hash(state);
+        self.access.hash(state);
+        self.declaring_class.hash(state);
+        self.is_method.hash(state);
     }
 }
 
@@ -379,6 +471,7 @@ pub struct IndexSignature {
 pub struct ObjectType {
     pub(crate) properties: Vec<PropertyType>,
     pub(crate) call_signatures: Vec<FunctionSignature>,
+    pub(crate) construct_signatures: Vec<FunctionSignature>,
     pub(crate) index_signatures: Vec<IndexSignature>,
 }
 
@@ -447,18 +540,52 @@ impl FunctionParameter {
 }
 
 /// One interned function signature.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct TypeParameterBounds {
+    constraint: Option<TypeId>,
+    default: Option<TypeId>,
+}
+
+impl TypeParameterBounds {
+    pub(crate) const NONE: Self = Self {
+        constraint: None,
+        default: None,
+    };
+
+    pub(crate) const fn new(constraint: Option<TypeId>, default: Option<TypeId>) -> Self {
+        Self {
+            constraint,
+            default,
+        }
+    }
+
+    #[must_use]
+    pub const fn constraint(self) -> Option<TypeId> {
+        self.constraint
+    }
+
+    #[must_use]
+    pub const fn default(self) -> Option<TypeId> {
+        self.default
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FunctionSignature {
     type_parameters: Vec<SymbolId>,
+    type_parameter_bounds: Vec<TypeParameterBounds>,
     parameters: Vec<FunctionParameter>,
     return_type: TypeId,
+    javascript: bool,
 }
 
 impl PartialEq for FunctionSignature {
     fn eq(&self, other: &Self) -> bool {
         self.type_parameters == other.type_parameters
+            && self.type_parameter_bounds == other.type_parameter_bounds
             && self.parameters == other.parameters
             && self.return_type == other.return_type
+            && self.javascript == other.javascript
     }
 }
 
@@ -467,8 +594,10 @@ impl Eq for FunctionSignature {}
 impl std::hash::Hash for FunctionSignature {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.type_parameters.hash(state);
+        self.type_parameter_bounds.hash(state);
         self.parameters.hash(state);
         self.return_type.hash(state);
+        self.javascript.hash(state);
     }
 }
 
@@ -476,6 +605,11 @@ impl FunctionSignature {
     #[must_use]
     pub fn type_parameters(&self) -> &[SymbolId] {
         &self.type_parameters
+    }
+
+    #[must_use]
+    pub fn type_parameter_bounds(&self) -> &[TypeParameterBounds] {
+        &self.type_parameter_bounds
     }
 
     #[must_use]
@@ -488,8 +622,16 @@ impl FunctionSignature {
         self.return_type
     }
 
+    #[must_use]
+    pub const fn javascript(&self) -> bool {
+        self.javascript
+    }
+
     /// Returns `(required, total, rest_index)` for this signature.
     /// `total` is `usize::MAX` when the signature ends in a rest parameter.
+    /// `required` is the count of fixed parameters that must be supplied; a
+    /// required parameter after optional/defaulted parameters still counts and
+    /// sets the minimum to its position plus one.
     #[must_use]
     pub fn arity(&self) -> (usize, usize, Option<usize>) {
         let mut required = 0;
@@ -499,10 +641,9 @@ impl FunctionSignature {
                 rest_index = Some(index);
                 break;
             }
-            if parameter.optional() {
-                break;
+            if !parameter.optional() {
+                required = index + 1;
             }
-            required += 1;
         }
         let total = if rest_index.is_some() {
             usize::MAX
@@ -510,6 +651,229 @@ impl FunctionSignature {
             self.parameters.len()
         };
         (required, total, rest_index)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CallMismatch {
+    NotCallable,
+    ArgumentCount,
+    ArgumentType(TextRange),
+}
+
+#[derive(Clone, Debug)]
+struct CallEvaluation {
+    return_type: Option<TypeId>,
+    mismatches: Vec<CallMismatch>,
+}
+
+impl CallEvaluation {
+    fn success(return_type: TypeId) -> Self {
+        Self {
+            return_type: Some(return_type),
+            mismatches: Vec::new(),
+        }
+    }
+
+    fn failure(mismatch: CallMismatch) -> Self {
+        Self {
+            return_type: None,
+            mismatches: vec![mismatch],
+        }
+    }
+
+    fn failure_all(mismatches: Vec<CallMismatch>) -> Self {
+        Self {
+            return_type: None,
+            mismatches,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ResolvedCallArgument {
+    Fixed { type_id: TypeId, range: TextRange },
+    Variadic { element: TypeId, range: TextRange },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClassSide {
+    Instance,
+    Static,
+}
+
+impl ClassSide {
+    const fn includes(self, is_static: bool) -> bool {
+        matches!(
+            (self, is_static),
+            (Self::Instance, false) | (Self::Static, true)
+        )
+    }
+}
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct TupleShape {
+    /// Fixed elements before the rest element, in source order.
+    pub prefix: Vec<TypeId>,
+    /// Count of leading prefix entries that are required.
+    pub required: u32,
+    /// Element type (not the array type) of the rest element.
+    pub rest: Option<TypeId>,
+    /// Fixed, always-required elements after the rest element.
+    pub suffix: Vec<TypeId>,
+}
+
+impl TupleShape {
+    #[must_use]
+    pub fn fixed(elements: Vec<TypeId>) -> Self {
+        Self {
+            required: u32::try_from(elements.len()).expect("tuple element count fits in u32"),
+            prefix: elements,
+            rest: None,
+            suffix: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn min_arity(&self) -> usize {
+        self.required as usize + self.suffix.len()
+    }
+
+    #[must_use]
+    pub fn max_arity(&self) -> Option<usize> {
+        self.rest
+            .is_none()
+            .then(|| self.prefix.len() + self.suffix.len())
+    }
+
+    /// Returns every element type that can occupy `index` at runtime.
+    #[must_use]
+    pub fn element_types_at(&self, index: usize) -> Vec<TypeId> {
+        let mut elements = Vec::new();
+        if let Some(&element) = self.prefix.get(index) {
+            Self::push_unique(&mut elements, element);
+        }
+
+        if let Some(rest) = self.rest {
+            if index >= self.required as usize {
+                Self::push_unique(&mut elements, rest);
+            }
+            for (suffix_index, &element) in self.suffix.iter().enumerate() {
+                if index >= self.required as usize + suffix_index {
+                    Self::push_unique(&mut elements, element);
+                }
+            }
+        } else {
+            for (suffix_index, &element) in self.suffix.iter().enumerate() {
+                let Some(prefix_len) = index.checked_sub(suffix_index) else {
+                    continue;
+                };
+                if prefix_len >= self.required as usize && prefix_len <= self.prefix.len() {
+                    Self::push_unique(&mut elements, element);
+                }
+            }
+        }
+        elements
+    }
+
+    /// Returns every element type that can occupy an offset from the end.
+    #[must_use]
+    pub fn element_types_from_end(&self, offset: usize) -> Vec<TypeId> {
+        if offset == 0 {
+            return Vec::new();
+        }
+        if offset <= self.suffix.len() {
+            return vec![self.suffix[self.suffix.len() - offset]];
+        }
+
+        let prefix_offset = offset - self.suffix.len();
+        let mut elements = Vec::new();
+        if let Some(rest) = self.rest {
+            Self::push_unique(&mut elements, rest);
+            let start = (self.required as usize).saturating_sub(prefix_offset);
+            for &element in &self.prefix[start..] {
+                Self::push_unique(&mut elements, element);
+            }
+        } else {
+            let first_present = (self.required as usize).max(prefix_offset);
+            for present in first_present..=self.prefix.len() {
+                Self::push_unique(&mut elements, self.prefix[present - prefix_offset]);
+            }
+        }
+        elements
+    }
+
+    /// Returns every element type that can occupy `index` at one valid runtime length.
+    #[must_use]
+    pub fn element_types_at_length(&self, index: usize, length: usize) -> Vec<TypeId> {
+        if index >= length {
+            return Vec::new();
+        }
+        let mut elements = Vec::new();
+        for prefix_len in self.prefix_lengths_at_length(length) {
+            Self::push_unique(
+                &mut elements,
+                self.element_at_layout(index, length, prefix_len),
+            );
+        }
+        elements
+    }
+
+    pub(crate) fn prefix_lengths_at_length(&self, length: usize) -> Vec<usize> {
+        if length < self.min_arity() || self.max_arity().is_some_and(|maximum| length > maximum) {
+            return Vec::new();
+        }
+        let available = length - self.suffix.len();
+        if self.rest.is_some() {
+            return (self.required as usize..=self.prefix.len().min(available)).collect();
+        }
+        (available >= self.required as usize && available <= self.prefix.len())
+            .then_some(available)
+            .into_iter()
+            .collect()
+    }
+
+    pub(crate) fn element_at_layout(
+        &self,
+        index: usize,
+        length: usize,
+        prefix_len: usize,
+    ) -> TypeId {
+        debug_assert!(index < length);
+        debug_assert!(prefix_len >= self.required as usize);
+        debug_assert!(prefix_len <= self.prefix.len());
+        debug_assert!(length >= prefix_len + self.suffix.len());
+        debug_assert!(self.rest.is_some() || length == prefix_len + self.suffix.len());
+        let rest_len = length - prefix_len - self.suffix.len();
+        if index < prefix_len {
+            self.prefix[index]
+        } else if index < prefix_len + rest_len {
+            self.rest
+                .expect("positive rest length requires a rest element")
+        } else {
+            self.suffix[index - prefix_len - rest_len]
+        }
+    }
+
+    fn push_unique(elements: &mut Vec<TypeId>, element: TypeId) {
+        if !elements.contains(&element) {
+            elements.push(element);
+        }
+    }
+
+    #[must_use]
+    pub fn all_element_types(&self) -> Vec<TypeId> {
+        let mut elements = Vec::with_capacity(
+            self.prefix.len() + usize::from(self.rest.is_some()) + self.suffix.len(),
+        );
+        elements.extend_from_slice(&self.prefix);
+        elements.extend(self.rest);
+        elements.extend_from_slice(&self.suffix);
+        elements
+    }
+
+    #[must_use]
+    pub fn is_fixed(&self) -> bool {
+        self.rest.is_none() && self.required as usize == self.prefix.len()
     }
 }
 
@@ -534,18 +898,66 @@ pub enum Type {
     Object,
     BooleanLiteral(bool),
     NumberLiteral(Box<str>),
-    StringLiteral(Box<str>),
+    StringLiteral(EcmaString),
     BigIntLiteral(Box<str>),
     Array(TypeId),
-    Tuple(Vec<TypeId>),
+    Tuple(TupleShape),
     Union(Vec<TypeId>),
     Intersection(Vec<TypeId>),
     ObjectType(ObjectType),
     Function(FunctionSignature),
-    /// A nominal named type (type parameter, class, or enum) compared by identity.
+    /// A nominal type-parameter or interface head compared by identity.
     Named(SymbolId),
+    /// The canonical semantic identity of a class instance. The argument vector
+    /// is complete, including defaults, and is empty for non-generic classes.
+    AppliedClass {
+        symbol: SymbolId,
+        arguments: Vec<TypeId>,
+    },
     /// A numeric enum value, distinct from both its runtime enum object and number.
     NumericEnum(SymbolId),
+    /// A deferred `keyof T` type, reduced when the operand becomes concrete.
+    Keyof(TypeId),
+    /// A deferred indexed access type `T[K]`, reduced when the object and key
+    /// become concrete enough to resolve a property or index signature.
+    IndexedAccess {
+        object: TypeId,
+        index: TypeId,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClassState {
+    Provisional,
+    Final,
+}
+
+#[derive(Clone, Debug)]
+struct ClassTemplate {
+    raw: TypeId,
+    revision: u32,
+    state: ClassState,
+}
+
+#[derive(Clone, Debug)]
+struct ClassMetadata {
+    parameters: Vec<SymbolId>,
+    bounds: Vec<TypeParameterBounds>,
+    bounds_resolving: bool,
+    bounds_ready: bool,
+    template: Option<ClassTemplate>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AppliedClassView {
+    revision: u32,
+    type_id: TypeId,
+}
+
+#[derive(Default)]
+struct ImportedTypeMap {
+    types: HashMap<TypeId, TypeId>,
+    symbols: HashMap<SymbolId, SymbolId>,
 }
 
 /// An interning table for structural types plus the assignability relation.
@@ -571,10 +983,21 @@ pub struct TypeTable {
     symbol: TypeId,
     object: TypeId,
     object_symbol: Option<SymbolId>,
-    /// Structural instance type per class symbol, so the relation algebra can
-    /// compare a class nominally named on one side against structure on the
-    /// other — the derived-to-base direction included.
-    class_instances: HashMap<SymbolId, TypeId>,
+    /// Declared constraint per type-parameter symbol. Class and interface names
+    /// never enter this map, so nominal named types remain nominal.
+    type_parameter_constraints: HashMap<SymbolId, TypeId>,
+    /// Canonical class metadata. Raw object types live only as revisioned
+    /// templates behind this seam; semantic class identities are AppliedClass.
+    classes: HashMap<SymbolId, ClassMetadata>,
+    /// Finite shallow structural views keyed by their canonical applied head.
+    applied_class_views: HashMap<TypeId, AppliedClassView>,
+    /// Class heads whose shallow views are being materialized. Per-head
+    /// recursion permits finite A-to-B expansion without unrolling A<T[]> forever.
+    materializing_class_views: HashSet<SymbolId>,
+    /// Completed structural body for an interface symbol. Recursive member
+    /// references use `Type::Named(symbol)` as an inert head and expand through
+    /// this single view after the body has been interned.
+    interface_structures: HashMap<SymbolId, TypeId>,
 }
 
 impl Default for TypeTable {
@@ -604,7 +1027,11 @@ impl TypeTable {
             symbol: TypeId(0),
             object: TypeId(0),
             object_symbol: None,
-            class_instances: HashMap::new(),
+            type_parameter_constraints: HashMap::new(),
+            classes: HashMap::new(),
+            applied_class_views: HashMap::new(),
+            materializing_class_views: HashSet::new(),
+            interface_structures: HashMap::new(),
         };
         table.error = table.intern(Type::Error);
         table.any = table.intern(Type::Any);
@@ -640,12 +1067,50 @@ impl TypeTable {
     /// Returns the type of a named property on a structural type, distributing
     /// over unions. `None` means the property is not present on the type.
     pub fn property_type(&mut self, ty: TypeId, name: &str) -> Option<TypeId> {
+        let ty = self.named_structural_view(ty);
+        let ty = match self.get(ty) {
+            Type::Named(symbol) => self
+                .classes
+                .get(symbol)
+                .and_then(|metadata| metadata.template.as_ref())
+                .map_or(ty, |template| template.raw),
+            _ => ty,
+        };
         match self.get(ty).clone() {
-            Type::ObjectType(object) => object
-                .properties
-                .iter()
-                .find(|property| property.name() == name)
-                .map(|property| property.type_id()),
+            Type::ObjectType(object) => {
+                if let Some(property) = object
+                    .properties
+                    .iter()
+                    .find(|property| property.name() == name)
+                {
+                    return Some(property.type_id());
+                }
+
+                let numeric = name.parse::<usize>().is_ok();
+                object
+                    .index_signatures
+                    .iter()
+                    .find(|signature| {
+                        signature.parameters.first().is_some_and(|parameter| {
+                            matches!(self.get(parameter.type_id()), Type::String)
+                                || (numeric
+                                    && matches!(self.get(parameter.type_id()), Type::Number))
+                        })
+                    })
+                    .map(|signature| signature.value_type)
+            }
+            Type::Tuple(shape) => {
+                if name == "length" {
+                    return Some(match shape.max_arity() {
+                        Some(max) if max == shape.min_arity() => {
+                            self.number_literal(max.to_string().as_str())
+                        }
+                        _ => self.number(),
+                    });
+                }
+                let index = name.parse::<usize>().ok()?;
+                self.tuple_index_type(&shape, index)
+            }
             Type::Union(members) => {
                 let mut found = Vec::with_capacity(members.len());
                 for member in members {
@@ -653,8 +1118,107 @@ impl TypeTable {
                 }
                 Some(self.union(&found))
             }
+            Type::Intersection(members) => {
+                let mut found = Vec::with_capacity(members.len());
+                for member in members {
+                    if let Some(property) = self.property_type(member, name) {
+                        found.push(property);
+                    }
+                }
+                match found.len() {
+                    0 => None,
+                    1 => Some(found[0]),
+                    _ => Some(self.intersection(found)),
+                }
+            }
+            Type::AppliedClass { .. } => self
+                .prepare_applied_class_view(ty)
+                .and_then(|view| self.property_type(view, name)),
             _ => None,
         }
+    }
+
+    /// Returns the type of a named property when it is *read*, distributing
+    /// over unions and intersections. For optional object properties, the
+    /// result includes `undefined`. `None` means the property is not present.
+    #[must_use]
+    pub fn read_property_type(&mut self, ty: TypeId, name: &str) -> Option<TypeId> {
+        let ty = self.named_structural_view(ty);
+        match self.get(ty).clone() {
+            Type::ObjectType(object) => {
+                if let Some(property) = object
+                    .properties
+                    .iter()
+                    .find(|property| property.name() == name)
+                {
+                    if property.optional() {
+                        let undefined = self.undefined_type();
+                        return Some(self.union(&[property.type_id(), undefined]));
+                    }
+                    return Some(property.type_id());
+                }
+
+                let numeric = name.parse::<usize>().is_ok();
+                object
+                    .index_signatures
+                    .iter()
+                    .find(|signature| {
+                        signature.parameters.first().is_some_and(|parameter| {
+                            matches!(self.get(parameter.type_id()), Type::String)
+                                || (numeric
+                                    && matches!(self.get(parameter.type_id()), Type::Number))
+                        })
+                    })
+                    .map(|signature| signature.value_type)
+            }
+            Type::Tuple(shape) => {
+                if name == "length" {
+                    return Some(match shape.max_arity() {
+                        Some(max) if max == shape.min_arity() => {
+                            self.number_literal(max.to_string().as_str())
+                        }
+                        _ => self.number(),
+                    });
+                }
+                let index = name.parse::<usize>().ok()?;
+                self.tuple_index_type(&shape, index)
+            }
+            Type::Union(members) => {
+                let mut found = Vec::with_capacity(members.len());
+                for member in members {
+                    found.push(self.read_property_type(member, name)?);
+                }
+                Some(self.union(&found))
+            }
+            Type::Intersection(members) => {
+                let mut found = Vec::with_capacity(members.len());
+                for member in members {
+                    if let Some(property) = self.read_property_type(member, name) {
+                        found.push(property);
+                    }
+                }
+                match found.len() {
+                    0 => None,
+                    1 => Some(found[0]),
+                    _ => Some(self.intersection(found)),
+                }
+            }
+            Type::AppliedClass { .. } => self
+                .prepare_applied_class_view(ty)
+                .and_then(|view| self.read_property_type(view, name)),
+            _ => None,
+        }
+    }
+
+    fn tuple_index_type(&mut self, shape: &TupleShape, index: usize) -> Option<TypeId> {
+        let mut elements = shape.element_types_at(index);
+        if elements.is_empty() {
+            return None;
+        }
+        if index >= shape.min_arity() {
+            elements.push(self.undefined_type());
+        }
+        Some(self.union(&elements))
     }
 
     #[must_use]
@@ -720,16 +1284,485 @@ impl TypeTable {
         self.object_symbol == Some(symbol)
     }
 
-    /// Records the structural instance type of a class symbol.
-    pub fn set_class_instance(&mut self, symbol: SymbolId, instance: TypeId) {
-        self.class_instances.insert(symbol, instance);
+    /// Predeclares a class before its bounds, heritage, or members are resolved.
+    pub fn declare_class(&mut self, symbol: SymbolId, parameters: Vec<SymbolId>) {
+        self.classes.entry(symbol).or_insert_with(|| ClassMetadata {
+            bounds: vec![TypeParameterBounds::NONE; parameters.len()],
+            parameters,
+            bounds_resolving: false,
+            bounds_ready: false,
+            template: None,
+        });
     }
 
-    /// Structural instance type of a class symbol, if one has been built.
     #[must_use]
-    pub fn class_instance(&self, symbol: SymbolId) -> Option<TypeId> {
-        self.class_instances.get(&symbol).copied()
+    pub fn has_class(&self, symbol: SymbolId) -> bool {
+        self.classes.contains_key(&symbol)
     }
+
+    #[must_use]
+    pub fn class_type_parameters(&self, symbol: SymbolId) -> &[SymbolId] {
+        self.classes
+            .get(&symbol)
+            .map_or(&[], |metadata| metadata.parameters.as_slice())
+    }
+
+    #[must_use]
+    pub fn class_type_parameter_bounds(&self, symbol: SymbolId) -> &[TypeParameterBounds] {
+        self.classes
+            .get(&symbol)
+            .map_or(&[], |metadata| metadata.bounds.as_slice())
+    }
+
+    #[must_use]
+    pub fn class_bounds_ready(&self, symbol: SymbolId) -> bool {
+        self.classes
+            .get(&symbol)
+            .is_some_and(|metadata| metadata.bounds_ready)
+    }
+
+    /// Starts resolving class defaults and constraints. Recursive references see
+    /// the prebound parameter symbols and do not start a second resolution.
+    pub fn begin_class_bounds(&mut self, symbol: SymbolId) -> bool {
+        let Some(metadata) = self.classes.get_mut(&symbol) else {
+            return false;
+        };
+        if metadata.bounds_ready || metadata.bounds_resolving {
+            return false;
+        }
+        metadata.bounds_resolving = true;
+        true
+    }
+
+    pub fn finish_class_bounds(&mut self, symbol: SymbolId, bounds: Vec<TypeParameterBounds>) {
+        let Some(metadata) = self.classes.get_mut(&symbol) else {
+            return;
+        };
+        debug_assert_eq!(metadata.parameters.len(), bounds.len());
+        metadata.bounds = bounds;
+        metadata.bounds_resolving = false;
+        metadata.bounds_ready = true;
+    }
+
+    /// Sets resolved type-parameter bounds for a class in one step.
+    pub fn set_class_bounds(&mut self, symbol: SymbolId, bounds: Vec<TypeParameterBounds>) {
+        self.finish_class_bounds(symbol, bounds);
+    }
+
+    /// Returns the `(symbol, arguments)` identity of an applied class type,
+    /// or `None` for any other type.
+    #[must_use]
+    pub fn class_identity(&self, type_id: TypeId) -> Option<(SymbolId, &[TypeId])> {
+        match self.get(type_id) {
+            Type::AppliedClass { symbol, arguments } => Some((*symbol, arguments)),
+            _ => None,
+        }
+    }
+
+    pub fn publish_provisional_class_template(&mut self, symbol: SymbolId, raw: TypeId) {
+        self.publish_class_template(symbol, raw, ClassState::Provisional);
+    }
+
+    pub fn publish_final_class_template(&mut self, symbol: SymbolId, raw: TypeId) {
+        self.publish_class_template(symbol, raw, ClassState::Final);
+    }
+
+    fn publish_class_template(&mut self, symbol: SymbolId, raw: TypeId, state: ClassState) {
+        let Some(metadata) = self.classes.get_mut(&symbol) else {
+            return;
+        };
+        debug_assert!(!matches!(
+            metadata.template.as_ref().map(|template| template.state),
+            Some(ClassState::Final)
+        ));
+        let revision = metadata
+            .template
+            .as_ref()
+            .map_or(1, |template| template.revision.saturating_add(1));
+        metadata.template = Some(ClassTemplate {
+            raw,
+            revision,
+            state,
+        });
+
+        let stale: Vec<TypeId> = self
+            .applied_class_views
+            .keys()
+            .copied()
+            .filter(|type_id| matches!(self.get(*type_id), Type::AppliedClass { symbol: head, .. } if *head == symbol))
+            .collect();
+        for type_id in stale {
+            self.applied_class_views.remove(&type_id);
+        }
+        let heads: Vec<TypeId> = self
+            .types
+            .iter()
+            .enumerate()
+            .filter_map(|(index, ty)| {
+                matches!(ty, Type::AppliedClass { symbol: head, .. } if *head == symbol).then_some(
+                    TypeId(u32::try_from(index).expect("type count fits in u32")),
+                )
+            })
+            .collect();
+        for head in heads {
+            self.materialize_applied_class_view(head);
+        }
+    }
+
+    /// Interns one complete class application and prepares its current shallow view.
+    ///
+    /// Argument completion and constraint checking belong to the binder boundary;
+    /// silently padding or truncating here would collapse distinct source programs
+    /// onto an invented semantic identity.
+    pub fn applied_class(&mut self, symbol: SymbolId, arguments: Vec<TypeId>) -> TypeId {
+        debug_assert!(
+            self.classes
+                .get(&symbol)
+                .is_none_or(|metadata| metadata.parameters.len() == arguments.len())
+        );
+        let type_id = self.intern(Type::AppliedClass { symbol, arguments });
+        self.materialize_applied_class_view(type_id);
+        type_id
+    }
+
+    /// Returns the parameter-relative self head used inside a class declaration.
+    pub fn declared_class(&mut self, symbol: SymbolId) -> Option<TypeId> {
+        let parameters = self.classes.get(&symbol)?.parameters.clone();
+        let arguments = parameters
+            .into_iter()
+            .map(|parameter| self.named(parameter))
+            .collect();
+        Some(self.applied_class(symbol, arguments))
+    }
+
+    /// Ensures and returns the finite shallow view for one applied root.
+    pub fn prepare_applied_class_view(&mut self, type_id: TypeId) -> Option<TypeId> {
+        self.materialize_applied_class_view(type_id);
+        self.applied_class_view(type_id)
+    }
+
+    /// Returns a previously prepared shallow view. Nested applications remain
+    /// opaque AppliedClass heads and are never expanded by this accessor.
+    #[must_use]
+    pub fn applied_class_view(&self, type_id: TypeId) -> Option<TypeId> {
+        let Type::AppliedClass { symbol, .. } = self.get(type_id) else {
+            return None;
+        };
+        let revision = self.classes.get(symbol)?.template.as_ref()?.revision;
+        self.applied_class_views
+            .get(&type_id)
+            .filter(|view| view.revision == revision)
+            .map(|view| view.type_id)
+    }
+
+    fn materialize_applied_class_view(&mut self, type_id: TypeId) {
+        let Type::AppliedClass { symbol, arguments } = self.get(type_id).clone() else {
+            return;
+        };
+        let Some(metadata) = self.classes.get(&symbol).cloned() else {
+            return;
+        };
+        let Some(template) = metadata.template else {
+            return;
+        };
+        if self
+            .applied_class_views
+            .get(&type_id)
+            .is_some_and(|view| view.revision == template.revision)
+        {
+            return;
+        }
+        if arguments.len() != metadata.parameters.len() {
+            return;
+        }
+        if !self.materializing_class_views.insert(symbol) {
+            return;
+        }
+        let substitutions = metadata
+            .parameters
+            .into_iter()
+            .zip(arguments)
+            .map(|(parameter, argument)| {
+                InferredTypeArgument::new(parameter, argument, InferenceProvenance::Explicit)
+            })
+            .collect();
+        let view = InferredTypeArguments::new(substitutions).instantiate(self, template.raw);
+        let removed = self.materializing_class_views.remove(&symbol);
+        debug_assert!(removed);
+        self.applied_class_views.insert(
+            type_id,
+            AppliedClassView {
+                revision: template.revision,
+                type_id: view,
+            },
+        );
+    }
+
+    /// Records the completed structural body behind an interface's named head.
+    pub fn set_interface_structure(&mut self, symbol: SymbolId, structure: TypeId) {
+        self.interface_structures.insert(symbol, structure);
+    }
+
+    /// Returns the completed structural body behind an interface symbol.
+    #[must_use]
+    pub fn interface_structure(&self, symbol: SymbolId) -> Option<TypeId> {
+        self.interface_structures.get(&symbol).copied()
+    }
+
+    /// Expands one named interface head to its completed structural body.
+    /// Other named identities remain inert.
+    #[must_use]
+    pub fn named_structural_view(&self, type_id: TypeId) -> TypeId {
+        match self.get(type_id) {
+            Type::Named(symbol) => self.interface_structure(*symbol).unwrap_or(type_id),
+            _ => type_id,
+        }
+    }
+    /// Expands one named interface head or applied class to its completed
+    /// structural body for indexed access. Other named identities remain inert.
+    #[must_use]
+    pub fn indexed_access_view(&mut self, type_id: TypeId) -> TypeId {
+        let view = self.named_structural_view(type_id);
+        if view == type_id {
+            if let Some(prepared) = self.prepare_applied_class_view(type_id) {
+                prepared
+            } else {
+                type_id
+            }
+        } else {
+            view
+        }
+    }
+
+    /// Reduces `keyof T` when `T` is a concrete object, tuple, or array;
+    /// otherwise interns a deferred `Type::Keyof`.
+    pub fn keyof(&mut self, operand: TypeId) -> TypeId {
+        self.try_reduce_keyof(operand)
+            .unwrap_or_else(|| self.intern(Type::Keyof(operand)))
+    }
+
+    fn try_reduce_keyof(&mut self, operand: TypeId) -> Option<TypeId> {
+        let view = self.indexed_access_view(operand);
+        self.keyof_view(view)
+    }
+
+    fn keyof_view(&mut self, view: TypeId) -> Option<TypeId> {
+        match self.get(view).clone() {
+            Type::ObjectType(object) => {
+                let mut keys =
+                    Vec::with_capacity(object.properties.len() + object.index_signatures.len());
+                for property in &object.properties {
+                    let name = property.name.as_ref();
+                    let key = if name.parse::<usize>().is_ok() {
+                        self.number_literal(name)
+                    } else {
+                        self.string_literal(name)
+                    };
+                    keys.push(key);
+                }
+                for signature in &object.index_signatures {
+                    if let Some(parameter) = signature.parameters.first() {
+                        keys.push(parameter.type_id());
+                    }
+                }
+                Some(self.union_or_single(keys))
+            }
+            Type::Tuple(shape) => {
+                if shape.rest.is_some() {
+                    Some(self.number())
+                } else {
+                    let count = shape.prefix.len() + shape.suffix.len();
+                    let mut keys = Vec::with_capacity(count);
+                    for i in 0..count {
+                        keys.push(self.number_literal(i.to_string().as_str()));
+                    }
+                    Some(self.union_or_single(keys))
+                }
+            }
+            Type::Array(_) => Some(self.number()),
+            Type::Union(members) => {
+                // keyof(A | B) = keyof(A) & keyof(B)
+                let mut keys = Vec::with_capacity(members.len());
+                for &member in &members {
+                    let key = self.keyof_view(member)?;
+                    keys.push(key);
+                }
+                Some(self.intersection(keys))
+            }
+            Type::Intersection(members) => {
+                // keyof(A & B) = keyof(A) | keyof(B)
+                let mut keys = Vec::new();
+                for &member in &members {
+                    let key = self.keyof_view(member)?;
+                    keys.push(key);
+                }
+                Some(self.union_or_single(keys))
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolves an indexed access `T[K]` when `T` and `K` are sufficiently
+    /// concrete; otherwise interns a deferred `Type::IndexedAccess`.
+    pub fn indexed_access(&mut self, object: TypeId, index: TypeId) -> TypeId {
+        self.try_reduce_indexed_access(object, index)
+            .unwrap_or_else(|| self.intern(Type::IndexedAccess { object, index }))
+    }
+
+    fn try_reduce_indexed_access(&mut self, object: TypeId, index: TypeId) -> Option<TypeId> {
+        match self.get(index).clone() {
+            Type::Union(members) => {
+                let mut found = Vec::with_capacity(members.len());
+                for &member in &members {
+                    found.push(self.indexed_access(object, member));
+                }
+                Some(self.union(&found))
+            }
+            _ => {
+                let view = self.indexed_access_view(object);
+                self.try_reduce_indexed_access_by_view(view, object, index)
+            }
+        }
+    }
+
+    fn try_reduce_indexed_access_by_view(
+        &mut self,
+        view: TypeId,
+        object: TypeId,
+        index: TypeId,
+    ) -> Option<TypeId> {
+        if let Type::Keyof(key_source) = self.get(index)
+            && *key_source == object
+        {
+            return self.indexed_access_keyof_view(view);
+        }
+        match self.get(view).clone() {
+            Type::Any => Some(self.any()),
+            Type::Unknown => Some(self.unknown()),
+            Type::Never => Some(self.never()),
+            Type::Error => Some(self.error_type()),
+            Type::Null | Type::Undefined => Some(self.error_type()),
+            Type::ObjectType(_) | Type::Tuple(_) | Type::Array(_) => {
+                self.try_resolve_concrete_indexed_access(view, index)
+            }
+            Type::Union(members) => {
+                let mut found = Vec::with_capacity(members.len());
+                for &member in &members {
+                    found.push(self.indexed_access(member, index));
+                }
+                Some(self.union(&found))
+            }
+            Type::Intersection(members) => {
+                let mut found = Vec::new();
+                for &member in &members {
+                    found.push(self.indexed_access(member, index));
+                }
+                Some(self.intersection(found))
+            }
+            _ => None,
+        }
+    }
+
+    fn try_resolve_concrete_indexed_access(
+        &mut self,
+        view: TypeId,
+        index: TypeId,
+    ) -> Option<TypeId> {
+        match self.get(index).clone() {
+            Type::StringLiteral(name) => {
+                let Ok(key) = name.to_utf8_strict() else {
+                    return Some(self.error_type());
+                };
+                self.property_type(view, &key).or(Some(self.error_type()))
+            }
+            Type::NumberLiteral(name) => self
+                .property_type(view, name.as_ref())
+                .or(Some(self.error_type())),
+            Type::String => {
+                if let Type::ObjectType(object) = self.get(view).clone()
+                    && let Some(signature) = object.index_signatures.iter().find(|signature| {
+                        signature.parameters.first().is_some_and(|parameter| {
+                            matches!(self.get(parameter.type_id()), Type::String)
+                        })
+                    })
+                {
+                    return Some(signature.value_type);
+                }
+                Some(self.error_type())
+            }
+            Type::Number => match self.get(view).clone() {
+                Type::Array(element) => Some(element),
+                Type::Tuple(shape) => Some(self.union(&shape.all_element_types())),
+                Type::ObjectType(object) => {
+                    if let Some(signature) = object.index_signatures.iter().find(|signature| {
+                        signature.parameters.first().is_some_and(|parameter| {
+                            matches!(self.get(parameter.type_id()), Type::Number)
+                        })
+                    }) {
+                        return Some(signature.value_type);
+                    }
+                    Some(self.error_type())
+                }
+                _ => Some(self.error_type()),
+            },
+            Type::Symbol => {
+                if let Type::ObjectType(object) = self.get(view).clone()
+                    && let Some(signature) = object.index_signatures.iter().find(|signature| {
+                        signature.parameters.first().is_some_and(|parameter| {
+                            matches!(self.get(parameter.type_id()), Type::Symbol)
+                        })
+                    })
+                {
+                    return Some(signature.value_type);
+                }
+                Some(self.error_type())
+            }
+            Type::Any => Some(self.any()),
+            Type::Never => Some(self.never()),
+            Type::Named(_)
+            | Type::Keyof(_)
+            | Type::IndexedAccess { .. }
+            | Type::Intersection(_) => None,
+            _ => Some(self.error_type()),
+        }
+    }
+
+    fn indexed_access_keyof_view(&mut self, view: TypeId) -> Option<TypeId> {
+        match self.get(view).clone() {
+            Type::ObjectType(object) => {
+                let mut members =
+                    Vec::with_capacity(object.properties.len() + object.index_signatures.len());
+                for property in &object.properties {
+                    members.push(property.type_id());
+                }
+                for signature in &object.index_signatures {
+                    members.push(signature.value_type);
+                }
+                Some(self.union_or_single(members))
+            }
+            Type::Tuple(shape) => Some(self.union_or_single(shape.all_element_types())),
+            Type::Array(element) => Some(element),
+            _ => None,
+        }
+    }
+
+    fn union_or_single(&mut self, members: Vec<TypeId>) -> TypeId {
+        match members.len() {
+            0 => self.never(),
+            1 => members[0],
+            _ => self.union(&members),
+        }
+    }
+
+    pub fn set_type_parameter_constraint(&mut self, symbol: SymbolId, constraint: TypeId) {
+        self.type_parameter_constraints.insert(symbol, constraint);
+    }
+
+    #[must_use]
+    pub fn type_parameter_constraint(&self, symbol: SymbolId) -> Option<TypeId> {
+        self.type_parameter_constraints.get(&symbol).copied()
+    }
+
     /// Interns a boolean literal type.
     pub fn boolean_literal(&mut self, value: bool) -> TypeId {
         self.intern(Type::BooleanLiteral(value))
@@ -740,9 +1773,15 @@ impl TypeTable {
         self.intern(Type::NumberLiteral(text.into()))
     }
 
-    /// Interns a string literal type keyed by its source lexeme.
-    pub fn string_literal(&mut self, text: &str) -> TypeId {
-        self.intern(Type::StringLiteral(text.into()))
+    /// Interns a string literal type from its semantic value.
+    pub fn string_literal(&mut self, value: &str) -> TypeId {
+        self.intern(Type::StringLiteral(EcmaString::encode(value)))
+    }
+
+    /// Interns a string literal type from a source lexeme.
+    pub(crate) fn string_literal_lexeme(&mut self, lexeme: &str) -> TypeId {
+        let value = string_value(lexeme).unwrap_or_else(|| EcmaString::encode(lexeme));
+        self.intern(Type::StringLiteral(value))
     }
 
     /// Interns a bigint literal type keyed by its source lexeme.
@@ -767,7 +1806,35 @@ impl TypeTable {
 
     /// Interns a fixed-length tuple type.
     pub fn tuple(&mut self, elements: Vec<TypeId>) -> TypeId {
-        self.intern(Type::Tuple(elements))
+        self.tuple_shape(TupleShape::fixed(elements))
+    }
+
+    /// Interns a tuple after canonicalizing its positional zones.
+    pub fn tuple_shape(&mut self, mut shape: TupleShape) -> TypeId {
+        shape.required = shape
+            .required
+            .min(u32::try_from(shape.prefix.len()).expect("tuple element count fits in u32"));
+        if shape
+            .rest
+            .is_some_and(|rest| matches!(self.get(rest), Type::Never))
+        {
+            shape.rest = None;
+        }
+        if shape.rest.is_none() {
+            let suffix_len = shape.suffix.len();
+            shape.prefix.append(&mut shape.suffix);
+            shape.required = shape
+                .required
+                .saturating_add(u32::try_from(suffix_len).expect("tuple element count fits in u32"))
+                .min(u32::try_from(shape.prefix.len()).expect("tuple element count fits in u32"));
+        }
+        if shape.prefix.is_empty()
+            && shape.suffix.is_empty()
+            && let Some(rest) = shape.rest
+        {
+            return self.array(rest);
+        }
+        self.intern(Type::Tuple(shape))
     }
 
     /// Interns an intersection type without assigning source syntax semantics.
@@ -777,22 +1844,96 @@ impl TypeTable {
         self.intern(Type::Intersection(members))
     }
 
+    /// Interns an intersection type preserving the source order of `members`.
+    ///
+    /// Overload groups use this instead of [`Self::intersection`] so call
+    /// signature resolution can try overloads in declaration order.
+    pub fn intersection_ordered(&mut self, members: Vec<TypeId>) -> TypeId {
+        self.intern(Type::Intersection(members))
+    }
+
+    /// If `type_id` is a function type or an intersection of function types,
+    /// returns the ordered function type ids. Otherwise returns `None`.
+    fn overload_members(&self, type_id: TypeId) -> Option<Vec<TypeId>> {
+        match self.get(type_id) {
+            Type::Function(_) => Some(vec![type_id]),
+            Type::Intersection(members) => {
+                let mut overloads = Vec::new();
+                for &member in members {
+                    match self.get(member) {
+                        Type::Function(_) => overloads.push(member),
+                        Type::Intersection(_) => {
+                            let nested = self.overload_members(member)?;
+                            overloads.extend(nested);
+                        }
+                        _ => return None,
+                    }
+                }
+                Some(overloads)
+            }
+            _ => None,
+        }
+    }
+
     /// Interns an object type after canonically ordering its members by name.
     pub fn object_type(&mut self, properties: Vec<PropertyType>) -> TypeId {
         self.object_type_with_members(ObjectType {
             properties,
             call_signatures: Vec::new(),
+            construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
         })
     }
-
+    /// Interns an object type after canonically ordering its members by name.
     pub(crate) fn object_type_with_members(&mut self, mut object: ObjectType) -> TypeId {
         object
             .properties
             .sort_by(|left, right| left.name.cmp(&right.name));
-        object
-            .properties
-            .dedup_by(|left, right| left.name == right.name);
+        let mut merged = Vec::with_capacity(object.properties.len());
+        let mut i = 0;
+        while i < object.properties.len() {
+            let first = &object.properties[i];
+            let mut j = i + 1;
+            while j < object.properties.len() && object.properties[j].name() == first.name() {
+                j += 1;
+            }
+            let group = &object.properties[i..j];
+            let mut property = group[0].clone();
+            if group.len() > 1
+                && first.is_method()
+                && let Some(mut overloads) = self.overload_members(first.type_id())
+            {
+                let mut can_merge = true;
+                for other in &group[1..] {
+                    if !other.is_method() {
+                        can_merge = false;
+                        break;
+                    }
+                    if let Some(members) = self.overload_members(other.type_id()) {
+                        overloads.extend(members);
+                    } else {
+                        can_merge = false;
+                        break;
+                    }
+                }
+                if can_merge && !overloads.is_empty() {
+                    let type_id = if overloads.len() == 1 {
+                        overloads[0]
+                    } else {
+                        self.intern(Type::Intersection(overloads))
+                    };
+                    property =
+                        PropertyType::new(first.name().to_owned(), first.optional(), type_id)
+                            .with_readonly(first.readonly())
+                            .with_getter_only(first.getter_only())
+                            .with_accessibility(first.access(), first.declaring_class())
+                            .with_method(true);
+                }
+            }
+            merged.push(property);
+            i = j;
+        }
+        object.properties = merged;
         self.intern(Type::ObjectType(object))
     }
 
@@ -815,10 +1956,31 @@ impl TypeTable {
         parameters: Vec<FunctionParameter>,
         return_type: TypeId,
     ) -> TypeId {
-        self.intern(Type::Function(FunctionSignature {
+        let type_parameter_bounds = vec![TypeParameterBounds::NONE; type_parameters.len()];
+        self.function_with_parameter_bounds(
             type_parameters,
+            type_parameter_bounds,
             parameters,
             return_type,
+            false,
+        )
+    }
+
+    pub fn function_with_parameter_bounds(
+        &mut self,
+        type_parameters: Vec<SymbolId>,
+        type_parameter_bounds: Vec<TypeParameterBounds>,
+        parameters: Vec<FunctionParameter>,
+        return_type: TypeId,
+        javascript: bool,
+    ) -> TypeId {
+        debug_assert_eq!(type_parameters.len(), type_parameter_bounds.len());
+        self.intern(Type::Function(FunctionSignature {
+            type_parameters,
+            type_parameter_bounds,
+            parameters,
+            return_type,
+            javascript,
         }))
     }
 
@@ -843,6 +2005,21 @@ impl TypeTable {
         }
     }
 
+    /// Removes `null` and `undefined` while preserving every other constituent.
+    pub fn non_nullable(&mut self, type_id: TypeId) -> TypeId {
+        match self.get(type_id).clone() {
+            Type::Null | Type::Undefined => self.never,
+            Type::Union(members) => {
+                let members: Vec<_> = members
+                    .into_iter()
+                    .filter(|member| !matches!(self.get(*member), Type::Null | Type::Undefined))
+                    .collect();
+                self.union(&members)
+            }
+            _ => type_id,
+        }
+    }
+
     /// Returns whether a value of `source` may be assigned where `target` is
     /// expected, using structural rules over the modeled type space.
     ///
@@ -861,54 +2038,69 @@ impl TypeTable {
     pub fn assignable_with_strict_null(&self, source: TypeId, target: TypeId) -> bool {
         TypeRelations::new(self).assignable_with_strict_null(source, target)
     }
-    /// Widens literal types to their base types so mutable variables can be
-    /// reassigned. When `keep_primitive_literals` is `true`, primitive
-    /// literals (`1`, `"foo"`, `true`, `1n`) are kept as-is; their containers
+
+    /// Returns whether two types sufficiently overlap for a TypeScript type
+    /// assertion.
+    #[must_use]
+    pub fn comparable(&self, left: TypeId, right: TypeId) -> bool {
+        TypeRelations::new(self).comparable(left, right)
+    }
+
+    /// Widens a top-level primitive literal so a mutable binding can accept
+    /// other values of the same primitive type. Composite types keep their
+    /// declared element and property types.
     pub fn widen(&mut self, type_id: TypeId, keep_primitive_literals: bool) -> TypeId {
-        let ty = self.get(type_id).clone();
-        match ty {
+        match self.get(type_id).clone() {
             Type::StringLiteral(_) if !keep_primitive_literals => self.string(),
             Type::NumberLiteral(_) if !keep_primitive_literals => self.number(),
             Type::BooleanLiteral(_) if !keep_primitive_literals => self.boolean(),
             Type::BigIntLiteral(_) if !keep_primitive_literals => self.bigint(),
-            // Composite types are widened as a whole: a `const a = [1]` has type
-            // `number[]`, and `const o = { x: 1 }` has type `{ x: number; }`.
-            // Literal assertions (`as const`) preserve the top-level expression;
-            // the `widen` call for those still keeps top-level primitive literals.
+            Type::Union(members) if !keep_primitive_literals => {
+                let widened = members
+                    .into_iter()
+                    .map(|member| self.widen(member, false))
+                    .collect::<Vec<_>>();
+                self.union(&widened)
+            }
+            _ => type_id,
+        }
+    }
+
+    /// Widens literal leaves while constructing a fresh array or object
+    /// literal. Nested object literals already cross this boundary themselves.
+    fn widen_fresh_literal(&mut self, type_id: TypeId) -> TypeId {
+        match self.get(type_id).clone() {
+            Type::StringLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::BooleanLiteral(_)
+            | Type::BigIntLiteral(_) => self.widen(type_id, false),
             Type::Array(element) => {
-                let widened = self.widen(element, false);
+                let widened = self.widen_fresh_literal(element);
                 self.array(widened)
             }
-            Type::Tuple(elements) => {
-                let widened = elements
+            Type::Tuple(shape) => {
+                let prefix = shape
+                    .prefix
                     .iter()
-                    .map(|element| self.widen(*element, false))
+                    .map(|element| self.widen_fresh_literal(*element))
                     .collect();
-                self.tuple(widened)
-            }
-            Type::ObjectType(object) => {
-                let properties = object
-                    .properties
+                let rest = shape.rest.map(|element| self.widen_fresh_literal(element));
+                let suffix = shape
+                    .suffix
                     .iter()
-                    .map(|property| {
-                        PropertyType::new(
-                            property.name.clone(),
-                            property.optional,
-                            self.widen(property.type_id, false),
-                        )
-                        .with_readonly(property.readonly)
-                    })
+                    .map(|element| self.widen_fresh_literal(*element))
                     .collect();
-                self.object_type_with_members(ObjectType {
-                    properties,
-                    call_signatures: object.call_signatures,
-                    index_signatures: object.index_signatures,
+                self.tuple_shape(TupleShape {
+                    prefix,
+                    required: shape.required,
+                    rest,
+                    suffix,
                 })
             }
             Type::Union(members) => {
                 let widened: Vec<_> = members
                     .iter()
-                    .map(|member| self.widen(*member, false))
+                    .map(|member| self.widen_fresh_literal(*member))
                     .collect();
                 self.union(&widened)
             }
@@ -919,6 +2111,303 @@ impl TypeTable {
     /// Computes compatibility once while retaining every accepted unsound
     pub fn relation(&self, source: TypeId, target: TypeId) -> TypeRelation {
         TypeRelations::new(self).relation(source, target)
+    }
+
+    fn import_type(
+        &mut self,
+        source: &Self,
+        root: TypeId,
+        imported: &mut ImportedTypeMap,
+        next_symbol: &mut u32,
+    ) -> TypeId {
+        fn copy(
+            target: &mut TypeTable,
+            source: &TypeTable,
+            source_id: TypeId,
+            imported: &mut ImportedTypeMap,
+            next_symbol: &mut u32,
+        ) -> TypeId {
+            if let Some(&type_id) = imported.types.get(&source_id) {
+                return type_id;
+            }
+            let source_type = source.get(source_id).clone();
+            let type_id = match source_type {
+                Type::Error => target.error_type(),
+                Type::Any => target.any(),
+                Type::Unknown => target.unknown(),
+                Type::Never => target.never(),
+                Type::Void => target.void(),
+                Type::Null => target.null_type(),
+                Type::Undefined => target.undefined_type(),
+                Type::Boolean => target.boolean(),
+                Type::Number => target.number(),
+                Type::BigInt => target.bigint(),
+                Type::String => target.string(),
+                Type::Symbol => target.symbol_type(),
+                Type::Object => target.object(),
+                Type::BooleanLiteral(value) => target.boolean_literal(value),
+                Type::NumberLiteral(value) => target.number_literal(&value),
+                Type::StringLiteral(value) => target.intern(Type::StringLiteral(value)),
+                Type::BigIntLiteral(value) => target.bigint_literal(&value),
+                Type::Array(element) => {
+                    let element = copy(target, source, element, imported, next_symbol);
+                    target.array(element)
+                }
+                Type::Tuple(shape) => {
+                    let prefix = shape
+                        .prefix
+                        .into_iter()
+                        .map(|item| copy(target, source, item, imported, next_symbol))
+                        .collect();
+                    let rest = shape
+                        .rest
+                        .map(|item| copy(target, source, item, imported, next_symbol));
+                    let suffix = shape
+                        .suffix
+                        .into_iter()
+                        .map(|item| copy(target, source, item, imported, next_symbol))
+                        .collect();
+                    target.tuple_shape(TupleShape {
+                        prefix,
+                        required: shape.required,
+                        rest,
+                        suffix,
+                    })
+                }
+                Type::Union(members) => {
+                    let members = members
+                        .into_iter()
+                        .map(|item| copy(target, source, item, imported, next_symbol))
+                        .collect::<Vec<_>>();
+                    target.union(&members)
+                }
+                Type::Intersection(members) => {
+                    let members = members
+                        .into_iter()
+                        .map(|item| copy(target, source, item, imported, next_symbol))
+                        .collect();
+                    target.intersection_ordered(members)
+                }
+                Type::ObjectType(object) => {
+                    let properties = object
+                        .properties
+                        .into_iter()
+                        .map(|property| {
+                            let declaring_class = property.declaring_class().map(|symbol| {
+                                remap_symbol(target, source, symbol, imported, next_symbol)
+                            });
+                            PropertyType::new(
+                                property.name.clone(),
+                                property.optional,
+                                copy(target, source, property.type_id, imported, next_symbol),
+                            )
+                            .with_readonly(property.readonly)
+                            .with_getter_only(property.getter_only)
+                            .with_accessibility(property.access(), declaring_class)
+                            .with_method(property.is_method)
+                        })
+                        .collect();
+                    let call_signatures = object
+                        .call_signatures
+                        .into_iter()
+                        .map(|signature| {
+                            copy_signature(target, source, signature, imported, next_symbol)
+                        })
+                        .collect();
+                    let construct_signatures = object
+                        .construct_signatures
+                        .into_iter()
+                        .map(|signature| {
+                            copy_signature(target, source, signature, imported, next_symbol)
+                        })
+                        .collect();
+                    let index_signatures = object
+                        .index_signatures
+                        .into_iter()
+                        .map(|signature| IndexSignature {
+                            readonly: signature.readonly,
+                            parameters: signature
+                                .parameters
+                                .into_iter()
+                                .map(|parameter| {
+                                    copy_parameter(target, source, parameter, imported, next_symbol)
+                                })
+                                .collect(),
+                            value_type: copy(
+                                target,
+                                source,
+                                signature.value_type,
+                                imported,
+                                next_symbol,
+                            ),
+                        })
+                        .collect();
+                    target.object_type_with_members(ObjectType {
+                        properties,
+                        call_signatures,
+                        construct_signatures,
+                        index_signatures,
+                    })
+                }
+                Type::Function(signature) => {
+                    let signature =
+                        copy_signature(target, source, signature, imported, next_symbol);
+                    target.intern(Type::Function(signature))
+                }
+                Type::Named(symbol) => {
+                    let symbol = remap_symbol(target, source, symbol, imported, next_symbol);
+                    target.named(symbol)
+                }
+                Type::AppliedClass { symbol, arguments } => {
+                    let symbol = remap_symbol(target, source, symbol, imported, next_symbol);
+                    let arguments = arguments
+                        .into_iter()
+                        .map(|argument| copy(target, source, argument, imported, next_symbol))
+                        .collect();
+                    target.applied_class(symbol, arguments)
+                }
+                Type::NumericEnum(symbol) => {
+                    let symbol = remap_symbol(target, source, symbol, imported, next_symbol);
+                    target.numeric_enum(symbol)
+                }
+                Type::Keyof(operand) => {
+                    let operand = copy(target, source, operand, imported, next_symbol);
+                    target.keyof(operand)
+                }
+                Type::IndexedAccess { object, index } => {
+                    let object = copy(target, source, object, imported, next_symbol);
+                    let index = copy(target, source, index, imported, next_symbol);
+                    target.indexed_access(object, index)
+                }
+            };
+            imported.types.insert(source_id, type_id);
+            type_id
+        }
+
+        fn remap_symbol(
+            target: &mut TypeTable,
+            source: &TypeTable,
+            source_symbol: SymbolId,
+            imported: &mut ImportedTypeMap,
+            next_symbol: &mut u32,
+        ) -> SymbolId {
+            if let Some(&symbol) = imported.symbols.get(&source_symbol) {
+                return symbol;
+            }
+            if source.object_symbol == Some(source_symbol)
+                && let Some(symbol) = target.object_symbol
+            {
+                imported.symbols.insert(source_symbol, symbol);
+                return symbol;
+            }
+
+            let symbol = SymbolId(*next_symbol);
+            *next_symbol = next_symbol
+                .checked_add(1)
+                .expect("imported symbol count fits in u32");
+            imported.symbols.insert(source_symbol, symbol);
+
+            if let Some(metadata) = source.classes.get(&source_symbol).cloned() {
+                let parameters = metadata
+                    .parameters
+                    .into_iter()
+                    .map(|parameter| remap_symbol(target, source, parameter, imported, next_symbol))
+                    .collect();
+                target.declare_class(symbol, parameters);
+                if metadata.bounds_ready {
+                    let bounds = metadata
+                        .bounds
+                        .into_iter()
+                        .map(|bounds| copy_bounds(target, source, bounds, imported, next_symbol))
+                        .collect();
+                    target.set_class_bounds(symbol, bounds);
+                }
+                if let Some(template) = metadata.template {
+                    let raw = copy(target, source, template.raw, imported, next_symbol);
+                    target.publish_class_template(symbol, raw, template.state);
+                }
+            }
+            if let Some(structure) = source.interface_structures.get(&source_symbol).copied() {
+                let structure = copy(target, source, structure, imported, next_symbol);
+                target.set_interface_structure(symbol, structure);
+            }
+            if let Some(constraint) = source
+                .type_parameter_constraints
+                .get(&source_symbol)
+                .copied()
+            {
+                let constraint = copy(target, source, constraint, imported, next_symbol);
+                target.set_type_parameter_constraint(symbol, constraint);
+            }
+            symbol
+        }
+
+        fn copy_parameter(
+            target: &mut TypeTable,
+            source: &TypeTable,
+            parameter: FunctionParameter,
+            imported: &mut ImportedTypeMap,
+            next_symbol: &mut u32,
+        ) -> FunctionParameter {
+            FunctionParameter::new(
+                parameter.name,
+                copy(target, source, parameter.type_id, imported, next_symbol),
+                parameter.optional,
+                parameter.rest,
+            )
+        }
+
+        fn copy_bounds(
+            target: &mut TypeTable,
+            source: &TypeTable,
+            bounds: TypeParameterBounds,
+            imported: &mut ImportedTypeMap,
+            next_symbol: &mut u32,
+        ) -> TypeParameterBounds {
+            TypeParameterBounds {
+                constraint: bounds
+                    .constraint
+                    .map(|type_id| copy(target, source, type_id, imported, next_symbol)),
+                default: bounds
+                    .default
+                    .map(|type_id| copy(target, source, type_id, imported, next_symbol)),
+            }
+        }
+
+        fn copy_signature(
+            target: &mut TypeTable,
+            source: &TypeTable,
+            signature: FunctionSignature,
+            imported: &mut ImportedTypeMap,
+            next_symbol: &mut u32,
+        ) -> FunctionSignature {
+            let javascript = signature.javascript;
+            let type_parameters = signature
+                .type_parameters
+                .into_iter()
+                .map(|parameter| remap_symbol(target, source, parameter, imported, next_symbol))
+                .collect();
+            let type_parameter_bounds = signature
+                .type_parameter_bounds
+                .into_iter()
+                .map(|bounds| copy_bounds(target, source, bounds, imported, next_symbol))
+                .collect();
+            let parameters = signature
+                .parameters
+                .into_iter()
+                .map(|parameter| copy_parameter(target, source, parameter, imported, next_symbol))
+                .collect();
+            let return_type = copy(target, source, signature.return_type, imported, next_symbol);
+            FunctionSignature {
+                type_parameters,
+                type_parameter_bounds,
+                parameters,
+                return_type,
+                javascript,
+            }
+        }
+
+        copy(self, source, root, imported, next_symbol)
     }
 }
 
@@ -945,6 +2434,17 @@ struct ImportEqualsTarget {
     ty: Option<SymbolId>,
 }
 
+/// One imported binding's resolved type fact, carried across module
+/// boundaries so a target binder can install the source's structural type
+/// before it resolves statements. `source_types` borrows the source file's
+/// [`TypeTable`]; `type_id` is the source-table identity to copy.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ImportedSymbolType<'a> {
+    pub symbol: SymbolId,
+    pub source_types: &'a TypeTable,
+    pub type_id: TypeId,
+}
+
 /// A named type definition kept by reference for lazy, memoized resolution.
 #[derive(Clone, Copy)]
 enum TypeDef<'src> {
@@ -956,8 +2456,6 @@ enum TypeDef<'src> {
     Interface {
         scope: ScopeId,
         type_parameters: Option<&'src crate::syntax::TypeParameterList>,
-        extends: &'src [TypeReference],
-        members: &'src [crate::syntax::TypeMemberNode],
     },
     Enum {
         numeric: bool,
@@ -1016,6 +2514,7 @@ pub struct SemanticModel {
     scopes: Vec<Scope>,
     symbols: Vec<Symbol>,
     symbol_types: Vec<TypeId>,
+    #[cfg(test)]
     overload_signatures: Vec<Vec<FunctionSignature>>,
     references: HashMap<NodeId, SymbolId>,
     reference_aliases: HashMap<NodeId, SymbolId>,
@@ -1092,6 +2591,7 @@ impl SemanticModel {
         self.symbol_types[id.0 as usize]
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn overload_signatures(&self, id: SymbolId) -> &[FunctionSignature] {
         &self.overload_signatures[id.0 as usize]
@@ -1257,6 +2757,26 @@ impl GuardResolver for BinderGuardResolver<'_> {
     }
 }
 
+struct WriteInventory {
+    root_scope: ScopeId,
+    shadow_frames: Vec<HashSet<String>>,
+}
+
+impl WriteInventory {
+    fn is_shadowed(&self, name: &str) -> bool {
+        self.shadow_frames
+            .iter()
+            .rev()
+            .any(|frame| frame.contains(name))
+    }
+}
+
+enum WriteFunctionBody<'src> {
+    Block(&'src [Stmt]),
+    Expression(&'src Expr),
+    Missing,
+}
+
 pub(crate) struct Binder<'src> {
     pub(crate) source: &'src SourceFile,
     intrinsics: GlobalEnvironment,
@@ -1266,6 +2786,9 @@ pub(crate) struct Binder<'src> {
     overload_signatures: Vec<Vec<FunctionSignature>>,
     type_state: Vec<TypeState>,
     type_defs: HashMap<SymbolId, TypeDef<'src>>,
+    /// All interface declarations that share the same symbol through merging,
+    /// in source order. The first declaration is also stored in `type_defs`.
+    interface_merges: HashMap<SymbolId, Vec<&'src InterfaceDeclaration>>,
     pub(crate) references: HashMap<NodeId, SymbolId>,
     reference_aliases: HashMap<NodeId, SymbolId>,
     type_nodes: HashMap<NodeId, TypeId>,
@@ -1309,17 +2832,43 @@ pub(crate) struct Binder<'src> {
     /// during class-body resolution so `new C()` and member access on class-typed
     /// values can resolve declared instance members.
     pub(crate) class_instance_types: HashMap<SymbolId, TypeId>,
+    /// Shared by provisional and final class-shape passes so a generic method's
+    /// type parameters keep one semantic identity.
+    class_method_signature_scopes: HashMap<NodeId, ScopeId>,
+    /// Predeclared scope for each named class declaration.
+    class_header_scopes: HashMap<NodeId, ScopeId>,
+    /// Enclosing class symbol for member-access authorization, innermost last.
+    class_owner_stack: Vec<SymbolId>,
+    /// Direct base class symbol for each class symbol, used for protected access.
+    class_base_symbols: HashMap<SymbolId, SymbolId>,
     /// Control-flow facts for guard narrowing, and the program point the walk
     /// currently sits at. Constructs the walk does not model contribute no
     /// facts, so a reference there falls back to its declared type.
     flow_facts: FlowFacts,
     flow: FlowNodeId,
+    /// Roots written through an identifier assignment or update in the
+    /// statement list currently being resolved. Captured narrowing may cross
+    /// a function boundary only when the root is immutable or no such write
+    /// appears in its enclosing scope.
+    reassigned_flow_roots: HashSet<SymbolId>,
+    /// Saved `reassigned_flow_roots` for enclosing statement lists, innermost
+    /// last. `captured_flow_seed` treats a root as reassigned if any frame on
+    /// the stack flags it, so later writes in an enclosing scope are visible.
+    reassigned_flow_roots_stack: Vec<HashSet<SymbolId>>,
     /// Enclosing function contexts for `super(...)` call legality, innermost
     /// last. Empty means top level, which behaves as
     /// [`SuperCallContext::NonConstructor`].
     super_call_contexts: Vec<SuperCallContext>,
     /// Whether each lexically enclosing class has a base class, innermost last.
     class_derived_stack: Vec<bool>,
+    /// Own readonly storage properties for each lexically enclosing class.
+    /// Only the active class constructor may initialize these through `this`.
+    constructor_writable_readonly_properties: Vec<HashSet<String>>,
+    /// Assignment targets that are writes to readonly or getter-only properties
+    /// outside the constructor-initialization window. The actual diagnostic is
+    /// emitted during `resolve_assignment_target`; the expression resolution
+    /// skips the unrelated `TYPE_NOT_ASSIGNABLE` check.
+    readonly_assignment_targets: HashSet<NodeId>,
     /// Enclosing `new.target` contexts: `true` when the innermost enclosing
     /// body is a function declaration, function expression, or constructor.
     /// `false` when it is a method, getter, setter, or static block.
@@ -1348,6 +2897,8 @@ pub(crate) struct Binder<'src> {
     return_types: HashMap<NodeId, Vec<TypeId>>,
     /// Stack of function body node ids currently being resolved, innermost last.
     function_body_stack: Vec<NodeId>,
+    /// Annotated return contract for the function body currently being resolved.
+    expected_return_types: Vec<Option<TypeId>>,
     /// Enclosing `this` types for `this` expressions, innermost last.
     this_context: Vec<TypeId>,
     /// Whether the current binding context is inside a `declare` directive.
@@ -1383,6 +2934,7 @@ impl<'src> Binder<'src> {
             overload_signatures: Vec::new(),
             type_state: Vec::new(),
             type_defs: HashMap::new(),
+            interface_merges: HashMap::new(),
             references: HashMap::new(),
             reference_aliases: HashMap::new(),
             type_nodes: HashMap::new(),
@@ -1414,15 +2966,23 @@ impl<'src> Binder<'src> {
             qualified_import_paths: HashMap::new(),
             import_equals_targets: HashMap::new(),
             hoisted_declaration_symbols: HashMap::new(),
+            class_instance_types: HashMap::new(),
+            class_method_signature_scopes: HashMap::new(),
+            class_header_scopes: HashMap::new(),
+            class_owner_stack: Vec::new(),
+            class_base_symbols: HashMap::new(),
             jsx_element_types: HashMap::new(),
             jsx_callables: HashMap::new(),
             jsx_factory_signatures: HashMap::new(),
-            class_instance_types: HashMap::new(),
-            flow_facts: FlowFacts::new(),
-            flow: FlowNodeId::ROOT,
+            reassigned_flow_roots: HashSet::new(),
+            reassigned_flow_roots_stack: Vec::new(),
             super_call_contexts: Vec::new(),
             class_derived_stack: Vec::new(),
+            constructor_writable_readonly_properties: Vec::new(),
+            readonly_assignment_targets: HashSet::new(),
             new_target_contexts: Vec::new(),
+            flow_facts: FlowFacts::new(),
+            flow: FlowNodeId::ROOT,
             ambient_stack: Vec::new(),
             strict_null_checks: options.strict_null_checks(),
             no_implicit_any: options.no_implicit_any(),
@@ -1432,6 +2992,7 @@ impl<'src> Binder<'src> {
             suppress_used_before_assigned: false,
             return_types: HashMap::new(),
             function_body_stack: Vec::new(),
+            expected_return_types: Vec::new(),
             this_context: Vec::new(),
             ambient_binding: false,
             is_declaration_file: source.source_text().is_declaration_file(),
@@ -1452,6 +3013,68 @@ impl<'src> Binder<'src> {
         } else {
             self.types.assignable(source, target)
         }
+    }
+
+    /// Resolves a `Type::Named` type-parameter symbol to its effective
+    /// (non-type-parameter) constraint, following chains and terminating on cycles.
+    /// Returns `None` for an unconstrained type parameter or for a named type that
+    /// is not a type parameter.
+    fn type_parameter_effective_constraint(&self, type_id: TypeId) -> Option<TypeId> {
+        let Type::Named(symbol) = self.types.get(type_id) else {
+            return None;
+        };
+        if self.symbols[symbol.get() as usize].kind() != SymbolKind::TypeParameter {
+            return None;
+        }
+        let mut current = *symbol;
+        let mut seen = HashSet::new();
+        while seen.insert(current) {
+            let constraint = self.types.type_parameter_constraint(current)?;
+            match self.types.get(constraint) {
+                Type::Named(next)
+                    if self.symbols[next.get() as usize].kind() == SymbolKind::TypeParameter =>
+                {
+                    current = *next;
+                    continue;
+                }
+                _ => return Some(constraint),
+            }
+        }
+        None
+    }
+
+    /// Returns the type to use for assertion overlap when `type_id` is a
+    /// type parameter: its constraint if present, or `unknown` when unconstrained.
+    /// Non-type-parameters are returned unchanged.
+    fn effective_overlap_type(&self, type_id: TypeId) -> TypeId {
+        self.type_parameter_effective_constraint(type_id)
+            .unwrap_or_else(|| {
+                if let Type::Named(symbol) = self.types.get(type_id)
+                    && self.symbols[symbol.get() as usize].kind() == SymbolKind::TypeParameter
+                {
+                    return self.types.unknown();
+                }
+                type_id
+            })
+    }
+
+    fn is_valid_rest_parameter_type(&self, type_id: TypeId) -> bool {
+        let resolved = self
+            .type_parameter_effective_constraint(type_id)
+            .unwrap_or(type_id);
+        matches!(
+            self.types.get(resolved),
+            Type::Any | Type::Error | Type::Array(_) | Type::Tuple(_)
+        )
+    }
+
+    /// Whether a type assertion is valid in either the source-to-target or
+    /// target-to-source direction, allowing both narrowing and widening casts
+    /// while still rejecting unrelated types.
+    fn is_assertion_compatible(&self, source: TypeId, target: TypeId) -> bool {
+        let source = self.effective_overlap_type(source);
+        let target = self.effective_overlap_type(target);
+        self.types.comparable(source, target)
     }
 
     fn is_typescript(&self) -> bool {
@@ -1501,8 +3124,10 @@ impl<'src> Binder<'src> {
                     | "TypeError"
                     | "URIError"
             ) {
-                self.class_instance_types.insert(id, error_instance);
-                self.types.set_class_instance(id, error_instance);
+                self.types.declare_class(id, Vec::new());
+                self.types.publish_final_class_template(id, error_instance);
+                let applied = self.types.applied_class(id, Vec::new());
+                self.class_instance_types.insert(id, applied);
             }
         }
         for name in self.intrinsics.types() {
@@ -1520,6 +3145,10 @@ impl<'src> Binder<'src> {
     }
 
     pub(crate) fn run(&mut self) {
+        self.run_with_imported_types(&[]);
+    }
+
+    fn run_with_imported_types(&mut self, imported_types: &[ImportedSymbolType<'_>]) {
         let statements = self.source.statements();
         let scope = self.module_scope;
         if self.is_declaration_file {
@@ -1536,6 +3165,22 @@ impl<'src> Binder<'src> {
         self.bind_statements(statements, scope);
         self.bind_hoisted_statements(statements, scope);
         self.build_import_equals_targets(statements, scope);
+        let mut imported_by_source = HashMap::<*const TypeTable, ImportedTypeMap>::new();
+        let mut next_imported_symbol =
+            u32::try_from(self.symbols.len()).expect("symbol count fits in u32");
+        for imported in imported_types {
+            let identities = imported_by_source
+                .entry(std::ptr::from_ref(imported.source_types))
+                .or_default();
+            let type_id = self.types.import_type(
+                imported.source_types,
+                imported.type_id,
+                identities,
+                &mut next_imported_symbol,
+            );
+            self.symbol_types[imported.symbol.get() as usize] = type_id;
+            self.type_state[imported.symbol.get() as usize] = TypeState::Done(type_id);
+        }
         self.resolve_statements(statements, scope);
         self.check_export_assignment_conflicts();
     }
@@ -1576,6 +3221,7 @@ impl<'src> Binder<'src> {
             scopes: self.scopes,
             symbols: self.symbols,
             symbol_types: self.symbol_types,
+            #[cfg(test)]
             overload_signatures: self.overload_signatures,
             references: self.references,
             reference_aliases: self.reference_aliases,
@@ -1671,6 +3317,51 @@ impl<'src> Binder<'src> {
             NarrowingContext::new(&mut self.types, &mut self.flow_facts).join(parent, branches);
     }
 
+    /// Runs `walk` at a fresh flow root, then restores the caller's program
+    /// point. Declared types remain visible, but refinements and exits inside
+    /// the walk do not leak into the enclosing flow.
+    fn in_isolated_flow<T>(&mut self, flow: FlowNodeId, walk: impl FnOnce(&mut Self) -> T) -> T {
+        let outer = self.flow;
+        self.flow = flow;
+        let result = walk(self);
+        self.flow = outer;
+        result
+    }
+
+    /// Seeds a nested closure with narrowed bare-root facts that are stable
+    /// across deferred execution. Property-path facts are deliberately not
+    /// copied: a const object does not make its properties immutable.
+    fn captured_flow_seed(&mut self) -> FlowNodeId {
+        let outer = self.flow;
+        let stable_roots: Vec<(SymbolId, TypeId)> = self
+            .symbols
+            .iter()
+            .enumerate()
+            .filter_map(|(index, symbol)| {
+                let symbol_id = SymbolId::new(index as u32);
+                let immutable = matches!(
+                    symbol.kind,
+                    SymbolKind::Variable(
+                        VariableKind::Const | VariableKind::Using | VariableKind::AwaitUsing
+                    )
+                );
+                (immutable || !self.is_reassigned_in_scope(symbol_id))
+                    .then_some((symbol_id, self.symbol_types[index]))
+            })
+            .collect();
+        let mut narrowing = NarrowingContext::new(&mut self.types, &mut self.flow_facts);
+        let seed = narrowing.branch(FlowNodeId::ROOT);
+        for (symbol, declared) in stable_roots {
+            let key = FlowKey::root(symbol);
+            if let Some(narrowed) = narrowing.type_at(outer, &key)
+                && narrowed != declared
+            {
+                narrowing.refine(seed, key, narrowed);
+            }
+        }
+        seed
+    }
+
     /// Effective type of `symbol` at the current program point: the nearest
     /// guard refinement, else `declared`.
     fn narrowed_type(&mut self, symbol: SymbolId, declared: TypeId) -> TypeId {
@@ -1679,6 +3370,349 @@ impl<'src> Binder<'src> {
         let mut narrowing = NarrowingContext::new(&mut self.types, &mut self.flow_facts);
         narrowing.declare(symbol, declared);
         narrowing.type_at(flow, &key).unwrap_or(declared)
+    }
+
+    fn assignment_flow_key(
+        &self,
+        target: &'src crate::syntax::AssignmentTargetNode,
+    ) -> Option<FlowKey> {
+        match target.data() {
+            AssignmentTarget::Identifier(identifier) => self
+                .references
+                .get(&identifier.id())
+                .copied()
+                .map(FlowKey::root),
+            AssignmentTarget::Member(member) => {
+                let resolver = BinderGuardResolver {
+                    references: &self.references,
+                    node_types: &self.node_types,
+                    fallback: self.types.any(),
+                    source: self.source,
+                };
+                let key = flow_key_of(&member.object, &resolver)?;
+                let MemberProperty::Named(property) = &member.property else {
+                    return None;
+                };
+                Some(key.child(self.identifier_text(property).as_ref()))
+            }
+            _ => None,
+        }
+    }
+
+    fn invalidate_assignment_flow(&mut self, target: &'src crate::syntax::AssignmentTargetNode) {
+        match target.data() {
+            AssignmentTarget::Object(object) => {
+                for property in &object.properties {
+                    self.invalidate_assignment_flow(&property.target);
+                }
+            }
+            AssignmentTarget::Array(array) => {
+                for element in &array.elements {
+                    if let crate::syntax::AssignmentArrayElement::Target(target) = element {
+                        self.invalidate_assignment_flow(target);
+                    }
+                }
+            }
+            AssignmentTarget::Identifier(_) | AssignmentTarget::Member(_) => {
+                let Some(key) = self.assignment_flow_key(target) else {
+                    return;
+                };
+                NarrowingContext::new(&mut self.types, &mut self.flow_facts)
+                    .invalidate(self.flow, &key);
+            }
+            AssignmentTarget::Missing(_) => {}
+        }
+    }
+
+    fn record_reassigned_root(&mut self, symbol: SymbolId) {
+        self.reassigned_flow_roots.insert(symbol);
+    }
+
+    fn inventory_assignment_target_writes(
+        &mut self,
+        target: &'src crate::syntax::AssignmentTargetNode,
+        inventory: &mut WriteInventory,
+    ) {
+        match target.data() {
+            AssignmentTarget::Identifier(identifier) => {
+                let name = self.identifier_text(identifier);
+                if inventory.is_shadowed(name.as_ref()) {
+                    return;
+                }
+                if let Some(symbol) = self.lookup_value(inventory.root_scope, name.as_ref()) {
+                    self.record_reassigned_root(symbol);
+                }
+            }
+            AssignmentTarget::Member(member) => {
+                self.inventory_expression_writes(&member.object, inventory);
+                if let MemberProperty::Computed(property) = &member.property {
+                    self.inventory_expression_writes(property, inventory);
+                }
+            }
+            AssignmentTarget::Object(object) => {
+                for property in &object.properties {
+                    self.inventory_assignment_target_writes(&property.target, inventory);
+                    if let Some(initializer) = &property.initializer {
+                        self.inventory_expression_writes(initializer, inventory);
+                    }
+                }
+            }
+            AssignmentTarget::Array(array) => {
+                for element in &array.elements {
+                    if let crate::syntax::AssignmentArrayElement::Target(target) = element {
+                        self.inventory_assignment_target_writes(target, inventory);
+                    }
+                }
+            }
+            AssignmentTarget::Missing(_) => {}
+        }
+    }
+
+    fn inventory_assignment_target_writes_in_scope(
+        &mut self,
+        target: &'src crate::syntax::AssignmentTargetNode,
+        scope: ScopeId,
+    ) {
+        let mut inventory = WriteInventory {
+            root_scope: scope,
+            shadow_frames: Vec::new(),
+        };
+        self.inventory_assignment_target_writes(target, &mut inventory);
+    }
+
+    fn inventory_binding_pattern_defaults(
+        &mut self,
+        pattern: &'src crate::syntax::Pattern,
+        inventory: &mut WriteInventory,
+    ) {
+        match pattern.data() {
+            BindingPattern::Object(object) => {
+                for property in &object.properties {
+                    self.inventory_binding_pattern_defaults(&property.binding, inventory);
+                    if let Some(initializer) = &property.initializer {
+                        self.inventory_expression_writes(initializer, inventory);
+                    }
+                }
+            }
+            BindingPattern::Array(array) => {
+                for element in &array.elements {
+                    if let crate::syntax::ArrayBindingElement::Binding(binding) = element {
+                        self.inventory_binding_pattern_defaults(binding, inventory);
+                    }
+                }
+            }
+            BindingPattern::Rest(rest) => {
+                self.inventory_binding_pattern_defaults(&rest.argument, inventory);
+            }
+            BindingPattern::Assignment(assignment) => {
+                self.inventory_binding_pattern_defaults(&assignment.left, inventory);
+                self.inventory_expression_writes(&assignment.right, inventory);
+            }
+            BindingPattern::Identifier(_) | BindingPattern::Missing(_) => {}
+        }
+    }
+
+    fn collect_write_binding_names(
+        &self,
+        pattern: &'src crate::syntax::Pattern,
+        names: &mut HashSet<String>,
+    ) {
+        match pattern.data() {
+            BindingPattern::Identifier(identifier) => {
+                names.insert(self.identifier_text(identifier).into_owned());
+            }
+            BindingPattern::Object(object) => {
+                for property in &object.properties {
+                    self.collect_write_binding_names(&property.binding, names);
+                }
+            }
+            BindingPattern::Array(array) => {
+                for element in &array.elements {
+                    if let crate::syntax::ArrayBindingElement::Binding(binding) = element {
+                        self.collect_write_binding_names(binding, names);
+                    }
+                }
+            }
+            BindingPattern::Rest(rest) => {
+                self.collect_write_binding_names(&rest.argument, names);
+            }
+            BindingPattern::Assignment(assignment) => {
+                self.collect_write_binding_names(&assignment.left, names);
+            }
+            BindingPattern::Missing(_) => {}
+        }
+    }
+
+    fn collect_direct_write_lexicals(
+        &self,
+        statements: &'src [crate::syntax::Stmt],
+        names: &mut HashSet<String>,
+    ) {
+        for statement in statements {
+            self.collect_direct_write_lexical(statement, names);
+        }
+    }
+
+    fn collect_direct_write_lexical(
+        &self,
+        statement: &'src crate::syntax::Stmt,
+        names: &mut HashSet<String>,
+    ) {
+        match statement.data() {
+            Statement::Variable(variable) if variable.kind != VariableKind::Var => {
+                for declarator in &variable.declarations {
+                    self.collect_write_binding_names(&declarator.data().binding, names);
+                }
+            }
+            Statement::Class(class) => {
+                if let Some(name) = &class.name {
+                    names.insert(self.identifier_text(name).into_owned());
+                }
+            }
+            Statement::Enum(declaration) => {
+                names.insert(self.identifier_text(&declaration.name).into_owned());
+            }
+            Statement::Namespace(namespace) => {
+                if let Some(name) = namespace.name.as_identifier() {
+                    names.insert(self.identifier_text(name).into_owned());
+                }
+            }
+            Statement::Declare(inner) => self.collect_direct_write_lexical(inner, names),
+            Statement::Export(crate::syntax::ExportDeclaration::Named(
+                crate::syntax::ExportNamedDeclaration::Declaration(inner),
+            )) => self.collect_direct_write_lexical(inner, names),
+            _ => {}
+        }
+    }
+
+    fn collect_hoisted_write_names(
+        &self,
+        statements: &'src [crate::syntax::Stmt],
+        names: &mut HashSet<String>,
+    ) {
+        for statement in statements {
+            self.collect_hoisted_write_name(statement, names);
+        }
+    }
+
+    fn collect_hoisted_write_name(
+        &self,
+        statement: &'src crate::syntax::Stmt,
+        names: &mut HashSet<String>,
+    ) {
+        match statement.data() {
+            Statement::Variable(variable) if variable.kind == VariableKind::Var => {
+                for declarator in &variable.declarations {
+                    self.collect_write_binding_names(&declarator.data().binding, names);
+                }
+            }
+            Statement::Function(function) => {
+                if let Some(name) = &function.function.name {
+                    names.insert(self.identifier_text(name).into_owned());
+                }
+            }
+            Statement::Block(block) => {
+                self.collect_hoisted_write_names(&block.data().statements, names);
+            }
+            Statement::If(statement) => {
+                self.collect_hoisted_write_name(&statement.consequent, names);
+                if let Some(alternate) = &statement.alternate {
+                    self.collect_hoisted_write_name(alternate, names);
+                }
+            }
+            Statement::Switch(statement) => {
+                for case in &statement.cases {
+                    self.collect_hoisted_write_names(&case.data().consequent, names);
+                }
+            }
+            Statement::For(statement) => {
+                if let Some(ForInitializer::Variable(variable)) = &statement.initializer
+                    && variable.kind == VariableKind::Var
+                {
+                    for declarator in &variable.declarations {
+                        self.collect_write_binding_names(&declarator.data().binding, names);
+                    }
+                }
+                self.collect_hoisted_write_name(&statement.body, names);
+            }
+            Statement::ForIn(statement) => {
+                if let ForBinding::Variable(variable) = &statement.binding
+                    && variable.kind == VariableKind::Var
+                {
+                    for declarator in &variable.declarations {
+                        self.collect_write_binding_names(&declarator.data().binding, names);
+                    }
+                }
+                self.collect_hoisted_write_name(&statement.body, names);
+            }
+            Statement::ForOf(statement) => {
+                if let ForBinding::Variable(variable) = &statement.binding
+                    && variable.kind == VariableKind::Var
+                {
+                    for declarator in &variable.declarations {
+                        self.collect_write_binding_names(&declarator.data().binding, names);
+                    }
+                }
+                self.collect_hoisted_write_name(&statement.body, names);
+            }
+            Statement::While(statement) => {
+                self.collect_hoisted_write_name(&statement.body, names);
+            }
+            Statement::DoWhile(statement) => {
+                self.collect_hoisted_write_name(&statement.body, names);
+            }
+            Statement::Try(statement) => {
+                self.collect_hoisted_write_names(&statement.block.data().statements, names);
+                if let Some(handler) = &statement.handler {
+                    self.collect_hoisted_write_names(&handler.data().body.data().statements, names);
+                }
+                if let Some(finalizer) = &statement.finalizer {
+                    self.collect_hoisted_write_names(&finalizer.data().statements, names);
+                }
+            }
+            Statement::With(statement) => {
+                self.collect_hoisted_write_name(&statement.body, names);
+            }
+            Statement::Labeled(statement) => {
+                self.collect_hoisted_write_name(&statement.body, names);
+            }
+            Statement::Declare(inner) => self.collect_hoisted_write_name(inner, names),
+            Statement::Export(crate::syntax::ExportDeclaration::Named(
+                crate::syntax::ExportNamedDeclaration::Declaration(inner),
+            )) => self.collect_hoisted_write_name(inner, names),
+            _ => {}
+        }
+    }
+
+    fn is_reassigned_in_scope(&self, symbol: SymbolId) -> bool {
+        if self.reassigned_flow_roots.contains(&symbol) {
+            return true;
+        }
+        self.reassigned_flow_roots_stack
+            .iter()
+            .any(|frame| frame.contains(&symbol))
+    }
+
+    /// Saves the current `reassigned_flow_roots` and starts a fresh frame for
+    /// a new statement list (function body, block, branch). Call
+    /// `pop_reassigned_scope` when the list ends to merge parent-visible
+    /// writes back.
+    fn push_reassigned_scope(&mut self) {
+        let outer = std::mem::take(&mut self.reassigned_flow_roots);
+        self.reassigned_flow_roots_stack.push(outer);
+    }
+
+    /// Merges the current frame's writes into the parent frame and restores
+    /// the parent as active. Writes in a child scope are visible to the parent
+    /// because the assignment has executed by the time control returns.
+    fn pop_reassigned_scope(&mut self) {
+        let mut child = std::mem::take(&mut self.reassigned_flow_roots);
+        if let Some(mut parent) = self.reassigned_flow_roots_stack.pop() {
+            parent.extend(child.drain());
+            self.reassigned_flow_roots = parent;
+        } else {
+            self.reassigned_flow_roots = child;
+        }
     }
 
     pub(crate) fn identifier_text(&self, identifier: &IdentifierNode) -> Cow<'src, str> {
@@ -1922,6 +3956,96 @@ impl<'src> Binder<'src> {
         for statement in statements {
             self.bind_statement(statement, scope);
         }
+        for statement in statements {
+            if let Some(class) = Self::statement_class(statement) {
+                self.predeclare_class_header(class, scope);
+            }
+        }
+        for statement in statements {
+            if let Some(class) = Self::statement_class(statement) {
+                self.resolve_predeclared_class_bounds(class);
+            }
+        }
+    }
+
+    fn statement_class(statement: &'src crate::syntax::Stmt) -> Option<&'src ClassDeclaration> {
+        match statement.data() {
+            Statement::Class(class) => Some(class),
+            Statement::Declare(inner) => Self::statement_class(inner),
+            Statement::Export(crate::syntax::ExportDeclaration::Named(
+                crate::syntax::ExportNamedDeclaration::Declaration(inner),
+            )) => Self::statement_class(inner),
+            Statement::Export(crate::syntax::ExportDeclaration::Default(default)) => {
+                match &default.value {
+                    crate::syntax::ExportDefaultValue::Class(class) => Some(class),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn predeclare_class_header(&mut self, class: &'src ClassDeclaration, parent: ScopeId) {
+        let Some(name) = &class.name else {
+            return;
+        };
+        let Some(owner) = self.scopes[parent.0 as usize]
+            .values
+            .get(self.identifier_text(name).as_ref())
+            .copied()
+        else {
+            return;
+        };
+        let scope = self.new_scope(ScopeKind::Class, Some(parent));
+        self.scopes[scope.0 as usize].strict = true;
+        self.bind_type_parameter_names(class.type_parameters.as_ref(), scope);
+        let parameters = self.class_type_parameter_symbols(class, scope);
+        self.types.declare_class(owner, parameters);
+        self.set_scope_owner(scope, owner);
+        let replaced = self.class_header_scopes.insert(name.id(), scope);
+        debug_assert!(replaced.is_none());
+    }
+
+    fn resolve_predeclared_class_bounds(&mut self, class: &'src ClassDeclaration) {
+        let Some(name) = &class.name else {
+            return;
+        };
+        let Some(scope) = self.class_header_scopes.get(&name.id()).copied() else {
+            return;
+        };
+        let owner = self.scopes[scope.0 as usize]
+            .owner
+            .expect("predeclared class scope has an owner");
+        if !self.types.begin_class_bounds(owner) {
+            return;
+        }
+        let bounds = self
+            .signature_type_parameters(class.type_parameters.as_ref(), scope)
+            .1;
+        self.types.finish_class_bounds(owner, bounds);
+    }
+
+    fn class_type_parameter_symbols(
+        &self,
+        class: &'src ClassDeclaration,
+        scope: ScopeId,
+    ) -> Vec<SymbolId> {
+        class
+            .type_parameters
+            .as_ref()
+            .map(|list| {
+                list.parameters
+                    .iter()
+                    .filter_map(|parameter| {
+                        let name = self.identifier_text(&parameter.data().name);
+                        self.scopes[scope.0 as usize]
+                            .types
+                            .get(name.as_ref())
+                            .copied()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Pre-binds `var` and function names that occur beneath lexical child
@@ -2288,7 +4412,16 @@ impl<'src> Binder<'src> {
             });
 
         for statement in &declaration.body.data().statements {
-            self.bind_namespace_member(statement, local_scope, export_scope, symbol, ambient);
+            let target =
+                self.bind_namespace_member(statement, local_scope, export_scope, symbol, ambient);
+            if let Some(class) = Self::statement_class(statement) {
+                self.predeclare_class_header(class, target);
+            }
+        }
+        for statement in &declaration.body.data().statements {
+            if let Some(class) = Self::statement_class(statement) {
+                self.resolve_predeclared_class_bounds(class);
+            }
         }
         for statement in &declaration.body.data().statements {
             let target = if ambient
@@ -2315,39 +4448,44 @@ impl<'src> Binder<'src> {
         export_scope: ScopeId,
         container: SymbolId,
         ambient: bool,
-    ) {
+    ) -> ScopeId {
+        let target = if ambient
+            || matches!(
+                statement.data(),
+                Statement::Declare(_)
+                    | Statement::Export(crate::syntax::ExportDeclaration::Named(
+                        crate::syntax::ExportNamedDeclaration::Declaration(_)
+                    ))
+            )
+            || self.is_dotted_namespace_tail(statement)
+        {
+            export_scope
+        } else {
+            local_scope
+        };
         match statement.data() {
             Statement::Export(crate::syntax::ExportDeclaration::Named(
                 crate::syntax::ExportNamedDeclaration::Declaration(inner),
             )) => match inner.data() {
-                Statement::Namespace(namespace) => self.bind_namespace(
-                    namespace,
-                    inner.id(),
-                    export_scope,
-                    ambient,
-                    Some(container),
-                ),
-                _ => self.bind_statement(inner, export_scope),
+                Statement::Namespace(namespace) => {
+                    self.bind_namespace(namespace, inner.id(), target, ambient, Some(container))
+                }
+                _ => self.bind_statement(inner, target),
             },
             Statement::Namespace(namespace)
                 if ambient || self.is_dotted_namespace_tail(statement) =>
             {
-                self.bind_namespace(
-                    namespace,
-                    statement.id(),
-                    export_scope,
-                    ambient,
-                    Some(container),
-                );
+                self.bind_namespace(namespace, statement.id(), target, ambient, Some(container));
             }
             Statement::Declare(inner) => match inner.data() {
                 Statement::Namespace(namespace) => {
-                    self.bind_namespace(namespace, inner.id(), export_scope, true, Some(container))
+                    self.bind_namespace(namespace, inner.id(), target, true, Some(container))
                 }
-                _ => self.bind_statement(statement, export_scope),
+                _ => self.bind_statement(statement, target),
             },
-            _ => self.bind_statement(statement, if ambient { export_scope } else { local_scope }),
+            _ => self.bind_statement(statement, target),
         }
+        target
     }
 
     fn is_dotted_namespace_tail(&self, statement: &crate::syntax::Stmt) -> bool {
@@ -2440,13 +4578,10 @@ impl<'src> Binder<'src> {
         );
         let type_scope = self.new_scope(ScopeKind::Block, Some(scope));
         self.bind_type_parameter_names(interface.type_parameters.as_ref(), type_scope);
-        // Only the first interface of a mergeable set owns the definition slot;
-        // later merges keep their symbol but reuse the representative's shape.
+        self.interface_merges.entry(id).or_default().push(interface);
         self.type_defs.entry(id).or_insert(TypeDef::Interface {
             scope: type_scope,
             type_parameters: interface.type_parameters.as_ref(),
-            extends: &interface.extends,
-            members: &interface.members,
         });
     }
 
@@ -2563,9 +4698,654 @@ impl<'src> Binder<'src> {
     }
 
     fn resolve_statements(&mut self, statements: &'src [crate::syntax::Stmt], scope: ScopeId) {
+        self.publish_statement_class_shapes(statements, scope);
+        self.check_bound_statements(statements, scope);
+    }
+
+    fn publish_statement_class_shapes(
+        &mut self,
+        statements: &'src [crate::syntax::Stmt],
+        scope: ScopeId,
+    ) {
+        for statement in statements {
+            if let Some(class) = Self::statement_class(statement) {
+                self.publish_predeclared_class_shape(class, scope);
+            }
+        }
+    }
+
+    fn check_bound_statements(&mut self, statements: &'src [crate::syntax::Stmt], scope: ScopeId) {
+        self.inventory_statement_writes(statements, scope);
         self.check_function_overload_order(statements, scope);
         for statement in statements {
             self.resolve_statement(statement, scope);
+        }
+    }
+
+    fn inventory_statement_writes(
+        &mut self,
+        statements: &'src [crate::syntax::Stmt],
+        scope: ScopeId,
+    ) {
+        let mut inventory = WriteInventory {
+            root_scope: scope,
+            shadow_frames: Vec::new(),
+        };
+        self.inventory_statement_list_writes(statements, &mut inventory);
+    }
+
+    fn inventory_statement_list_writes(
+        &mut self,
+        statements: &'src [crate::syntax::Stmt],
+        inventory: &mut WriteInventory,
+    ) {
+        for statement in statements {
+            self.inventory_statement_write(statement, inventory);
+        }
+    }
+
+    fn inventory_lexical_statement_list_writes(
+        &mut self,
+        statements: &'src [crate::syntax::Stmt],
+        inventory: &mut WriteInventory,
+    ) {
+        let mut names = HashSet::new();
+        self.collect_direct_write_lexicals(statements, &mut names);
+        inventory.shadow_frames.push(names);
+        self.inventory_statement_list_writes(statements, inventory);
+        inventory.shadow_frames.pop();
+    }
+
+    fn inventory_hoisted_lexical_statement_list_writes(
+        &mut self,
+        statements: &'src [crate::syntax::Stmt],
+        inventory: &mut WriteInventory,
+    ) {
+        let mut names = HashSet::new();
+        self.collect_direct_write_lexicals(statements, &mut names);
+        self.collect_hoisted_write_names(statements, &mut names);
+        inventory.shadow_frames.push(names);
+        self.inventory_statement_list_writes(statements, inventory);
+        inventory.shadow_frames.pop();
+    }
+
+    fn inventory_function_like_writes(
+        &mut self,
+        function: &'src FunctionLike,
+        local_name: Option<&'src IdentifierNode>,
+        inventory: &mut WriteInventory,
+    ) {
+        for decorator in &function.decorators {
+            self.inventory_expression_writes(&decorator.data().expression, inventory);
+        }
+        self.inventory_parameter_decorator_writes(&function.parameters, inventory);
+        let body = match &function.body {
+            Some(FunctionBody::Block(block)) => WriteFunctionBody::Block(&block.data().statements),
+            Some(FunctionBody::Expression(expression)) => WriteFunctionBody::Expression(expression),
+            Some(FunctionBody::Missing(_)) | None => WriteFunctionBody::Missing,
+        };
+        self.inventory_nested_function_writes(&function.parameters, local_name, body, inventory);
+    }
+
+    fn inventory_arrow_writes(
+        &mut self,
+        arrow: &'src ArrowFunction,
+        inventory: &mut WriteInventory,
+    ) {
+        self.inventory_parameter_decorator_writes(&arrow.parameters, inventory);
+        let body = match &arrow.body {
+            FunctionBody::Block(block) => WriteFunctionBody::Block(&block.data().statements),
+            FunctionBody::Expression(expression) => WriteFunctionBody::Expression(expression),
+            FunctionBody::Missing(_) => WriteFunctionBody::Missing,
+        };
+        self.inventory_nested_function_writes(&arrow.parameters, None, body, inventory);
+    }
+
+    fn inventory_parameter_decorator_writes(
+        &mut self,
+        parameters: &'src [ParameterNode],
+        inventory: &mut WriteInventory,
+    ) {
+        for parameter in parameters {
+            for decorator in &parameter.data().decorators {
+                self.inventory_expression_writes(&decorator.data().expression, inventory);
+            }
+        }
+    }
+
+    fn inventory_nested_function_writes(
+        &mut self,
+        parameters: &'src [ParameterNode],
+        local_name: Option<&'src IdentifierNode>,
+        body: WriteFunctionBody<'src>,
+        inventory: &mut WriteInventory,
+    ) {
+        let mut parameter_names = HashSet::new();
+        if let Some(name) = local_name {
+            parameter_names.insert(self.identifier_text(name).into_owned());
+        }
+        for parameter in parameters {
+            self.collect_write_binding_names(&parameter.data().binding, &mut parameter_names);
+        }
+
+        inventory.shadow_frames.push(parameter_names);
+        for parameter in parameters {
+            let data = parameter.data();
+            self.inventory_binding_pattern_defaults(&data.binding, inventory);
+            if let Some(initializer) = &data.initializer {
+                self.inventory_expression_writes(initializer, inventory);
+            }
+        }
+
+        match body {
+            WriteFunctionBody::Block(statements) => {
+                self.inventory_hoisted_lexical_statement_list_writes(statements, inventory);
+            }
+            WriteFunctionBody::Expression(expression) => {
+                self.inventory_expression_writes(expression, inventory);
+            }
+            WriteFunctionBody::Missing => {}
+        }
+        inventory.shadow_frames.pop();
+    }
+
+    fn inventory_property_name_writes(
+        &mut self,
+        name: &'src PropertyName,
+        inventory: &mut WriteInventory,
+    ) {
+        if let PropertyName::Computed(expression) = name {
+            self.inventory_expression_writes(expression, inventory);
+        }
+    }
+
+    fn inventory_class_writes(
+        &mut self,
+        class: &'src ClassDeclaration,
+        local_name: Option<&'src IdentifierNode>,
+        inventory: &mut WriteInventory,
+    ) {
+        for decorator in &class.decorators {
+            self.inventory_expression_writes(&decorator.data().expression, inventory);
+        }
+        if let Some(name) = local_name {
+            inventory
+                .shadow_frames
+                .push(HashSet::from([self.identifier_text(name).into_owned()]));
+        }
+        if let Some(heritage) = &class.extends {
+            self.inventory_expression_writes(&heritage.expression, inventory);
+        }
+        for member in &class.members {
+            match member.data() {
+                ClassMember::Constructor(constructor) => {
+                    for decorator in &constructor.decorators {
+                        self.inventory_expression_writes(&decorator.data().expression, inventory);
+                    }
+                    self.inventory_parameter_decorator_writes(&constructor.parameters, inventory);
+                    self.inventory_nested_function_writes(
+                        &constructor.parameters,
+                        None,
+                        WriteFunctionBody::Block(&constructor.body.data().statements),
+                        inventory,
+                    );
+                }
+                ClassMember::Method(method) => {
+                    self.inventory_property_name_writes(&method.name, inventory);
+                    self.inventory_function_like_writes(&method.function, None, inventory);
+                }
+                ClassMember::Property(property) => {
+                    for decorator in &property.decorators {
+                        self.inventory_expression_writes(&decorator.data().expression, inventory);
+                    }
+                    self.inventory_property_name_writes(&property.name, inventory);
+                    if let Some(initializer) = &property.initializer {
+                        self.inventory_expression_writes(initializer, inventory);
+                    }
+                }
+                ClassMember::AutoAccessor(accessor) => {
+                    for decorator in &accessor.decorators {
+                        self.inventory_expression_writes(&decorator.data().expression, inventory);
+                    }
+                    self.inventory_property_name_writes(&accessor.name, inventory);
+                    if let Some(initializer) = &accessor.initializer {
+                        self.inventory_expression_writes(initializer, inventory);
+                    }
+                }
+                ClassMember::StaticBlock(block) => {
+                    self.inventory_hoisted_lexical_statement_list_writes(
+                        &block.data().statements,
+                        inventory,
+                    );
+                }
+                ClassMember::IndexSignature(_) | ClassMember::Missing(_) => {}
+            }
+        }
+        if local_name.is_some() {
+            inventory.shadow_frames.pop();
+        }
+    }
+
+    fn inventory_namespace_writes(
+        &mut self,
+        namespace: &'src crate::syntax::NamespaceDeclaration,
+        inventory: &mut WriteInventory,
+    ) {
+        self.inventory_hoisted_lexical_statement_list_writes(
+            &namespace.body.data().statements,
+            inventory,
+        );
+    }
+
+    fn inventory_jsx_attributes_writes(
+        &mut self,
+        attributes: &'src [JsxAttributeItem],
+        inventory: &mut WriteInventory,
+    ) {
+        for attribute in attributes {
+            match attribute {
+                JsxAttributeItem::Attribute(attribute) => {
+                    if let Some(JsxAttributeInitializer::Expression(container)) =
+                        &attribute.data().initializer
+                        && let Some(expression) = &container.data().expression
+                    {
+                        self.inventory_expression_writes(expression, inventory);
+                    }
+                }
+                JsxAttributeItem::Spread(spread) => {
+                    self.inventory_expression_writes(&spread.data().expression, inventory);
+                }
+            }
+        }
+    }
+
+    fn inventory_jsx_children_writes(
+        &mut self,
+        children: &'src [JsxChild],
+        inventory: &mut WriteInventory,
+    ) {
+        for child in children {
+            match child {
+                JsxChild::ExpressionContainer(container) => {
+                    if let Some(expression) = &container.data().expression {
+                        self.inventory_expression_writes(expression, inventory);
+                    }
+                }
+                JsxChild::Spread(spread) => {
+                    self.inventory_expression_writes(&spread.data().expression, inventory);
+                }
+                JsxChild::Element(expression) => {
+                    self.inventory_expression_writes(expression, inventory);
+                }
+                JsxChild::Text(_) => {}
+            }
+        }
+    }
+
+    fn inventory_statement_write(
+        &mut self,
+        statement: &'src crate::syntax::Stmt,
+        inventory: &mut WriteInventory,
+    ) {
+        match statement.data() {
+            Statement::Variable(variable) => {
+                for declarator in &variable.declarations {
+                    self.inventory_binding_pattern_defaults(&declarator.data().binding, inventory);
+                    if let Some(initializer) = &declarator.data().initializer {
+                        self.inventory_expression_writes(initializer, inventory);
+                    }
+                }
+            }
+            Statement::Function(function) => {
+                self.inventory_function_like_writes(&function.function, None, inventory);
+            }
+            Statement::Class(class) => {
+                self.inventory_class_writes(class, None, inventory);
+            }
+            Statement::Enum(declaration) => {
+                for member in &declaration.members {
+                    if let Some(initializer) = &member.data().initializer {
+                        self.inventory_expression_writes(initializer, inventory);
+                    }
+                }
+            }
+            Statement::Namespace(namespace) => {
+                self.inventory_namespace_writes(namespace, inventory);
+            }
+            Statement::Block(block) => {
+                self.inventory_lexical_statement_list_writes(&block.data().statements, inventory);
+            }
+            Statement::Expression(statement) => {
+                self.inventory_expression_writes(&statement.expression, inventory);
+            }
+            Statement::If(statement) => {
+                self.inventory_expression_writes(&statement.test, inventory);
+                self.inventory_statement_write(&statement.consequent, inventory);
+                if let Some(alternate) = &statement.alternate {
+                    self.inventory_statement_write(alternate, inventory);
+                }
+            }
+            Statement::Switch(statement) => {
+                self.inventory_expression_writes(&statement.discriminant, inventory);
+                let mut names = HashSet::new();
+                for case in &statement.cases {
+                    self.collect_direct_write_lexicals(&case.data().consequent, &mut names);
+                }
+                inventory.shadow_frames.push(names);
+                for case in &statement.cases {
+                    if let Some(test) = &case.data().test {
+                        self.inventory_expression_writes(test, inventory);
+                    }
+                    self.inventory_statement_list_writes(&case.data().consequent, inventory);
+                }
+                inventory.shadow_frames.pop();
+            }
+            Statement::For(for_statement) => {
+                let mut names = HashSet::new();
+                if let Some(ForInitializer::Variable(variable)) = &for_statement.initializer
+                    && variable.kind != VariableKind::Var
+                {
+                    for declarator in &variable.declarations {
+                        self.collect_write_binding_names(&declarator.data().binding, &mut names);
+                    }
+                }
+                inventory.shadow_frames.push(names);
+                if let Some(initializer) = &for_statement.initializer {
+                    match initializer {
+                        ForInitializer::Variable(variable) => {
+                            for declarator in &variable.declarations {
+                                self.inventory_binding_pattern_defaults(
+                                    &declarator.data().binding,
+                                    inventory,
+                                );
+                                if let Some(initializer) = &declarator.data().initializer {
+                                    self.inventory_expression_writes(initializer, inventory);
+                                }
+                            }
+                        }
+                        ForInitializer::Expression(expression) => {
+                            self.inventory_expression_writes(expression, inventory);
+                        }
+                    }
+                }
+                if let Some(test) = &for_statement.test {
+                    self.inventory_expression_writes(test, inventory);
+                }
+                if let Some(update) = &for_statement.update {
+                    self.inventory_expression_writes(update, inventory);
+                }
+                self.inventory_statement_write(&for_statement.body, inventory);
+                inventory.shadow_frames.pop();
+            }
+            Statement::ForIn(for_statement) => {
+                let mut names = HashSet::new();
+                if let ForBinding::Variable(variable) = &for_statement.binding
+                    && variable.kind != VariableKind::Var
+                {
+                    for declarator in &variable.declarations {
+                        self.collect_write_binding_names(&declarator.data().binding, &mut names);
+                    }
+                }
+                inventory.shadow_frames.push(names);
+                if let ForBinding::Target(target) = &for_statement.binding {
+                    self.inventory_assignment_target_writes(target, inventory);
+                }
+                self.inventory_expression_writes(&for_statement.object, inventory);
+                self.inventory_statement_write(&for_statement.body, inventory);
+                inventory.shadow_frames.pop();
+            }
+            Statement::ForOf(for_statement) => {
+                let mut names = HashSet::new();
+                if let ForBinding::Variable(variable) = &for_statement.binding
+                    && variable.kind != VariableKind::Var
+                {
+                    for declarator in &variable.declarations {
+                        self.collect_write_binding_names(&declarator.data().binding, &mut names);
+                    }
+                }
+                inventory.shadow_frames.push(names);
+                if let ForBinding::Target(target) = &for_statement.binding {
+                    self.inventory_assignment_target_writes(target, inventory);
+                }
+                self.inventory_expression_writes(&for_statement.iterable, inventory);
+                self.inventory_statement_write(&for_statement.body, inventory);
+                inventory.shadow_frames.pop();
+            }
+            Statement::While(statement) => {
+                self.inventory_expression_writes(&statement.test, inventory);
+                self.inventory_statement_write(&statement.body, inventory);
+            }
+            Statement::DoWhile(statement) => {
+                self.inventory_statement_write(&statement.body, inventory);
+                self.inventory_expression_writes(&statement.test, inventory);
+            }
+            Statement::Try(statement) => {
+                self.inventory_lexical_statement_list_writes(
+                    &statement.block.data().statements,
+                    inventory,
+                );
+                if let Some(handler) = &statement.handler {
+                    let mut names = HashSet::new();
+                    if let Some(binding) = &handler.data().binding {
+                        self.collect_write_binding_names(binding, &mut names);
+                    }
+                    inventory.shadow_frames.push(names);
+                    self.inventory_lexical_statement_list_writes(
+                        &handler.data().body.data().statements,
+                        inventory,
+                    );
+                    inventory.shadow_frames.pop();
+                }
+                if let Some(finalizer) = &statement.finalizer {
+                    self.inventory_lexical_statement_list_writes(
+                        &finalizer.data().statements,
+                        inventory,
+                    );
+                }
+            }
+            Statement::With(with_statement) => {
+                self.inventory_expression_writes(&with_statement.object, inventory);
+                self.inventory_statement_write(&with_statement.body, inventory);
+            }
+            Statement::Labeled(statement) => {
+                self.inventory_statement_write(&statement.body, inventory);
+            }
+            Statement::Return(return_statement) => {
+                if let Some(argument) = &return_statement.argument {
+                    self.inventory_expression_writes(argument, inventory);
+                }
+            }
+            Statement::Throw(statement) => {
+                self.inventory_expression_writes(&statement.argument, inventory);
+            }
+            Statement::Declare(inner) => self.inventory_statement_write(inner, inventory),
+            Statement::Export(crate::syntax::ExportDeclaration::Named(
+                crate::syntax::ExportNamedDeclaration::Declaration(inner),
+            )) => self.inventory_statement_write(inner, inventory),
+            Statement::Export(crate::syntax::ExportDeclaration::Default(default)) => {
+                match &default.value {
+                    crate::syntax::ExportDefaultValue::Function(function) => {
+                        self.inventory_function_like_writes(function, None, inventory);
+                    }
+                    crate::syntax::ExportDefaultValue::Class(class) => {
+                        self.inventory_class_writes(class, None, inventory);
+                    }
+                    crate::syntax::ExportDefaultValue::Expression(expression) => {
+                        self.inventory_expression_writes(expression, inventory);
+                    }
+                    _ => {}
+                }
+            }
+            Statement::Export(crate::syntax::ExportDeclaration::Assignment(expression)) => {
+                self.inventory_expression_writes(expression, inventory);
+            }
+            _ => {}
+        }
+    }
+
+    fn inventory_expression_writes(
+        &mut self,
+        expression: &'src Expr,
+        inventory: &mut WriteInventory,
+    ) {
+        match expression.data() {
+            Expression::Template(template) => {
+                for expression in &template.expressions {
+                    self.inventory_expression_writes(expression, inventory);
+                }
+            }
+            Expression::TaggedTemplate(tagged) => {
+                self.inventory_expression_writes(&tagged.tag, inventory);
+                for expression in &tagged.template.expressions {
+                    self.inventory_expression_writes(expression, inventory);
+                }
+            }
+            Expression::Array(array) => {
+                for element in &array.elements {
+                    match element {
+                        ArrayElement::Expression(expression) => {
+                            self.inventory_expression_writes(expression, inventory)
+                        }
+                        ArrayElement::Spread(spread) => {
+                            self.inventory_expression_writes(&spread.argument, inventory)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Expression::Object(object) => {
+                for member in &object.members {
+                    match member.data() {
+                        ObjectMember::Property(property) => {
+                            self.inventory_property_name_writes(&property.name, inventory);
+                            self.inventory_expression_writes(&property.value, inventory);
+                        }
+                        ObjectMember::Method(method) => {
+                            self.inventory_property_name_writes(&method.name, inventory);
+                            self.inventory_function_like_writes(&method.function, None, inventory);
+                        }
+                        ObjectMember::Spread(spread) => {
+                            self.inventory_expression_writes(&spread.argument, inventory)
+                        }
+                        ObjectMember::Missing(_) => {}
+                    }
+                }
+            }
+            Expression::Call(call) => {
+                self.inventory_expression_writes(&call.callee, inventory);
+                for argument in &call.arguments {
+                    match argument {
+                        CallArgument::Expression(expression) => {
+                            self.inventory_expression_writes(expression, inventory)
+                        }
+                        CallArgument::Spread(spread) => {
+                            self.inventory_expression_writes(&spread.argument, inventory)
+                        }
+                        CallArgument::Missing(_) => {}
+                    }
+                }
+            }
+            Expression::Member(member) => {
+                self.inventory_expression_writes(&member.object, inventory);
+                if let MemberProperty::Computed(property) = &member.property {
+                    self.inventory_expression_writes(property, inventory);
+                }
+            }
+            Expression::New(new) => {
+                self.inventory_expression_writes(&new.callee, inventory);
+                for argument in &new.arguments {
+                    match argument {
+                        CallArgument::Expression(expression) => {
+                            self.inventory_expression_writes(expression, inventory)
+                        }
+                        CallArgument::Spread(spread) => {
+                            self.inventory_expression_writes(&spread.argument, inventory)
+                        }
+                        CallArgument::Missing(_) => {}
+                    }
+                }
+            }
+            Expression::Await(awaited) => {
+                self.inventory_expression_writes(&awaited.argument, inventory)
+            }
+            Expression::Yield(yielded) => {
+                if let Some(argument) = &yielded.argument {
+                    self.inventory_expression_writes(argument, inventory);
+                }
+            }
+            Expression::Unary(unary) => {
+                self.inventory_expression_writes(&unary.argument, inventory);
+            }
+            Expression::Update(update) => {
+                self.inventory_assignment_target_writes(&update.argument, inventory);
+            }
+            Expression::Binary(binary) => {
+                self.inventory_expression_writes(&binary.left, inventory);
+                self.inventory_expression_writes(&binary.right, inventory);
+            }
+            Expression::Logical(logical) => {
+                self.inventory_expression_writes(&logical.left, inventory);
+                self.inventory_expression_writes(&logical.right, inventory);
+            }
+            Expression::Conditional(conditional) => {
+                self.inventory_expression_writes(&conditional.test, inventory);
+                self.inventory_expression_writes(&conditional.consequent, inventory);
+                self.inventory_expression_writes(&conditional.alternate, inventory);
+            }
+            Expression::Assignment(assignment) => {
+                self.inventory_assignment_target_writes(&assignment.left, inventory);
+                self.inventory_expression_writes(&assignment.right, inventory);
+            }
+            Expression::Sequence(sequence) => {
+                for expression in &sequence.expressions {
+                    self.inventory_expression_writes(expression, inventory);
+                }
+            }
+            Expression::Parenthesized(expression) => {
+                self.inventory_expression_writes(expression, inventory)
+            }
+            Expression::As(expression) => {
+                self.inventory_expression_writes(&expression.expression, inventory)
+            }
+            Expression::Satisfies(expression) => {
+                self.inventory_expression_writes(&expression.expression, inventory)
+            }
+            Expression::TypeAssertion(expression) => {
+                self.inventory_expression_writes(&expression.expression, inventory)
+            }
+            Expression::NonNull(expression) => {
+                self.inventory_expression_writes(&expression.expression, inventory)
+            }
+            Expression::Import(import) => {
+                self.inventory_expression_writes(&import.source, inventory);
+                if let Some(options) = &import.options {
+                    self.inventory_expression_writes(options, inventory);
+                }
+            }
+            Expression::Function(function) => {
+                self.inventory_function_like_writes(
+                    &function.function,
+                    function.function.name.as_ref(),
+                    inventory,
+                );
+            }
+            Expression::Class(class) => {
+                self.inventory_class_writes(&class.class, class.class.name.as_ref(), inventory);
+            }
+            Expression::Arrow(arrow) => {
+                self.inventory_arrow_writes(arrow, inventory);
+            }
+            Expression::JsxElement(element) => {
+                self.inventory_jsx_attributes_writes(&element.opening.data().attributes, inventory);
+                self.inventory_jsx_children_writes(&element.children, inventory);
+            }
+            Expression::JsxSelfClosingElement(element) => {
+                self.inventory_jsx_attributes_writes(&element.attributes, inventory);
+            }
+            Expression::JsxFragment(fragment) => {
+                self.inventory_jsx_children_writes(&fragment.children, inventory);
+            }
+            _ => {}
         }
     }
 
@@ -2716,7 +5496,10 @@ impl<'src> Binder<'src> {
                 self.bind_statements(&block.data().statements, child);
                 self.resolve_statements(&block.data().statements, child);
             }
-            Statement::Expression(statement) => self.resolve_expr(&statement.expression, scope),
+            Statement::Expression(statement) => {
+                self.resolve_expr(&statement.expression, scope);
+                self.type_of_expr(&statement.expression, scope);
+            }
             Statement::If(statement) => {
                 self.resolve_expr(&statement.test, scope);
                 let parent = self.flow;
@@ -2755,7 +5538,10 @@ impl<'src> Binder<'src> {
                     self.bind_statements(&case.data().consequent, child);
                 }
                 for case in &statement.cases {
-                    self.resolve_statements(&case.data().consequent, child);
+                    self.publish_statement_class_shapes(&case.data().consequent, child);
+                }
+                for case in &statement.cases {
+                    self.check_bound_statements(&case.data().consequent, child);
                 }
             }
             Statement::For(for_statement) => {
@@ -2766,10 +5552,25 @@ impl<'src> Binder<'src> {
                 if let Some(test) = &for_statement.test {
                     self.resolve_expr(test, child);
                 }
-                if let Some(update) = &for_statement.update {
-                    self.resolve_expr(update, child);
+                let parent = self.flow;
+                let truthy = for_statement
+                    .test
+                    .as_ref()
+                    .map_or_else(Vec::new, |test| self.guards_for(test, false));
+                let body_end = self.in_branch(parent, &truthy, |binder| {
+                    binder.resolve_statement(&for_statement.body, child);
+                    if let Some(update) = &for_statement.update {
+                        binder.resolve_expr(update, child);
+                    }
+                });
+                if let Some(test) = &for_statement.test {
+                    let falsy = self.guards_for(test, true);
+                    let skipped = self.branch_guarded(parent, &falsy);
+                    let body_exit = self.branch_guarded(body_end, &falsy);
+                    self.join_flow(parent, &[skipped, body_exit]);
+                } else {
+                    self.flow = body_end;
                 }
-                self.resolve_statement(&for_statement.body, child);
             }
             Statement::ForIn(for_statement) => {
                 let child = self.new_scope(ScopeKind::For, Some(scope));
@@ -2795,17 +5596,42 @@ impl<'src> Binder<'src> {
                     self.resolve_for_binding(&for_statement.binding, child, false);
                 }
                 self.resolve_expr(&for_statement.object, child);
-                self.resolve_statement(&for_statement.body, child);
+                let parent = self.flow;
+                let skipped = self.branch_guarded(parent, &[]);
+                let body_end = self.in_branch(parent, &[], |binder| {
+                    binder.resolve_statement(&for_statement.body, child);
+                });
+                self.join_flow(parent, &[skipped, body_end]);
             }
             Statement::ForOf(for_statement) => {
                 let child = self.new_scope(ScopeKind::For, Some(scope));
-                self.resolve_for_binding(&for_statement.binding, child, false);
                 self.resolve_expr(&for_statement.iterable, child);
-                self.resolve_statement(&for_statement.body, child);
+                let iterable_type = self.type_of_expr(&for_statement.iterable, child);
+                let element_type = self.iteration_element_type(iterable_type);
+                self.resolve_for_of_binding(
+                    &for_statement.binding,
+                    child,
+                    for_statement.mode,
+                    element_type,
+                );
+                let parent = self.flow;
+                let skipped = self.branch_guarded(parent, &[]);
+                let body_end = self.in_branch(parent, &[], |binder| {
+                    binder.resolve_statement(&for_statement.body, child);
+                });
+                self.join_flow(parent, &[skipped, body_end]);
             }
             Statement::While(statement) => {
                 self.resolve_expr(&statement.test, scope);
-                self.resolve_statement(&statement.body, scope);
+                let parent = self.flow;
+                let truthy = self.guards_for(&statement.test, false);
+                let falsy = self.guards_for(&statement.test, true);
+                let body_end = self.in_branch(parent, &truthy, |binder| {
+                    binder.resolve_statement(&statement.body, scope);
+                });
+                let skipped = self.branch_guarded(parent, &falsy);
+                let body_exit = self.branch_guarded(body_end, &falsy);
+                self.join_flow(parent, &[skipped, body_exit]);
             }
             Statement::DoWhile(statement) => {
                 self.resolve_statement(&statement.body, scope);
@@ -2850,16 +5676,35 @@ impl<'src> Binder<'src> {
             }
             Statement::Labeled(statement) => self.resolve_statement(&statement.body, scope),
             Statement::ImportEquals(_) => {}
-            Statement::Return(statement) => {
-                if let Some(argument) = &statement.argument {
-                    self.resolve_expr(argument, scope);
-                }
-                if let Some(body_id) = self.function_body_stack.last().copied() {
-                    let return_type = statement
+            Statement::Return(return_statement) => {
+                let expected = self.expected_return_types.last().copied().flatten();
+                let return_type = return_statement
+                    .argument
+                    .as_ref()
+                    .map(|argument| {
+                        self.resolve_expr(argument, scope);
+                        match expected {
+                            Some(target) => self.type_of_expr_with_target(argument, target, scope),
+                            None => self.type_of_expr(argument, scope),
+                        }
+                    })
+                    .unwrap_or_else(|| self.types.undefined_type());
+                let compatible = if return_statement.argument.is_some() {
+                    expected.is_none_or(|expected| self.types_assignable(return_type, expected))
+                } else if let Some(expected) = expected {
+                    self.types
+                        .assignable_with_strict_null(return_type, expected)
+                } else {
+                    true
+                };
+                if !compatible {
+                    let range = return_statement
                         .argument
                         .as_ref()
-                        .map(|argument| self.type_of_expr(argument, scope))
-                        .unwrap_or_else(|| self.types.void());
+                        .map_or_else(|| statement.range(), |argument| argument.range());
+                    self.emit(TYPE_NOT_ASSIGNABLE, range, NOT_ASSIGNABLE_MESSAGE);
+                }
+                if let Some(body_id) = self.function_body_stack.last().copied() {
                     self.return_types
                         .entry(body_id)
                         .or_default()
@@ -2999,7 +5844,76 @@ impl<'src> Binder<'src> {
                         FOR_IN_LEFT_HAND_SIDE_INVALID_MESSAGE,
                     );
                 } else {
+                    self.inventory_assignment_target_writes_in_scope(target, scope);
                     self.resolve_assignment_target(target, scope);
+                }
+            }
+        }
+    }
+
+    fn resolve_for_of_binding(
+        &mut self,
+        binding: &'src ForBinding,
+        scope: ScopeId,
+        _mode: ForOfMode,
+        element_type: TypeId,
+    ) {
+        match binding {
+            ForBinding::Variable(variable) => {
+                self.bind_variable(variable, scope, NodeId::default());
+                for declarator_node in &variable.declarations {
+                    let declarator = declarator_node.data();
+                    if matches!(
+                        variable.kind,
+                        VariableKind::Using | VariableKind::AwaitUsing
+                    ) && !matches!(declarator.binding.data(), BindingPattern::Identifier(_))
+                    {
+                        self.emit(
+                            USING_DECLARATION_BINDING_PATTERN,
+                            declarator_node.range(),
+                            USING_DECLARATION_BINDING_PATTERN_MESSAGE,
+                        );
+                    }
+                    let annotation = declarator
+                        .type_annotation
+                        .as_ref()
+                        .map(|annotation| self.resolve_type(&annotation.data().type_node, scope));
+                    if let Some(target) = annotation
+                        && !self.types_assignable(element_type, target)
+                    {
+                        self.emit(
+                            TYPE_NOT_ASSIGNABLE,
+                            declarator.binding.range(),
+                            NOT_ASSIGNABLE_MESSAGE,
+                        );
+                    }
+                    let declared = annotation.unwrap_or(element_type);
+                    let keep_literal = matches!(
+                        variable.kind,
+                        VariableKind::Const | VariableKind::Using | VariableKind::AwaitUsing
+                    );
+                    self.assign_binding_pattern_types(
+                        &declarator.binding,
+                        declared,
+                        scope,
+                        keep_literal,
+                    );
+                }
+            }
+            ForBinding::Target(target) => {
+                if matches!(target.data(), AssignmentTarget::Missing(_)) {
+                    self.emit(
+                        FOR_IN_LEFT_HAND_SIDE_INVALID,
+                        target.range(),
+                        FOR_IN_LEFT_HAND_SIDE_INVALID_MESSAGE,
+                    );
+                } else {
+                    self.inventory_assignment_target_writes_in_scope(target, scope);
+                    self.resolve_assignment_target(target, scope);
+                    let target_type = self.type_of_assignment_target(target, scope);
+                    if !self.types_assignable(element_type, target_type) {
+                        self.emit(TYPE_NOT_ASSIGNABLE, target.range(), NOT_ASSIGNABLE_MESSAGE);
+                    }
                 }
             }
         }
@@ -3045,55 +5959,146 @@ impl<'src> Binder<'src> {
                 .type_annotation
                 .as_ref()
                 .map(|annotation| self.resolve_type(&annotation.data().type_node, scope));
-            let initializer_type = declarator
-                .initializer
-                .as_ref()
-                .map(|initializer| self.type_of_expr(initializer, scope));
-
-            // Only a plain identifier binding carries a checkable declared type.
-            if let BindingPattern::Identifier(name) = declarator.binding.data() {
-                let declared = annotation
-                    .or(initializer_type)
-                    .unwrap_or_else(|| self.types.any());
-                let initializer_is_as_const =
-                    declarator.initializer.as_ref().is_some_and(|initializer| {
-                        matches!(
-                            initializer.data(),
-                            Expression::As(cast) if cast.type_node.is_none()
-                        )
+            let initializer_type =
+                declarator
+                    .initializer
+                    .as_ref()
+                    .map(|initializer| match annotation {
+                        Some(target) => self.type_of_expr_with_target(initializer, target, scope),
+                        None => self.type_of_expr(initializer, scope),
                     });
-                let keep_literal = matches!(
-                    variable.kind,
-                    VariableKind::Const | VariableKind::Using | VariableKind::AwaitUsing
+
+            if let (Some(target), Some(source)) = (annotation, initializer_type)
+                && !self.types_assignable(source, target)
+            {
+                self.emit(
+                    TYPE_NOT_ASSIGNABLE,
+                    declarator.binding.range(),
+                    NOT_ASSIGNABLE_MESSAGE,
                 );
-                let declared = if initializer_is_as_const {
-                    declared
-                } else {
-                    self.types.widen(declared, keep_literal)
-                };
-                if let Some(symbol) = self.lookup_value(scope, &self.identifier_text(name)) {
-                    self.symbol_types[symbol.get() as usize] = declared;
-                    match declarator
+            }
+
+            let declared = match (annotation, initializer_type) {
+                (Some(annotation), _) => annotation,
+                (None, Some(initializer)) => {
+                    if declarator
                         .initializer
-                        .as_ref()
-                        .map(|initializer| initializer.data())
+                        .as_deref()
+                        .is_some_and(Self::is_fresh_array_literal)
                     {
-                        Some(Expression::Function(function)) => {
-                            self.jsx_callables
-                                .insert(symbol, JsxCallable::Function(&function.function));
-                        }
-                        Some(Expression::Arrow(arrow)) => {
-                            self.jsx_callables.insert(symbol, JsxCallable::Arrow(arrow));
-                        }
-                        _ => {}
+                        self.types.widen_fresh_literal(initializer)
+                    } else {
+                        initializer
                     }
                 }
-                if let (Some(target), Some(source)) = (annotation, initializer_type)
-                    && !self.types_assignable(source, target)
+                (None, None) => self.types.any(),
+            };
+            let initializer_is_as_const =
+                declarator.initializer.as_ref().is_some_and(|initializer| {
+                    matches!(
+                        initializer.data(),
+                        Expression::As(cast) if cast.type_node.is_none()
+                    )
+                });
+            let keep_literal = matches!(
+                variable.kind,
+                VariableKind::Const | VariableKind::Using | VariableKind::AwaitUsing
+            );
+            let keep_literal = initializer_is_as_const || keep_literal;
+            self.assign_binding_pattern_types(&declarator.binding, declared, scope, keep_literal);
+
+            if let BindingPattern::Identifier(name) = declarator.binding.data()
+                && let Some(symbol) = self.lookup_value(scope, &self.identifier_text(name))
+            {
+                match declarator
+                    .initializer
+                    .as_ref()
+                    .map(|initializer| initializer.data())
                 {
-                    self.emit(TYPE_NOT_ASSIGNABLE, name.range(), NOT_ASSIGNABLE_MESSAGE);
+                    Some(Expression::Function(function)) => {
+                        self.jsx_callables
+                            .insert(symbol, JsxCallable::Function(&function.function));
+                    }
+                    Some(Expression::Arrow(arrow)) => {
+                        self.jsx_callables.insert(symbol, JsxCallable::Arrow(arrow));
+                    }
+                    _ => {}
                 }
             }
+        }
+    }
+
+    fn is_fresh_array_literal(expression: &Expr) -> bool {
+        match expression.data() {
+            Expression::Array(_) => true,
+            Expression::Parenthesized(parenthesized) => {
+                Self::is_fresh_array_literal(parenthesized.as_ref())
+            }
+            _ => false,
+        }
+    }
+
+    fn assign_binding_pattern_types(
+        &mut self,
+        pattern: &'src crate::syntax::Pattern,
+        source: TypeId,
+        scope: ScopeId,
+        keep_literal: bool,
+    ) {
+        match pattern.data() {
+            BindingPattern::Identifier(name) => {
+                let declared = self.types.widen(source, keep_literal);
+                if let Some(symbol) = self.lookup_value(scope, &self.identifier_text(name)) {
+                    self.symbol_types[symbol.get() as usize] = declared;
+                }
+            }
+            BindingPattern::Object(object) => {
+                for property in &object.properties {
+                    let projected = self
+                        .property_key(&property.name)
+                        .and_then(|name| self.types.read_property_type(source, &name))
+                        .unwrap_or_else(|| self.types.any());
+                    self.assign_binding_pattern_types(
+                        &property.binding,
+                        projected,
+                        scope,
+                        keep_literal,
+                    );
+                }
+            }
+            BindingPattern::Array(array) => {
+                for (index, element) in array.elements.iter().enumerate() {
+                    if let crate::syntax::ArrayBindingElement::Binding(inner) = element {
+                        let projected = self.binding_element_type(source, index);
+                        self.assign_binding_pattern_types(inner, projected, scope, keep_literal);
+                    }
+                }
+            }
+            BindingPattern::Rest(rest) => {
+                self.assign_binding_pattern_types(&rest.argument, source, scope, keep_literal);
+            }
+            BindingPattern::Assignment(assignment) => {
+                self.assign_binding_pattern_types(&assignment.left, source, scope, keep_literal);
+            }
+            BindingPattern::Missing(_) => {}
+        }
+    }
+
+    fn binding_element_type(&mut self, source: TypeId, index: usize) -> TypeId {
+        match self.types.get(source).clone() {
+            Type::Tuple(shape) => self
+                .types
+                .tuple_index_type(&shape, index)
+                .unwrap_or_else(|| self.types.undefined_type()),
+            Type::Array(element) => element,
+            Type::Union(members) => {
+                let projected: Vec<_> = members
+                    .into_iter()
+                    .map(|member| self.binding_element_type(member, index))
+                    .collect();
+                self.types.union(&projected)
+            }
+            _ => self.types.any(),
         }
     }
 
@@ -3154,54 +6159,71 @@ impl<'src> Binder<'src> {
             }
             self.resolve_parameter(parameter, scope);
         }
-        if let Some(return_type) = &function.return_type {
-            let _ = self.resolve_type(&return_type.data().type_node, scope);
-        }
+        let annotated_return_type = function
+            .return_type
+            .as_ref()
+            .map(|annotation| self.resolve_type(&annotation.data().type_node, scope));
+        let expected_return_type = annotated_return_type.map(|return_type| {
+            if function.is_async {
+                self.promise_value_type(return_type).unwrap_or(return_type)
+            } else {
+                return_type
+            }
+        });
+        self.expected_return_types.push(expected_return_type);
         self.this_context.push(this_type);
         if let Some(body_id) = function.body.as_ref().and_then(FunctionBody::id) {
+            self.return_types.entry(body_id).or_default();
             self.function_body_stack.push(body_id);
         }
-        match &function.body {
+        let body_flow = if is_declaration {
+            FlowNodeId::ROOT
+        } else {
+            self.captured_flow_seed()
+        };
+        if !is_declaration {
+            self.push_reassigned_scope();
+        }
+        self.in_isolated_flow(body_flow, |binder| match &function.body {
             Some(FunctionBody::Block(block)) => {
-                if directive_prologue_is_strict(self.source, &block.data().statements) {
-                    self.scopes[scope.0 as usize].strict = true;
+                if directive_prologue_is_strict(binder.source, &block.data().statements) {
+                    binder.scopes[scope.0 as usize].strict = true;
                 }
-                self.bind_statements(&block.data().statements, scope);
-                self.bind_hoisted_statements(&block.data().statements, scope);
-                self.resolve_statements(&block.data().statements, scope);
+                binder.bind_statements(&block.data().statements, scope);
+                binder.bind_hoisted_statements(&block.data().statements, scope);
+                binder.resolve_statements(&block.data().statements, scope);
             }
-            Some(FunctionBody::Expression(expression)) => self.resolve_expr(expression, scope),
+            Some(FunctionBody::Expression(expression)) => binder.resolve_expr(expression, scope),
             _ => {}
+        });
+        if !is_declaration {
+            self.pop_reassigned_scope();
         }
         if let Some(symbol) = function_symbol {
             let return_type = if let Some(annotation) = &function.return_type {
                 self.resolve_type(&annotation.data().type_node, scope)
             } else {
-                self.inferred_return_type(function, scope)
+                let inferred = self.inferred_return_type(function, scope);
+                if function.is_async {
+                    self.promise_type(inferred)
+                } else {
+                    inferred
+                }
             };
-            let type_parameters = function
-                .type_parameters
-                .as_ref()
-                .map(|list| {
-                    list.parameters
-                        .iter()
-                        .filter_map(|param| {
-                            let name = self.identifier_text(&param.data().name);
-                            self.lookup_type(scope, &name)
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let (type_parameters, type_parameter_bounds) =
+                self.signature_type_parameters(function.type_parameters.as_ref(), scope);
             let mut function_parameters = Vec::with_capacity(function.parameters.len());
             for (idx, parameter) in function.parameters.iter().enumerate() {
                 if let Some(lowered) = self.lower_parameter(idx, parameter, scope) {
                     function_parameters.push(lowered);
                 }
             }
-            let function_type = self.types.function_with_parameters(
+            let function_type = self.types.function_with_parameter_bounds(
                 type_parameters,
+                type_parameter_bounds,
                 function_parameters,
                 return_type,
+                !self.is_typescript(),
             );
             self.symbol_types[symbol.get() as usize] = function_type;
             if is_declaration && function.body.is_none() {
@@ -3215,6 +6237,7 @@ impl<'src> Binder<'src> {
             let popped = self.function_body_stack.pop();
             debug_assert_eq!(popped, Some(body_id));
         }
+        self.expected_return_types.pop();
         self.this_context.pop();
         self.new_target_contexts.truncate(new_target_marker);
         let popped_context = self.super_call_contexts.pop();
@@ -3255,18 +6278,43 @@ impl<'src> Binder<'src> {
         list: Option<&'src crate::syntax::TypeParameterList>,
         scope: ScopeId,
     ) {
+        let _ = self.signature_type_parameters(list, scope);
+    }
+
+    fn signature_type_parameters(
+        &mut self,
+        list: Option<&'src crate::syntax::TypeParameterList>,
+        scope: ScopeId,
+    ) -> (Vec<SymbolId>, Vec<TypeParameterBounds>) {
         let Some(list) = list else {
-            return;
+            return (Vec::new(), Vec::new());
         };
+        let mut symbols = Vec::with_capacity(list.parameters.len());
+        let mut bounds = Vec::with_capacity(list.parameters.len());
         for parameter in &list.parameters {
             let data = parameter.data();
-            if let Some(constraint) = &data.constraint {
-                let _ = self.resolve_type(constraint, scope);
+            let name = self.identifier_text(&data.name);
+            let Some(symbol) = self.lookup_type(scope, &name) else {
+                continue;
+            };
+            let constraint = data
+                .constraint
+                .as_ref()
+                .map(|constraint| self.resolve_type(constraint, scope));
+            if let Some(constraint) = constraint {
+                self.types.set_type_parameter_constraint(symbol, constraint);
             }
-            if let Some(default) = &data.default {
-                let _ = self.resolve_type(default, scope);
-            }
+            let default = data
+                .default
+                .as_ref()
+                .map(|default| self.resolve_type(default, scope));
+            symbols.push(symbol);
+            bounds.push(TypeParameterBounds {
+                constraint,
+                default,
+            });
         }
+        (symbols, bounds)
     }
 
     fn resolve_unsupported_legacy_decorators(
@@ -3291,22 +6339,41 @@ impl<'src> Binder<'src> {
             scope,
         );
         self.bind_pattern(&data.binding, VariableKind::Let, scope, parameter.id());
-        if let (BindingPattern::Identifier(name), Some(annotation)) =
-            (data.binding.data(), &data.type_annotation)
+        let annotation = data
+            .type_annotation
+            .as_ref()
+            .map(|annotation| self.resolve_type(&annotation.data().type_node, scope));
+        if let Some(initializer) = &data.initializer {
+            self.resolve_expr(initializer, scope);
+        }
+        let initializer_type = data
+            .initializer
+            .as_ref()
+            .map(|initializer| match annotation {
+                Some(target) => self.type_of_expr_with_target(initializer, target, scope),
+                None => self.type_of_expr(initializer, scope),
+            });
+        if let (Some(target), Some(source)) = (annotation, initializer_type)
+            && !self.types_assignable(source, target)
         {
-            let resolved = self.resolve_type(&annotation.data().type_node, scope);
-            if let Some(symbol) = self.scopes[scope.0 as usize]
+            self.emit(
+                TYPE_NOT_ASSIGNABLE,
+                data.initializer
+                    .as_ref()
+                    .map_or(parameter.range(), |initializer| initializer.range()),
+                NOT_ASSIGNABLE_MESSAGE,
+            );
+        }
+        if let BindingPattern::Identifier(name) = data.binding.data()
+            && let Some(symbol) = self.scopes[scope.0 as usize]
                 .values
                 .get(self.identifier_text(name).as_ref())
                 .copied()
-            {
-                self.symbol_types[symbol.get() as usize] = resolved;
-            }
-        } else if let Some(annotation) = &data.type_annotation {
-            let _ = self.resolve_type(&annotation.data().type_node, scope);
-        }
-        if let Some(initializer) = &data.initializer {
-            self.resolve_expr(initializer, scope);
+        {
+            let type_id = annotation
+                .or_else(|| initializer_type.map(|ty| self.types.widen(ty, false)))
+                .unwrap_or_else(|| self.types.any());
+            self.symbol_types[symbol.get() as usize] = type_id;
         }
     }
 
@@ -3325,9 +6392,8 @@ impl<'src> Binder<'src> {
         )
     }
     /// Lowers one parsed parameter into an interned [`FunctionParameter`],
-    /// skipping `this` parameters. Shared by function-declaration binding and
-    /// [`Binder::signature_type`] so the two lowering paths cannot quietly
-    /// diverge.
+    /// skipping `this` parameters. Function declaration binding and signature
+    /// construction share this path so parameter lowering cannot diverge.
     fn lower_parameter(
         &mut self,
         index: usize,
@@ -3338,11 +6404,29 @@ impl<'src> Binder<'src> {
             return None;
         }
         let data = parameter.data();
-        let type_id = match &data.type_annotation {
-            Some(annotation) => self.resolve_type(&annotation.data().type_node, scope),
-            None => self.types.any(),
+        let type_id = match (&data.type_annotation, &data.initializer) {
+            (Some(annotation), _) => self.resolve_type(&annotation.data().type_node, scope),
+            (None, Some(initializer)) => {
+                let initializer_type = self.type_of_expr(initializer, scope);
+                if Self::is_fresh_array_literal(initializer) {
+                    self.types.widen_fresh_literal(initializer_type)
+                } else {
+                    self.types.widen(initializer_type, false)
+                }
+            }
+            (None, None) => self.types.any(),
         };
         let rest = matches!(data.binding.data(), BindingPattern::Rest(_));
+        if rest
+            && let Some(annotation) = &data.type_annotation
+            && !self.is_valid_rest_parameter_type(type_id)
+        {
+            self.emit(
+                TYPE_NOT_ASSIGNABLE,
+                annotation.range(),
+                NOT_ASSIGNABLE_MESSAGE,
+            );
+        }
         let optional = data.optional || data.initializer.is_some();
         let name = match data.binding.data() {
             BindingPattern::Identifier(identifier) => self.identifier_text(identifier).into_owned(),
@@ -3525,6 +6609,47 @@ impl<'src> Binder<'src> {
         }
     }
 
+    fn publish_predeclared_class_shape(&mut self, class: &'src ClassDeclaration, _parent: ScopeId) {
+        let Some(name) = &class.name else {
+            return;
+        };
+        let scope = self
+            .class_header_scopes
+            .get(&name.id())
+            .copied()
+            .expect("named class header was predeclared");
+        let owner = self.scopes[scope.0 as usize]
+            .owner
+            .expect("predeclared class scope has an owner");
+        self.prepare_class_shape(class, scope, Some(owner));
+    }
+
+    fn prepare_class_shape(
+        &mut self,
+        class: &'src ClassDeclaration,
+        scope: ScopeId,
+        owner: Option<SymbolId>,
+    ) {
+        if let Some(heritage) = &class.extends {
+            self.resolve_expr(&heritage.expression, scope);
+            if let Some(owner) = owner
+                && let Some(base_symbol) = self.resolved_expression_reference(&heritage.expression)
+            {
+                self.class_base_symbols.insert(owner, base_symbol);
+            }
+        }
+        for member in &class.members {
+            self.bind_class_member(member, scope);
+        }
+        let preliminary_instance =
+            self.class_instance_type(class, scope, owner, ClassState::Provisional);
+        if let Some(owner) = owner {
+            self.class_instance_types
+                .insert(owner, preliminary_instance);
+            let static_type = self.class_static_type(class, scope, preliminary_instance);
+            self.symbol_types[owner.get() as usize] = static_type;
+        }
+    }
     fn resolve_class_body(
         &mut self,
         class: &'src ClassDeclaration,
@@ -3537,8 +6662,49 @@ impl<'src> Binder<'src> {
         self.super_call_contexts
             .push(SuperCallContext::NonConstructor);
         self.class_derived_stack.push(class.extends.is_some());
-        let scope = self.new_scope(ScopeKind::Class, Some(parent));
-        self.scopes[scope.0 as usize].strict = true;
+        let mut constructor_writable_readonly: HashSet<String> = class
+            .members
+            .iter()
+            .filter_map(|member| match member.data() {
+                ClassMember::Property(property)
+                    if !property.modifiers.is_static && property.modifiers.is_readonly =>
+                {
+                    self.property_key(&property.name)
+                }
+                _ => None,
+            })
+            .collect();
+        if let Some(constructor) = class.members.iter().find_map(|member| {
+            let ClassMember::Constructor(constructor) = member.data() else {
+                return None;
+            };
+            Some(constructor)
+        }) {
+            for parameter in &constructor.parameters {
+                let parameter = parameter.data();
+                if !parameter.modifiers.is_readonly {
+                    continue;
+                }
+                let BindingPattern::Identifier(identifier) = parameter.binding.data() else {
+                    continue;
+                };
+                constructor_writable_readonly.insert(self.identifier_text(identifier).into_owned());
+            }
+        }
+        self.constructor_writable_readonly_properties
+            .push(constructor_writable_readonly);
+        let predeclared = !bind_internal_name && class.name.is_some();
+        let scope = if predeclared {
+            let name = class.name.as_ref().expect("predeclared class has a name");
+            self.class_header_scopes
+                .remove(&name.id())
+                .expect("named class header was predeclared")
+        } else {
+            let scope = self.new_scope(ScopeKind::Class, Some(parent));
+            self.scopes[scope.0 as usize].strict = true;
+            self.bind_type_parameter_names(class.type_parameters.as_ref(), scope);
+            scope
+        };
         // Named class expressions bind their internal name into the class scope
         // only (mirroring named function expressions). Declarations keep their
         // existing outer-scope binding from `bind_statement` unchanged.
@@ -3551,51 +6717,65 @@ impl<'src> Binder<'src> {
                 name.range(),
             );
         }
-        self.bind_type_parameters(class.type_parameters.as_ref(), scope);
-        // Member-scope ownership: the class symbol owns the class scope so
-        // member declarations (bound by a later workstream) qualify as
-        // `Ship.isSunk`. Set only after the internal-name and type-parameter
-        // bindings above, which must stay bare (pinned classExpression.symbols,
-        // strictFunctionTypesErrors.symbols).
-        let owner_scope = if bind_internal_name { scope } else { parent };
-        let owner = class.name.as_ref().and_then(|name| {
-            self.scopes[owner_scope.0 as usize]
-                .values
-                .get(self.identifier_text(name).as_ref())
-                .copied()
-        });
+        let owner = if predeclared {
+            self.scopes[scope.0 as usize].owner
+        } else {
+            let owner_scope = if bind_internal_name { scope } else { parent };
+            class.name.as_ref().and_then(|name| {
+                self.scopes[owner_scope.0 as usize]
+                    .values
+                    .get(self.identifier_text(name).as_ref())
+                    .copied()
+            })
+        };
         if let Some(owner) = owner {
-            self.set_scope_owner(scope, owner);
+            if !predeclared {
+                let class_parameters = self.class_type_parameter_symbols(class, scope);
+                self.types.declare_class(owner, class_parameters);
+                let class_bounds = self
+                    .signature_type_parameters(class.type_parameters.as_ref(), scope)
+                    .1;
+                self.types.set_class_bounds(owner, class_bounds);
+                self.set_scope_owner(scope, owner);
+            }
+            self.class_owner_stack.push(owner);
         }
         // Class decorator expressions evaluate in the enclosing scope, before
         // heritage and members, so they do not see a class-expression name.
         for decorator in &class.decorators {
             self.resolve_expr(&decorator.data().expression, parent);
         }
-        if let Some(heritage) = &class.extends {
-            self.resolve_expr(&heritage.expression, scope);
+        if !predeclared {
+            self.prepare_class_shape(class, scope, owner);
         }
         self.check_class_method_overload_order(&class.members, ambient);
-        for member in &class.members {
-            self.bind_class_member(member, scope);
-        }
+        let mut implemented_types = Vec::new();
         for implemented in &class.implements {
-            let _ = self.resolve_type(implemented, scope);
-        }
-        if let Some(owner) = owner {
-            let instance_type = self.class_instance_type(class, scope);
-            self.class_instance_types.insert(owner, instance_type);
-            self.types.set_class_instance(owner, instance_type);
-            self.symbol_types[owner.get() as usize] = self.types.named(owner);
+            let ty = self.resolve_type(implemented, scope);
+            implemented_types.push((ty, implemented.range()));
         }
         for member in &class.members {
             self.resolve_class_member(member.data(), scope, ambient);
         }
+        let instance_type = self.class_instance_type(class, scope, owner, ClassState::Final);
+        if let Some(owner) = owner {
+            self.class_instance_types.insert(owner, instance_type);
+            let static_type = self.class_static_type(class, scope, instance_type);
+            self.symbol_types[owner.get() as usize] = static_type;
+        }
+        for (implemented_type, range) in implemented_types {
+            if !self.types_assignable(instance_type, implemented_type) {
+                self.emit(TYPE_NOT_ASSIGNABLE, range, NOT_ASSIGNABLE_MESSAGE);
+            }
+        }
         self.check_class_property_initialization(&class.members, scope);
+        self.constructor_writable_readonly_properties.pop();
         let popped_derived = self.class_derived_stack.pop();
         debug_assert_eq!(popped_derived, Some(class.extends.is_some()));
-        let popped_context = self.super_call_contexts.pop();
-        debug_assert_eq!(popped_context, Some(SuperCallContext::NonConstructor));
+        if let Some(owner) = owner {
+            let popped_owner = self.class_owner_stack.pop();
+            debug_assert_eq!(popped_owner, Some(owner));
+        }
     }
     fn check_class_property_initialization(
         &mut self,
@@ -3647,77 +6827,445 @@ impl<'src> Binder<'src> {
             );
         }
     }
-    fn class_instance_type(&mut self, class: &'src ClassDeclaration, scope: ScopeId) -> TypeId {
+    fn class_member_properties(
+        &mut self,
+        class: &'src ClassDeclaration,
+        scope: ScopeId,
+        side: ClassSide,
+    ) -> (Vec<PropertyType>, HashSet<String>) {
         let mut properties = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
+        let mut overload_state = HashMap::<String, bool>::new();
+        let declaring_class = self.scopes[scope.0 as usize].owner;
         for member in &class.members {
-            let (name, type_id, optional) = match member.data() {
-                ClassMember::Property(property) if !property.modifiers.is_static => {
+            let (name, type_id, optional, readonly, getter_only, access, is_method) = match member
+                .data()
+            {
+                ClassMember::Property(property) if side.includes(property.modifiers.is_static) => {
                     let Some(name) = self.property_key(&property.name) else {
                         continue;
                     };
-                    let type_id = match &property.type_annotation {
-                        Some(annotation) => self.resolve_type(&annotation.data().type_node, scope),
-                        None => self.types.any(),
-                    };
-                    (name, type_id, property.optional)
+                    let type_id = self.class_property_type(
+                        property.type_annotation.as_ref(),
+                        property.initializer.as_deref(),
+                        &property.modifiers,
+                        scope,
+                        false,
+                    );
+                    (
+                        name,
+                        type_id,
+                        property.optional,
+                        property.modifiers.is_readonly,
+                        false,
+                        property
+                            .modifiers
+                            .accessibility
+                            .unwrap_or(Accessibility::Public),
+                        false,
+                    )
                 }
-                ClassMember::AutoAccessor(accessor) if !accessor.modifiers.is_static => {
+                ClassMember::AutoAccessor(accessor)
+                    if side.includes(accessor.modifiers.is_static) =>
+                {
                     let Some(name) = self.property_key(&accessor.name) else {
                         continue;
                     };
-                    let type_id = match &accessor.type_annotation {
-                        Some(annotation) => self.resolve_type(&annotation.data().type_node, scope),
-                        None => self.types.any(),
-                    };
-                    (name, type_id, false)
+                    let type_id = self.class_property_type(
+                        accessor.type_annotation.as_ref(),
+                        accessor.initializer.as_deref(),
+                        &accessor.modifiers,
+                        scope,
+                        false,
+                    );
+                    (
+                        name,
+                        type_id,
+                        false,
+                        accessor.modifiers.is_readonly,
+                        false,
+                        accessor
+                            .modifiers
+                            .accessibility
+                            .unwrap_or(Accessibility::Public),
+                        false,
+                    )
                 }
-                ClassMember::Method(method) if !method.modifiers.is_static => match method.modifier
-                {
-                    PropertyModifier::None => {
-                        let Some(name) = self.property_key(&method.name) else {
-                            continue;
-                        };
-                        let type_id = self.type_of_function_like(&method.function, scope);
-                        (name, type_id, method.optional)
-                    }
-                    PropertyModifier::Get => {
-                        let Some(name) = self.property_key(&method.name) else {
-                            continue;
-                        };
-                        let type_id = match &method.function.return_type {
-                            Some(annotation) => {
-                                self.resolve_type(&annotation.data().type_node, scope)
+                ClassMember::Method(method) if side.includes(method.modifiers.is_static) => {
+                    match method.modifier {
+                        PropertyModifier::None => {
+                            let Some(name) = self.property_key(&method.name) else {
+                                continue;
+                            };
+                            if name == "constructor" {
+                                continue;
                             }
-                            None => self.types.any(),
-                        };
-                        (name, type_id, method.optional)
+                            let is_overload_signature =
+                                method.function.body.is_none() && !method.modifiers.is_abstract;
+                            if is_overload_signature {
+                                overload_state.insert(name.clone(), true);
+                            } else if overload_state.get(&name).copied().unwrap_or(false) {
+                                overload_state.insert(name.clone(), false);
+                                continue;
+                            }
+                            let signature_scope = self.class_method_signature_scope(
+                                member.id(),
+                                &method.function,
+                                scope,
+                            );
+                            let type_id = self
+                                .type_of_function_like_in_scope(&method.function, signature_scope);
+                            (
+                                name,
+                                type_id,
+                                method.optional,
+                                false,
+                                false,
+                                method
+                                    .modifiers
+                                    .accessibility
+                                    .unwrap_or(Accessibility::Public),
+                                true,
+                            )
+                        }
+                        PropertyModifier::Get => {
+                            let Some(name) = self.property_key(&method.name) else {
+                                continue;
+                            };
+                            let type_id = match &method.function.return_type {
+                                Some(annotation) => {
+                                    self.resolve_type(&annotation.data().type_node, scope)
+                                }
+                                None => self.types.any(),
+                            };
+                            let has_setter = class.members.iter().any(|candidate| {
+                                let ClassMember::Method(candidate) = candidate.data() else {
+                                    return false;
+                                };
+                                candidate.modifier == PropertyModifier::Set
+                                    && side.includes(candidate.modifiers.is_static)
+                                    && self.property_key(&candidate.name).as_deref()
+                                        == Some(name.as_str())
+                            });
+                            (
+                                name,
+                                type_id,
+                                method.optional,
+                                !has_setter,
+                                !has_setter,
+                                method
+                                    .modifiers
+                                    .accessibility
+                                    .unwrap_or(Accessibility::Public),
+                                false,
+                            )
+                        }
+                        PropertyModifier::Set => continue,
                     }
-                    PropertyModifier::Set => continue,
-                },
+                }
                 _ => continue,
             };
-            if !seen.insert(name.clone()) {
-                continue;
-            }
-            properties.push(PropertyType::new(name, optional, type_id));
+            let _ = seen.insert(name.clone());
+            properties.push(
+                PropertyType::new(name, optional, type_id)
+                    .with_readonly(readonly)
+                    .with_getter_only(getter_only)
+                    .with_accessibility(access, declaring_class)
+                    .with_method(is_method),
+            );
         }
-        // Inherit the base class's instance members. Own members win; base
-        // members fill in inherited properties (e.g. `name`/`message` from
-        // `extends Error`). The base expression was resolved in
-        // `resolve_class_body` before this call, so its reference is available.
+        (properties, seen)
+    }
+
+    fn class_property_type(
+        &mut self,
+        annotation: Option<&'src TypeAnnotationNode>,
+        initializer: Option<&'src Expr>,
+        modifiers: &DeclarationModifiers,
+        scope: ScopeId,
+        diagnose: bool,
+    ) -> TypeId {
+        if let Some(annotation) = annotation {
+            let annotated = self.resolve_type(&annotation.data().type_node, scope);
+            if let Some(initializer) = initializer {
+                let inferred = if let Some(&cached) = self.node_types.get(&initializer.id()) {
+                    cached
+                } else if diagnose {
+                    self.resolve_expr(initializer, scope);
+                    self.type_of_expr_with_target(initializer, annotated, scope)
+                } else {
+                    return annotated;
+                };
+                if diagnose && !self.types_assignable(inferred, annotated) {
+                    self.emit(
+                        TYPE_NOT_ASSIGNABLE,
+                        initializer.range(),
+                        NOT_ASSIGNABLE_MESSAGE,
+                    );
+                }
+            }
+            return annotated;
+        }
+        let Some(initializer) = initializer else {
+            return self.types.any();
+        };
+        let inferred = if let Some(&cached) = self.node_types.get(&initializer.id()) {
+            cached
+        } else if diagnose {
+            self.resolve_expr(initializer, scope);
+            self.type_of_expr(initializer, scope)
+        } else if let Expression::Literal(literal) = initializer.data() {
+            self.type_of_literal(literal)
+        } else {
+            return self.types.any();
+        };
+        if Self::is_fresh_array_literal(initializer) {
+            self.types.widen_fresh_literal(inferred)
+        } else {
+            self.types.widen(inferred, modifiers.is_readonly)
+        }
+    }
+
+    fn class_instance_type(
+        &mut self,
+        class: &'src ClassDeclaration,
+        scope: ScopeId,
+        owner: Option<SymbolId>,
+        state: ClassState,
+    ) -> TypeId {
+        let (mut properties, mut seen) =
+            self.class_member_properties(class, scope, ClassSide::Instance);
+        for constructor in class.members.iter().filter_map(|member| {
+            let ClassMember::Constructor(constructor) = member.data() else {
+                return None;
+            };
+            Some(constructor)
+        }) {
+            for parameter in &constructor.parameters {
+                let parameter = parameter.data();
+                if parameter.modifiers.accessibility.is_none() && !parameter.modifiers.is_readonly {
+                    continue;
+                }
+                let BindingPattern::Identifier(identifier) = parameter.binding.data() else {
+                    continue;
+                };
+                let name = self.identifier_text(identifier).into_owned();
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                let type_id = match &parameter.type_annotation {
+                    Some(annotation) => self.resolve_type(&annotation.data().type_node, scope),
+                    None => self.types.any(),
+                };
+                let access = parameter
+                    .modifiers
+                    .accessibility
+                    .unwrap_or(Accessibility::Public);
+                let declaring_class = self.scopes[scope.0 as usize].owner;
+                properties.push(
+                    PropertyType::new(name, parameter.optional, type_id)
+                        .with_readonly(parameter.modifiers.is_readonly)
+                        .with_accessibility(access, declaring_class),
+                );
+            }
+        }
+        // Inherit the base class's instance members. Shape preparation resolves
+        // the base expression before this call, so its reference is available.
+        // Explicit type arguments in the `extends` clause are resolved
+        // and substituted so inherited members use the actual type arguments.
         if let Some(heritage) = &class.extends
             && let Some(base_symbol) = self.resolved_expression_reference(&heritage.expression)
-            && let Some(&base_instance) = self.class_instance_types.get(&base_symbol)
-            && let Type::ObjectType(base_props) = self.types.get(base_instance).clone()
         {
-            for base_prop in base_props.properties {
-                if seen.insert(base_prop.name.to_string()) {
-                    properties.push(base_prop);
+            let explicit: Option<Vec<TypeId>> = heritage.type_arguments.as_ref().map(|list| {
+                list.arguments
+                    .iter()
+                    .map(|argument| self.resolve_type(argument, scope))
+                    .collect()
+            });
+            let base = self.resolve_named_type_symbol(base_symbol);
+            let base_instance =
+                self.instantiate_explicit_type_arguments(base_symbol, explicit.as_deref(), base);
+            if let Some(base_view) = self.types.prepare_applied_class_view(base_instance)
+                && let Type::ObjectType(base_props) = self.types.get(base_view).clone()
+            {
+                for base_prop in base_props.properties {
+                    if seen.insert(base_prop.name().to_string()) {
+                        properties.push(base_prop);
+                    }
                 }
             }
         }
-        self.types.object_type(properties)
+        let raw = self.types.object_type(properties);
+        let Some(owner) = owner else {
+            return raw;
+        };
+        match state {
+            ClassState::Provisional => self.types.publish_provisional_class_template(owner, raw),
+            ClassState::Final => self.types.publish_final_class_template(owner, raw),
+        }
+        self.types
+            .declared_class(owner)
+            .unwrap_or_else(|| self.types.applied_class(owner, Vec::new()))
+    }
+
+    fn class_static_type(
+        &mut self,
+        class: &'src ClassDeclaration,
+        scope: ScopeId,
+        instance_type: TypeId,
+    ) -> TypeId {
+        let (mut properties, mut seen) =
+            self.class_member_properties(class, scope, ClassSide::Static);
+        if seen.insert("prototype".to_owned()) {
+            let prototype_type = self
+                .types
+                .prepare_applied_class_view(instance_type)
+                .unwrap_or(instance_type);
+            properties.push(PropertyType::new("prototype", false, prototype_type));
+        }
+        let mut base_arguments = Vec::new();
+        let base_static = if let Some(heritage) = &class.extends
+            && let Some(base_symbol) = self.resolved_expression_reference(&heritage.expression)
+        {
+            let explicit: Option<Vec<TypeId>> = heritage.type_arguments.as_ref().map(|list| {
+                list.arguments
+                    .iter()
+                    .map(|argument| self.resolve_type(argument, scope))
+                    .collect()
+            });
+            let base = self.resolve_named_type_symbol(base_symbol);
+            let base_instance =
+                self.instantiate_explicit_type_arguments(base_symbol, explicit.as_deref(), base);
+            if let Type::AppliedClass { arguments, .. } = self.types.get(base_instance).clone() {
+                base_arguments = arguments;
+            }
+            let type_id = self.symbol_types[base_symbol.get() as usize];
+            match self.types.get(type_id).clone() {
+                Type::ObjectType(object) => Some(object),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(base_static) = &base_static {
+            for base_property in &base_static.properties {
+                if base_property.name() != "prototype"
+                    && seen.insert(base_property.name().to_owned())
+                {
+                    properties.push(base_property.clone());
+                }
+            }
+        }
+        let construct_signatures = self.class_construct_signatures(
+            class,
+            scope,
+            instance_type,
+            base_static.as_ref(),
+            &base_arguments,
+        );
+        self.types.object_type_with_members(ObjectType {
+            properties,
+            call_signatures: Vec::new(),
+            construct_signatures,
+            index_signatures: Vec::new(),
+        })
+    }
+
+    fn class_construct_signatures(
+        &mut self,
+        class: &'src ClassDeclaration,
+        scope: ScopeId,
+        instance_type: TypeId,
+        base_static: Option<&ObjectType>,
+        base_arguments: &[TypeId],
+    ) -> Vec<FunctionSignature> {
+        let overloads: Vec<_> = class
+            .members
+            .iter()
+            .filter_map(|member| {
+                let ClassMember::Method(method) = member.data() else {
+                    return None;
+                };
+                if method.modifier != PropertyModifier::None
+                    || method.modifiers.is_static
+                    || method.function.body.is_some()
+                    || self.property_key(&method.name).as_deref() != Some("constructor")
+                {
+                    return None;
+                }
+                Some(method.function.parameters.as_slice())
+            })
+            .collect();
+        if !overloads.is_empty() {
+            return overloads
+                .into_iter()
+                .map(|parameters| {
+                    self.class_construct_signature(class, parameters, scope, instance_type)
+                })
+                .collect();
+        }
+        if let Some(parameters) = class.members.iter().find_map(|member| match member.data() {
+            ClassMember::Constructor(constructor) => Some(constructor.parameters.as_slice()),
+            _ => None,
+        }) {
+            return vec![self.class_construct_signature(class, parameters, scope, instance_type)];
+        }
+        if let Some(base_static) = base_static
+            && !base_static.construct_signatures.is_empty()
+        {
+            let mut inherited = Vec::with_capacity(base_static.construct_signatures.len());
+            for signature in &base_static.construct_signatures {
+                let javascript = signature.javascript;
+                let mut signature =
+                    if signature.type_parameters.is_empty() || base_arguments.is_empty() {
+                        signature.clone()
+                    } else {
+                        let arguments = signature
+                            .type_parameters
+                            .iter()
+                            .copied()
+                            .zip(base_arguments.iter().copied())
+                            .map(|(symbol, type_id)| {
+                                InferredTypeArgument::new(
+                                    symbol,
+                                    type_id,
+                                    InferenceProvenance::Explicit,
+                                )
+                            })
+                            .collect();
+                        let type_id = InferredTypeArguments::new(arguments)
+                            .instantiate_signature(&mut self.types, signature);
+                        let Type::Function(signature) = self.types.get(type_id) else {
+                            unreachable!("instantiated constructor must remain a function");
+                        };
+                        signature.clone()
+                    };
+                signature.javascript = javascript;
+                signature.return_type = instance_type;
+                inherited.push(signature);
+            }
+            return inherited;
+        }
+        vec![self.class_construct_signature(class, &[], scope, instance_type)]
+    }
+
+    fn class_construct_signature(
+        &mut self,
+        class: &'src ClassDeclaration,
+        parameters: &'src [ParameterNode],
+        scope: ScopeId,
+        instance_type: TypeId,
+    ) -> FunctionSignature {
+        let signature_type = self.signature_type_with_return(
+            class.type_parameters.as_ref(),
+            parameters,
+            instance_type,
+            scope,
+        );
+        let Type::Function(signature) = self.types.get(signature_type) else {
+            unreachable!("class constructor signature must be a function type");
+        };
+        signature.clone()
     }
 
     fn constructor_property_assignments(
@@ -3964,17 +7512,22 @@ impl<'src> Binder<'src> {
             _ => {}
         }
     }
+
     fn class_this_type(&mut self, scope: ScopeId, is_static: bool) -> TypeId {
         let Some(owner) = self.scopes[scope.0 as usize].owner else {
             return self.types.any();
         };
         if is_static {
-            self.types.named(owner)
+            self.symbol_types[owner.get() as usize]
         } else {
-            self.class_instance_types
+            let instance = self
+                .class_instance_types
                 .get(&owner)
                 .copied()
-                .unwrap_or_else(|| self.types.any())
+                .unwrap_or_else(|| self.types.any());
+            self.types
+                .prepare_applied_class_view(instance)
+                .unwrap_or(instance)
         }
     }
 
@@ -4068,22 +7621,25 @@ impl<'src> Binder<'src> {
                 });
                 let this_type = self.class_this_type(scope, false);
                 self.this_context.push(this_type);
-                self.bind_statements(&constructor.body.data().statements, child);
-                self.resolve_statements(&constructor.body.data().statements, child);
+                self.push_reassigned_scope();
+                self.in_isolated_flow(FlowNodeId::ROOT, |binder| {
+                    binder.bind_statements(&constructor.body.data().statements, child);
+                    binder.resolve_statements(&constructor.body.data().statements, child);
+                });
+                self.pop_reassigned_scope();
                 self.this_context.pop();
                 self.new_target_contexts.truncate(new_target_marker);
                 self.super_call_contexts.pop();
             }
             ClassMember::Property(property) => {
                 self.resolve_property_name(&property.name, scope);
-                let type_id = if let Some(annotation) = &property.type_annotation {
-                    self.resolve_type(&annotation.data().type_node, scope)
-                } else if let Some(initializer) = &property.initializer {
-                    self.resolve_expr(initializer, scope);
-                    self.type_of_expr(initializer, scope)
-                } else {
-                    self.types.any()
-                };
+                let type_id = self.class_property_type(
+                    property.type_annotation.as_ref(),
+                    property.initializer.as_deref(),
+                    &property.modifiers,
+                    scope,
+                    true,
+                );
                 if let Some(name) = self.property_key(&property.name)
                     && let Some(&symbol) = self.scopes[scope.0 as usize].values.get(&name)
                 {
@@ -4092,14 +7648,13 @@ impl<'src> Binder<'src> {
             }
             ClassMember::AutoAccessor(accessor) => {
                 self.resolve_property_name(&accessor.name, scope);
-                let type_id = if let Some(annotation) = &accessor.type_annotation {
-                    self.resolve_type(&annotation.data().type_node, scope)
-                } else if let Some(initializer) = &accessor.initializer {
-                    self.resolve_expr(initializer, scope);
-                    self.type_of_expr(initializer, scope)
-                } else {
-                    self.types.any()
-                };
+                let type_id = self.class_property_type(
+                    accessor.type_annotation.as_ref(),
+                    accessor.initializer.as_deref(),
+                    &accessor.modifiers,
+                    scope,
+                    true,
+                );
                 if let Some(name) = self.property_key(&accessor.name)
                     && let Some(&symbol) = self.scopes[scope.0 as usize].values.get(&name)
                 {
@@ -4156,20 +7711,56 @@ impl<'src> Binder<'src> {
                 for parameter in &arrow.parameters {
                     self.resolve_parameter(parameter, child);
                 }
-                if let Some(return_type) = &arrow.return_type {
-                    let _ = self.resolve_type(&return_type.data().type_node, child);
-                }
-                match &arrow.body {
-                    FunctionBody::Block(block) => {
-                        if directive_prologue_is_strict(self.source, &block.data().statements) {
-                            self.scopes[child.0 as usize].strict = true;
-                        }
-                        self.bind_statements(&block.data().statements, child);
-                        self.resolve_statements(&block.data().statements, child);
+                let expected_return_type = arrow.return_type.as_ref().map(|annotation| {
+                    let return_type = self.resolve_type(&annotation.data().type_node, child);
+                    if arrow.is_async {
+                        self.promise_value_type(return_type).unwrap_or(return_type)
+                    } else {
+                        return_type
                     }
-                    FunctionBody::Expression(inner) => self.resolve_expr(inner, child),
+                });
+                self.expected_return_types.push(expected_return_type);
+                let block_body_id = match &arrow.body {
+                    FunctionBody::Block(block) => {
+                        let body_id = block.id();
+                        self.return_types.entry(body_id).or_default();
+                        self.function_body_stack.push(body_id);
+                        Some(body_id)
+                    }
+                    FunctionBody::Expression(_) | FunctionBody::Missing(_) => None,
+                };
+                let body_flow = self.captured_flow_seed();
+                self.push_reassigned_scope();
+                self.in_isolated_flow(body_flow, |binder| match &arrow.body {
+                    FunctionBody::Block(block) => {
+                        if directive_prologue_is_strict(binder.source, &block.data().statements) {
+                            binder.scopes[child.0 as usize].strict = true;
+                        }
+                        binder.bind_statements(&block.data().statements, child);
+                        binder.bind_hoisted_statements(&block.data().statements, child);
+                        binder.resolve_statements(&block.data().statements, child);
+                    }
+                    FunctionBody::Expression(inner) => {
+                        binder.resolve_expr(inner, child);
+                        if let Some(Some(expected)) = binder.expected_return_types.last().copied() {
+                            let actual = binder.type_of_expr_with_target(inner, expected, child);
+                            if !binder.types_assignable(actual, expected) {
+                                binder.emit(
+                                    TYPE_NOT_ASSIGNABLE,
+                                    inner.range(),
+                                    NOT_ASSIGNABLE_MESSAGE,
+                                );
+                            }
+                        }
+                    }
                     FunctionBody::Missing(_) => {}
+                });
+                self.pop_reassigned_scope();
+                if let Some(body_id) = block_body_id {
+                    let popped = self.function_body_stack.pop();
+                    debug_assert_eq!(popped, Some(body_id));
                 }
+                self.expected_return_types.pop();
                 let popped_context = self.super_call_contexts.pop();
                 debug_assert_eq!(popped_context, Some(SuperCallContext::NonConstructor));
             }
@@ -4187,6 +7778,7 @@ impl<'src> Binder<'src> {
                 self.resolve_expr(&new.callee, scope);
                 self.resolve_type_arguments(new.type_arguments.as_ref(), scope);
                 self.resolve_arguments(&new.arguments, scope);
+                self.check_new(new, scope, expression.range());
             }
             Expression::Member(member) => {
                 if !matches!(member.object.data(), Expression::Super) {
@@ -4242,7 +7834,11 @@ impl<'src> Binder<'src> {
                 }
             }
             Expression::Unary(unary) => self.resolve_expr(&unary.argument, scope),
-            Expression::Update(update) => self.resolve_assignment_target(&update.argument, scope),
+            Expression::Update(update) => {
+                self.inventory_assignment_target_writes_in_scope(&update.argument, scope);
+                self.resolve_assignment_target(&update.argument, scope);
+                self.invalidate_assignment_flow(&update.argument);
+            }
             Expression::Binary(binary) => {
                 self.resolve_expr(&binary.left, scope);
                 self.resolve_expr(&binary.right, scope);
@@ -4290,11 +7886,24 @@ impl<'src> Binder<'src> {
                 }
             }
             Expression::Assignment(assignment) => {
+                self.inventory_assignment_target_writes_in_scope(&assignment.left, scope);
                 self.resolve_assignment_target(&assignment.left, scope);
                 self.resolve_expr(&assignment.right, scope);
-                if assignment.operator == AssignmentOperator::Assign && self.is_typescript() {
+                if assignment.operator == AssignmentOperator::Assign && !self.is_typescript() {
+                    self.extend_javascript_object_assignment(
+                        &assignment.left,
+                        &assignment.right,
+                        scope,
+                    );
+                }
+                if assignment.operator == AssignmentOperator::Assign
+                    && self.is_typescript()
+                    && !self
+                        .readonly_assignment_targets
+                        .contains(&assignment.left.id())
+                {
                     let target = self.type_of_assignment_target(&assignment.left, scope);
-                    let source = self.type_of_expr(&assignment.right, scope);
+                    let source = self.type_of_expr_with_target(&assignment.right, target, scope);
                     if !self.types_assignable(source, target) {
                         self.emit(
                             TYPE_NOT_ASSIGNABLE,
@@ -4303,6 +7912,7 @@ impl<'src> Binder<'src> {
                         );
                     }
                 }
+                self.invalidate_assignment_flow(&assignment.left);
             }
             Expression::Sequence(sequence) => {
                 for inner in &sequence.expressions {
@@ -4315,16 +7925,40 @@ impl<'src> Binder<'src> {
             Expression::As(cast) => {
                 self.resolve_transparent_expression(expression, &cast.expression, scope);
                 if let Some(type_node) = &cast.type_node {
-                    let _ = self.resolve_type(type_node, scope);
+                    let source = self.type_of_expr(&cast.expression, scope);
+                    let target = self.resolve_type(type_node, scope);
+                    if !self.is_assertion_compatible(source, target) {
+                        self.emit(
+                            TYPE_NOT_ASSIGNABLE,
+                            expression.range(),
+                            NOT_ASSIGNABLE_MESSAGE,
+                        );
+                    }
                 }
             }
             Expression::Satisfies(satisfies) => {
                 self.resolve_transparent_expression(expression, &satisfies.expression, scope);
-                let _ = self.resolve_type(&satisfies.type_node, scope);
+                let source = self.type_of_expr(&satisfies.expression, scope);
+                let target = self.resolve_type(&satisfies.type_node, scope);
+                if !self.types_assignable(source, target) {
+                    self.emit(
+                        TYPE_NOT_ASSIGNABLE,
+                        expression.range(),
+                        NOT_ASSIGNABLE_MESSAGE,
+                    );
+                }
             }
             Expression::TypeAssertion(assertion) => {
                 self.resolve_transparent_expression(expression, &assertion.expression, scope);
-                let _ = self.resolve_type(&assertion.type_node, scope);
+                let source = self.type_of_expr(&assertion.expression, scope);
+                let target = self.resolve_type(&assertion.type_node, scope);
+                if !self.is_assertion_compatible(source, target) {
+                    self.emit(
+                        TYPE_NOT_ASSIGNABLE,
+                        expression.range(),
+                        NOT_ASSIGNABLE_MESSAGE,
+                    );
+                }
             }
             Expression::NonNull(non_null) => {
                 self.resolve_transparent_expression(expression, &non_null.expression, scope);
@@ -4334,6 +7968,7 @@ impl<'src> Binder<'src> {
                 for inner in &tagged.template.expressions {
                     self.resolve_expr(inner, scope);
                 }
+                self.check_tagged_template(tagged, scope, expression.range());
             }
             Expression::Template(template) => {
                 for inner in &template.expressions {
@@ -4475,25 +8110,246 @@ impl<'src> Binder<'src> {
         }
         let not_callable_range = match call.callee.data() {
             Expression::Member(member) => match &member.property {
-                MemberProperty::Named(identifier) => identifier.range(),
                 MemberProperty::Private(identifier) => identifier.range(),
                 MemberProperty::Computed(expression) => expression.range(),
+                MemberProperty::Named(identifier) => identifier.range(),
             },
             _ => call.callee.range(),
         };
-
         let callee_type = self.type_of_expr(&call.callee, scope);
-        let callee_kind = self.types.get(callee_type);
-        if !matches!(
-            callee_kind,
-            Type::Any
-                | Type::Unknown
-                | Type::Error
-                | Type::Function(_)
-                | Type::Union(_)
-                | Type::ObjectType(_)
-                | Type::Named(_)
-        ) {
+        let evaluation = self.evaluate_call(call, scope, callee_type);
+        for mismatch in evaluation.mismatches {
+            let (code, range, message) = match mismatch {
+                CallMismatch::NotCallable => (
+                    EXPRESSION_NOT_CALLABLE,
+                    not_callable_range,
+                    EXPRESSION_NOT_CALLABLE_MESSAGE,
+                ),
+                CallMismatch::ArgumentCount => (
+                    ARGUMENT_COUNT_MISMATCH,
+                    call_range,
+                    ARGUMENT_COUNT_MISMATCH_MESSAGE,
+                ),
+                CallMismatch::ArgumentType(range) => (
+                    ARGUMENT_NOT_ASSIGNABLE,
+                    range,
+                    ARGUMENT_NOT_ASSIGNABLE_MESSAGE,
+                ),
+            };
+            self.emit(code, range, message);
+        }
+    }
+
+    fn evaluate_call(
+        &mut self,
+        call: &'src CallExpression,
+        scope: ScopeId,
+        callee_type: TypeId,
+    ) -> CallEvaluation {
+        if matches!(self.types.get(callee_type), Type::Any | Type::Error) {
+            return CallEvaluation::success(self.types.any());
+        }
+
+        let arguments = self.resolve_call_arguments(&call.arguments, scope);
+        let groups = self.call_signature_groups(&call.callee, callee_type);
+        if groups.is_empty() {
+            return CallEvaluation::failure(CallMismatch::NotCallable);
+        }
+        let explicit_types = call
+            .type_arguments
+            .as_ref()
+            .map(|arguments| self.resolve_type_arguments(Some(arguments), scope));
+        self.evaluate_signature_groups(
+            groups,
+            &arguments,
+            explicit_types.as_deref(),
+            call.callee.range(),
+        )
+    }
+
+    fn check_new(&mut self, new: &'src NewExpression, scope: ScopeId, range: TextRange) {
+        if !self.is_typescript() {
+            return;
+        }
+        let callee_type = self.type_of_expr(&new.callee, scope);
+        let evaluation = self.evaluate_new(new, scope, callee_type);
+        for mismatch in evaluation.mismatches {
+            let (code, diagnostic_range, message) = match mismatch {
+                CallMismatch::NotCallable => (
+                    EXPRESSION_NOT_CONSTRUCTABLE,
+                    new.callee.range(),
+                    EXPRESSION_NOT_CONSTRUCTABLE_MESSAGE,
+                ),
+                CallMismatch::ArgumentCount => (
+                    ARGUMENT_COUNT_MISMATCH,
+                    range,
+                    ARGUMENT_COUNT_MISMATCH_MESSAGE,
+                ),
+                CallMismatch::ArgumentType(argument_range) => (
+                    ARGUMENT_NOT_ASSIGNABLE,
+                    argument_range,
+                    ARGUMENT_NOT_ASSIGNABLE_MESSAGE,
+                ),
+            };
+            self.emit(code, diagnostic_range, message);
+        }
+    }
+
+    fn evaluate_new(
+        &mut self,
+        new: &'src NewExpression,
+        scope: ScopeId,
+        callee_type: TypeId,
+    ) -> CallEvaluation {
+        if matches!(self.types.get(callee_type), Type::Any | Type::Error) {
+            return CallEvaluation::success(self.types.any());
+        }
+        let groups = self.construct_signature_groups_for_type(callee_type);
+        if groups.is_empty() {
+            return CallEvaluation::failure(CallMismatch::NotCallable);
+        }
+        let arguments = self.resolve_call_arguments(&new.arguments, scope);
+        let explicit_types = new
+            .type_arguments
+            .as_ref()
+            .map(|arguments| self.resolve_type_arguments(Some(arguments), scope));
+        self.evaluate_signature_groups(
+            groups,
+            &arguments,
+            explicit_types.as_deref(),
+            new.callee.range(),
+        )
+    }
+
+    fn evaluate_signature_groups(
+        &mut self,
+        groups: Vec<Vec<FunctionSignature>>,
+        arguments: &[ResolvedCallArgument],
+        explicit_types: Option<&[TypeId]>,
+        diagnostic_range: TextRange,
+    ) -> CallEvaluation {
+        let inference_types: Vec<_> = arguments
+            .iter()
+            .filter_map(|argument| match argument {
+                ResolvedCallArgument::Fixed { type_id, .. } => Some(*type_id),
+                ResolvedCallArgument::Variadic { .. } => None,
+            })
+            .collect();
+        let mut return_types = Vec::with_capacity(groups.len());
+        for group in groups {
+            let mut group_mismatches = vec![CallMismatch::ArgumentCount];
+            let mut selected = None;
+            for signature in group {
+                let instantiated = match explicit_types {
+                    Some(explicit) => {
+                        self.explicit_function_signature(&signature, explicit, diagnostic_range)
+                    }
+                    None => self
+                        .inferred_function_signature(&signature, &inference_types)
+                        .ok_or(CallMismatch::ArgumentType(diagnostic_range)),
+                };
+                let signature = match instantiated {
+                    Ok(signature) => signature,
+                    Err(mismatch) => {
+                        group_mismatches = vec![mismatch];
+                        continue;
+                    }
+                };
+                let mismatches = self.signature_argument_mismatches(&signature, arguments);
+                if mismatches.is_empty() {
+                    selected = Some(signature.return_type());
+                    break;
+                }
+                group_mismatches = mismatches;
+            }
+            let Some(return_type) = selected else {
+                return CallEvaluation::failure_all(group_mismatches);
+            };
+            return_types.push(return_type);
+        }
+        CallEvaluation::success(self.types.union(&return_types))
+    }
+
+    fn resolve_call_arguments(
+        &mut self,
+        arguments: &'src [CallArgument],
+        scope: ScopeId,
+    ) -> Vec<ResolvedCallArgument> {
+        let mut resolved = Vec::new();
+        for argument in arguments {
+            match argument {
+                CallArgument::Expression(expression) => {
+                    resolved.push(ResolvedCallArgument::Fixed {
+                        type_id: self.type_of_expr(expression, scope),
+                        range: expression.range(),
+                    });
+                }
+                CallArgument::Spread(spread) => {
+                    let type_id = self.type_of_expr(&spread.argument, scope);
+                    match self.types.get(type_id).clone() {
+                        Type::Tuple(shape) => {
+                            for (index, &type_id) in shape.prefix.iter().enumerate() {
+                                let type_id = if index >= shape.required as usize {
+                                    self.types.union(&[type_id, self.types.undefined_type()])
+                                } else {
+                                    type_id
+                                };
+                                resolved.push(ResolvedCallArgument::Fixed {
+                                    type_id,
+                                    range: spread.argument.range(),
+                                });
+                            }
+                            if let Some(rest) = shape.rest {
+                                let mut rest_and_suffix =
+                                    Vec::with_capacity(1 + shape.suffix.len());
+                                rest_and_suffix.push(rest);
+                                rest_and_suffix.extend_from_slice(&shape.suffix);
+                                let element = self.types.union(&rest_and_suffix);
+                                resolved.push(ResolvedCallArgument::Variadic {
+                                    element,
+                                    range: spread.argument.range(),
+                                });
+                            }
+                        }
+                        Type::Array(element) => {
+                            resolved.push(ResolvedCallArgument::Variadic {
+                                element,
+                                range: spread.argument.range(),
+                            });
+                        }
+                        _ => resolved.push(ResolvedCallArgument::Variadic {
+                            element: self.types.any(),
+                            range: spread.argument.range(),
+                        }),
+                    }
+                }
+                CallArgument::Missing(_) => {}
+            }
+        }
+        resolved
+    }
+
+    fn check_tagged_template(
+        &mut self,
+        tagged: &'src crate::syntax::TaggedTemplateExpression,
+        scope: ScopeId,
+        call_range: TextRange,
+    ) {
+        if !self.is_typescript() {
+            return;
+        }
+        let not_callable_range = match tagged.tag.data() {
+            Expression::Member(member) => match &member.property {
+                MemberProperty::Private(identifier) => identifier.range(),
+                MemberProperty::Computed(expression) => expression.range(),
+                MemberProperty::Named(identifier) => identifier.range(),
+            },
+            _ => tagged.tag.range(),
+        };
+        let callee_type = self.type_of_expr(&tagged.tag, scope);
+        let arguments = self.resolve_tagged_template_arguments(tagged, scope, call_range);
+        let groups = self.call_signature_groups(&tagged.tag, callee_type);
+        if groups.is_empty() {
             self.emit(
                 EXPRESSION_NOT_CALLABLE,
                 not_callable_range,
@@ -4501,270 +8357,304 @@ impl<'src> Binder<'src> {
             );
             return;
         }
-        // Avoid typing arguments when the callee is not a function or union of
-        // functions, so that calls through `any` do not trigger member-access
-        // diagnostics on the arguments (discriminated unions, etc.).
-        if !matches!(callee_kind, Type::Function(_) | Type::Union(_)) {
-            return;
-        }
-
-        let mut argument_ranges = Vec::new();
-        let mut argument_types = Vec::new();
-        let mut has_spread = false;
-        for argument in &call.arguments {
-            match argument {
-                CallArgument::Expression(inner) => {
-                    let argument_type = self.type_of_expr(inner, scope);
-                    argument_ranges.push(inner.range());
-                    argument_types.push(argument_type);
-                }
-                CallArgument::Spread(_) => {
-                    has_spread = true;
-                    break;
-                }
-                CallArgument::Missing(_) => {}
-            }
-        }
-        if has_spread {
-            return;
-        }
-
-        let signature = match self.types.get(callee_type).clone() {
-            Type::Function(signature) => Some(signature),
-            Type::Union(members) => self.union_call_signature(&members),
-            Type::Error
-            | Type::Intersection(_)
-            | Type::Any
-            | Type::Unknown
-            | Type::Never
-            | Type::Void
-            | Type::Null
-            | Type::Undefined
-            | Type::Boolean
-            | Type::Number
-            | Type::BigInt
-            | Type::String
-            | Type::Symbol
-            | Type::Object
-            | Type::BooleanLiteral(_)
-            | Type::NumberLiteral(_)
-            | Type::StringLiteral(_)
-            | Type::BigIntLiteral(_)
-            | Type::Array(_)
-            | Type::Tuple(_)
-            | Type::ObjectType(_)
-            | Type::Named(_)
-            | Type::NumericEnum(_) => None,
-        };
-
-        let Some(signature) = signature else {
-            return;
-        };
-        // Instantiate the callee's type parameters against the arguments. This runs
-        // off the signature alone, so a method reached through a member expression
-        // is instantiated the same as a call through a plain identifier.
-        let instantiated = if call.type_arguments.is_some() {
-            self.explicit_function_signature(call, scope, &signature, &argument_types)
-        } else {
-            self.inferred_function_signature(&signature, &argument_types)
-        };
-        let signature = instantiated.unwrap_or(signature);
-
-        let argument_count = argument_types.len();
-        let (required, total, rest_index) = signature.arity();
-        if argument_count < required {
-            self.emit(
-                ARGUMENT_COUNT_MISMATCH,
-                call_range,
-                ARGUMENT_COUNT_MISMATCH_MESSAGE,
-            );
-            return;
-        }
-        if rest_index.is_none() && argument_count > total {
-            let range = argument_ranges.get(total).copied().unwrap_or(call_range);
-            self.emit(
-                ARGUMENT_COUNT_MISMATCH,
-                range,
-                ARGUMENT_COUNT_MISMATCH_MESSAGE,
-            );
-            return;
-        }
-
-        let parameter_types: Vec<TypeId> = signature
-            .parameters()
-            .iter()
-            .map(FunctionParameter::type_id)
-            .collect();
-        for (index, (argument_type, argument_range)) in
-            argument_types.iter().zip(&argument_ranges).enumerate()
-        {
-            let parameter_index = if let Some(rest) = rest_index {
-                if index >= rest { rest } else { index }
-            } else {
-                index
-            };
-            if *argument_type == self.types.undefined_type()
-                && let Some(parameter) = signature.parameters().get(parameter_index)
-                && parameter.optional()
-            {
-                continue;
-            }
-            let mut target = parameter_types
-                .get(parameter_index)
-                .copied()
-                .unwrap_or_else(|| self.types.any());
-            if rest_index == Some(parameter_index)
-                && let Some(element) = self.array_element_type(target)
-            {
-                target = element;
-            }
-            if !self.types_assignable(*argument_type, target) {
-                self.emit(
+        let evaluation =
+            self.evaluate_signature_groups(groups, &arguments, None, tagged.tag.range());
+        for mismatch in evaluation.mismatches {
+            let (code, range, message) = match mismatch {
+                CallMismatch::NotCallable => (
+                    EXPRESSION_NOT_CALLABLE,
+                    not_callable_range,
+                    EXPRESSION_NOT_CALLABLE_MESSAGE,
+                ),
+                CallMismatch::ArgumentCount => (
+                    ARGUMENT_COUNT_MISMATCH,
+                    call_range,
+                    ARGUMENT_COUNT_MISMATCH_MESSAGE,
+                ),
+                CallMismatch::ArgumentType(range) => (
                     ARGUMENT_NOT_ASSIGNABLE,
-                    *argument_range,
+                    range,
                     ARGUMENT_NOT_ASSIGNABLE_MESSAGE,
-                );
-            }
+                ),
+            };
+            self.emit(code, range, message);
         }
     }
 
-    fn collect_type_parameter_symbols(&self, type_id: TypeId, out: &mut Vec<SymbolId>) {
-        match self.types.get(type_id) {
-            Type::Named(symbol) => {
-                if self.symbols[symbol.get() as usize].kind == SymbolKind::TypeParameter
-                    && !out.contains(symbol)
-                {
-                    out.push(*symbol);
-                }
+    fn evaluate_tagged_template(
+        &mut self,
+        tagged: &'src crate::syntax::TaggedTemplateExpression,
+        scope: ScopeId,
+        callee_type: TypeId,
+        call_range: TextRange,
+    ) -> CallEvaluation {
+        if matches!(self.types.get(callee_type), Type::Any | Type::Error) {
+            return CallEvaluation::success(self.types.any());
+        }
+        let arguments = self.resolve_tagged_template_arguments(tagged, scope, call_range);
+        let groups = self.call_signature_groups(&tagged.tag, callee_type);
+        if groups.is_empty() {
+            return CallEvaluation::failure(CallMismatch::NotCallable);
+        }
+        self.evaluate_signature_groups(groups, &arguments, None, tagged.tag.range())
+    }
+
+    fn resolve_tagged_template_arguments(
+        &mut self,
+        tagged: &'src crate::syntax::TaggedTemplateExpression,
+        scope: ScopeId,
+        call_range: TextRange,
+    ) -> Vec<ResolvedCallArgument> {
+        let strings_range = self
+            .template_literal_range(&tagged.template)
+            .unwrap_or(call_range);
+        let mut resolved = vec![ResolvedCallArgument::Fixed {
+            type_id: self.types.array(self.types.string()),
+            range: strings_range,
+        }];
+        for expression in &tagged.template.expressions {
+            resolved.push(ResolvedCallArgument::Fixed {
+                type_id: self.type_of_expr(expression, scope),
+                range: expression.range(),
+            });
+        }
+        resolved
+    }
+
+    fn template_literal_range(
+        &self,
+        template: &'src crate::syntax::TemplateLiteral,
+    ) -> Option<TextRange> {
+        let first = template.elements.first()?;
+        let last = template.elements.last()?;
+        TextRange::new(first.range().start(), last.range().end()).ok()
+    }
+
+    fn call_signature_groups(
+        &mut self,
+        callee: &Expr,
+        callee_type: TypeId,
+    ) -> Vec<Vec<FunctionSignature>> {
+        if let Some(symbol) = self.resolved_expression_reference(callee) {
+            let overloads = &self.overload_signatures[symbol.get() as usize];
+            if !overloads.is_empty() {
+                return vec![overloads.clone()];
             }
-            Type::Array(element) => self.collect_type_parameter_symbols(*element, out),
-            Type::Tuple(elements) => {
-                for element in elements {
-                    self.collect_type_parameter_symbols(*element, out);
-                }
+        }
+        self.call_signature_groups_for_type(callee_type)
+    }
+
+    fn call_signature_groups_for_type(&mut self, type_id: TypeId) -> Vec<Vec<FunctionSignature>> {
+        if let Some(view) = self.types.prepare_applied_class_view(type_id) {
+            return self.call_signature_groups_for_type(view);
+        }
+        match self.types.get(type_id) {
+            Type::Function(signature) => vec![vec![signature.clone()]],
+            Type::ObjectType(object) if !object.call_signatures.is_empty() => {
+                vec![object.call_signatures.clone()]
             }
             Type::Union(members) => {
+                let members = members.clone();
+                let mut groups = Vec::with_capacity(members.len());
                 for member in members {
-                    self.collect_type_parameter_symbols(*member, out);
-                }
-            }
-            Type::ObjectType(object) => {
-                for property in &object.properties {
-                    self.collect_type_parameter_symbols(property.type_id(), out);
-                }
-            }
-            Type::Function(signature) => {
-                for parameter in signature.parameters() {
-                    self.collect_type_parameter_symbols(parameter.type_id(), out);
-                }
-                self.collect_type_parameter_symbols(signature.return_type(), out);
-            }
-            Type::Error
-            | Type::Intersection(_)
-            | Type::Any
-            | Type::Unknown
-            | Type::Never
-            | Type::Void
-            | Type::Null
-            | Type::Undefined
-            | Type::Boolean
-            | Type::Number
-            | Type::BigInt
-            | Type::String
-            | Type::Symbol
-            | Type::Object
-            | Type::BooleanLiteral(_)
-            | Type::NumberLiteral(_)
-            | Type::StringLiteral(_)
-            | Type::BigIntLiteral(_)
-            | Type::NumericEnum(_) => {}
-        }
-    }
-    fn union_call_signature(&self, members: &[TypeId]) -> Option<FunctionSignature> {
-        let mut signatures = Vec::new();
-        if !self.collect_function_signatures(members, &mut signatures) {
-            return None;
-        }
-        let mut required = 0;
-        let mut total = 0;
-        let mut has_rest = false;
-        for signature in &signatures {
-            let (signature_required, signature_total, rest_index) = signature.arity();
-            required = required.max(signature_required);
-            if rest_index.is_some() {
-                has_rest = true;
-            } else {
-                total = total.max(signature_total);
-            }
-        }
-        let any = self.types.any();
-        if has_rest {
-            total = required + 1;
-        }
-        let mut parameters = Vec::with_capacity(total);
-        for index in 0..total {
-            let optional = index >= required;
-            let rest = has_rest && index == required;
-            parameters.push(FunctionParameter::new(
-                format!("arg{index}"),
-                any,
-                optional,
-                rest,
-            ));
-        }
-        Some(FunctionSignature {
-            type_parameters: Vec::new(),
-            parameters,
-            return_type: any,
-        })
-    }
-
-    fn collect_function_signatures(
-        &self,
-        members: &[TypeId],
-        signatures: &mut Vec<FunctionSignature>,
-    ) -> bool {
-        for member in members {
-            match self.types.get(*member) {
-                Type::Function(signature) => signatures.push(signature.clone()),
-                Type::Union(nested) => {
-                    if !self.collect_function_signatures(nested, signatures) {
-                        return false;
+                    let member_groups = self.call_signature_groups_for_type(member);
+                    if member_groups.is_empty() {
+                        return Vec::new();
                     }
+                    groups.extend(member_groups);
                 }
-                Type::Error
-                | Type::Intersection(_)
-                | Type::Any
-                | Type::Unknown
-                | Type::Never
-                | Type::Void
-                | Type::Null
-                | Type::Undefined
-                | Type::Boolean
-                | Type::Number
-                | Type::BigInt
-                | Type::String
-                | Type::Symbol
-                | Type::Object
-                | Type::BooleanLiteral(_)
-                | Type::NumberLiteral(_)
-                | Type::StringLiteral(_)
-                | Type::BigIntLiteral(_)
-                | Type::Array(_)
-                | Type::Tuple(_)
-                | Type::ObjectType(_)
-                | Type::Named(_)
-                | Type::NumericEnum(_) => return false,
+                groups
             }
+            Type::Intersection(members) => {
+                let members = members.clone();
+                let signatures: Vec<_> = members
+                    .iter()
+                    .flat_map(|member| self.call_signature_groups_for_type(*member))
+                    .flatten()
+                    .collect();
+                if signatures.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![signatures]
+                }
+            }
+            Type::Named(symbol) if self.types.interface_structure(*symbol).is_some() => {
+                let view = self.types.named_structural_view(type_id);
+                self.call_signature_groups_for_type(view)
+            }
+            Type::Named(symbol) => {
+                let resolved = self
+                    .types
+                    .type_parameter_constraint(*symbol)
+                    .unwrap_or(self.symbol_types[symbol.get() as usize]);
+                if resolved == type_id {
+                    Vec::new()
+                } else {
+                    self.call_signature_groups_for_type(resolved)
+                }
+            }
+            _ => Vec::new(),
         }
-        true
     }
 
-    fn array_element_type(&self, array_type: TypeId) -> Option<TypeId> {
-        match self.types.get(array_type) {
-            Type::Array(element) => Some(*element),
-            Type::Tuple(_) => None,
+    fn construct_signature_groups_for_type(
+        &mut self,
+        type_id: TypeId,
+    ) -> Vec<Vec<FunctionSignature>> {
+        if let Some(view) = self.types.prepare_applied_class_view(type_id) {
+            return self.construct_signature_groups_for_type(view);
+        }
+        match self.types.get(type_id) {
+            Type::ObjectType(object) if !object.construct_signatures.is_empty() => {
+                vec![object.construct_signatures.clone()]
+            }
+            Type::Union(members) => {
+                let members = members.clone();
+                let mut groups = Vec::with_capacity(members.len());
+                for member in members {
+                    let member_groups = self.construct_signature_groups_for_type(member);
+                    if member_groups.is_empty() {
+                        return Vec::new();
+                    }
+                    groups.extend(member_groups);
+                }
+                groups
+            }
+            Type::Intersection(members) => {
+                let members = members.clone();
+                let signatures: Vec<_> = members
+                    .iter()
+                    .flat_map(|member| self.construct_signature_groups_for_type(*member))
+                    .flatten()
+                    .collect();
+                if signatures.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![signatures]
+                }
+            }
+            Type::Named(symbol) if self.types.interface_structure(*symbol).is_some() => {
+                let view = self.types.named_structural_view(type_id);
+                self.construct_signature_groups_for_type(view)
+            }
+            Type::Named(symbol) => {
+                let resolved = self
+                    .types
+                    .type_parameter_constraint(*symbol)
+                    .unwrap_or(self.symbol_types[symbol.get() as usize]);
+                if resolved == type_id {
+                    Vec::new()
+                } else {
+                    self.construct_signature_groups_for_type(resolved)
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn signature_argument_mismatches(
+        &mut self,
+        signature: &FunctionSignature,
+        arguments: &[ResolvedCallArgument],
+    ) -> Vec<CallMismatch> {
+        let fixed_count = arguments
+            .iter()
+            .filter(|argument| matches!(argument, ResolvedCallArgument::Fixed { .. }))
+            .count();
+        let has_variadic = arguments
+            .iter()
+            .any(|argument| matches!(argument, ResolvedCallArgument::Variadic { .. }));
+        let (required, total, rest_index) = {
+            let (r, t, rest) = signature.arity();
+            if signature.javascript() {
+                (0, usize::MAX, rest)
+            } else {
+                (r, t, rest)
+            }
+        };
+        if !has_variadic && (fixed_count < required || fixed_count > total) {
+            return vec![CallMismatch::ArgumentCount];
+        }
+
+        let mut mismatches = Vec::new();
+        for (position, argument) in arguments.iter().enumerate() {
+            let parameter_index = rest_index.map_or(position, |rest| position.min(rest));
+            let Some(parameter) = signature.parameters().get(parameter_index) else {
+                if signature.javascript() {
+                    continue;
+                }
+                return vec![CallMismatch::ArgumentCount];
+            };
+            let mut target = parameter.type_id();
+            if rest_index == Some(parameter_index) {
+                target = self.array_element_type(target).unwrap_or(target);
+            }
+            let (source, range) = match argument {
+                ResolvedCallArgument::Fixed { type_id, range } => (*type_id, *range),
+                ResolvedCallArgument::Variadic { element, range } => {
+                    if rest_index != Some(parameter_index) {
+                        if signature.javascript() {
+                            continue;
+                        }
+                        return vec![CallMismatch::ArgumentCount];
+                    }
+                    (*element, *range)
+                }
+            };
+            if !(matches!(self.types.get(source), Type::Undefined) && parameter.optional())
+                && !self.types_assignable(source, target)
+            {
+                mismatches.push(CallMismatch::ArgumentType(range));
+            }
+        }
+        mismatches
+    }
+
+    fn array_element_type(&mut self, array_type: TypeId) -> Option<TypeId> {
+        match self.types.get(array_type).clone() {
+            Type::Array(element) => Some(element),
+            Type::Tuple(shape) => {
+                let mut elements = shape.all_element_types();
+                if (shape.required as usize) < shape.prefix.len() {
+                    elements.push(self.types.undefined_type());
+                }
+                Some(self.types.union(&elements))
+            }
             _ => None,
+        }
+    }
+
+    fn iteration_element_type(&mut self, iterable: TypeId) -> TypeId {
+        match self.types.get(iterable).clone() {
+            Type::Array(element) => element,
+            Type::Tuple(shape) => {
+                let mut elements = shape.all_element_types();
+                if (shape.required as usize) < shape.prefix.len() {
+                    elements.push(self.types.undefined_type());
+                }
+                self.types.union(&elements)
+            }
+            Type::String | Type::StringLiteral(_) => self.types.string(),
+            Type::Any | Type::Unknown => iterable,
+            Type::Union(members) => {
+                let element: Vec<TypeId> = members
+                    .iter()
+                    .map(|&member| self.iteration_element_type(member))
+                    .collect();
+                self.types.union(&element)
+            }
+            Type::Named(symbol) => {
+                let resolved = self.resolve_named_type_symbol(symbol);
+                let view = self.types.named_structural_view(resolved);
+                if view != resolved {
+                    self.iteration_element_type(view)
+                } else if resolved != iterable {
+                    self.iteration_element_type(resolved)
+                } else {
+                    self.types.error_type()
+                }
+            }
+            _ => self.types.error_type(),
         }
     }
 
@@ -4783,7 +8673,7 @@ impl<'src> Binder<'src> {
                     |symbol| self.symbol_types[symbol.get() as usize],
                 ),
             AssignmentTarget::Member(member) => {
-                self.type_of_member(&member.object, &member.property, scope)
+                self.type_of_member(&member.object, &member.property, false, false, scope)
             }
             _ => self.types.any(),
         }
@@ -4793,6 +8683,8 @@ impl<'src> Binder<'src> {
         &mut self,
         object: &'src Expr,
         property: &MemberProperty,
+        optional: bool,
+        read: bool,
         scope: ScopeId,
     ) -> TypeId {
         let Some(name) = enum_plan::cook_member_property_name(self.source, property) else {
@@ -4821,17 +8713,84 @@ impl<'src> Binder<'src> {
             }
         }
         let object_type = self.type_of_expr(object, scope);
+        let object_was_nullish = match self.types.get(object_type) {
+            Type::Null | Type::Undefined => true,
+            Type::Union(members) => members
+                .iter()
+                .any(|member| matches!(self.types.get(*member), Type::Null | Type::Undefined)),
+            _ => false,
+        };
+        let lookup_type = if optional {
+            self.types.non_nullable(object_type)
+        } else {
+            object_type
+        };
         let property_range = match property {
             MemberProperty::Named(identifier) => identifier.range(),
             MemberProperty::Private(identifier) => identifier.range(),
             MemberProperty::Computed(expression) => expression.range(),
         };
         if let Some(type_id) =
-            self.property_type_for_member(object_type, name_str.as_str(), property_range)
+            self.property_type_for_member(lookup_type, name_str.as_str(), property_range, read)
         {
+            if optional && object_was_nullish {
+                return self.types.union(&[type_id, self.types.undefined_type()]);
+            }
             return type_id;
         }
         self.types.any()
+    }
+
+    fn is_member_accessible(&self, property: &PropertyType) -> bool {
+        if matches!(property.access(), Accessibility::Public) {
+            return true;
+        }
+        let Some(declaring_class) = property.declaring_class() else {
+            return true;
+        };
+        let Some(current) = self.class_owner_stack.last().copied() else {
+            return false;
+        };
+        if declaring_class == current {
+            return true;
+        }
+        if matches!(property.access(), Accessibility::Private) {
+            return false;
+        }
+        self.is_derived_from(current, declaring_class)
+    }
+
+    fn is_derived_from(&self, mut derived: SymbolId, base: SymbolId) -> bool {
+        let mut visited = HashSet::new();
+        visited.insert(derived);
+        while let Some(parent) = self.class_base_symbols.get(&derived).copied() {
+            if parent == base {
+                return true;
+            }
+            if !visited.insert(parent) {
+                break;
+            }
+            derived = parent;
+        }
+        false
+    }
+
+    fn function_call_member_type(&mut self, signature: &FunctionSignature) -> TypeId {
+        let mut parameters = Vec::with_capacity(signature.parameters().len() + 1);
+        parameters.push(FunctionParameter::new(
+            "thisArg".to_owned(),
+            self.types.any(),
+            false,
+            false,
+        ));
+        parameters.extend(signature.parameters().iter().cloned());
+        self.types.function_with_parameter_bounds(
+            signature.type_parameters().to_vec(),
+            signature.type_parameter_bounds().to_vec(),
+            parameters,
+            signature.return_type(),
+            signature.javascript(),
+        )
     }
 
     fn property_type_for_member(
@@ -4839,10 +8798,127 @@ impl<'src> Binder<'src> {
         object_type: TypeId,
         name: &str,
         range: TextRange,
+        read: bool,
     ) -> Option<TypeId> {
         match self.types.get(object_type).clone() {
-            Type::ObjectType(_) => {
-                if let Some(type_id) = self.types.property_type(object_type, name) {
+            Type::ObjectType(object) => {
+                if let Some(property) = object
+                    .properties
+                    .iter()
+                    .find(|property| property.name() == name)
+                {
+                    if !self.is_member_accessible(property) {
+                        self.emit(MEMBER_NOT_ACCESSIBLE, range, MEMBER_NOT_ACCESSIBLE_MESSAGE);
+                        return Some(self.types.error_type());
+                    }
+                    let type_id = property.type_id();
+                    if read && property.optional() {
+                        let undefined = self.types.undefined_type();
+                        return Some(self.types.union(&[type_id, undefined]));
+                    }
+                    return Some(type_id);
+                }
+                let numeric = name.parse::<usize>().is_ok();
+                if let Some(signature) = object.index_signatures.iter().find(|signature| {
+                    signature.parameters.first().is_some_and(|parameter| {
+                        matches!(self.types.get(parameter.type_id()), Type::String)
+                            || (numeric
+                                && matches!(self.types.get(parameter.type_id()), Type::Number))
+                    })
+                }) {
+                    return Some(signature.value_type);
+                }
+                if self.is_typescript() {
+                    self.emit(
+                        PROPERTY_DOES_NOT_EXIST,
+                        range,
+                        PROPERTY_DOES_NOT_EXIST_MESSAGE,
+                    );
+                    Some(self.types.error_type())
+                } else {
+                    Some(self.types.any())
+                }
+            }
+            Type::Named(symbol) => {
+                let resolved = self.resolve_named_type_symbol(symbol);
+                let view = self.types.named_structural_view(resolved);
+                if view == object_type {
+                    None
+                } else {
+                    self.property_type_for_member(view, name, range, read)
+                }
+            }
+            Type::Union(members) => {
+                if self.strict_null_checks
+                    && members.iter().any(|member| {
+                        matches!(self.types.get(*member), Type::Null | Type::Undefined)
+                    })
+                {
+                    self.emit(
+                        STRICT_NULL_MEMBER_ACCESS,
+                        range,
+                        STRICT_NULL_MEMBER_ACCESS_MESSAGE,
+                    );
+                    return Some(self.types.error_type());
+                }
+                let mut found = Vec::with_capacity(members.len());
+                for member in members {
+                    let member_property =
+                        self.property_type_for_member(member, name, range, read)?;
+                    if member_property == self.types.error_type() {
+                        return Some(self.types.error_type());
+                    }
+                    found.push(member_property);
+                }
+                if found.len() == 1 {
+                    Some(found[0])
+                } else {
+                    Some(self.types.union(&found))
+                }
+            }
+            Type::Intersection(members) => {
+                let mut found = Vec::with_capacity(members.len());
+                for member in members {
+                    let resolved = match self.types.get(member) {
+                        Type::Named(symbol) => self.resolve_named_type_symbol(*symbol),
+                        _ => member,
+                    };
+                    let view = self.types.named_structural_view(resolved);
+                    let property = match self.types.get(view).clone() {
+                        Type::Function(signature) if name == "call" => {
+                            Some(self.function_call_member_type(&signature))
+                        }
+                        _ if read => self.types.read_property_type(view, name),
+                        _ => self.types.property_type(view, name),
+                    };
+                    if let Some(property) = property {
+                        found.push(property);
+                    }
+                }
+                match found.len() {
+                    0 => {
+                        if self.is_typescript() {
+                            self.emit(
+                                PROPERTY_DOES_NOT_EXIST,
+                                range,
+                                PROPERTY_DOES_NOT_EXIST_MESSAGE,
+                            );
+                            Some(self.types.error_type())
+                        } else {
+                            Some(self.types.any())
+                        }
+                    }
+                    1 => Some(found[0]),
+                    _ => Some(self.types.intersection(found)),
+                }
+            }
+            Type::Tuple(_) => {
+                let property = if read {
+                    self.types.read_property_type(object_type, name)
+                } else {
+                    self.types.property_type(object_type, name)
+                };
+                if let Some(type_id) = property {
                     Some(type_id)
                 } else if self.is_typescript() {
                     self.emit(
@@ -4855,48 +8931,16 @@ impl<'src> Binder<'src> {
                     Some(self.types.any())
                 }
             }
-            Type::Named(symbol) => {
-                if let Some(instance_type) = self.class_instance_types.get(&symbol).copied() {
-                    // A class constructor value exposes `prototype`, typed as the
-                    // class instance type, alongside its static members. The
-                    // static side has no property table yet, so resolve
-                    // `prototype` here. For user classes an unknown constructor
-                    // property falls through to the instance-type lookup, which
-                    // reports `PROPERTY_DOES_NOT_EXIST`. Intrinsics (Error, ...)
-                    // instead keep the permissive `resolve_named_type_symbol`
-                    // fallthrough below, so `Error.captureStackTrace` and other
-                    // unmodelled statics do not newly report C057.
-                    if name == "prototype" {
-                        return Some(instance_type);
-                    }
-                    if self.symbols[symbol.get() as usize].kind == SymbolKind::Class {
-                        return self.property_type_for_member(instance_type, name, range);
-                    }
+            Type::AppliedClass { .. } => {
+                if let Some(view) = self.types.prepare_applied_class_view(object_type) {
+                    return self.property_type_for_member(view, name, range, read);
                 }
-                let resolved = self.resolve_named_type_symbol(symbol);
-                if resolved == object_type {
-                    None
-                } else {
-                    self.property_type_for_member(resolved, name, range)
-                }
+                None
             }
-            Type::Union(members) => {
-                let mut found = Vec::with_capacity(members.len());
-                for member in members {
-                    let member_property = self.property_type_for_member(member, name, range)?;
-                    if member_property == self.types.error_type() {
-                        return Some(self.types.error_type());
-                    }
-                    found.push(member_property);
-                }
-                if found.len() == 1 {
-                    Some(found[0])
-                } else {
-                    Some(self.types.union(&found))
-                }
+            Type::Function(signature) if name == "call" => {
+                Some(self.function_call_member_type(&signature))
             }
             Type::Error
-            | Type::Intersection(_)
             | Type::Any
             | Type::Unknown
             | Type::Never
@@ -4914,9 +8958,48 @@ impl<'src> Binder<'src> {
             | Type::StringLiteral(_)
             | Type::BigIntLiteral(_)
             | Type::Array(_)
-            | Type::Tuple(_)
             | Type::Function(_)
-            | Type::NumericEnum(_) => None,
+            | Type::NumericEnum(_)
+            | Type::Keyof(_)
+            | Type::IndexedAccess { .. } => None,
+        }
+    }
+
+    fn property_is_readonly(&mut self, object_type: TypeId, name: &str) -> bool {
+        match self.types.get(object_type).clone() {
+            Type::ObjectType(object) => {
+                if let Some(property) = object
+                    .properties
+                    .iter()
+                    .find(|property| property.name() == name)
+                {
+                    return property.readonly();
+                }
+                let numeric = name.parse::<usize>().is_ok();
+                object.index_signatures.iter().any(|signature| {
+                    signature.readonly
+                        && signature.parameters.first().is_some_and(|parameter| {
+                            matches!(self.types.get(parameter.type_id()), Type::String)
+                                || (numeric
+                                    && matches!(self.types.get(parameter.type_id()), Type::Number))
+                        })
+                })
+            }
+            Type::Named(symbol) => {
+                let resolved = self.resolve_named_type_symbol(symbol);
+                let view = self.types.named_structural_view(resolved);
+                view != object_type && self.property_is_readonly(view, name)
+            }
+            Type::Union(members) | Type::Intersection(members) => members
+                .into_iter()
+                .any(|member| self.property_is_readonly(member, name)),
+            Type::AppliedClass { .. } => {
+                if let Some(view) = self.types.prepare_applied_class_view(object_type) {
+                    return self.property_is_readonly(view, name);
+                }
+                false
+            }
+            _ => false,
         }
     }
 
@@ -4944,6 +9027,11 @@ impl<'src> Binder<'src> {
                             identifier.range(),
                             ASSIGNMENT_TO_NAMESPACE_MESSAGE,
                         ),
+                        SymbolKind::Variable(VariableKind::Const) => self.emit(
+                            ASSIGNMENT_TO_CONST,
+                            identifier.range(),
+                            ASSIGNMENT_TO_CONST_MESSAGE,
+                        ),
                         _ => {}
                     }
                 }
@@ -4968,6 +9056,35 @@ impl<'src> Binder<'src> {
                 else {
                     return;
                 };
+                let name_text = name.to_utf8_lossy();
+                let object_type = self.type_of_expr(&member.object, scope);
+                let constructor_initialization = matches!(member.object.data(), Expression::This)
+                    && matches!(
+                        self.super_call_contexts.last(),
+                        Some(
+                            SuperCallContext::BaseConstructor
+                                | SuperCallContext::DerivedConstructor
+                        )
+                    )
+                    && self
+                        .constructor_writable_readonly_properties
+                        .last()
+                        .is_some_and(|properties| properties.contains(name_text.as_str()));
+                if self.property_is_readonly(object_type, name_text.as_str())
+                    && !constructor_initialization
+                {
+                    self.readonly_assignment_targets.insert(target.id());
+                    let range = match &member.property {
+                        MemberProperty::Named(identifier) => identifier.range(),
+                        MemberProperty::Private(identifier) => identifier.range(),
+                        MemberProperty::Computed(expression) => expression.range(),
+                    };
+                    self.emit(
+                        ASSIGNMENT_TO_READONLY,
+                        range,
+                        ASSIGNMENT_TO_READONLY_MESSAGE,
+                    );
+                }
                 let base = object_symbol
                     .filter(|symbol| self.symbols[symbol.get() as usize].kind == SymbolKind::Import)
                     .map(enum_plan::ImportedEnumMemberBase::Import)
@@ -5020,6 +9137,44 @@ impl<'src> Binder<'src> {
                 );
             }
         }
+    }
+
+    fn extend_javascript_object_assignment(
+        &mut self,
+        target: &'src crate::syntax::AssignmentTargetNode,
+        source: &'src Expr,
+        scope: ScopeId,
+    ) {
+        let AssignmentTarget::Member(member) = target.data() else {
+            return;
+        };
+        let Some(symbol) = self.resolved_expression_reference(&member.object) else {
+            return;
+        };
+        let Some(name) = enum_plan::cook_member_property_name(self.source, &member.property) else {
+            return;
+        };
+        let Type::ObjectType(mut object) = self
+            .types
+            .get(self.symbol_types[symbol.get() as usize])
+            .clone()
+        else {
+            return;
+        };
+        let source_type = self.type_of_expr(source, scope);
+        let name = name.to_utf8_lossy();
+        if let Some(property) = object
+            .properties
+            .iter_mut()
+            .find(|property| property.name() == name)
+        {
+            property.type_id = self.types.union(&[property.type_id(), source_type]);
+        } else {
+            object
+                .properties
+                .push(PropertyType::new(name, false, source_type));
+        }
+        self.symbol_types[symbol.get() as usize] = self.types.object_type_with_members(object);
     }
 
     fn resolve_value(&mut self, identifier: &IdentifierNode, reference: NodeId, scope: ScopeId) {
@@ -5154,6 +9309,13 @@ impl<'src> Binder<'src> {
                     .collect();
                 self.types.union(&resolved)
             }
+            TypeNode::Intersection(members) => {
+                let resolved = members
+                    .iter()
+                    .map(|member| self.resolve_type(member, scope))
+                    .collect();
+                self.types.intersection(resolved)
+            }
             TypeNode::Array(element) => {
                 let resolved = self.resolve_type(element, scope);
                 self.types.array(resolved)
@@ -5162,13 +9324,39 @@ impl<'src> Binder<'src> {
             TypeNode::Function(function) => self.resolve_function_type(function, scope),
             TypeNode::Parenthesized(inner) => self.resolve_type(inner, scope),
             TypeNode::Tuple(tuple) => {
-                let element_types: Vec<TypeId> = tuple
-                    .elements
-                    .iter()
-                    .map(|element| self.resolve_type(&element.type_node, scope))
-                    .collect();
-                let element = self.types.union(&element_types);
-                self.types.array(element)
+                let mut shape = TupleShape {
+                    prefix: Vec::with_capacity(tuple.elements.len()),
+                    required: 0,
+                    rest: None,
+                    suffix: Vec::new(),
+                };
+                for element in &tuple.elements {
+                    let resolved = self.resolve_type(&element.type_node, scope);
+                    if element.rest {
+                        match self.types.get(resolved).clone() {
+                            Type::Array(rest) => shape.rest = Some(rest),
+                            Type::Tuple(inner) => {
+                                if shape.rest.is_none() {
+                                    shape.required = shape.required.saturating_add(inner.required);
+                                    shape.prefix.extend(inner.prefix);
+                                    shape.rest = inner.rest;
+                                    shape.suffix.extend(inner.suffix);
+                                } else {
+                                    shape.suffix.extend(inner.all_element_types());
+                                }
+                            }
+                            _ => shape.rest = Some(self.types.any()),
+                        }
+                    } else if shape.rest.is_some() {
+                        shape.suffix.push(resolved);
+                    } else {
+                        if !element.optional {
+                            shape.required = shape.required.saturating_add(1);
+                        }
+                        shape.prefix.push(resolved);
+                    }
+                }
+                self.types.tuple_shape(shape)
             }
             TypeNode::Query(query) => {
                 if let Some(arguments) = &query.type_arguments {
@@ -5178,19 +9366,77 @@ impl<'src> Binder<'src> {
                 }
                 self.resolve_type_query(query, scope, node.range())
             }
+            TypeNode::IndexedAccess(indexed) => {
+                let object_type = self.resolve_type(&indexed.object_type, scope);
+                self.resolve_indexed_access(object_type, &indexed.index_type, scope, node.range())
+            }
+            TypeNode::Operator { operator, operand } => match operator {
+                TypeOperator::Keyof => {
+                    let resolved = self.resolve_type(operand, scope);
+                    self.types.keyof(resolved)
+                }
+                TypeOperator::Readonly | TypeOperator::Unique => {
+                    let _ = self.resolve_type(operand, scope);
+                    self.types.error_type()
+                }
+            },
             _ => self.types.error_type(),
         };
         self.type_nodes.insert(node.id(), resolved);
         resolved
     }
 
+    fn resolve_indexed_access(
+        &mut self,
+        object_type: TypeId,
+        index_node: &'src Ty,
+        scope: ScopeId,
+        range: TextRange,
+    ) -> TypeId {
+        let index_type = match index_node.data() {
+            TypeNode::Operator {
+                operator: TypeOperator::Keyof,
+                operand,
+            } => {
+                let key_source = self.resolve_type(operand, scope);
+                self.types.keyof(key_source)
+            }
+            _ => self.resolve_type(index_node, scope),
+        };
+        self.resolve_indexed_access_by_type(object_type, index_type, range)
+    }
+
+    fn resolve_indexed_access_by_type(
+        &mut self,
+        object_type: TypeId,
+        index_type: TypeId,
+        range: TextRange,
+    ) -> TypeId {
+        let result = self.types.indexed_access(object_type, index_type);
+        if result == self.types.error_type()
+            && object_type != self.types.error_type()
+            && index_type != self.types.error_type()
+        {
+            self.emit(
+                INVALID_INDEXED_ACCESS_KEY,
+                range,
+                INVALID_INDEXED_ACCESS_KEY_MESSAGE,
+            );
+        }
+        result
+    }
+
     fn resolve_type_query(
         &mut self,
         query: &'src crate::syntax::TypeQuery,
         scope: ScopeId,
-        range: TextRange,
+        _range: TextRange,
     ) -> TypeId {
-        match &query.name {
+        self.resolve_type_query_name(&query.name, scope)
+    }
+
+    fn resolve_type_query_name(&mut self, name: &EntityName, scope: ScopeId) -> TypeId {
+        match name {
             EntityName::Identifier(identifier) => {
                 let name = self.identifier_text(identifier);
                 let Some(symbol) = self.lookup_value(scope, &name) else {
@@ -5204,33 +9450,51 @@ impl<'src> Binder<'src> {
                 self.symbol_types[symbol.get() as usize]
             }
             EntityName::Qualified { left, right } => {
-                let (member_scope, _path) = match self.resolve_entity_name_scope(left, scope) {
-                    Ok(resolved) => resolved,
-                    Err(EntityNameScopeError::NotNamespace) => {
-                        self.emit(CANNOT_FIND_NAMESPACE, range, CANNOT_FIND_NAMESPACE_MESSAGE);
-                        return self.types.error_type();
-                    }
-                    Err(EntityNameScopeError::MissingMember(missing_range)) => {
-                        self.emit(CANNOT_FIND_NAME, missing_range, CANNOT_FIND_NAME_MESSAGE);
-                        return self.types.error_type();
-                    }
-                    Err(EntityNameScopeError::Unresolved) => {
-                        if self.entity_name_identifier_is_unresolved(left, scope) {
-                            self.emit(
-                                CANNOT_FIND_NAME,
-                                self.entity_name_range(left),
-                                CANNOT_FIND_NAME_MESSAGE,
-                            );
+                // A qualified `typeof A.B` can be a namespace path (the prefix
+                // resolves through a namespace/module scope, the final name is a
+                // value it exports) or a value property path (the prefix is an
+                // expression, each subsequent identifier is a member on it).
+                // Try the namespace interpretation first; if the prefix is not a
+                // namespace, fall back to type-table member lookup.
+                match self.resolve_entity_name_scope(left, scope) {
+                    Ok((member_scope, _path)) => {
+                        let name = self.identifier_text(right);
+                        match self.scopes[member_scope.0 as usize].value(&name) {
+                            Some(symbol) => self.symbol_types[symbol.get() as usize],
+                            None => {
+                                self.emit(
+                                    CANNOT_FIND_NAME,
+                                    right.range(),
+                                    CANNOT_FIND_NAME_MESSAGE,
+                                );
+                                self.types.error_type()
+                            }
                         }
-                        return self.types.error_type();
                     }
-                };
-                let name = self.identifier_text(right);
-                let Some(symbol) = self.scopes[member_scope.0 as usize].value(&name) else {
-                    self.emit(CANNOT_FIND_NAME, right.range(), CANNOT_FIND_NAME_MESSAGE);
-                    return self.types.error_type();
-                };
-                self.symbol_types[symbol.get() as usize]
+                    Err(_) => {
+                        let base_type = self.resolve_type_query_name(left, scope);
+                        if base_type == self.types.error_type() || base_type == self.types.any() {
+                            return base_type;
+                        }
+                        let name = self.identifier_text(right);
+                        match self.property_type_for_member(
+                            base_type,
+                            name.as_ref(),
+                            right.range(),
+                            true,
+                        ) {
+                            Some(type_id) => type_id,
+                            None => {
+                                self.emit(
+                                    PROPERTY_DOES_NOT_EXIST,
+                                    right.range(),
+                                    PROPERTY_DOES_NOT_EXIST_MESSAGE,
+                                );
+                                self.types.error_type()
+                            }
+                        }
+                    }
+                }
             }
             EntityName::Missing(_) => self.types.error_type(),
         }
@@ -5258,7 +9522,7 @@ impl<'src> Binder<'src> {
         match literal {
             TypeLiteral::String(token) => {
                 let text = self.text(token.data().token());
-                self.types.string_literal(text)
+                self.types.string_literal_lexeme(text)
             }
             TypeLiteral::Number(token) => {
                 let text = self.text(token.data().token());
@@ -5297,6 +9561,53 @@ impl<'src> Binder<'src> {
                 match self.lookup_type(scope, &name) {
                     Some(symbol) => {
                         self.symbol_references.push((identifier.range(), symbol));
+                        if name.as_ref() == "Promise"
+                            && matches!(
+                                self.symbols[symbol.get() as usize].kind,
+                                SymbolKind::IntrinsicType
+                            )
+                        {
+                            return self.promise_type(
+                                explicit_arguments
+                                    .as_deref()
+                                    .and_then(|arguments| arguments.first().copied())
+                                    .unwrap_or_else(|| self.types.any()),
+                            );
+                        }
+                        if matches!(name.as_ref(), "Array" | "ReadonlyArray" | "ArrayLike")
+                            && matches!(
+                                self.symbols[symbol.get() as usize].kind,
+                                SymbolKind::IntrinsicType
+                            )
+                        {
+                            return self.types.array(
+                                explicit_arguments
+                                    .as_deref()
+                                    .and_then(|arguments| arguments.first().copied())
+                                    .unwrap_or_else(|| self.types.any()),
+                            );
+                        }
+                        if matches!(
+                            name.as_ref(),
+                            "Iterable"
+                                | "Iterator"
+                                | "IterableIterator"
+                                | "AsyncIterable"
+                                | "AsyncIterableIterator"
+                                | "AsyncIterator"
+                                | "Generator"
+                                | "AsyncGenerator"
+                        ) && matches!(
+                            self.symbols[symbol.get() as usize].kind,
+                            SymbolKind::IntrinsicType
+                        ) {
+                            return self.types.array(
+                                explicit_arguments
+                                    .as_deref()
+                                    .and_then(|arguments| arguments.first().copied())
+                                    .unwrap_or_else(|| self.types.any()),
+                            );
+                        }
                         let base = self.resolve_named_type_symbol(symbol);
                         self.instantiate_explicit_type_arguments(
                             symbol,
@@ -5353,9 +9664,38 @@ impl<'src> Binder<'src> {
         arguments: Option<&[TypeId]>,
         base: TypeId,
     ) -> TypeId {
-        let Some(arguments) = arguments else {
-            return base;
-        };
+        if let Some((class_symbol, _)) = self.types.class_identity(base) {
+            let class_parameters = self.types.class_type_parameters(class_symbol).to_vec();
+            if !class_parameters.is_empty() {
+                let bounds = self
+                    .types
+                    .class_type_parameter_bounds(class_symbol)
+                    .to_vec();
+                let mut inferred = Vec::with_capacity(class_parameters.len());
+                for (index, parameter) in class_parameters.iter().enumerate() {
+                    let explicit = arguments
+                        .and_then(|arguments| arguments.get(index))
+                        .copied();
+                    let type_id = match (explicit, bounds.get(index).and_then(|b| b.default())) {
+                        (Some(type_id), _) => type_id,
+                        (None, Some(default)) => InferredTypeArguments::new(inferred.clone())
+                            .instantiate(&mut self.types, default),
+                        (None, None) => self.types.any(),
+                    };
+                    inferred.push(InferredTypeArgument::new(
+                        *parameter,
+                        type_id,
+                        if explicit.is_some() {
+                            InferenceProvenance::Explicit
+                        } else {
+                            InferenceProvenance::Default
+                        },
+                    ));
+                }
+                let instantiation = InferredTypeArguments::new(inferred);
+                return instantiation.instantiate(&mut self.types, base);
+            }
+        }
         let Some(definition) = self.type_defs.get(&symbol).copied() else {
             return base;
         };
@@ -5379,25 +9719,37 @@ impl<'src> Binder<'src> {
         if parameters.is_empty() {
             return base;
         }
-        let scope_entry = self.scopes.get(type_scope.0 as usize);
-        let scope = match scope_entry {
-            Some(scope) => scope,
-            None => return base,
-        };
         let mut inferred = Vec::with_capacity(parameters.len());
         for (index, parameter) in parameters.iter().enumerate() {
-            let name = self.identifier_text(&parameter.data().name);
-            let Some(parameter_symbol) = scope.types.get(name.as_ref()).copied() else {
+            let data = parameter.data();
+            let name = self.identifier_text(&data.name);
+            let Some(parameter_symbol) = self.scopes[type_scope.0 as usize]
+                .types
+                .get(name.as_ref())
+                .copied()
+            else {
                 continue;
             };
-            let type_id = arguments
-                .get(index)
-                .copied()
-                .unwrap_or_else(|| self.types.any());
+            let explicit = arguments
+                .and_then(|arguments| arguments.get(index))
+                .copied();
+            let type_id = match (explicit, data.default.as_ref()) {
+                (Some(type_id), _) => type_id,
+                (None, Some(default)) => {
+                    let default = self.resolve_type(default, type_scope);
+                    InferredTypeArguments::new(inferred.clone())
+                        .instantiate(&mut self.types, default)
+                }
+                (None, None) => self.types.any(),
+            };
             inferred.push(InferredTypeArgument::new(
                 parameter_symbol,
                 type_id,
-                InferenceProvenance::Explicit,
+                if explicit.is_some() {
+                    InferenceProvenance::Explicit
+                } else {
+                    InferenceProvenance::Default
+                },
             ));
         }
         if inferred.is_empty() {
@@ -5409,10 +9761,24 @@ impl<'src> Binder<'src> {
 
     fn resolve_named_type_symbol(&mut self, symbol: SymbolId) -> TypeId {
         match self.symbols[symbol.get() as usize].kind {
-            SymbolKind::Interface | SymbolKind::TypeAlias | SymbolKind::Enum => {
-                self.resolve_type_symbol(symbol)
+            SymbolKind::Interface => {
+                let head = self.resolve_type_symbol(symbol);
+                self.types.named_structural_view(head)
             }
-            SymbolKind::Class | SymbolKind::TypeParameter => self.types.named(symbol),
+            SymbolKind::TypeAlias | SymbolKind::Enum => self.resolve_type_symbol(symbol),
+            SymbolKind::Class => self
+                .types
+                .declared_class(symbol)
+                .unwrap_or_else(|| self.types.applied_class(symbol, Vec::new())),
+            SymbolKind::TypeParameter => self.types.named(symbol),
+            // IntrinsicValue symbols that carry a registered class instance
+            // type (the Error family registered in `bind_intrinsic_environment`)
+            // resolve to their AppliedClass instance so `class E extends Error`
+            // inherits `name`/`message`/`stack`/`cause`. Symbols without a
+            // registered instance fall through to the permissive error type.
+            SymbolKind::IntrinsicValue if self.class_instance_types.contains_key(&symbol) => {
+                self.class_instance_types[&symbol]
+            }
             // `Object` is the only intrinsic type the table models nominally, because
             // relations knows it is the top object type. The other intrinsics
             // (`Record`, `Promise`, `Iterable`, ...) have no structural definition yet.
@@ -5622,6 +9988,11 @@ impl<'src> Binder<'src> {
     pub(crate) fn resolve_type_symbol(&mut self, symbol: SymbolId) -> TypeId {
         match self.type_state[symbol.get() as usize] {
             TypeState::Done(id) => return id,
+            TypeState::InProgress
+                if self.symbols[symbol.get() as usize].kind == SymbolKind::Interface =>
+            {
+                return self.types.named(symbol);
+            }
             TypeState::InProgress => return self.types.error_type(),
             TypeState::Unresolved => {}
         }
@@ -5643,11 +10014,45 @@ impl<'src> Binder<'src> {
             TypeDef::Interface {
                 scope,
                 type_parameters,
-                extends,
-                members,
             } => {
+                let head = self.types.named(symbol);
                 self.resolve_type_parameter_bounds(type_parameters, scope);
-                self.resolve_interface_type(scope, extends, members)
+                let declarations = self
+                    .interface_merges
+                    .get(&symbol)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut merged = ObjectType {
+                    properties: Vec::new(),
+                    call_signatures: Vec::new(),
+                    construct_signatures: Vec::new(),
+                    index_signatures: Vec::new(),
+                };
+                for interface in declarations {
+                    let base =
+                        self.resolve_interface_type(scope, &interface.extends, &interface.members);
+                    if let Type::ObjectType(object) = self.types.get(base).clone() {
+                        merged.properties.extend(object.properties);
+                        for signature in object.call_signatures {
+                            if !merged.call_signatures.contains(&signature) {
+                                merged.call_signatures.push(signature);
+                            }
+                        }
+                        for signature in object.construct_signatures {
+                            if !merged.construct_signatures.contains(&signature) {
+                                merged.construct_signatures.push(signature);
+                            }
+                        }
+                        for signature in object.index_signatures {
+                            if !merged.index_signatures.contains(&signature) {
+                                merged.index_signatures.push(signature);
+                            }
+                        }
+                    }
+                }
+                let structure = self.types.object_type_with_members(merged);
+                self.types.set_interface_structure(symbol, structure);
+                head
             }
             TypeDef::Enum { numeric } => {
                 if numeric {
@@ -5675,19 +10080,19 @@ impl<'src> Binder<'src> {
                 NodeId::default(),
                 NodeId::default_range(),
             );
-            if let Type::ObjectType(base_object) = self.types.get(base_type) {
+            let base_view = self.types.named_structural_view(base_type);
+            if let Type::ObjectType(base_object) = self.types.get(base_view) {
                 for base_property in &base_object.properties {
-                    if !object
-                        .properties
-                        .iter()
-                        .any(|property| property.name == base_property.name)
-                    {
-                        object.properties.push(base_property.clone());
-                    }
+                    object.properties.push(base_property.clone());
                 }
                 for base_signature in &base_object.call_signatures {
                     if !object.call_signatures.contains(base_signature) {
                         object.call_signatures.push(base_signature.clone());
+                    }
+                }
+                for base_signature in &base_object.construct_signatures {
+                    if !object.construct_signatures.contains(base_signature) {
+                        object.construct_signatures.push(base_signature.clone());
                     }
                 }
                 for base_signature in &base_object.index_signatures {
@@ -5717,6 +10122,7 @@ impl<'src> Binder<'src> {
         let mut object = ObjectType {
             properties: Vec::new(),
             call_signatures: Vec::new(),
+            construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
         };
         for member in members {
@@ -5730,9 +10136,10 @@ impl<'src> Binder<'src> {
                             }
                             None => self.types.any(),
                         };
-                        object
-                            .properties
-                            .push(PropertyType::new(name, property.optional, type_id));
+                        object.properties.push(
+                            PropertyType::new(name, property.optional, type_id)
+                                .with_readonly(property.readonly),
+                        );
                     }
                 }
                 TypeMember::Method(method) => {
@@ -5746,9 +10153,9 @@ impl<'src> Binder<'src> {
                             );
                         }
                         let type_id = self.resolve_function_type(&method.function, scope);
-                        object
-                            .properties
-                            .push(PropertyType::new(name, method.optional, type_id));
+                        object.properties.push(
+                            PropertyType::new(name, method.optional, type_id).with_method(true),
+                        );
                     }
                 }
                 TypeMember::Call(call) => {
@@ -5771,7 +10178,9 @@ impl<'src> Binder<'src> {
                             MISSING_METHOD_RETURN_TYPE_MESSAGE,
                         );
                     }
-                    let _ = self.resolve_function_type(&construct.function.function, scope);
+                    object
+                        .construct_signatures
+                        .push(self.resolve_function_signature(&construct.function.function, scope));
                 }
                 TypeMember::Index(index) => {
                     let parameters = index
@@ -5821,6 +10230,13 @@ impl<'src> Binder<'src> {
                 continue;
             }
             let type_id = self.resolve_type(&parameter.type_annotation.data().type_node, child);
+            if parameter.rest && !self.is_valid_rest_parameter_type(type_id) {
+                self.emit(
+                    TYPE_NOT_ASSIGNABLE,
+                    parameter.type_annotation.range(),
+                    NOT_ASSIGNABLE_MESSAGE,
+                );
+            }
             parameters.push(FunctionParameter::new(
                 self.identifier_text(&parameter.name).into_owned(),
                 type_id,
@@ -5829,23 +10245,14 @@ impl<'src> Binder<'src> {
             ));
         }
         let return_type = self.resolve_type(&function.return_type, child);
-        let type_parameters = function
-            .type_parameters
-            .as_ref()
-            .map(|list| {
-                list.parameters
-                    .iter()
-                    .filter_map(|param| {
-                        let name = self.identifier_text(&param.data().name);
-                        self.lookup_type(child, &name)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let (type_parameters, type_parameter_bounds) =
+            self.signature_type_parameters(function.type_parameters.as_ref(), child);
         FunctionSignature {
             type_parameters,
+            type_parameter_bounds,
             parameters,
             return_type,
+            javascript: false,
         }
     }
 
@@ -5866,6 +10273,20 @@ impl<'src> Binder<'src> {
         }
     }
 
+    fn promise_type(&mut self, value: TypeId) -> TypeId {
+        let any = self.types.any();
+        self.types.object_type(vec![
+            PropertyType::new("__bamts_promise_value", false, value),
+            PropertyType::new("then", false, any),
+            PropertyType::new("catch", false, any),
+            PropertyType::new("finally", false, any),
+        ])
+    }
+
+    fn promise_value_type(&mut self, promise: TypeId) -> Option<TypeId> {
+        self.types.property_type(promise, "__bamts_promise_value")
+    }
+
     // -- expression typing (bounded, permissive) -------------------------------
 
     pub(crate) fn type_of_expr(&mut self, expression: &'src Expr, scope: ScopeId) -> TypeId {
@@ -5879,6 +10300,359 @@ impl<'src> Binder<'src> {
         result
     }
 
+    fn type_of_expr_with_target(
+        &mut self,
+        expression: &'src Expr,
+        target: TypeId,
+        scope: ScopeId,
+    ) -> TypeId {
+        let result = match expression.data() {
+            Expression::Array(array)
+                if !array
+                    .elements
+                    .iter()
+                    .any(|element| matches!(element, ArrayElement::Spread(_))) =>
+            {
+                let target = self.types.non_nullable(target);
+                let (target_shape, array_target) = match self.types.get(target).clone() {
+                    Type::Tuple(shape) => (Some(shape), None),
+                    Type::Array(element) => (None, Some(element)),
+                    _ => return self.type_of_expr(expression, scope),
+                };
+                let mut element_types = Vec::with_capacity(array.elements.len());
+                let source_length = array.elements.len();
+                for (index, element) in array.elements.iter().enumerate() {
+                    let element_type = match element {
+                        ArrayElement::Expression(inner) => {
+                            let element_target = target_shape
+                                .as_ref()
+                                .and_then(|shape| {
+                                    let elements =
+                                        shape.element_types_at_length(index, source_length);
+                                    (!elements.is_empty()).then(|| self.types.union(&elements))
+                                })
+                                .or(array_target);
+                            match element_target {
+                                Some(target) => self.type_of_expr_with_target(inner, target, scope),
+                                None => self.type_of_expr(inner, scope),
+                            }
+                        }
+                        ArrayElement::Elision => self.types.undefined_type(),
+                        ArrayElement::Missing(_) => self.types.any(),
+                        ArrayElement::Spread(_) => unreachable!("spread arrays are excluded"),
+                    };
+                    element_types.push(element_type);
+                }
+                if target_shape.is_some() {
+                    self.types.tuple(element_types)
+                } else {
+                    let element = self.types.union(&element_types);
+                    self.types.array(element)
+                }
+            }
+            Expression::Object(object) => self.type_of_object_literal(object, Some(target), scope),
+            Expression::Conditional(conditional) => {
+                self.type_of_conditional_expr(conditional, Some(target), scope)
+            }
+            _ => return self.type_of_expr(expression, scope),
+        };
+        if self.node_types.insert(expression.id(), result).is_none() {
+            self.typed_expressions.push((expression.range(), result));
+        }
+        result
+    }
+
+    /// Checks one contextual method against every target overload.
+    fn contextual_overload_method_type(&mut self, source: TypeId, target: TypeId) -> TypeId {
+        fn erase_signature(types: &mut TypeTable, type_id: TypeId) -> Option<TypeId> {
+            let Type::Function(signature) = types.get(type_id).clone() else {
+                return None;
+            };
+            if signature.type_parameters().is_empty() {
+                return Some(type_id);
+            }
+            let any = types.any();
+            let arguments = signature
+                .type_parameters()
+                .iter()
+                .copied()
+                .map(|symbol| InferredTypeArgument::new(symbol, any, InferenceProvenance::Explicit))
+                .collect();
+            Some(InferredTypeArguments::new(arguments).instantiate_signature(types, &signature))
+        }
+
+        fn constrain_signature(types: &mut TypeTable, type_id: TypeId) -> Option<TypeId> {
+            let Type::Function(signature) = types.get(type_id).clone() else {
+                return None;
+            };
+            if signature.type_parameters().is_empty() {
+                return Some(type_id);
+            }
+            let mut arguments = Vec::with_capacity(signature.type_parameters().len());
+            for (&symbol, bound) in signature
+                .type_parameters()
+                .iter()
+                .zip(signature.type_parameter_bounds())
+            {
+                let prior = InferredTypeArguments::new(arguments.clone());
+                let (argument, provenance) = if let Some(constraint) = bound.constraint() {
+                    (
+                        prior.instantiate(types, constraint),
+                        InferenceProvenance::Constraint,
+                    )
+                } else {
+                    (types.any(), InferenceProvenance::Unknown)
+                };
+                arguments.push(InferredTypeArgument::new(symbol, argument, provenance));
+            }
+            Some(InferredTypeArguments::new(arguments).instantiate_signature(types, &signature))
+        }
+
+        let Some(target_overloads) = self.types.overload_members(target) else {
+            return source;
+        };
+        if target_overloads.len() < 2 {
+            return source;
+        }
+        let Some(source_overloads) = self.types.overload_members(source) else {
+            return source;
+        };
+        let mut sources = Vec::with_capacity(source_overloads.len());
+        for source_member in source_overloads {
+            let (Some(erased), Some(constrained)) = (
+                erase_signature(&mut self.types, source_member),
+                constrain_signature(&mut self.types, source_member),
+            ) else {
+                return source;
+            };
+            sources.push((erased, constrained));
+        }
+        for target_member in target_overloads {
+            let Type::Function(target_signature) = self.types.get(target_member) else {
+                return source;
+            };
+            let target_is_generic = !target_signature.type_parameters().is_empty();
+            let target_candidate = if target_is_generic {
+                let Some(constrained) = constrain_signature(&mut self.types, target_member) else {
+                    return source;
+                };
+                constrained
+            } else {
+                target_member
+            };
+            let compatible = sources.iter().any(|&(erased, constrained)| {
+                let candidate = if target_is_generic {
+                    constrained
+                } else {
+                    erased
+                };
+                self.types_assignable(candidate, target_candidate)
+            });
+            if !compatible {
+                return source;
+            }
+        }
+        target
+    }
+
+    fn type_of_object_literal(
+        &mut self,
+        object: &'src ObjectLiteral,
+        contextual_target: Option<TypeId>,
+        scope: ScopeId,
+    ) -> TypeId {
+        let contextual_target = contextual_target.map(|target| self.types.non_nullable(target));
+        let mut properties = Vec::new();
+        let mut accessors: BTreeMap<String, (Option<TypeId>, Option<TypeId>)> = BTreeMap::new();
+
+        fn upsert_property(properties: &mut Vec<PropertyType>, property: PropertyType) {
+            if let Some(existing) = properties
+                .iter_mut()
+                .find(|existing| existing.name() == property.name())
+            {
+                *existing = property;
+            } else {
+                properties.push(property);
+            }
+        }
+
+        for member in &object.members {
+            match member.data() {
+                ObjectMember::Property(property) => {
+                    if let Some(name) = self.property_key(&property.name) {
+                        let target = contextual_target
+                            .and_then(|target| self.types.read_property_type(target, &name));
+                        let value_type = match target {
+                            Some(target) => {
+                                self.type_of_expr_with_target(&property.value, target, scope)
+                            }
+                            None => {
+                                let inferred = self.type_of_expr(&property.value, scope);
+                                self.types.widen_fresh_literal(inferred)
+                            }
+                        };
+                        upsert_property(
+                            &mut properties,
+                            PropertyType::new(name, false, value_type),
+                        );
+                    }
+                }
+                ObjectMember::Method(method) => {
+                    if let Some(name) = self.property_key(&method.name) {
+                        match method.modifier {
+                            PropertyModifier::Get => {
+                                let return_type =
+                                    self.inferred_return_type(&method.function, scope);
+                                accessors.entry(name.clone()).or_default().0 = Some(return_type);
+                                let (get, set) = accessors.get(&name).copied().unwrap_or_default();
+                                let type_id = get.or(set).unwrap_or_else(|| self.types.any());
+                                let type_id = if contextual_target.is_some() {
+                                    type_id
+                                } else {
+                                    self.types.widen_fresh_literal(type_id)
+                                };
+                                let getter_only = get.is_some() && set.is_none();
+                                upsert_property(
+                                    &mut properties,
+                                    PropertyType::new(name, false, type_id)
+                                        .with_readonly(getter_only)
+                                        .with_getter_only(getter_only),
+                                );
+                            }
+                            PropertyModifier::Set => {
+                                let method_type =
+                                    self.type_of_function_like(&method.function, scope);
+                                let param_type = if let Type::Function(signature) =
+                                    self.types.get(method_type)
+                                {
+                                    signature
+                                        .parameters()
+                                        .first()
+                                        .map(|parameter| parameter.type_id())
+                                        .unwrap_or_else(|| self.types.any())
+                                } else {
+                                    self.types.any()
+                                };
+                                accessors.entry(name.clone()).or_default().1 = Some(param_type);
+                                let (get, set) = accessors.get(&name).copied().unwrap_or_default();
+                                let type_id = get.or(set).unwrap_or_else(|| self.types.any());
+                                let type_id = if contextual_target.is_some() {
+                                    type_id
+                                } else {
+                                    self.types.widen_fresh_literal(type_id)
+                                };
+                                upsert_property(
+                                    &mut properties,
+                                    PropertyType::new(name, false, type_id)
+                                        .with_readonly(false)
+                                        .with_getter_only(false),
+                                );
+                            }
+                            _ => {
+                                let method_type =
+                                    self.type_of_function_like(&method.function, scope);
+                                let target_type = contextual_target.and_then(|target| {
+                                    self.types.read_property_type(target, &name)
+                                });
+                                let method_type = target_type.map_or(method_type, |target| {
+                                    self.contextual_overload_method_type(method_type, target)
+                                });
+                                upsert_property(
+                                    &mut properties,
+                                    PropertyType::new(name, false, method_type),
+                                );
+                            }
+                        }
+                    }
+                }
+                ObjectMember::Spread(spread) => {
+                    let spread_type = self.type_of_expr(&spread.argument, scope);
+                    let spread_type = self.types.named_structural_view(spread_type);
+                    let spread_type = self
+                        .types
+                        .prepare_applied_class_view(spread_type)
+                        .unwrap_or(spread_type);
+                    if let Type::ObjectType(object) = self.types.get(spread_type).clone() {
+                        for source_property in &object.properties {
+                            let fresh = PropertyType::new(
+                                source_property.name.as_ref(),
+                                source_property.optional(),
+                                source_property.type_id(),
+                            );
+                            upsert_property(&mut properties, fresh);
+                        }
+                    }
+                    // Non-object spread operands add no properties and produce no
+                    // diagnostic here because the checker has no boundary for them.
+                }
+                ObjectMember::Missing(_) => {}
+            }
+        }
+        self.types.object_type(properties)
+    }
+
+    fn type_of_conditional_expr(
+        &mut self,
+        conditional: &'src ConditionalExpression,
+        contextual_target: Option<TypeId>,
+        scope: ScopeId,
+    ) -> TypeId {
+        let literal_truthy =
+            if let Expression::Literal(Literal::Boolean(literal)) = conditional.test.data() {
+                Some(literal.data().token().kind() == TokenKind::KwTrue)
+            } else {
+                None
+            };
+        match literal_truthy {
+            Some(true) => match contextual_target {
+                Some(target) => {
+                    self.type_of_expr_with_target(conditional.consequent.as_ref(), target, scope)
+                }
+                None => self.type_of_expr(conditional.consequent.as_ref(), scope),
+            },
+            Some(false) => match contextual_target {
+                Some(target) => {
+                    self.type_of_expr_with_target(conditional.alternate.as_ref(), target, scope)
+                }
+                None => self.type_of_expr(conditional.alternate.as_ref(), scope),
+            },
+            None => {
+                let parent = self.flow;
+                let truthy = self.guards_for(&conditional.test, false);
+                let falsy = self.guards_for(&conditional.test, true);
+                let mut consequent = self.types.any();
+                self.in_branch(parent, &truthy, |binder| {
+                    consequent = match contextual_target {
+                        Some(target) => binder.type_of_expr_with_target(
+                            conditional.consequent.as_ref(),
+                            target,
+                            scope,
+                        ),
+                        None => binder.type_of_expr(conditional.consequent.as_ref(), scope),
+                    };
+                });
+                let mut alternate = self.types.any();
+                self.in_branch(parent, &falsy, |binder| {
+                    alternate = match contextual_target {
+                        Some(target) => binder.type_of_expr_with_target(
+                            conditional.alternate.as_ref(),
+                            target,
+                            scope,
+                        ),
+                        None => binder.type_of_expr(conditional.alternate.as_ref(), scope),
+                    };
+                });
+                if self.types.assignable(consequent, alternate) {
+                    alternate
+                } else if self.types.assignable(alternate, consequent) {
+                    consequent
+                } else {
+                    self.types.union(&[consequent, alternate])
+                }
+            }
+        }
+    }
+
     fn compute_type_of_expr(&mut self, expression: &'src Expr, scope: ScopeId) -> TypeId {
         match expression.data() {
             Expression::Identifier(identifier) => {
@@ -5889,24 +10663,128 @@ impl<'src> Binder<'src> {
                 self.narrowed_type(symbol, declared)
             }
             Expression::Literal(literal) => self.type_of_literal(literal),
+            Expression::Unary(unary) => {
+                let operand = self.type_of_expr(&unary.argument, scope);
+                match unary.operator {
+                    UnaryOperator::Not | UnaryOperator::Delete => self.types.boolean(),
+                    UnaryOperator::Typeof => self.types.string(),
+                    UnaryOperator::Void => self.types.undefined_type(),
+                    UnaryOperator::Plus | UnaryOperator::Minus | UnaryOperator::BitNot => {
+                        if self.is_bigint_like(operand) {
+                            self.types.bigint()
+                        } else {
+                            self.types.number()
+                        }
+                    }
+                }
+            }
+            Expression::Update(update) => {
+                let target = self.type_of_assignment_target(&update.argument, scope);
+                self.types.widen(target, false)
+            }
+            Expression::Binary(binary) => {
+                let left = self.type_of_expr(&binary.left, scope);
+                let right = self.type_of_expr(&binary.right, scope);
+                match binary.operator {
+                    BinaryOperator::LessThan
+                    | BinaryOperator::LessThanOrEqual
+                    | BinaryOperator::GreaterThan
+                    | BinaryOperator::GreaterThanOrEqual
+                    | BinaryOperator::In
+                    | BinaryOperator::Instanceof
+                    | BinaryOperator::Equal
+                    | BinaryOperator::NotEqual
+                    | BinaryOperator::StrictEqual
+                    | BinaryOperator::StrictNotEqual => self.types.boolean(),
+                    BinaryOperator::Add
+                        if matches!(self.types.get(left), Type::Any)
+                            || matches!(self.types.get(right), Type::Any) =>
+                    {
+                        self.types.any()
+                    }
+                    BinaryOperator::Add
+                        if self.is_string_like(left) || self.is_string_like(right) =>
+                    {
+                        self.types.string()
+                    }
+                    BinaryOperator::Add
+                    | BinaryOperator::Subtract
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Remainder
+                    | BinaryOperator::Exponentiate
+                    | BinaryOperator::LeftShift
+                    | BinaryOperator::SignedRightShift
+                    | BinaryOperator::UnsignedRightShift
+                    | BinaryOperator::BitAnd
+                    | BinaryOperator::BitXor
+                    | BinaryOperator::BitOr => {
+                        if self.is_bigint_like(left) && self.is_bigint_like(right) {
+                            self.types.bigint()
+                        } else {
+                            self.types.number()
+                        }
+                    }
+                }
+            }
+            Expression::Logical(logical) => {
+                let left = self.type_of_expr(&logical.left, scope);
+                let right = self.type_of_expr(&logical.right, scope);
+                let left = if logical.operator == LogicalOperator::Nullish {
+                    self.types.non_nullable(left)
+                } else {
+                    left
+                };
+                self.types.union(&[left, right])
+            }
+            Expression::Sequence(sequence) => sequence
+                .expressions
+                .last()
+                .map(|last| self.type_of_expr(last, scope))
+                .unwrap_or_else(|| self.types.undefined_type()),
             Expression::Parenthesized(inner) => self.type_of_expr(inner, scope),
-            Expression::NonNull(non_null) => self.type_of_expr(&non_null.expression, scope),
+            Expression::NonNull(non_null) => {
+                let operand = self.type_of_expr(&non_null.expression, scope);
+                self.types.non_nullable(operand)
+            }
             Expression::Assignment(assignment)
                 if assignment.operator == AssignmentOperator::Assign =>
             {
                 self.type_of_expr(&assignment.right, scope)
             }
+            Expression::Assignment(assignment)
+                if assignment.operator == AssignmentOperator::NullishAssign =>
+            {
+                let target = self.type_of_assignment_target(&assignment.left, scope);
+                let target = self.types.non_nullable(target);
+                let source = self.type_of_expr(&assignment.right, scope);
+                self.types.union(&[target, source])
+            }
+            Expression::Assignment(assignment) => {
+                let target = self.type_of_assignment_target(&assignment.left, scope);
+                self.types.widen(target, false)
+            }
             Expression::As(cast) => match &cast.type_node {
                 Some(type_node) => self.resolve_type(type_node, scope),
                 None => self.type_of_expr(&cast.expression, scope),
             },
+            Expression::Satisfies(satisfies) => self.type_of_expr(&satisfies.expression, scope),
             Expression::TypeAssertion(assertion) => self.resolve_type(&assertion.type_node, scope),
             Expression::Array(array) => {
                 let mut element_types = Vec::new();
                 for element in &array.elements {
-                    if let ArrayElement::Expression(inner) = element {
-                        let inner_type = self.type_of_expr(inner, scope);
-                        element_types.push(inner_type);
+                    match element {
+                        ArrayElement::Expression(inner) => {
+                            element_types.push(self.type_of_expr(inner, scope));
+                        }
+                        ArrayElement::Spread(spread) => {
+                            let spread_type = self.type_of_expr(&spread.argument, scope);
+                            let element = self
+                                .array_element_type(spread_type)
+                                .unwrap_or_else(|| self.types.any());
+                            element_types.push(element);
+                        }
+                        ArrayElement::Elision | ArrayElement::Missing(_) => {}
                     }
                 }
                 let element = if element_types.is_empty() {
@@ -5916,66 +10794,7 @@ impl<'src> Binder<'src> {
                 };
                 self.types.array(element)
             }
-            Expression::Object(object) => {
-                let mut properties = Vec::new();
-                let mut accessors: BTreeMap<String, (Option<TypeId>, Option<TypeId>)> =
-                    BTreeMap::new();
-                for member in &object.members {
-                    match member.data() {
-                        ObjectMember::Property(property) => {
-                            if let Some(name) = self.property_key(&property.name) {
-                                let value_type = self.type_of_expr(&property.value, scope);
-                                properties.push(PropertyType::new(name, false, value_type));
-                            }
-                        }
-                        ObjectMember::Method(method) => {
-                            if let Some(name) = self.property_key(&method.name) {
-                                match method.modifier {
-                                    PropertyModifier::Get => {
-                                        let return_type =
-                                            self.inferred_return_type(&method.function, scope);
-                                        accessors.entry(name).or_default().0 = Some(return_type);
-                                    }
-                                    PropertyModifier::Set => {
-                                        let method_type =
-                                            self.type_of_function_like(&method.function, scope);
-                                        let param_type = if let Type::Function(signature) =
-                                            self.types.get(method_type)
-                                        {
-                                            signature
-                                                .parameters()
-                                                .first()
-                                                .map(|parameter| parameter.type_id())
-                                                .unwrap_or_else(|| self.types.any())
-                                        } else {
-                                            self.types.any()
-                                        };
-                                        accessors.entry(name).or_default().1 = Some(param_type);
-                                    }
-                                    _ => {
-                                        let method_type =
-                                            self.type_of_function_like(&method.function, scope);
-                                        properties.push(PropertyType::new(
-                                            name,
-                                            false,
-                                            method_type,
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                for (name, (get, set)) in accessors {
-                    let type_id = get.or(set).unwrap_or_else(|| self.types.any());
-                    let readonly = get.is_some() && set.is_none();
-                    properties
-                        .push(PropertyType::new(name, false, type_id).with_readonly(readonly));
-                }
-                let object_type = self.types.object_type(properties);
-                self.types.widen(object_type, false)
-            }
+            Expression::Object(object) => self.type_of_object_literal(object, None, scope),
             Expression::JsxElement(_)
             | Expression::JsxSelfClosingElement(_)
             | Expression::JsxFragment(_) => self
@@ -5984,59 +10803,21 @@ impl<'src> Binder<'src> {
                 .copied()
                 .unwrap_or_else(|| self.types.any()),
             Expression::Conditional(conditional) => {
-                let literal_truthy = if let Expression::Literal(Literal::Boolean(literal)) =
-                    conditional.test.data()
-                {
-                    Some(literal.data().token().kind() == TokenKind::KwTrue)
-                } else {
-                    None
-                };
-                match literal_truthy {
-                    Some(true) => self.type_of_expr(conditional.consequent.as_ref(), scope),
-                    Some(false) => self.type_of_expr(conditional.alternate.as_ref(), scope),
-                    None => {
-                        // Each arm is typed at its own guarded program point, so a
-                        // `typeof x === "s" ? f(x) : g(x)` sees the narrowed `x`.
-                        let parent = self.flow;
-                        let truthy = self.guards_for(&conditional.test, false);
-                        let falsy = self.guards_for(&conditional.test, true);
-                        let mut consequent = self.types.any();
-                        self.in_branch(parent, &truthy, |binder| {
-                            consequent =
-                                binder.type_of_expr(conditional.consequent.as_ref(), scope);
-                        });
-                        let mut alternate = self.types.any();
-                        self.in_branch(parent, &falsy, |binder| {
-                            alternate = binder.type_of_expr(conditional.alternate.as_ref(), scope);
-                        });
-                        if self.types.assignable(consequent, alternate) {
-                            alternate
-                        } else if self.types.assignable(alternate, consequent) {
-                            consequent
-                        } else {
-                            self.types.union(&[consequent, alternate])
-                        }
-                    }
-                }
+                self.type_of_conditional_expr(conditional, None, scope)
             }
             Expression::Function(function) => self.type_of_function_like(&function.function, scope),
             Expression::Arrow(arrow) => self.type_of_arrow(arrow, scope),
-            Expression::Member(member) => {
-                self.type_of_member(&member.object, &member.property, scope)
-            }
+            Expression::Member(member) => self.type_of_member(
+                &member.object,
+                &member.property,
+                member.optional,
+                true,
+                scope,
+            ),
             Expression::New(new) => {
-                if let Some(symbol) = self.resolved_expression_reference(&new.callee)
-                    && let Some(instance_type) = self.class_instance_types.get(&symbol).copied()
-                {
-                    return instance_type;
-                }
                 let callee_type = self.type_of_expr(&new.callee, scope);
-                if let Type::Named(symbol) = self.types.get(callee_type)
-                    && let Some(instance_type) = self.class_instance_types.get(symbol).copied()
-                {
-                    return instance_type;
-                }
-                self.types.any()
+                self.new_return_type(new, callee_type, scope)
+                    .unwrap_or_else(|| self.types.any())
             }
             Expression::This => self
                 .this_context
@@ -6045,40 +10826,82 @@ impl<'src> Binder<'src> {
                 .unwrap_or_else(|| self.types.any()),
             Expression::Call(call) => {
                 let callee_type = self.type_of_expr(&call.callee, scope);
-                let mut argument_types = Vec::new();
-                let mut has_spread = false;
-                for argument in &call.arguments {
-                    match argument {
-                        CallArgument::Expression(inner) => {
-                            argument_types.push(self.type_of_expr(inner, scope))
-                        }
-                        CallArgument::Spread(_) => {
-                            has_spread = true;
-                            break;
-                        }
-                        CallArgument::Missing(_) => {}
-                    }
-                }
-                if has_spread {
-                    return self.types.any();
-                }
-                if let Some(return_type) =
-                    self.call_return_type(call, callee_type, &argument_types, scope)
-                {
-                    return return_type;
-                }
-                self.types.any()
+                self.call_return_type(call, callee_type, scope)
+                    .unwrap_or_else(|| self.types.any())
             }
+            Expression::Await(await_expression) => {
+                let operand = self.type_of_expr(&await_expression.argument, scope);
+                self.promise_value_type(operand).unwrap_or(operand)
+            }
+            Expression::TaggedTemplate(tagged) => {
+                let callee_type = self.type_of_expr(&tagged.tag, scope);
+                self.evaluate_tagged_template(tagged, scope, callee_type, expression.range())
+                    .return_type
+                    .unwrap_or_else(|| self.types.any())
+            }
+            Expression::Template(_) => self.types.string(),
             _ => self.types.any(),
         }
     }
+
+    fn is_string_like(&self, type_id: TypeId) -> bool {
+        match self.types.get(type_id) {
+            Type::String | Type::StringLiteral(_) => true,
+            Type::Union(members) => members.iter().any(|member| self.is_string_like(*member)),
+            _ => false,
+        }
+    }
+
+    fn is_bigint_like(&self, type_id: TypeId) -> bool {
+        match self.types.get(type_id) {
+            Type::BigInt | Type::BigIntLiteral(_) => true,
+            Type::Union(members) => {
+                !members.is_empty() && members.iter().all(|member| self.is_bigint_like(*member))
+            }
+            _ => false,
+        }
+    }
+    fn class_method_signature_scope(
+        &mut self,
+        member: NodeId,
+        function: &'src FunctionLike,
+        parent: ScopeId,
+    ) -> ScopeId {
+        if let Some(scope) = self.class_method_signature_scopes.get(&member).copied() {
+            return scope;
+        }
+        let scope = self.new_scope(ScopeKind::Function, Some(parent));
+        self.bind_type_parameters(function.type_parameters.as_ref(), scope);
+        self.class_method_signature_scopes.insert(member, scope);
+        scope
+    }
+
     fn type_of_function_like(&mut self, function: &'src FunctionLike, parent: ScopeId) -> TypeId {
         let scope = self.new_scope(ScopeKind::Function, Some(parent));
         self.bind_type_parameters(function.type_parameters.as_ref(), scope);
-        self.signature_type(
+        self.type_of_function_like_in_scope(function, scope)
+    }
+
+    fn type_of_function_like_in_scope(
+        &mut self,
+        function: &'src FunctionLike,
+        scope: ScopeId,
+    ) -> TypeId {
+        let return_type = match &function.return_type {
+            Some(annotation) => self.resolve_type(&annotation.data().type_node, scope),
+            None => {
+                let inferred = self.inferred_return_type(function, scope);
+                if function.is_async {
+                    self.promise_type(inferred)
+                } else {
+                    inferred
+                }
+            }
+        };
+        self.signature_type_with_return(
             function.type_parameters.as_ref(),
             &function.parameters,
-            function.return_type.as_ref(),
+            return_type,
             scope,
         )
     }
@@ -6086,19 +10909,30 @@ impl<'src> Binder<'src> {
     fn type_of_arrow(&mut self, arrow: &'src ArrowFunction, parent: ScopeId) -> TypeId {
         let scope = self.new_scope(ScopeKind::Function, Some(parent));
         self.bind_type_parameters(arrow.type_parameters.as_ref(), scope);
-        self.signature_type(
+        let return_type = match &arrow.return_type {
+            Some(annotation) => self.resolve_type(&annotation.data().type_node, scope),
+            None => {
+                let inferred = self.inferred_arrow_return_type(arrow, scope);
+                if arrow.is_async {
+                    self.promise_type(inferred)
+                } else {
+                    inferred
+                }
+            }
+        };
+        self.signature_type_with_return(
             arrow.type_parameters.as_ref(),
             &arrow.parameters,
-            arrow.return_type.as_ref(),
+            return_type,
             scope,
         )
     }
 
-    fn signature_type(
+    fn signature_type_with_return(
         &mut self,
         type_parameters: Option<&'src crate::syntax::TypeParameterList>,
         parameters: &'src [ParameterNode],
-        return_type: Option<&'src TypeAnnotationNode>,
+        return_type: TypeId,
         scope: ScopeId,
     ) -> TypeId {
         let mut function_parameters: Vec<FunctionParameter> = Vec::with_capacity(parameters.len());
@@ -6107,23 +10941,40 @@ impl<'src> Binder<'src> {
                 function_parameters.push(lowered);
             }
         }
-        let return_type = match return_type {
-            Some(annotation) => self.resolve_type(&annotation.data().type_node, scope),
-            None => self.types.any(),
-        };
-        let type_parameters = type_parameters
-            .map(|list| {
-                list.parameters
-                    .iter()
-                    .filter_map(|param| {
-                        let name = self.identifier_text(&param.data().name);
-                        self.lookup_type(scope, &name)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        self.types
-            .function_with_parameters(type_parameters, function_parameters, return_type)
+        let (type_parameters, type_parameter_bounds) =
+            self.signature_type_parameters(type_parameters, scope);
+        self.types.function_with_parameter_bounds(
+            type_parameters,
+            type_parameter_bounds,
+            function_parameters,
+            return_type,
+            !self.is_typescript(),
+        )
+    }
+
+    fn block_can_complete_normally(block: &'src crate::syntax::Block) -> bool {
+        !block
+            .statements
+            .iter()
+            .any(|stmt| Self::statement_always_exits(stmt.data()))
+    }
+
+    fn inferred_block_return_type(
+        &mut self,
+        block: &'src crate::syntax::Block,
+        returns: &[TypeId],
+    ) -> TypeId {
+        if returns.is_empty() {
+            return self.types.void();
+        }
+        let mut members: Vec<TypeId> = returns.to_vec();
+        let can_complete_normally = Self::block_can_complete_normally(block);
+        let has_value = members.iter().any(|&t| t != self.types.undefined_type());
+        if can_complete_normally && has_value {
+            members.push(self.types.undefined_type());
+        }
+        let return_type = self.types.union(&members);
+        self.types.widen_fresh_literal(return_type)
     }
 
     fn inferred_return_type(&mut self, function: &'src FunctionLike, parent: ScopeId) -> TypeId {
@@ -6132,18 +10983,31 @@ impl<'src> Binder<'src> {
         }
         match &function.body {
             Some(FunctionBody::Expression(expression)) => self.type_of_expr(expression, parent),
-            Some(body) => {
-                let Some(body_id) = body.id() else {
+            Some(FunctionBody::Block(block)) => {
+                let Some(returns) = self.return_types.get(&block.id()).cloned() else {
                     return self.types.any();
                 };
-                let returns = self.return_types.get(&body_id).cloned().unwrap_or_default();
-                if returns.is_empty() {
-                    self.types.void()
-                } else {
-                    self.types.union(&returns)
-                }
+                self.inferred_block_return_type(block.data(), &returns)
             }
+            Some(FunctionBody::Missing(_)) => self.types.any(),
             None => self.types.void(),
+        }
+    }
+
+    fn inferred_arrow_return_type(
+        &mut self,
+        arrow: &'src ArrowFunction,
+        parent: ScopeId,
+    ) -> TypeId {
+        match &arrow.body {
+            FunctionBody::Expression(expression) => self.type_of_expr(expression, parent),
+            FunctionBody::Block(block) => {
+                let Some(returns) = self.return_types.get(&block.id()).cloned() else {
+                    return self.types.any();
+                };
+                self.inferred_block_return_type(block.data(), &returns)
+            }
+            FunctionBody::Missing(_) => self.types.void(),
         }
     }
 
@@ -6151,86 +11015,72 @@ impl<'src> Binder<'src> {
         &mut self,
         call: &'src CallExpression,
         callee_type: TypeId,
-        argument_types: &[TypeId],
         scope: ScopeId,
     ) -> Option<TypeId> {
-        match self.types.get(callee_type).clone() {
-            Type::Function(signature) => {
-                let instantiated = if call.type_arguments.is_some() {
-                    self.explicit_function_signature(call, scope, &signature, argument_types)
-                } else {
-                    self.inferred_function_signature(&signature, argument_types)
-                };
-                let sig = instantiated.unwrap_or(signature);
-                Some(sig.return_type())
-            }
-            Type::Union(members) => self
-                .union_call_signature(&members)
-                .map(|sig| sig.return_type()),
-            Type::Error
-            | Type::Intersection(_)
-            | Type::Any
-            | Type::Unknown
-            | Type::Never
-            | Type::Void
-            | Type::Null
-            | Type::Undefined
-            | Type::Boolean
-            | Type::Number
-            | Type::BigInt
-            | Type::String
-            | Type::Symbol
-            | Type::Object
-            | Type::BooleanLiteral(_)
-            | Type::NumberLiteral(_)
-            | Type::StringLiteral(_)
-            | Type::BigIntLiteral(_)
-            | Type::Array(_)
-            | Type::Tuple(_)
-            | Type::ObjectType(_)
-            | Type::Named(_)
-            | Type::NumericEnum(_) => None,
-        }
+        self.evaluate_call(call, scope, callee_type).return_type
+    }
+
+    fn new_return_type(
+        &mut self,
+        new: &'src NewExpression,
+        callee_type: TypeId,
+        scope: ScopeId,
+    ) -> Option<TypeId> {
+        self.evaluate_new(new, scope, callee_type).return_type
     }
 
     fn explicit_function_signature(
         &mut self,
-        call: &'src CallExpression,
-        scope: ScopeId,
         signature: &FunctionSignature,
-        _argument_types: &[TypeId],
-    ) -> Option<FunctionSignature> {
-        let Some(type_args) = &call.type_arguments else {
-            return Some(signature.clone());
-        };
-        let explicit = self.resolve_type_arguments(Some(type_args), scope);
-        // Bind explicit type arguments against the signature's declared type
-        // parameters in declaration order — not occurrence order — so
-        // `f<T, U>(u: U, t: T)` called as `f<number, string>(...)` binds
-        // T := number and U := string, matching TypeScript. Every construction
-        // site that places type-parameter symbols into the parameter/return
-        // types populates `type_parameters`, so no occurrence-order fallback
-        // is needed here.
-        let deduped: Vec<SymbolId> = signature.type_parameters().to_vec();
-        if deduped.is_empty() {
-            return Some(signature.clone());
+        explicit: &[TypeId],
+        diagnostic_range: TextRange,
+    ) -> Result<FunctionSignature, CallMismatch> {
+        let type_parameters = signature.type_parameters();
+        if type_parameters.is_empty() {
+            return if explicit.is_empty() || signature.javascript() {
+                Ok(signature.clone())
+            } else {
+                Err(CallMismatch::ArgumentCount)
+            };
         }
-        let mut inferred = Vec::new();
-        for (index, symbol) in deduped.iter().enumerate() {
-            let type_id = explicit
-                .get(index)
-                .copied()
-                .unwrap_or_else(|| self.types.any());
-            inferred.push(InferredTypeArgument::new(
-                *symbol,
+        let bounds = signature.type_parameter_bounds();
+        let required = bounds
+            .iter()
+            .rposition(|bound| bound.default().is_none())
+            .map_or(0, |index| index + 1);
+        if explicit.len() < required || explicit.len() > type_parameters.len() {
+            return Err(CallMismatch::ArgumentCount);
+        }
+
+        let mut arguments = Vec::with_capacity(type_parameters.len());
+        for (index, symbol) in type_parameters.iter().copied().enumerate() {
+            let prior = InferredTypeArguments::new(arguments.clone());
+            let bound = bounds[index];
+            let type_id = if let Some(explicit) = explicit.get(index).copied() {
+                explicit
+            } else {
+                let Some(default) = bound.default() else {
+                    return Err(CallMismatch::ArgumentCount);
+                };
+                prior.instantiate(&mut self.types, default)
+            };
+            if let Some(constraint) = bound.constraint() {
+                let constraint = prior.instantiate(&mut self.types, constraint);
+                if !self.types_assignable(type_id, constraint) {
+                    return Err(CallMismatch::ArgumentType(diagnostic_range));
+                }
+            }
+            arguments.push(InferredTypeArgument::new(
+                symbol,
                 type_id,
-                InferenceProvenance::Explicit,
+                if index < explicit.len() {
+                    InferenceProvenance::Explicit
+                } else {
+                    InferenceProvenance::Default
+                },
             ));
         }
-        if inferred.is_empty() {
-            return Some(signature.clone());
-        }
-        let inferred = InferredTypeArguments::new(inferred);
+        let inferred = InferredTypeArguments::new(arguments);
         let mut instantiated_parameters = Vec::with_capacity(signature.parameters().len());
         for parameter in signature.parameters() {
             let type_id = inferred.instantiate(&mut self.types, parameter.type_id());
@@ -6242,10 +11092,12 @@ impl<'src> Binder<'src> {
             ));
         }
         let instantiated_return = inferred.instantiate(&mut self.types, signature.return_type());
-        Some(FunctionSignature {
+        Ok(FunctionSignature {
             type_parameters: Vec::new(),
+            type_parameter_bounds: Vec::new(),
             parameters: instantiated_parameters,
             return_type: instantiated_return,
+            javascript: signature.javascript(),
         })
     }
 
@@ -6254,38 +11106,46 @@ impl<'src> Binder<'src> {
         signature: &FunctionSignature,
         argument_types: &[TypeId],
     ) -> Option<FunctionSignature> {
-        let mut inference_symbols = Vec::new();
-        for parameter in signature.parameters() {
-            self.collect_type_parameter_symbols(parameter.type_id(), &mut inference_symbols);
-        }
-        self.collect_type_parameter_symbols(signature.return_type(), &mut inference_symbols);
-        if inference_symbols.is_empty() {
+        if signature.type_parameters().is_empty() {
             return Some(signature.clone());
         }
-        let inference_parameters: Vec<_> = inference_symbols
+        let inference_parameters: Vec<_> = signature
+            .type_parameters()
             .iter()
-            .map(|symbol| InferenceParameter::new(*symbol))
+            .copied()
+            .zip(signature.type_parameter_bounds().iter().copied())
+            .map(|(symbol, bound)| {
+                let mut parameter = InferenceParameter::new(symbol);
+                if let Some(constraint) = bound.constraint() {
+                    parameter = parameter.with_constraint(constraint);
+                }
+                if let Some(default) = bound.default() {
+                    parameter = parameter.with_default(default);
+                }
+                parameter
+            })
             .collect();
         let mut context = InferenceContext::new(&mut self.types, &inference_parameters);
         context.infer_from_arguments(signature, argument_types);
-        let inferred = context.resolve();
+        let mut inferred = context.resolve();
+        inferred.widen_unconstrained_literals(&mut self.types, &inference_parameters);
         let mut instantiated_parameters = Vec::with_capacity(signature.parameters().len());
         for parameter in signature.parameters() {
             let type_id = inferred.instantiate(&mut self.types, parameter.type_id());
-            let widened = self.types.widen(type_id, false);
             instantiated_parameters.push(FunctionParameter::new(
                 parameter.name().to_owned(),
-                widened,
+                type_id,
                 parameter.optional(),
                 parameter.rest(),
             ));
         }
         let instantiated_return = inferred.instantiate(&mut self.types, signature.return_type());
-        let widened_return = self.types.widen(instantiated_return, false);
         Some(FunctionSignature {
             type_parameters: Vec::new(),
+            type_parameter_bounds: Vec::new(),
             parameters: instantiated_parameters,
-            return_type: widened_return,
+            return_type: instantiated_return,
+            javascript: signature.javascript(),
         })
     }
 
@@ -6293,7 +11153,7 @@ impl<'src> Binder<'src> {
         match literal {
             Literal::String(token) => {
                 let text = self.text(token.data().token());
-                self.types.string_literal(text)
+                self.types.string_literal_lexeme(text)
             }
             Literal::Number(token) => {
                 let text = self.text(token.data().token());
@@ -6341,8 +11201,18 @@ pub(crate) fn bind_source_with_environment(
     is_module: bool,
     options: ProgramCheckOptions,
 ) -> (SemanticModel, Vec<Diagnostic>) {
+    bind_source_with_environment_and_imports(source, environment, is_module, options, &[])
+}
+
+pub(crate) fn bind_source_with_environment_and_imports(
+    source: &SourceFile,
+    environment: GlobalEnvironment,
+    is_module: bool,
+    options: ProgramCheckOptions,
+    imported_types: &[ImportedSymbolType<'_>],
+) -> (SemanticModel, Vec<Diagnostic>) {
     let mut binder = Binder::with_environment(source, environment, is_module, options);
-    binder.run();
+    binder.run_with_imported_types(imported_types);
     binder.finish()
 }
 
@@ -6350,12 +11220,12 @@ pub(crate) fn bind_source_with_environment(
 mod tests {
     use super::{
         ACCESSOR_THIS_PARAMETER, AMBIENT_IMPLEMENTATION, ARGUMENT_COUNT_MISMATCH,
-        ARGUMENT_NOT_ASSIGNABLE, CONSTRUCTOR_TYPE_PARAMETERS, DUPLICATE_DECLARATION,
-        EXPRESSION_NOT_CALLABLE, FUNCTION_IMPLEMENTATION_WRONG_NAME,
+        ARGUMENT_NOT_ASSIGNABLE, ASSIGNMENT_TO_READONLY, CONSTRUCTOR_TYPE_PARAMETERS,
+        DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE, FUNCTION_IMPLEMENTATION_WRONG_NAME,
         FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS,
         PROPERTY_NOT_INITIALIZED, PropertyType, SET_ACCESSOR_PARAMETER_INITIALIZER,
         STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT, ScopeId, ScopeKind, SymbolId, SymbolKind,
-        TYPE_NOT_ASSIGNABLE, Type, TypeTable, bind_source,
+        TYPE_NOT_ASSIGNABLE, TupleShape, Type, TypeTable, bind_source,
     };
     use crate::diagnostic::Diagnostic;
     use crate::source::{ScriptKind, SourceId, SourceText};
@@ -6441,8 +11311,8 @@ mod tests {
         assert!(
             recorded
                 .iter()
-                .any(|ty| matches!(ty, Type::StringLiteral(text) if &**text == "'hi'")),
-            "string literal 'hi' recorded: {recorded:?}"
+                .any(|ty| matches!(ty, Type::StringLiteral(text) if text.eq_ascii("hi"))),
+            "string literal hi recorded: {recorded:?}"
         );
     }
 
@@ -6779,6 +11649,21 @@ mod tests {
     }
 
     #[test]
+    fn required_parameter_after_default_counts_toward_minimum_arity() {
+        let (_, diagnostics) = bound(
+            "function f(a=1, b:string) {}\n\
+             f();\n\
+             f(1);\n\
+             f(1, 'x');\n",
+        );
+        let count = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code() == ARGUMENT_COUNT_MISMATCH)
+            .count();
+        assert_eq!(count, 2, "{diagnostics:?}");
+    }
+
+    #[test]
     fn non_callable_expression_emits_not_callable() {
         let (_, diagnostics) = bound("const x = 1; x();");
         assert_eq!(
@@ -6803,6 +11688,47 @@ mod tests {
             super::source_is_module(parsed.product()),
             super::ProgramCheckOptions::standard().with_strict_null_checks(true),
         )
+    }
+
+    #[test]
+    fn non_null_assertion_removes_nullish_union_members() {
+        let (_, diagnostics) =
+            bound_strict("declare const value: string | null; const text: string = value!;");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code() == TYPE_NOT_ASSIGNABLE),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn strict_null_direct_member_access_is_diagnosed() {
+        let (_, diagnostics) = bound_strict("declare const value: { x: number } | null; value.x;");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code() == super::STRICT_NULL_MEMBER_ACCESS),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn strict_null_non_null_and_optional_member_access_preserve_types() {
+        let (_, diagnostics) = bound_strict(
+            "declare const value: { x: number } | null;\n\
+             const asserted: number = value!.x;\n\
+             const optional: number | undefined = value?.x;",
+        );
+        assert!(
+            !diagnostics.iter().any(|diagnostic| {
+                matches!(
+                    diagnostic.code(),
+                    super::STRICT_NULL_MEMBER_ACCESS | TYPE_NOT_ASSIGNABLE
+                )
+            }),
+            "{diagnostics:?}"
+        );
     }
 
     #[test]
@@ -7312,6 +12238,405 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code() == TYPE_NOT_ASSIGNABLE),
             "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn function_body_narrowing_does_not_leak_to_sibling_statements() {
+        // A guard inside a function body narrows a captured outer variable only
+        // for the function's own control flow; the outer program point must keep
+        // the declared union. Without flow isolation, the assignment below would
+        // incorrectly see `x` as `string`.
+        let (_, diagnostics) = bound(
+            "declare let x: string | number;\n\
+             function f() { if (typeof x !== \"string\") return; }\n\
+             const y: string = x;\n",
+        );
+        assert!(
+            diagnostics.iter().any(|d| d.code() == TYPE_NOT_ASSIGNABLE),
+            "expected x to remain string | number after the function: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn assignment_to_readonly_class_property_in_constructor_is_allowed() {
+        let (_, diagnostics) =
+            bound("class C { readonly x: number; constructor() { this.x = 1; } }");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code() == ASSIGNMENT_TO_READONLY),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn assignment_to_readonly_class_property_outside_constructor_is_diagnosed() {
+        let (_, diagnostics) = bound("class C { readonly x: number; m() { this.x = 1; } }");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == ASSIGNMENT_TO_READONLY),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn assignment_to_getter_only_class_property_in_constructor_is_diagnosed() {
+        let (_, diagnostics) =
+            bound("class C { get x() { return 1; } constructor() { this.x = 1; } }");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == ASSIGNMENT_TO_READONLY),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn assignment_to_getter_only_object_property_is_diagnosed() {
+        let (_, diagnostics) = bound("const o = { get x() { return 1; } }; o.x = 1;");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == ASSIGNMENT_TO_READONLY),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn assignment_to_get_set_object_property_is_allowed() {
+        let (_, diagnostics) =
+            bound("const o = { get x() { return 1; }, set x(v: number) { } }; o.x = 1;");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code() == ASSIGNMENT_TO_READONLY),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn assignment_to_readonly_interface_property_is_diagnosed() {
+        let (_, diagnostics) =
+            bound("interface I { readonly x: number; } declare const o: I; o.x = 1;");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == ASSIGNMENT_TO_READONLY),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn assignment_to_readonly_type_literal_property_is_diagnosed() {
+        let (_, diagnostics) = bound("declare const o: { readonly x: number }; o.x = 1;");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == ASSIGNMENT_TO_READONLY),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn const_narrowed_value_remains_narrowed_inside_nested_arrow() {
+        // A `const` binding narrowed by a guard before the arrow should stay
+        // narrowed inside the arrow body: `x` is `string` there, so assigning
+        // it to `number` must error.
+        let (_, diagnostics) = bound(
+            "declare const x: string | number;\n\
+             if (typeof x !== \"string\") return;\n\
+             const f = () => { const y: number = x; };\n",
+        );
+        assert!(
+            diagnostics.iter().any(|d| d.code() == TYPE_NOT_ASSIGNABLE),
+            "expected x to be narrowed to string inside the arrow: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn reassigned_let_narrowing_does_not_cross_function_boundary() {
+        // A `let` binding that is narrowed before a function declaration is
+        // reassigned later in the same scope. The narrowing must NOT cross the
+        // function boundary because the variable could be changed between the
+        // guard and the deferred call.
+        let (_, diagnostics) = bound(
+            "declare let x: string | number;\n\
+             if (typeof x !== \"string\") return;\n\
+             function f() { const y: number = x; }\n\
+             x = 1;\n",
+        );
+        assert!(
+            diagnostics.iter().any(|d| d.code() == TYPE_NOT_ASSIGNABLE),
+            "expected x to remain string | number inside f because it is reassigned: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn sibling_branch_narrowing_does_not_leak_into_nested_function() {
+        // A guard in one branch of an `if` narrows `x` to `string` only within
+        // that branch. A function declared in the sibling (else) branch must
+        // NOT see the narrowing.
+        let (_, diagnostics) = bound(
+            "declare let x: string | number;\n\
+             if (typeof x === \"string\") {\n\
+               const a: string = x;\n\
+             } else {\n\
+               const f = () => { const y: string = x; };\n\
+             }\n",
+        );
+        assert!(
+            diagnostics.iter().any(|d| d.code() == TYPE_NOT_ASSIGNABLE),
+            "expected x to remain string | number in the else-branch arrow: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn const_narrowing_passes_through_function_declaration() {
+        // A `const` binding narrowed before a function declaration: the
+        // function body should see the narrowed type because `const` cannot be
+        // reassigned. Assigning `x` (narrowed to `string`) to `number` inside
+        // the function must error.
+        let (_, diagnostics) = bound(
+            "declare const x: string | number;\n\
+             if (typeof x !== \"string\") return;\n\
+             function f() { const y: number = x; }\n",
+        );
+        assert!(
+            diagnostics.iter().any(|d| d.code() == TYPE_NOT_ASSIGNABLE),
+            "expected x to be narrowed to string inside f: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn future_write_prevents_captured_narrowing() {
+        let (_, diagnostics) = bound(
+            "let f: (() => void) | undefined = () => {};\n             if (f) {\n                 const g = () => f();\n                 f = undefined;\n                 g();\n             }",
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code() == EXPRESSION_NOT_CALLABLE),
+            "expected a later write to invalidate the earlier closure capture: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn loop_destructuring_write_prevents_captured_narrowing() {
+        let (_, diagnostics) = bound(
+            "let f: (() => void) | undefined = () => {};\n             if (f) {\n                 const read = () => f();\n                 for ([f] of [[undefined]]) {}\n                 read();\n             }",
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code() == EXPRESSION_NOT_CALLABLE),
+            "expected a destructuring for-of write to invalidate capture: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn never_written_let_narrowing_passes_into_nested_arrow() {
+        let (_, diagnostics) = bound(
+            "declare let f: (() => void) | undefined;\n             if (f) {\n                 const read = () => f();\n                 read();\n             }",
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code() == EXPRESSION_NOT_CALLABLE),
+            "expected a never-written root to remain narrowed: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn property_type_identity_includes_access_and_declaring_class() {
+        use crate::syntax::Accessibility;
+
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let owner = SymbolId::new(900);
+        let other_owner = SymbolId::new(901);
+
+        let public = PropertyType::new("x", false, number);
+        let private = PropertyType::new("x", false, number)
+            .with_accessibility(Accessibility::Private, Some(owner));
+        let protected = PropertyType::new("x", false, number)
+            .with_accessibility(Accessibility::Protected, Some(owner));
+        let private_other = PropertyType::new("x", false, number)
+            .with_accessibility(Accessibility::Private, Some(other_owner));
+
+        assert_eq!(public, public);
+        assert_eq!(private, private);
+        assert_eq!(protected, protected);
+        assert_ne!(public, private);
+        assert_ne!(public, protected);
+        assert_ne!(private, protected);
+        assert_ne!(private, private_other);
+
+        let public_first = table.object_type(vec![public.clone()]);
+        let private_first = table.object_type(vec![private.clone()]);
+        let public_second = table.object_type(vec![public.clone()]);
+        let private_second = table.object_type(vec![private.clone()]);
+        let public_fresh = table.object_type(vec![PropertyType::new("x", false, number)]);
+
+        assert_eq!(public_first, public_second);
+        assert_eq!(public_first, public_fresh);
+        assert_eq!(private_first, private_second);
+        assert_ne!(public_first, private_first);
+    }
+
+    #[test]
+    fn object_type_interning_is_declaration_order_independent() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let string = table.string();
+
+        let forward = table.object_type(vec![
+            PropertyType::new("a", false, number),
+            PropertyType::new("b", false, string),
+        ]);
+        let backward = table.object_type(vec![
+            PropertyType::new("b", false, string),
+            PropertyType::new("a", false, number),
+        ]);
+
+        assert_eq!(forward, backward);
+    }
+
+    #[test]
+    fn tuple_possible_elements_include_optional_prefix_rest_and_suffix() {
+        let table = TypeTable::new();
+        let first = table.number();
+        let optional = table.string();
+        let rest = table.boolean();
+        let suffix = table.unknown();
+        let shape = TupleShape {
+            prefix: vec![first, optional],
+            required: 0,
+            rest: Some(rest),
+            suffix: vec![suffix],
+        };
+
+        assert_eq!(shape.element_types_at(0), [first, rest, suffix]);
+        assert_eq!(shape.element_types_at(1), [optional, rest, suffix]);
+        assert_eq!(shape.element_types_at_length(0, 2), [rest, first]);
+        assert_eq!(shape.element_types_from_end(2), [rest, first, optional]);
+    }
+
+    #[test]
+    fn imported_symbol_identity_is_source_local_and_preserves_private_origin() {
+        use crate::syntax::Accessibility;
+
+        let source_symbol = SymbolId::new(700);
+        let mut left = TypeTable::new();
+        let left_number = left.number();
+        left.declare_class(source_symbol, Vec::new());
+        let left_raw = left.object_type(vec![
+            PropertyType::new("value", false, left_number)
+                .with_accessibility(Accessibility::Private, Some(source_symbol)),
+        ]);
+        left.publish_final_class_template(source_symbol, left_raw);
+        let left_class = left.applied_class(source_symbol, Vec::new());
+
+        let mut right = TypeTable::new();
+        let right_string = right.string();
+        right.declare_class(source_symbol, Vec::new());
+        let right_raw = right.object_type(vec![
+            PropertyType::new("value", false, right_string)
+                .with_accessibility(Accessibility::Private, Some(source_symbol)),
+        ]);
+        right.publish_final_class_template(source_symbol, right_raw);
+        let right_class = right.applied_class(source_symbol, Vec::new());
+
+        let mut target = TypeTable::new();
+        let mut next_symbol = 1_000;
+        let imported_left = target.import_type(
+            &left,
+            left_class,
+            &mut super::ImportedTypeMap::default(),
+            &mut next_symbol,
+        );
+        let imported_right = target.import_type(
+            &right,
+            right_class,
+            &mut super::ImportedTypeMap::default(),
+            &mut next_symbol,
+        );
+        let Type::AppliedClass {
+            symbol: left_symbol,
+            ..
+        } = target.get(imported_left)
+        else {
+            panic!("left import must remain an applied class");
+        };
+        let left_symbol = *left_symbol;
+        let Type::AppliedClass {
+            symbol: right_symbol,
+            ..
+        } = target.get(imported_right)
+        else {
+            panic!("right import must remain an applied class");
+        };
+        let right_symbol = *right_symbol;
+        assert_ne!(left_symbol, right_symbol);
+
+        let left_view = target
+            .prepare_applied_class_view(imported_left)
+            .expect("left class view");
+        let right_view = target
+            .prepare_applied_class_view(imported_right)
+            .expect("right class view");
+        let Type::ObjectType(left_object) = target.get(left_view) else {
+            panic!("left class view must be structural");
+        };
+        let Type::ObjectType(right_object) = target.get(right_view) else {
+            panic!("right class view must be structural");
+        };
+        assert_eq!(
+            left_object.properties[0].declaring_class(),
+            Some(left_symbol)
+        );
+        assert_eq!(
+            right_object.properties[0].declaring_class(),
+            Some(right_symbol)
+        );
+    }
+
+    #[test]
+    fn imported_named_structure_is_independent_of_source_symbol_numbering() {
+        let mut left = TypeTable::new();
+        let left_number = left.number();
+        let left_structure = left.object_type(vec![PropertyType::new("value", false, left_number)]);
+        let left_symbol = SymbolId::new(3);
+        left.set_interface_structure(left_symbol, left_structure);
+        let left_named = left.named(left_symbol);
+
+        let mut right = TypeTable::new();
+        let right_number = right.number();
+        let right_structure =
+            right.object_type(vec![PropertyType::new("value", false, right_number)]);
+        let right_symbol = SymbolId::new(999);
+        right.set_interface_structure(right_symbol, right_structure);
+        let right_named = right.named(right_symbol);
+
+        let mut target = TypeTable::new();
+        let mut next_symbol = 2_000;
+        let imported_left = target.import_type(
+            &left,
+            left_named,
+            &mut super::ImportedTypeMap::default(),
+            &mut next_symbol,
+        );
+        let imported_right = target.import_type(
+            &right,
+            right_named,
+            &mut super::ImportedTypeMap::default(),
+            &mut next_symbol,
+        );
+
+        assert_eq!(
+            target.named_structural_view(imported_left),
+            target.named_structural_view(imported_right)
         );
     }
 }

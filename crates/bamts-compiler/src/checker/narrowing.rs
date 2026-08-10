@@ -388,6 +388,41 @@ impl<'a> NarrowingContext<'a> {
         self.facts.frames[flow.index()].facts.insert(key, ty);
     }
 
+    /// Invalidates refinements affected by a write to `key`. A write can
+    /// invalidate both facts below that path and facts for its narrowed
+    /// ancestors (for example, writing `shape.kind` invalidates a refinement
+    /// of `shape` derived from that discriminant). Inherited facts are
+    /// shadowed with their projections from the root's declared type.
+    pub fn invalidate(&mut self, flow: FlowNodeId, key: &FlowKey) {
+        let mut affected = Vec::new();
+        let mut current = Some(flow);
+        while let Some(id) = current {
+            let frame = &self.facts.frames[id.index()];
+            for candidate in frame.facts.keys() {
+                if candidate.root == key.root
+                    && (candidate.path.starts_with(&key.path)
+                        || key.path.starts_with(&candidate.path))
+                    && !affected.contains(candidate)
+                {
+                    affected.push(candidate.clone());
+                }
+            }
+            current = frame.parent;
+        }
+
+        for candidate in affected {
+            let Some(declared) = self.facts.declared.get(&candidate.root).copied() else {
+                continue;
+            };
+            let Some(baseline) = self.project(declared, &candidate.path) else {
+                continue;
+            };
+            self.facts.frames[flow.index()]
+                .facts
+                .insert(candidate, baseline);
+        }
+    }
+
     /// The effective type of a reference at one program point: the nearest
     /// refinement walking up the frame chain, else the declared root type
     /// projected through the key's property path, else `None` for
@@ -496,12 +531,17 @@ impl<'a> NarrowingContext<'a> {
 
     /// Narrows to (or away from) the types whose `typeof` is `name`.
     /// `typeof null` is `"object"`, and `void` behaves as `undefined`.
-    /// Nominal and generic-object members are runtime-opaque and pass both
-    /// polarities unchanged.
+    /// `AppliedClass` instances are runtime objects (`typeof new C() ===
+    /// "object"`), so `typeof x === "function"` removes them and `typeof x
+    /// === "object"` keeps them. Nominal (`Named`) and generic-object
+    /// (`Object`) members remain runtime-opaque and pass both polarities
+    /// unchanged.
     #[must_use]
     pub fn narrow_typeof(&mut self, ty: TypeId, name: TypeofName, negated: bool) -> TypeId {
         self.filter(ty, &|candidate| match candidate {
-            Type::Named(_) | Type::Object => Narrow::Keep,
+            Type::Named(_) | Type::Object | Type::Keyof(_) | Type::IndexedAccess { .. } => {
+                Narrow::Keep
+            }
             _ if typeof_matches(candidate, name) != negated => Narrow::Keep,
             _ => Narrow::Drop,
         })
@@ -537,7 +577,11 @@ impl<'a> NarrowingContext<'a> {
                     Narrow::Drop
                 }
             }
-            Type::Object | Type::Function(_) | Type::Array(_) | Type::Named(_) => Narrow::Keep,
+            Type::Object
+            | Type::Function(_)
+            | Type::Array(_)
+            | Type::Named(_)
+            | Type::AppliedClass { .. } => Narrow::Keep,
             _ if negated => Narrow::Keep,
             _ => Narrow::Drop,
         })
@@ -627,7 +671,10 @@ impl<'a> NarrowingContext<'a> {
             | Type::ObjectType(_)
             | Type::Function(_)
             | Type::Named(_)
-            | Type::NumericEnum(_) => self.table.never(),
+            | Type::AppliedClass { .. }
+            | Type::NumericEnum(_)
+            | Type::Keyof(_)
+            | Type::IndexedAccess { .. } => self.table.never(),
         }
     }
 
@@ -671,7 +718,10 @@ impl<'a> NarrowingContext<'a> {
             | Type::Union(_)
             | Type::ObjectType(_)
             | Type::Named(_)
-            | Type::NumericEnum(_) => None,
+            | Type::AppliedClass { .. }
+            | Type::NumericEnum(_)
+            | Type::Keyof(_)
+            | Type::IndexedAccess { .. } => None,
         };
         let parameters: Vec<FunctionParameter> = parameters
             .iter()
@@ -744,7 +794,10 @@ impl<'a> NarrowingContext<'a> {
             | Type::ObjectType(_)
             | Type::Function(_)
             | Type::Named(_)
-            | Type::NumericEnum(_) => None,
+            | Type::AppliedClass { .. }
+            | Type::NumericEnum(_)
+            | Type::Keyof(_)
+            | Type::IndexedAccess { .. } => None,
         }
     }
 
@@ -791,7 +844,10 @@ impl<'a> NarrowingContext<'a> {
             | Type::ObjectType(_)
             | Type::Function(_)
             | Type::Named(_)
-            | Type::NumericEnum(_) => ty,
+            | Type::AppliedClass { .. }
+            | Type::NumericEnum(_)
+            | Type::Keyof(_)
+            | Type::IndexedAccess { .. } => ty,
         }
     }
 
@@ -834,9 +890,33 @@ impl<'a> NarrowingContext<'a> {
     /// when any member cannot supply the property — the access is then not
     /// flow-trackable through this path.
     fn property_type(&mut self, ty: TypeId, name: &str) -> Option<TypeId> {
-        self.table.property_type(ty, name)
+        if let Some(view) = self.table.prepare_applied_class_view(ty) {
+            return self.property_type(view, name);
+        }
+        match self.table.get(ty).clone() {
+            Type::Union(members) => {
+                let mut found = Vec::with_capacity(members.len());
+                for member in members {
+                    found.push(self.property_type(member, name)?);
+                }
+                Some(self.table.union(&found))
+            }
+            Type::Intersection(members) => {
+                let mut found = Vec::new();
+                for member in members {
+                    if let Some(property) = self.property_type(member, name) {
+                        found.push(property);
+                    }
+                }
+                match found.len() {
+                    0 => None,
+                    1 => Some(found[0]),
+                    _ => Some(self.table.intersection(found)),
+                }
+            }
+            _ => self.table.property_type(ty, name),
+        }
     }
-
     fn project(&mut self, mut ty: TypeId, path: &[Box<str>]) -> Option<TypeId> {
         for segment in path {
             ty = self.property_type(ty, segment)?;
@@ -884,7 +964,10 @@ impl<'a> NarrowingContext<'a> {
             | Type::ObjectType(_)
             | Type::Function(_)
             | Type::Named(_)
-            | Type::NumericEnum(_) => match decide(self.table.get(ty)) {
+            | Type::AppliedClass { .. }
+            | Type::NumericEnum(_)
+            | Type::Keyof(_)
+            | Type::IndexedAccess { .. } => match decide(self.table.get(ty)) {
                 Narrow::Keep => ty,
                 Narrow::Drop => self.table.never(),
                 Narrow::Replace(replacement) => replacement,
@@ -960,7 +1043,10 @@ impl<'a> NarrowingContext<'a> {
                 | Type::ObjectType(_)
                 | Type::Function(_)
                 | Type::Named(_)
-                | Type::NumericEnum(_),
+                | Type::AppliedClass { .. }
+                | Type::NumericEnum(_)
+                | Type::Keyof(_)
+                | Type::IndexedAccess { .. },
                 _,
             ) => self.table.never(),
         }
@@ -995,7 +1081,10 @@ impl<'a> NarrowingContext<'a> {
             | Type::ObjectType(_)
             | Type::Function(_)
             | Type::Named(_)
-            | Type::NumericEnum(_) => {}
+            | Type::AppliedClass { .. }
+            | Type::NumericEnum(_)
+            | Type::Keyof(_)
+            | Type::IndexedAccess { .. } => {}
         }
         match self.table.get(ty).clone() {
             Type::Error | Type::Intersection(_) | Type::Any | Type::Unknown | Type::Never => ty,
@@ -1029,32 +1118,32 @@ impl<'a> NarrowingContext<'a> {
             | Type::ObjectType(_)
             | Type::Function(_)
             | Type::Named(_)
-            | Type::NumericEnum(_) => ty,
+            | Type::AppliedClass { .. }
+            | Type::NumericEnum(_)
+            | Type::Keyof(_)
+            | Type::IndexedAccess { .. } => ty,
         }
     }
 
     fn discriminant_keeps(
-        &self,
+        &mut self,
         member: TypeId,
         property: &str,
         literal: TypeId,
         negated: bool,
     ) -> bool {
-        let Type::ObjectType(object) = self.table.get(member) else {
-            // Members without modeled properties cannot be discriminated;
-            // conservatively pass both polarities.
+        if matches!(
+            self.table.get(member),
+            Type::Error | Type::Any | Type::Unknown
+        ) {
             return true;
-        };
-        let Some(candidate) = object
-            .properties
-            .iter()
-            .find(|member| member.name() == property)
-        else {
+        }
+        let property_type = self.property_type(member, property);
+        let Some(property_type) = property_type else {
             // A member lacking the discriminant cannot have produced the
             // tested value positively; it always survives the negative.
             return negated;
         };
-        let property_type = candidate.type_id();
         if negated {
             !self.table.assignable(property_type, literal)
         } else {
@@ -1062,7 +1151,6 @@ impl<'a> NarrowingContext<'a> {
                 || self.table.assignable(property_type, literal)
         }
     }
-
     fn collect_guards(
         &mut self,
         expression: &Expr,
@@ -1188,13 +1276,12 @@ impl<'a> NarrowingContext<'a> {
         })
     }
 
-    /// The interned literal type of a literal expression, keyed by the raw
-    /// lexeme exactly as the binder keys initializer literal types.
+    /// The interned literal type of a literal expression.
     fn literal_type(&mut self, expression: &Expr, resolver: &dyn GuardResolver) -> Option<TypeId> {
         match expression.data() {
             Expression::Literal(Literal::String(token)) => {
                 let text = resolver.token_text(token.data().token());
-                Some(self.table.string_literal(text))
+                Some(self.table.string_literal_lexeme(text))
             }
             Expression::Literal(Literal::Number(token)) => {
                 let text = resolver.token_text(token.data().token());
@@ -1270,7 +1357,11 @@ fn typeof_matches(ty: &Type, name: TypeofName) -> bool {
         TypeofName::Undefined => matches!(ty, Type::Undefined | Type::Void),
         TypeofName::Object => matches!(
             ty,
-            Type::ObjectType(_) | Type::Array(_) | Type::Tuple(_) | Type::Null
+            Type::ObjectType(_)
+                | Type::Array(_)
+                | Type::Tuple(_)
+                | Type::Null
+                | Type::AppliedClass { .. }
         ),
         TypeofName::Function => matches!(ty, Type::Function(_)),
     }
@@ -1283,7 +1374,7 @@ fn definitely_falsy(ty: &Type) -> bool {
         Type::Null | Type::Undefined | Type::Void => true,
         Type::BooleanLiteral(value) => !value,
         Type::NumberLiteral(text) => number_value(text) == Some(0.0),
-        Type::StringLiteral(text) => string_literal_is_empty(text),
+        Type::StringLiteral(text) => text.is_empty(),
         Type::BigIntLiteral(text) => bigint_literal_is_zero(text),
         _ => false,
     }
@@ -1302,13 +1393,10 @@ fn possibly_falsy(ty: &Type) -> bool {
         | Type::String
         | Type::BigInt
         | Type::NumericEnum(_)
-        | Type::Named(_) => true,
+        | Type::Named(_)
+        | Type::AppliedClass { .. } => true,
         _ => definitely_falsy(ty),
     }
-}
-
-fn string_literal_is_empty(lexeme: &str) -> bool {
-    unquote_if_quoted(lexeme).is_some_and(str::is_empty)
 }
 
 fn bigint_literal_is_zero(lexeme: &str) -> bool {
@@ -1415,7 +1503,7 @@ mod tests {
             table.undefined_type(),
             table.any(),
         );
-        let (a, b) = (table.string_literal("\"a\""), table.string_literal("\"b\""));
+        let (a, b) = (table.string_literal("a"), table.string_literal("b"));
         let union = table.union(&[string, number]);
         let literal_union = table.union(&[a, b]);
         let nullable = table.union(&[string, null]);
@@ -1466,8 +1554,8 @@ mod tests {
     fn discriminant_narrowing_filters_union_variants_by_the_literal() {
         let mut table = TypeTable::new();
         let (circle_tag, square_tag) = (
-            table.string_literal("\"circle\""),
-            table.string_literal("\"square\""),
+            table.string_literal("circle"),
+            table.string_literal("square"),
         );
         let circle = table.object_type(vec![
             PropertyType::new("kind", false, circle_tag),
@@ -1506,6 +1594,68 @@ mod tests {
         assert_eq!(
             context.narrow_discriminant(any, "kind", circle_tag, false),
             any
+        );
+    }
+
+    #[test]
+    fn discriminant_narrowing_filters_intersection_variants() {
+        let mut table = TypeTable::new();
+        let literal_tag = table.string_literal("literal");
+        let other_tag = table.string_literal("other");
+        let literal_name = table.object_type(vec![PropertyType::new("name", false, literal_tag)]);
+        let literal_value =
+            table.object_type(vec![PropertyType::new("value", false, table.number())]);
+        let broad_tag = table.union(&[literal_tag, other_tag]);
+        let broad_name = table.object_type(vec![PropertyType::new("name", false, broad_tag)]);
+        let other_name = table.object_type(vec![PropertyType::new("name", false, other_tag)]);
+        let other_value =
+            table.object_type(vec![PropertyType::new("other", false, table.string())]);
+        let literal_variant = table.intersection(vec![literal_name, literal_value]);
+        let other_variant = table.intersection(vec![broad_name, other_name, other_value]);
+        let union = table.union(&[literal_variant, other_variant]);
+        let mut facts = FlowFacts::new();
+        let mut context = NarrowingContext::new(&mut table, &mut facts);
+
+        assert_eq!(
+            context.narrow_discriminant(union, "name", literal_tag, false),
+            literal_variant
+        );
+        assert_eq!(
+            context.narrow_discriminant(union, "name", literal_tag, true),
+            other_variant
+        );
+    }
+
+    #[test]
+    fn discriminant_narrowing_projects_named_class_members() {
+        let mut table = TypeTable::new();
+        let literal_symbol = SymbolId::new(401);
+        let array_symbol = SymbolId::new(402);
+        let literal_tag = table.string_literal("literal");
+        let array_tag = table.string_literal("array");
+        let number = table.number();
+        let literal_body = table.object_type(vec![
+            PropertyType::new("name", false, literal_tag),
+            PropertyType::new("value", false, number),
+        ]);
+        let array_body = table.object_type(vec![PropertyType::new("name", false, array_tag)]);
+        table.declare_class(literal_symbol, Vec::new());
+        table.publish_final_class_template(literal_symbol, literal_body);
+        table.declare_class(array_symbol, Vec::new());
+        table.publish_final_class_template(array_symbol, array_body);
+        let literal = table.named(literal_symbol);
+        let array = table.named(array_symbol);
+        let terminal = table.union(&[literal, array]);
+        let mut facts = FlowFacts::new();
+        let mut context = NarrowingContext::new(&mut table, &mut facts);
+
+        assert_eq!(
+            context.narrow_discriminant(terminal, "name", literal_tag, false),
+            literal
+        );
+        assert_eq!(
+            context.narrow_discriminant(terminal, "name", literal_tag, true),
+            array
         );
     }
 
@@ -1635,6 +1785,29 @@ mod tests {
             },
         );
         assert_eq!(context.type_at(joined, &ghost), None);
+    }
+
+    #[test]
+    fn member_write_invalidation_restores_ancestor_and_descendant_baselines() {
+        let mut table = TypeTable::new();
+        let a = table.string_literal("a");
+        let b = table.string_literal("b");
+        let kind = table.union(&[a, b]);
+        let declared = table.object_type(vec![PropertyType::new("kind", false, kind)]);
+        let refined = table.object_type(vec![PropertyType::new("kind", false, a)]);
+        let root = FlowKey::root(symbol(1));
+        let child = root.clone().child("kind");
+        let mut facts = FlowFacts::new();
+        let mut context = NarrowingContext::new(&mut table, &mut facts);
+        context.declare(symbol(1), declared);
+
+        let flow = context.branch(FlowNodeId::ROOT);
+        context.refine(flow, root.clone(), refined);
+        context.refine(flow, child.clone(), a);
+        context.invalidate(flow, &child);
+
+        assert_eq!(context.type_at(flow, &root), Some(declared));
+        assert_eq!(context.type_at(flow, &child), Some(kind));
     }
 
     // ---- contextual typing --------------------------------------------------
@@ -2138,7 +2311,7 @@ mod tests {
             table.undefined_type(),
             table.error_type(),
         );
-        let a = table.string_literal("\"a\"");
+        let a = table.string_literal("a");
         let kinded = table.object_type(vec![PropertyType::new("kind", false, string)]);
         let other = table.object_type(vec![PropertyType::new("other", false, number)]);
         let false_literal = table.boolean_literal(false);
@@ -2203,6 +2376,112 @@ mod tests {
         assert_eq!(
             context.narrow_instanceof(string_or_error, number, true),
             string_or_error
+        );
+    }
+    // ---- AppliedClass typeof classification -------------------------------
+
+    #[test]
+    fn typeof_object_keeps_applied_class() {
+        let mut table = TypeTable::new();
+        let class_symbol = symbol(300);
+        let instance_template =
+            table.object_type(vec![PropertyType::new("x", false, table.number())]);
+        table.declare_class(class_symbol, Vec::new());
+        table.publish_final_class_template(class_symbol, instance_template);
+        let applied = table.applied_class(class_symbol, Vec::new());
+        let mut facts = FlowFacts::new();
+        let mut context = NarrowingContext::new(&mut table, &mut facts);
+
+        // `typeof x === "object"` keeps the AppliedClass instance.
+        assert_eq!(
+            context.narrow_typeof(applied, TypeofName::Object, false),
+            applied
+        );
+    }
+
+    #[test]
+    fn typeof_function_drops_applied_class() {
+        let mut table = TypeTable::new();
+        let class_symbol = symbol(310);
+        let instance_template =
+            table.object_type(vec![PropertyType::new("x", false, table.number())]);
+        table.declare_class(class_symbol, Vec::new());
+        table.publish_final_class_template(class_symbol, instance_template);
+        let applied = table.applied_class(class_symbol, Vec::new());
+        let never = table.never();
+        let mut facts = FlowFacts::new();
+        let mut context = NarrowingContext::new(&mut table, &mut facts);
+
+        // `typeof x === "function"` drops the AppliedClass instance — it is
+        // not callable.
+        assert_eq!(
+            context.narrow_typeof(applied, TypeofName::Function, false),
+            never
+        );
+    }
+
+    #[test]
+    fn typeof_function_negated_keeps_applied_class() {
+        let mut table = TypeTable::new();
+        let class_symbol = symbol(320);
+        let instance_template =
+            table.object_type(vec![PropertyType::new("x", false, table.number())]);
+        table.declare_class(class_symbol, Vec::new());
+        table.publish_final_class_template(class_symbol, instance_template);
+        let applied = table.applied_class(class_symbol, Vec::new());
+        let mut facts = FlowFacts::new();
+        let mut context = NarrowingContext::new(&mut table, &mut facts);
+
+        // `typeof x !== "function"` keeps the AppliedClass instance.
+        assert_eq!(
+            context.narrow_typeof(applied, TypeofName::Function, true),
+            applied
+        );
+    }
+
+    #[test]
+    fn typeof_object_negated_drops_applied_class() {
+        let mut table = TypeTable::new();
+        let class_symbol = symbol(330);
+        let instance_template =
+            table.object_type(vec![PropertyType::new("x", false, table.number())]);
+        table.declare_class(class_symbol, Vec::new());
+        table.publish_final_class_template(class_symbol, instance_template);
+        let applied = table.applied_class(class_symbol, Vec::new());
+        let never = table.never();
+        let mut facts = FlowFacts::new();
+        let mut context = NarrowingContext::new(&mut table, &mut facts);
+
+        // `typeof x !== "object"` drops the AppliedClass instance.
+        assert_eq!(
+            context.narrow_typeof(applied, TypeofName::Object, true),
+            never
+        );
+    }
+
+    #[test]
+    fn typeof_function_splits_union_of_applied_class_and_function() {
+        let mut table = TypeTable::new();
+        let class_symbol = symbol(340);
+        let instance_template =
+            table.object_type(vec![PropertyType::new("x", false, table.number())]);
+        table.declare_class(class_symbol, Vec::new());
+        table.publish_final_class_template(class_symbol, instance_template);
+        let applied = table.applied_class(class_symbol, Vec::new());
+        let func = table.function(Vec::new(), table.void());
+        let union = table.union(&[applied, func]);
+        let mut facts = FlowFacts::new();
+        let mut context = NarrowingContext::new(&mut table, &mut facts);
+
+        // `typeof x === "function"` keeps only the function member.
+        assert_eq!(
+            context.narrow_typeof(union, TypeofName::Function, false),
+            func
+        );
+        // `typeof x === "object"` keeps only the AppliedClass member.
+        assert_eq!(
+            context.narrow_typeof(union, TypeofName::Object, false),
+            applied
         );
     }
 }
