@@ -31,7 +31,8 @@ use std::sync::Arc;
 use bamts_bytecode::{
     AccessorKind, BinaryOp, BindingId, BindingKind, Constant, ConstantId, DisposeHint, EcmaString,
     EcmaStringBuilder, EdgeId, EdgeTarget, Function, FunctionId, Instruction, IteratorCloseMode,
-    IteratorKind, Module, ModuleId, Pc, Program, ProgramModule, ResolvedExport, UnaryOp, Verified,
+    IteratorKind, Module, ModuleId, Pc, Program, ProgramModule, RESUME_NEXT, RESUME_RETURN,
+    RESUME_THROW, ResolvedExport, UnaryOp, Verified,
 };
 use bamts_native::{Decoded, SlotId, Value};
 
@@ -814,19 +815,59 @@ pub(crate) enum GeneratorResume {
         origin: ThrowOrigin,
     },
 }
+/// How a suspended generator body is re-entered. Abrupt completions are
+/// interpreted by the bytecode dispatch at the suspension's resume point.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResumeCompletion {
+    Next(Value),
+    Throw(Value),
+    Return(Value),
+}
 
-/// One `.next()` request on an async generator: the value sent into the body
-/// plus the Promise handed back to the caller that the request settles.
+impl ResumeCompletion {
+    pub(crate) const fn value(self) -> Value {
+        match self {
+            Self::Next(value) | Self::Throw(value) | Self::Return(value) => value,
+        }
+    }
+
+    pub(crate) const fn mode(self) -> u32 {
+        match self {
+            Self::Next(_) => RESUME_NEXT as u32,
+            Self::Throw(_) => RESUME_THROW as u32,
+            Self::Return(_) => RESUME_RETURN as u32,
+        }
+    }
+
+    pub(crate) const fn sync_operation(self) -> &'static str {
+        match self {
+            Self::Next(_) => "Generator.prototype.next called on incompatible receiver",
+            Self::Throw(_) => "Generator.prototype.throw called on incompatible receiver",
+            Self::Return(_) => "Generator.prototype.return called on incompatible receiver",
+        }
+    }
+
+    pub(crate) const fn async_operation(self) -> &'static str {
+        match self {
+            Self::Next(_) => "AsyncGenerator.prototype.next called on incompatible receiver",
+            Self::Throw(_) => "AsyncGenerator.prototype.throw called on incompatible receiver",
+            Self::Return(_) => "AsyncGenerator.prototype.return called on incompatible receiver",
+        }
+    }
+}
+
+/// One resume request on an async generator plus the Promise handed back to
+/// the caller that the request settles.
 #[derive(Clone, Debug)]
 pub(crate) struct AsyncGeneratorRequest {
-    pub(crate) resume_value: Value,
+    pub(crate) completion: ResumeCompletion,
     pub(crate) capability: Value,
 }
 
 /// Lifecycle of a `HeapEntry::AsyncGenerator`. `AwaitingOperand` parks on an
-/// `Await` inside the body; `AwaitingYield` parks awaiting a `yield` operand.
-/// While `Executing` or in either `Awaiting*` state the body is owned by one
-/// in-flight request and further `.next()` calls only enqueue.
+/// `Await` inside the body; `AwaitingYield` parks awaiting a yielded operand;
+/// `AwaitingResumption` parks while awaiting a return-resumption operand.
+/// While executing or awaiting, the body is owned by the front FIFO request.
 #[derive(Clone, Debug)]
 pub(crate) enum AsyncGeneratorState {
     SuspendedStart(GeneratorStart),
@@ -834,8 +875,8 @@ pub(crate) enum AsyncGeneratorState {
     Executing,
     AwaitingOperand(SuspendedActivation),
     AwaitingYield(SuspendedActivation),
-    /// The body returned; its return value is being awaited before the front
-    /// request settles `done: true`. No activation is held.
+    AwaitingResumption(SuspendedActivation),
+    /// The body is gone; the front request's return value is being awaited.
     AwaitingReturn,
     Completed,
 }
@@ -1325,7 +1366,8 @@ impl HeapEntry {
                         .saturating_add(1),
                     AsyncGeneratorState::SuspendedYield(activation)
                     | AsyncGeneratorState::AwaitingOperand(activation)
-                    | AsyncGeneratorState::AwaitingYield(activation) => activation
+                    | AsyncGeneratorState::AwaitingYield(activation)
+                    | AsyncGeneratorState::AwaitingResumption(activation) => activation
                         .registers
                         .len()
                         .saturating_add(activation.args.len())
@@ -6564,10 +6606,10 @@ impl<'a, H: Host> Machine<'a, H> {
                             this_value = next_this;
                             arguments = Cow::Owned(next_arguments);
                         }
-                        Ok(intrinsics::BuiltinOutcome::GeneratorNext {
+                        Ok(intrinsics::BuiltinOutcome::GeneratorResume {
                             generator,
-                            resume_value,
-                        }) => match self.resume_generator(generator, resume_value) {
+                            completion,
+                        }) => match self.resume_generator(generator, completion) {
                             Ok(value) => {
                                 if let Some(register) = destination {
                                     self.write_register(self.frames.len() - 1, register, value);
@@ -6576,10 +6618,10 @@ impl<'a, H: Host> Machine<'a, H> {
                             }
                             Err(failure) => return self.resolve_failure(failure, call_pc),
                         },
-                        Ok(intrinsics::BuiltinOutcome::AsyncGeneratorNext {
+                        Ok(intrinsics::BuiltinOutcome::AsyncGeneratorResume {
                             generator,
-                            resume_value,
-                        }) => match self.enqueue_async_generator_next(generator, resume_value) {
+                            completion,
+                        }) => match self.enqueue_async_generator_next(generator, completion) {
                             Ok(value) => {
                                 if let Some(register) = destination {
                                     self.write_register(self.frames.len() - 1, register, value);
@@ -6652,8 +6694,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 Ok(
                     intrinsics::BuiltinOutcome::Call { .. }
-                    | intrinsics::BuiltinOutcome::GeneratorNext { .. }
-                    | intrinsics::BuiltinOutcome::AsyncGeneratorNext { .. },
+                    | intrinsics::BuiltinOutcome::GeneratorResume { .. }
+                    | intrinsics::BuiltinOutcome::AsyncGeneratorResume { .. },
                 ) => self.throw_type("construct", call_pc),
                 Err(failure) => self.resolve_failure(failure, call_pc),
             };
@@ -7115,14 +7157,14 @@ impl<'a, H: Host> Machine<'a, H> {
                             this_value = next_this;
                             arguments = Cow::Owned(next_arguments);
                         }
-                        intrinsics::BuiltinOutcome::GeneratorNext {
+                        intrinsics::BuiltinOutcome::GeneratorResume {
                             generator,
-                            resume_value,
-                        } => return self.resume_generator(generator, resume_value),
-                        intrinsics::BuiltinOutcome::AsyncGeneratorNext {
+                            completion,
+                        } => return self.resume_generator(generator, completion),
+                        intrinsics::BuiltinOutcome::AsyncGeneratorResume {
                             generator,
-                            resume_value,
-                        } => return self.enqueue_async_generator_next(generator, resume_value),
+                            completion,
+                        } => return self.enqueue_async_generator_next(generator, completion),
                     }
                 }
                 CalleeKind::Runtime {
@@ -8977,11 +9019,28 @@ impl<'a, H: Host> Machine<'a, H> {
     fn resume_generator(
         &mut self,
         generator: Value,
-        resume_value: Value,
+        completion: ResumeCompletion,
     ) -> Result<Value, EvalFailure> {
-        let state = self.take_generator_state(generator)?;
+        let state = self.take_generator_state(generator).map_err(|failure| {
+            if let EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Generator.prototype.next called on incompatible receiver",
+            }) = failure
+            {
+                return EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: completion.sync_operation(),
+                });
+            }
+            failure
+        })?;
         if matches!(&state, GeneratorState::Completed) {
-            return self.iterator_result(Value::UNDEFINED, true);
+            return match completion {
+                ResumeCompletion::Next(_) => self.iterator_result(Value::UNDEFINED, true),
+                ResumeCompletion::Throw(value) => Err(EvalFailure::ThrowValueOrigin {
+                    value,
+                    origin: ThrowOrigin::Bytecode,
+                }),
+                ResumeCompletion::Return(value) => self.iterator_result(value, true),
+            };
         }
 
         let stop_depth = self.frames.len();
@@ -8991,19 +9050,32 @@ impl<'a, H: Host> Machine<'a, H> {
             constructed: None,
         });
         let prepared = match state {
-            GeneratorState::SuspendedStart(start) => self
-                .push_frame(ActivationRequest {
-                    target: start.target,
-                    captures: &start.captures,
-                    context: start.context,
-                    this_value: start.this_value,
-                    new_target: start.new_target,
-                    arguments: &start.args,
-                    return_to,
-                })
-                .map_err(|error| EvalFailure::Runtime(error.kind)),
+            GeneratorState::SuspendedStart(start) => match completion {
+                ResumeCompletion::Next(_) => self
+                    .push_frame(ActivationRequest {
+                        target: start.target,
+                        captures: &start.captures,
+                        context: start.context,
+                        this_value: start.this_value,
+                        new_target: start.new_target,
+                        arguments: &start.args,
+                        return_to,
+                    })
+                    .map_err(|error| EvalFailure::Runtime(error.kind)),
+                ResumeCompletion::Throw(value) => {
+                    self.settle_generator_completed(generator)?;
+                    return Err(EvalFailure::ThrowValueOrigin {
+                        value,
+                        origin: ThrowOrigin::Bytecode,
+                    });
+                }
+                ResumeCompletion::Return(value) => {
+                    self.settle_generator_completed(generator)?;
+                    return self.iterator_result(value, true);
+                }
+            },
             GeneratorState::Suspended(activation) => {
-                self.push_resumed_generator_frame(activation, resume_value, return_to)
+                self.push_resumed_generator_frame(activation, completion, return_to)
             }
             GeneratorState::Executing | GeneratorState::Completed => unreachable!(),
         };
@@ -9035,7 +9107,7 @@ impl<'a, H: Host> Machine<'a, H> {
     fn push_resumed_generator_frame(
         &mut self,
         activation: SuspendedActivation,
-        resume_value: Value,
+        completion: ResumeCompletion,
         return_to: Option<ReturnTo>,
     ) -> Result<(), EvalFailure> {
         if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
@@ -9051,10 +9123,19 @@ impl<'a, H: Host> Machine<'a, H> {
         let instruction = self.module_code(activation.target.module).functions()
             [activation.target.function.get() as usize]
             .code()[suspend_pc];
-        let (Instruction::Suspend { dst, resume, .. } | Instruction::Await { dst, resume, .. }) =
-            instruction
-        else {
-            unreachable!("generator resume token names a suspension instruction");
+        let (dst, resume, mode) = match instruction {
+            Instruction::Suspend {
+                dst,
+                src: _,
+                resume,
+                mode,
+            } => (dst, resume, Some(mode)),
+            Instruction::Await {
+                dst,
+                src: _,
+                resume,
+            } => (dst, resume, None),
+            _ => unreachable!("generator resume token names a suspension instruction"),
         };
         let mut frame = Frame {
             module: activation.target.module,
@@ -9069,7 +9150,10 @@ impl<'a, H: Host> Machine<'a, H> {
             context: activation.context,
             outer_context: None,
         };
-        frame.registers[dst.get() as usize] = resume_value;
+        frame.registers[dst.get() as usize] = completion.value();
+        if let Some(mode) = mode {
+            frame.registers[mode.get() as usize] = Value::int32(completion.mode());
+        }
         frame.outer_context = std::mem::replace(&mut self.context_global, frame.context);
         self.frames.push(frame);
         Ok(())
@@ -9462,16 +9546,15 @@ impl<'a, H: Host> Machine<'a, H> {
     pub(crate) fn enqueue_async_generator_next(
         &mut self,
         generator: Value,
-        resume_value: Value,
+        completion: ResumeCompletion,
     ) -> Result<Value, EvalFailure> {
         let capability = self.create_promise()?;
+        let operation = completion.async_operation();
         let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)? else {
             self.reject_promise(
                 capability,
                 Value::UNDEFINED,
-                ThrowOrigin::TypeError {
-                    operation: "AsyncGenerator.prototype.next called on incompatible receiver",
-                },
+                ThrowOrigin::TypeError { operation },
             )
             .map_err(EvalFailure::Runtime)?;
             return Ok(capability);
@@ -9480,15 +9563,13 @@ impl<'a, H: Host> Machine<'a, H> {
             self.reject_promise(
                 capability,
                 Value::UNDEFINED,
-                ThrowOrigin::TypeError {
-                    operation: "AsyncGenerator.prototype.next called on incompatible receiver",
-                },
+                ThrowOrigin::TypeError { operation },
             )
             .map_err(EvalFailure::Runtime)?;
             return Ok(capability);
         };
         queue.push_back(AsyncGeneratorRequest {
-            resume_value,
+            completion,
             capability,
         });
         let idle = !matches!(
@@ -9496,6 +9577,7 @@ impl<'a, H: Host> Machine<'a, H> {
             AsyncGeneratorState::Executing
                 | AsyncGeneratorState::AwaitingOperand(_)
                 | AsyncGeneratorState::AwaitingYield(_)
+                | AsyncGeneratorState::AwaitingResumption(_)
                 | AsyncGeneratorState::AwaitingReturn
         );
         if idle {
@@ -9512,69 +9594,159 @@ impl<'a, H: Host> Machine<'a, H> {
     /// done: true}`.
     pub(crate) fn drive_async_generator(&mut self, generator: Value) -> Result<(), EvalFailure> {
         loop {
-            let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)? else {
-                return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
-                    value: generator,
-                }));
+            // Phase 1: inspect state and queue front without holding borrows
+            // across subsequent self-method calls (borrow checker).
+            let (is_completed, front_completion) = {
+                let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)?
+                else {
+                    return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                        value: generator,
+                    }));
+                };
+                let HeapEntry::AsyncGenerator { state, queue, .. } = &self.heap[index] else {
+                    return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                        value: generator,
+                    }));
+                };
+                if matches!(
+                    state,
+                    AsyncGeneratorState::Executing
+                        | AsyncGeneratorState::AwaitingOperand(_)
+                        | AsyncGeneratorState::AwaitingYield(_)
+                        | AsyncGeneratorState::AwaitingResumption(_)
+                        | AsyncGeneratorState::AwaitingReturn
+                ) {
+                    return Ok(());
+                }
+                if queue.is_empty() {
+                    return Ok(());
+                }
+                (
+                    matches!(state, AsyncGeneratorState::Completed),
+                    queue.front().expect("queue non-empty").completion,
+                )
             };
-            let HeapEntry::AsyncGenerator { state, queue, .. } = &mut self.heap[index] else {
-                return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
-                    value: generator,
-                }));
-            };
-            if matches!(
-                state,
-                AsyncGeneratorState::Executing
-                    | AsyncGeneratorState::AwaitingOperand(_)
-                    | AsyncGeneratorState::AwaitingYield(_)
-                    | AsyncGeneratorState::AwaitingReturn
-            ) {
-                return Ok(());
-            }
-            if queue.is_empty() {
-                return Ok(());
-            }
-            if matches!(state, AsyncGeneratorState::Completed) {
-                let request = queue.pop_front().expect("queue emptiness checked");
-                let result = self.iterator_result(Value::UNDEFINED, true)?;
-                self.resolve_promise(request.capability, result)
-                    .map_err(EvalFailure::Runtime)?;
+
+            // Phase 2: act on the state, dropping all borrows first.
+            if is_completed {
+                match front_completion {
+                    ResumeCompletion::Throw(value) => {
+                        let request = self.pop_async_generator_front(generator)?;
+                        self.reject_promise(request.capability, value, ThrowOrigin::Bytecode)
+                            .map_err(EvalFailure::Runtime)?;
+                    }
+                    ResumeCompletion::Return(value) => {
+                        // Don't pop; leave the request queued so the
+                        // AwaitingReturn reaction settles it. Transition
+                        // Completed → Executing → AwaitingReturn, then await.
+                        self.take_async_generator_state(generator)?;
+                        let result = self
+                            .replace_async_generator_state(
+                                generator,
+                                AsyncGeneratorState::AwaitingReturn,
+                            )
+                            .map_err(EvalFailure::Runtime)
+                            .and_then(|()| self.await_promise_for_generator(value, generator));
+                        if result.is_err() {
+                            self.complete_async_generator(generator)?;
+                        }
+                        return result;
+                    }
+                    ResumeCompletion::Next(_) => {
+                        let request = self.pop_async_generator_front(generator)?;
+                        let result = self.iterator_result(Value::UNDEFINED, true)?;
+                        self.resolve_promise(request.capability, result)
+                            .map_err(EvalFailure::Runtime)?;
+                    }
+                }
                 continue;
             }
-            let resume_value = queue.front().expect("queue emptiness checked").resume_value;
-            let taken = std::mem::replace(state, AsyncGeneratorState::Executing);
+
+            // Not Completed: SuspendedStart or SuspendedYield. Take the state
+            // (sets to Executing) and dispatch the body.
+            let state = self.take_async_generator_state(generator)?;
             let stop_depth = self.frames.len();
             let return_to = self.frames.last().map(|frame| ReturnTo {
                 destination: None,
                 call_pc: frame.pc,
                 constructed: None,
             });
-            let pushed = match taken {
-                AsyncGeneratorState::SuspendedStart(start) => self
-                    .push_frame(ActivationRequest {
-                        target: start.target,
-                        captures: &start.captures,
-                        context: start.context,
-                        this_value: start.this_value,
-                        new_target: start.new_target,
-                        arguments: &start.args,
-                        return_to,
-                    })
-                    .map_err(|error| EvalFailure::Runtime(error.kind)),
-                AsyncGeneratorState::SuspendedYield(activation) => {
-                    self.push_resumed_generator_frame(activation, resume_value, return_to)
-                }
+            match state {
+                AsyncGeneratorState::SuspendedStart(start) => match front_completion {
+                    ResumeCompletion::Next(_) => {
+                        let pushed = self
+                            .push_frame(ActivationRequest {
+                                target: start.target,
+                                captures: &start.captures,
+                                context: start.context,
+                                this_value: start.this_value,
+                                new_target: start.new_target,
+                                arguments: &start.args,
+                                return_to,
+                            })
+                            .map_err(|error| EvalFailure::Runtime(error.kind));
+                        let step = match pushed {
+                            Ok(()) => self.drive_async_generator_activation(stop_depth, None),
+                            Err(failure) => Err(failure),
+                        };
+                        self.settle_async_generator_step(generator, step)?;
+                    }
+                    ResumeCompletion::Throw(value) => {
+                        let request = self.pop_async_generator_front(generator)?;
+                        self.complete_async_generator(generator)?;
+                        self.reject_promise(request.capability, value, ThrowOrigin::Bytecode)
+                            .map_err(EvalFailure::Runtime)?;
+                        continue;
+                    }
+                    ResumeCompletion::Return(value) => {
+                        let result = self
+                            .replace_async_generator_state(
+                                generator,
+                                AsyncGeneratorState::AwaitingReturn,
+                            )
+                            .map_err(EvalFailure::Runtime)
+                            .and_then(|()| self.await_promise_for_generator(value, generator));
+                        if result.is_err() {
+                            self.complete_async_generator(generator)?;
+                        }
+                        return result;
+                    }
+                },
+                AsyncGeneratorState::SuspendedYield(activation) => match front_completion {
+                    ResumeCompletion::Next(_) | ResumeCompletion::Throw(_) => {
+                        let step = self
+                            .push_resumed_generator_frame(activation, front_completion, return_to)
+                            .and_then(|()| self.drive_async_generator_activation(stop_depth, None));
+                        self.settle_async_generator_step(generator, step)?;
+                    }
+                    ResumeCompletion::Return(value) => {
+                        // Park in AwaitingResumption and await the return
+                        // operand. On fulfillment, resume_async_generator
+                        // re-enters with Return(value); on rejection, with
+                        // Throw(reason). Any setup failure must release the
+                        // activation registers and complete the generator.
+                        let register_count = activation.registers.len();
+                        let result = self
+                            .replace_async_generator_state(
+                                generator,
+                                AsyncGeneratorState::AwaitingResumption(activation),
+                            )
+                            .map_err(EvalFailure::Runtime)
+                            .and_then(|()| self.await_promise_for_generator(value, generator));
+                        if result.is_err() {
+                            self.release_suspended_activation_registers(register_count);
+                            self.complete_async_generator(generator)?;
+                        }
+                        return result;
+                    }
+                },
                 AsyncGeneratorState::Executing
                 | AsyncGeneratorState::AwaitingOperand(_)
                 | AsyncGeneratorState::AwaitingYield(_)
+                | AsyncGeneratorState::AwaitingResumption(_)
                 | AsyncGeneratorState::AwaitingReturn
                 | AsyncGeneratorState::Completed => unreachable!(),
-            };
-            let step = match pushed {
-                Ok(()) => self.drive_async_generator_activation(stop_depth, None),
-                Err(failure) => Err(failure),
-            };
-            self.settle_async_generator_step(generator, step)?;
+            }
         }
     }
 
@@ -9848,11 +10020,14 @@ impl<'a, H: Host> Machine<'a, H> {
                 self.drive_async_generator(generator)
                     .map_err(|failure| async_generator_kind(generator, failure))
             }
-            (AsyncGeneratorState::AwaitingOperand(activation), None) => {
-                self.drive_resumed_async_generator(generator, activation, value, None)
-            }
-            (AsyncGeneratorState::AwaitingOperand(activation), Some(origin))
-            | (AsyncGeneratorState::AwaitingYield(activation), Some(origin)) => {
+            (AsyncGeneratorState::AwaitingOperand(activation), None) => self
+                .drive_resumed_async_generator(
+                    generator,
+                    activation,
+                    ResumeCompletion::Next(value),
+                    None,
+                ),
+            (AsyncGeneratorState::AwaitingOperand(activation), Some(origin)) => {
                 let suspend_pc = activation
                     .resume_token
                     .checked_sub(1)
@@ -9861,7 +10036,38 @@ impl<'a, H: Host> Machine<'a, H> {
                 self.drive_resumed_async_generator(
                     generator,
                     activation,
-                    Value::UNDEFINED,
+                    ResumeCompletion::Next(Value::UNDEFINED),
+                    Some((value, origin, suspend_pc)),
+                )
+            }
+            (AsyncGeneratorState::AwaitingResumption(activation), None) => self
+                .drive_resumed_async_generator(
+                    generator,
+                    activation,
+                    ResumeCompletion::Return(value),
+                    None,
+                ),
+            (AsyncGeneratorState::AwaitingResumption(activation), Some(_)) => {
+                // The suspension is a Suspend instruction with a mode
+                // register; re-enter with Throw(value) and let the
+                // compiler's inline abrupt dispatch handle it — no inject.
+                self.drive_resumed_async_generator(
+                    generator,
+                    activation,
+                    ResumeCompletion::Throw(value),
+                    None,
+                )
+            }
+            (AsyncGeneratorState::AwaitingYield(activation), Some(origin)) => {
+                let suspend_pc = activation
+                    .resume_token
+                    .checked_sub(1)
+                    .expect("suspended async generator token is nonzero")
+                    as usize;
+                self.drive_resumed_async_generator(
+                    generator,
+                    activation,
+                    ResumeCompletion::Next(Value::UNDEFINED),
                     Some((value, origin, suspend_pc)),
                 )
             }
@@ -9895,7 +10101,7 @@ impl<'a, H: Host> Machine<'a, H> {
         &mut self,
         generator: Value,
         activation: SuspendedActivation,
-        resume_value: Value,
+        completion: ResumeCompletion,
         inject: Option<(Value, ThrowOrigin, usize)>,
     ) -> Result<(), RuntimeErrorKind> {
         let stop_depth = self.frames.len();
@@ -9905,7 +10111,7 @@ impl<'a, H: Host> Machine<'a, H> {
             constructed: None,
         });
         let step = self
-            .push_resumed_generator_frame(activation, resume_value, return_to)
+            .push_resumed_generator_frame(activation, completion, return_to)
             .and_then(|()| self.drive_async_generator_activation(stop_depth, inject));
         match self.settle_async_generator_step(generator, step) {
             // A completing step (throw) leaves the queue for the drain loop;
@@ -13494,6 +13700,7 @@ mod tests {
                             dst: reg(1),
                             src: reg(0),
                             resume: pc(2),
+                            mode: reg(2),
                         },
                         Instruction::Binary {
                             dst: reg(2),
@@ -13706,6 +13913,7 @@ mod tests {
                             dst: reg(2),
                             src: reg(1),
                             resume: pc(3),
+                            mode: reg(0),
                         },
                         Instruction::Return { value: reg(2) },
                     ],
@@ -13753,6 +13961,7 @@ mod tests {
                             dst: reg(1),
                             src: reg(0),
                             resume: pc(2),
+                            mode: reg(2),
                         },
                         Instruction::Return { value: reg(1) },
                     ],
@@ -13810,6 +14019,7 @@ mod tests {
                             dst: reg(1),
                             src: reg(0),
                             resume: pc(2),
+                            mode: reg(0),
                         },
                         Instruction::Return { value: reg(1) },
                     ],
@@ -13905,6 +14115,7 @@ mod tests {
                             dst: reg(2),
                             src: reg(0),
                             resume: pc(2),
+                            mode: reg(1),
                         },
                         Instruction::LoadConst {
                             dst: reg(1),
@@ -13914,6 +14125,7 @@ mod tests {
                             dst: reg(2),
                             src: reg(1),
                             resume: pc(4),
+                            mode: reg(1),
                         },
                         Instruction::Return { value: reg(2) },
                     ],
@@ -14080,6 +14292,7 @@ mod tests {
                             dst: reg(1),
                             src: reg(0),
                             resume: pc(2),
+                            mode: reg(2),
                         },
                         Instruction::Return { value: reg(1) },
                     ],
@@ -14143,6 +14356,7 @@ mod tests {
                             dst: reg(3),
                             src: reg(2),
                             resume: pc(4),
+                            mode: reg(2),
                         },
                         Instruction::Return { value: reg(3) },
                     ],
@@ -14242,6 +14456,7 @@ mod tests {
                             dst: reg(1),
                             src: reg(0),
                             resume: pc(2),
+                            mode: reg(0),
                         },
                         Instruction::Return { value: reg(1) },
                     ],
@@ -14286,6 +14501,7 @@ mod tests {
                             dst: reg(4),
                             src: reg(0),
                             resume: pc(2),
+                            mode: reg(3),
                         },
                         Instruction::LoadConst {
                             dst: reg(1),
@@ -14295,6 +14511,7 @@ mod tests {
                             dst: reg(4),
                             src: reg(1),
                             resume: pc(4),
+                            mode: reg(3),
                         },
                         Instruction::LoadConst {
                             dst: reg(2),
@@ -14304,6 +14521,7 @@ mod tests {
                             dst: reg(4),
                             src: reg(2),
                             resume: pc(6),
+                            mode: reg(3),
                         },
                         Instruction::Return { value: reg(4) },
                     ],
@@ -25231,5 +25449,602 @@ mod tests {
         machine.pop_native_roots(depth);
 
         Ok(BuiltinOutcome::Value(result))
+    }
+
+    fn generator_return<H: Host>(
+        machine: &mut Machine<'_, H>,
+        generator: Value,
+        resume_value: Value,
+    ) -> Result<(Value, bool), EvalFailure> {
+        let method = machine.get_named_property(generator, "return")?;
+        let result = machine.call_value(method, generator, &[resume_value])?;
+        let done = machine.get_named_property(result, "done")?;
+        let value = machine.get_named_property(result, "value")?;
+        Ok((value, machine.truthy(done)))
+    }
+
+    fn generator_throw<H: Host>(
+        machine: &mut Machine<'_, H>,
+        generator: Value,
+        resume_value: Value,
+    ) -> Result<(Value, bool), EvalFailure> {
+        let method = machine.get_named_property(generator, "throw")?;
+        let result = machine.call_value(method, generator, &[resume_value])?;
+        let done = machine.get_named_property(result, "done")?;
+        let value = machine.get_named_property(result, "value")?;
+        Ok((value, machine.truthy(done)))
+    }
+
+    #[test]
+    fn sync_generator_resume_next_return_throw_modes() {
+        let program = verified(
+            vec![Constant::Int32(42), Constant::Int32(0), Constant::Int32(1)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                generator_function(
+                    0,
+                    6,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(3),
+                            constant: cid(1),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(4),
+                            constant: cid(2),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(1),
+                            src: reg(0),
+                            resume: pc(4),
+                            mode: reg(2),
+                        },
+                        Instruction::Binary {
+                            dst: reg(5),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(2),
+                            right: reg(3),
+                        },
+                        Instruction::JumpIfTrue {
+                            condition: reg(5),
+                            target: pc(11),
+                        },
+                        Instruction::Binary {
+                            dst: reg(5),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(2),
+                            right: reg(4),
+                        },
+                        Instruction::JumpIfTrue {
+                            condition: reg(5),
+                            target: pc(9),
+                        },
+                        Instruction::Return { value: reg(1) },
+                        Instruction::Throw { value: reg(1) },
+                        Instruction::Return { value: reg(5) },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    vec![ExceptionHandler {
+                        start: pc(8),
+                        end: pc(10),
+                        handler: pc(10),
+                        catch_register: reg(5),
+                    }],
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+
+        let callable = generator_callable(&mut machine, 1);
+
+        // next resumes from SuspendedStart and yields the first value.
+        let g1 = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        assert_eq!(
+            generator_next(&mut machine, g1, Value::UNDEFINED).unwrap(),
+            (Value::int32(42), false)
+        );
+        // next with a value reaches the Next dispatch arm and returns it.
+        assert_eq!(
+            generator_next(&mut machine, g1, Value::int32(5)).unwrap(),
+            (Value::int32(5), true)
+        );
+        // next on Completed returns undefined/done.
+        assert_eq!(
+            generator_next(&mut machine, g1, Value::UNDEFINED).unwrap(),
+            (Value::UNDEFINED, true)
+        );
+        assert_eq!(machine.live_registers, 0);
+
+        // return from SuspendedYield reaches the Return dispatch arm.
+        let g2 = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        assert_eq!(
+            generator_next(&mut machine, g2, Value::UNDEFINED).unwrap(),
+            (Value::int32(42), false)
+        );
+        assert_eq!(
+            generator_return(&mut machine, g2, Value::int32(7)).unwrap(),
+            (Value::int32(7), true)
+        );
+        assert_eq!(machine.live_registers, 0);
+
+        // throw from SuspendedYield reaches the Throw dispatch arm and is caught.
+        let g3 = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        assert_eq!(
+            generator_next(&mut machine, g3, Value::UNDEFINED).unwrap(),
+            (Value::int32(42), false)
+        );
+        assert_eq!(
+            generator_throw(&mut machine, g3, Value::int32(55)).unwrap(),
+            (Value::int32(55), true)
+        );
+        assert_eq!(machine.live_registers, 0);
+
+        // return before the body starts returns the supplied value and completes.
+        let g4 = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        assert_eq!(
+            generator_return(&mut machine, g4, Value::int32(9)).unwrap(),
+            (Value::int32(9), true)
+        );
+        assert_eq!(machine.live_registers, 0);
+
+        // throw before the body starts is reported as a Bytecode-origin throw.
+        let g5 = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        let err = generator_throw(&mut machine, g5, Value::int32(13)).unwrap_err();
+        assert!(matches!(
+            err,
+            EvalFailure::ThrowValueOrigin { value, origin }
+                if value == Value::int32(13) && origin == ThrowOrigin::Bytecode
+        ));
+
+        // next/return/throw on a completed generator have the expected final states.
+        let g6 = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        assert_eq!(
+            generator_next(&mut machine, g6, Value::UNDEFINED).unwrap(),
+            (Value::int32(42), false)
+        );
+        assert_eq!(
+            generator_next(&mut machine, g6, Value::int32(2)).unwrap(),
+            (Value::int32(2), true)
+        );
+        assert_eq!(
+            generator_next(&mut machine, g6, Value::UNDEFINED).unwrap(),
+            (Value::UNDEFINED, true)
+        );
+        assert_eq!(
+            generator_return(&mut machine, g6, Value::int32(3)).unwrap(),
+            (Value::int32(3), true)
+        );
+        let err = generator_throw(&mut machine, g6, Value::int32(4)).unwrap_err();
+        assert!(matches!(
+            err,
+            EvalFailure::ThrowValueOrigin { value, origin }
+                if value == Value::int32(4) && origin == ThrowOrigin::Bytecode
+        ));
+
+        // Operation brand messages are exact for next/return/throw on
+        // an incompatible receiver.
+        let proto = machine.intrinsics.builtins.generator_prototype();
+        let bad = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        for (name, expected) in [
+            (
+                "next",
+                "Generator.prototype.next called on incompatible receiver",
+            ),
+            (
+                "return",
+                "Generator.prototype.return called on incompatible receiver",
+            ),
+            (
+                "throw",
+                "Generator.prototype.throw called on incompatible receiver",
+            ),
+        ] {
+            let method = machine.get_named_property(proto, name).unwrap();
+            let err = machine.call_value(method, bad, &[]).unwrap_err();
+            assert!(matches!(
+                err,
+                EvalFailure::Throw(ThrowOrigin::TypeError { operation })
+                    if operation == expected
+            ));
+        }
+    }
+    fn async_generator_return<H: Host>(
+        machine: &mut Machine<'_, H>,
+        generator: Value,
+        resume_value: Value,
+    ) -> Result<Value, EvalFailure> {
+        let method = machine.get_named_property(generator, "return")?;
+        machine.call_value(method, generator, &[resume_value])
+    }
+
+    fn async_generator_throw<H: Host>(
+        machine: &mut Machine<'_, H>,
+        generator: Value,
+        resume_value: Value,
+    ) -> Result<Value, EvalFailure> {
+        let method = machine.get_named_property(generator, "throw")?;
+        machine.call_value(method, generator, &[resume_value])
+    }
+
+    #[test]
+    fn async_generator_start_and_completed_abrupt_completions() {
+        let program = verified(
+            vec![
+                Constant::Int32(42),
+                Constant::Int32(1),
+                Constant::String(EcmaString::encode("started")),
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(1),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(2),
+                            value: reg(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(1),
+                            src: reg(0),
+                            resume: pc(4),
+                            mode: reg(2),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+
+        // A1/A5/A6: .return() at SuspendedStart awaits the value, then drains the
+        // queued next/return/throw requests in FIFO order without entering the body.
+        let callable = generator_callable(&mut machine, 1);
+        let g1 = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let r1 = async_generator_return(&mut machine, g1, Value::int32(7)).unwrap();
+        let n1 = async_generator_next(&mut machine, g1, Value::UNDEFINED).unwrap();
+        let r2 = async_generator_return(&mut machine, g1, Value::int32(8)).unwrap();
+        let t1 = async_generator_throw(&mut machine, g1, Value::int32(9)).unwrap();
+
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            settled_iterator_result(&mut machine, r1),
+            (Value::int32(7), true),
+        );
+        assert_eq!(
+            settled_iterator_result(&mut machine, n1),
+            (Value::UNDEFINED, true),
+        );
+        assert_eq!(
+            settled_iterator_result(&mut machine, r2),
+            (Value::int32(8), true),
+        );
+        assert_eq!(rejected_reason(&machine, t1), Value::int32(9));
+        assert_eq!(machine.test_global("started"), None);
+        assert_eq!(machine.live_registers, 0);
+
+        // A2: .throw() at SuspendedStart rejects and completes without entering the body.
+        let callable = generator_callable(&mut machine, 1);
+        let g2 = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let t2 = async_generator_throw(&mut machine, g2, Value::int32(5)).unwrap();
+        let n2 = async_generator_next(&mut machine, g2, Value::UNDEFINED).unwrap();
+        let r3 = async_generator_return(&mut machine, g2, Value::int32(6)).unwrap();
+
+        machine.drain_microtasks().unwrap();
+        assert_eq!(rejected_reason(&machine, t2), Value::int32(5));
+        assert_eq!(
+            settled_iterator_result(&mut machine, n2),
+            (Value::UNDEFINED, true),
+        );
+        assert_eq!(
+            settled_iterator_result(&mut machine, r3),
+            (Value::int32(6), true),
+        );
+        assert_eq!(machine.test_global("started"), None);
+        assert_eq!(machine.live_registers, 0);
+    }
+
+    #[test]
+    fn async_generator_yield_and_await_abrupt_completions() {
+        // A3/A5: .return(v) at SuspendedYield awaits the operand, runs the body's
+        // "finally" path, and preserves FIFO for a request queued behind the return.
+        let return_program = verified(
+            vec![
+                Constant::Int32(0),
+                Constant::Int32(42),
+                Constant::Int32(99),
+                Constant::String(EcmaString::encode("finally")),
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    6,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(1),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(2),
+                            src: reg(1),
+                            resume: pc(3),
+                            mode: reg(3),
+                        },
+                        Instruction::Binary {
+                            dst: reg(4),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(3),
+                            right: reg(0),
+                        },
+                        Instruction::JumpIfTrue {
+                            condition: reg(4),
+                            target: pc(8),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(5),
+                            constant: cid(2),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(3),
+                            value: reg(5),
+                        },
+                        Instruction::Return { value: reg(2) },
+                        Instruction::Return { value: reg(2) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+
+        let mut host = TestHost;
+        let mut machine = Machine::new(&return_program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+
+        let callable = generator_callable(&mut machine, 1);
+        let g1 = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let first = async_generator_next(&mut machine, g1, Value::UNDEFINED).unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            settled_iterator_result(&mut machine, first),
+            (Value::int32(42), false),
+        );
+
+        let awaited = machine.create_promise().unwrap();
+        let result = async_generator_return(&mut machine, g1, awaited).unwrap();
+        let later = async_generator_next(&mut machine, g1, Value::UNDEFINED).unwrap();
+        assert!(pending_promise(&machine, result));
+        assert!(pending_promise(&machine, later));
+        assert_eq!(machine.test_global("finally"), None);
+
+        machine.resolve_promise(awaited, Value::int32(7)).unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            settled_iterator_result(&mut machine, result),
+            (Value::int32(7), true),
+        );
+        assert_eq!(
+            settled_iterator_result(&mut machine, later),
+            (Value::UNDEFINED, true),
+        );
+        assert_eq!(machine.test_global("finally"), Some(Value::int32(99)));
+        assert_eq!(machine.live_registers, 0);
+
+        // A4: .throw() at SuspendedYield is catchable by a handler around the yield.
+        let throw_program = verified(
+            vec![
+                Constant::Int32(0),
+                Constant::Int32(1),
+                Constant::Int32(42),
+                Constant::Int32(99),
+                Constant::String(EcmaString::encode("finally")),
+                Constant::String(EcmaString::encode("caught")),
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    8,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(1),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(2),
+                            constant: cid(2),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(3),
+                            src: reg(2),
+                            resume: pc(4),
+                            mode: reg(4),
+                        },
+                        Instruction::Binary {
+                            dst: reg(5),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(4),
+                            right: reg(0),
+                        },
+                        Instruction::JumpIfTrue {
+                            condition: reg(5),
+                            target: pc(11),
+                        },
+                        Instruction::Binary {
+                            dst: reg(5),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(4),
+                            right: reg(1),
+                        },
+                        Instruction::JumpIfTrue {
+                            condition: reg(5),
+                            target: pc(12),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(6),
+                            constant: cid(3),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(4),
+                            value: reg(6),
+                        },
+                        Instruction::Return { value: reg(3) },
+                        Instruction::Return { value: reg(3) },
+                        Instruction::Throw { value: reg(3) },
+                        Instruction::StoreGlobal {
+                            name: cid(5),
+                            value: reg(7),
+                        },
+                        Instruction::Return { value: reg(7) },
+                    ],
+                    vec![ExceptionHandler {
+                        start: pc(4),
+                        end: pc(13),
+                        handler: pc(13),
+                        catch_register: reg(7),
+                    }],
+                ),
+            ],
+        );
+
+        let mut throw_host = TestHost;
+        let mut machine = Machine::new(&throw_program, &mut throw_host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+
+        let callable = generator_callable(&mut machine, 1);
+        let g2 = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let first = async_generator_next(&mut machine, g2, Value::UNDEFINED).unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            settled_iterator_result(&mut machine, first),
+            (Value::int32(42), false),
+        );
+
+        let result = async_generator_throw(&mut machine, g2, Value::int32(5)).unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(machine.test_global("caught"), Some(Value::int32(5)));
+        assert_eq!(
+            settled_iterator_result(&mut machine, result),
+            (Value::int32(5), true),
+        );
+        assert_eq!(machine.live_registers, 0);
+
+        // A8: .return() while the generator is parked on an Await is queued only
+        // and does not disturb the await resumption path.
+        let await_program = verified(
+            vec![
+                Constant::String(EcmaString::encode("p")),
+                Constant::Int32(1),
+                Constant::String(EcmaString::encode("after_await")),
+                Constant::Int32(9),
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    6,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::Await {
+                            dst: reg(1),
+                            src: reg(0),
+                            resume: pc(2),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(2),
+                            constant: cid(1),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(2),
+                            value: reg(2),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(3),
+                            constant: cid(3),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(4),
+                            src: reg(3),
+                            resume: pc(6),
+                            mode: reg(5),
+                        },
+                        Instruction::Return { value: reg(4) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+
+        let mut await_host = TestHost;
+        let mut machine = Machine::new(&await_program, &mut await_host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+
+        let awaited = machine.create_promise().unwrap();
+        machine.test_set_global("p", awaited);
+
+        let callable = generator_callable(&mut machine, 1);
+        let g3 = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let first = async_generator_next(&mut machine, g3, Value::UNDEFINED).unwrap();
+        let result = async_generator_return(&mut machine, g3, Value::int32(7)).unwrap();
+        assert!(pending_promise(&machine, first));
+        assert!(pending_promise(&machine, result));
+
+        machine.resolve_promise(awaited, Value::int32(9)).unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(machine.test_global("after_await"), Some(Value::int32(1)));
+        assert_eq!(
+            settled_iterator_result(&mut machine, first),
+            (Value::int32(9), false),
+        );
+        assert_eq!(
+            settled_iterator_result(&mut machine, result),
+            (Value::int32(7), true),
+        );
+        assert_eq!(machine.live_registers, 0);
     }
 }

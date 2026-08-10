@@ -382,6 +382,7 @@ fn helper_address(helper: Helper) -> *const u8 {
         Helper::ToObject => bamts_native::bamts_to_object as *const u8,
         Helper::DisposeCapture => bamts_native::bamts_dispose_capture as *const u8,
         Helper::SuppressError => bamts_native::bamts_suppress_error as *const u8,
+        Helper::ResumeMode => bamts_native::bamts_resume_mode as *const u8,
     }
 }
 
@@ -776,6 +777,7 @@ mod tests {
                     dst: Register::new(0),
                     src: Register::new(0),
                     resume: Pc::new(2),
+                    mode: Register::new(0),
                 },
                 Instruction::Halt,
             ],
@@ -794,6 +796,137 @@ mod tests {
 
         assert_eq!(tag, CompletionTag::FatalTrap);
         assert_eq!(frame.bytecode_pc, 1);
+    }
+    /// A resume dispatcher that records the helper-call order and returns fixed
+    /// values for the resume prologue.
+    struct RecordingResume {
+        calls: std::cell::RefCell<Vec<HelperCall>>,
+        resumed_value: Value,
+        mode_value: Value,
+    }
+
+    impl RecordingResume {
+        fn new(resumed_value: Value, mode_value: Value) -> Self {
+            Self {
+                calls: std::cell::RefCell::new(Vec::new()),
+                resumed_value,
+                mode_value,
+            }
+        }
+    }
+
+    impl NativeOps for RecordingResume {
+        fn truthy(&self, _frame: &mut NativeFrame<'_>, _value: Value) -> bool {
+            unreachable!("resume prologue fixture never tests truthiness")
+        }
+
+        fn dispatch(&self, _frame: &mut NativeFrame<'_>, call: HelperCall) -> HelperResult {
+            self.calls.borrow_mut().push(call);
+            match call {
+                HelperCall::LoadConstant { .. } => HelperResult::normal(Value::NULL),
+                HelperCall::ConsumeFuel { .. } => HelperResult::normal(Value::UNDEFINED),
+                HelperCall::ResumeValue => HelperResult::normal(self.resumed_value),
+                HelperCall::ResumeMode => HelperResult::normal(self.mode_value),
+                _ => panic!("unexpected helper call in resume prologue fixture: {call:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn jit_resume_prologue_calls_resume_value_then_resume_mode() {
+        let bytecode = one_function_program(
+            vec![
+                Constant::String(EcmaString::encode("entry")),
+                Constant::Null,
+            ],
+            2,
+            vec![
+                Instruction::LoadConst {
+                    dst: Register::new(0),
+                    constant: ConstantId::new(1),
+                },
+                Instruction::Suspend {
+                    dst: Register::new(0),
+                    src: Register::new(0),
+                    resume: Pc::new(2),
+                    mode: Register::new(1),
+                },
+                Instruction::Halt,
+            ],
+            Vec::new(),
+        );
+        let program = compile_jit(&bytecode).expect("suspend program compiles");
+        let mut registers = [Value::UNINITIALIZED; 2];
+        let mut frame = ShadowFrame::new(core::ptr::null_mut(), 0, 0, registers.as_mut_ptr(), 2);
+        let mut completion = Completion::new(Value::UNDEFINED);
+        let mut ops = RecordingResume::new(Value::int32(42), Value::int32(2));
+
+        // Fresh call: token 0 yields the value and suspends.
+        let tag = with_native_ops(&mut ops, || {
+            program.invoke(0, 0, &mut frame, &mut completion)
+        })
+        .expect("compiled entry is registered");
+        assert_eq!(tag, CompletionTag::Suspend);
+
+        // Resume: token 2 enters the resume prologue.
+        frame.bytecode_pc = 2;
+        let mut completion = Completion::new(Value::UNDEFINED);
+        let tag = with_native_ops(&mut ops, || {
+            program.invoke(0, 0, &mut frame, &mut completion)
+        })
+        .expect("compiled resume entry is registered");
+        assert_eq!(tag, CompletionTag::Normal);
+
+        let calls = ops.calls.into_inner();
+        let value_pos = calls
+            .iter()
+            .position(|c| matches!(c, HelperCall::ResumeValue))
+            .expect("ResumeValue called");
+        let mode_pos = calls
+            .iter()
+            .position(|c| matches!(c, HelperCall::ResumeMode))
+            .expect("ResumeMode called");
+        assert!(
+            value_pos < mode_pos,
+            "ResumeValue must be called before ResumeMode:\n{calls:?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| matches!(c, HelperCall::ResumeValue))
+                .count(),
+            1,
+            "ResumeValue called exactly once"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| matches!(c, HelperCall::ResumeMode))
+                .count(),
+            1,
+            "ResumeMode called exactly once"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, HelperCall::LoadConstant { .. }))
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, HelperCall::ConsumeFuel { .. }))
+        );
+        assert_eq!(
+            registers[0],
+            Value::int32(42),
+            "resumed value stored into dst"
+        );
+        assert_eq!(
+            registers[1],
+            Value::int32(2),
+            "resume mode stored into mode"
+        );
+        assert_eq!(frame.bytecode_pc, 2, "resume continues at the resume pc");
     }
 
     #[test]

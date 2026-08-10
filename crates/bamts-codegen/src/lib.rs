@@ -137,8 +137,8 @@
 //! | `Return`            | `handles[value]` → `out.value`, return `Normal`           |
 //! | `Throw`             | route to covering handler (bind `catch_register`) or       |
 //! |                     | `out.value` + return `Throw`                              |
-//! | `Suspend`           | yield path + resume path via [`Helper::ResumeValue`]      |
-//! | `Await`             | same suspension ABI as `Suspend` (await operand)         |
+//! | `Suspend`           | yield path + resume path via [`Helper::ResumeValue`]/[`Helper::ResumeMode`] |
+//! | `Await`             | same value resume as `Suspend`; no mode helper            |
 //! | `Halt`              | `undefined` → `out.value`, return `Normal`               |
 //!
 //! No opcode is silently dropped and none is lowered to a placeholder no-op.
@@ -154,27 +154,30 @@
 //!
 //! # Suspend/Await and the resume helper
 //!
-//! `Suspend { dst, src, resume }` (the `yield` form) and
+//! `Suspend { dst, src, resume, mode }` (the `yield` form) and
 //! `Await { dst, src, resume }` (the `await` form) share one suspension ABI:
-//! yield `src` and, when resumed, deliver the resumed value into `dst` before
-//! continuing at `resume`. The native entry ABI
-//! carries no resume input (`out.value` is the *yielded* value, not an input),
-//! so the resumed value is obtained through an explicit runtime contract rather
-//! than invented:
+//! yield `src` and, when resumed, deliver the resumed value into `dst` and the
+//! completion mode into `mode` before continuing at `resume`. The native entry
+//! ABI carries no resume input (`out.value` is the *yielded* value, not an
+//! input), so the resumed value and mode are obtained through an explicit
+//! runtime contract rather than invented:
 //!
 //! * **Yield path** — store this suspension's resume token into `frame.bytecode_pc`
 //!   (`0` is a fresh call; the `Suspend`/`Await` at bytecode pc `P` uses token
 //!   `P + 1`, so tokens never collide with a fresh entry or with each other),
 //!   write `src` into `out.value`, and return `Suspend`.
 //! * **Resume path** — the dispatch prologue for token `P + 1` calls
-//!   [`Helper::ResumeValue`], which the runtime resolves to write the verified
-//!   resumed value for this frame into `out.value` (it may return `Throw` for
+//!   [`Helper::ResumeValue`], which the runtime resolves to write the resumed
+//!   completion value for this frame into `out.value` (it may return `Throw` for
 //!   `generator.throw`, routed to a covering handler, or `FatalTrap`); the
-//!   resumed value is then stored into `dst` and control continues at `resume`.
+//!   resumed value is then stored into `dst`. For [`Instruction::Suspend`] only,
+//!   the prologue then calls [`Helper::ResumeMode`], which writes the mode
+//!   (`0` = Next, `1` = Throw, `2` = Return) into `out.value` and stores it
+//!   into `mode` before continuing at `resume`.
 //!
 //! `bamts_bytecode` currently exposes no ABI for the resume input, so
-//! [`Helper::ResumeValue`] is a **new required contract** the runtime must
-//! provide for any module that suspends.
+//! [`Helper::ResumeValue`] and [`Helper::ResumeMode`] are **new required
+//! contracts** the runtime must provide for any module that suspends.
 
 #![deny(unsafe_code)]
 
@@ -322,7 +325,8 @@ const _: () = {
 /// | 42 | `DefineDataProperty` | `object: i64, key: i64, value: i64`         |
 /// | 43 | `LoadOwnDescriptorSlot` | `object: i64, key: i64, slot: i32`      |
 /// | 44 | `DefineOwnDescriptorSlot` | `object: i64, key: i64, src: i64, slot: i32` |
-/// | 45 | `WithHasBinding`     | `object: i64, key: i64`                     |
+/// | 45 | `WithHasBinding`    | `object: i64, key: i64`                     |
+/// | 46 | `ResumeMode`        | —                                            |
 ///
 /// Every helper except [`Helper::Truthy`] returns a
 /// `bamts_native::CompletionTag`. [`Helper::Truthy`] returns `0`/`1`.
@@ -370,9 +374,8 @@ pub enum Helper {
     /// never writes `out`.
     Truthy,
     /// `bamts_resume_value(frame, out)`: write the verified resumed value for
-    /// `frame` into `out.value`. Resolves the resume-input gap in the native
-    /// entry ABI (see the crate docs); may return `Throw` (`generator.throw`)
-    /// or `FatalTrap`.
+    /// `frame` into `out.value`. The helper only reports the value;
+    /// [`Helper::ResumeMode`] supplies and consumes the resume completion.
     ResumeValue,
     /// `bamts_define_accessor(frame, object, key, accessor, kind, out)`: install
     /// a getter or setter (`kind`, see `accessor_kind_selector`) under `key`.
@@ -483,6 +486,10 @@ pub enum Helper {
     /// Record `HasBinding` for a `with` binding object. Uses the realm-owned
     /// `%Symbol.unscopables%` intrinsic and writes a Boolean into `out.value`.
     WithHasBinding,
+    /// `bamts_resume_mode(frame, out)`: write the resumed completion mode for
+    /// `frame` into `out.value`, consuming the pending completion after
+    /// [`Helper::ResumeValue`] observed it.
+    ResumeMode,
 }
 
 impl Helper {
@@ -536,6 +543,7 @@ impl Helper {
             Helper::Export => "bamts_export",
             Helper::ConsumeFuel => "bamts_consume_fuel",
             Helper::CreateCell => "bamts_create_cell",
+            Helper::ResumeMode => "bamts_resume_mode",
         }
     }
 
@@ -590,6 +598,7 @@ impl Helper {
             Helper::LoadOwnDescriptorSlot => 43,
             Helper::DefineOwnDescriptorSlot => 44,
             Helper::WithHasBinding => 45,
+            Helper::ResumeMode => 46,
         }
     }
 
@@ -644,6 +653,7 @@ impl Helper {
             43 => Some(Helper::LoadOwnDescriptorSlot),
             44 => Some(Helper::DefineOwnDescriptorSlot),
             45 => Some(Helper::WithHasBinding),
+            46 => Some(Helper::ResumeMode),
             _ => None,
         }
     }
@@ -664,6 +674,7 @@ impl Helper {
             | Helper::CreateArray
             | Helper::CreateCell
             | Helper::ResumeValue
+            | Helper::ResumeMode
             | Helper::LoadThis
             | Helper::LoadArguments
             | Helper::LoadNewTarget
@@ -1236,9 +1247,13 @@ impl<'a> Lowering<'a> {
         }
         for &pc in reachable {
             match code[pc] {
-                Instruction::Suspend { dst, resume, .. }
-                | Instruction::Await { dst, resume, .. } => {
-                    self.emit_resume_prologue(pc, dst, resume);
+                Instruction::Suspend {
+                    dst, resume, mode, ..
+                } => {
+                    self.emit_resume_prologue(pc, dst, resume, Some(mode));
+                }
+                Instruction::Await { dst, resume, .. } => {
+                    self.emit_resume_prologue(pc, dst, resume, None);
                 }
                 _ => {}
             }
@@ -1913,11 +1928,19 @@ impl<'a> Lowering<'a> {
         self.builder.ins().return_(&[tag]);
     }
 
-    /// Emits a `Suspend`/`Await` resume prologue: obtain the resumed value
-    /// from the runtime via [`Helper::ResumeValue`], store it into `dst`, and
-    /// continue at `resume`. A `Throw` from the resume (e.g. `generator.throw`)
-    /// routes to a covering handler; `FatalTrap` propagates.
-    fn emit_resume_prologue(&mut self, pc: usize, dst: Register, resume: Pc) {
+    /// Emits a `Suspend`/`Await` resume prologue: obtain the resumed value from
+    /// the runtime via [`Helper::ResumeValue`], store it into `dst`, and continue
+    /// at `resume`. For [`Instruction::Suspend`] only, also obtain the resume
+    /// mode via [`Helper::ResumeMode`] and store it into `mode`. Each helper is
+    /// called at most once, and `ResumeMode` is only reached after `ResumeValue`
+    /// succeeds.
+    fn emit_resume_prologue(
+        &mut self,
+        pc: usize,
+        dst: Register,
+        resume: Pc,
+        mode: Option<Register>,
+    ) {
         let block = self.resume_blocks[&pc];
         self.builder.switch_to_block(block);
         let current_pc = self.iconst32(i64::from(pc as u32));
@@ -1927,21 +1950,43 @@ impl<'a> Lowering<'a> {
             self.frame,
             SHADOW_FRAME_PC_OFFSET,
         );
-        let tag = self.call_helper(Helper::ResumeValue, &[self.frame, self.out]);
+        let value_tag = self.call_helper(Helper::ResumeValue, &[self.frame, self.out]);
 
-        let normal = self.builder.create_block();
-        let abnormal = self.builder.create_block();
-        self.builder.ins().brif(tag, abnormal, &[], normal, &[]);
+        let value_normal = self.builder.create_block();
+        let value_abnormal = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(value_tag, value_abnormal, &[], value_normal, &[]);
 
-        self.builder.switch_to_block(normal);
+        self.builder.switch_to_block(value_normal);
         let handles = self.load_handles();
         let resumed = self.load_completion_value();
         self.store_register(handles, dst, resumed);
-        let target = self.pc_block(resume);
-        self.builder.ins().jump(target, &[]);
 
-        self.builder.switch_to_block(abnormal);
-        self.emit_abnormal_completion(pc, tag);
+        if let Some(mode) = mode {
+            let mode_tag = self.call_helper(Helper::ResumeMode, &[self.frame, self.out]);
+            let mode_normal = self.builder.create_block();
+            let mode_abnormal = self.builder.create_block();
+            self.builder
+                .ins()
+                .brif(mode_tag, mode_abnormal, &[], mode_normal, &[]);
+
+            self.builder.switch_to_block(mode_normal);
+            let handles = self.load_handles();
+            let mode_value = self.load_completion_value();
+            self.store_register(handles, mode, mode_value);
+            let target = self.pc_block(resume);
+            self.builder.ins().jump(target, &[]);
+
+            self.builder.switch_to_block(mode_abnormal);
+            self.emit_abnormal_completion(pc, mode_tag);
+        } else {
+            let target = self.pc_block(resume);
+            self.builder.ins().jump(target, &[]);
+        }
+
+        self.builder.switch_to_block(value_abnormal);
+        self.emit_abnormal_completion(pc, value_tag);
     }
 
     fn emit_halt(&mut self) {
@@ -2527,6 +2572,7 @@ mod tests {
             Helper::LoadOwnDescriptorSlot,
             Helper::DefineOwnDescriptorSlot,
             Helper::WithHasBinding,
+            Helper::ResumeMode,
         ];
         let mut symbols = BTreeSet::new();
         for (expected_index, helper) in helpers.iter().copied().enumerate() {
@@ -2539,8 +2585,8 @@ mod tests {
             );
             assert!(symbols.insert(helper.symbol()), "unique symbol {helper:?}");
         }
-        assert_eq!(symbols.len(), 46);
-        assert_eq!(Helper::from_external_index(46), None);
+        assert_eq!(symbols.len(), 47);
+        assert_eq!(Helper::from_external_index(47), None);
     }
     #[test]
     fn iterator_close_helpers_use_the_pinned_abis() {
@@ -3514,16 +3560,19 @@ mod tests {
                 dst: reg(0),
                 src: reg(0),
                 resume: Pc::new(2),
+                mode: reg(1),
             },
             Instruction::Halt,
         ];
-        let module = single(func(1, code, Vec::new()));
+        let module = single(func(2, code, Vec::new()));
         let lowered = lower_code_module(ModuleId::new(0), &module, host_config()).expect("lowers");
         let function = &lowered.functions[0];
         // Fresh token 0 plus the suspend at pc 1 -> token 2.
         assert_eq!(function.entry_points, vec![0, 2]);
         assert!(function.helpers.contains(&Helper::ResumeValue));
         assert_eq!(Helper::ResumeValue.external_index(), 13);
+        assert!(function.helpers.contains(&Helper::ResumeMode));
+        assert_eq!(Helper::ResumeMode.external_index(), 46);
         let clif = function.clif.display().to_string();
         // Multi-token dispatch loads and compares the resume token.
         assert!(
@@ -3540,6 +3589,10 @@ mod tests {
             clif.contains("u1:13"),
             "resume helper import missing:\n{clif}"
         );
+        assert!(
+            clif.contains("u1:46"),
+            "resume mode helper import missing:\n{clif}"
+        );
     }
 
     #[test]
@@ -3553,6 +3606,7 @@ mod tests {
                 dst: reg(0),
                 src: reg(0),
                 resume: Pc::new(2),
+                mode: reg(1),
             },
             Instruction::Await {
                 dst: reg(0),
@@ -3561,13 +3615,15 @@ mod tests {
             },
             Instruction::Halt,
         ];
-        let module = single(func(1, code, Vec::new()));
+        let module = single(func(2, code, Vec::new()));
         let lowered = lower_code_module(ModuleId::new(0), &module, host_config()).expect("lowers");
         let function = &lowered.functions[0];
         // Fresh token 0, the suspend at pc 1 -> token 2, the await at pc 2 ->
         // token 3: distinct tokens across both suspension opcodes.
         assert_eq!(function.entry_points, vec![0, 2, 3]);
         assert!(function.helpers.contains(&Helper::ResumeValue));
+        assert!(function.helpers.contains(&Helper::ResumeMode));
+        assert_eq!(Helper::ResumeMode.external_index(), 46);
         let clif = function.clif.display().to_string();
         // Multi-token dispatch loads and compares the resume token.
         assert!(
@@ -3578,6 +3634,61 @@ mod tests {
         assert!(
             clif.contains("u1:13"),
             "resume helper import missing:\n{clif}"
+        );
+        assert!(
+            clif.contains("u1:46"),
+            "resume mode helper import missing:\n{clif}"
+        );
+    }
+    #[test]
+    fn suspend_resume_prologue_calls_resume_value_then_resume_mode() {
+        // Load undefined into r0, then yield it via Suspend. r1 receives the
+        // resume mode. The resume prologue must call ResumeValue before
+        // ResumeMode and store both results into the destination registers.
+        let code = vec![
+            load_undef(reg(0)),
+            Instruction::Suspend {
+                dst: reg(0),
+                src: reg(0),
+                resume: Pc::new(2),
+                mode: reg(1),
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(2, code, Vec::new()));
+        let clif = lower_one(&module).1;
+        let value_call = clif.find("u1:13").expect("ResumeValue call missing");
+        let mode_call = clif.find("u1:46").expect("ResumeMode call missing");
+        assert!(
+            value_call < mode_call,
+            "ResumeValue must be called before ResumeMode:\n{clif}"
+        );
+        assert!(clif.contains("store"), "resume stores missing:\n{clif}");
+    }
+
+    #[test]
+    fn await_resume_prologue_uses_only_resume_value() {
+        // Load undefined into r0, then await it. Await uses ResumeValue only.
+        let code = vec![
+            load_undef(reg(0)),
+            Instruction::Await {
+                dst: reg(0),
+                src: reg(0),
+                resume: Pc::new(2),
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(1, code, Vec::new()));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::ResumeValue));
+        assert!(!helpers.contains(&Helper::ResumeMode));
+        assert!(
+            clif.contains("u1:13"),
+            "ResumeValue import missing:\n{clif}"
+        );
+        assert!(
+            !clif.contains("u1:46"),
+            "Await must not import ResumeMode:\n{clif}"
         );
     }
 

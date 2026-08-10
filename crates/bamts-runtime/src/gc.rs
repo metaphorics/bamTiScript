@@ -453,7 +453,8 @@ fn trace_async_generator_state(
         }
         AsyncGeneratorState::SuspendedYield(activation)
         | AsyncGeneratorState::AwaitingOperand(activation)
-        | AsyncGeneratorState::AwaitingYield(activation) => {
+        | AsyncGeneratorState::AwaitingYield(activation)
+        | AsyncGeneratorState::AwaitingResumption(activation) => {
             trace_activation(activation, heap, marks, work);
         }
         AsyncGeneratorState::Executing
@@ -764,7 +765,7 @@ fn trace_entry(
         } => {
             trace_async_generator_state(state, heap, marks, work);
             for request in queue {
-                mark_value(heap, marks, work, request.resume_value);
+                mark_value(heap, marks, work, request.completion.value());
                 mark_value(heap, marks, work, request.capability);
             }
             trace_properties_and_prototype(properties, *prototype, heap, marks, work);

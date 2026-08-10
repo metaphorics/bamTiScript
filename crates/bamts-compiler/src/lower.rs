@@ -29,8 +29,8 @@ use bamts_bytecode::{
     AccessorKind, BigIntLiteral, BinaryOp, Constant, ConstantId, DescriptorSlot, DisposeHint,
     EcmaString, ExceptionHandler, Function, FunctionFlags, FunctionId, Instruction,
     IteratorCloseMode, IteratorKind, MAX_BIGINT_BYTES, MAX_CONSTANTS, MAX_FUNCTIONS,
-    MAX_INSTRUCTIONS, MAX_REGISTERS, Module, NumberBits, Pc, Register, UnaryOp, Verified,
-    VerifyError,
+    MAX_INSTRUCTIONS, MAX_REGISTERS, Module, NumberBits, Pc, RESUME_RETURN, RESUME_THROW, Register,
+    UnaryOp, Verified, VerifyError,
 };
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -4296,7 +4296,7 @@ impl<'a> FunctionContext<'a> {
             Some(expression) => self.lower_expression(builder, expression)?,
             None => self.undefined(builder, range)?,
         };
-        self.emit_suspend(range, src)
+        self.emit_suspend(builder, range, src)
     }
     fn lower_yield_delegate(
         &mut self,
@@ -4338,7 +4338,7 @@ impl<'a> FunctionContext<'a> {
                 target: Pc::new(0),
             },
         )?;
-        let resumed = self.emit_suspend(range, value)?;
+        let resumed = self.emit_suspend(builder, range, value)?;
         self.move_to(range, result, resumed)?;
         self.emit(range, Instruction::Jump { target: head })?;
         let exit = self.next_pc();
@@ -4346,10 +4346,36 @@ impl<'a> FunctionContext<'a> {
         self.move_to(range, result, value)?;
         Ok(result)
     }
-    fn emit_suspend(&mut self, range: TextRange, src: Register) -> Result<Register, LowerError> {
+    fn emit_suspend(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        src: Register,
+    ) -> Result<Register, LowerError> {
         let dst = self.alloc_register(range)?;
+        let mode = self.alloc_register(range)?;
         let resume = Pc::new(self.code.len() as u32 + 1);
-        self.emit(range, Instruction::Suspend { dst, src, resume })?;
+        self.emit(
+            range,
+            Instruction::Suspend {
+                dst,
+                src,
+                resume,
+                mode,
+            },
+        )?;
+
+        let skip_throw = self.emit_int32_guard(builder, range, mode, RESUME_THROW)?;
+        self.emit(range, Instruction::Throw { value: dst })?;
+        let after_throw = self.next_pc();
+        self.patch_jump(skip_throw, after_throw);
+
+        let skip_return = self.emit_int32_guard(builder, range, mode, RESUME_RETURN)?;
+        if !self.route_through_finally(builder, range, COMPLETION_RETURN, Some(dst), None)? {
+            self.emit_function_return(builder, range, dst)?;
+        }
+        let after_return = self.next_pc();
+        self.patch_jump(skip_return, after_return);
         Ok(dst)
     }
     fn emit_await(&mut self, range: TextRange, src: Register) -> Result<Register, LowerError> {
@@ -10405,8 +10431,8 @@ mod tests {
         );
     }
     use bamts_bytecode::{
-        BinaryOp, Constant, DecodeLimits, Function, Instruction, Module, Pc, Register, UnaryOp,
-        Verified, decode_verified,
+        BinaryOp, Constant, DecodeLimits, Function, Instruction, Module, Pc, RESUME_RETURN,
+        RESUME_THROW, Register, UnaryOp, Verified, decode_verified,
     };
     fn lower_js_result(src: &str) -> Result<Module<Verified>, LowerError> {
         let source = Arc::new(
@@ -14267,6 +14293,241 @@ mod tests {
             "yield never emits the await opcode"
         );
     }
+    #[test]
+    fn generator_suspend_emits_inline_throw_and_return_dispatch() {
+        let module = lower_js("function* g() { yield 1; }");
+        let function = module
+            .functions()
+            .iter()
+            .find(|function| function.flags().is_generator)
+            .expect("generator function");
+        let code = function.code();
+        let suspend_pc = code
+            .iter()
+            .position(|instruction| matches!(instruction, Instruction::Suspend { .. }))
+            .expect("generator suspends");
+        let Instruction::Suspend {
+            dst, resume, mode, ..
+        } = code[suspend_pc]
+        else {
+            unreachable!()
+        };
+        assert_ne!(
+            dst, mode,
+            "resume value and completion mode use distinct registers"
+        );
+        let resume_pc = resume.get() as usize;
+        assert_eq!(
+            resume_pc,
+            suspend_pc + 1,
+            "resume enters the inline dispatch"
+        );
+
+        let Instruction::LoadConst {
+            dst: throw_marker,
+            constant: throw_constant,
+        } = code[resume_pc]
+        else {
+            panic!("throw mode marker is loaded first")
+        };
+        assert_eq!(
+            module.constants()[throw_constant.get() as usize],
+            Constant::Int32(RESUME_THROW)
+        );
+        let Instruction::Binary {
+            dst: throw_matches,
+            op: BinaryOp::StrictEqual,
+            left: throw_left,
+            right: throw_right,
+        } = code[resume_pc + 1]
+        else {
+            panic!("throw mode is tested inline")
+        };
+        assert_eq!((throw_left, throw_right), (mode, throw_marker));
+        let Instruction::JumpIfFalse {
+            condition: throw_condition,
+            target: after_throw,
+        } = code[resume_pc + 2]
+        else {
+            panic!("throw guard skips the abrupt arm")
+        };
+        assert_eq!(throw_condition, throw_matches);
+        assert_eq!(after_throw.get() as usize, resume_pc + 4);
+        assert_eq!(code[resume_pc + 3], Instruction::Throw { value: dst });
+
+        let Instruction::LoadConst {
+            dst: return_marker,
+            constant: return_constant,
+        } = code[resume_pc + 4]
+        else {
+            panic!("return mode marker follows throw dispatch")
+        };
+        assert_eq!(
+            module.constants()[return_constant.get() as usize],
+            Constant::Int32(RESUME_RETURN)
+        );
+        let Instruction::Binary {
+            dst: return_matches,
+            op: BinaryOp::StrictEqual,
+            left: return_left,
+            right: return_right,
+        } = code[resume_pc + 5]
+        else {
+            panic!("return mode is tested inline")
+        };
+        assert_eq!((return_left, return_right), (mode, return_marker));
+        let Instruction::JumpIfFalse {
+            condition: return_condition,
+            target: after_return,
+        } = code[resume_pc + 6]
+        else {
+            panic!("return guard skips the abrupt arm")
+        };
+        assert_eq!(return_condition, return_matches);
+        assert_eq!(after_return.get() as usize, resume_pc + 8);
+        assert_eq!(code[resume_pc + 7], Instruction::Return { value: dst });
+        assert_round_trips(&module);
+    }
+
+    #[test]
+    fn generator_throw_resume_dispatch_stays_inside_try_handler() {
+        let module = lower_js("function* g() { try { yield 1; } catch (e) { yield e; } }");
+        let function = module
+            .functions()
+            .iter()
+            .find(|function| function.flags().is_generator)
+            .expect("generator function");
+        let code = function.code();
+        let suspend_pc = code
+            .iter()
+            .position(|instruction| matches!(instruction, Instruction::Suspend { .. }))
+            .expect("try body suspends");
+        let Instruction::Suspend { dst, resume, .. } = code[suspend_pc] else {
+            unreachable!()
+        };
+        let throw_pc = code
+            .iter()
+            .enumerate()
+            .skip(resume.get() as usize)
+            .find_map(|(pc, instruction)| match instruction {
+                Instruction::Throw { value } if *value == dst => Some(pc),
+                _ => None,
+            })
+            .expect("resume throw arm");
+        let handler = function
+            .handlers()
+            .iter()
+            .find(|handler| {
+                handler.start.get() as usize <= suspend_pc
+                    && handler.end.get() as usize > suspend_pc
+            })
+            .expect("try handler covers the suspension");
+        assert!(
+            handler.start.get() as usize <= resume.get() as usize
+                && handler.end.get() as usize > throw_pc,
+            "resume entry and Throw remain inside the protected range"
+        );
+    }
+
+    #[test]
+    fn generator_return_bypasses_catch_and_routes_to_finally() {
+        let module = lower_js(
+            "function* g() { try { yield 1; } catch (e) { sink(e); } finally { sink(2); } }",
+        );
+        let function = module
+            .functions()
+            .iter()
+            .find(|function| function.flags().is_generator)
+            .expect("generator function");
+        let code = function.code();
+        let suspend_pc = code
+            .iter()
+            .position(|instruction| matches!(instruction, Instruction::Suspend { .. }))
+            .expect("try body suspends");
+        let Instruction::Suspend { resume, .. } = code[suspend_pc] else {
+            unreachable!()
+        };
+        let handler = function
+            .handlers()
+            .iter()
+            .find(|handler| {
+                handler.start.get() as usize <= suspend_pc
+                    && handler.end.get() as usize > suspend_pc
+            })
+            .expect("try handler");
+        let return_route = code[resume.get() as usize + 7..handler.end.get() as usize]
+            .iter()
+            .find_map(|instruction| match instruction {
+                Instruction::Jump { target } => Some(*target),
+                _ => None,
+            })
+            .expect("return routes out of the protected body");
+        assert_ne!(
+            return_route, handler.handler,
+            "return completion must not enter the catch clause"
+        );
+        assert!(
+            return_route.get() >= handler.end.get(),
+            "return completion targets the finalizer after the protected range"
+        );
+    }
+
+    #[test]
+    fn nested_generator_return_routes_through_each_finally() {
+        let module = lower_js(
+            "function* g() { try { try { yield 1; } finally { sink(1); } } finally { sink(2); } }",
+        );
+        let function = module
+            .functions()
+            .iter()
+            .find(|function| function.flags().is_generator)
+            .expect("generator function");
+        let code = function.code();
+        let suspend_pc = code
+            .iter()
+            .position(|instruction| matches!(instruction, Instruction::Suspend { .. }))
+            .expect("nested try body suspends");
+        let Instruction::Suspend { dst, resume, .. } = code[suspend_pc] else {
+            unreachable!()
+        };
+        let mut enclosing: Vec<_> = function
+            .handlers()
+            .iter()
+            .filter(|handler| {
+                handler.start.get() as usize <= suspend_pc
+                    && handler.end.get() as usize > suspend_pc
+            })
+            .collect();
+        enclosing.sort_by_key(|handler| handler.end.get() - handler.start.get());
+        let [inner, outer] = enclosing.as_slice() else {
+            panic!("the suspension is protected by two nested handlers")
+        };
+        let return_body = resume.get() as usize + 7;
+        assert!(
+            code[return_body..inner.end.get() as usize].iter().any(
+                |instruction| matches!(instruction, Instruction::Move { src, .. } if *src == dst)
+            ),
+            "return value is recorded in the innermost finally frame"
+        );
+        let inner_route = code[return_body..inner.end.get() as usize]
+            .iter()
+            .find_map(|instruction| match instruction {
+                Instruction::Jump { target } => Some(*target),
+                _ => None,
+            })
+            .expect("return routes to inner finalizer");
+        assert!(
+            inner_route.get() >= inner.end.get() && inner_route.get() < outer.end.get(),
+            "inner finalizer runs while still inside the outer protected range"
+        );
+        assert!(
+            code[inner_route.get() as usize..outer.end.get() as usize]
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::Jump { target } if target.get() >= outer.end.get())),
+            "inner finalizer dispatch preserves return and routes to the outer finalizer"
+        );
+    }
+
     #[test]
     fn async_await_uses_the_await_opcode() {
         let module = lower_js("async function f(p: any) { return await p; }");

@@ -1191,8 +1191,8 @@ mod tests {
         {
             BuiltinOutcome::Value(script) => script,
             BuiltinOutcome::Call { .. }
-            | BuiltinOutcome::GeneratorNext { .. }
-            | BuiltinOutcome::AsyncGeneratorNext { .. } => {
+            | BuiltinOutcome::GeneratorResume { .. }
+            | BuiltinOutcome::AsyncGeneratorResume { .. } => {
                 panic!("Script construction must not execute")
             }
         };
@@ -1456,8 +1456,8 @@ mod tests {
         {
             BuiltinOutcome::Value(script) => script,
             BuiltinOutcome::Call { .. }
-            | BuiltinOutcome::GeneratorNext { .. }
-            | BuiltinOutcome::AsyncGeneratorNext { .. } => unreachable!(),
+            | BuiltinOutcome::GeneratorResume { .. }
+            | BuiltinOutcome::AsyncGeneratorResume { .. } => unreachable!(),
         };
         let run = machine
             .get_named_property(script, "runInThisContext")

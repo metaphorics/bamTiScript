@@ -4,7 +4,10 @@ use std::marker::PhantomData;
 use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
 
-use crate::{EvalFailure, HeapEntry, Host, Machine, NativeCallable, PropertyMap, ThrowOrigin};
+use crate::{
+    EvalFailure, HeapEntry, Host, Machine, NativeCallable, PropertyMap, ResumeCompletion,
+    ThrowOrigin,
+};
 
 #[path = "builtins/mod.rs"]
 pub(crate) mod builtins;
@@ -23,13 +26,13 @@ pub(crate) enum BuiltinOutcome {
         this_value: Value,
         arguments: Vec<Value>,
     },
-    GeneratorNext {
+    GeneratorResume {
         generator: Value,
-        resume_value: Value,
+        completion: ResumeCompletion,
     },
-    AsyncGeneratorNext {
+    AsyncGeneratorResume {
         generator: Value,
-        resume_value: Value,
+        completion: ResumeCompletion,
     },
 }
 

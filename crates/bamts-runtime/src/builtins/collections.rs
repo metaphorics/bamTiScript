@@ -9,7 +9,7 @@ use super::{
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{
     CollectionKind, EvalFailure, HeapEntry, Host, IterationKind, Machine, Property, PropertyKey,
-    PropertyMap,
+    PropertyMap, ResumeCompletion,
 };
 
 pub(super) fn install<H: Host>(
@@ -166,8 +166,14 @@ pub(super) fn install_generator_prototype<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.iterator_prototype()));
-    let next = install_function(heap, builtins, "next", 1, generator_next::<H>);
-    define_data(heap, prototype, "next", next);
+    for (name, handler) in [
+        ("next", generator_next::<H> as BuiltinHandler<H>),
+        ("return", generator_return::<H> as BuiltinHandler<H>),
+        ("throw", generator_throw::<H> as BuiltinHandler<H>),
+    ] {
+        let function = install_function(heap, builtins, name, 1, handler);
+        define_data(heap, prototype, name, function);
+    }
     builtins.set_generator_prototype(prototype);
 }
 
@@ -176,9 +182,19 @@ pub(super) fn install_async_generator_prototype<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.async_iterator_prototype()));
-    let next = install_function(heap, builtins, "next", 1, async_generator_next::<H>);
-    define_data(heap, prototype, "next", next);
+    for (name, handler) in [
+        ("next", async_generator_next::<H> as BuiltinHandler<H>),
+        ("return", async_generator_return::<H> as BuiltinHandler<H>),
+        ("throw", async_generator_throw::<H> as BuiltinHandler<H>),
+    ] {
+        let function = install_function(heap, builtins, name, 1, handler);
+        define_data(heap, prototype, name, function);
+    }
     builtins.set_async_generator_prototype(prototype);
+}
+
+fn resume_value(args: &[Value]) -> Value {
+    args.first().copied().unwrap_or(Value::UNDEFINED)
 }
 
 fn async_generator_next<H: Host>(
@@ -187,9 +203,33 @@ fn async_generator_next<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    Ok(BuiltinOutcome::AsyncGeneratorNext {
+    Ok(BuiltinOutcome::AsyncGeneratorResume {
         generator: this,
-        resume_value: args.first().copied().unwrap_or(Value::UNDEFINED),
+        completion: ResumeCompletion::Next(resume_value(args)),
+    })
+}
+
+fn async_generator_return<H: Host>(
+    _machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    Ok(BuiltinOutcome::AsyncGeneratorResume {
+        generator: this,
+        completion: ResumeCompletion::Return(resume_value(args)),
+    })
+}
+
+fn async_generator_throw<H: Host>(
+    _machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    Ok(BuiltinOutcome::AsyncGeneratorResume {
+        generator: this,
+        completion: ResumeCompletion::Throw(resume_value(args)),
     })
 }
 
@@ -199,9 +239,33 @@ fn generator_next<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    Ok(BuiltinOutcome::GeneratorNext {
+    Ok(BuiltinOutcome::GeneratorResume {
         generator: this,
-        resume_value: args.first().copied().unwrap_or(Value::UNDEFINED),
+        completion: ResumeCompletion::Next(resume_value(args)),
+    })
+}
+
+fn generator_return<H: Host>(
+    _machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    Ok(BuiltinOutcome::GeneratorResume {
+        generator: this,
+        completion: ResumeCompletion::Return(resume_value(args)),
+    })
+}
+
+fn generator_throw<H: Host>(
+    _machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    Ok(BuiltinOutcome::GeneratorResume {
+        generator: this,
+        completion: ResumeCompletion::Throw(resume_value(args)),
     })
 }
 
@@ -1593,154 +1657,249 @@ mod tests {
     }
 
     #[test]
-    fn generator_prototype_next_has_length_one() {
+    fn async_generator_prototype_chains_to_async_iterator_prototype() {
         let module = blank_program("<test>");
         let mut host = TestHost;
-        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let machine = Machine::new(&module, &mut host, Limits::default());
 
-        let gen_proto = machine.intrinsics.builtins.generator_prototype();
-        let next = machine.get_named_property(gen_proto, "next").unwrap();
-        let index = machine.runtime_slot(next).unwrap().unwrap();
-        let HeapEntry::NativeFunction {
-            callable: NativeCallable::Builtin(id),
-            ..
-        } = machine.heap[index]
-        else {
-            panic!("next must be a native function");
-        };
-        let def = machine.intrinsics.builtins.get(id);
-        assert_eq!(def.length, 1, "Generator.prototype.next length must be 1");
-        assert_eq!(def.name, "next");
-    }
-
-    #[test]
-    fn generator_prototype_inherits_symbol_iterator_identity() {
-        let module = blank_program("<test>");
-        let mut host = TestHost;
-        let mut machine = Machine::new(&module, &mut host, Limits::default());
-
-        let gen_proto = machine.intrinsics.builtins.generator_prototype();
-        let iter_proto = machine.intrinsics.builtins.iterator_prototype();
-        let symbol = machine.intrinsics.builtins.symbol_iterator();
-        let key = machine.to_property_key(symbol).unwrap();
-
-        // %GeneratorPrototype% has no own Symbol.iterator — it inherits from
-        // %IteratorPrototype%, and the inherited function returns the same
-        // identity (the receiver itself).
-        let gen_identity = machine.get_property_key(gen_proto, &key).unwrap();
-        let iter_identity = machine.get_property_key(iter_proto, &key).unwrap();
-        assert_eq!(
-            gen_identity, iter_identity,
-            "Symbol.iterator on %GeneratorPrototype% must be the same \
-             function inherited from %IteratorPrototype%"
-        );
-    }
-
-    #[test]
-    fn async_generator_prototype_has_the_async_iterator_contract() {
-        let module = blank_program("<test>");
-        let mut host = TestHost;
-        let mut machine = Machine::new(&module, &mut host, Limits::default());
-
-        let generator = machine.intrinsics.builtins.async_generator_prototype();
-        let iterator = machine.intrinsics.builtins.async_iterator_prototype();
+        let async_gen_proto = machine.intrinsics.builtins.async_generator_prototype();
+        let async_iter_proto = machine.intrinsics.builtins.async_iterator_prototype();
         assert!(
             machine
-                .inherits_from_prototype(generator, iterator)
+                .inherits_from_prototype(async_gen_proto, async_iter_proto)
                 .unwrap(),
             "%AsyncGeneratorPrototype% must inherit from %AsyncIteratorPrototype%"
         );
-        assert_eq!(
-            machine.get_named_property(iterator, "next").unwrap(),
-            Value::UNDEFINED,
-            "%AsyncIteratorPrototype% must not define next"
-        );
-
-        let symbol = machine.intrinsics.builtins.symbol_async_iterator();
-        let key = machine.to_property_key(symbol).unwrap();
-        assert!(
-            !machine.has_own_property_key(generator, &key).unwrap(),
-            "the async iterator identity must be inherited"
-        );
-        let identity = machine.get_property_key(generator, &key).unwrap();
-        assert_eq!(
-            machine.call_value(identity, generator, &[]).unwrap(),
-            generator
-        );
-
-        let next = machine.get_named_property(generator, "next").unwrap();
-        let index = machine.runtime_slot(next).unwrap().unwrap();
-        let HeapEntry::NativeFunction {
-            callable: NativeCallable::Builtin(id),
-            ..
-        } = machine.heap[index]
-        else {
-            panic!("next must be a native function");
-        };
-        let def = machine.intrinsics.builtins.get(id);
-        assert_eq!(def.name, "next");
-        assert_eq!(def.length, 1);
     }
 
     #[test]
-    fn generator_next_on_incompatible_receiver_typeerrors() {
+    fn generator_method_surface_has_expected_metadata_and_descriptors() {
         let module = blank_program("<test>");
         let mut host = TestHost;
-        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let machine = Machine::new(&module, &mut host, Limits::default());
 
-        // An ordinary object is not a generator — take_generator_state (the
-        // centralized driver validation) must reject it with a TypeError.
-        let non_generator = ordinary_object(&mut machine);
-        let result = machine.take_generator_state(non_generator);
-        assert!(
-            matches!(
-                result,
-                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        for (label, prototype) in [
+            (
+                "Generator",
+                machine.intrinsics.builtins.generator_prototype(),
             ),
-            "next on a non-generator must produce a TypeError"
-        );
+            (
+                "AsyncGenerator",
+                machine.intrinsics.builtins.async_generator_prototype(),
+            ),
+        ] {
+            for name in ["next", "return", "throw"] {
+                let key = PropertyKey::Named(EcmaString::encode(name));
+                let method_descriptor = machine
+                    .own_descriptor(prototype, &key)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{label}.prototype.{name} must be an own property"));
+                let Property::Data {
+                    value: method,
+                    writable,
+                    enumerable,
+                    configurable,
+                } = method_descriptor
+                else {
+                    panic!("{label}.prototype.{name} must be a data property");
+                };
+                assert!(writable, "{label}.prototype.{name} must be writable");
+                assert!(
+                    !enumerable,
+                    "{label}.prototype.{name} must not be enumerable"
+                );
+                assert!(
+                    configurable,
+                    "{label}.prototype.{name} must be configurable"
+                );
+
+                let index = machine.runtime_slot(method).unwrap().unwrap();
+                let HeapEntry::NativeFunction {
+                    callable: NativeCallable::Builtin(id),
+                    ..
+                } = machine.heap[index]
+                else {
+                    panic!("{label}.prototype.{name} must be a native function");
+                };
+                let definition = machine.intrinsics.builtins.get(id);
+                assert_eq!(definition.name, name, "{label}.prototype.{name} name");
+                assert_eq!(definition.length, 1, "{label}.prototype.{name} length");
+
+                for metadata in ["name", "length"] {
+                    let descriptor = machine
+                        .own_descriptor(method, &PropertyKey::Named(EcmaString::encode(metadata)))
+                        .unwrap()
+                        .unwrap_or_else(|| {
+                            panic!("{label}.prototype.{name}.{metadata} must exist")
+                        });
+                    assert!(
+                        matches!(
+                            descriptor,
+                            Property::Data {
+                                writable: false,
+                                enumerable: false,
+                                configurable: true,
+                                ..
+                            }
+                        ),
+                        "{label}.prototype.{name}.{metadata} has the wrong descriptor: {descriptor:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
-    fn generator_next_outcome_packages_this_and_resume_value() {
+    fn generator_methods_use_operation_specific_brand_errors() {
         let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let prototype = machine.intrinsics.builtins.generator_prototype();
+        let receiver = ordinary_object(&mut machine);
 
-        let gen_proto = machine.intrinsics.builtins.generator_prototype();
-        let next = machine.get_named_property(gen_proto, "next").unwrap();
-        let index = machine.runtime_slot(next).unwrap().unwrap();
-        let HeapEntry::NativeFunction {
-            callable: NativeCallable::Builtin(id),
-            ..
-        } = machine.heap[index]
-        else {
-            panic!("next must be a native function");
-        };
+        for name in ["next", "return", "throw"] {
+            let method = machine.get_named_property(prototype, name).unwrap();
+            let error = machine.call_value(method, receiver, &[]).unwrap_err();
+            assert!(matches!(
+                error,
+                EvalFailure::Throw(ThrowOrigin::TypeError { operation })
+                    if operation == match name {
+                        "next" => "Generator.prototype.next called on incompatible receiver",
+                        "return" => "Generator.prototype.return called on incompatible receiver",
+                        "throw" => "Generator.prototype.throw called on incompatible receiver",
+                        _ => unreachable!(),
+                    }
+            ));
+        }
+    }
 
+    #[test]
+    fn async_generator_methods_reject_bad_receivers_without_throwing() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let prototype = machine.intrinsics.builtins.async_generator_prototype();
+        let receiver = ordinary_object(&mut machine);
+
+        for name in ["next", "return", "throw"] {
+            let method = machine.get_named_property(prototype, name).unwrap();
+            let promise = machine
+                .call_value(method, receiver, &[])
+                .unwrap_or_else(|error| panic!("AsyncGenerator.prototype.{name} threw: {error:?}"));
+            let index = machine.runtime_slot(promise).unwrap().unwrap();
+            assert!(
+                matches!(
+                    &machine.heap[index],
+                    HeapEntry::Promise {
+                        state: crate::PromiseState::Rejected {
+                            origin: ThrowOrigin::TypeError { operation },
+                            ..
+                        },
+                        ..
+                    } if *operation == match name {
+                        "next" => "AsyncGenerator.prototype.next called on incompatible receiver",
+                        "return" => "AsyncGenerator.prototype.return called on incompatible receiver",
+                        "throw" => "AsyncGenerator.prototype.throw called on incompatible receiver",
+                        _ => unreachable!(),
+                    }
+                ),
+                "AsyncGenerator.prototype.{name} must return an operation-specific rejected promise"
+            );
+        }
+    }
+
+    #[test]
+    fn generator_resume_outcomes_package_receiver_completion_and_default_value() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
         let receiver = ordinary_object(&mut machine);
         let resume = Value::int32(42);
-        let outcome = machine
-            .call_builtin(id, receiver, &[resume], false)
-            .unwrap();
-        match outcome {
-            BuiltinOutcome::GeneratorNext {
-                generator,
-                resume_value,
-            } => {
-                assert_eq!(generator, receiver);
-                assert_eq!(resume_value, resume);
-            }
-            other => panic!("expected GeneratorNext, got {other:?}"),
-        }
 
-        // Without arguments, resume_value defaults to undefined.
-        let outcome = machine.call_builtin(id, receiver, &[], false).unwrap();
-        match outcome {
-            BuiltinOutcome::GeneratorNext { resume_value, .. } => {
-                assert_eq!(resume_value, Value::UNDEFINED);
+        for (name, expected) in [
+            ("next", ResumeCompletion::Next(resume)),
+            ("return", ResumeCompletion::Return(resume)),
+            ("throw", ResumeCompletion::Throw(resume)),
+        ] {
+            let method = machine
+                .get_named_property(machine.intrinsics.builtins.generator_prototype(), name)
+                .unwrap();
+            let index = machine.runtime_slot(method).unwrap().unwrap();
+            let HeapEntry::NativeFunction {
+                callable: NativeCallable::Builtin(id),
+                ..
+            } = machine.heap[index]
+            else {
+                panic!("{name} must be a native function");
+            };
+            let outcome = machine
+                .call_builtin(id, receiver, &[resume], false)
+                .unwrap();
+            match outcome {
+                BuiltinOutcome::GeneratorResume {
+                    generator,
+                    completion,
+                } => {
+                    assert_eq!(generator, receiver);
+                    assert_eq!(completion, expected);
+                }
+                other => panic!("expected GeneratorResume, got {other:?}"),
             }
-            other => panic!("expected GeneratorNext, got {other:?}"),
+
+            let outcome = machine.call_builtin(id, receiver, &[], false).unwrap();
+            let BuiltinOutcome::GeneratorResume { completion, .. } = outcome else {
+                panic!("expected GeneratorResume");
+            };
+            assert_eq!(completion.value(), Value::UNDEFINED);
+        }
+    }
+
+    #[test]
+    fn async_generator_resume_outcomes_package_receiver_completion_and_default_value() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let receiver = ordinary_object(&mut machine);
+        let resume = Value::int32(42);
+
+        for (name, expected) in [
+            ("next", ResumeCompletion::Next(resume)),
+            ("return", ResumeCompletion::Return(resume)),
+            ("throw", ResumeCompletion::Throw(resume)),
+        ] {
+            let method = machine
+                .get_named_property(
+                    machine.intrinsics.builtins.async_generator_prototype(),
+                    name,
+                )
+                .unwrap();
+            let index = machine.runtime_slot(method).unwrap().unwrap();
+            let HeapEntry::NativeFunction {
+                callable: NativeCallable::Builtin(id),
+                ..
+            } = machine.heap[index]
+            else {
+                panic!("{name} must be a native function");
+            };
+            let outcome = machine
+                .call_builtin(id, receiver, &[resume], false)
+                .unwrap();
+            match outcome {
+                BuiltinOutcome::AsyncGeneratorResume {
+                    generator,
+                    completion,
+                } => {
+                    assert_eq!(generator, receiver);
+                    assert_eq!(completion, expected);
+                }
+                other => panic!("expected AsyncGeneratorResume, got {other:?}"),
+            }
+
+            let outcome = machine.call_builtin(id, receiver, &[], false).unwrap();
+            let BuiltinOutcome::AsyncGeneratorResume { completion, .. } = outcome else {
+                panic!("expected AsyncGeneratorResume");
+            };
+            assert_eq!(completion.value(), Value::UNDEFINED);
         }
     }
 

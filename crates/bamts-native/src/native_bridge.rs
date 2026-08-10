@@ -1,4 +1,4 @@
-//! The native runtime bridge: the typed helper-call algebra, the exact 35
+//! The native runtime bridge: the typed helper-call algebra, the 47
 //! `bamts_*` C-ABI helper exports, the panic- and nesting-safe thread-local
 //! [`NativeOps`] dispatch seam, and the feature-gated JIT and AOT linkage
 //! surfaces.
@@ -37,10 +37,10 @@ use crate::{Completion, CompletionTag, ShadowFrame, Value};
 // -- The helper algebra ------------------------------------------------------
 
 /// The number of runtime helpers, `0..HELPER_COUNT`.
-pub const HELPER_COUNT: u32 = 46;
+pub const HELPER_COUNT: u32 = 47;
 
 /// A runtime helper, identified by its stable ABI index. The variant order is
-/// the canonical `external_index` order (0..45) and is byte-identical to
+/// the canonical `external_index` order (0..46) and is byte-identical to
 /// `bamts_codegen::Helper`; [`NativeHelper::symbol`] returns the exact linker
 /// symbol generated code resolves against.
 ///
@@ -144,6 +144,8 @@ pub enum NativeHelper {
     DefineOwnDescriptorSlot = 44,
     /// `bamts_with_has_binding` — index 45 (object-environment HasBinding for `with`).
     WithHasBinding = 45,
+    /// `bamts_resume_mode` — index 46.
+    ResumeMode = 46,
 }
 
 impl NativeHelper {
@@ -198,6 +200,7 @@ impl NativeHelper {
             NativeHelper::LoadOwnDescriptorSlot => "bamts_load_own_descriptor_slot",
             NativeHelper::DefineOwnDescriptorSlot => "bamts_define_own_descriptor_slot",
             NativeHelper::WithHasBinding => "bamts_with_has_binding",
+            NativeHelper::ResumeMode => "bamts_resume_mode",
         }
     }
 
@@ -258,6 +261,7 @@ impl NativeHelper {
             43 => Some(NativeHelper::LoadOwnDescriptorSlot),
             44 => Some(NativeHelper::DefineOwnDescriptorSlot),
             45 => Some(NativeHelper::WithHasBinding),
+            46 => Some(NativeHelper::ResumeMode),
             _ => None,
         }
     }
@@ -330,6 +334,8 @@ pub enum HelperCall {
     Truthy { value: Value },
     /// The verified resumed value for the current frame.
     ResumeValue,
+    /// The resume mode for the current frame, consuming its pending completion.
+    ResumeMode,
     /// Install a getter/setter (`kind` selector) under `key`.
     DefineAccessor {
         object: Value,
@@ -457,6 +463,7 @@ impl HelperCall {
             HelperCall::ImportDynamic { .. } => NativeHelper::ImportDynamic,
             HelperCall::Truthy { .. } => NativeHelper::Truthy,
             HelperCall::ResumeValue => NativeHelper::ResumeValue,
+            HelperCall::ResumeMode => NativeHelper::ResumeMode,
             HelperCall::DefineAccessor { .. } => NativeHelper::DefineAccessor,
             HelperCall::DefineDataProperty { .. } => NativeHelper::DefineDataProperty,
             HelperCall::LoadOwnDescriptorSlot { .. } => NativeHelper::LoadOwnDescriptorSlot,
@@ -845,7 +852,7 @@ fn dispatch_simple(frame: *mut ShadowFrame, out: *mut Completion, call: HelperCa
     })
 }
 
-// -- The exact 35 exported C-ABI helpers -------------------------------------
+// -- The 47 exported C-ABI helpers -------------------------------------------
 //
 // Parameter order and widths mirror `bamts_codegen::Helper::param_types`
 // exactly: `frame` (pointer) first, `out` (pointer) last, runtime `Value`s as
@@ -1239,6 +1246,18 @@ pub unsafe extern "C" fn bamts_truthy(frame: *mut ShadowFrame, value: u64) -> u3
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bamts_resume_value(frame: *mut ShadowFrame, out: *mut Completion) -> u32 {
     dispatch_simple(frame, out, HelperCall::ResumeValue)
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out` when
+/// this helper has one. Both remain valid and unaliased for the full call.
+///
+/// `bamts_resume_mode(frame, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_resume_mode(frame: *mut ShadowFrame, out: *mut Completion) -> u32 {
+    dispatch_simple(frame, out, HelperCall::ResumeMode)
 }
 
 /// # Safety
@@ -1943,6 +1962,7 @@ const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, u64, u32, *mut Complet
     bamts_define_own_descriptor_slot; // 44
 const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 =
     bamts_with_has_binding; // 45
+const _: unsafe extern "C" fn(*mut ShadowFrame, *mut Completion) -> u32 = bamts_resume_mode; // 46
 
 // -- Native entry invocation seam --------------------------------------------
 
@@ -2635,7 +2655,7 @@ mod tests {
     /// this crate under `host-jit`, so importing it would be a cycle), so this
     /// literal is the pinned contract; it must stay byte-identical to
     /// `bamts_codegen::Helper::{external_index, symbol}`.
-    const CODEGEN_HELPERS: [(u32, &str); 46] = [
+    const CODEGEN_HELPERS: [(u32, &str); 47] = [
         (0, "bamts_load_constant"),
         (1, "bamts_unary"),
         (2, "bamts_binary"),
@@ -2682,6 +2702,7 @@ mod tests {
         (43, "bamts_load_own_descriptor_slot"),
         (44, "bamts_define_own_descriptor_slot"),
         (45, "bamts_with_has_binding"),
+        (46, "bamts_resume_mode"),
     ];
 
     /// A recording dispatcher: captures the last call and returns a fixed
@@ -2842,6 +2863,7 @@ mod tests {
             NativeHelper::Binary
         );
         assert_eq!(HelperCall::ResumeValue.helper(), NativeHelper::ResumeValue);
+        assert_eq!(HelperCall::ResumeMode.helper(), NativeHelper::ResumeMode);
         assert_eq!(
             HelperCall::Truthy { value: Value::TRUE }.helper(),
             NativeHelper::Truthy
@@ -3629,7 +3651,8 @@ mod tests {
             NativeHelper::from_u32(45),
             Some(NativeHelper::WithHasBinding)
         );
-        assert_eq!(NativeHelper::from_u32(46), None);
+        assert_eq!(NativeHelper::from_u32(46), Some(NativeHelper::ResumeMode));
+        assert_eq!(NativeHelper::from_u32(47), None);
         // Earlier appends stay stable.
         assert_eq!(NativeHelper::DefineDataProperty.as_u32(), 42);
         assert_eq!(

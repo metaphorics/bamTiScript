@@ -67,8 +67,9 @@ use crate::intrinsics::BuiltinOutcome;
 use crate::{
     CalleeKind, EvalFailure, Execution, ExecutionOutcome, GeneratorResume, GeneratorStart,
     GeneratorState, GetOutcome, HeapEntry, Host, IteratorNextPrepared, Limits, Machine, Property,
-    PropertyMap, RuntimeError, RuntimeErrorKind, SetOutcome, SuspendedActivation, ThrowOrigin,
-    accessor_from_selector, binary_from_selector, iterator_kind_from_selector, unary_from_selector,
+    PropertyMap, ResumeCompletion, RuntimeError, RuntimeErrorKind, SetOutcome, SuspendedActivation,
+    ThrowOrigin, accessor_from_selector, binary_from_selector, iterator_kind_from_selector,
+    unary_from_selector,
 };
 
 // -- ABI selector encoders (inverse of the shared `*_from_selector` decoders) --
@@ -254,14 +255,14 @@ impl CodeRef<'_> {
 
 /// A native activation record. It holds only per-call *metadata*; the register
 /// file lives as a driver-stack-local `Vec<Value>` so a [`NativeFrame`] can
-/// borrow it disjointly from the engine.
 struct Activation {
     this_value: Value,
     new_target: Value,
     args: Vec<Value>,
     arguments_object: Option<Value>,
-    /// The resumed value delivered to a pending `ResumeValue` (linked backend).
-    pending_resume: Option<Value>,
+    /// The pending [`ResumeCompletion`] delivered to [`HelperCall::ResumeValue`] /
+    /// [`HelperCall::ResumeMode`] (linked backend).
+    pending_resume: Option<ResumeCompletion>,
     /// The executing function; [`ShadowFrame`] carries only module and pc, so
     /// the activation supplies the function id for sourced errors and handler
     /// lookup at the helper boundary.
@@ -292,12 +293,14 @@ enum FrameCompletion {
     Unwind(Value, ThrowOrigin, usize),
     Suspend(Value, u32),
 }
-
 #[derive(Clone, Copy)]
 enum FrameDrive {
     Ordinary,
     GeneratorStart,
-    GeneratorResume { token: u32, sent: Value },
+    GeneratorResume {
+        token: u32,
+        completion: ResumeCompletion,
+    },
 }
 
 /// The result of invoking a callee (runtime function, host entity, or foreign
@@ -496,7 +499,11 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         roots.push(activation.new_target);
         roots.extend_from_slice(&activation.args);
         roots.extend(activation.arguments_object);
-        roots.extend(activation.pending_resume);
+        roots.extend(
+            activation
+                .pending_resume
+                .map(|completion| completion.value()),
+        );
         roots.extend(self.pending_throw.get().map(|pending| pending.value));
         roots
     }
@@ -750,7 +757,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         };
         let mut pc = match drive {
             FrameDrive::Ordinary | FrameDrive::GeneratorStart => 0,
-            FrameDrive::GeneratorResume { token, sent } => {
+            FrameDrive::GeneratorResume { token, completion } => {
                 let suspend_pc = token.checked_sub(1).map(|pc| pc as usize).ok_or_else(|| {
                     self.error_at(
                         module,
@@ -761,8 +768,9 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         0,
                     )
                 })?;
-                let Instruction::Suspend { dst, resume, .. } =
-                    code.functions()[function].code()[suspend_pc]
+                let Instruction::Suspend {
+                    dst, resume, mode, ..
+                } = code.functions()[function].code()[suspend_pc]
                 else {
                     return Err(self.error_at(
                         module,
@@ -773,7 +781,8 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         suspend_pc,
                     ));
                 };
-                frame.set_register(dst.get(), sent);
+                frame.set_register(dst.get(), completion.value());
+                frame.set_register(mode.get(), Value::int32(completion.mode()));
                 resume.get() as usize
             }
         };
@@ -1446,20 +1455,20 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                             args = Cow::Owned(next_arguments);
                             new_target = Value::UNDEFINED;
                         }
-                        Ok(BuiltinOutcome::GeneratorNext {
+                        Ok(BuiltinOutcome::GeneratorResume {
                             generator,
-                            resume_value,
+                            completion,
                         }) => {
-                            return self.resume_generator(generator, resume_value);
+                            return self.resume_generator(generator, completion);
                         }
-                        Ok(BuiltinOutcome::AsyncGeneratorNext {
+                        Ok(BuiltinOutcome::AsyncGeneratorResume {
                             generator,
-                            resume_value,
+                            completion,
                         }) => {
                             let outcome = self
                                 .machine
                                 .borrow_mut()
-                                .enqueue_async_generator_next(generator, resume_value);
+                                .enqueue_async_generator_next(generator, completion);
                             return match outcome {
                                 Ok(promise) => InvokeOutcome::Value(promise),
                                 Err(failure) => self.failure_outcome(failure),
@@ -1616,27 +1625,56 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         outcome
     }
 
-    fn resume_generator(&self, generator: Value, resume_value: Value) -> InvokeOutcome {
+    fn resume_generator(&self, generator: Value, completion: ResumeCompletion) -> InvokeOutcome {
         let state = self.machine.borrow_mut().take_generator_state(generator);
         let resumed = match state {
             Ok(GeneratorState::Completed) => {
-                return self.generator_result(Value::UNDEFINED, true);
+                return match completion {
+                    ResumeCompletion::Next(_) => self.generator_result(Value::UNDEFINED, true),
+                    ResumeCompletion::Return(value) => self.generator_result(value, true),
+                    ResumeCompletion::Throw(value) => {
+                        InvokeOutcome::Threw(value, ThrowOrigin::Bytecode)
+                    }
+                };
             }
-            Ok(GeneratorState::SuspendedStart(start)) => {
-                if self.backend == Backend::Reference || self.is_dynamic_module(start.target.module)
-                {
-                    self.start_reference_generator(start)
-                } else {
-                    self.start_linked_generator(start)
+            Ok(GeneratorState::SuspendedStart(start)) => match completion {
+                ResumeCompletion::Next(_) => {
+                    if self.backend == Backend::Reference
+                        || self.is_dynamic_module(start.target.module)
+                    {
+                        self.start_reference_generator(start)
+                    } else {
+                        self.start_linked_generator(start)
+                    }
                 }
-            }
+                ResumeCompletion::Return(value) => {
+                    if let Err(failure) = self
+                        .machine
+                        .borrow_mut()
+                        .settle_generator_completed(generator)
+                    {
+                        return self.failure_outcome(failure);
+                    }
+                    return self.generator_result(value, true);
+                }
+                ResumeCompletion::Throw(value) => {
+                    if let Err(failure) = self
+                        .machine
+                        .borrow_mut()
+                        .settle_generator_completed(generator)
+                    {
+                        return self.failure_outcome(failure);
+                    }
+                    return InvokeOutcome::Threw(value, ThrowOrigin::Bytecode);
+                }
+            },
             Ok(GeneratorState::Suspended(activation)) => {
                 if self.backend == Backend::Reference
                     || self.is_dynamic_module(activation.target.module)
                 {
-                    self.resume_reference_generator(activation, resume_value)
+                    self.resume_reference_generator(activation, completion)
                 } else {
-                    self.resume_linked_generator(activation, resume_value)
+                    self.resume_linked_generator(activation, completion)
                 }
             }
             Ok(GeneratorState::Executing) => {
@@ -1663,7 +1701,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 }
                 self.generator_result(value, true)
             }
-            Some(GeneratorResume::Throw { value, origin, .. }) => {
+            Some(GeneratorResume::Throw { value, origin }) => {
                 let settled = self
                     .machine
                     .borrow_mut()
@@ -2100,7 +2138,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     fn resume_reference_generator(
         &self,
         mut suspended: SuspendedActivation,
-        sent: Value,
+        completion: ResumeCompletion,
     ) -> Option<GeneratorResume> {
         let target = suspended.target;
         let context = suspended.context;
@@ -2135,7 +2173,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             &mut suspended.registers,
             FrameDrive::GeneratorResume {
                 token: suspended.resume_token,
-                sent,
+                completion,
             },
         );
         self.machine.borrow_mut().context_global = previous;
@@ -2231,15 +2269,15 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     fn resume_linked_generator(
         &self,
         activation: SuspendedActivation,
-        sent: Value,
+        completion: ResumeCompletion,
     ) -> Option<GeneratorResume> {
-        self.drive_linked_generator(activation, Some(sent))
+        self.drive_linked_generator(activation, Some(completion))
     }
 
     fn drive_linked_generator(
         &self,
         mut suspended: SuspendedActivation,
-        pending_resume: Option<Value>,
+        pending_resume: Option<ResumeCompletion>,
     ) -> Option<GeneratorResume> {
         let register_count = suspended.registers.len();
         if let Err(kind) = self.machine.borrow_mut().enter_native_generator() {
@@ -2680,8 +2718,8 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     Ok(BuiltinOutcome::Value(value)) => HelperResult::normal(value),
                     Ok(
                         BuiltinOutcome::Call { .. }
-                        | BuiltinOutcome::GeneratorNext { .. }
-                        | BuiltinOutcome::AsyncGeneratorNext { .. },
+                        | BuiltinOutcome::GeneratorResume { .. }
+                        | BuiltinOutcome::AsyncGeneratorResume { .. },
                     ) => {
                         self.pending_throw.set(Some(PendingThrow {
                             value: Value::UNDEFINED,
@@ -2964,7 +3002,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
         self.prepare_native_helper(frame);
         let module = ModuleId::new(frame.module_id());
         let amount = match call {
-            HelperCall::ResumeValue => None,
+            HelperCall::ResumeValue | HelperCall::ResumeMode => None,
             HelperCall::ConsumeFuel { amount } => Some(u64::from(amount)),
             _ => Some(1),
         };
@@ -3281,13 +3319,33 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     HelperResult::normal(Value::boolean(self.machine.borrow().truthy(value)))
                 }
                 HelperCall::ResumeValue => {
-                    let resumed = self
+                    match self
+                        .activations
+                        .borrow()
+                        .last()
+                        .and_then(|a| a.pending_resume)
+                    {
+                        Some(ResumeCompletion::Throw(value)) => {
+                            self.pending_throw.set(Some(PendingThrow {
+                                value,
+                                origin: ThrowOrigin::Bytecode,
+                            }));
+                            HelperResult::throw(value)
+                        }
+                        Some(completion) => self.validated(completion.value()),
+                        None => self.fatal(RuntimeErrorKind::InvalidValue {
+                            value: Value::UNDEFINED,
+                        }),
+                    }
+                }
+                HelperCall::ResumeMode => {
+                    match self
                         .activations
                         .borrow_mut()
                         .last_mut()
-                        .and_then(|activation| activation.pending_resume.take());
-                    match resumed {
-                        Some(value) => self.validated(value),
+                        .and_then(|a| a.pending_resume.take())
+                    {
+                        Some(completion) => self.validated(Value::int32(completion.mode())),
                         None => self.fatal(RuntimeErrorKind::InvalidValue {
                             value: Value::UNDEFINED,
                         }),
@@ -3582,13 +3640,13 @@ mod tests {
         ModuleId, Pc, Program, ProgramModule, Register, Verified,
     };
     use bamts_native::{
-        AbiError, Completion, CompletionTag, HelperCall, HelperResult, NativeEntryTable,
-        NativeFrame, NativeHelper, NativeOps, ShadowFrame, Value,
+        AbiError, Completion, CompletionTag, HELPER_COUNT, HelperCall, HelperResult,
+        NativeEntryTable, NativeFrame, NativeHelper, NativeOps, ShadowFrame, Value,
     };
 
     use crate::{
         GeneratorState, HeapEntry, Host, Limits, Machine, Property, PropertyKey, PropertyMap,
-        RuntimeError, RuntimeErrorKind, ThrowOrigin,
+        ResumeCompletion, RuntimeError, RuntimeErrorKind, ThrowOrigin,
     };
 
     use super::EcmaString;
@@ -7659,6 +7717,7 @@ mod tests {
                     dst: reg(1),
                     src: reg(0),
                     resume: pc(2),
+                    mode: reg(2),
                 },
                 Instruction::LoadConst {
                     dst: reg(0),
@@ -7668,6 +7727,7 @@ mod tests {
                     dst: reg(1),
                     src: reg(0),
                     resume: pc(4),
+                    mode: reg(2),
                 },
                 Instruction::Return { value: reg(1) },
             ],
@@ -7735,7 +7795,7 @@ mod tests {
 
         assert_iterator_result(
             &engine,
-            engine.resume_generator(generator, Value::int32(999)),
+            engine.resume_generator(generator, ResumeCompletion::Next(Value::int32(999))),
             Value::int32(4),
             false,
         );
@@ -7755,19 +7815,19 @@ mod tests {
 
         assert_iterator_result(
             &engine,
-            engine.resume_generator(generator, Value::int32(99)),
+            engine.resume_generator(generator, ResumeCompletion::Next(Value::int32(99))),
             Value::int32(5),
             false,
         );
         assert_iterator_result(
             &engine,
-            engine.resume_generator(generator, Value::int32(7)),
+            engine.resume_generator(generator, ResumeCompletion::Next(Value::int32(7))),
             Value::int32(7),
             true,
         );
         assert_iterator_result(
             &engine,
-            engine.resume_generator(generator, Value::int32(8)),
+            engine.resume_generator(generator, ResumeCompletion::Next(Value::int32(8))),
             Value::UNDEFINED,
             true,
         );
@@ -7793,12 +7853,12 @@ mod tests {
         let engine = NativeEngine::new(&program, &entries, &mut host, Limits::default());
         let generator = invoke_test_generator(&engine);
         assert!(matches!(
-            engine.resume_generator(generator, Value::UNDEFINED),
+            engine.resume_generator(generator, ResumeCompletion::Next(Value::UNDEFINED)),
             InvokeOutcome::Threw(value, ThrowOrigin::Bytecode) if value == Value::int32(42)
         ));
         assert_iterator_result(
             &engine,
-            engine.resume_generator(generator, Value::UNDEFINED),
+            engine.resume_generator(generator, ResumeCompletion::Next(Value::UNDEFINED)),
             Value::UNDEFINED,
             true,
         );
@@ -7821,12 +7881,12 @@ mod tests {
         let second = invoke_test_generator(&engine);
         assert_iterator_result(
             &engine,
-            engine.resume_generator(first, Value::UNDEFINED),
+            engine.resume_generator(first, ResumeCompletion::Next(Value::UNDEFINED)),
             Value::int32(4),
             false,
         );
         assert!(matches!(
-            engine.resume_generator(second, Value::UNDEFINED),
+            engine.resume_generator(second, ResumeCompletion::Next(Value::UNDEFINED)),
             InvokeOutcome::Fatal
         ));
         assert!(matches!(
@@ -7938,25 +7998,25 @@ mod tests {
         assert_eq!(entries.call.get(), 0, "generator call is lazy");
         assert_iterator_result(
             &engine,
-            engine.resume_generator(generator, Value::int32(999)),
+            engine.resume_generator(generator, ResumeCompletion::Next(Value::int32(999))),
             Value::int32(4),
             false,
         );
         assert_iterator_result(
             &engine,
-            engine.resume_generator(generator, Value::int32(99)),
+            engine.resume_generator(generator, ResumeCompletion::Next(Value::int32(99))),
             Value::int32(5),
             false,
         );
         assert_iterator_result(
             &engine,
-            engine.resume_generator(generator, Value::int32(7)),
+            engine.resume_generator(generator, ResumeCompletion::Next(Value::int32(7))),
             Value::int32(7),
             true,
         );
         assert_iterator_result(
             &engine,
-            engine.resume_generator(generator, Value::UNDEFINED),
+            engine.resume_generator(generator, ResumeCompletion::Next(Value::UNDEFINED)),
             Value::UNDEFINED,
             true,
         );
@@ -7988,13 +8048,13 @@ mod tests {
             new_target: Value::UNDEFINED,
             args: Vec::new(),
             arguments_object: None,
-            pending_resume: Some(resumed_value),
+            pending_resume: Some(ResumeCompletion::Next(resumed_value)),
             target: test_target(),
         });
-        let mut registers = vec![Value::UNINITIALIZED];
+        let mut registers = vec![Value::UNINITIALIZED, Value::UNINITIALIZED];
         engine.push_native_roots(&registers);
         engine.machine.borrow_mut().set_gc_watermarks_for_test(0, 0);
-        let mut shadow = ShadowFrame::new(std::ptr::null_mut(), 2, 0, registers.as_mut_ptr(), 1);
+        let mut shadow = ShadowFrame::new(std::ptr::null_mut(), 2, 0, registers.as_mut_ptr(), 2);
         let mut frame = NativeFrame::new(&mut shadow, &mut registers).unwrap();
         let resumed = engine.dispatch(&mut frame, HelperCall::ResumeValue);
         assert_eq!(resumed, HelperResult::normal(resumed_value));
@@ -8006,9 +8066,32 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        let mode = engine.dispatch(&mut frame, HelperCall::ResumeMode);
+        assert_eq!(mode, HelperResult::normal(Value::int32(0)));
+        assert!(
+            engine
+                .activations
+                .borrow()
+                .last()
+                .unwrap()
+                .pending_resume
+                .is_none()
+        );
         assert_eq!(
             engine.dispatch(&mut frame, HelperCall::ResumeValue).tag,
             CompletionTag::FatalTrap
+        );
+        engine
+            .activations
+            .borrow_mut()
+            .last_mut()
+            .expect("active generator frame")
+            .pending_resume = Some(ResumeCompletion::Throw(Value::int32(42)));
+        let thrown = engine.dispatch(&mut frame, HelperCall::ResumeValue);
+        assert_eq!(thrown, HelperResult::throw(Value::int32(42)));
+        assert_eq!(
+            engine.pending_throw.get().map(|p| (p.value, p.origin)),
+            Some((Value::int32(42), ThrowOrigin::Bytecode))
         );
         engine.pop_native_roots();
         engine.activations.borrow_mut().pop();
@@ -8031,7 +8114,8 @@ mod tests {
                 Backend::Linked,
             );
             let generator = invoke_test_generator(&engine);
-            let outcome = engine.resume_generator(generator, Value::UNDEFINED);
+            let outcome =
+                engine.resume_generator(generator, ResumeCompletion::Next(Value::UNDEFINED));
             if expected_throw {
                 assert!(matches!(
                     outcome,
@@ -8043,7 +8127,7 @@ mod tests {
             }
             assert_iterator_result(
                 &engine,
-                engine.resume_generator(generator, Value::UNDEFINED),
+                engine.resume_generator(generator, ResumeCompletion::Next(Value::UNDEFINED)),
                 Value::UNDEFINED,
                 true,
             );
@@ -8169,7 +8253,7 @@ mod tests {
             new_target: values[2],
             args: vec![values[3]],
             arguments_object: Some(values[4]),
-            pending_resume: Some(values[5]),
+            pending_resume: Some(ResumeCompletion::Next(values[5])),
             target: test_target(),
         });
         engine.pending_throw.set(Some(PendingThrow {
@@ -8389,7 +8473,7 @@ mod tests {
             None,
             0,
             0,
-            1,
+            2,
             FunctionFlags::default(),
             vec![
                 Instruction::LoadConst {
@@ -8440,6 +8524,7 @@ mod tests {
                     dst: reg(0),
                     src: reg(0),
                     resume: pc(2),
+                    mode: reg(1),
                 },
                 "suspend outside an engine-owned event loop",
             ),
@@ -9204,11 +9289,8 @@ mod tests {
             NativeHelper::WithHasBinding.symbol(),
             "bamts_with_has_binding"
         );
-        assert_eq!(
-            NativeHelper::from_u32(45),
-            Some(NativeHelper::WithHasBinding)
-        );
-        assert_eq!(bamts_native::HELPER_COUNT, 46);
+        assert_eq!(NativeHelper::ResumeMode.as_u32(), 46);
+        assert_eq!(HELPER_COUNT, 47);
     }
 
     #[test]

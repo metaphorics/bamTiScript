@@ -77,22 +77,24 @@
 //!
 //! ## Resume contract (async / generators)
 //!
-//! Two suspension primitives share one wire and CFG shape
-//! (`{ dst, src, resume }`): [`Instruction::Suspend`] is the `yield` form
-//! (including delegated `yield*`) and [`Instruction::Await`] is the `await`
-//! form, so an async-generator body can tell its two suspension kinds apart.
-//! [`FunctionFlags::is_async`] and [`FunctionFlags::is_generator`] select *how*
-//! a suspension is driven, but the contract is identical for both opcodes:
+//! [`Instruction::Suspend`] carries `{ dst, src, resume, mode }` for generator
+//! `yield`, while [`Instruction::Await`] retains `{ dst, src, resume }` for an
+//! awaited operand. Both suspension primitives have the same single-successor
+//! CFG shape, but only a generator suspension receives an engine-written resume
+//! completion mode. [`FunctionFlags::is_async`] and
+//! [`FunctionFlags::is_generator`] select *how* a suspension is driven:
 //!
 //! 1. The activation yields the value in `src` (a produced item for a
 //!    generator `yield`; an awaited operand for `await`) to its driver.
 //! 2. When the driver resumes the activation, control continues at `resume`
-//!    with the resumed value written to `dst` (the argument of `.next(v)` for a
-//!    generator; the settled result of the awaited value for `await`).
-//! 3. `resume` is a normal CFG successor and the only successor of either
-//!    suspension opcode, so the definite-initialization witness treats every
-//!    register live across a suspension as it would across any join: `dst` is
-//!    initialized on the resume edge, and registers not provably initialized
+//!    with the resumed value written to `dst`. A generator suspension also
+//!    receives [`RESUME_NEXT`], [`RESUME_THROW`], or [`RESUME_RETURN`] in
+//!    `mode`; the compiler dispatches that completion inside the suspended
+//!    body's protected ranges.
+//! 3. `resume` is the only CFG successor of either suspension opcode, so the
+//!    definite-initialization witness treats every register live across a
+//!    suspension as it would across any join: `dst` (and `mode` for `Suspend`)
+//!    is initialized on the resume edge, and registers not provably initialized
 //!    before the suspension are not assumed initialized after it.
 //!
 //! A generator's completion is an ordinary [`Instruction::Return`]; an uncaught
@@ -118,7 +120,7 @@ use std::marker::PhantomData;
 /// `BMTBC\0\0\1`, matching `Bamti.Bytecode.magicBytes`.
 pub const MAGIC: [u8; 8] = [66, 77, 84, 66, 67, 0, 0, 1];
 /// The sole supported wire version.
-pub const FORMAT_VERSION: u8 = 4;
+pub const FORMAT_VERSION: u8 = 5;
 
 /// Structural verify-time ceiling on a function's register count. Generous
 /// enough for real code yet bounds definite-initialization bitset allocation.
@@ -560,6 +562,13 @@ impl DescriptorSlot {
     }
 }
 
+/// Normal generator resumption (`Generator.prototype.next`).
+pub const RESUME_NEXT: i32 = 0;
+/// Abrupt throw resumption (`Generator.prototype.throw`).
+pub const RESUME_THROW: i32 = 1;
+/// Abrupt return resumption (`Generator.prototype.return`).
+pub const RESUME_RETURN: i32 = 2;
+
 /// The production instruction algebra. Existing opcodes 0..=50 retain stable
 /// wire tags; later instructions append new tags without reinterpreting them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -808,16 +817,17 @@ pub enum Instruction {
     /// Throw `value` (terminator; caught by an enclosing handler if any).
     Throw { value: Register },
     /// Yield `src` (the `yield` form, including delegated `yield*`) and resume
-    /// at `resume`, receiving the resumed value in `dst` (refines the formal
-    /// `Suspend`). See the module-level resume contract.
+    /// at `resume`, receiving the resumed value in `dst` and the engine-defined
+    /// completion mode in `mode`. See the module-level resume contract.
     Suspend {
         dst: Register,
         src: Register,
         resume: Pc,
+        mode: Register,
     },
     /// Await the operand in `src` and resume at `resume`, receiving the
-    /// settled value in `dst`. Identical register and CFG shape to
-    /// [`Instruction::Suspend`], which remains the `yield` form; keeping the
+    /// settled value in `dst`. It shares [`Instruction::Suspend`]'s CFG shape
+    /// but has no completion-mode destination; keeping the
     /// opcodes distinct lets an async-generator body tell `await` from
     /// `yield`. See the module-level resume contract.
     Await {
@@ -973,8 +983,9 @@ impl Instruction {
     }
 
     /// Visits each register this instruction defines: zero, one, or two.
-    /// [`Instruction::IteratorNext`], [`Instruction::IteratorResult`], and
-    /// [`Instruction::IteratorClose`] are the two-write opcodes.
+    /// [`Instruction::IteratorNext`], [`Instruction::IteratorResult`],
+    /// [`Instruction::IteratorClose`], and [`Instruction::Suspend`] are the
+    /// two-write opcodes.
     fn visit_writes(self, mut visit: impl FnMut(Register)) {
         match self {
             Self::LoadConst { dst, .. }
@@ -1003,11 +1014,14 @@ impl Instruction {
             | Self::CreateRegExp { dst, .. }
             | Self::GetIterator { dst, .. }
             | Self::IteratorStep { dst, .. }
-            | Self::Suspend { dst, .. }
             | Self::Await { dst, .. }
             | Self::Import { dst, .. }
             | Self::ImportDynamic { dst, .. }
             | Self::SuppressError { dst, .. } => visit(dst),
+            Self::Suspend { dst, mode, .. } => {
+                visit(dst);
+                visit(mode);
+            }
             Self::IteratorNext { done, value, .. } | Self::IteratorResult { done, value, .. } => {
                 visit(done);
                 visit(value);
@@ -2234,7 +2248,18 @@ fn verify_instruction(
             verify_target(function_index, pc, target, code_len)?;
         }
         Instruction::Return { value } | Instruction::Throw { value } => check_register(value)?,
-        Instruction::Suspend { dst, src, resume } | Instruction::Await { dst, src, resume } => {
+        Instruction::Suspend {
+            dst,
+            src,
+            resume,
+            mode,
+        } => {
+            check_register(dst)?;
+            check_register(src)?;
+            check_register(mode)?;
+            verify_target(function_index, pc, resume, code_len)?;
+        }
+        Instruction::Await { dst, src, resume } => {
             check_register(dst)?;
             check_register(src)?;
             verify_target(function_index, pc, resume, code_len)?;
@@ -2876,6 +2901,7 @@ impl<'a> Decoder<'a> {
                 dst: Register::new(self.leb128()?),
                 src: Register::new(self.leb128()?),
                 resume: Pc::new(self.leb128()?),
+                mode: Register::new(self.leb128()?),
             }),
             33 => Ok(Instruction::Import {
                 dst: Register::new(self.leb128()?),
@@ -3363,11 +3389,17 @@ fn encode_instruction(instruction: Instruction, output: &mut Vec<u8>) {
             output.push(31);
             write_u32(value.get(), output);
         }
-        Instruction::Suspend { dst, src, resume } => {
+        Instruction::Suspend {
+            dst,
+            src,
+            resume,
+            mode,
+        } => {
             output.push(32);
             write_u32(dst.get(), output);
             write_u32(src.get(), output);
             write_u32(resume.get(), output);
+            write_u32(mode.get(), output);
         }
         Instruction::Import { dst, specifier } => {
             output.push(33);
@@ -3687,6 +3719,7 @@ mod tests {
                 dst: Register::new(24),
                 src: Register::new(22),
                 resume: Pc::new(31),
+                mode: Register::new(25),
             },
             Instruction::JumpIfTrue {
                 condition: Register::new(21),
@@ -3883,6 +3916,7 @@ mod tests {
                 dst: Register::new(68),
                 src: Register::new(69),
                 resume: Pc::new(70),
+                mode: Register::new(71),
             },
             Instruction::Import {
                 dst: Register::new(71),
@@ -3991,6 +4025,28 @@ mod tests {
             assert_eq!(decoded, instruction, "{instruction:?} round-trips");
             assert_eq!(decoder.offset, bytes.len(), "consumes exactly its bytes");
         }
+    }
+
+    #[test]
+    fn suspend_wire_round_trip_preserves_mode() {
+        let instruction = Instruction::Suspend {
+            dst: Register::new(1),
+            src: Register::new(2),
+            resume: Pc::new(3),
+            mode: Register::new(4),
+        };
+        let mut bytes = Vec::new();
+        encode_instruction(instruction, &mut bytes);
+        assert_eq!(bytes, vec![32, 1, 2, 3, 4]);
+        let limits = DecodeLimits::default();
+        let mut decoder = Decoder {
+            bytes: &bytes,
+            offset: 0,
+            limits: &limits,
+            total_instructions: 0,
+        };
+        assert_eq!(decoder.instruction().expect("Suspend decodes"), instruction);
+        assert_eq!(decoder.offset, bytes.len());
     }
 
     #[test]
@@ -4219,6 +4275,16 @@ mod tests {
                 offset: 8,
                 kind: DecodeErrorKind::UnsupportedVersion { version: 3 },
             })
+        );
+        let mut version_four = rich_module().verify().expect("valid module").encode();
+        version_four[MAGIC.len()] = 4;
+        assert_eq!(
+            decode(&version_four, &DecodeLimits::default()),
+            Err(DecodeError {
+                offset: 8,
+                kind: DecodeErrorKind::UnsupportedVersion { version: 4 },
+            }),
+            "v4 artifacts are rejected after the Suspend wire grows"
         );
     }
 
@@ -6689,6 +6755,87 @@ mod tests {
                 kind: VerifyErrorKind::ReadBeforeWrite { .. },
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn suspend_initializes_value_and_mode_on_resume() {
+        let module = Module::new(
+            vec![Constant::Int32(0)],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                3,
+                flags(),
+                vec![
+                    Instruction::LoadConst {
+                        dst: Register::new(0),
+                        constant: ConstantId::new(0),
+                    },
+                    Instruction::Suspend {
+                        dst: Register::new(1),
+                        src: Register::new(0),
+                        resume: Pc::new(2),
+                        mode: Register::new(2),
+                    },
+                    Instruction::Return {
+                        value: Register::new(2),
+                    },
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        let verified = module.verify().expect("Suspend mode is engine-defined");
+        let certificate = verified.certificate(FunctionId::new(0)).unwrap();
+        assert_eq!(
+            certificate.initialized_before(Pc::new(2), Register::new(1)),
+            Some(true),
+            "resumed value is initialized on the resume edge"
+        );
+        assert_eq!(
+            certificate.initialized_before(Pc::new(2), Register::new(2)),
+            Some(true),
+            "resume mode is initialized on the resume edge"
+        );
+    }
+
+    #[test]
+    fn verifier_rejects_out_of_bounds_suspend_mode() {
+        let module = Module::new(
+            vec![Constant::Int32(0)],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                2,
+                flags(),
+                vec![
+                    Instruction::LoadConst {
+                        dst: Register::new(0),
+                        constant: ConstantId::new(0),
+                    },
+                    Instruction::Suspend {
+                        dst: Register::new(1),
+                        src: Register::new(0),
+                        resume: Pc::new(2),
+                        mode: Register::new(2),
+                    },
+                    Instruction::Return {
+                        value: Register::new(1),
+                    },
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        assert!(matches!(
+            module.verify(),
+            Err(VerifyError {
+                kind: VerifyErrorKind::RegisterOutOfBounds { register, .. },
+                ..
+            }) if register == Register::new(2)
         ));
     }
 }
