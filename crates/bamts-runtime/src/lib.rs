@@ -3346,9 +3346,17 @@ impl<'a, H: Host> Machine<'a, H> {
             Ok(close) => close,
             Err(failure) => return (Err(failure), false),
         };
+        if matches!(close.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+            return (Ok(Value::UNDEFINED), false);
+        }
         match self.is_callable(close) {
             Ok(true) => (self.call_value(close, target, &[]), true),
-            Ok(false) => (Ok(Value::UNDEFINED), false),
+            Ok(false) => (
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "iterator return method is not callable",
+                })),
+                false,
+            ),
             Err(failure) => (Err(failure), false),
         }
     }
@@ -14615,6 +14623,103 @@ mod tests {
             )],
         );
         assert_eq!(run_ok(&program).value, Value::boolean(true));
+    }
+
+    #[test]
+    fn close_iterator_raw_get_method_rejects_non_callable_return() {
+        let program = verified(
+            vec![Constant::Int32(99)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+
+        let non_callable = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        machine
+            .set_data_property(non_callable, "return", Value::int32(42))
+            .unwrap();
+        let iterator = machine
+            .create_protocol_iterator(non_callable, Value::UNDEFINED)
+            .unwrap();
+        let (result, called) = machine.close_iterator_raw(iterator);
+        assert!(matches!(
+            result,
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+        assert!(!called);
+
+        let absent = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        let iterator = machine
+            .create_protocol_iterator(absent, Value::UNDEFINED)
+            .unwrap();
+        let (result, called) = machine.close_iterator_raw(iterator);
+        assert_eq!(result.unwrap(), Value::UNDEFINED);
+        assert!(!called);
+
+        let null_return = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        machine
+            .set_data_property(null_return, "return", Value::NULL)
+            .unwrap();
+        let iterator = machine
+            .create_protocol_iterator(null_return, Value::UNDEFINED)
+            .unwrap();
+        let (result, called) = machine.close_iterator_raw(iterator);
+        assert_eq!(result.unwrap(), Value::UNDEFINED);
+        assert!(!called);
+
+        let callable_return = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        let returner = generator_callable(&mut machine, 1);
+        machine
+            .set_data_property(callable_return, "return", returner)
+            .unwrap();
+        let iterator = machine
+            .create_protocol_iterator(callable_return, Value::UNDEFINED)
+            .unwrap();
+        let (result, called) = machine.close_iterator_raw(iterator);
+        assert_eq!(result.unwrap(), Value::int32(99));
+        assert!(called);
     }
 
     #[test]
