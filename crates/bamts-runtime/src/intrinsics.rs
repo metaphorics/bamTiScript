@@ -1579,6 +1579,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn checker_rejected_value_names_are_absent_from_runtime() {
+        let module = module();
+        let mut host = TestHost;
+        let machine = Machine::new(&module, &mut host, Limits::default());
+        let names = [
+            "eval",
+            "decodeURI",
+            "encodeURI",
+            "escape",
+            "BigInt",
+            "Int8Array",
+            "Uint8ClampedArray",
+            "Int16Array",
+            "Uint16Array",
+            "Int32Array",
+            "Uint32Array",
+            "BigInt64Array",
+            "BigUint64Array",
+            "Float16Array",
+            "Float32Array",
+            "Float64Array",
+            "ArrayBuffer",
+            "SharedArrayBuffer",
+            "DataView",
+            "Proxy",
+            "Reflect",
+            "FinalizationRegistry",
+            "WeakRef",
+            "Intl",
+            "Iterator",
+            "AsyncIterator",
+            "URL",
+            "URLSearchParams",
+            "TextEncoder",
+            "TextDecoder",
+            "TextEncoderStream",
+            "TextDecoderStream",
+        ];
+
+        for name in names {
+            assert!(
+                machine.intrinsics.global(name).is_none(),
+                "{name} must not be checker-visible until the runtime installs it"
+            );
+        }
+        assert!(machine.intrinsics.global("global").is_some());
+    }
+
+    #[test]
+    fn function_global_remains_unimplemented() {
+        let module = module();
+        let mut host = TestHost;
+        let machine = Machine::new(&module, &mut host, Limits::default());
+
+        assert!(
+            machine.intrinsics.global("Function").is_none(),
+            "checker-only Function compatibility must not imply runtime support"
+        );
+    }
+
     fn constructor_name(machine: &mut Machine<'_, TestHost>, constructor: Value) -> EcmaString {
         let name = machine
             .get_named_property(constructor, "name")

@@ -2475,36 +2475,53 @@ mod tests {
     #[test]
     fn standard_global_families_bind_as_intrinsics() {
         let names = [
-            // ECMAScript values and constructors.
-            "JSON",
-            "Math",
-            "Object",
-            "Array",
-            "Promise",
-            "Error",
-            "TypeError",
-            "escape",
+            "undefined",
+            "NaN",
+            "Infinity",
+            "isFinite",
+            "isNaN",
+            "parseFloat",
+            "parseInt",
+            "decodeURIComponent",
+            "encodeURIComponent",
             "unescape",
-            // Collections, reflection, shared-memory, and typed-array families.
+            "Object",
+            "Function",
+            "Boolean",
+            "Symbol",
+            "Error",
+            "AggregateError",
+            "EvalError",
+            "RangeError",
+            "ReferenceError",
+            "SyntaxError",
+            "TypeError",
+            "URIError",
+            "Number",
+            "Date",
+            "String",
+            "RegExp",
+            "Array",
+            "Uint8Array",
             "Map",
             "Set",
-            "Symbol",
-            "Reflect",
+            "WeakMap",
+            "WeakSet",
             "Atomics",
-            "Int8Array",
-            "BigUint64Array",
-            // Timers and URL/text host APIs.
-            "setTimeout",
-            "clearInterval",
-            "queueMicrotask",
-            "URL",
-            "URLSearchParams",
-            "TextEncoder",
-            "TextDecoder",
-            // Node host globals that the runtime installs.
+            "JSON",
+            "Math",
+            "Promise",
+            "SuppressedError",
+            "global",
+            "globalThis",
+            "structuredClone",
             "console",
             "process",
-            "globalThis",
+            "setTimeout",
+            "clearTimeout",
+            "setInterval",
+            "clearInterval",
+            "queueMicrotask",
         ];
         let text = names.join(";");
         let mut start = 0;
@@ -2531,6 +2548,76 @@ mod tests {
             result.diagnostics()
         );
         assert_eq!(result.product().resolved_reference_count(), names.len());
+    }
+
+    #[test]
+    fn function_value_is_declared_for_source_compatibility() {
+        let result = check_text("declare const fn: unknown; Function.prototype.toString.call(fn);");
+        assert!(
+            !checker_codes(&result).contains(&CANNOT_FIND_NAME.as_str()),
+            "Function.prototype must resolve for library source: {:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn runtime_absent_value_names_report_cannot_find_name() {
+        let names = [
+            "eval",
+            "decodeURI",
+            "encodeURI",
+            "escape",
+            "BigInt",
+            "Int8Array",
+            "Uint8ClampedArray",
+            "Int16Array",
+            "Uint16Array",
+            "Int32Array",
+            "Uint32Array",
+            "BigInt64Array",
+            "BigUint64Array",
+            "Float16Array",
+            "Float32Array",
+            "Float64Array",
+            "ArrayBuffer",
+            "SharedArrayBuffer",
+            "DataView",
+            "Proxy",
+            "Reflect",
+            "FinalizationRegistry",
+            "WeakRef",
+            "Intl",
+            "Iterator",
+            "AsyncIterator",
+            "URL",
+            "URLSearchParams",
+            "TextEncoder",
+            "TextDecoder",
+            "TextEncoderStream",
+            "TextDecoderStream",
+        ];
+        let result = check_text(&names.join(";"));
+        assert_eq!(
+            checker_codes(&result),
+            vec![CANNOT_FIND_NAME.as_str(); names.len()]
+        );
+    }
+
+    #[test]
+    fn runtime_absent_constructors_remain_available_as_types() {
+        let result = check_text(
+            "type RuntimeAbsent = Function | BigInt | Int8Array | Uint8ClampedArray
+                | Int16Array | Uint16Array | Int32Array | Uint32Array
+                | BigInt64Array | BigUint64Array | Float16Array | Float32Array
+                | Float64Array | ArrayBuffer | SharedArrayBuffer | DataView
+                | Iterator | AsyncIterator | URL | URLSearchParams
+                | TextEncoder | TextDecoder;",
+        );
+        assert!(
+            !checker_codes(&result).contains(&CANNOT_FIND_TYPE.as_str()),
+            "type-only library names must remain available: {:?}",
+            result.diagnostics()
+        );
     }
 
     #[test]
