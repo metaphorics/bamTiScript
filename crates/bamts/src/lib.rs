@@ -145,6 +145,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Compiles an entrypoint and its complete local module graph into one executable program.
 ///
+/// This convenience API enables JavaScript compatibility for `.js` and `.jsx`
+/// entrypoints. The CLI remains strict by default and requires `--js-compat`.
+///
 /// ```
 /// # fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 /// let directory = std::env::temp_dir().join(format!(
