@@ -6265,6 +6265,22 @@ mod tests {
     }
 
     #[test]
+    fn fresh_object_property_keys_use_ecmascript_values() {
+        for source in [
+            r#"const value: { a: number } = { ["\x61"]: 1 };"#,
+            r#"const value: { a: number } = { "\u0061": 1 };"#,
+            "const value: { 1: number } = { [0x1]: 1 };",
+        ] {
+            let result = check_text(source);
+            assert!(
+                checker_codes(&result).is_empty(),
+                "{source}: {:?}",
+                checker_codes(&result)
+            );
+        }
+    }
+
+    #[test]
     fn fresh_object_union_keys_follow_discriminant_narrowing() {
         let nondiscriminated = check_text(
             "type Target = { a: number } | { b: number };\

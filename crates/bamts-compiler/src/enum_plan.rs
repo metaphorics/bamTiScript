@@ -1133,7 +1133,7 @@ fn to_u32(value: f64) -> u32 {
     modulo as u32
 }
 
-fn number_name(value: f64) -> String {
+pub(crate) fn number_name(value: f64) -> String {
     if value == 0.0 {
         "0".to_owned()
     } else if value.fract() == 0.0

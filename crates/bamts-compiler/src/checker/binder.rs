@@ -71,7 +71,7 @@ use super::{
 };
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::enum_plan::{self, EnumDeclarationBinding, EnumFacts};
-use crate::literal::string_value;
+use crate::literal::{number_value, string_value};
 use crate::namespace_plan::{self, NamespaceDeclarationBinding, NamespaceFacts};
 use crate::source::{ScriptKind, TextRange};
 use crate::syntax::{
@@ -10567,23 +10567,18 @@ impl<'src> Binder<'src> {
                 Some(self.identifier_text(identifier).into_owned())
             }
             PropertyName::String(string) => {
-                let text = self.text(string.data().token());
-                Some(
-                    text.trim_matches(|c| c == '"' || c == '\'' || c == '`')
-                        .to_owned(),
-                )
+                string_value(self.text(string.data().token())).map(|value| value.to_utf8_lossy())
             }
-            PropertyName::Number(number) => Some(self.text(number.data().token()).to_owned()),
+            PropertyName::Number(number) => {
+                number_value(self.text(number.data().token())).map(enum_plan::number_name)
+            }
             PropertyName::Computed(expression) => match expression.data() {
                 Expression::Literal(Literal::String(string)) => {
-                    let text = self.text(string.data().token());
-                    Some(
-                        text.trim_matches(|c| c == '"' || c == '\'' || c == '`')
-                            .to_owned(),
-                    )
+                    string_value(self.text(string.data().token()))
+                        .map(|value| value.to_utf8_lossy())
                 }
                 Expression::Literal(Literal::Number(number)) => {
-                    Some(self.text(number.data().token()).to_owned())
+                    number_value(self.text(number.data().token())).map(enum_plan::number_name)
                 }
                 _ => None,
             },
