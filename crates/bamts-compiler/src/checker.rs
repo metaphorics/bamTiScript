@@ -6360,6 +6360,333 @@ mod tests {
     }
 
     #[test]
+    fn for_of_structural_iterator_uses_next_value_type() {
+        let result = check_text(
+            "const iterable = {\
+                 [Symbol.iterator]() {\
+                     return { next() { return { value: 1, done: false as false }; } };\
+                 }\
+             };\
+             for (const value of iterable) {\
+                 const numberValue: number = value;\
+                 const stringValue: string = value;\
+             }",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn string_property_cannot_forge_structural_iterator_metadata() {
+        let result = check_text(
+            "const iterable = {\
+                 \"\\0bamts.symbol.iterator\": () => ({\
+                     next: () => ({ value: 1, done: false as false })\
+                 })\
+             };\
+             for (const value of iterable) { value; }",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            [super::FOR_OF_ITERABLE_REQUIRED.as_str()]
+        );
+    }
+
+    #[test]
+    fn shadowed_symbol_iterator_does_not_make_an_object_iterable() {
+        let result = check_text(
+            "export {};\
+             const Symbol = { iterator: \"iterator\" };\
+             const iterable = {\
+                 [Symbol.iterator]() {\
+                     return { next() { return { value: 1, done: false as false }; } };\
+                 }\
+             };\
+             for (const value of iterable) { value; }",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            [super::FOR_OF_ITERABLE_REQUIRED.as_str()]
+        );
+    }
+
+    #[test]
+    fn inherited_interface_iterator_uses_next_value_type() {
+        let result = check_text(
+            "interface NumberIterator {\
+                 [Symbol.iterator](): { next(): { value: number, done: false } };\
+             }\
+             interface Numbers extends NumberIterator {}\
+             declare const numbers: Numbers;\
+             for (const value of numbers) {\
+                 const numberValue: number = value;\
+                 const stringValue: string = value;\
+             }",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn interface_iterator_inheritance_reports_conflicts() {
+        let result = check_text(
+            "interface NumberIterator {\
+                 [Symbol.iterator](): { next(): { value: number, done: false } };\
+             }\
+             interface StringIterator {\
+                 [Symbol.iterator](): { next(): { value: string, done: false } };\
+             }\
+             interface Conflict extends NumberIterator, StringIterator {}",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn structural_iterator_element_types_relate_covariantly() {
+        let result = check_text(
+            "type IteratorOf<T> = {\
+                 [Symbol.iterator](): { next(): { value: T, done: false } };\
+             };\
+             declare const numbers: IteratorOf<number>;\
+             const same: IteratorOf<number> = numbers;\
+             const wrong: IteratorOf<string> = numbers;",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn structural_iterator_relations_compare_the_full_callable() {
+        let result = check_text(
+            "type Source = {\
+                 [Symbol.iterator](): { next(): { value: number, done: false } };\
+             };\
+             type Target = {\
+                 [Symbol.iterator](): {\
+                     next(): { value: number, done: false };\
+                     close(): void;\
+                 };\
+             };\
+             declare const source: Source;\
+             const target: Target = source;",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn optional_iterator_cannot_satisfy_a_required_iterator() {
+        let result = check_text(
+            "type Optional = {\
+                 [Symbol.iterator]?(): { next(): { value: number, done: false } };\
+             };\
+             type Required = {\
+                 [Symbol.iterator](): { next(): { value: number, done: false } };\
+             };\
+             declare const source: Optional;\
+             const target: Required = source;",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn optional_iterator_does_not_guarantee_iterability() {
+        let result = check_text(
+            "declare const source: {\
+                 [Symbol.iterator]?(): { next(): { value: number, done: false } };\
+             };\
+             for (const value of source) { value; }",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            [super::FOR_OF_ITERABLE_REQUIRED.as_str()]
+        );
+    }
+
+    #[test]
+    fn class_iterator_accessibility_is_preserved_in_structural_relations() {
+        let result = check_text(
+            "type IterableShape = {\
+                 [Symbol.iterator](): { next(): { value: number, done: false } };\
+             };\
+             class PublicValues {\
+                 public [Symbol.iterator](): { next(): { value: number, done: false } } {\
+                     throw 0;\
+                 }\
+             }\
+             class ProtectedValues {\
+                 protected [Symbol.iterator](): { next(): { value: number, done: false } } {\
+                     throw 0;\
+                 }\
+             }\
+             class PrivateValues {\
+                 private [Symbol.iterator](): { next(): { value: number, done: false } } {\
+                     throw 0;\
+                 }\
+             }\
+             const publicShape: IterableShape = new PublicValues();\
+             const protectedShape: IterableShape = new ProtectedValues();\
+             const privateShape: IterableShape = new PrivateValues();",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004", "BAMTS-C004"]);
+    }
+
+    #[test]
+    fn object_spread_preserves_an_own_iterator_property() {
+        let result = check_text(
+            "const source = {\
+                 [Symbol.iterator]() {\
+                     return { next() { return { value: 1, done: false as false }; } };\
+                 }\
+             };\
+             const spread = { ...source };\
+             for (const value of spread) {\
+                 const numberValue: number = value;\
+                 const stringValue: string = value;\
+             }",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn object_spread_does_not_copy_a_class_prototype_iterator() {
+        let result = check_text(
+            "class Values {\
+                 [Symbol.iterator](): { next(): { value: number, done: false } } { throw 0; }\
+             }\
+             const spread = { ...new Values() };\
+             for (const value of spread) { value; }",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            [super::FOR_OF_ITERABLE_REQUIRED.as_str()]
+        );
+    }
+
+    #[test]
+    fn object_spread_copies_an_own_class_field_iterator() {
+        let result = check_text(
+            "class Values {\
+                 [Symbol.iterator] = () => ({\
+                     next: () => ({ value: 1, done: false as false })\
+                 });\
+             }\
+             const spread = { ...new Values() };\
+             for (const value of spread) {\
+                 const numberValue: number = value;\
+             }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn later_object_iterator_overrides_a_spread_iterator() {
+        let result = check_text(
+            "const source = {\
+                 [Symbol.iterator]() {\
+                     return { next() { return { value: 1, done: false as false }; } };\
+                 }\
+             };\
+             const spread = {\
+                 ...source,\
+                 [Symbol.iterator]() {\
+                     return { next() { return { value: \"x\", done: false as false }; } };\
+                 }\
+             };\
+             for (const value of spread) {\
+                 const stringValue: string = value;\
+             }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn generic_class_iterator_instantiates_next_value_type() {
+        let result = check_text(
+            "class Box<T> {\
+                 [Symbol.iterator](): { next(): { value: T, done: false } } { throw 0; }\
+             }\
+             declare const numbers: Box<number>;\
+             for (const value of numbers) {\
+                 const numberValue: number = value;\
+                 const stringValue: string = value;\
+             }",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn derived_class_inherits_iterator_element_type() {
+        let result = check_text(
+            "class NumberIterator {\
+                 [Symbol.iterator](): { next(): { value: number, done: false } } { throw 0; }\
+             }\
+             class Numbers extends NumberIterator {}\
+             declare const numbers: Numbers;\
+             for (const value of numbers) {\
+                 const numberValue: number = value;\
+                 const stringValue: string = value;\
+             }",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn class_iterator_accessibility_does_not_block_protocol_iteration() {
+        // TypeScript's iteration protocol deliberately ignores class member
+        // access modifiers when it resolves the intrinsic iterator symbol.
+        for access in ["public", "protected", "private"] {
+            let source = format!(
+                "class Base {{\
+                     {access} [Symbol.iterator](): {{ next(): {{ value: number, done: false }} }} {{\
+                         throw 0;\
+                     }}\
+                 }}\
+                 class Derived extends Base {{}}\
+                 for (const value of new Derived()) {{\
+                     const numberValue: number = value;\
+                 }}"
+            );
+            let result = check_text(&source);
+            assert!(
+                checker_codes(&result).is_empty(),
+                "{access}: {:?}",
+                checker_codes(&result)
+            );
+        }
+    }
+
+    #[test]
+    fn static_class_iterator_uses_next_value_type() {
+        let result = check_text(
+            "class Numbers {\
+                 static [Symbol.iterator](): { next(): { value: number, done: false } } {\
+                     throw 0;\
+                 }\
+             }\
+             for (const value of Numbers) {\
+                 const numberValue: number = value;\
+                 const stringValue: string = value;\
+             }",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn object_getter_iterator_uses_callable_property_type() {
+        let result = check_text(
+            "const numbers = {\
+                 get [Symbol.iterator]() {\
+                     return () => ({\
+                         next: () => ({ value: 1, done: false as false })\
+                     });\
+                 }\
+             };\
+             for (const value of numbers) {\
+                 const numberValue: number = value;\
+                 const stringValue: string = value;\
+             }",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
     fn for_of_error_iterable_does_not_cascade() {
         let result = check_text("for (const value of missing) { value; }");
         assert!(!checker_codes(&result).contains(&super::FOR_OF_ITERABLE_REQUIRED.as_str()));

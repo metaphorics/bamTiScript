@@ -21,8 +21,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use super::binder::{
-    ConstructEntry, FunctionSignature, ObjectType, PropertyType, SymbolId, TupleShape, Type,
-    TypeId, TypeTable,
+    ConstructEntry, FunctionSignature, IteratorProperty, ObjectType, PropertyType, SymbolId,
+    TupleShape, Type, TypeId, TypeTable,
 };
 use crate::syntax::Accessibility;
 /// are computed without being stored; results stay deterministic because the
@@ -671,7 +671,17 @@ impl<'table> TypeRelations<'table> {
         have.access() != Accessibility::Public && have.declaring_class() == want.declaring_class()
     }
 
-    fn generator_return_relates(
+    fn iterator_property_origin_compatible(
+        have: &IteratorProperty,
+        want: &IteratorProperty,
+    ) -> bool {
+        if want.access() == Accessibility::Public {
+            return have.access() == Accessibility::Public;
+        }
+        have.access() != Accessibility::Public && have.declaring_class() == want.declaring_class()
+    }
+
+    fn optional_semantic_type_relates(
         &self,
         source: Option<TypeId>,
         target: Option<TypeId>,
@@ -685,6 +695,33 @@ impl<'table> TypeRelations<'table> {
                 || (strictness == Strictness::Comparable
                     && self.relates(target, source, strictness))
         })
+    }
+
+    fn iterator_property_relates(
+        &self,
+        source: Option<&IteratorProperty>,
+        target: Option<&IteratorProperty>,
+        strictness: Strictness,
+    ) -> bool {
+        let Some(target) = target else {
+            return true;
+        };
+        let Some(source) = source else {
+            return target.optional();
+        };
+        if source.optional() && !target.optional() {
+            return false;
+        }
+        Self::iterator_property_origin_compatible(source, target)
+            && (self.relates(source.type_id(), target.type_id(), strictness)
+                || (strictness == Strictness::Comparable
+                    && self.relates(target.type_id(), source.type_id(), strictness))
+                || (target.is_method()
+                    && self.method_overloads_relate(
+                        source.type_id(),
+                        target.type_id(),
+                        strictness,
+                    )))
     }
 
     fn object_relates(
@@ -714,9 +751,14 @@ impl<'table> TypeRelations<'table> {
             }
         });
         properties_relate
-            && self.generator_return_relates(
+            && self.optional_semantic_type_relates(
                 source.generator_return,
                 target.generator_return,
+                strictness,
+            )
+            && self.iterator_property_relates(
+                source.iterator_property.as_ref(),
+                target.iterator_property.as_ref(),
                 strictness,
             )
             && self.signature_sets_relate(
@@ -823,7 +865,7 @@ impl<'table> TypeRelations<'table> {
         let generator_return_relates = target.generator_return.is_none_or(|target_return| {
             sources.iter().any(|source| {
                 self.relation_object_view(*source).is_some_and(|object| {
-                    self.generator_return_relates(
+                    self.optional_semantic_type_relates(
                         object.generator_return,
                         Some(target_return),
                         strictness,
@@ -831,7 +873,18 @@ impl<'table> TypeRelations<'table> {
                 })
             })
         });
-        if !properties_relate || !generator_return_relates {
+        let iterator_property_relates = target.iterator_property.as_ref().is_none_or(|target| {
+            sources.iter().any(|source| {
+                self.relation_object_view(*source).is_some_and(|object| {
+                    self.iterator_property_relates(
+                        object.iterator_property.as_ref(),
+                        Some(target),
+                        strictness,
+                    )
+                })
+            })
+        });
+        if !properties_relate || !generator_return_relates || !iterator_property_relates {
             return false;
         }
 
@@ -841,6 +894,7 @@ impl<'table> TypeRelations<'table> {
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
+            iterator_property: None,
         };
         let mut has_object = false;
         for source in sources {
@@ -870,6 +924,7 @@ impl<'table> TypeRelations<'table> {
             construct_signatures: Vec::new(),
             index_signatures: target.index_signatures.clone(),
             generator_return: None,
+            iterator_property: None,
         };
         self.signature_sets_relate(
             &combined.call_signatures,

@@ -387,12 +387,16 @@ impl InferredTypeArguments {
                 let generator_return = object
                     .generator_return
                     .map(|return_type| self.instantiate(table, return_type));
+                let iterator_property = object.iterator_property.as_ref().map(|property| {
+                    property.with_type_id(self.instantiate(table, property.type_id()))
+                });
                 table.object_type_with_members(ObjectType {
                     properties,
                     call_signatures,
                     construct_signatures,
                     index_signatures,
                     generator_return,
+                    iterator_property,
                 })
             }
             Type::Function(signature) => {

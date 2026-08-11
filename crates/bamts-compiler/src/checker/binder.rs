@@ -461,6 +461,83 @@ impl std::hash::Hash for PropertyType {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct IteratorProperty {
+    type_id: TypeId,
+    optional: bool,
+    access: Accessibility,
+    declaring_class: Option<SymbolId>,
+    is_method: bool,
+    spreadable: bool,
+}
+
+impl IteratorProperty {
+    fn new(type_id: TypeId, optional: bool) -> Self {
+        Self {
+            type_id,
+            optional,
+            access: Accessibility::Public,
+            declaring_class: None,
+            is_method: false,
+            spreadable: true,
+        }
+    }
+
+    #[must_use]
+    fn with_accessibility(
+        mut self,
+        access: Accessibility,
+        declaring_class: Option<SymbolId>,
+    ) -> Self {
+        self.access = access;
+        self.declaring_class = declaring_class;
+        self
+    }
+
+    #[must_use]
+    fn with_method(mut self, is_method: bool) -> Self {
+        self.is_method = is_method;
+        self
+    }
+
+    #[must_use]
+    fn with_spreadable(mut self, spreadable: bool) -> Self {
+        self.spreadable = spreadable;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_type_id(&self, type_id: TypeId) -> Self {
+        let mut property = self.clone();
+        property.type_id = type_id;
+        property
+    }
+
+    pub(crate) const fn type_id(&self) -> TypeId {
+        self.type_id
+    }
+
+    pub(crate) const fn optional(&self) -> bool {
+        self.optional
+    }
+
+    pub(crate) const fn access(&self) -> Accessibility {
+        self.access
+    }
+
+    pub(crate) const fn declaring_class(&self) -> Option<SymbolId> {
+        self.declaring_class
+    }
+
+    pub(crate) const fn is_method(&self) -> bool {
+        self.is_method
+    }
+
+    pub(crate) const fn spreadable(&self) -> bool {
+        self.spreadable
+    }
+}
+
 /// One index signature retained by an interned object type.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct IndexSignature {
@@ -477,6 +554,7 @@ pub struct ObjectType {
     pub(crate) construct_signatures: Vec<ConstructEntry>,
     pub(crate) index_signatures: Vec<IndexSignature>,
     pub(crate) generator_return: Option<TypeId>,
+    pub(crate) iterator_property: Option<IteratorProperty>,
 }
 
 impl ObjectType {
@@ -1219,6 +1297,25 @@ impl TypeTable {
             Type::AppliedClass { .. } => self
                 .prepare_applied_class_view(ty)
                 .and_then(|view| self.generator_return_type(view)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn iterator_property_of(&mut self, ty: TypeId) -> Option<IteratorProperty> {
+        let ty = self.named_structural_view(ty);
+        let ty = match self.get(ty) {
+            Type::Named(symbol) => self
+                .classes
+                .get(symbol)
+                .and_then(|metadata| metadata.template.as_ref())
+                .map_or(ty, |template| template.raw),
+            _ => ty,
+        };
+        match self.get(ty).clone() {
+            Type::ObjectType(object) => object.iterator_property,
+            Type::AppliedClass { .. } => self
+                .prepare_applied_class_view(ty)
+                .and_then(|view| self.iterator_property_of(view)),
             _ => None,
         }
     }
@@ -1969,6 +2066,7 @@ impl TypeTable {
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
+            iterator_property: None,
         })
     }
     /// Interns an object type after canonically ordering its members by name.
@@ -2339,12 +2437,25 @@ impl TypeTable {
                     let generator_return = object.generator_return.map(|return_type| {
                         copy(target, source, return_type, imported, next_symbol)
                     });
+                    let iterator_property = object.iterator_property.map(|property| {
+                        let declaring_class = property.declaring_class().map(|symbol| {
+                            remap_symbol(target, source, symbol, imported, next_symbol)
+                        });
+                        IteratorProperty::new(
+                            copy(target, source, property.type_id(), imported, next_symbol),
+                            property.optional(),
+                        )
+                        .with_accessibility(property.access(), declaring_class)
+                        .with_method(property.is_method())
+                        .with_spreadable(property.spreadable())
+                    });
                     target.object_type_with_members(ObjectType {
                         properties,
                         call_signatures,
                         construct_signatures,
                         index_signatures,
                         generator_return,
+                        iterator_property,
                     })
                 }
                 Type::Function(signature) => {
@@ -6969,17 +7080,134 @@ impl<'src> Binder<'src> {
             );
         }
     }
+    fn merge_iterator_properties(
+        &mut self,
+        left: IteratorProperty,
+        right: IteratorProperty,
+    ) -> IteratorProperty {
+        debug_assert_eq!(left.access(), right.access());
+        debug_assert_eq!(left.declaring_class(), right.declaring_class());
+        let type_id = self
+            .types
+            .intersection_ordered(vec![left.type_id(), right.type_id()]);
+        IteratorProperty::new(type_id, left.optional() && right.optional())
+            .with_accessibility(left.access(), left.declaring_class())
+            .with_method(left.is_method() || right.is_method())
+            .with_spreadable(left.spreadable() && right.spreadable())
+    }
+
     fn class_member_properties(
         &mut self,
         class: &'src ClassDeclaration,
         scope: ScopeId,
         side: ClassSide,
-    ) -> (Vec<PropertyType>, HashSet<String>) {
+    ) -> (Vec<PropertyType>, HashSet<String>, Option<IteratorProperty>) {
         let mut properties = Vec::new();
         let mut seen = HashSet::new();
+        let mut iterator_property = None;
         let mut overload_state = HashMap::<String, bool>::new();
+        let mut iterator_overload = false;
         let declaring_class = self.scopes[scope.0 as usize].owner;
         for member in &class.members {
+            let intrinsic_iterator = match member.data() {
+                ClassMember::Property(property)
+                    if side.includes(property.modifiers.is_static)
+                        && self.is_intrinsic_symbol_iterator_name(&property.name) =>
+                {
+                    let type_id = self.class_property_type(
+                        property.type_annotation.as_ref(),
+                        property.initializer.as_deref(),
+                        &property.modifiers,
+                        scope,
+                        false,
+                    );
+                    Some(
+                        IteratorProperty::new(type_id, property.optional).with_accessibility(
+                            property
+                                .modifiers
+                                .accessibility
+                                .unwrap_or(Accessibility::Public),
+                            declaring_class,
+                        ),
+                    )
+                }
+                ClassMember::AutoAccessor(accessor)
+                    if side.includes(accessor.modifiers.is_static)
+                        && self.is_intrinsic_symbol_iterator_name(&accessor.name) =>
+                {
+                    let type_id = self.class_property_type(
+                        accessor.type_annotation.as_ref(),
+                        accessor.initializer.as_deref(),
+                        &accessor.modifiers,
+                        scope,
+                        false,
+                    );
+                    Some(
+                        IteratorProperty::new(type_id, false)
+                            .with_accessibility(
+                                accessor
+                                    .modifiers
+                                    .accessibility
+                                    .unwrap_or(Accessibility::Public),
+                                declaring_class,
+                            )
+                            .with_spreadable(false),
+                    )
+                }
+                ClassMember::Method(method)
+                    if side.includes(method.modifiers.is_static)
+                        && self.is_intrinsic_symbol_iterator_name(&method.name) =>
+                {
+                    let (type_id, is_method) = match method.modifier {
+                        PropertyModifier::None => {
+                            let is_overload_signature =
+                                method.function.body.is_none() && !method.modifiers.is_abstract;
+                            if is_overload_signature {
+                                iterator_overload = true;
+                            } else if iterator_overload {
+                                iterator_overload = false;
+                                continue;
+                            }
+                            let signature_scope = self.class_method_signature_scope(
+                                member.id(),
+                                &method.function,
+                                scope,
+                            );
+                            (
+                                self.type_of_function_like_in_scope(
+                                    &method.function,
+                                    signature_scope,
+                                ),
+                                true,
+                            )
+                        }
+                        PropertyModifier::Get => {
+                            (self.inferred_return_type(&method.function, scope), false)
+                        }
+                        PropertyModifier::Set => continue,
+                    };
+                    Some(
+                        IteratorProperty::new(type_id, method.optional)
+                            .with_accessibility(
+                                method
+                                    .modifiers
+                                    .accessibility
+                                    .unwrap_or(Accessibility::Public),
+                                declaring_class,
+                            )
+                            .with_method(is_method)
+                            .with_spreadable(false),
+                    )
+                }
+                _ => None,
+            };
+            if let Some(property) = intrinsic_iterator {
+                iterator_property = Some(match iterator_property.take() {
+                    None => property,
+                    Some(existing) => self.merge_iterator_properties(existing, property),
+                });
+                continue;
+            }
             let (name, type_id, optional, readonly, getter_only, access, is_method) = match member
                 .data()
             {
@@ -7116,7 +7344,7 @@ impl<'src> Binder<'src> {
                     .with_method(is_method),
             );
         }
-        (properties, seen)
+        (properties, seen, iterator_property)
     }
 
     fn class_property_type(
@@ -7175,7 +7403,7 @@ impl<'src> Binder<'src> {
         owner: Option<SymbolId>,
         state: ClassState,
     ) -> TypeId {
-        let (mut properties, mut seen) =
+        let (mut properties, mut seen, mut iterator_property) =
             self.class_member_properties(class, scope, ClassSide::Instance);
         for constructor in class.members.iter().filter_map(|member| {
             let ClassMember::Constructor(constructor) = member.data() else {
@@ -7234,6 +7462,9 @@ impl<'src> Binder<'src> {
             if let Some(base_view) = self.types.prepare_applied_class_view(base_instance)
                 && let Type::ObjectType(base_props) = self.types.get(base_view).clone()
             {
+                if iterator_property.is_none() {
+                    iterator_property = base_props.iterator_property;
+                }
                 for base_prop in base_props.properties {
                     if seen.insert(base_prop.name().to_string()) {
                         properties.push(base_prop);
@@ -7241,7 +7472,14 @@ impl<'src> Binder<'src> {
                 }
             }
         }
-        let raw = self.types.object_type(properties);
+        let raw = self.types.object_type_with_members(ObjectType {
+            properties,
+            call_signatures: Vec::new(),
+            construct_signatures: Vec::new(),
+            index_signatures: Vec::new(),
+            generator_return: None,
+            iterator_property,
+        });
         let Some(owner) = owner else {
             return raw;
         };
@@ -7260,7 +7498,7 @@ impl<'src> Binder<'src> {
         scope: ScopeId,
         instance_type: TypeId,
     ) -> TypeId {
-        let (mut properties, mut seen) =
+        let (mut properties, mut seen, mut iterator_property) =
             self.class_member_properties(class, scope, ClassSide::Static);
         if seen.insert("prototype".to_owned()) {
             let prototype_type = self
@@ -7306,6 +7544,11 @@ impl<'src> Binder<'src> {
                 }
             }
         }
+        if iterator_property.is_none() {
+            iterator_property = base_static
+                .as_ref()
+                .and_then(|object| object.iterator_property.clone());
+        }
         let construct_signatures = self.class_construct_signatures(
             class,
             scope,
@@ -7319,6 +7562,7 @@ impl<'src> Binder<'src> {
             construct_signatures,
             index_signatures: Vec::new(),
             generator_return: None,
+            iterator_property,
         })
     }
 
@@ -8968,6 +9212,55 @@ impl<'src> Binder<'src> {
         }
     }
 
+    fn zero_argument_return_type(&mut self, callable: TypeId) -> Option<TypeId> {
+        let mut returns = Vec::new();
+        for group in self.call_signature_groups_for_type(callable) {
+            if let Some(signature) = group.into_iter().find(|signature| signature.arity().0 == 0) {
+                returns.push(signature.return_type());
+            }
+        }
+        match returns.len() {
+            0 => None,
+            1 => Some(returns[0]),
+            _ => Some(self.types.union(&returns)),
+        }
+    }
+
+    fn iterator_object_element_type(&mut self, iterator: TypeId) -> Option<TypeId> {
+        match self.types.get(iterator).clone() {
+            Type::Any => Some(iterator),
+            Type::Array(_) | Type::Tuple(_) => self.array_element_type(iterator),
+            Type::Union(members) => {
+                let mut elements = Vec::with_capacity(members.len());
+                for member in members {
+                    elements.push(self.iterator_object_element_type(member)?);
+                }
+                Some(self.types.union(&elements))
+            }
+            Type::Named(_) | Type::AppliedClass { .. } => {
+                let view = self.types.named_structural_view(iterator);
+                let view = self.types.prepare_applied_class_view(view).unwrap_or(view);
+                (view != iterator)
+                    .then(|| self.iterator_object_element_type(view))
+                    .flatten()
+            }
+            Type::ObjectType(_) => {
+                let next = self.types.property_type(iterator, "next")?;
+                let result = self.zero_argument_return_type(next)?;
+                if matches!(self.types.get(result), Type::Any) {
+                    return Some(result);
+                }
+                self.types.property_type(result, "value")
+            }
+            _ => None,
+        }
+    }
+
+    fn structural_iterator_element_type(&mut self, method: TypeId) -> Option<TypeId> {
+        let iterator = self.zero_argument_return_type(method)?;
+        self.iterator_object_element_type(iterator)
+    }
+
     fn iteration_element_type(&mut self, iterable: TypeId) -> TypeId {
         match self.types.get(iterable).clone() {
             Type::Array(element) => element,
@@ -8977,6 +9270,16 @@ impl<'src> Binder<'src> {
                     elements.push(self.types.undefined_type());
                 }
                 self.types.union(&elements)
+            }
+            Type::ObjectType(object) => {
+                let Some(property) = object.iterator_property else {
+                    return self.types.error_type();
+                };
+                if property.optional() {
+                    return self.types.error_type();
+                }
+                self.structural_iterator_element_type(property.type_id())
+                    .unwrap_or_else(|| self.types.error_type())
             }
             Type::String | Type::StringLiteral(_) => self.types.string(),
             Type::Any | Type::Unknown => iterable,
@@ -9012,6 +9315,12 @@ impl<'src> Binder<'src> {
                 } else {
                     self.types.error_type()
                 }
+            }
+            Type::AppliedClass { .. } => {
+                let Some(view) = self.types.prepare_applied_class_view(iterable) else {
+                    return self.types.error_type();
+                };
+                self.iteration_element_type(view)
             }
             _ => self.types.error_type(),
         }
@@ -9699,6 +10008,7 @@ impl<'src> Binder<'src> {
                     }],
                     index_signatures: Vec::new(),
                     generator_return: None,
+                    iterator_property: None,
                 })
             }
             TypeNode::Parenthesized(inner) => self.resolve_type(inner, scope),
@@ -9987,6 +10297,7 @@ impl<'src> Binder<'src> {
                                 construct_signatures: Vec::new(),
                                 index_signatures: Vec::new(),
                                 generator_return: Some(return_type),
+                                iterator_property: None,
                             });
                             return self.types.intersection(vec![iterable, marker]);
                         }
@@ -10471,6 +10782,7 @@ impl<'src> Binder<'src> {
                     construct_signatures: Vec::new(),
                     index_signatures: Vec::new(),
                     generator_return: None,
+                    iterator_property: None,
                 };
                 for interface in declarations {
                     let base =
@@ -10482,6 +10794,14 @@ impl<'src> Binder<'src> {
                                 (return_type, None) => return_type,
                                 (Some(left), Some(right)) => {
                                     Some(self.types.intersection(vec![left, right]))
+                                }
+                            };
+                        merged.iterator_property =
+                            match (merged.iterator_property.take(), object.iterator_property) {
+                                (None, property) => property,
+                                (property, None) => property,
+                                (Some(left), Some(right)) => {
+                                    Some(self.merge_iterator_properties(left, right))
                                 }
                             };
                         merged.properties.extend(object.properties);
@@ -10526,6 +10846,7 @@ impl<'src> Binder<'src> {
     ) -> TypeId {
         let mut object = self.resolve_type_members(members, scope);
         let declared_properties = object.properties.len();
+        let declared_iterator = object.iterator_property.is_some();
         for base in extends {
             let base_type = self.resolve_type_reference(
                 base,
@@ -10538,6 +10859,29 @@ impl<'src> Binder<'src> {
                     None => Some(return_type),
                     Some(existing) => Some(self.types.intersection(vec![existing, return_type])),
                 };
+            }
+            if let Some(base_property) = self.types.iterator_property_of(base_type) {
+                if let Some(existing) = &object.iterator_property {
+                    let incompatible = if declared_iterator {
+                        (existing.optional() && !base_property.optional())
+                            || !self.types_assignable(existing.type_id(), base_property.type_id())
+                    } else {
+                        existing.optional() != base_property.optional()
+                            || !TypeRelations::new(&self.types)
+                                .equivalent(existing.type_id(), base_property.type_id())
+                    };
+                    if incompatible {
+                        self.emit(
+                            TYPE_NOT_ASSIGNABLE,
+                            self.entity_name_range(&base.name),
+                            NOT_ASSIGNABLE_MESSAGE,
+                        );
+                    }
+                }
+                object.iterator_property = Some(match object.iterator_property.take() {
+                    None => base_property,
+                    Some(existing) => self.merge_iterator_properties(existing, base_property),
+                });
             }
             let base_view = self.types.named_structural_view(base_type);
             if let Type::ObjectType(base_object) = self.types.get(base_view).clone() {
@@ -10605,11 +10949,26 @@ impl<'src> Binder<'src> {
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
+            iterator_property: None,
         };
         for member in members {
             match member.data() {
                 TypeMember::Property(property) => {
                     self.resolve_property_name(&property.name, scope);
+                    if self.is_intrinsic_symbol_iterator_name(&property.name) {
+                        let method = match &property.type_annotation {
+                            Some(annotation) => {
+                                self.resolve_type(&annotation.data().type_node, scope)
+                            }
+                            None => self.types.any(),
+                        };
+                        let property = IteratorProperty::new(method, property.optional);
+                        object.iterator_property = Some(match object.iterator_property.take() {
+                            None => property,
+                            Some(existing) => self.merge_iterator_properties(existing, property),
+                        });
+                        continue;
+                    }
                     if let Some(name) = self.property_key(&property.name) {
                         let type_id = match &property.type_annotation {
                             Some(annotation) => {
@@ -10625,6 +10984,23 @@ impl<'src> Binder<'src> {
                 }
                 TypeMember::Method(method) => {
                     self.resolve_property_name(&method.name, scope);
+                    if self.is_intrinsic_symbol_iterator_name(&method.name) {
+                        if self.no_implicit_any && method.function.return_type_missing {
+                            self.emit(
+                                MISSING_METHOD_RETURN_TYPE,
+                                member.range(),
+                                MISSING_METHOD_RETURN_TYPE_MESSAGE,
+                            );
+                        }
+                        let method_type = self.resolve_function_type(&method.function, scope);
+                        let property =
+                            IteratorProperty::new(method_type, method.optional).with_method(true);
+                        object.iterator_property = Some(match object.iterator_property.take() {
+                            None => property,
+                            Some(existing) => self.merge_iterator_properties(existing, property),
+                        });
+                        continue;
+                    }
                     if let Some(name) = self.property_key(&method.name) {
                         if self.no_implicit_any && method.function.return_type_missing {
                             self.emit(
@@ -10760,6 +11136,32 @@ impl<'src> Binder<'src> {
         key
     }
 
+    fn is_intrinsic_symbol_iterator(&self, expression: &Expr) -> bool {
+        let Expression::Member(member) = expression.data() else {
+            return false;
+        };
+        let Expression::Identifier(object) = member.object.data() else {
+            return false;
+        };
+        let MemberProperty::Named(property) = &member.property else {
+            return false;
+        };
+        self.identifier_text(object) == "Symbol"
+            && self.identifier_text(property) == "iterator"
+            && self
+                .resolved_expression_reference(&member.object)
+                .is_some_and(|symbol| {
+                    self.symbols[symbol.get() as usize].kind == SymbolKind::IntrinsicValue
+                })
+    }
+
+    fn is_intrinsic_symbol_iterator_name(&self, name: &PropertyName) -> bool {
+        matches!(
+            name,
+            PropertyName::Computed(expression)
+                if self.is_intrinsic_symbol_iterator(expression)
+        )
+    }
     fn property_key(&self, name: &PropertyName) -> Option<String> {
         match name {
             PropertyName::Identifier(identifier) => {
@@ -10818,6 +11220,7 @@ impl<'src> Binder<'src> {
                     construct_signatures: Vec::new(),
                     index_signatures: Vec::new(),
                     generator_return: None,
+                    iterator_property: None,
                 };
                 let mut found = false;
                 for member in members {
@@ -11239,6 +11642,7 @@ impl<'src> Binder<'src> {
     ) -> TypeId {
         let contextual_target = contextual_target.map(|target| self.types.non_nullable(target));
         let mut properties = Vec::new();
+        let mut iterator_property = None;
         let mut accessors: BTreeMap<String, (Option<TypeId>, Option<TypeId>)> = BTreeMap::new();
 
         fn upsert_property(properties: &mut Vec<PropertyType>, property: PropertyType) {
@@ -11255,6 +11659,11 @@ impl<'src> Binder<'src> {
         for member in &object.members {
             match member.data() {
                 ObjectMember::Property(property) => {
+                    if self.is_intrinsic_symbol_iterator_name(&property.name) {
+                        let method_type = self.type_of_expr(&property.value, scope);
+                        iterator_property = Some(IteratorProperty::new(method_type, false));
+                        continue;
+                    }
                     if let Some(name) = self.property_key(&property.name) {
                         let target = contextual_target
                             .and_then(|target| self.types.read_property_type(target, &name));
@@ -11274,6 +11683,20 @@ impl<'src> Binder<'src> {
                     }
                 }
                 ObjectMember::Method(method) => {
+                    if self.is_intrinsic_symbol_iterator_name(&method.name) {
+                        let (method_type, is_method) = match method.modifier {
+                            PropertyModifier::None => {
+                                (self.type_of_function_like(&method.function, scope), true)
+                            }
+                            PropertyModifier::Get => {
+                                (self.inferred_return_type(&method.function, scope), false)
+                            }
+                            PropertyModifier::Set => continue,
+                        };
+                        iterator_property =
+                            Some(IteratorProperty::new(method_type, false).with_method(is_method));
+                        continue;
+                    }
                     if let Some(name) = self.property_key(&method.name) {
                         match method.modifier {
                             PropertyModifier::Get => {
@@ -11349,6 +11772,12 @@ impl<'src> Binder<'src> {
                         .prepare_applied_class_view(spread_type)
                         .unwrap_or(spread_type);
                     if let Type::ObjectType(object) = self.types.get(spread_type).clone() {
+                        if let Some(source_iterator) = object
+                            .iterator_property
+                            .filter(IteratorProperty::spreadable)
+                        {
+                            iterator_property = Some(source_iterator);
+                        }
                         for source_property in &object.properties {
                             let fresh = PropertyType::new(
                                 source_property.name.as_ref(),
@@ -11364,7 +11793,14 @@ impl<'src> Binder<'src> {
                 ObjectMember::Missing(_) => {}
             }
         }
-        self.types.object_type(properties)
+        self.types.object_type_with_members(ObjectType {
+            properties,
+            call_signatures: Vec::new(),
+            construct_signatures: Vec::new(),
+            index_signatures: Vec::new(),
+            generator_return: None,
+            iterator_property,
+        })
     }
 
     fn type_of_conditional_expr(
