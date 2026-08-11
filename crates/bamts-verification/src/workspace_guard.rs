@@ -332,7 +332,10 @@ fn validate_member_lints(name: &str, manifest: &Value, context: &str) -> Result<
 
     // These crates own tightly-scoped unsafe boundaries, so they pin a local
     // `deny` policy instead of inheriting the workspace-wide `forbid`.
-    if matches!(name, "bamts-native" | "bamts-node" | "bamts-codegen") {
+    if matches!(
+        name,
+        "bamts-native" | "bamts-node" | "bamts-codegen" | "bamts-verification"
+    ) {
         if lints.contains_key("workspace") {
             return Err(workspace_error(format!(
                 "{context}: {name} must not inherit workspace lints"
