@@ -6311,6 +6311,41 @@ mod tests {
     }
 
     #[test]
+    fn for_of_readonly_array_binding_infers_element_type() {
+        let result = check_text(
+            "const values: readonly number[] = [1, 2, 3];\
+             for (const value of values) {\
+                 const numberValue: number = value;\
+                 const stringValue: string = value;\
+             }",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn readonly_operator_accepts_only_array_and_tuple_syntax() {
+        let result = check_text(
+            "let array: readonly number[];\
+             let tuple: readonly [number];\
+             let generic: readonly Array<number>;\
+             let parenthesized: readonly (number[]);",
+        );
+        let model = result.product();
+        for name in ["array", "tuple"] {
+            let symbol = model
+                .lookup_value(model.module_scope(), name)
+                .expect("variable is bound");
+            assert_ne!(model.symbol_type(symbol), model.types().error_type());
+        }
+        for name in ["generic", "parenthesized"] {
+            let symbol = model
+                .lookup_value(model.module_scope(), name)
+                .expect("variable is bound");
+            assert_eq!(model.symbol_type(symbol), model.types().error_type());
+        }
+    }
+
+    #[test]
     fn for_of_string_binding_infers_string_type() {
         let result = check_text(
             "declare function takesString(value: string): void;\nfor (const c of 'abc') { takesString(c); }",

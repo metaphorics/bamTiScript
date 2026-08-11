@@ -5404,6 +5404,34 @@ impl Parser {
     }
 
     fn parse_postfix_type(&mut self) -> Ty {
+        let operator_budget = MAX_DEPTH.saturating_sub(self.depth) as usize;
+        let mut operators = Vec::new();
+        let mut overflowed = false;
+        while matches!(
+            self.kind(),
+            TokenKind::KwKeyof | TokenKind::KwUnique | TokenKind::KwReadonly
+        ) {
+            let start = self.cur_start();
+            let operator = match self.kind() {
+                TokenKind::KwKeyof => TypeOperator::Keyof,
+                TokenKind::KwUnique => TypeOperator::Unique,
+                _ => TypeOperator::Readonly,
+            };
+            if operators.len() < operator_budget {
+                operators.push((start, operator));
+            } else if !overflowed {
+                self.error_here(
+                    NESTING_TOO_DEEP,
+                    "this construct is nested too deeply to parse",
+                );
+                overflowed = true;
+            }
+            self.bump();
+        }
+
+        let operator_depth = operators.len() as u32;
+        self.depth += operator_depth;
+
         let start = self.cur_start();
         let mut type_node = self.parse_primary_type();
         loop {
@@ -5425,6 +5453,16 @@ impl Parser {
             } else {
                 break;
             }
+        }
+        self.depth -= operator_depth;
+        for (start, operator) in operators.into_iter().rev() {
+            type_node = self.node(
+                start,
+                TypeNode::Operator {
+                    operator,
+                    operand: Box::new(type_node),
+                },
+            );
         }
         type_node
     }
@@ -5520,22 +5558,6 @@ impl Parser {
                         name,
                         type_arguments,
                     }),
-                )
-            }
-            TokenKind::KwKeyof | TokenKind::KwUnique | TokenKind::KwReadonly => {
-                let operator = match self.kind() {
-                    TokenKind::KwKeyof => TypeOperator::Keyof,
-                    TokenKind::KwUnique => TypeOperator::Unique,
-                    _ => TypeOperator::Readonly,
-                };
-                self.bump();
-                let operand = self.parse_primary_type();
-                self.node(
-                    start,
-                    TypeNode::Operator {
-                        operator,
-                        operand: Box::new(operand),
-                    },
                 )
             }
             TokenKind::KwInfer => {
@@ -6755,6 +6777,65 @@ mod tests {
     }
 
     #[test]
+    fn type_operators_bind_after_postfix_types() {
+        let readonly = assert_clean("type R = readonly Case[];");
+        let Statement::TypeAlias(alias) = readonly.product().statements()[0].data() else {
+            panic!("expected a type alias");
+        };
+        let TypeNode::Operator {
+            operator: TypeOperator::Readonly,
+            operand,
+        } = alias.type_node.data()
+        else {
+            panic!("expected readonly to be the top-level type operator");
+        };
+        assert!(matches!(operand.data(), TypeNode::Array(_)));
+
+        let keyof = assert_clean("type K = keyof T[];");
+        let Statement::TypeAlias(alias) = keyof.product().statements()[0].data() else {
+            panic!("expected a type alias");
+        };
+        let TypeNode::Operator {
+            operator: TypeOperator::Keyof,
+            operand,
+        } = alias.type_node.data()
+        else {
+            panic!("expected keyof to be the top-level type operator");
+        };
+        assert!(matches!(operand.data(), TypeNode::Array(_)));
+
+        let parenthesized = assert_clean("type P = (keyof T)[];");
+        let Statement::TypeAlias(alias) = parenthesized.product().statements()[0].data() else {
+            panic!("expected a type alias");
+        };
+        let TypeNode::Array(element) = alias.type_node.data() else {
+            panic!("expected parentheses to keep the array outside keyof");
+        };
+        assert!(matches!(
+            element.data(),
+            TypeNode::Parenthesized(inner)
+                if matches!(
+                    inner.data(),
+                    TypeNode::Operator {
+                        operator: TypeOperator::Keyof,
+                        ..
+                    }
+                )
+        ));
+        let unique = assert_clean("type S = unique symbol;");
+        let Statement::TypeAlias(alias) = unique.product().statements()[0].data() else {
+            panic!("expected a type alias");
+        };
+        assert!(matches!(
+            alias.type_node.data(),
+            TypeNode::Operator {
+                operator: TypeOperator::Unique,
+                operand,
+            } if matches!(operand.data(), TypeNode::Keyword(KeywordType::Symbol))
+        ));
+    }
+
+    #[test]
     fn parses_enum_and_namespace() {
         let recovered = assert_clean(
             "enum Color { Red, Green = 2, Blue }\nnamespace A.B { export const x = 1; }",
@@ -7119,6 +7200,36 @@ mod tests {
                 .diagnostics()
                 .iter()
                 .any(|d| d.code() == NESTING_TOO_DEEP)
+        );
+        assert_eq!(recovered.product().eof().kind(), TokenKind::EndOfFile);
+    }
+
+    #[test]
+    fn deeply_nested_type_operator_chain_is_iterative_and_bounded() {
+        let text = format!("type T = {}number;", "keyof ".repeat(20_000));
+        let recovered = parse_ts(&text);
+        assert!(
+            recovered
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code() == NESTING_TOO_DEEP),
+            "the type-operator depth budget must emit BAMTS-P010"
+        );
+        assert_eq!(recovered.product().eof().kind(), TokenKind::EndOfFile);
+
+        let text = format!(
+            "type U = {}{}number{};",
+            "keyof ".repeat(200),
+            "(".repeat(200),
+            ")".repeat(200)
+        );
+        let recovered = parse_ts(&text);
+        assert!(
+            recovered
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code() == NESTING_TOO_DEEP),
+            "operator and operand nesting must share one depth budget"
         );
         assert_eq!(recovered.product().eof().kind(), TokenKind::EndOfFile);
     }

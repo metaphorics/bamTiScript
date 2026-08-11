@@ -9992,8 +9992,8 @@ impl<'src> Binder<'src> {
                 self.types.intersection(resolved)
             }
             TypeNode::Array(element) => {
-                let resolved = self.resolve_type(element, scope);
-                self.types.array(resolved)
+                let element = self.resolve_type(element, scope);
+                self.types.array(element)
             }
             TypeNode::Object(object) => self.resolve_object_type(&object.members, scope),
             TypeNode::Function(function) => self.resolve_function_type(function, scope),
@@ -10063,6 +10063,11 @@ impl<'src> Binder<'src> {
                 TypeOperator::Keyof => {
                     let resolved = self.resolve_type(operand, scope);
                     self.types.keyof(resolved)
+                }
+                TypeOperator::Readonly
+                    if matches!(operand.data(), TypeNode::Array(_) | TypeNode::Tuple(_)) =>
+                {
+                    self.resolve_type(operand, scope)
                 }
                 TypeOperator::Readonly | TypeOperator::Unique => {
                     let _ = self.resolve_type(operand, scope);
