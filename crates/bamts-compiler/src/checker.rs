@@ -55,9 +55,9 @@ pub use relations::{RelationHazard, TypeRelation};
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
 use crate::enum_plan::{self, EnumDeclarationBinding};
 use crate::lint::{LintProfile, LintTable};
-use crate::source::{SourceId, TextRange};
+use crate::source::{ScriptKind, SourceId, TextRange};
 use crate::syntax::{
-    IdentifierNode, ImportBinding, ModuleExportName, NodeId, SourceFile, Statement,
+    IdentifierNode, ImportBinding, ModuleExportName, NodeId, SourceFile, Statement, TokenKind,
 };
 use crate::warning::analyze_warnings;
 use intrinsic_environment::GlobalEnvironment;
@@ -419,6 +419,7 @@ pub struct ProgramCheckOptions {
     /// Whether the compilation target is ES5 or earlier, which forbids function
     /// declarations inside blocks in strict mode.
     es5: bool,
+    check_js: bool,
 }
 
 impl ProgramCheckOptions {
@@ -430,6 +431,7 @@ impl ProgramCheckOptions {
             no_implicit_any: false,
             always_strict: false,
             es5: false,
+            check_js: false,
         }
     }
 
@@ -441,6 +443,7 @@ impl ProgramCheckOptions {
             no_implicit_any: false,
             always_strict: false,
             es5: false,
+            check_js: false,
         }
     }
 
@@ -470,6 +473,12 @@ impl ProgramCheckOptions {
             }
             None => false,
         };
+        self
+    }
+
+    #[must_use]
+    pub const fn with_check_js(mut self, value: bool) -> Self {
+        self.check_js = value;
         self
     }
 
@@ -530,6 +539,42 @@ impl ProgramSemanticModel {
     }
 }
 
+fn check_directive(comment: &str) -> Option<bool> {
+    let body = comment.strip_prefix("//")?;
+    let body = body.strip_prefix('/').unwrap_or(body).trim_start();
+    for (directive, enabled) in [("@ts-check", true), ("@ts-nocheck", false)] {
+        let Some(rest) = body.strip_prefix(directive) else {
+            continue;
+        };
+        if rest.chars().next().is_none_or(char::is_whitespace) {
+            return Some(enabled);
+        }
+    }
+    None
+}
+
+fn semantic_diagnostics_enabled(source: &SourceFile, options: ProgramCheckOptions) -> bool {
+    let mut enabled = !matches!(
+        source.script_kind(),
+        ScriptKind::JavaScript | ScriptKind::JavaScriptReact
+    ) || options.check_js;
+    for token in source.tokens() {
+        match token.kind() {
+            TokenKind::Whitespace | TokenKind::Shebang | TokenKind::BlockComment => {}
+            TokenKind::LineComment => {
+                let Some(text) = source.token_text(token) else {
+                    continue;
+                };
+                if let Some(value) = check_directive(text) {
+                    enabled = value;
+                }
+            }
+            _ => break,
+        }
+    }
+    enabled
+}
+
 /// Checks a set of loaded files after module resolution.
 #[must_use]
 pub fn check_program(
@@ -551,6 +596,14 @@ pub fn check_program_with_options(
         .iter()
         .map(|recovered| recovered.product().source_id())
         .collect();
+    let checked_sources = input
+        .files
+        .iter()
+        .filter_map(|recovered| {
+            let source = recovered.product();
+            semantic_diagnostics_enabled(source, options).then_some(source.source_id())
+        })
+        .collect::<HashSet<_>>();
     let edge_targets: HashMap<_, _> = input
         .edges
         .iter()
@@ -641,14 +694,24 @@ pub fn check_program_with_options(
             )
         };
         model.replace_facts(crate::rules::semantic::collect_facts(source, &model));
-        diagnostics.extend(core_diagnostics);
+        if checked_sources.contains(&source_id) {
+            diagnostics.extend(core_diagnostics);
+        }
         diagnostics.extend(analyze_warnings(source, levels));
         final_files.insert(source_id, model);
     }
     let mut files = final_files;
 
     crate::rules::semantic::collect_program_facts(input.files, input.edges, &mut files);
+    let original_diagnostic_count = diagnostics.len();
     collect_imported_const_enum_facts(input.files, input.edges, &mut files, &mut diagnostics);
+    let mut position = 0;
+    diagnostics.retain(|diagnostic| {
+        let keep = position < original_diagnostic_count
+            || checked_sources.contains(&diagnostic.source_id());
+        position += 1;
+        keep
+    });
     let program = ProgramSemanticModel {
         files,
         edges: input.edges.into(),

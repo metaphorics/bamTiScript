@@ -1092,8 +1092,11 @@ fn load_program_frontend(args: &CliArgs) -> Result<LoadedProgramFrontend, Driver
             .unwrap_or_else(|| Path::new("/"))
             .to_path_buf()
     };
-    let resolved =
+    let mut resolved =
         resolve_project(&absolute_entrypoint, fallback_root).map_err(map_resolution_error)?;
+    if args.js_compat.check_js {
+        resolved.program.enable_javascript_checking();
+    }
     let levels = levels(args, resolved.root.path())?;
     let output =
         compile_program_frontend_with_lints(&resolved.program, FrontendMode::Check, &levels);

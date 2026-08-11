@@ -832,6 +832,180 @@ fn check_applies_project_lint_config_to_dependencies() {
 }
 
 #[test]
+fn check_js_controls_javascript_dependency_diagnostics() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        "import { value } from './dependency.mjs';\nconst answer: number = value;\n",
+    );
+    project.write("dependency.mjs", "export const value = 1;\nmissingName;\n");
+    project.write(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"allowJs":true,"checkJs":false}}"#,
+    );
+
+    assert_success(
+        &project.check("main.ts"),
+        "bamts check with checkJs disabled",
+    );
+
+    let command_line_checked = project
+        .command()
+        .args([
+            "check",
+            "--check-js",
+            "--diagnostics-format",
+            "text",
+            "main.ts",
+        ])
+        .current_dir(&project.path)
+        .output()
+        .expect("bamts check --check-js starts");
+    assert!(!command_line_checked.status.success());
+    assert!(
+        stderr(&command_line_checked).contains("BAMTS-C002"),
+        "{}",
+        stderr(&command_line_checked)
+    );
+
+    project.write(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"allowJs":true,"checkJs":true}}"#,
+    );
+    let checked = project.check("main.ts");
+    assert!(!checked.status.success());
+    assert!(
+        stderr(&checked).contains("BAMTS-C002"),
+        "{}",
+        stderr(&checked)
+    );
+}
+
+#[test]
+fn check_js_honors_file_directives() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "bamts.toml",
+        "[lints.rules]\ndiagnostic-suppression-directive = \"warn\"\nts-check-directive = \"warn\"\n",
+    );
+    project.write("main.ts", "import './dependency.mjs';\n");
+    project.write("dependency.mjs", "// @ts-check\nmissingName;\n");
+    project.write(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"allowJs":true,"checkJs":false}}"#,
+    );
+
+    let checked = project.check("main.ts");
+    assert!(!checked.status.success());
+    assert!(
+        stderr(&checked).contains("BAMTS-C002"),
+        "{}",
+        stderr(&checked)
+    );
+    assert!(
+        stderr(&checked).contains("BAMTS-W057"),
+        "{}",
+        stderr(&checked)
+    );
+
+    project.write(
+        "dependency.mjs",
+        "// @ts-check\n// @ts-nocheck\nmissingName;\n",
+    );
+    project.write(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"allowJs":true,"checkJs":true}}"#,
+    );
+    let unchecked = project.check("main.ts");
+    assert_success(
+        &unchecked,
+        "bamts check with a file-level no-check directive",
+    );
+    assert!(
+        stderr(&unchecked).contains("BAMTS-W057"),
+        "{}",
+        stderr(&unchecked)
+    );
+    assert!(
+        !stderr(&unchecked).contains("BAMTS-C002"),
+        "{}",
+        stderr(&unchecked)
+    );
+
+    project.write(
+        "dependency.mjs",
+        "// @ts-nocheck\n// @ts-check\nmissingName;\n",
+    );
+    let reenabled = project.check("main.ts");
+    assert!(!reenabled.status.success());
+    assert!(
+        stderr(&reenabled).contains("BAMTS-C002"),
+        "{}",
+        stderr(&reenabled)
+    );
+    assert!(
+        stderr(&reenabled).contains("BAMTS-W057"),
+        "{}",
+        stderr(&reenabled)
+    );
+
+    project.write(
+        "dependency.mjs",
+        "// @ts-check\n// @ts-nocheck\nconst = 1;\n",
+    );
+    let malformed = project.check("main.ts");
+    assert!(!malformed.status.success());
+    assert!(
+        stderr(&malformed).contains("BAMTS-W057"),
+        "{}",
+        stderr(&malformed)
+    );
+    assert!(
+        !stderr(&malformed).contains("BAMTS-C002"),
+        "{}",
+        stderr(&malformed)
+    );
+
+    project.write(
+        "dependency.mjs",
+        "// documentation mentions @ts-check behavior\nmissingName;\n",
+    );
+    project.write(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"allowJs":true,"checkJs":false}}"#,
+    );
+    assert_success(
+        &project.check("main.ts"),
+        "bamts check with a directive mentioned in prose",
+    );
+
+    project.write("dependency.mjs", "// @ts-nochecking\nmissingName;\n");
+    project.write(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"allowJs":true,"checkJs":true}}"#,
+    );
+    let near_miss = project.check("main.ts");
+    assert!(!near_miss.status.success());
+    assert!(
+        stderr(&near_miss).contains("BAMTS-C002"),
+        "{}",
+        stderr(&near_miss)
+    );
+
+    project.write("main.ts", "// @ts-nocheck\nmissingName;\n");
+    let unchecked_typescript = project.check("main.ts");
+    assert_success(
+        &unchecked_typescript,
+        "bamts check with a TypeScript no-check directive",
+    );
+    assert!(
+        stderr(&unchecked_typescript).contains("BAMTS-W023"),
+        "{}",
+        stderr(&unchecked_typescript)
+    );
+}
+
+#[test]
 fn check_renders_multi_file_diagnostics_in_stable_source_order() {
     let project = ScratchDirectory::new();
     project.write("main.ts", "import './first.ts';\nimport './second.ts';\n");

@@ -155,6 +155,7 @@ pub struct ResolvedProgram {
     no_implicit_any: bool,
     always_strict: bool,
     es5: bool,
+    check_js: bool,
 }
 
 impl ResolvedProgram {
@@ -213,6 +214,17 @@ impl ResolvedProgram {
     #[must_use]
     pub const fn is_target_es5(&self) -> bool {
         self.es5
+    }
+
+    /// Whether compiler options enable `checkJs`.
+    #[must_use]
+    pub const fn is_check_js(&self) -> bool {
+        self.check_js
+    }
+
+    /// Enables semantic diagnostics for JavaScript modules.
+    pub fn enable_javascript_checking(&mut self) {
+        self.check_js = true;
     }
 
     /// Returns the eager runtime closure in the program's canonical order.
@@ -484,6 +496,7 @@ impl ProgramLoader {
                 .options
                 .target()
                 .is_some_and(|target| matches!(target, "es5" | "ES5" | "es3" | "ES3")),
+            check_js: self.options.check_js(),
         })
     }
 

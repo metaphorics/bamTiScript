@@ -347,6 +347,7 @@ pub fn compile_program_frontend_with_lints(
             .with_strict_null_checks(program.is_strict_null_checks())
             .with_no_implicit_any(program.is_no_implicit_any())
             .with_always_strict(program.is_always_strict())
+            .with_check_js(program.is_check_js())
             .with_target(if program.is_target_es5() {
                 Some("es5")
             } else {
