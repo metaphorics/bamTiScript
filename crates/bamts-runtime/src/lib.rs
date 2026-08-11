@@ -32,7 +32,7 @@ use bamts_bytecode::{
     AccessorKind, BinaryOp, BindingId, BindingKind, Constant, ConstantId, DisposeHint, EcmaString,
     EcmaStringBuilder, EdgeId, EdgeTarget, Function, FunctionId, Instruction, IteratorCloseMode,
     IteratorKind, Module, ModuleId, Pc, Program, ProgramModule, RESUME_NEXT, RESUME_RETURN,
-    RESUME_THROW, ResolvedExport, UnaryOp, Verified,
+    RESUME_THROW, ResolvedExport, UnaryOp, Verified, format_number,
 };
 use bamts_native::{Decoded, SlotId, Value};
 
@@ -11776,72 +11776,6 @@ fn parse_number_utf8(text: &str) -> f64 {
     } else {
         trimmed.parse::<f64>().unwrap_or(f64::NAN)
     }
-}
-
-fn format_number(number: f64) -> String {
-    if number.is_nan() {
-        return "NaN".to_owned();
-    }
-    if number == f64::INFINITY {
-        return "Infinity".to_owned();
-    }
-    if number == f64::NEG_INFINITY {
-        return "-Infinity".to_owned();
-    }
-    if number == 0.0 {
-        return "0".to_owned();
-    }
-
-    let negative = number.is_sign_negative();
-    let raw = number.abs().to_string();
-    let (mantissa, explicit_exponent) = match raw.split_once(['e', 'E']) {
-        Some((mantissa, exponent)) => (
-            mantissa,
-            exponent
-                .parse::<i32>()
-                .expect("Rust formats finite f64 exponents as i32"),
-        ),
-        None => (raw.as_str(), 0),
-    };
-    let decimal = mantissa.find('.').unwrap_or(mantissa.len());
-    let untrimmed: String = mantissa.chars().filter(|ch| *ch != '.').collect();
-    let first = untrimmed
-        .find(|ch| ch != '0')
-        .expect("a nonzero number has a nonzero decimal digit");
-    let digits = untrimmed[first..].trim_end_matches('0');
-    let exponent = explicit_exponent + decimal as i32 - first as i32 - 1;
-
-    let mut result = String::new();
-    if negative {
-        result.push('-');
-    }
-    if !(-6..21).contains(&exponent) {
-        result.push(digits.as_bytes()[0] as char);
-        if digits.len() > 1 {
-            result.push('.');
-            result.push_str(&digits[1..]);
-        }
-        result.push('e');
-        if exponent >= 0 {
-            result.push('+');
-        }
-        result.push_str(&exponent.to_string());
-    } else if exponent >= 0 {
-        let integer_digits = exponent as usize + 1;
-        if digits.len() <= integer_digits {
-            result.push_str(digits);
-            result.extend(std::iter::repeat_n('0', integer_digits - digits.len()));
-        } else {
-            result.push_str(&digits[..integer_digits]);
-            result.push('.');
-            result.push_str(&digits[integer_digits..]);
-        }
-    } else {
-        result.push_str("0.");
-        result.extend(std::iter::repeat_n('0', (-exponent - 1) as usize));
-        result.push_str(digits);
-    }
-    result
 }
 
 fn to_uint32(number: f64) -> u32 {

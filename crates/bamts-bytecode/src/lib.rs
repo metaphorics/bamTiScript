@@ -201,6 +201,74 @@ pub use program::{
     ProgramVerifyErrorKind, ResolvedExport, decode_program, decode_verified_program,
 };
 
+/// Formats one IEEE-754 number with ECMAScript `Number::toString` semantics.
+#[must_use]
+pub fn format_number(number: f64) -> String {
+    if number.is_nan() {
+        return "NaN".to_owned();
+    }
+    if number == f64::INFINITY {
+        return "Infinity".to_owned();
+    }
+    if number == f64::NEG_INFINITY {
+        return "-Infinity".to_owned();
+    }
+    if number == 0.0 {
+        return "0".to_owned();
+    }
+
+    let negative = number.is_sign_negative();
+    let raw = number.abs().to_string();
+    let (mantissa, explicit_exponent) = match raw.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (
+            mantissa,
+            exponent
+                .parse::<i32>()
+                .expect("Rust formats finite f64 exponents as i32"),
+        ),
+        None => (raw.as_str(), 0),
+    };
+    let decimal = mantissa.find('.').unwrap_or(mantissa.len());
+    let untrimmed: String = mantissa.chars().filter(|ch| *ch != '.').collect();
+    let first = untrimmed
+        .find(|ch| ch != '0')
+        .expect("a nonzero number has a nonzero decimal digit");
+    let digits = untrimmed[first..].trim_end_matches('0');
+    let exponent = explicit_exponent + decimal as i32 - first as i32 - 1;
+
+    let mut result = String::new();
+    if negative {
+        result.push('-');
+    }
+    if !(-6..21).contains(&exponent) {
+        result.push(digits.as_bytes()[0] as char);
+        if digits.len() > 1 {
+            result.push('.');
+            result.push_str(&digits[1..]);
+        }
+        result.push('e');
+        if exponent >= 0 {
+            result.push('+');
+        }
+        result.push_str(&exponent.to_string());
+    } else if exponent >= 0 {
+        let integer_digits = exponent as usize + 1;
+        if digits.len() <= integer_digits {
+            result.push_str(digits);
+            result.extend(std::iter::repeat_n('0', integer_digits - digits.len()));
+        } else {
+            result.push_str(&digits[..integer_digits]);
+            result.push('.');
+            result.push_str(&digits[integer_digits..]);
+        }
+    } else {
+        result.push_str("0.");
+        result.extend(std::iter::repeat_n('0', (-exponent - 1) as usize));
+        result.push_str(digits);
+    }
+    result
+}
+
 /// Canonical IEEE-754 bits. Every positive or negative NaN payload collapses
 /// to the unique arithmetic NaN from `Bamti.canonical_nan`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -3544,6 +3612,27 @@ fn encode_instruction(instruction: Instruction, output: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_number_truth_table() {
+        let cases = [
+            (0.1 + 0.2, "0.30000000000000004"),
+            (1e21, "1e+21"),
+            (-0.0, "0"),
+            (1.0 / 3.0, "0.3333333333333333"),
+            (1e-6, "0.000001"),
+            (1e-7, "1e-7"),
+            (9_007_199_254_740_991.0, "9007199254740991"),
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "Infinity"),
+            (f64::NEG_INFINITY, "-Infinity"),
+            (9_007_199_254_740_992.0, "9007199254740992"),
+            (1e20, "100000000000000000000"),
+        ];
+        for (number, expected) in cases {
+            assert_eq!(format_number(number), expected);
+        }
+    }
 
     fn flags() -> FunctionFlags {
         FunctionFlags::default()
