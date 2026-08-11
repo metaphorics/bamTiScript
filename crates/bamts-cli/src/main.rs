@@ -2,20 +2,13 @@
 
 use std::io::{self, Write};
 
-use bamts_cli::args::{
-    explain_rule, help_message, load_error_message, parse_env_args, version_message,
-};
+use bamts_cli::args::{help_message, load_error_message, parse_env_args, version_message};
 use bamts_cli::driver::{DriverError, execute};
 
 fn main() {
     let exit_code = match parse_env_args() {
         Ok(args) if args.help => write_stdout(help_message().as_bytes()),
         Ok(args) if args.version => write_stdout(format!("{}\n", version_message()).as_bytes()),
-        Ok(args) if args.is_explain() => match args.explain_rule.as_deref().map(explain_rule) {
-            Some(Ok(explanation)) => write_stdout(explanation.as_bytes()),
-            Some(Err(error)) => report_usage_error(&error),
-            None => 2,
-        },
         Ok(args) => match execute(&args) {
             Ok(outcome) => {
                 if write_stderr(&outcome.stderr) != 0 || write_stdout(&outcome.stdout) != 0 {
