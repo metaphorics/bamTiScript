@@ -197,6 +197,8 @@ pub const STRICT_NULL_MEMBER_ACCESS: DiagnosticCode = DiagnosticCode::new("BAMTS
 pub const ASSIGNMENT_TO_CONST: DiagnosticCode = DiagnosticCode::new("BAMTS-C060");
 /// Diagnostic emitted when an indexed access type uses a key that does not exist on the object type.
 pub const INVALID_INDEXED_ACCESS_KEY: DiagnosticCode = DiagnosticCode::new("BAMTS-C064");
+/// Diagnostic emitted when a `for...of` operand is not iterable.
+pub const FOR_OF_ITERABLE_REQUIRED: DiagnosticCode = DiagnosticCode::new("BAMTS-C065");
 const PROPERTY_NOT_INITIALIZED_MESSAGE: &str =
     "Property has no initializer and is not definitely assigned in the constructor.";
 const ASSIGNMENT_TO_FUNCTION_MESSAGE: &str = "Cannot assign to a function.";
@@ -269,6 +271,8 @@ const STRICT_NULL_MEMBER_ACCESS_MESSAGE: &str = "Object is possibly 'null' or 'u
 const ASSIGNMENT_TO_CONST_MESSAGE: &str = "Cannot assign to a constant.";
 const INVALID_INDEXED_ACCESS_KEY_MESSAGE: &str =
     "Type cannot be used to index the object type; the key does not match any property.";
+const FOR_OF_ITERABLE_REQUIRED_MESSAGE: &str =
+    "Type is not iterable; a 'for...of' statement requires an iterable value.";
 
 /// Compact identity for one allocated object literal and its aliases.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -5966,6 +5970,27 @@ mod tests {
             "for-of with string annotation over number array should fail: {}",
             checker_codes(&result).join(", ")
         );
+    }
+
+    #[test]
+    fn for_of_numeric_iterable_is_diagnosed_once() {
+        let result = check_text("for (const value of 123) { value; }");
+        assert_eq!(
+            checker_codes(&result),
+            [super::FOR_OF_ITERABLE_REQUIRED.as_str()]
+        );
+    }
+
+    #[test]
+    fn for_of_valid_array_iterable_produces_no_diagnostic() {
+        let result = check_text("for (const value of [1, 2, 3]) { value; }");
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn for_of_error_iterable_does_not_cascade() {
+        let result = check_text("for (const value of missing) { value; }");
+        assert!(!checker_codes(&result).contains(&super::FOR_OF_ITERABLE_REQUIRED.as_str()));
     }
     // ---- object-literal spread ------------------------------------------------
 
