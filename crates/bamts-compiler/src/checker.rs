@@ -5830,6 +5830,42 @@ mod tests {
     }
 
     #[test]
+    fn noncompleting_expressions_infer_never_but_declarations_use_void() {
+        let result = check_text(
+            "function fail() { throw 'stop'; }\
+             const declarationResult: void = fail();\
+             class Example { method() { throw 'stop'; } }\
+             const classResult: void = new Example().method();\
+             const object = { method() { throw 'stop'; } };\
+             const objectResult: never = object.method();\
+             const iterable = {\
+                 [Symbol.iterator]() {\
+                     return { next() { throw 'stop'; } };\
+                 }\
+             };\
+             async function consume(): Promise<void> {\
+                 for await (const value of iterable) { value; }\
+             }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn noncompleting_declarations_do_not_infer_never() {
+        let result = check_text(
+            "function fail() { throw 'stop'; }\
+             const declarationResult: never = fail();\
+             class Example { method() { throw 'stop'; } }\
+             const classResult: never = new Example().method();",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004", "BAMTS-C004"]);
+    }
+
+    #[test]
     fn annotated_return_mismatch_and_fallthrough_are_distinct_errors() {
         let result =
             check_text("function value(flag: boolean): number { if (flag) return 'wrong'; }");

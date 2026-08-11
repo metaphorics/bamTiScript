@@ -3162,6 +3162,8 @@ pub(crate) struct Binder<'src> {
     return_types: HashMap<NodeId, Vec<TypeId>>,
     /// Accumulated yielded element types per generator body node.
     yield_types: HashMap<NodeId, Vec<TypeId>>,
+    /// Function and class method bodies whose historical inference result is `void`.
+    declaration_function_bodies: HashSet<NodeId>,
     /// Stack of function body node ids currently being resolved, innermost last.
     function_body_stack: Vec<NodeId>,
     /// Return contract for each function body currently being resolved.
@@ -3261,6 +3263,7 @@ impl<'src> Binder<'src> {
             suppress_used_before_assigned: false,
             return_types: HashMap::new(),
             yield_types: HashMap::new(),
+            declaration_function_bodies: HashSet::new(),
             function_body_stack: Vec::new(),
             return_contexts: Vec::new(),
             this_context: Vec::new(),
@@ -6482,6 +6485,9 @@ impl<'src> Binder<'src> {
         if let Some(body_id) = function.body.as_ref().and_then(FunctionBody::id) {
             self.return_types.entry(body_id).or_default();
             self.yield_types.entry(body_id).or_default();
+            if is_declaration {
+                self.declaration_function_bodies.insert(body_id);
+            }
             self.function_body_stack.push(body_id);
         }
         let body_flow = if is_declaration {
@@ -12858,12 +12864,17 @@ impl<'src> Binder<'src> {
         &mut self,
         block: &'src crate::syntax::Block,
         returns: &[TypeId],
+        noncompleting_is_never: bool,
     ) -> TypeId {
+        let can_complete_normally = self.block_can_complete_normally(block);
         if returns.is_empty() {
-            return self.types.void();
+            return if can_complete_normally || !noncompleting_is_never {
+                self.types.void()
+            } else {
+                self.types.never()
+            };
         }
         let mut members: Vec<TypeId> = returns.to_vec();
-        let can_complete_normally = self.block_can_complete_normally(block);
         let has_value = members.iter().any(|&t| t != self.types.undefined_type());
         if can_complete_normally && has_value {
             members.push(self.types.undefined_type());
@@ -12923,7 +12934,9 @@ impl<'src> Binder<'src> {
                 let Some(returns) = self.return_types.get(&block.id()).cloned() else {
                     return self.types.any();
                 };
-                self.inferred_block_return_type(block.data(), &returns)
+                let noncompleting_is_never =
+                    !self.declaration_function_bodies.contains(&block.id());
+                self.inferred_block_return_type(block.data(), &returns, noncompleting_is_never)
             }
             Some(FunctionBody::Missing(_)) => self.types.any(),
             None => self.types.void(),
@@ -12948,7 +12961,7 @@ impl<'src> Binder<'src> {
                 let Some(returns) = self.return_types.get(&block.id()).cloned() else {
                     return self.types.any();
                 };
-                self.inferred_block_return_type(block.data(), &returns)
+                self.inferred_block_return_type(block.data(), &returns, true)
             }
             FunctionBody::Missing(_) => self.types.void(),
         }
