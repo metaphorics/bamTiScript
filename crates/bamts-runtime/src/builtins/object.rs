@@ -5,7 +5,7 @@ use bamts_native::{Decoded, Value};
 
 use super::{
     allocate_array, allocate_string, define_data, install_function, range_error,
-    to_integer_or_infinity, type_error,
+    to_integer_or_infinity, type_error, value_number,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{
@@ -941,7 +941,13 @@ fn create_list_from_array_like<H: Host>(
         ));
     }
     let length_value = machine.get_named_property(source, "length")?;
-    let length = to_integer_or_infinity(machine, length_value)?.clamp(0.0, 9_007_199_254_740_991.0);
+    let number = value_number(machine.coerce_number_observable(length_value)?);
+    let length = (if number.is_nan() || number == 0.0 {
+        0.0
+    } else {
+        number.trunc()
+    })
+    .clamp(0.0, 9_007_199_254_740_991.0);
     if length > f64::from(machine.limits.max_argument_count) {
         return Err(EvalFailure::Runtime(
             RuntimeErrorKind::ArgumentLimitExceeded {
@@ -2312,6 +2318,255 @@ mod tests {
         assert_eq!(
             machine.get_named_property(arguments, "touched").unwrap(),
             Value::UNDEFINED
+        );
+    }
+
+    #[test]
+    fn apply_converts_object_length_via_valueof_tostring_before_indices() {
+        fn value_of<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            if machine.get_named_property(this, "step")? != Value::int32(0) {
+                return Err(type_error("valueOf called out of order"));
+            }
+            machine.set_data_property(this, "step", Value::int32(1))?;
+            Ok(BuiltinOutcome::Value(this))
+        }
+
+        fn to_string<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            if machine.get_named_property(this, "step")? != Value::int32(1) {
+                return Err(type_error("toString called out of order"));
+            }
+            machine.set_data_property(this, "step", Value::int32(2))?;
+            Ok(BuiltinOutcome::Value(Value::int32(2)))
+        }
+
+        fn index_zero_getter<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            if machine.get_named_property(this, "step")? != Value::int32(2) {
+                return Err(type_error("index 0 read before length conversion"));
+            }
+            machine.set_data_property(this, "step", Value::int32(3))?;
+            Ok(BuiltinOutcome::Value(Value::int32(11)))
+        }
+
+        fn index_one_getter<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            if machine.get_named_property(this, "step")? != Value::int32(3) {
+                return Err(type_error("index 1 read out of order"));
+            }
+            machine.set_data_property(this, "step", Value::int32(4))?;
+            Ok(BuiltinOutcome::Value(Value::int32(22)))
+        }
+
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = probe(&mut machine, "probe", 2);
+        let receiver = ordinary_object(&mut machine);
+        let arguments = ordinary_object(&mut machine);
+        machine
+            .set_data_property(arguments, "step", Value::int32(0))
+            .unwrap();
+        machine
+            .set_data_property(arguments, "length", arguments)
+            .unwrap();
+
+        let value_of_id = machine
+            .intrinsics
+            .builtins
+            .register(crate::intrinsics::BuiltinDef {
+                name: "valueOf",
+                length: 0,
+                handler: value_of::<TestHost>,
+            });
+        let value_of_fn =
+            crate::intrinsics::native_function(&mut machine.heap, value_of_id, "valueOf", 0);
+        machine
+            .set_data_property(arguments, "valueOf", value_of_fn)
+            .unwrap();
+
+        let to_string_id = machine
+            .intrinsics
+            .builtins
+            .register(crate::intrinsics::BuiltinDef {
+                name: "toString",
+                length: 0,
+                handler: to_string::<TestHost>,
+            });
+        let to_string_fn =
+            crate::intrinsics::native_function(&mut machine.heap, to_string_id, "toString", 0);
+        machine
+            .set_data_property(arguments, "toString", to_string_fn)
+            .unwrap();
+
+        let index_zero_id = machine
+            .intrinsics
+            .builtins
+            .register(crate::intrinsics::BuiltinDef {
+                name: "index 0 getter",
+                length: 0,
+                handler: index_zero_getter::<TestHost>,
+            });
+        let index_zero_getter_fn = crate::intrinsics::native_function(
+            &mut machine.heap,
+            index_zero_id,
+            "index 0 getter",
+            0,
+        );
+        machine
+            .define_descriptor(
+                arguments,
+                PropertyKey::Named(EcmaString::encode("0")),
+                Property::Accessor {
+                    getter: Some(index_zero_getter_fn),
+                    setter: None,
+                    enumerable: true,
+                    configurable: true,
+                },
+            )
+            .unwrap();
+
+        let index_one_id = machine
+            .intrinsics
+            .builtins
+            .register(crate::intrinsics::BuiltinDef {
+                name: "index 1 getter",
+                length: 0,
+                handler: index_one_getter::<TestHost>,
+            });
+        let index_one_getter_fn = crate::intrinsics::native_function(
+            &mut machine.heap,
+            index_one_id,
+            "index 1 getter",
+            0,
+        );
+        machine
+            .define_descriptor(
+                arguments,
+                PropertyKey::Named(EcmaString::encode("1")),
+                Property::Accessor {
+                    getter: Some(index_one_getter_fn),
+                    setter: None,
+                    enumerable: true,
+                    configurable: true,
+                },
+            )
+            .unwrap();
+
+        let result = call_method(&mut machine, target, "apply", &[receiver, arguments]).unwrap();
+        assert_eq!(
+            machine.array_elements(result).unwrap().unwrap(),
+            vec![receiver, Value::int32(11), Value::int32(22)]
+        );
+        assert_eq!(
+            machine.get_named_property(arguments, "step").unwrap(),
+            Value::int32(4)
+        );
+    }
+
+    #[test]
+    fn apply_propagates_length_conversion_failure() {
+        fn throwing_value_of<H: Host>(
+            _machine: &mut Machine<'_, H>,
+            _this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            Err(type_error("length valueOf throws"))
+        }
+
+        fn index_zero_getter<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            machine.set_data_property(this, "touched", Value::TRUE)?;
+            Ok(BuiltinOutcome::Value(Value::int32(11)))
+        }
+
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = probe(&mut machine, "probe", 2);
+        let receiver = ordinary_object(&mut machine);
+        let arguments = ordinary_object(&mut machine);
+        machine
+            .set_data_property(arguments, "touched", Value::FALSE)
+            .unwrap();
+        machine
+            .set_data_property(arguments, "length", arguments)
+            .unwrap();
+
+        let value_of_id = machine
+            .intrinsics
+            .builtins
+            .register(crate::intrinsics::BuiltinDef {
+                name: "throwing valueOf",
+                length: 0,
+                handler: throwing_value_of::<TestHost>,
+            });
+        let value_of_fn = crate::intrinsics::native_function(
+            &mut machine.heap,
+            value_of_id,
+            "throwing valueOf",
+            0,
+        );
+        machine
+            .set_data_property(arguments, "valueOf", value_of_fn)
+            .unwrap();
+
+        let index_zero_id = machine
+            .intrinsics
+            .builtins
+            .register(crate::intrinsics::BuiltinDef {
+                name: "index 0 getter",
+                length: 0,
+                handler: index_zero_getter::<TestHost>,
+            });
+        let index_zero_getter_fn = crate::intrinsics::native_function(
+            &mut machine.heap,
+            index_zero_id,
+            "index 0 getter",
+            0,
+        );
+        machine
+            .define_descriptor(
+                arguments,
+                PropertyKey::Named(EcmaString::encode("0")),
+                Property::Accessor {
+                    getter: Some(index_zero_getter_fn),
+                    setter: None,
+                    enumerable: true,
+                    configurable: true,
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            call_method(&mut machine, target, "apply", &[receiver, arguments]),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+        assert_eq!(
+            machine.get_named_property(arguments, "touched").unwrap(),
+            Value::FALSE
         );
     }
 
