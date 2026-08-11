@@ -9383,7 +9383,55 @@ impl<'src> Binder<'src> {
                 ) {
                     return Some(result);
                 }
-                self.types.property_type(result, "value")
+                self.iterator_result_yield_type(result)
+            }
+            _ => None,
+        }
+    }
+    fn iterator_result_yield_type(&mut self, result: TypeId) -> Option<TypeId> {
+        match self.types.get(result).clone() {
+            Type::Any | Type::Never | Type::Error => Some(result),
+            Type::Union(members) => {
+                let mut yields = Vec::with_capacity(members.len());
+                for member in members {
+                    yields.push(self.iterator_result_yield_type(member)?);
+                }
+                Some(self.types.union(&yields))
+            }
+            Type::ObjectType(object) => {
+                let value = self.types.property_type(result, "value")?;
+                let returns_only = object.properties.iter().any(|property| {
+                    property.name() == "done"
+                        && !property.optional()
+                        && matches!(
+                            self.types.get(property.type_id()),
+                            Type::BooleanLiteral(true)
+                        )
+                });
+                Some(if returns_only {
+                    self.types.never()
+                } else {
+                    value
+                })
+            }
+            Type::Intersection(_) => {
+                let value = self.types.property_type(result, "value")?;
+                let returns_only = self
+                    .types
+                    .read_property_type(result, "done")
+                    .is_some_and(|done| matches!(self.types.get(done), Type::BooleanLiteral(true)));
+                Some(if returns_only {
+                    self.types.never()
+                } else {
+                    value
+                })
+            }
+            Type::Named(_) | Type::AppliedClass { .. } => {
+                let view = self.types.named_structural_view(result);
+                let view = self.types.prepare_applied_class_view(view).unwrap_or(view);
+                (view != result)
+                    .then(|| self.iterator_result_yield_type(view))
+                    .flatten()
             }
             _ => None,
         }
@@ -10491,12 +10539,26 @@ impl<'src> Binder<'src> {
                             let yield_type = explicit_arguments
                                 .as_deref()
                                 .and_then(|arguments| arguments.first().copied())
-                                .unwrap_or_else(|| self.types.any());
+                                .unwrap_or_else(|| self.types.unknown());
                             let return_type = explicit_arguments
                                 .as_deref()
                                 .and_then(|arguments| arguments.get(1).copied())
                                 .unwrap_or_else(|| self.types.any());
-                            let iterable = self.types.array(yield_type);
+                            let next_type = explicit_arguments
+                                .as_deref()
+                                .and_then(|arguments| arguments.get(2).copied())
+                                .unwrap_or_else(|| self.types.any());
+                            let protocol = if name.as_ref() == "AsyncGenerator" {
+                                ForOfMode::Async
+                            } else {
+                                ForOfMode::Sync
+                            };
+                            let iterable = self.intrinsic_iterable_iterator_type(
+                                yield_type,
+                                return_type,
+                                next_type,
+                                protocol,
+                            );
                             let marker = self.types.object_type_with_members(ObjectType {
                                 properties: Vec::new(),
                                 call_signatures: Vec::new(),
@@ -10520,12 +10582,57 @@ impl<'src> Binder<'src> {
                             self.symbols[symbol.get() as usize].kind,
                             SymbolKind::IntrinsicType
                         ) {
-                            return self.types.array(
-                                explicit_arguments
-                                    .as_deref()
-                                    .and_then(|arguments| arguments.first().copied())
-                                    .unwrap_or_else(|| self.types.any()),
-                            );
+                            let yield_type = explicit_arguments
+                                .as_deref()
+                                .and_then(|arguments| arguments.first().copied())
+                                .unwrap_or_else(|| self.types.any());
+                            let return_type = explicit_arguments
+                                .as_deref()
+                                .and_then(|arguments| arguments.get(1).copied())
+                                .unwrap_or_else(|| self.types.any());
+                            let next_type = explicit_arguments
+                                .as_deref()
+                                .and_then(|arguments| arguments.get(2).copied())
+                                .unwrap_or_else(|| self.types.any());
+                            return match name.as_ref() {
+                                "Iterable" => self.intrinsic_iterable_type(
+                                    yield_type,
+                                    return_type,
+                                    next_type,
+                                    ForOfMode::Sync,
+                                ),
+                                "Iterator" => self.intrinsic_iterator_type(
+                                    yield_type,
+                                    return_type,
+                                    next_type,
+                                    ForOfMode::Sync,
+                                ),
+                                "IterableIterator" => self.intrinsic_iterable_iterator_type(
+                                    yield_type,
+                                    return_type,
+                                    next_type,
+                                    ForOfMode::Sync,
+                                ),
+                                "AsyncIterable" => self.intrinsic_iterable_type(
+                                    yield_type,
+                                    return_type,
+                                    next_type,
+                                    ForOfMode::Async,
+                                ),
+                                "AsyncIterator" => self.intrinsic_iterator_type(
+                                    yield_type,
+                                    return_type,
+                                    next_type,
+                                    ForOfMode::Async,
+                                ),
+                                "AsyncIterableIterator" => self.intrinsic_iterable_iterator_type(
+                                    yield_type,
+                                    return_type,
+                                    next_type,
+                                    ForOfMode::Async,
+                                ),
+                                _ => unreachable!("matched intrinsic iterator name"),
+                            };
                         }
                         let base = self.resolve_named_type_symbol(symbol);
                         self.instantiate_explicit_type_arguments(
@@ -11682,6 +11789,80 @@ impl<'src> Binder<'src> {
             }
             _ => Vec::new(),
         }
+    }
+
+    fn intrinsic_iterator_type(
+        &mut self,
+        yield_type: TypeId,
+        return_type: TypeId,
+        next_type: TypeId,
+        protocol: ForOfMode,
+    ) -> TypeId {
+        let done_false = self.types.boolean_literal(false);
+        let done_true = self.types.boolean_literal(true);
+        let yield_result = self.types.object_type(vec![
+            PropertyType::new("value", false, yield_type),
+            PropertyType::new("done", true, done_false),
+        ]);
+        let return_result = self.types.object_type(vec![
+            PropertyType::new("value", false, return_type),
+            PropertyType::new("done", false, done_true),
+        ]);
+        let result = self.types.union(&[yield_result, return_result]);
+        let next_result = match protocol {
+            ForOfMode::Sync => result,
+            ForOfMode::Async => self.promise_type(result),
+        };
+        let next = self.types.function_with_parameters(
+            Vec::new(),
+            vec![FunctionParameter::new(
+                "value".to_owned(),
+                next_type,
+                true,
+                false,
+            )],
+            next_result,
+        );
+        self.types.object_type(vec![
+            PropertyType::new("next", false, next).with_method(true),
+        ])
+    }
+
+    fn intrinsic_iterable_type(
+        &mut self,
+        yield_type: TypeId,
+        return_type: TypeId,
+        next_type: TypeId,
+        protocol: ForOfMode,
+    ) -> TypeId {
+        let iterator = self.intrinsic_iterator_type(yield_type, return_type, next_type, protocol);
+        let method = self.types.function(Vec::new(), iterator);
+        let property = IteratorProperty::new(method, false).with_method(true);
+        let (iterator_property, async_iterator_property) = match protocol {
+            ForOfMode::Sync => (Some(property), None),
+            ForOfMode::Async => (None, Some(property)),
+        };
+        self.types.object_type_with_members(ObjectType {
+            properties: Vec::new(),
+            call_signatures: Vec::new(),
+            construct_signatures: Vec::new(),
+            index_signatures: Vec::new(),
+            generator_return: None,
+            iterator_property,
+            async_iterator_property,
+        })
+    }
+
+    fn intrinsic_iterable_iterator_type(
+        &mut self,
+        yield_type: TypeId,
+        return_type: TypeId,
+        next_type: TypeId,
+        protocol: ForOfMode,
+    ) -> TypeId {
+        let iterator = self.intrinsic_iterator_type(yield_type, return_type, next_type, protocol);
+        let iterable = self.intrinsic_iterable_type(yield_type, return_type, next_type, protocol);
+        self.types.intersection(vec![iterator, iterable])
     }
 
     fn promise_type(&mut self, value: TypeId) -> TypeId {

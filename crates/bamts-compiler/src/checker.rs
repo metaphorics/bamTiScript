@@ -6628,6 +6628,149 @@ mod tests {
     }
 
     #[test]
+    fn declared_async_iterables_use_only_the_async_protocol() {
+        let accepted = check_text(
+            "declare const iterable: AsyncIterable<Promise<number>>;\
+             async function consume(): Promise<void> {\
+                 for await (const value of iterable) {\
+                     const numberValue: number = value;\
+                 }\
+             }",
+        );
+        assert!(
+            checker_codes(&accepted).is_empty(),
+            "{:?}",
+            accepted.diagnostics()
+        );
+
+        let rejected = check_text(
+            "declare const iterable: AsyncIterable<number>;\
+             for (const value of iterable) { value; }",
+        );
+        assert_eq!(
+            checker_codes(&rejected),
+            [super::FOR_OF_ITERABLE_REQUIRED.as_str()]
+        );
+    }
+
+    #[test]
+    fn generic_async_iterable_metadata_survives_instantiation_and_relations() {
+        let result = check_text(
+            "interface Stream<T> extends AsyncIterable<T> {}\
+             declare const stream: Stream<Promise<string>>;\
+             const base: AsyncIterable<Promise<string>> = stream;\
+             async function consume(): Promise<void> {\
+                 for await (const value of stream) {\
+                     const text: string = value;\
+                 }\
+             }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn declared_async_iterators_are_not_implicitly_iterable() {
+        let result = check_text(
+            "declare const iterator: AsyncIterator<number>;\
+             async function consume(): Promise<void> {\
+                 for await (const value of iterator) { value; }\
+             }",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            [super::FOR_OF_ITERABLE_REQUIRED.as_str()]
+        );
+    }
+
+    #[test]
+    fn declared_sync_iterators_require_an_iterable_protocol() {
+        let result = check_text(
+            "declare const iterator: Iterator<number>;\
+             declare const iterable: IterableIterator<number>;\
+             for (const value of iterator) { value; }\
+             for (const value of iterable) { const numberValue: number = value; }",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            [super::FOR_OF_ITERABLE_REQUIRED.as_str()]
+        );
+    }
+
+    #[test]
+    fn intrinsic_iterators_preserve_return_and_next_types() {
+        let result = check_text(
+            "declare const iterator: Iterator<number, string, boolean>;\
+             const step = iterator.next(true);\
+             if (step.done === true) {\
+                 const completion: string = step.value;\
+             } else {\
+                 const yielded: number = step.value;\
+             }\
+             declare const asynchronous: AsyncIterator<number, string, boolean>;\
+             async function consume(): Promise<void> {\
+                 const asyncStep = await asynchronous.next(false);\
+                 if (asyncStep.done === true) {\
+                     const completion: string = asyncStep.value;\
+                 } else {\
+                     const yielded: number = asyncStep.value;\
+                 }\
+             }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn intrinsic_iterator_next_is_a_bivariant_method() {
+        let result = check_text(
+            "declare const source: Iterator<number, any, 'only'>;\
+             const target: Iterator<number, any, string> = source;\
+             declare const asyncSource: AsyncIterator<number, any, 'only'>;\
+             const asyncTarget: AsyncIterator<number, any, string> = asyncSource;",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn iterator_yield_result_allows_omitted_done() {
+        let result = check_text(
+            "const iterator: Iterator<number> = {\
+                 next() { return { value: 1 }; }\
+             };",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn iteration_excludes_iterator_completion_values() {
+        for source in [
+            "declare const iterable: Iterable<number, string>;\
+             for (const value of iterable) { const invalid: string = value; }",
+            "declare const iterable: AsyncIterable<number, string>;\
+             async function consume(): Promise<void> {\
+                 for await (const value of iterable) { const invalid: string = value; }\
+             }",
+        ] {
+            let result = check_text(source);
+            assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+        }
+    }
+    #[test]
     fn known_iterables_with_error_elements_are_not_reported_as_non_iterable() {
         let result = check_text(
             "declare const array: Array<MissingArrayElement>;\
