@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use bamts_bytecode::{EcmaString, EcmaStringBuilder};
+use bamts_bytecode::{EcmaString, EcmaStringBuilder, IteratorKind};
 use bamts_native::{Decoded, Value};
 
 use super::{
@@ -766,7 +766,6 @@ fn from_entries<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let iterable = args.first().copied().unwrap_or(Value::UNDEFINED);
-    let entries = machine.iterable_values(iterable)?;
     let object = machine
         .allocate(HeapEntry::Object {
             properties: PropertyMap::default(),
@@ -775,15 +774,48 @@ fn from_entries<H: Host>(
             boxed_primitive: None,
         })
         .map_err(EvalFailure::Runtime)?;
-    for entry in entries {
-        if !machine.is_object(entry) {
-            return Err(type_error("Iterator value is not an entry object"));
+    let depth = machine.native_roots.len();
+    machine.push_native_roots(depth, &[object, iterable]);
+    let result: Result<(), EvalFailure> = (|| {
+        let iterator = machine.create_iterator(iterable, IteratorKind::Sync)?;
+        machine.refresh_native_roots(depth, &[object, iterator]);
+        loop {
+            let (done, entry) = machine.iterator_next(iterator)?;
+            if done {
+                break;
+            }
+            machine.refresh_native_roots(depth, &[object, iterator, entry]);
+            let inserted = (|| {
+                if !machine.is_object(entry) {
+                    return Err(type_error("Iterator value is not an entry object"));
+                }
+                let key_value = machine.get_named_property(entry, "0")?;
+                machine.refresh_native_roots(depth, &[object, iterator, entry, key_value]);
+                let key = machine.to_property_key(key_value)?;
+                machine.refresh_native_roots(depth, &[object, iterator, entry, key_value]);
+                let value = machine.get_named_property(entry, "1")?;
+                machine.refresh_native_roots(depth, &[object, iterator, entry, key_value, value]);
+                machine.create_data_property_key(object, key, value)
+            })();
+            if let Err(failure) = inserted {
+                match &failure {
+                    EvalFailure::ThrowValue(value)
+                    | EvalFailure::ThrowValueOrigin { value, .. } => {
+                        machine.refresh_native_roots(depth, &[object, iterator, *value]);
+                    }
+                    EvalFailure::Throw(_) | EvalFailure::Runtime(_) => {
+                        machine.refresh_native_roots(depth, &[object, iterator]);
+                    }
+                }
+                return Err(super::collections::close_iterator_preserving_failure(
+                    machine, iterator, failure,
+                ));
+            }
         }
-        let key_value = machine.get_named_property(entry, "0")?;
-        let key = machine.to_property_key(key_value)?;
-        let value = machine.get_named_property(entry, "1")?;
-        machine.set_data_property_key(object, key, value)?;
-    }
+        Ok(())
+    })();
+    machine.pop_native_roots(depth);
+    result?;
     Ok(BuiltinOutcome::Value(object))
 }
 
@@ -3222,6 +3254,16 @@ mod tests {
         Ok(BuiltinOutcome::Value(result))
     }
 
+    fn custom_iterator_return<H: Host>(
+        machine: &mut Machine<'_, H>,
+        this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        machine.set_data_property(this, "_closed", Value::TRUE)?;
+        Ok(BuiltinOutcome::Value(this))
+    }
+
     fn custom_iterator_create<H: Host>(
         machine: &mut Machine<'_, H>,
         this: Value,
@@ -3238,9 +3280,13 @@ mod tests {
             .map_err(EvalFailure::Runtime)?;
         let values = machine.get_named_property(this, "_values")?;
         let next = machine.get_named_property(this, "_next")?;
+        let close = machine.get_named_property(this, "_return")?;
         machine.set_data_property(iter, "_values", values)?;
         machine.set_data_property(iter, "_index", Value::int32(0))?;
+        machine.set_data_property(iter, "_closed", Value::FALSE)?;
         machine.set_data_property(iter, "next", next)?;
+        machine.set_data_property(iter, "return", close)?;
+        machine.test_set_global("fromEntriesIterator", iter);
         Ok(BuiltinOutcome::Value(iter))
     }
 
@@ -3255,6 +3301,20 @@ mod tests {
             });
         let next_fn =
             crate::intrinsics::native_function(&mut machine.heap, next_id, "from entries next", 0);
+        let return_id = machine
+            .intrinsics
+            .builtins
+            .register(crate::intrinsics::BuiltinDef {
+                name: "from_entries return",
+                length: 0,
+                handler: custom_iterator_return::<TestHost>,
+            });
+        let return_fn = crate::intrinsics::native_function(
+            &mut machine.heap,
+            return_id,
+            "from entries return",
+            0,
+        );
         let create_id = machine
             .intrinsics
             .builtins
@@ -3277,6 +3337,9 @@ mod tests {
         machine
             .set_data_property(iterable, "_next", next_fn)
             .unwrap();
+        machine
+            .set_data_property(iterable, "_return", return_fn)
+            .unwrap();
         let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
         let iterator_key = machine.to_property_key(iterator_symbol).unwrap();
         machine
@@ -3291,6 +3354,63 @@ mod tests {
         machine.set_data_property(entry, "0", key_str).unwrap();
         machine.set_data_property(entry, "1", value).unwrap();
         entry
+    }
+
+    fn throwing_from_entries_value_getter<H: Host>(
+        _machine: &mut Machine<'_, H>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Err(type_error("entry value getter failed"))
+    }
+
+    fn collecting_from_entries_key_getter<H: Host>(
+        machine: &mut Machine<'_, H>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        machine.collect_garbage();
+        Ok(BuiltinOutcome::Value(
+            machine
+                .test_global("fromEntriesKey")
+                .expect("key remains globally rooted"),
+        ))
+    }
+
+    fn collecting_from_entries_value_getter<H: Host>(
+        machine: &mut Machine<'_, H>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        machine.test_set_global("fromEntriesKey", Value::UNDEFINED);
+        machine.collect_garbage();
+        Ok(BuiltinOutcome::Value(Value::int32(7)))
+    }
+
+    fn rejecting_inherited_setter<H: Host>(
+        _machine: &mut Machine<'_, H>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Err(type_error("inherited setter called"))
+    }
+
+    fn assert_from_entries_closed_after_one_step(machine: &mut Machine<'_, TestHost>) {
+        let iterator = machine
+            .test_global("fromEntriesIterator")
+            .expect("iterator is captured");
+        assert_eq!(
+            machine.get_named_property(iterator, "_index").unwrap(),
+            Value::int32(1)
+        );
+        assert_eq!(
+            machine.get_named_property(iterator, "_closed").unwrap(),
+            Value::TRUE
+        );
     }
 
     #[test]
@@ -3349,6 +3469,194 @@ mod tests {
             result.is_err(),
             "Object.fromEntries with primitive entry must fail"
         );
+    }
+
+    #[test]
+    fn from_entries_closes_before_advancing_past_invalid_entry() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let second = entry_pair(&mut machine, "later", Value::int32(2));
+        let source = custom_iterable(&mut machine, vec![Value::int32(42), second]);
+
+        assert!(matches!(
+            call_object(&mut machine, "fromEntries", &[source]),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+        assert_from_entries_closed_after_one_step(&mut machine);
+    }
+
+    #[test]
+    fn from_entries_closes_before_advancing_after_value_getter_failure() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let first = ordinary_object(&mut machine);
+        let key = allocate_string(&mut machine, EcmaString::encode("first")).unwrap();
+        machine.set_data_property(first, "0", key).unwrap();
+        let getter_id = machine
+            .intrinsics
+            .builtins
+            .register(crate::intrinsics::BuiltinDef {
+                name: "from_entries throwing value getter",
+                length: 0,
+                handler: throwing_from_entries_value_getter::<TestHost>,
+            });
+        let getter = crate::intrinsics::native_function(
+            &mut machine.heap,
+            getter_id,
+            "from entries throwing value getter",
+            0,
+        );
+        machine
+            .define_descriptor(
+                first,
+                PropertyKey::Named(EcmaString::encode("1")),
+                Property::Accessor {
+                    getter: Some(getter),
+                    setter: None,
+                    enumerable: true,
+                    configurable: true,
+                },
+            )
+            .unwrap();
+        let second = entry_pair(&mut machine, "later", Value::int32(2));
+        let source = custom_iterable(&mut machine, vec![first, second]);
+
+        assert!(matches!(
+            call_object(&mut machine, "fromEntries", &[source]),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+        assert_from_entries_closed_after_one_step(&mut machine);
+    }
+
+    #[test]
+    fn from_entries_roots_result_across_entry_getters() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let entry = ordinary_object(&mut machine);
+        let key = symbol(&mut machine, "rooted");
+        machine.test_set_global("fromEntriesKey", key);
+        let key_getter_id = machine
+            .intrinsics
+            .builtins
+            .register(crate::intrinsics::BuiltinDef {
+                name: "from_entries collecting key getter",
+                length: 0,
+                handler: collecting_from_entries_key_getter::<TestHost>,
+            });
+        let key_getter = crate::intrinsics::native_function(
+            &mut machine.heap,
+            key_getter_id,
+            "from entries collecting key getter",
+            0,
+        );
+        machine
+            .define_descriptor(
+                entry,
+                PropertyKey::Named(EcmaString::encode("0")),
+                Property::Accessor {
+                    getter: Some(key_getter),
+                    setter: None,
+                    enumerable: true,
+                    configurable: true,
+                },
+            )
+            .unwrap();
+        let getter_id = machine
+            .intrinsics
+            .builtins
+            .register(crate::intrinsics::BuiltinDef {
+                name: "from_entries collecting value getter",
+                length: 0,
+                handler: collecting_from_entries_value_getter::<TestHost>,
+            });
+        let getter = crate::intrinsics::native_function(
+            &mut machine.heap,
+            getter_id,
+            "from entries collecting value getter",
+            0,
+        );
+        machine
+            .define_descriptor(
+                entry,
+                PropertyKey::Named(EcmaString::encode("1")),
+                Property::Accessor {
+                    getter: Some(getter),
+                    setter: None,
+                    enumerable: true,
+                    configurable: true,
+                },
+            )
+            .unwrap();
+        let source = custom_iterable(&mut machine, vec![entry]);
+
+        let result = call_object(&mut machine, "fromEntries", &[source]).unwrap();
+        assert_eq!(
+            machine
+                .get_property_key(result, &symbol_key(&machine, key))
+                .unwrap(),
+            Value::int32(7)
+        );
+        let description = machine.get_named_property(key, "description").unwrap();
+        assert!(
+            machine
+                .string_value(description)
+                .is_some_and(|text| text.eq_ascii("rooted"))
+        );
+    }
+
+    #[test]
+    fn from_entries_ignores_inherited_setters() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let setter_id = machine
+            .intrinsics
+            .builtins
+            .register(crate::intrinsics::BuiltinDef {
+                name: "from_entries inherited setter",
+                length: 1,
+                handler: rejecting_inherited_setter::<TestHost>,
+            });
+        let setter = crate::intrinsics::native_function(
+            &mut machine.heap,
+            setter_id,
+            "from entries inherited setter",
+            1,
+        );
+        machine
+            .define_descriptor(
+                machine.intrinsics.object_prototype,
+                PropertyKey::Named(EcmaString::encode("own")),
+                Property::Accessor {
+                    getter: None,
+                    setter: Some(setter),
+                    enumerable: false,
+                    configurable: true,
+                },
+            )
+            .unwrap();
+        let entry = entry_pair(&mut machine, "own", Value::int32(9));
+        let source = custom_iterable(&mut machine, vec![entry]);
+
+        let result = call_object(&mut machine, "fromEntries", &[source]).unwrap();
+        assert!(matches!(
+            machine
+                .own_descriptor(result, &PropertyKey::Named(EcmaString::encode("own")))
+                .unwrap(),
+            Some(Property::Data {
+                value,
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            }) if value == Value::int32(9)
+        ));
     }
 
     #[test]

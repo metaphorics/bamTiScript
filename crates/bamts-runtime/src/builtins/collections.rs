@@ -473,7 +473,7 @@ fn map_like_constructor<H: Host>(
     Ok(BuiltinOutcome::Value(object))
 }
 
-fn close_iterator_preserving_failure<H: Host>(
+pub(super) fn close_iterator_preserving_failure<H: Host>(
     machine: &mut Machine<'_, H>,
     iterator: Value,
     failure: EvalFailure,
