@@ -446,29 +446,40 @@ fn map_like_constructor<H: Host>(
         .copied()
         .filter(|value| !matches!(value.decode(), Some(Decoded::Null | Decoded::Undefined)))
     {
-        let iterator = machine.create_iterator(source, IteratorKind::Sync)?;
-        loop {
-            let (done, entry) = machine.iterator_next(iterator)?;
-            if done {
-                break;
-            }
-            let inserted = (|| {
-                if !machine.is_object(entry) {
-                    return Err(type_error("Iterator value is not an entry object"));
+        let depth = machine.native_roots.len();
+        machine.push_native_roots(depth, &[object, source]);
+        let result: Result<(), EvalFailure> = (|| {
+            let iterator = machine.create_iterator(source, IteratorKind::Sync)?;
+            loop {
+                machine.refresh_native_roots(depth, &[object, iterator]);
+                let (done, entry) = machine.iterator_next(iterator)?;
+                if done {
+                    break;
                 }
-                let key = machine.get_named_property(entry, "0")?;
-                let value = machine.get_named_property(entry, "1")?;
-                if kind == CollectionKind::WeakMap {
-                    require_weak_key(machine, key)?;
+                machine.refresh_native_roots(depth, &[object, iterator, entry]);
+                let inserted = (|| {
+                    if !machine.is_object(entry) {
+                        return Err(type_error("Iterator value is not an entry object"));
+                    }
+                    let key = machine.get_named_property(entry, "0")?;
+                    machine.refresh_native_roots(depth, &[object, iterator, entry, key]);
+                    let value = machine.get_named_property(entry, "1")?;
+                    machine.refresh_native_roots(depth, &[object, iterator, entry, key, value]);
+                    if kind == CollectionKind::WeakMap {
+                        require_weak_key(machine, key)?;
+                    }
+                    map_put(machine, object, key, value, kind)
+                })();
+                if let Err(failure) = inserted {
+                    return Err(close_rooted_collection_iterator(
+                        machine, depth, object, iterator, failure,
+                    ));
                 }
-                map_put(machine, object, key, value, kind)
-            })();
-            if let Err(failure) = inserted {
-                return Err(close_iterator_preserving_failure(
-                    machine, iterator, failure,
-                ));
             }
-        }
+            Ok(())
+        })();
+        machine.pop_native_roots(depth);
+        result?;
     }
     Ok(BuiltinOutcome::Value(object))
 }
@@ -483,6 +494,24 @@ pub(super) fn close_iterator_preserving_failure<H: Host>(
         Err(EvalFailure::Runtime(kind)) => EvalFailure::Runtime(kind),
         _ => failure,
     }
+}
+
+fn close_rooted_collection_iterator<H: Host>(
+    machine: &mut Machine<'_, H>,
+    depth: usize,
+    object: Value,
+    iterator: Value,
+    failure: EvalFailure,
+) -> EvalFailure {
+    match &failure {
+        EvalFailure::ThrowValue(value) | EvalFailure::ThrowValueOrigin { value, .. } => {
+            machine.refresh_native_roots(depth, &[object, iterator, *value]);
+        }
+        EvalFailure::Throw(_) | EvalFailure::Runtime(_) => {
+            machine.refresh_native_roots(depth, &[object, iterator]);
+        }
+    }
+    close_iterator_preserving_failure(machine, iterator, failure)
 }
 
 fn set_like_constructor<H: Host>(
@@ -500,24 +529,33 @@ fn set_like_constructor<H: Host>(
         .copied()
         .filter(|value| !matches!(value.decode(), Some(Decoded::Null | Decoded::Undefined)))
     {
-        let iterator = machine.create_iterator(source, IteratorKind::Sync)?;
-        loop {
-            let (done, value) = machine.iterator_next(iterator)?;
-            if done {
-                break;
-            }
-            let inserted = (|| {
-                if kind == CollectionKind::WeakSet {
-                    require_weak_key(machine, value)?;
+        let depth = machine.native_roots.len();
+        machine.push_native_roots(depth, &[object, source]);
+        let result: Result<(), EvalFailure> = (|| {
+            let iterator = machine.create_iterator(source, IteratorKind::Sync)?;
+            loop {
+                machine.refresh_native_roots(depth, &[object, iterator]);
+                let (done, value) = machine.iterator_next(iterator)?;
+                if done {
+                    break;
                 }
-                set_put(machine, object, value, kind)
-            })();
-            if let Err(failure) = inserted {
-                return Err(close_iterator_preserving_failure(
-                    machine, iterator, failure,
-                ));
+                machine.refresh_native_roots(depth, &[object, iterator, value]);
+                let inserted = (|| {
+                    if kind == CollectionKind::WeakSet {
+                        require_weak_key(machine, value)?;
+                    }
+                    set_put(machine, object, value, kind)
+                })();
+                if let Err(failure) = inserted {
+                    return Err(close_rooted_collection_iterator(
+                        machine, depth, object, iterator, failure,
+                    ));
+                }
             }
-        }
+            Ok(())
+        })();
+        machine.pop_native_roots(depth);
+        result?;
     }
     Ok(BuiltinOutcome::Value(object))
 }
@@ -2837,6 +2875,7 @@ mod tests {
         _args: &[Value],
         _constructing: bool,
     ) -> Result<BuiltinOutcome, EvalFailure> {
+        machine.collect_garbage();
         let count = match machine.test_global("nextCount") {
             Some(v) => match v.decode() {
                 Some(Decoded::Int32(n)) => n,
@@ -2935,6 +2974,26 @@ mod tests {
             vec![10, 20, 30, 40, 50],
             "Map constructor must process entries lazily in order: next0, get0, get1, put, next1"
         );
+    }
+
+    #[test]
+    fn set_constructor_roots_result_across_iterator_callbacks() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let log = allocate_array(&mut machine, Vec::new()).unwrap();
+        machine.test_set_global("log", log);
+        machine.test_set_global("nextCount", Value::int32(0));
+        let entry = ordinary_object(&mut machine);
+        machine.test_set_global("testEntry", entry);
+
+        let next = native_callback(&mut machine, "next", order_next_callback);
+        let ret = native_callback(&mut machine, "return", order_return_callback);
+        let source = make_custom_iterator_source(&mut machine, next, ret);
+
+        let set = construct_builtin(&mut machine, "Set", &[source]);
+        assert_eq!(collection_entries(&machine, set), vec![(entry, entry)]);
     }
 
     fn failing_entry_next_callback(
