@@ -157,17 +157,23 @@ fn array_like_values<H: Host>(
         .map_err(EvalFailure::Runtime)?;
     let mut values = Vec::with_capacity(length);
     for index in 0..length {
-        values.push(machine.get_named_property(source, &index.to_string())?);
+        let value = machine.get_named_property(source, &index.to_string())?;
+        values.push(Value::int32(u32::from(to_uint8(machine, value)?)));
     }
     Ok(values)
 }
 fn array_like_length<H: Host>(
-    machine: &Machine<'_, H>,
+    machine: &mut Machine<'_, H>,
     value: Value,
 ) -> Result<usize, EvalFailure> {
     const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
-    let integer = to_integer_or_infinity(machine, value)?;
-    let length = if integer.is_nan() || integer <= 0.0 {
+    let number = super::value_number(machine.coerce_number_observable(value)?);
+    let integer = if number.is_nan() || number == 0.0 {
+        0.0
+    } else {
+        number.trunc()
+    };
+    let length = if integer <= 0.0 {
         0.0
     } else if integer.is_infinite() {
         MAX_SAFE_INTEGER
@@ -282,6 +288,9 @@ mod tests {
     static NEXT_CALLS: AtomicUsize = AtomicUsize::new(0);
     static ITERATION_COMPLETE: AtomicBool = AtomicBool::new(false);
 
+    static LENGTH_VALUE_OF_CALLED: AtomicBool = AtomicBool::new(false);
+    static INDEX_ONE_READS: AtomicUsize = AtomicUsize::new(0);
+
     fn native(
         machine: &mut Machine<'_, TestHost>,
         name: &'static str,
@@ -351,6 +360,49 @@ mod tests {
             "Uint8Array must finish iterable collection before coercing elements"
         );
         Ok(BuiltinOutcome::Value(Value::int32(257)))
+    }
+
+    fn array_like_length_value_of(
+        _: &mut Machine<'_, TestHost>,
+        _: Value,
+        _: &[Value],
+        _: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        LENGTH_VALUE_OF_CALLED.store(true, Ordering::SeqCst);
+        Ok(BuiltinOutcome::Value(Value::int32(2)))
+    }
+
+    fn index_one_getter(
+        _: &mut Machine<'_, TestHost>,
+        _: Value,
+        _: &[Value],
+        _: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        INDEX_ONE_READS.fetch_add(1, Ordering::SeqCst);
+        Ok(BuiltinOutcome::Value(Value::int32(42)))
+    }
+
+    fn abrupt_value_of(
+        _: &mut Machine<'_, TestHost>,
+        _: Value,
+        _: &[Value],
+        _: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+            operation: "abrupt ToUint8 valueOf",
+        }))
+    }
+
+    fn zero_getter_returns_abrupt(
+        machine: &mut Machine<'_, TestHost>,
+        _: Value,
+        _: &[Value],
+        _: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let abrupt = ordinary_object(machine);
+        let value_of = native(machine, "abrupt valueOf", abrupt_value_of);
+        machine.set_data_property(abrupt, "valueOf", value_of)?;
+        Ok(BuiltinOutcome::Value(abrupt))
     }
 
     fn separator_mutates_first_byte(
@@ -778,6 +830,77 @@ mod tests {
                     );
                 }
             }
+        });
+    }
+
+    #[test]
+    fn uint8array_array_like_length_observes_valueof() {
+        LENGTH_VALUE_OF_CALLED.store(false, Ordering::SeqCst);
+        with_machine(|machine| {
+            let length_box = ordinary_object(machine);
+            let value_of = native(machine, "length valueOf", array_like_length_value_of);
+            machine
+                .set_data_property(length_box, "valueOf", value_of)
+                .unwrap();
+
+            let source = ordinary_object(machine);
+            machine
+                .set_data_property(source, "0", Value::int32(257))
+                .unwrap();
+            machine
+                .set_data_property(source, "1", Value::int32(2))
+                .unwrap();
+            machine
+                .set_data_property(source, "length", length_box)
+                .unwrap();
+
+            let typed = construct(machine, source);
+            assert!(
+                LENGTH_VALUE_OF_CALLED.load(Ordering::SeqCst),
+                "length valueOf must be observed"
+            );
+            assert_eq!(int(machine, typed, "length"), 2);
+            assert_eq!(int(machine, typed, "0"), 1);
+            assert_eq!(int(machine, typed, "1"), 2);
+        });
+    }
+
+    #[test]
+    fn uint8array_array_like_values_interleave_get_and_touint8() {
+        INDEX_ONE_READS.store(0, Ordering::SeqCst);
+        with_machine(|machine| {
+            let source = ordinary_object(machine);
+            let getter0 = native(machine, "zero getter", zero_getter_returns_abrupt);
+            let getter1 = native(machine, "one getter", index_one_getter);
+            machine
+                .define_accessor(
+                    source,
+                    PropertyKey::Named(EcmaString::encode("0")),
+                    getter0,
+                    bamts_bytecode::AccessorKind::Getter,
+                )
+                .unwrap();
+            machine
+                .define_accessor(
+                    source,
+                    PropertyKey::Named(EcmaString::encode("1")),
+                    getter1,
+                    bamts_bytecode::AccessorKind::Getter,
+                )
+                .unwrap();
+            machine
+                .set_data_property(source, "length", Value::int32(2))
+                .unwrap();
+
+            assert!(matches!(
+                try_construct(machine, source),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+            assert_eq!(
+                INDEX_ONE_READS.load(Ordering::SeqCst),
+                0,
+                "index 1 getter must not be read after abrupt ToUint8"
+            );
         });
     }
 
