@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
 
 use bamts_bytecode::EcmaString;
-use bamts_native::Value;
+use bamts_native::{Decoded, Value};
 
 use super::{define_data, define_to_string_tag, install_function};
 use crate::intrinsics::BuiltinOutcome;
 use crate::intrinsics::BuiltinTable;
-use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyKey, PropertyMap, ThrowOrigin};
+use crate::{
+    EvalFailure, HeapEntry, Host, IteratorKind, Machine, PropertyKey, PropertyMap, ThrowOrigin,
+};
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -101,9 +103,15 @@ pub(super) fn install<H: Host>(
     let resolve = install_function(heap, builtins, "resolve", 1, resolve::<H>);
     let reject = install_function(heap, builtins, "reject", 1, reject::<H>);
     let all = install_function(heap, builtins, "all", 1, all::<H>);
+    let race = install_function(heap, builtins, "race", 1, race::<H>);
+    let all_settled = install_function(heap, builtins, "allSettled", 1, all_settled::<H>);
+    let any = install_function(heap, builtins, "any", 1, any::<H>);
     define_static(heap, constructor, "resolve", resolve);
     define_static(heap, constructor, "reject", reject);
     define_static(heap, constructor, "all", all);
+    define_static(heap, constructor, "race", race);
+    define_static(heap, constructor, "allSettled", all_settled);
+    define_static(heap, constructor, "any", any);
     builtins.set_promise_capability_executor(capability_executor);
     builtins.set_promise_finally_value(finally_value);
     builtins.set_promise_finally_throw(finally_throw);
@@ -484,6 +492,404 @@ fn all<H: Host>(
     Ok(BuiltinOutcome::Value(capability.promise))
 }
 
+fn race<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if constructing {
+        return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+            operation: "Promise.race",
+        }));
+    }
+    let capability = new_promise_capability(machine, this)?;
+    let resolve = match constructor_resolve(machine, this, "Promise.race resolve") {
+        Ok(resolve) => resolve,
+        Err(failure) => return reject_capability_failure(machine, &capability, failure),
+    };
+    let iterable = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let iterator = match machine.create_iterator(iterable, IteratorKind::Sync) {
+        Ok(iterator) => iterator,
+        Err(failure) => return reject_capability_failure(machine, &capability, failure),
+    };
+    loop {
+        let value = match machine.iterator_next(iterator) {
+            Ok((true, _)) => break,
+            Ok((false, value)) => value,
+            Err(failure) => {
+                return reject_iterator_failure(machine, &capability, iterator, failure);
+            }
+        };
+        let resolved = match machine.call_value(resolve, this, &[value]) {
+            Ok(resolved) => resolved,
+            Err(failure) => {
+                return reject_iterator_failure(machine, &capability, iterator, failure);
+            }
+        };
+        let then = match machine.get_named_property(resolved, "then") {
+            Ok(then) => then,
+            Err(failure) => {
+                return reject_iterator_failure(machine, &capability, iterator, failure);
+            }
+        };
+        if let Err(failure) =
+            machine.call_value(then, resolved, &[capability.resolve, capability.reject])
+        {
+            return reject_iterator_failure(machine, &capability, iterator, failure);
+        }
+    }
+    Ok(BuiltinOutcome::Value(capability.promise))
+}
+
+fn all_settled<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    aggregate_static(machine, this, args, constructing, AggregateKind::AllSettled)
+}
+
+fn any<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    aggregate_static(machine, this, args, constructing, AggregateKind::Any)
+}
+
+#[derive(Clone, Copy)]
+enum AggregateKind {
+    AllSettled,
+    Any,
+}
+
+fn aggregate_static<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    constructing: bool,
+    kind: AggregateKind,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let operation = match kind {
+        AggregateKind::AllSettled => "Promise.allSettled",
+        AggregateKind::Any => "Promise.any",
+    };
+    if constructing {
+        return Err(EvalFailure::Throw(ThrowOrigin::TypeError { operation }));
+    }
+    let capability = new_promise_capability(machine, this)?;
+    let resolve = match constructor_resolve(machine, this, operation) {
+        Ok(resolve) => resolve,
+        Err(failure) => return reject_capability_failure(machine, &capability, failure),
+    };
+    let iterable = args.first().copied().unwrap_or(Value::UNDEFINED);
+    perform_ordered_aggregate(machine, iterable, resolve, this, &capability, kind)?;
+    Ok(BuiltinOutcome::Value(capability.promise))
+}
+
+fn constructor_resolve<H: Host>(
+    machine: &mut Machine<'_, H>,
+    constructor: Value,
+    operation: &'static str,
+) -> Result<Value, EvalFailure> {
+    let resolve = machine.get_named_property(constructor, "resolve")?;
+    if machine.is_callable(resolve)? {
+        Ok(resolve)
+    } else {
+        Err(EvalFailure::Throw(ThrowOrigin::TypeError { operation }))
+    }
+}
+
+fn perform_ordered_aggregate<H: Host>(
+    machine: &mut Machine<'_, H>,
+    iterable: Value,
+    resolve_method: Value,
+    receiver: Value,
+    capability: &PromiseCapability,
+    kind: AggregateKind,
+) -> Result<(), EvalFailure> {
+    let aggregate_resolve = match kind {
+        AggregateKind::AllSettled => {
+            let record = completion_record(
+                machine,
+                ReactionKind::AllSettledComplete,
+                capability.resolve,
+                capability.reject,
+            )?;
+            machine.create_promise_resolver_function(
+                machine.intrinsics.builtins.promise_all_target(),
+                record,
+            )?
+        }
+        AggregateKind::Any => {
+            let constructor =
+                machine
+                    .intrinsics
+                    .global("AggregateError")
+                    .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "Promise.any AggregateError",
+                    }))?;
+            let record = reaction_record(
+                machine,
+                ReactionKind::AnyComplete,
+                Value::UNDEFINED,
+                Some(capability.reject),
+            )?;
+            machine.create_data_property_key(
+                record,
+                PropertyKey::Named(EcmaString::encode("constructor")),
+                constructor,
+            )?;
+            machine.create_promise_resolver_function(
+                machine.intrinsics.builtins.promise_all_target(),
+                record,
+            )?
+        }
+    };
+    let aggregate = machine
+        .allocate(HeapEntry::PromiseAll {
+            resolve: aggregate_resolve,
+            reject: capability.reject,
+            values: Vec::new(),
+            remaining: 1,
+            settled: false,
+        })
+        .map_err(EvalFailure::Runtime)?;
+    let iterator = match machine.create_iterator(iterable, IteratorKind::Sync) {
+        Ok(iterator) => iterator,
+        Err(failure) => {
+            machine.mark_promise_all_settled(aggregate)?;
+            return reject_failure(machine, capability.reject, failure);
+        }
+    };
+    loop {
+        let value = match machine.iterator_next(iterator) {
+            Ok((true, _)) => break,
+            Ok((false, value)) => value,
+            Err(failure) => {
+                return reject_aggregate_failure(
+                    machine,
+                    aggregate,
+                    capability.reject,
+                    iterator,
+                    failure,
+                );
+            }
+        };
+        let index = match machine.add_promise_all_element(aggregate) {
+            Ok(index) => index,
+            Err(failure) => {
+                return reject_aggregate_failure(
+                    machine,
+                    aggregate,
+                    capability.reject,
+                    iterator,
+                    failure,
+                );
+            }
+        };
+        let element = match machine
+            .allocate(HeapEntry::PromiseAllElement {
+                aggregate,
+                index,
+                called: false,
+            })
+            .map_err(EvalFailure::Runtime)
+        {
+            Ok(element) => element,
+            Err(failure) => {
+                return reject_aggregate_failure(
+                    machine,
+                    aggregate,
+                    capability.reject,
+                    iterator,
+                    failure,
+                );
+            }
+        };
+        let callbacks = match aggregate_callbacks(machine, kind, element, capability) {
+            Ok(callbacks) => callbacks,
+            Err(failure) => {
+                return reject_aggregate_failure(
+                    machine,
+                    aggregate,
+                    capability.reject,
+                    iterator,
+                    failure,
+                );
+            }
+        };
+        let resolved = match machine.call_value(resolve_method, receiver, &[value]) {
+            Ok(resolved) => resolved,
+            Err(failure) => {
+                return reject_aggregate_failure(
+                    machine,
+                    aggregate,
+                    capability.reject,
+                    iterator,
+                    failure,
+                );
+            }
+        };
+        let then = match machine.get_named_property(resolved, "then") {
+            Ok(then) => then,
+            Err(failure) => {
+                return reject_aggregate_failure(
+                    machine,
+                    aggregate,
+                    capability.reject,
+                    iterator,
+                    failure,
+                );
+            }
+        };
+        if let Err(failure) = machine.call_value(then, resolved, &[callbacks.0, callbacks.1]) {
+            return reject_aggregate_failure(
+                machine,
+                aggregate,
+                capability.reject,
+                iterator,
+                failure,
+            );
+        }
+    }
+    if machine.finish_promise_all(aggregate)? {
+        let values = machine.move_promise_all_values_to_array(aggregate)?;
+        if let Err(failure) = machine.call_value(aggregate_resolve, Value::UNDEFINED, &[values]) {
+            reject_failure(machine, capability.reject, failure)?;
+        }
+    }
+    Ok(())
+}
+
+fn aggregate_callbacks<H: Host>(
+    machine: &mut Machine<'_, H>,
+    kind: AggregateKind,
+    element: Value,
+    capability: &PromiseCapability,
+) -> Result<(Value, Value), EvalFailure> {
+    let target = machine.intrinsics.builtins.promise_all_target();
+    match kind {
+        AggregateKind::AllSettled => {
+            let fulfilled =
+                reaction_record(machine, ReactionKind::AllSettledFulfilled, element, None)?;
+            let rejected =
+                reaction_record(machine, ReactionKind::AllSettledRejected, element, None)?;
+            Ok((
+                machine.create_promise_resolver_function(target, fulfilled)?,
+                machine.create_promise_resolver_function(target, rejected)?,
+            ))
+        }
+        AggregateKind::Any => {
+            let on_fulfilled = completion_record(
+                machine,
+                ReactionKind::AnyFulfilled,
+                capability.resolve,
+                capability.reject,
+            )?;
+            let rejected = reaction_record(machine, ReactionKind::AnyRejected, element, None)?;
+            Ok((
+                machine.create_promise_resolver_function(target, on_fulfilled)?,
+                machine.create_promise_resolver_function(target, rejected)?,
+            ))
+        }
+    }
+}
+
+#[repr(i32)]
+#[derive(Clone, Copy)]
+enum ReactionKind {
+    AllSettledFulfilled = 0,
+    AllSettledRejected = 1,
+    AnyRejected = 2,
+    AnyComplete = 3,
+    AllSettledComplete = 4,
+    AnyFulfilled = 5,
+}
+
+fn reaction_record<H: Host>(
+    machine: &mut Machine<'_, H>,
+    kind: ReactionKind,
+    element: Value,
+    reject: Option<Value>,
+) -> Result<Value, EvalFailure> {
+    let record = super::ordinary_runtime(machine, None)?;
+    machine.create_data_property_key(
+        record,
+        PropertyKey::Named(EcmaString::encode("kind")),
+        Value::int32(kind as u32),
+    )?;
+    machine.create_data_property_key(
+        record,
+        PropertyKey::Named(EcmaString::encode("element")),
+        element,
+    )?;
+    if let Some(reject) = reject {
+        machine.create_data_property_key(
+            record,
+            PropertyKey::Named(EcmaString::encode("reject")),
+            reject,
+        )?;
+    }
+    Ok(record)
+}
+
+fn completion_record<H: Host>(
+    machine: &mut Machine<'_, H>,
+    kind: ReactionKind,
+    resolve: Value,
+    reject: Value,
+) -> Result<Value, EvalFailure> {
+    let record = reaction_record(machine, kind, Value::UNDEFINED, Some(reject))?;
+    machine.create_data_property_key(
+        record,
+        PropertyKey::Named(EcmaString::encode("resolve")),
+        resolve,
+    )?;
+    Ok(record)
+}
+
+fn reject_iterator_failure<H: Host>(
+    machine: &mut Machine<'_, H>,
+    capability: &PromiseCapability,
+    iterator: Value,
+    failure: EvalFailure,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let (close, _) = machine.close_iterator_raw(iterator);
+    if let Err(EvalFailure::Runtime(kind)) = close {
+        return Err(EvalFailure::Runtime(kind));
+    }
+    reject_capability_failure(machine, capability, failure)
+}
+
+fn reject_aggregate_failure<H: Host>(
+    machine: &mut Machine<'_, H>,
+    aggregate: Value,
+    reject: Value,
+    iterator: Value,
+    failure: EvalFailure,
+) -> Result<(), EvalFailure> {
+    machine.mark_promise_all_settled(aggregate)?;
+    let (close, _) = machine.close_iterator_raw(iterator);
+    if let Err(EvalFailure::Runtime(kind)) = close {
+        return Err(EvalFailure::Runtime(kind));
+    }
+    reject_failure(machine, reject, failure)
+}
+
+fn reject_failure<H: Host>(
+    machine: &mut Machine<'_, H>,
+    reject: Value,
+    failure: EvalFailure,
+) -> Result<(), EvalFailure> {
+    let (reason, _) = machine.promise_rejection_value(failure)?;
+    machine.call_value(reject, Value::UNDEFINED, &[reason])?;
+    Ok(())
+}
+
 fn catch<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
@@ -718,15 +1124,88 @@ fn all_fulfill<H: Host>(
             operation: "Promise all target",
         }));
     }
-    let element = args
+    let record = args
         .first()
         .copied()
         .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
             operation: "Promise all target",
         }))?;
-    machine
-        .resolve_promise_all_element(element, args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+    let value = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    let index = machine
+        .runtime_slot(record)
+        .map_err(EvalFailure::Runtime)?
+        .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+            operation: "Promise all target",
+        }))?;
+    if matches!(machine.heap[index], HeapEntry::PromiseAllElement { .. }) {
+        machine.resolve_promise_all_element(record, value)?;
+        return Ok(BuiltinOutcome::Value(Value::UNDEFINED));
+    }
+    let kind = match machine.get_named_property(record, "kind")?.decode() {
+        Some(Decoded::Int32(raw)) => raw as i32,
+        _ => {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise aggregate target",
+            }));
+        }
+    };
+    match kind {
+        raw if raw == ReactionKind::AllSettledFulfilled as i32 => {
+            let element = machine.get_named_property(record, "element")?;
+            let result = settlement_result(machine, "fulfilled", "value", value)?;
+            machine.resolve_promise_all_element(element, result)?;
+        }
+        raw if raw == ReactionKind::AllSettledRejected as i32 => {
+            let element = machine.get_named_property(record, "element")?;
+            let result = settlement_result(machine, "rejected", "reason", value)?;
+            machine.resolve_promise_all_element(element, result)?;
+        }
+        raw if raw == ReactionKind::AnyRejected as i32 => {
+            let element = machine.get_named_property(record, "element")?;
+            machine.resolve_promise_all_element(element, value)?;
+        }
+        raw if raw == ReactionKind::AnyComplete as i32 => {
+            let reject = machine.get_named_property(record, "reject")?;
+            let constructor = machine.get_named_property(record, "constructor")?;
+            let error = machine.construct_value(constructor, &[value])?;
+            machine.call_value(reject, Value::UNDEFINED, &[error])?;
+        }
+        raw if raw == ReactionKind::AllSettledComplete as i32
+            || raw == ReactionKind::AnyFulfilled as i32 =>
+        {
+            let resolve = machine.get_named_property(record, "resolve")?;
+            machine.call_value(resolve, Value::UNDEFINED, &[value])?;
+        }
+        _ => {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise aggregate target",
+            }));
+        }
+    }
     Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+}
+
+fn settlement_result<H: Host>(
+    machine: &mut Machine<'_, H>,
+    status: &str,
+    field: &str,
+    value: Value,
+) -> Result<Value, EvalFailure> {
+    let result = super::ordinary_runtime(machine, None)?;
+    let status = machine
+        .allocate(HeapEntry::String(EcmaString::encode(status)))
+        .map_err(EvalFailure::Runtime)?;
+    machine.create_data_property_key(
+        result,
+        PropertyKey::Named(EcmaString::encode("status")),
+        status,
+    )?;
+    machine.create_data_property_key(
+        result,
+        PropertyKey::Named(EcmaString::encode(field)),
+        value,
+    )?;
+    Ok(result)
 }
 
 fn queue_microtask<H: Host>(
@@ -752,7 +1231,7 @@ fn queue_microtask<H: Host>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{TestHost, blank_program};
+    use super::super::test_support::{TestHost, blank_program, custom_iterable};
     use super::*;
     use crate::intrinsics::BuiltinHandler;
     use crate::{Limits, PromiseState};
@@ -828,6 +1307,24 @@ mod tests {
         Ok(BuiltinOutcome::Value(Value::UNDEFINED))
     }
 
+    fn count_capability_resolve_then_throw(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let count = machine
+            .test_global("capabilityResolveCount")
+            .and_then(Value::decode)
+            .and_then(|value| match value {
+                bamts_native::Decoded::Int32(raw) => Some(raw),
+                _ => None,
+            })
+            .unwrap_or(0);
+        machine.test_set_global("capabilityResolveCount", Value::int32(count + 1));
+        Err(EvalFailure::ThrowValue(Value::int32(99)))
+    }
+
     fn throwing_capability_constructor(
         machine: &mut Machine<'_, TestHost>,
         _this: Value,
@@ -841,7 +1338,11 @@ mod tests {
         }
         let executor = args.first().copied().unwrap_or(Value::UNDEFINED);
         let promise = super::super::ordinary_runtime(machine, None)?;
-        let resolve = callback(machine, "throwing capability resolve", throw_99);
+        let resolve = callback(
+            machine,
+            "throwing capability resolve",
+            count_capability_resolve_then_throw,
+        );
         let reject = callback(
             machine,
             "record capability reject",
@@ -849,6 +1350,77 @@ mod tests {
         );
         machine.call_value(executor, Value::UNDEFINED, &[resolve, reject])?;
         machine.test_set_global("capabilityPromise", promise);
+        Ok(BuiltinOutcome::Value(promise))
+    }
+
+    fn return_fulfilled_builtin_promise(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let promise = machine.create_promise()?;
+        machine
+            .resolve_promise(promise, args.first().copied().unwrap_or(Value::UNDEFINED))
+            .map_err(EvalFailure::Runtime)?;
+        Ok(BuiltinOutcome::Value(promise))
+    }
+
+    fn return_rejected_builtin_promise(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let promise = machine.create_promise()?;
+        machine
+            .reject_promise(
+                promise,
+                args.first().copied().unwrap_or(Value::UNDEFINED),
+                ThrowOrigin::Bytecode,
+            )
+            .map_err(EvalFailure::Runtime)?;
+        Ok(BuiltinOutcome::Value(promise))
+    }
+
+    fn count_capability_reject_then_throw(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let count = machine
+            .test_global("capabilityRejectCount")
+            .and_then(Value::decode)
+            .and_then(|value| match value {
+                bamts_native::Decoded::Int32(raw) => Some(raw),
+                _ => None,
+            })
+            .unwrap_or(0);
+        machine.test_set_global("capabilityRejectCount", Value::int32(count + 1));
+        Err(EvalFailure::ThrowValue(Value::int32(99)))
+    }
+
+    fn throwing_reject_capability_constructor(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        args: &[Value],
+        constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        if !constructing {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "test Promise constructor",
+            }));
+        }
+        let executor = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let promise = super::super::ordinary_runtime(machine, None)?;
+        let resolve = callback(machine, "unused capability resolve", return_undefined);
+        let reject = callback(
+            machine,
+            "counting throwing capability reject",
+            count_capability_reject_then_throw,
+        );
+        machine.call_value(executor, Value::UNDEFINED, &[resolve, reject])?;
         Ok(BuiltinOutcome::Value(promise))
     }
 
@@ -947,6 +1519,52 @@ mod tests {
                 .test_global("throwingResolve")
                 .expect("test installs throwing resolve"),
         ))
+    }
+
+    fn self_capability_constructor(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        args: &[Value],
+        constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        if !constructing {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Promise constructor",
+            }));
+        }
+        let executor = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let built_in = machine
+            .intrinsics
+            .global("Promise")
+            .expect("Promise global is installed");
+        let promise = machine.construct_value(built_in, &[executor])?;
+        let throwing_then = callback(machine, "self then", throw_then_observed);
+        machine.set_data_property(promise, "then", throwing_then)?;
+        machine.test_set_global("selfCapabilityPromise", promise);
+        Ok(BuiltinOutcome::Value(promise))
+    }
+
+    fn resolve_returns_capability(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Ok(BuiltinOutcome::Value(
+            machine
+                .test_global("selfCapabilityPromise")
+                .expect("constructor set capability promise"),
+        ))
+    }
+
+    fn throw_then_observed(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        machine.test_set_global("thenObserved", Value::TRUE);
+        Err(EvalFailure::ThrowValue(Value::int32(77)))
     }
 
     fn one_value_iterable(machine: &mut Machine<'_, TestHost>) -> Value {
@@ -1399,5 +2017,634 @@ mod tests {
             state(&machine, derived),
             PromiseState::Fulfilled { .. }
         ));
+    }
+
+    // ── Static presence and length ─────────────────────────────────────
+
+    #[test]
+    fn race_all_settled_any_are_installed_statics_with_length_1() {
+        let module = blank_program("<promise-statics>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        for name in ["race", "allSettled", "any"] {
+            let method = machine.get_named_property(constructor, name).unwrap();
+            assert!(
+                machine.is_callable(method).unwrap(),
+                "Promise.{name} must be callable"
+            );
+            let length = machine.get_named_property(method, "length").unwrap();
+            assert_eq!(length, Value::int32(1), "Promise.{name} length must be 1");
+        }
+    }
+
+    // ── race ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn race_fulfills_with_first_settled_promise() {
+        let module = blank_program("<promise-race-fulfill>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let slow = machine.create_promise().unwrap();
+        let fast = machine.create_promise().unwrap();
+        let iterable = super::super::allocate_array(&mut machine, vec![slow, fast]).unwrap();
+        let race = machine.get_named_property(constructor, "race").unwrap();
+
+        let promise = machine.call_value(race, constructor, &[iterable]).unwrap();
+        assert!(matches!(
+            state(&machine, promise),
+            PromiseState::Pending { .. }
+        ));
+
+        machine.fulfill_promise(fast, Value::int32(42)).unwrap();
+        machine.drain_microtasks().unwrap();
+
+        assert!(
+            matches!(state(&machine, promise), PromiseState::Fulfilled { value } if value == Value::int32(42)),
+            "race should fulfill with the first settled promise"
+        );
+    }
+
+    #[test]
+    fn race_rejects_with_first_rejected_promise() {
+        let module = blank_program("<promise-race-reject>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let slow = machine.create_promise().unwrap();
+        let fast = machine.create_promise().unwrap();
+        let iterable = super::super::allocate_array(&mut machine, vec![slow, fast]).unwrap();
+        let race = machine.get_named_property(constructor, "race").unwrap();
+
+        let promise = machine.call_value(race, constructor, &[iterable]).unwrap();
+        machine
+            .reject_promise(fast, Value::int32(7), ThrowOrigin::Bytecode)
+            .unwrap();
+        machine.drain_microtasks().unwrap();
+
+        assert!(
+            matches!(state(&machine, promise), PromiseState::Rejected { reason, .. } if reason == Value::int32(7)),
+            "race should reject with the first rejected promise"
+        );
+    }
+
+    #[test]
+    fn race_empty_iterable_stays_pending() {
+        let module = blank_program("<promise-race-empty>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let iterable = super::super::allocate_array(&mut machine, Vec::new()).unwrap();
+        let race = machine.get_named_property(constructor, "race").unwrap();
+
+        let promise = machine.call_value(race, constructor, &[iterable]).unwrap();
+        assert!(
+            matches!(state(&machine, promise), PromiseState::Pending { .. }),
+            "race with empty iterable must stay pending"
+        );
+    }
+
+    #[test]
+    fn race_mixed_fulfilled_and_rejected_settles_with_first() {
+        let module = blank_program("<promise-race-mixed>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let fulfilled = machine.create_promise().unwrap();
+        let rejected = machine.create_promise().unwrap();
+        let iterable =
+            super::super::allocate_array(&mut machine, vec![fulfilled, rejected]).unwrap();
+        let race = machine.get_named_property(constructor, "race").unwrap();
+
+        let promise = machine.call_value(race, constructor, &[iterable]).unwrap();
+        machine
+            .fulfill_promise(fulfilled, Value::int32(11))
+            .unwrap();
+        machine
+            .reject_promise(rejected, Value::int32(22), ThrowOrigin::Bytecode)
+            .unwrap();
+        machine.drain_microtasks().unwrap();
+
+        assert!(
+            matches!(state(&machine, promise), PromiseState::Fulfilled { value } if value == Value::int32(11)),
+            "race mixed should settle with whichever settles first"
+        );
+    }
+
+    // ── allSettled ─────────────────────────────────────────────────────
+
+    #[test]
+    fn all_settled_empty_resolves_with_empty_array() {
+        let module = blank_program("<promise-all-settled-empty>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let iterable = super::super::allocate_array(&mut machine, Vec::new()).unwrap();
+        let all_settled = machine
+            .get_named_property(constructor, "allSettled")
+            .unwrap();
+
+        let promise = machine
+            .call_value(all_settled, constructor, &[iterable])
+            .unwrap();
+        machine.drain_microtasks().unwrap();
+
+        match state(&machine, promise) {
+            PromiseState::Fulfilled { value } => {
+                let elements = machine
+                    .array_elements(value)
+                    .unwrap()
+                    .expect("result is an array");
+                assert!(elements.is_empty(), "empty allSettled resolves with []");
+            }
+            other => panic!("empty allSettled should fulfill, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_settled_mixed_produces_ordered_records() {
+        let module = blank_program("<promise-all-settled-mixed>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let p0 = machine.create_promise().unwrap();
+        let p1 = machine.create_promise().unwrap();
+        let iterable = super::super::allocate_array(&mut machine, vec![p0, p1]).unwrap();
+        let all_settled = machine
+            .get_named_property(constructor, "allSettled")
+            .unwrap();
+
+        let promise = machine
+            .call_value(all_settled, constructor, &[iterable])
+            .unwrap();
+        // Settle out of order: p1 first (rejected), then p0 (fulfilled).
+        machine
+            .reject_promise(p1, Value::int32(99), ThrowOrigin::Bytecode)
+            .unwrap();
+        machine.fulfill_promise(p0, Value::int32(42)).unwrap();
+        machine.drain_microtasks().unwrap();
+
+        match state(&machine, promise) {
+            PromiseState::Fulfilled { value } => {
+                let elements = machine
+                    .array_elements(value)
+                    .unwrap()
+                    .expect("result is an array");
+                assert_eq!(elements.len(), 2, "two inputs → two records");
+                // Index 0: fulfilled with 42
+                let status0 = machine.get_named_property(elements[0], "status").unwrap();
+                assert_eq!(
+                    machine.string_value(status0).unwrap(),
+                    EcmaString::encode("fulfilled")
+                );
+                let val0 = machine.get_named_property(elements[0], "value").unwrap();
+                assert_eq!(val0, Value::int32(42));
+                // Index 1: rejected with 99
+                let status1 = machine.get_named_property(elements[1], "status").unwrap();
+                assert_eq!(
+                    machine.string_value(status1).unwrap(),
+                    EcmaString::encode("rejected")
+                );
+                let reason1 = machine.get_named_property(elements[1], "reason").unwrap();
+                assert_eq!(reason1, Value::int32(99));
+            }
+            other => panic!("mixed allSettled should fulfill, got {other:?}"),
+        }
+    }
+
+    // ── any ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn any_fulfills_with_first_fulfilled_promise() {
+        let module = blank_program("<promise-any-fulfill>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let rejected = machine.create_promise().unwrap();
+        let fulfilled = machine.create_promise().unwrap();
+        let iterable =
+            super::super::allocate_array(&mut machine, vec![rejected, fulfilled]).unwrap();
+        let any = machine.get_named_property(constructor, "any").unwrap();
+
+        let promise = machine.call_value(any, constructor, &[iterable]).unwrap();
+        machine
+            .reject_promise(rejected, Value::int32(10), ThrowOrigin::Bytecode)
+            .unwrap();
+        machine
+            .fulfill_promise(fulfilled, Value::int32(77))
+            .unwrap();
+        machine.drain_microtasks().unwrap();
+
+        assert!(
+            matches!(state(&machine, promise), PromiseState::Fulfilled { value } if value == Value::int32(77)),
+            "any should fulfill with the first fulfilled promise"
+        );
+    }
+
+    #[test]
+    fn any_all_rejected_rejects_with_aggregate_error() {
+        let module = blank_program("<promise-any-all-rejected>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let p0 = machine.create_promise().unwrap();
+        let p1 = machine.create_promise().unwrap();
+        let iterable = super::super::allocate_array(&mut machine, vec![p0, p1]).unwrap();
+        let any = machine.get_named_property(constructor, "any").unwrap();
+
+        let promise = machine.call_value(any, constructor, &[iterable]).unwrap();
+        machine
+            .reject_promise(p0, Value::int32(10), ThrowOrigin::Bytecode)
+            .unwrap();
+        machine
+            .reject_promise(p1, Value::int32(20), ThrowOrigin::Bytecode)
+            .unwrap();
+        machine.drain_microtasks().unwrap();
+
+        match state(&machine, promise) {
+            PromiseState::Rejected { reason, .. } => {
+                // The reason must be an AggregateError whose `errors` array
+                // contains the rejection reasons in iteration order.
+                let errors = machine.get_named_property(reason, "errors").unwrap();
+                let elements = machine
+                    .array_elements(errors)
+                    .unwrap()
+                    .expect("AggregateError.errors is an array");
+                assert_eq!(elements.len(), 2, "two rejections → two errors");
+                assert_eq!(elements[0], Value::int32(10));
+                assert_eq!(elements[1], Value::int32(20));
+            }
+            other => panic!("all-rejected any should reject with AggregateError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn any_empty_iterable_rejects_with_aggregate_error() {
+        let module = blank_program("<promise-any-empty>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let iterable = super::super::allocate_array(&mut machine, Vec::new()).unwrap();
+        let any = machine.get_named_property(constructor, "any").unwrap();
+
+        let promise = machine.call_value(any, constructor, &[iterable]).unwrap();
+        machine.drain_microtasks().unwrap();
+
+        match state(&machine, promise) {
+            PromiseState::Rejected { reason, .. } => {
+                let errors = machine.get_named_property(reason, "errors").unwrap();
+                let elements = machine
+                    .array_elements(errors)
+                    .unwrap()
+                    .expect("AggregateError.errors is an array");
+                assert!(
+                    elements.is_empty(),
+                    "empty any → AggregateError with empty errors"
+                );
+            }
+            other => panic!("empty any should reject with AggregateError, got {other:?}"),
+        }
+    }
+
+    // ── Abrupt iterator / setup rejection ──────────────────────────────
+
+    #[test]
+    fn race_rejects_when_iterator_creation_throws() {
+        let module = blank_program("<promise-race-bad-iter>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let race = machine.get_named_property(constructor, "race").unwrap();
+
+        let promise = machine
+            .call_value(race, constructor, &[Value::int32(0)])
+            .unwrap();
+
+        assert!(
+            matches!(state(&machine, promise), PromiseState::Rejected { .. }),
+            "race with non-iterable must reject the capability"
+        );
+    }
+
+    #[test]
+    fn all_settled_rejects_when_iterator_creation_throws() {
+        let module = blank_program("<promise-all-settled-bad-iter>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let all_settled = machine
+            .get_named_property(constructor, "allSettled")
+            .unwrap();
+
+        let promise = machine
+            .call_value(all_settled, constructor, &[Value::int32(0)])
+            .unwrap();
+
+        assert!(
+            matches!(state(&machine, promise), PromiseState::Rejected { .. }),
+            "allSettled with non-iterable must reject the capability"
+        );
+    }
+
+    #[test]
+    fn any_rejects_when_iterator_creation_throws() {
+        let module = blank_program("<promise-any-bad-iter>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let any = machine.get_named_property(constructor, "any").unwrap();
+
+        let promise = machine
+            .call_value(any, constructor, &[Value::int32(0)])
+            .unwrap();
+
+        assert!(
+            matches!(state(&machine, promise), PromiseState::Rejected { .. }),
+            "any with non-iterable must reject the capability"
+        );
+    }
+
+    #[test]
+    fn all_settled_rejects_when_constructor_resolve_is_not_callable() {
+        let module = blank_program("<promise-all-settled-bad-resolve>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        machine
+            .set_data_property(constructor, "resolve", Value::int32(0))
+            .unwrap();
+        let all_settled = machine
+            .get_named_property(constructor, "allSettled")
+            .unwrap();
+        let iterable = super::super::allocate_array(&mut machine, Vec::new()).unwrap();
+
+        let promise = machine
+            .call_value(all_settled, constructor, &[iterable])
+            .unwrap();
+
+        assert!(
+            matches!(state(&machine, promise), PromiseState::Rejected { .. }),
+            "allSettled with non-callable resolve must reject the capability"
+        );
+    }
+
+    // ── Self-capability promise then observation ───────────────────────
+
+    #[test]
+    fn all_settled_observes_then_on_self_capability_promise() {
+        let module = blank_program("<promise-all-settled-self-then>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let built_in = machine.intrinsics.global("Promise").unwrap();
+        let constructor = callback(
+            &mut machine,
+            "self constructor",
+            self_capability_constructor,
+        );
+        let resolve = callback(&mut machine, "self resolve", resolve_returns_capability);
+        machine
+            .set_data_property(constructor, "resolve", resolve)
+            .unwrap();
+        let all_settled = machine.get_named_property(built_in, "allSettled").unwrap();
+
+        let iterable = custom_iterable(&mut machine, vec![Value::int32(1)]);
+        let promise = machine
+            .call_value(all_settled, constructor, &[iterable])
+            .expect("allSettled returns its capability");
+        machine.drain_microtasks().unwrap();
+
+        assert_eq!(
+            machine.test_global("thenObserved"),
+            Some(Value::TRUE),
+            "allSettled must observe the self-capability's own .then"
+        );
+        assert!(
+            matches!(
+                state(&machine, promise),
+                PromiseState::Rejected { reason, .. } if reason == Value::int32(77)
+            ),
+            "allSettled must reject the capability when the self-capability's .then throws"
+        );
+    }
+
+    #[test]
+    fn any_observes_then_on_self_capability_promise() {
+        let module = blank_program("<promise-any-self-then>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let built_in = machine.intrinsics.global("Promise").unwrap();
+        let constructor = callback(
+            &mut machine,
+            "self constructor",
+            self_capability_constructor,
+        );
+        let resolve = callback(&mut machine, "self resolve", resolve_returns_capability);
+        machine
+            .set_data_property(constructor, "resolve", resolve)
+            .unwrap();
+        let any = machine.get_named_property(built_in, "any").unwrap();
+
+        let iterable = custom_iterable(&mut machine, vec![Value::int32(1)]);
+        let promise = machine
+            .call_value(any, constructor, &[iterable])
+            .expect("any returns its capability");
+        machine.drain_microtasks().unwrap();
+
+        assert_eq!(
+            machine.test_global("thenObserved"),
+            Some(Value::TRUE),
+            "any must observe the self-capability's own .then"
+        );
+        assert!(
+            matches!(
+                state(&machine, promise),
+                PromiseState::Rejected { reason, .. } if reason == Value::int32(77)
+            ),
+            "any must reject the capability when the self-capability's .then throws"
+        );
+    }
+
+    #[test]
+    fn race_observes_then_on_self_capability_promise() {
+        let module = blank_program("<promise-race-self-then>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let built_in = machine.intrinsics.global("Promise").unwrap();
+        let constructor = callback(
+            &mut machine,
+            "self constructor",
+            self_capability_constructor,
+        );
+        let resolve = callback(&mut machine, "self resolve", resolve_returns_capability);
+        machine
+            .set_data_property(constructor, "resolve", resolve)
+            .unwrap();
+        let race = machine.get_named_property(built_in, "race").unwrap();
+
+        let iterable = custom_iterable(&mut machine, vec![Value::int32(1)]);
+        let promise = machine
+            .call_value(race, constructor, &[iterable])
+            .expect("race returns its capability");
+        machine.drain_microtasks().unwrap();
+
+        assert_eq!(
+            machine.test_global("thenObserved"),
+            Some(Value::TRUE),
+            "race must observe the self-capability's own .then"
+        );
+        assert!(
+            matches!(
+                state(&machine, promise),
+                PromiseState::Rejected { reason, .. } if reason == Value::int32(77)
+            ),
+            "race must reject the capability when the self-capability's .then throws"
+        );
+    }
+
+    // ── Post-capability error escape ───────────────────────────────────
+
+    #[test]
+    fn all_settled_routes_final_resolve_error_to_capability_reject() {
+        let module = blank_program("<promise-all-settled-resolve-throws>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let promise_constructor = machine.intrinsics.global("Promise").unwrap();
+        let all_settled = machine
+            .get_named_property(promise_constructor, "allSettled")
+            .unwrap();
+        let constructor = callback(
+            &mut machine,
+            "throwing capability constructor",
+            throwing_capability_constructor,
+        );
+        let resolve = callback(&mut machine, "unused resolve", return_undefined);
+        machine
+            .set_data_property(constructor, "resolve", resolve)
+            .unwrap();
+        let iterable = super::super::allocate_array(&mut machine, Vec::new()).unwrap();
+
+        let promise = machine
+            .call_value(all_settled, constructor, &[iterable])
+            .unwrap();
+
+        assert_eq!(machine.test_global("capabilityPromise"), Some(promise));
+        assert_eq!(
+            machine.test_global("capabilityRejectReason"),
+            Some(Value::int32(99)),
+            "allSettled empty with throwing capability resolve must route 99 to capability reject"
+        );
+    }
+
+    #[test]
+    fn all_settled_fulfillment_resolve_error_stays_on_derived_reaction() {
+        let module = blank_program("<promise-all-settled-derived-resolve-throws>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let built_in = machine.intrinsics.global("Promise").unwrap();
+        let all_settled = machine.get_named_property(built_in, "allSettled").unwrap();
+        let constructor = callback(
+            &mut machine,
+            "throwing capability constructor",
+            throwing_capability_constructor,
+        );
+        let resolve = callback(
+            &mut machine,
+            "return fulfilled built-in promise",
+            return_fulfilled_builtin_promise,
+        );
+        machine
+            .set_data_property(constructor, "resolve", resolve)
+            .unwrap();
+        let iterable = super::super::allocate_array(&mut machine, vec![Value::int32(1)]).unwrap();
+
+        let promise = machine
+            .call_value(all_settled, constructor, &[iterable])
+            .unwrap();
+        machine.drain_microtasks().unwrap();
+
+        assert_eq!(machine.test_global("capabilityPromise"), Some(promise));
+        assert_eq!(
+            machine.test_global("capabilityResolveCount"),
+            Some(Value::int32(1)),
+            "allSettled must invoke the outer capability resolve once"
+        );
+        assert_eq!(
+            machine.test_global("capabilityRejectReason"),
+            None,
+            "allSettled reaction resolve failure must not invoke the outer capability reject"
+        );
+    }
+
+    #[test]
+    fn any_fulfillment_resolve_error_stays_on_derived_reaction() {
+        let module = blank_program("<promise-any-derived-resolve-throws>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let built_in = machine.intrinsics.global("Promise").unwrap();
+        let any = machine.get_named_property(built_in, "any").unwrap();
+        let constructor = callback(
+            &mut machine,
+            "throwing capability constructor",
+            throwing_capability_constructor,
+        );
+        let resolve = callback(
+            &mut machine,
+            "return fulfilled built-in promise",
+            return_fulfilled_builtin_promise,
+        );
+        machine
+            .set_data_property(constructor, "resolve", resolve)
+            .unwrap();
+        let iterable = super::super::allocate_array(&mut machine, vec![Value::int32(1)]).unwrap();
+
+        let promise = machine.call_value(any, constructor, &[iterable]).unwrap();
+        machine.drain_microtasks().unwrap();
+
+        assert_eq!(machine.test_global("capabilityPromise"), Some(promise));
+        assert_eq!(
+            machine.test_global("capabilityResolveCount"),
+            Some(Value::int32(1)),
+            "Promise.any must invoke the outer capability resolve once"
+        );
+        assert_eq!(
+            machine.test_global("capabilityRejectReason"),
+            None,
+            "any reaction resolve failure must not invoke the outer capability reject"
+        );
+    }
+
+    #[test]
+    fn any_all_rejected_calls_throwing_capability_reject_once() {
+        let module = blank_program("<promise-any-reject-once>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let built_in = machine.intrinsics.global("Promise").unwrap();
+        let any = machine.get_named_property(built_in, "any").unwrap();
+        let constructor = callback(
+            &mut machine,
+            "throwing reject capability constructor",
+            throwing_reject_capability_constructor,
+        );
+        let resolve = callback(
+            &mut machine,
+            "return rejected built-in promise",
+            return_rejected_builtin_promise,
+        );
+        machine
+            .set_data_property(constructor, "resolve", resolve)
+            .unwrap();
+        let iterable =
+            super::super::allocate_array(&mut machine, vec![Value::int32(11), Value::int32(22)])
+                .unwrap();
+
+        machine.call_value(any, constructor, &[iterable]).unwrap();
+        machine.drain_microtasks().unwrap();
+
+        assert_eq!(
+            machine.test_global("capabilityRejectCount"),
+            Some(Value::int32(1)),
+            "Promise.any must invoke a throwing aggregate reject exactly once"
+        );
     }
 }
