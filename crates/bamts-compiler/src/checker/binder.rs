@@ -1324,6 +1324,30 @@ impl TypeTable {
             Type::AppliedClass { .. } => self
                 .prepare_applied_class_view(ty)
                 .and_then(|view| self.iterator_property_of(view, protocol)),
+            Type::Intersection(members) => {
+                let mut properties = Vec::with_capacity(members.len());
+                for member in members {
+                    if let Some(property) = self.iterator_property_of(member, protocol) {
+                        properties.push(property);
+                    }
+                }
+                if properties.is_empty() {
+                    return None;
+                }
+                let optional = properties.iter().all(IteratorProperty::optional);
+                let mut types = properties.iter().map(IteratorProperty::type_id);
+                let first = types.next().expect("iterator properties are not empty");
+                let type_id = match types.next() {
+                    None => first,
+                    Some(second) => self.intersection(
+                        std::iter::once(first)
+                            .chain(std::iter::once(second))
+                            .chain(types)
+                            .collect(),
+                    ),
+                };
+                Some(IteratorProperty::new(type_id, optional))
+            }
             _ => None,
         }
     }
@@ -5858,23 +5882,19 @@ impl<'src> Binder<'src> {
                 let child = self.new_scope(ScopeKind::For, Some(scope));
                 self.resolve_expr(&for_statement.iterable, child);
                 let iterable_type = self.type_of_expr(&for_statement.iterable, child);
-                let element_type = match self.iteration_element_type(iterable_type) {
-                    Some(element_type) => element_type,
-                    None => {
-                        self.emit(
-                            FOR_OF_ITERABLE_REQUIRED,
-                            for_statement.iterable.range(),
-                            FOR_OF_ITERABLE_REQUIRED_MESSAGE,
-                        );
-                        self.types.error_type()
-                    }
-                };
-                self.resolve_for_of_binding(
-                    &for_statement.binding,
-                    child,
-                    for_statement.mode,
-                    element_type,
-                );
+                let element_type =
+                    match self.iteration_element_type(iterable_type, for_statement.mode) {
+                        Some(element_type) => element_type,
+                        None => {
+                            self.emit(
+                                FOR_OF_ITERABLE_REQUIRED,
+                                for_statement.iterable.range(),
+                                FOR_OF_ITERABLE_REQUIRED_MESSAGE,
+                            );
+                            self.types.error_type()
+                        }
+                    };
+                self.resolve_for_of_binding(&for_statement.binding, child, element_type);
                 let parent = self.flow;
                 let skipped = self.branch_guarded(parent, &[]);
                 let body_end = self.in_branch(parent, &[], |binder| {
@@ -6122,7 +6142,6 @@ impl<'src> Binder<'src> {
         &mut self,
         binding: &'src ForBinding,
         scope: ScopeId,
-        _mode: ForOfMode,
         element_type: TypeId,
     ) {
         match binding {
@@ -9303,7 +9322,11 @@ impl<'src> Binder<'src> {
         }
     }
 
-    fn iterator_object_element_type(&mut self, iterator: TypeId) -> Option<TypeId> {
+    fn iterator_object_element_type(
+        &mut self,
+        iterator: TypeId,
+        protocol: ForOfMode,
+    ) -> Option<TypeId> {
         match self.types.get(iterator).clone() {
             Type::Any | Type::Never | Type::Error => Some(iterator),
             Type::Array(_) | Type::Tuple(_) => self.array_element_type(iterator),
@@ -9312,7 +9335,7 @@ impl<'src> Binder<'src> {
                 let mut has_error = false;
                 let mut elements = Vec::with_capacity(members.len());
                 for member in members {
-                    let element = self.iterator_object_element_type(member)?;
+                    let element = self.iterator_object_element_type(member, protocol)?;
                     has_error |= element == error;
                     elements.push(element);
                 }
@@ -9326,14 +9349,14 @@ impl<'src> Binder<'src> {
                 let view = self.types.named_structural_view(iterator);
                 let view = self.types.prepare_applied_class_view(view).unwrap_or(view);
                 (view != iterator)
-                    .then(|| self.iterator_object_element_type(view))
+                    .then(|| self.iterator_object_element_type(view, protocol))
                     .flatten()
             }
             Type::Intersection(members) => {
                 let error = self.types.error_type();
                 let mut elements = Vec::with_capacity(members.len());
                 for member in members {
-                    let Some(element) = self.iterator_object_element_type(member) else {
+                    let Some(element) = self.iterator_object_element_type(member, protocol) else {
                         continue;
                     };
                     if element == error {
@@ -9350,6 +9373,10 @@ impl<'src> Binder<'src> {
             Type::ObjectType(_) => {
                 let next = self.types.read_property_type(iterator, "next")?;
                 let result = self.zero_argument_return_type(next)?;
+                let result = match protocol {
+                    ForOfMode::Sync => result,
+                    ForOfMode::Async => self.awaited_type(result),
+                };
                 if matches!(
                     self.types.get(result),
                     Type::Any | Type::Never | Type::Error
@@ -9362,7 +9389,11 @@ impl<'src> Binder<'src> {
         }
     }
 
-    fn structural_iterator_element_type(&mut self, method: TypeId) -> Option<TypeId> {
+    fn structural_iterator_element_type(
+        &mut self,
+        method: TypeId,
+        protocol: ForOfMode,
+    ) -> Option<TypeId> {
         if matches!(
             self.types.get(method),
             Type::Any | Type::Never | Type::Error
@@ -9370,10 +9401,22 @@ impl<'src> Binder<'src> {
             return Some(method);
         }
         let iterator = self.zero_argument_return_type(method)?;
-        self.iterator_object_element_type(iterator)
+        self.iterator_object_element_type(iterator, protocol)
     }
 
-    fn iteration_element_type(&mut self, iterable: TypeId) -> Option<TypeId> {
+    fn iteration_element_type(&mut self, iterable: TypeId, mode: ForOfMode) -> Option<TypeId> {
+        let element = self.iteration_element_type_inner(iterable, mode)?;
+        Some(match mode {
+            ForOfMode::Sync => element,
+            ForOfMode::Async => self.awaited_type(element),
+        })
+    }
+
+    fn iteration_element_type_inner(
+        &mut self,
+        iterable: TypeId,
+        mode: ForOfMode,
+    ) -> Option<TypeId> {
         match self.types.get(iterable).clone() {
             Type::Array(element) => Some(element),
             Type::Tuple(shape) => {
@@ -9384,11 +9427,24 @@ impl<'src> Binder<'src> {
                 Some(self.types.union(&elements))
             }
             Type::ObjectType(object) => {
+                if mode == ForOfMode::Async
+                    && let Some(property) = object.async_iterator_property
+                    && !property.optional()
+                {
+                    let method = property.type_id();
+                    let passthrough = matches!(
+                        self.types.get(method),
+                        Type::Any | Type::Never | Type::Error
+                    );
+                    if passthrough || self.zero_argument_return_type(method).is_some() {
+                        return self.structural_iterator_element_type(method, ForOfMode::Async);
+                    }
+                }
                 let property = object.iterator_property?;
                 if property.optional() {
                     return None;
                 }
-                self.structural_iterator_element_type(property.type_id())
+                self.structural_iterator_element_type(property.type_id(), ForOfMode::Sync)
             }
             Type::String | Type::StringLiteral(_) => Some(self.types.string()),
             Type::Any | Type::Never | Type::Error => Some(iterable),
@@ -9397,7 +9453,7 @@ impl<'src> Binder<'src> {
                 let mut has_error = false;
                 let mut elements = Vec::with_capacity(members.len());
                 for member in members {
-                    let element = self.iteration_element_type(member)?;
+                    let element = self.iteration_element_type_inner(member, mode)?;
                     has_error |= element == error;
                     elements.push(element);
                 }
@@ -9408,10 +9464,31 @@ impl<'src> Binder<'src> {
                 }
             }
             Type::Intersection(members) => {
+                if mode == ForOfMode::Async
+                    && let Some(property) =
+                        self.types.iterator_property_of(iterable, ForOfMode::Async)
+                    && !property.optional()
+                {
+                    let method = property.type_id();
+                    let passthrough = matches!(
+                        self.types.get(method),
+                        Type::Any | Type::Never | Type::Error
+                    );
+                    if passthrough || self.zero_argument_return_type(method).is_some() {
+                        return self.structural_iterator_element_type(method, ForOfMode::Async);
+                    }
+                }
+                if let Some(property) = self.types.iterator_property_of(iterable, ForOfMode::Sync)
+                    && !property.optional()
+                {
+                    return self
+                        .structural_iterator_element_type(property.type_id(), ForOfMode::Sync);
+                }
                 let error = self.types.error_type();
                 let mut elements = Vec::with_capacity(members.len());
                 for member in members {
-                    let Some(element) = self.iteration_element_type(member) else {
+                    let Some(element) = self.iteration_element_type_inner(member, ForOfMode::Sync)
+                    else {
                         continue;
                     };
                     if element == error {
@@ -9427,14 +9504,14 @@ impl<'src> Binder<'src> {
             }
             Type::Named(symbol) => {
                 if let Some(constraint) = self.type_parameter_effective_constraint(iterable) {
-                    return self.iteration_element_type(constraint);
+                    return self.iteration_element_type_inner(constraint, mode);
                 }
                 let resolved = self.resolve_named_type_symbol(symbol);
                 let view = self.types.named_structural_view(resolved);
                 if view != resolved {
-                    self.iteration_element_type(view)
+                    self.iteration_element_type_inner(view, mode)
                 } else if resolved != iterable {
-                    self.iteration_element_type(resolved)
+                    self.iteration_element_type_inner(resolved, mode)
                 } else {
                     None
                 }
@@ -9442,7 +9519,7 @@ impl<'src> Binder<'src> {
             Type::AppliedClass { .. } => {
                 let view = self.types.prepare_applied_class_view(iterable)?;
                 (view != iterable)
-                    .then(|| self.iteration_element_type(view))
+                    .then(|| self.iteration_element_type_inner(view, mode))
                     .flatten()
             }
             _ => None,

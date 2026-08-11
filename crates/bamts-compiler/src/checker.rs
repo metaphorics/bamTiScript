@@ -6469,6 +6469,165 @@ mod tests {
     }
 
     #[test]
+    fn for_await_prefers_async_protocol_and_awaits_next_and_value() {
+        let result = check_text(
+            "const iterable = {\
+                 [Symbol.asyncIterator](): {\
+                     next(): Promise<{ value: Promise<string>; done: false }>\
+                 } { throw 0; },\
+                 [Symbol.iterator](): {\
+                     next(): { value: number; done: false }\
+                 } { throw 0; }\
+             };\
+             async function consume(): Promise<void> {\
+                 for await (const value of iterable) {\
+                     const text: string = value;\
+                 }\
+             }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn for_await_sync_fallback_awaits_value() {
+        let result = check_text(
+            "const iterable = {\
+                 [Symbol.iterator](): {\
+                     next(): { value: Promise<number>; done: false }\
+                 } { throw 0; }\
+             };\
+             async function consume(): Promise<void> {\
+                 for await (const value of iterable) {\
+                     const numberValue: number = value;\
+                 }\
+             }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn for_await_invalid_async_protocol_does_not_use_sync_fallback() {
+        let result = check_text(
+            "const iterable = {\
+                 [Symbol.asyncIterator](): { tag: true } { throw 0; },\
+                 [Symbol.iterator](): {\
+                     next(): { value: number; done: false }\
+                 } { throw 0; }\
+             };\
+             async function consume(): Promise<void> {\
+                 for await (const value of iterable) { value; }\
+             }",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            [super::FOR_OF_ITERABLE_REQUIRED.as_str()]
+        );
+    }
+
+    #[test]
+    fn for_await_intersection_selects_one_async_protocol() {
+        let result = check_text(
+            "declare const iterable: {\
+                 [Symbol.asyncIterator](): {\
+                     next(): Promise<{ value: string; done: false }>\
+                 };\
+             } & {\
+                 [Symbol.iterator](): {\
+                     next(): { value: number; done: false }\
+                 };\
+             };\
+             async function consume(): Promise<void> {\
+                 for await (const value of iterable) {\
+                     const text: string = value;\
+                 }\
+             }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn for_await_intersection_commits_to_malformed_async_protocol() {
+        let result = check_text(
+            "declare const iterable: {\
+                 [Symbol.asyncIterator](): { tag: true };\
+             } & {\
+                 [Symbol.iterator](): {\
+                     next(): { value: number; done: false }\
+                 };\
+             };\
+             async function consume(): Promise<void> {\
+                 for await (const value of iterable) { value; }\
+             }",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            [super::FOR_OF_ITERABLE_REQUIRED.as_str()]
+        );
+    }
+
+    #[test]
+    fn for_await_optional_or_non_callable_async_protocol_uses_sync_fallback() {
+        for source in [
+            "declare const iterable: {\
+                 [Symbol.asyncIterator]?: () => {\
+                     next(): Promise<{ value: string; done: false }>\
+                 };\
+                 [Symbol.iterator](): {\
+                     next(): { value: number; done: false }\
+                 };\
+             };",
+            "declare const iterable: {\
+                 [Symbol.asyncIterator]: number;\
+                 [Symbol.iterator](): {\
+                     next(): { value: number; done: false }\
+                 };\
+             };",
+        ] {
+            let result = check_text(&format!(
+                "{source}\
+                 async function consume(): Promise<void> {{\
+                     for await (const value of iterable) {{\
+                         const numberValue: number = value;\
+                     }}\
+                 }}"
+            ));
+            assert!(
+                checker_codes(&result).is_empty(),
+                "{:?}",
+                result.diagnostics()
+            );
+        }
+    }
+
+    #[test]
+    fn plain_for_of_rejects_async_only_protocol() {
+        let result = check_text(
+            "declare const iterable: {\
+                 [Symbol.asyncIterator](): {\
+                     next(): Promise<{ value: number; done: false }>\
+                 };\
+             };\
+             for (const value of iterable) { value; }",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            [super::FOR_OF_ITERABLE_REQUIRED.as_str()]
+        );
+    }
+
+    #[test]
     fn known_iterables_with_error_elements_are_not_reported_as_non_iterable() {
         let result = check_text(
             "declare const array: Array<MissingArrayElement>;\
