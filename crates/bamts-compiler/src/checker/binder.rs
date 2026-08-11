@@ -10677,21 +10677,41 @@ impl<'src> Binder<'src> {
         }
     }
 
+    fn semantic_property_key(value: &EcmaString) -> String {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+        let mut key = String::with_capacity(value.as_units().len());
+        for decoded in char::decode_utf16(value.as_units().iter().copied()) {
+            match decoded {
+                Ok('\0') => key.push_str("\0\0"),
+                Ok(character) => key.push(character),
+                Err(error) => {
+                    let unit = error.unpaired_surrogate();
+                    key.push('\0');
+                    key.push('u');
+                    for shift in [12, 8, 4, 0] {
+                        key.push(HEX[usize::from((unit >> shift) & 0xF)] as char);
+                    }
+                }
+            }
+        }
+        key
+    }
+
     fn property_key(&self, name: &PropertyName) -> Option<String> {
         match name {
             PropertyName::Identifier(identifier) => {
                 Some(self.identifier_text(identifier).into_owned())
             }
-            PropertyName::String(string) => {
-                string_value(self.text(string.data().token())).map(|value| value.to_utf8_lossy())
-            }
+            PropertyName::String(string) => string_value(self.text(string.data().token()))
+                .map(|value| Self::semantic_property_key(&value)),
             PropertyName::Number(number) => {
                 number_value(self.text(number.data().token())).map(enum_plan::number_name)
             }
             PropertyName::Computed(expression) => match expression.data() {
                 Expression::Literal(Literal::String(string)) => {
                     string_value(self.text(string.data().token()))
-                        .map(|value| value.to_utf8_lossy())
+                        .map(|value| Self::semantic_property_key(&value))
                 }
                 Expression::Literal(Literal::Number(number)) => {
                     number_value(self.text(number.data().token())).map(enum_plan::number_name)

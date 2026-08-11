@@ -6287,6 +6287,23 @@ mod tests {
     }
 
     #[test]
+    fn fresh_object_property_keys_preserve_lone_surrogates() {
+        let distinct = check_text(r#"const value: { "\uFFFD": number } = { "\uD800": 1 };"#);
+        assert!(
+            checker_codes(&distinct).contains(&"BAMTS-C067"),
+            "{:?}",
+            checker_codes(&distinct)
+        );
+
+        let same = check_text(r#"const value: { "\uD800": number } = { "\uD800": 1 };"#);
+        assert!(
+            checker_codes(&same).is_empty(),
+            "{:?}",
+            checker_codes(&same)
+        );
+    }
+
+    #[test]
     fn fresh_object_excess_properties_are_checked_for_call_and_new_arguments() {
         let call = check_text(
             "declare function use(value: { ok: number }): void;\
