@@ -1505,8 +1505,7 @@ mod tests {
     }
 
     #[test]
-    fn run_executes_node_vm_scripts_with_the_linked_backend()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn run_executes_node_vm_scripts_with_jit_backend() -> Result<(), Box<dyn std::error::Error>> {
         let cases = [
             (
                 "default-import",
@@ -1543,7 +1542,11 @@ mod tests {
             let entrypoint = directory.join("main.ts");
             std::fs::write(&entrypoint, source)?;
 
-            let args = parse_args(["run", entrypoint.to_str().expect("UTF-8 temp path")])?;
+            let args = parse_args([
+                "run",
+                "--jit",
+                entrypoint.to_str().expect("UTF-8 temp path"),
+            ])?;
             let outcome = super::execute(&args)?;
             assert_eq!(outcome.stdout, expected_stdout, "{name}");
             assert_eq!(outcome.exit_code, 0, "{name}");
