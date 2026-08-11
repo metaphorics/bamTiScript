@@ -425,18 +425,7 @@ fn lower_options(args: &CliArgs) -> LowerOptions {
 }
 
 fn check(args: &CliArgs, frontend: &LoadedProgramFrontend) -> Result<CommandOutcome, DriverError> {
-    let (rendered, truncation) = render_program_diagnostics(args, frontend);
-    if frontend
-        .output
-        .modules()
-        .iter()
-        .any(|module| module.has_errors())
-    {
-        return Err(DriverError::Diagnostics {
-            rendered,
-            truncation,
-        });
-    }
+    let (rendered, truncation) = require_clean_frontend(args, frontend)?;
     Ok(CommandOutcome {
         stderr: rendered.into_bytes(),
         truncation,
