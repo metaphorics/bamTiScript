@@ -11156,7 +11156,7 @@ impl<'a, H: Host> Machine<'a, H> {
         ))
     }
 
-    fn coerce_primitive_default(&mut self, value: Value) -> Result<Value, EvalFailure> {
+    pub(crate) fn coerce_primitive_default(&mut self, value: Value) -> Result<Value, EvalFailure> {
         let prefer_string = self
             .runtime_slot(value)
             .map_err(EvalFailure::Runtime)?

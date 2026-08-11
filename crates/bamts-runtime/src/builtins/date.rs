@@ -66,16 +66,21 @@ fn constructor<H: Host>(
             });
         if let Some(time) = copied_time {
             time_clip(time)
-        } else if let Some(text) = machine.string_value(value) {
-            parse_iso_date(&text).unwrap_or(f64::NAN)
         } else {
-            time_clip(value_number(machine.coerce_number_observable(value)?))
+            let primitive = machine.coerce_primitive_default(value)?;
+            if let Some(text) = machine.string_value(primitive) {
+                parse_iso_date(&text).unwrap_or(f64::NAN)
+            } else {
+                time_clip(value_number(machine.coerce_number_observable(primitive)?))
+            }
         }
     } else {
         let mut components = [0.0; 7];
         components[2] = 1.0;
-        for (component, argument) in components.iter_mut().zip(args.iter().copied()) {
-            *component = value_number(machine.to_number(argument)?);
+        for (i, component) in components.iter_mut().enumerate() {
+            if let Some(&argument) = args.get(i) {
+                *component = value_number(machine.coerce_number_observable(argument)?);
+            }
         }
         date_from_components(components)
     };
@@ -475,7 +480,7 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use bamts_native::Value;
 
@@ -763,6 +768,64 @@ mod tests {
         Ok(BuiltinOutcome::Value(Value::int32(99_999)))
     }
 
+    static CALL_ORDER: AtomicUsize = AtomicUsize::new(0);
+    static YEAR_ORDER: AtomicUsize = AtomicUsize::new(0);
+    static MONTH_ORDER: AtomicUsize = AtomicUsize::new(0);
+    static DAY_ORDER: AtomicUsize = AtomicUsize::new(0);
+    static TO_STRING_CALLED: AtomicBool = AtomicBool::new(false);
+
+    fn year_value_of(
+        _machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        YEAR_ORDER.store(
+            CALL_ORDER.fetch_add(1, Ordering::SeqCst) + 1,
+            Ordering::SeqCst,
+        );
+        Ok(BuiltinOutcome::Value(Value::int32(2024)))
+    }
+
+    fn month_value_of(
+        _machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        MONTH_ORDER.store(
+            CALL_ORDER.fetch_add(1, Ordering::SeqCst) + 1,
+            Ordering::SeqCst,
+        );
+        Ok(BuiltinOutcome::Value(Value::int32(0)))
+    }
+
+    fn day_value_of(
+        _machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        DAY_ORDER.store(
+            CALL_ORDER.fetch_add(1, Ordering::SeqCst) + 1,
+            Ordering::SeqCst,
+        );
+        Ok(BuiltinOutcome::Value(Value::int32(1)))
+    }
+
+    fn to_string_date_string(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        TO_STRING_CALLED.store(true, Ordering::SeqCst);
+        Ok(BuiltinOutcome::Value(allocate_string(
+            machine,
+            EcmaString::encode("2024-01-01T00:00:00.000Z"),
+        )?))
+    }
+
     #[test]
     fn one_argument_copies_valid_and_invalid_date_time_values() {
         let module = blank_program("<test>");
@@ -819,6 +882,79 @@ mod tests {
             "Date valueOf must not be called when copying"
         );
         assert_eq!(date_time(&machine, copy).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn one_argument_parses_object_to_string_primitive() {
+        TO_STRING_CALLED.store(false, Ordering::SeqCst);
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let source = ordinary_object(&mut machine);
+        let to_string = native(&mut machine, "toString", to_string_date_string);
+        machine
+            .set_data_property(source, "toString", to_string)
+            .expect("toString install succeeds");
+
+        let value = call_date(&mut machine, &[source], true);
+        assert!(
+            TO_STRING_CALLED.load(Ordering::SeqCst),
+            "toString must be called"
+        );
+        assert_eq!(
+            date_time(&machine, value).unwrap(),
+            1_704_067_200_000.0,
+            "object toString must be parsed as an ISO date string"
+        );
+    }
+
+    #[test]
+    fn multi_argument_components_call_value_of_in_order() {
+        CALL_ORDER.store(0, Ordering::SeqCst);
+        YEAR_ORDER.store(0, Ordering::SeqCst);
+        MONTH_ORDER.store(0, Ordering::SeqCst);
+        DAY_ORDER.store(0, Ordering::SeqCst);
+
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let year = ordinary_object(&mut machine);
+        let month = ordinary_object(&mut machine);
+        let day = ordinary_object(&mut machine);
+
+        let year_fn = native(&mut machine, "yearValueOf", year_value_of);
+        let month_fn = native(&mut machine, "monthValueOf", month_value_of);
+        let day_fn = native(&mut machine, "dayValueOf", day_value_of);
+
+        machine
+            .set_data_property(year, "valueOf", year_fn)
+            .expect("year valueOf install succeeds");
+        machine
+            .set_data_property(month, "valueOf", month_fn)
+            .expect("month valueOf install succeeds");
+        machine
+            .set_data_property(day, "valueOf", day_fn)
+            .expect("day valueOf install succeeds");
+
+        let value = call_date(&mut machine, &[year, month, day], true);
+        assert_eq!(
+            date_time(&machine, value).unwrap(),
+            1_704_067_200_000.0,
+            "multi-argument components must coerce to 2024-01-01"
+        );
+        assert_eq!(
+            YEAR_ORDER.load(Ordering::SeqCst),
+            1,
+            "year must coerce first"
+        );
+        assert_eq!(
+            MONTH_ORDER.load(Ordering::SeqCst),
+            2,
+            "month must coerce second"
+        );
+        assert_eq!(DAY_ORDER.load(Ordering::SeqCst), 3, "day must coerce third");
     }
 
     #[test]
