@@ -30,15 +30,16 @@ use super::{
     ASSIGNMENT_TO_READONLY, AWAIT_USING_DECLARATION_IN_FOR_IN, BARE_SUPER_EXPRESSION,
     CANNOT_FIND_NAME, CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED,
     CONSTRUCTOR_TYPE_PARAMETERS, DERIVED_CONSTRUCTOR_MISSING_SUPER, DUPLICATE_DECLARATION,
-    EXPRESSION_NOT_CALLABLE, EXPRESSION_NOT_CONSTRUCTABLE, FOR_IN_LEFT_HAND_SIDE_INVALID,
-    FOR_OF_ITERABLE_REQUIRED, FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT,
-    FUNCTION_IMPLEMENTATION_WRONG_NAME, FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION,
-    GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS, IMPORT_CONFLICTS_WITH_LOCAL,
-    INVALID_ASSIGNMENT_TARGET, INVALID_INDEXED_ACCESS_KEY, MEMBER_NOT_ACCESSIBLE,
-    MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT, NEW_TARGET_OUTSIDE_FUNCTION,
-    PARAMETER_DECORATOR_NOT_SUPPORTED, PROPERTY_DOES_NOT_EXIST, PROPERTY_NOT_INITIALIZED,
-    SET_ACCESSOR_PARAMETER_INITIALIZER, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT,
-    STRICT_NULL_MEMBER_ACCESS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
+    EXCESS_PROPERTY, EXPRESSION_NOT_CALLABLE, EXPRESSION_NOT_CONSTRUCTABLE,
+    FOR_IN_LEFT_HAND_SIDE_INVALID, FOR_OF_ITERABLE_REQUIRED,
+    FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT, FUNCTION_IMPLEMENTATION_WRONG_NAME,
+    FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS,
+    IMPORT_CONFLICTS_WITH_LOCAL, INVALID_ASSIGNMENT_TARGET, INVALID_INDEXED_ACCESS_KEY,
+    MEMBER_NOT_ACCESSIBLE, MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT,
+    NEW_TARGET_OUTSIDE_FUNCTION, PARAMETER_DECORATOR_NOT_SUPPORTED, PROPERTY_DOES_NOT_EXIST,
+    PROPERTY_NOT_INITIALIZED, SET_ACCESSOR_PARAMETER_INITIALIZER,
+    STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT, STRICT_NULL_MEMBER_ACCESS,
+    SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
     SUPER_REFERENCE_NON_DERIVED, TYPE_NOT_ASSIGNABLE, USED_BEFORE_ASSIGNED,
     USING_DECLARATION_BINDING_PATTERN, USING_DECLARATION_IN_FOR_IN,
     USING_DECLARATION_MISSING_INITIALIZER, WITH_STATEMENT_NOT_ALLOWED,
@@ -51,14 +52,15 @@ use super::{
     BARE_SUPER_EXPRESSION_MESSAGE, CANNOT_FIND_NAME_MESSAGE, CANNOT_FIND_NAMESPACE_MESSAGE,
     CANNOT_FIND_TYPE_MESSAGE, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED_MESSAGE,
     CONSTRUCTOR_TYPE_PARAMETERS_MESSAGE, DERIVED_CONSTRUCTOR_MISSING_SUPER_MESSAGE,
-    DUPLICATE_MESSAGE, EXPRESSION_NOT_CALLABLE_MESSAGE, EXPRESSION_NOT_CONSTRUCTABLE_MESSAGE,
-    FOR_IN_LEFT_HAND_SIDE_INVALID_MESSAGE, FOR_OF_ITERABLE_REQUIRED_MESSAGE,
-    FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT_MESSAGE, FUNCTION_IMPLEMENTATION_WRONG_NAME_MESSAGE,
-    FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION_MESSAGE, GET_ACCESSOR_NO_RETURN_MESSAGE,
-    GET_ACCESSOR_PARAMETERS_MESSAGE, IMPORT_CONFLICTS_WITH_LOCAL_MESSAGE,
-    INVALID_ASSIGNMENT_TARGET_MESSAGE, INVALID_INDEXED_ACCESS_KEY_MESSAGE,
-    MEMBER_NOT_ACCESSIBLE_MESSAGE, MISSING_METHOD_RETURN_TYPE_MESSAGE,
-    MIXED_EXPORT_ASSIGNMENT_MESSAGE, NEW_TARGET_OUTSIDE_FUNCTION_MESSAGE, NOT_ASSIGNABLE_MESSAGE,
+    DUPLICATE_MESSAGE, EXCESS_PROPERTY_MESSAGE, EXPRESSION_NOT_CALLABLE_MESSAGE,
+    EXPRESSION_NOT_CONSTRUCTABLE_MESSAGE, FOR_IN_LEFT_HAND_SIDE_INVALID_MESSAGE,
+    FOR_OF_ITERABLE_REQUIRED_MESSAGE, FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT_MESSAGE,
+    FUNCTION_IMPLEMENTATION_WRONG_NAME_MESSAGE, FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION_MESSAGE,
+    GET_ACCESSOR_NO_RETURN_MESSAGE, GET_ACCESSOR_PARAMETERS_MESSAGE,
+    IMPORT_CONFLICTS_WITH_LOCAL_MESSAGE, INVALID_ASSIGNMENT_TARGET_MESSAGE,
+    INVALID_INDEXED_ACCESS_KEY_MESSAGE, MEMBER_NOT_ACCESSIBLE_MESSAGE,
+    MISSING_METHOD_RETURN_TYPE_MESSAGE, MIXED_EXPORT_ASSIGNMENT_MESSAGE,
+    NEW_TARGET_OUTSIDE_FUNCTION_MESSAGE, NOT_ASSIGNABLE_MESSAGE,
     PARAMETER_DECORATOR_NOT_SUPPORTED_MESSAGE, PROPERTY_DOES_NOT_EXIST_MESSAGE,
     PROPERTY_NOT_INITIALIZED_MESSAGE, SET_ACCESSOR_PARAMETER_INITIALIZER_MESSAGE,
     STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT_MESSAGE, STRICT_NULL_MEMBER_ACCESS_MESSAGE,
@@ -691,6 +693,7 @@ enum CallMismatch {
     NotCallable,
     ArgumentCount,
     ArgumentType(TextRange),
+    ExcessProperty(TextRange),
 }
 
 #[derive(Clone, Debug)]
@@ -727,9 +730,16 @@ impl CallEvaluation {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum ResolvedCallArgument {
-    Fixed { type_id: TypeId, range: TextRange },
-    Variadic { element: TypeId, range: TextRange },
+enum ResolvedCallArgument<'src> {
+    Fixed {
+        type_id: TypeId,
+        range: TextRange,
+        expression: Option<&'src Expr>,
+    },
+    Variadic {
+        element: TypeId,
+        range: TextRange,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8127,8 +8137,8 @@ impl<'src> Binder<'src> {
             }
             Expression::Satisfies(satisfies) => {
                 self.resolve_transparent_expression(expression, &satisfies.expression, scope);
-                let source = self.type_of_expr(&satisfies.expression, scope);
                 let target = self.resolve_type(&satisfies.type_node, scope);
+                let source = self.type_of_expr_with_target(&satisfies.expression, target, scope);
                 if !self.types_assignable(source, target) {
                     self.emit(
                         TYPE_NOT_ASSIGNABLE,
@@ -8329,6 +8339,9 @@ impl<'src> Binder<'src> {
                     range,
                     ARGUMENT_NOT_ASSIGNABLE_MESSAGE,
                 ),
+                CallMismatch::ExcessProperty(range) => {
+                    (EXCESS_PROPERTY, range, EXCESS_PROPERTY_MESSAGE)
+                }
             };
             self.emit(code, range, message);
         }
@@ -8417,6 +8430,9 @@ impl<'src> Binder<'src> {
                     argument_range,
                     ARGUMENT_NOT_ASSIGNABLE_MESSAGE,
                 ),
+                CallMismatch::ExcessProperty(range) => {
+                    (EXCESS_PROPERTY, range, EXCESS_PROPERTY_MESSAGE)
+                }
             };
             self.emit(code, diagnostic_range, message);
         }
@@ -8451,7 +8467,7 @@ impl<'src> Binder<'src> {
     fn evaluate_signature_groups<C: SignatureCandidate>(
         &mut self,
         groups: Vec<Vec<C>>,
-        arguments: &[ResolvedCallArgument],
+        arguments: &[ResolvedCallArgument<'src>],
         explicit_types: Option<&[TypeId]>,
         diagnostic_range: TextRange,
     ) -> CallEvaluation {
@@ -8507,7 +8523,7 @@ impl<'src> Binder<'src> {
         &mut self,
         arguments: &'src [CallArgument],
         scope: ScopeId,
-    ) -> Vec<ResolvedCallArgument> {
+    ) -> Vec<ResolvedCallArgument<'src>> {
         let mut resolved = Vec::new();
         for argument in arguments {
             match argument {
@@ -8515,6 +8531,7 @@ impl<'src> Binder<'src> {
                     resolved.push(ResolvedCallArgument::Fixed {
                         type_id: self.type_of_expr(expression, scope),
                         range: expression.range(),
+                        expression: Some(expression),
                     });
                 }
                 CallArgument::Spread(spread) => {
@@ -8530,6 +8547,7 @@ impl<'src> Binder<'src> {
                                 resolved.push(ResolvedCallArgument::Fixed {
                                     type_id,
                                     range: spread.argument.range(),
+                                    expression: None,
                                 });
                             }
                             if let Some(rest) = shape.rest {
@@ -8609,6 +8627,9 @@ impl<'src> Binder<'src> {
                     range,
                     ARGUMENT_NOT_ASSIGNABLE_MESSAGE,
                 ),
+                CallMismatch::ExcessProperty(range) => {
+                    (EXCESS_PROPERTY, range, EXCESS_PROPERTY_MESSAGE)
+                }
             };
             self.emit(code, range, message);
         }
@@ -8637,18 +8658,20 @@ impl<'src> Binder<'src> {
         tagged: &'src crate::syntax::TaggedTemplateExpression,
         scope: ScopeId,
         call_range: TextRange,
-    ) -> Vec<ResolvedCallArgument> {
+    ) -> Vec<ResolvedCallArgument<'src>> {
         let strings_range = self
             .template_literal_range(&tagged.template)
             .unwrap_or(call_range);
         let mut resolved = vec![ResolvedCallArgument::Fixed {
             type_id: self.types.array(self.types.string()),
             range: strings_range,
+            expression: None,
         }];
         for expression in &tagged.template.expressions {
             resolved.push(ResolvedCallArgument::Fixed {
                 type_id: self.type_of_expr(expression, scope),
                 range: expression.range(),
+                expression: Some(expression),
             });
         }
         resolved
@@ -8785,7 +8808,7 @@ impl<'src> Binder<'src> {
     fn signature_argument_mismatches(
         &mut self,
         signature: &FunctionSignature,
-        arguments: &[ResolvedCallArgument],
+        arguments: &[ResolvedCallArgument<'src>],
     ) -> Vec<CallMismatch> {
         let fixed_count = arguments
             .iter()
@@ -8819,8 +8842,12 @@ impl<'src> Binder<'src> {
             if rest_index == Some(parameter_index) {
                 target = self.array_element_type(target).unwrap_or(target);
             }
-            let (source, range) = match argument {
-                ResolvedCallArgument::Fixed { type_id, range } => (*type_id, *range),
+            let (source, range, expression) = match argument {
+                ResolvedCallArgument::Fixed {
+                    type_id,
+                    range,
+                    expression,
+                } => (*type_id, *range, *expression),
                 ResolvedCallArgument::Variadic { element, range } => {
                     if rest_index != Some(parameter_index) {
                         if signature.javascript() {
@@ -8828,13 +8855,22 @@ impl<'src> Binder<'src> {
                         }
                         return vec![CallMismatch::ArgumentCount];
                     }
-                    (*element, *range)
+                    (*element, *range, None)
                 }
             };
-            if !(matches!(self.types.get(source), Type::Undefined) && parameter.optional())
-                && !self.types_assignable(source, target)
-            {
+            let assignable = (matches!(self.types.get(source), Type::Undefined)
+                && parameter.optional())
+                || self.types_assignable(source, target);
+            if !assignable {
                 mismatches.push(CallMismatch::ArgumentType(range));
+                continue;
+            }
+            if let Some(expression) = expression {
+                mismatches.extend(
+                    self.fresh_excess_property_ranges(expression, target, true)
+                        .into_iter()
+                        .map(CallMismatch::ExcessProperty),
+                );
             }
         }
         mismatches
@@ -10538,7 +10574,245 @@ impl<'src> Binder<'src> {
                 )
             }
             PropertyName::Number(number) => Some(self.text(number.data().token()).to_owned()),
+            PropertyName::Computed(expression) => match expression.data() {
+                Expression::Literal(Literal::String(string)) => {
+                    let text = self.text(string.data().token());
+                    Some(
+                        text.trim_matches(|c| c == '"' || c == '\'' || c == '`')
+                            .to_owned(),
+                    )
+                }
+                Expression::Literal(Literal::Number(number)) => {
+                    Some(self.text(number.data().token()).to_owned())
+                }
+                _ => None,
+            },
+            PropertyName::Private(_) | PropertyName::Missing(_) => None,
+        }
+    }
+
+    fn fresh_object_candidates(&mut self, target: TypeId) -> Vec<ObjectType> {
+        let target = self.types.non_nullable(target);
+        let target = self
+            .types
+            .prepare_applied_class_view(target)
+            .unwrap_or(target);
+        let target = self.types.named_structural_view(target);
+        match self.types.get(target).clone() {
+            Type::Union(members) => members
+                .into_iter()
+                .filter_map(|member| self.fresh_object_candidate(member))
+                .collect(),
+            _ => self.fresh_object_candidate(target).into_iter().collect(),
+        }
+    }
+
+    fn fresh_object_candidate(&mut self, target: TypeId) -> Option<ObjectType> {
+        let target = self
+            .types
+            .prepare_applied_class_view(target)
+            .unwrap_or(target);
+        let structural = self.types.named_structural_view(target);
+        if structural != target {
+            return self.fresh_object_candidate(structural);
+        }
+        match self.types.get(target).clone() {
+            Type::ObjectType(object) => Some(object),
+            Type::Intersection(members) => {
+                let mut combined = ObjectType {
+                    properties: Vec::new(),
+                    call_signatures: Vec::new(),
+                    construct_signatures: Vec::new(),
+                    index_signatures: Vec::new(),
+                };
+                let mut found = false;
+                for member in members {
+                    let Some(object) = self.fresh_object_candidate(member) else {
+                        continue;
+                    };
+                    found = true;
+                    combined.properties.extend(object.properties);
+                    combined.call_signatures.extend(object.call_signatures);
+                    combined
+                        .construct_signatures
+                        .extend(object.construct_signatures);
+                    combined.index_signatures.extend(object.index_signatures);
+                }
+                found.then_some(combined)
+            }
+            Type::Named(symbol) => {
+                let resolved = self
+                    .types
+                    .type_parameter_constraint(symbol)
+                    .unwrap_or(self.symbol_types[symbol.get() as usize]);
+                (resolved != target)
+                    .then(|| self.fresh_object_candidate(resolved))
+                    .flatten()
+            }
             _ => None,
+        }
+    }
+
+    fn object_property_target(&self, object: &ObjectType, key: &str) -> Option<TypeId> {
+        if let Some(property) = object
+            .properties
+            .iter()
+            .find(|property| property.name() == key)
+        {
+            return Some(property.type_id());
+        }
+        let numeric = key.parse::<usize>().is_ok();
+        object.index_signatures.iter().find_map(|signature| {
+            let parameter = signature.parameters.first()?;
+            match self.types.get(parameter.type_id()) {
+                Type::String => Some(signature.value_type),
+                Type::Number if numeric => Some(signature.value_type),
+                _ => None,
+            }
+        })
+    }
+
+    fn literal_discriminant_type(&self, type_id: TypeId) -> bool {
+        match self.types.get(type_id) {
+            Type::BooleanLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::StringLiteral(_)
+            | Type::BigIntLiteral(_) => true,
+            Type::Union(members) => members
+                .iter()
+                .all(|member| self.literal_discriminant_type(*member)),
+            _ => false,
+        }
+    }
+
+    fn filter_discriminated_candidates(
+        &mut self,
+        object: &'src ObjectLiteral,
+        mut candidates: Vec<ObjectType>,
+    ) -> Vec<ObjectType> {
+        for member in &object.members {
+            let ObjectMember::Property(property) = member.data() else {
+                continue;
+            };
+            let Some(name) = self.property_key(&property.name) else {
+                continue;
+            };
+            let Expression::Literal(literal) = property.value.data() else {
+                continue;
+            };
+            let targets: Vec<_> = candidates
+                .iter()
+                .filter_map(|candidate| {
+                    candidate
+                        .properties
+                        .iter()
+                        .find(|property| property.name() == name)
+                        .map(PropertyType::type_id)
+                })
+                .collect();
+            if targets.len() != candidates.len()
+                || !targets
+                    .iter()
+                    .all(|target| self.literal_discriminant_type(*target))
+            {
+                continue;
+            }
+            let source = self.type_of_literal(literal);
+            let filtered: Vec<_> = candidates
+                .into_iter()
+                .zip(targets)
+                .filter_map(|(candidate, target)| {
+                    self.types_assignable(source, target).then_some(candidate)
+                })
+                .collect();
+            if filtered.is_empty() {
+                return Vec::new();
+            }
+            candidates = filtered;
+        }
+        candidates
+    }
+
+    fn fresh_excess_property_ranges(
+        &mut self,
+        expression: &'src Expr,
+        target: TypeId,
+        recurse: bool,
+    ) -> Vec<TextRange> {
+        match expression.data() {
+            Expression::Object(object) => {
+                let candidates = self.fresh_object_candidates(target);
+                if candidates.is_empty() {
+                    return Vec::new();
+                }
+                let candidates = self.filter_discriminated_candidates(object, candidates);
+                if candidates.is_empty() {
+                    return Vec::new();
+                }
+                let mut ranges = Vec::new();
+                for member in &object.members {
+                    let (name, value) = match member.data() {
+                        ObjectMember::Property(property) => {
+                            (self.property_key(&property.name), Some(&property.value))
+                        }
+                        ObjectMember::Method(method) => (self.property_key(&method.name), None),
+                        ObjectMember::Spread(_) | ObjectMember::Missing(_) => continue,
+                    };
+                    let Some(name) = name else {
+                        continue;
+                    };
+                    let property_targets: Vec<_> = candidates
+                        .iter()
+                        .filter_map(|candidate| self.object_property_target(candidate, &name))
+                        .collect();
+                    if property_targets.is_empty() {
+                        ranges.push(member.range());
+                        continue;
+                    }
+                    if recurse && let Some(value) = value {
+                        let target = self.types.union(&property_targets);
+                        ranges.extend(self.fresh_excess_property_ranges(value, target, true));
+                    }
+                }
+                ranges
+            }
+            Expression::Array(array) if recurse => {
+                let target = self.types.non_nullable(target);
+                let (target_shape, array_target) = match self.types.get(target).clone() {
+                    Type::Tuple(shape) => (Some(shape), None),
+                    Type::Array(element) => (None, Some(element)),
+                    _ => return Vec::new(),
+                };
+                let source_length = array.elements.len();
+                let mut ranges = Vec::new();
+                for (index, element) in array.elements.iter().enumerate() {
+                    let ArrayElement::Expression(inner) = element else {
+                        continue;
+                    };
+                    let element_target = target_shape
+                        .as_ref()
+                        .and_then(|shape| {
+                            let elements = shape.element_types_at_length(index, source_length);
+                            (!elements.is_empty()).then(|| self.types.union(&elements))
+                        })
+                        .or(array_target);
+                    if let Some(target) = element_target {
+                        ranges.extend(self.fresh_excess_property_ranges(inner, target, true));
+                    }
+                }
+                ranges
+            }
+            Expression::Conditional(conditional) if recurse => {
+                let mut ranges =
+                    self.fresh_excess_property_ranges(&conditional.consequent, target, true);
+                ranges.extend(self.fresh_excess_property_ranges(
+                    &conditional.alternate,
+                    target,
+                    true,
+                ));
+                ranges
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -10619,7 +10893,13 @@ impl<'src> Binder<'src> {
                     self.types.array(element)
                 }
             }
-            Expression::Object(object) => self.type_of_object_literal(object, Some(target), scope),
+            Expression::Object(object) => {
+                let result = self.type_of_object_literal(object, Some(target), scope);
+                for range in self.fresh_excess_property_ranges(expression, target, false) {
+                    self.emit(EXCESS_PROPERTY, range, EXCESS_PROPERTY_MESSAGE);
+                }
+                result
+            }
             Expression::Conditional(conditional) => {
                 self.type_of_conditional_expr(conditional, Some(target), scope)
             }

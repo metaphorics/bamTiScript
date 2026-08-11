@@ -203,6 +203,8 @@ pub const INVALID_INDEXED_ACCESS_KEY: DiagnosticCode = DiagnosticCode::new("BAMT
 pub const FOR_OF_ITERABLE_REQUIRED: DiagnosticCode = DiagnosticCode::new("BAMTS-C065");
 /// Diagnostic emitted when a `new` expression selects an abstract construct signature.
 pub const ABSTRACT_CONSTRUCTOR: DiagnosticCode = DiagnosticCode::new("BAMTS-C066");
+/// Diagnostic emitted for an explicit property that no viable fresh-object target admits.
+pub const EXCESS_PROPERTY: DiagnosticCode = DiagnosticCode::new("BAMTS-C067");
 const PROPERTY_NOT_INITIALIZED_MESSAGE: &str =
     "Property has no initializer and is not definitely assigned in the constructor.";
 const ASSIGNMENT_TO_FUNCTION_MESSAGE: &str = "Cannot assign to a function.";
@@ -266,6 +268,7 @@ pub(crate) const SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE: &str =
 const DERIVED_CONSTRUCTOR_MISSING_SUPER_MESSAGE: &str =
     "Constructors for derived classes must contain a 'super' call.";
 const ABSTRACT_CONSTRUCTOR_MESSAGE: &str = "Cannot create an instance of an abstract class.";
+const EXCESS_PROPERTY_MESSAGE: &str = "Object literal may only specify known properties.";
 const ARGUMENT_NOT_ASSIGNABLE_MESSAGE: &str = "Argument type is not assignable to parameter type.";
 const ARGUMENT_COUNT_MISMATCH_MESSAGE: &str =
     "Supplied arguments do not match the expected parameter count.";
@@ -6166,6 +6169,114 @@ mod tests {
         let result = check_text("for (const value of missing) { value; }");
         assert!(!checker_codes(&result).contains(&super::FOR_OF_ITERABLE_REQUIRED.as_str()));
     }
+
+    #[test]
+    fn fresh_object_excess_properties_are_checked_at_direct_boundaries() {
+        for source in [
+            "const options: { timeout: number } = { timeout: 100, timout: 100 };",
+            "let options: { timeout: number }; options = { timeout: 100, timout: 100 };",
+            "function options(): { timeout: number } { return { timeout: 100, timout: 100 }; }",
+            "const options = { timeout: 100, timout: 100 } satisfies { timeout: number };",
+        ] {
+            let result = check_text(source);
+            assert_eq!(
+                checker_codes(&result),
+                ["BAMTS-C067"],
+                "{source}: {:?}",
+                checker_codes(&result)
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_object_excess_properties_are_checked_recursively() {
+        for source in [
+            "const value: { nested: { ok: number } } = { nested: { ok: 1, extra: 2 } };",
+            "const value: { ok: number }[] = [{ ok: 1, extra: 2 }];",
+        ] {
+            let result = check_text(source);
+            assert_eq!(
+                checker_codes(&result),
+                ["BAMTS-C067"],
+                "{source}: {:?}",
+                checker_codes(&result)
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_object_excess_properties_are_checked_for_call_and_new_arguments() {
+        let call = check_text(
+            "declare function use(value: { ok: number }): void;\
+             use({ ok: 1, extra: 2 });",
+        );
+        assert_eq!(checker_codes(&call), ["BAMTS-C067"]);
+
+        let construct = check_text(
+            "declare const Factory: new (value: { ok: number }) => object;\
+             new Factory({ ok: 1, extra: 2 });",
+        );
+        assert_eq!(checker_codes(&construct), ["BAMTS-C067"]);
+    }
+
+    #[test]
+    fn stored_and_spread_object_properties_are_not_fresh() {
+        let stored = check_text(
+            "const stored = { ok: 1, extra: 2 }; const accepted: { ok: number } = stored;",
+        );
+        assert!(checker_codes(&stored).is_empty());
+
+        let spread = check_text(
+            "const source = { extra: 2 };\
+             const accepted: { ok: number } = { ok: 1, ...source };",
+        );
+        assert!(checker_codes(&spread).is_empty());
+
+        let explicit_after_spread = check_text(
+            "const source = { extra: 2 };\
+             const rejected: { ok: number } = { ok: 1, ...source, explicit: 3 };",
+        );
+        assert_eq!(checker_codes(&explicit_after_spread), ["BAMTS-C067"]);
+    }
+
+    #[test]
+    fn fresh_object_static_computed_keys_and_index_signatures_are_checked() {
+        let computed = check_text("const value: { ok: number } = { ok: 1, ['extra']: 2 };");
+        assert_eq!(checker_codes(&computed), ["BAMTS-C067"]);
+
+        let indexed = check_text("const value: { [key: string]: number } = { ok: 1, extra: 2 };");
+        assert!(checker_codes(&indexed).is_empty());
+    }
+
+    #[test]
+    fn fresh_object_union_keys_follow_discriminant_narrowing() {
+        let nondiscriminated = check_text(
+            "type Target = { a: number } | { b: number };\
+             const value: Target = { a: 1, b: 2 };",
+        );
+        assert!(checker_codes(&nondiscriminated).is_empty());
+
+        let discriminated = check_text(
+            "type Target = { kind: 'a'; a: number } | { kind: 'b'; b: number };\
+             const value: Target = { kind: 'a', a: 1, b: 2 };",
+        );
+        assert_eq!(checker_codes(&discriminated), ["BAMTS-C067"]);
+    }
+
+    #[test]
+    fn fresh_object_overloads_reject_candidates_without_emitting_eagerly() {
+        let result = check_text(
+            "declare function choose(value: { value: number }): number;\
+             declare function choose(value: { value: number; extra: number }): number;\
+             choose({ value: 1, extra: 2 });",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
+    }
+
     // ---- object-literal spread ------------------------------------------------
 
     #[test]
