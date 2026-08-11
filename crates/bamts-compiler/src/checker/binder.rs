@@ -1302,7 +1302,11 @@ impl TypeTable {
         }
     }
 
-    pub(crate) fn iterator_property_of(&mut self, ty: TypeId) -> Option<IteratorProperty> {
+    pub(crate) fn iterator_property_of(
+        &mut self,
+        ty: TypeId,
+        protocol: ForOfMode,
+    ) -> Option<IteratorProperty> {
         let ty = self.named_structural_view(ty);
         let ty = match self.get(ty) {
             Type::Named(symbol) => self
@@ -1313,10 +1317,13 @@ impl TypeTable {
             _ => ty,
         };
         match self.get(ty).clone() {
-            Type::ObjectType(object) => object.iterator_property,
+            Type::ObjectType(object) => match protocol {
+                ForOfMode::Sync => object.iterator_property,
+                ForOfMode::Async => object.async_iterator_property,
+            },
             Type::AppliedClass { .. } => self
                 .prepare_applied_class_view(ty)
-                .and_then(|view| self.iterator_property_of(view)),
+                .and_then(|view| self.iterator_property_of(view, protocol)),
             _ => None,
         }
     }
@@ -7128,19 +7135,31 @@ impl<'src> Binder<'src> {
         class: &'src ClassDeclaration,
         scope: ScopeId,
         side: ClassSide,
-    ) -> (Vec<PropertyType>, HashSet<String>, Option<IteratorProperty>) {
+    ) -> (
+        Vec<PropertyType>,
+        HashSet<String>,
+        Option<IteratorProperty>,
+        Option<IteratorProperty>,
+    ) {
         let mut properties = Vec::new();
         let mut seen = HashSet::new();
         let mut iterator_property = None;
+        let mut async_iterator_property = None;
         let mut overload_state = HashMap::<String, bool>::new();
         let mut iterator_overload = false;
+        let mut async_iterator_overload = false;
         let declaring_class = self.scopes[scope.0 as usize].owner;
         for member in &class.members {
             let intrinsic_iterator = match member.data() {
                 ClassMember::Property(property)
                     if side.includes(property.modifiers.is_static)
-                        && self.is_intrinsic_symbol_iterator_name(&property.name) =>
+                        && self
+                            .intrinsic_symbol_iterator_protocol(&property.name)
+                            .is_some() =>
                 {
+                    let protocol = self
+                        .intrinsic_symbol_iterator_protocol(&property.name)
+                        .expect("guard checked iterator protocol");
                     let type_id = self.class_property_type(
                         property.type_annotation.as_ref(),
                         property.initializer.as_deref(),
@@ -7148,7 +7167,8 @@ impl<'src> Binder<'src> {
                         scope,
                         false,
                     );
-                    Some(
+                    Some((
+                        protocol,
                         IteratorProperty::new(type_id, property.optional).with_accessibility(
                             property
                                 .modifiers
@@ -7156,12 +7176,17 @@ impl<'src> Binder<'src> {
                                 .unwrap_or(Accessibility::Public),
                             declaring_class,
                         ),
-                    )
+                    ))
                 }
                 ClassMember::AutoAccessor(accessor)
                     if side.includes(accessor.modifiers.is_static)
-                        && self.is_intrinsic_symbol_iterator_name(&accessor.name) =>
+                        && self
+                            .intrinsic_symbol_iterator_protocol(&accessor.name)
+                            .is_some() =>
                 {
+                    let protocol = self
+                        .intrinsic_symbol_iterator_protocol(&accessor.name)
+                        .expect("guard checked iterator protocol");
                     let type_id = self.class_property_type(
                         accessor.type_annotation.as_ref(),
                         accessor.initializer.as_deref(),
@@ -7169,7 +7194,8 @@ impl<'src> Binder<'src> {
                         scope,
                         false,
                     );
-                    Some(
+                    Some((
+                        protocol,
                         IteratorProperty::new(type_id, false)
                             .with_accessibility(
                                 accessor
@@ -7179,20 +7205,29 @@ impl<'src> Binder<'src> {
                                 declaring_class,
                             )
                             .with_spreadable(false),
-                    )
+                    ))
                 }
                 ClassMember::Method(method)
                     if side.includes(method.modifiers.is_static)
-                        && self.is_intrinsic_symbol_iterator_name(&method.name) =>
+                        && self
+                            .intrinsic_symbol_iterator_protocol(&method.name)
+                            .is_some() =>
                 {
+                    let protocol = self
+                        .intrinsic_symbol_iterator_protocol(&method.name)
+                        .expect("guard checked iterator protocol");
                     let (type_id, is_method) = match method.modifier {
                         PropertyModifier::None => {
                             let is_overload_signature =
                                 method.function.body.is_none() && !method.modifiers.is_abstract;
+                            let overload = match protocol {
+                                ForOfMode::Sync => &mut iterator_overload,
+                                ForOfMode::Async => &mut async_iterator_overload,
+                            };
                             if is_overload_signature {
-                                iterator_overload = true;
-                            } else if iterator_overload {
-                                iterator_overload = false;
+                                *overload = true;
+                            } else if *overload {
+                                *overload = false;
                                 continue;
                             }
                             let signature_scope = self.class_method_signature_scope(
@@ -7213,7 +7248,8 @@ impl<'src> Binder<'src> {
                         }
                         PropertyModifier::Set => continue,
                     };
-                    Some(
+                    Some((
+                        protocol,
                         IteratorProperty::new(type_id, method.optional)
                             .with_accessibility(
                                 method
@@ -7224,12 +7260,16 @@ impl<'src> Binder<'src> {
                             )
                             .with_method(is_method)
                             .with_spreadable(false),
-                    )
+                    ))
                 }
                 _ => None,
             };
-            if let Some(property) = intrinsic_iterator {
-                iterator_property = Some(match iterator_property.take() {
+            if let Some((protocol, property)) = intrinsic_iterator {
+                let target = match protocol {
+                    ForOfMode::Sync => &mut iterator_property,
+                    ForOfMode::Async => &mut async_iterator_property,
+                };
+                *target = Some(match target.take() {
                     None => property,
                     Some(existing) => self.merge_iterator_properties(existing, property),
                 });
@@ -7371,7 +7411,7 @@ impl<'src> Binder<'src> {
                     .with_method(is_method),
             );
         }
-        (properties, seen, iterator_property)
+        (properties, seen, iterator_property, async_iterator_property)
     }
 
     fn class_property_type(
@@ -7430,7 +7470,7 @@ impl<'src> Binder<'src> {
         owner: Option<SymbolId>,
         state: ClassState,
     ) -> TypeId {
-        let (mut properties, mut seen, mut iterator_property) =
+        let (mut properties, mut seen, mut iterator_property, mut async_iterator_property) =
             self.class_member_properties(class, scope, ClassSide::Instance);
         for constructor in class.members.iter().filter_map(|member| {
             let ClassMember::Constructor(constructor) = member.data() else {
@@ -7492,6 +7532,9 @@ impl<'src> Binder<'src> {
                 if iterator_property.is_none() {
                     iterator_property = base_props.iterator_property;
                 }
+                if async_iterator_property.is_none() {
+                    async_iterator_property = base_props.async_iterator_property;
+                }
                 for base_prop in base_props.properties {
                     if seen.insert(base_prop.name().to_string()) {
                         properties.push(base_prop);
@@ -7506,7 +7549,7 @@ impl<'src> Binder<'src> {
             index_signatures: Vec::new(),
             generator_return: None,
             iterator_property,
-            async_iterator_property: None,
+            async_iterator_property,
         });
         let Some(owner) = owner else {
             return raw;
@@ -7526,7 +7569,7 @@ impl<'src> Binder<'src> {
         scope: ScopeId,
         instance_type: TypeId,
     ) -> TypeId {
-        let (mut properties, mut seen, mut iterator_property) =
+        let (mut properties, mut seen, mut iterator_property, mut async_iterator_property) =
             self.class_member_properties(class, scope, ClassSide::Static);
         if seen.insert("prototype".to_owned()) {
             let prototype_type = self
@@ -7577,6 +7620,11 @@ impl<'src> Binder<'src> {
                 .as_ref()
                 .and_then(|object| object.iterator_property.clone());
         }
+        if async_iterator_property.is_none() {
+            async_iterator_property = base_static
+                .as_ref()
+                .and_then(|object| object.async_iterator_property.clone());
+        }
         let construct_signatures = self.class_construct_signatures(
             class,
             scope,
@@ -7591,7 +7639,7 @@ impl<'src> Binder<'src> {
             index_signatures: Vec::new(),
             generator_return: None,
             iterator_property,
-            async_iterator_property: None,
+            async_iterator_property,
         })
     }
 
@@ -10891,6 +10939,16 @@ impl<'src> Binder<'src> {
                                     Some(self.merge_iterator_properties(left, right))
                                 }
                             };
+                        merged.async_iterator_property = match (
+                            merged.async_iterator_property.take(),
+                            object.async_iterator_property,
+                        ) {
+                            (None, property) => property,
+                            (property, None) => property,
+                            (Some(left), Some(right)) => {
+                                Some(self.merge_iterator_properties(left, right))
+                            }
+                        };
                         merged.properties.extend(object.properties);
                         for signature in object.call_signatures {
                             if !merged.call_signatures.contains(&signature) {
@@ -10934,6 +10992,7 @@ impl<'src> Binder<'src> {
         let mut object = self.resolve_type_members(members, scope);
         let declared_properties = object.properties.len();
         let declared_iterator = object.iterator_property.is_some();
+        let declared_async_iterator = object.async_iterator_property.is_some();
         for base in extends {
             let base_type = self.resolve_type_reference(
                 base,
@@ -10947,7 +11006,8 @@ impl<'src> Binder<'src> {
                     Some(existing) => Some(self.types.intersection(vec![existing, return_type])),
                 };
             }
-            if let Some(base_property) = self.types.iterator_property_of(base_type) {
+            if let Some(base_property) = self.types.iterator_property_of(base_type, ForOfMode::Sync)
+            {
                 if let Some(existing) = &object.iterator_property {
                     let incompatible = if declared_iterator {
                         (existing.optional() && !base_property.optional())
@@ -10969,6 +11029,32 @@ impl<'src> Binder<'src> {
                     None => base_property,
                     Some(existing) => self.merge_iterator_properties(existing, base_property),
                 });
+            }
+            if let Some(base_property) =
+                self.types.iterator_property_of(base_type, ForOfMode::Async)
+            {
+                if let Some(existing) = &object.async_iterator_property {
+                    let incompatible = if declared_async_iterator {
+                        (existing.optional() && !base_property.optional())
+                            || !self.types_assignable(existing.type_id(), base_property.type_id())
+                    } else {
+                        existing.optional() != base_property.optional()
+                            || !TypeRelations::new(&self.types)
+                                .equivalent(existing.type_id(), base_property.type_id())
+                    };
+                    if incompatible {
+                        self.emit(
+                            TYPE_NOT_ASSIGNABLE,
+                            self.entity_name_range(&base.name),
+                            NOT_ASSIGNABLE_MESSAGE,
+                        );
+                    }
+                }
+                object.async_iterator_property =
+                    Some(match object.async_iterator_property.take() {
+                        None => base_property,
+                        Some(existing) => self.merge_iterator_properties(existing, base_property),
+                    });
             }
             let base_view = self.types.named_structural_view(base_type);
             if let Type::ObjectType(base_object) = self.types.get(base_view).clone() {
@@ -11043,7 +11129,8 @@ impl<'src> Binder<'src> {
             match member.data() {
                 TypeMember::Property(property) => {
                     self.resolve_property_name(&property.name, scope);
-                    if self.is_intrinsic_symbol_iterator_name(&property.name) {
+                    if let Some(protocol) = self.intrinsic_symbol_iterator_protocol(&property.name)
+                    {
                         let method = match &property.type_annotation {
                             Some(annotation) => {
                                 self.resolve_type(&annotation.data().type_node, scope)
@@ -11051,7 +11138,11 @@ impl<'src> Binder<'src> {
                             None => self.types.any(),
                         };
                         let property = IteratorProperty::new(method, property.optional);
-                        object.iterator_property = Some(match object.iterator_property.take() {
+                        let target = match protocol {
+                            ForOfMode::Sync => &mut object.iterator_property,
+                            ForOfMode::Async => &mut object.async_iterator_property,
+                        };
+                        *target = Some(match target.take() {
                             None => property,
                             Some(existing) => self.merge_iterator_properties(existing, property),
                         });
@@ -11072,7 +11163,7 @@ impl<'src> Binder<'src> {
                 }
                 TypeMember::Method(method) => {
                     self.resolve_property_name(&method.name, scope);
-                    if self.is_intrinsic_symbol_iterator_name(&method.name) {
+                    if let Some(protocol) = self.intrinsic_symbol_iterator_protocol(&method.name) {
                         if self.no_implicit_any && method.function.return_type_missing {
                             self.emit(
                                 MISSING_METHOD_RETURN_TYPE,
@@ -11083,7 +11174,11 @@ impl<'src> Binder<'src> {
                         let method_type = self.resolve_function_type(&method.function, scope);
                         let property =
                             IteratorProperty::new(method_type, method.optional).with_method(true);
-                        object.iterator_property = Some(match object.iterator_property.take() {
+                        let target = match protocol {
+                            ForOfMode::Sync => &mut object.iterator_property,
+                            ForOfMode::Async => &mut object.async_iterator_property,
+                        };
+                        *target = Some(match target.take() {
                             None => property,
                             Some(existing) => self.merge_iterator_properties(existing, property),
                         });
@@ -11224,31 +11319,33 @@ impl<'src> Binder<'src> {
         key
     }
 
-    fn is_intrinsic_symbol_iterator(&self, expression: &Expr) -> bool {
+    fn intrinsic_symbol_iterator_protocol(&self, name: &PropertyName) -> Option<ForOfMode> {
+        let PropertyName::Computed(expression) = name else {
+            return None;
+        };
         let Expression::Member(member) = expression.data() else {
-            return false;
+            return None;
         };
         let Expression::Identifier(object) = member.object.data() else {
-            return false;
+            return None;
         };
         let MemberProperty::Named(property) = &member.property else {
-            return false;
+            return None;
         };
-        self.identifier_text(object) == "Symbol"
-            && self.identifier_text(property) == "iterator"
-            && self
+        if self.identifier_text(object) != "Symbol"
+            || !self
                 .resolved_expression_reference(&member.object)
                 .is_some_and(|symbol| {
                     self.symbols[symbol.get() as usize].kind == SymbolKind::IntrinsicValue
                 })
-    }
-
-    fn is_intrinsic_symbol_iterator_name(&self, name: &PropertyName) -> bool {
-        matches!(
-            name,
-            PropertyName::Computed(expression)
-                if self.is_intrinsic_symbol_iterator(expression)
-        )
+        {
+            return None;
+        }
+        match self.identifier_text(property).as_ref() {
+            "iterator" => Some(ForOfMode::Sync),
+            "asyncIterator" => Some(ForOfMode::Async),
+            _ => None,
+        }
     }
     fn property_key(&self, name: &PropertyName) -> Option<String> {
         match name {
@@ -11732,6 +11829,7 @@ impl<'src> Binder<'src> {
         let contextual_target = contextual_target.map(|target| self.types.non_nullable(target));
         let mut properties = Vec::new();
         let mut iterator_property = None;
+        let mut async_iterator_property = None;
         let mut accessors: BTreeMap<String, (Option<TypeId>, Option<TypeId>)> = BTreeMap::new();
 
         fn upsert_property(properties: &mut Vec<PropertyType>, property: PropertyType) {
@@ -11748,9 +11846,14 @@ impl<'src> Binder<'src> {
         for member in &object.members {
             match member.data() {
                 ObjectMember::Property(property) => {
-                    if self.is_intrinsic_symbol_iterator_name(&property.name) {
+                    if let Some(protocol) = self.intrinsic_symbol_iterator_protocol(&property.name)
+                    {
                         let method_type = self.type_of_expr(&property.value, scope);
-                        iterator_property = Some(IteratorProperty::new(method_type, false));
+                        let property = IteratorProperty::new(method_type, false);
+                        match protocol {
+                            ForOfMode::Sync => iterator_property = Some(property),
+                            ForOfMode::Async => async_iterator_property = Some(property),
+                        }
                         continue;
                     }
                     if let Some(name) = self.property_key(&property.name) {
@@ -11772,7 +11875,7 @@ impl<'src> Binder<'src> {
                     }
                 }
                 ObjectMember::Method(method) => {
-                    if self.is_intrinsic_symbol_iterator_name(&method.name) {
+                    if let Some(protocol) = self.intrinsic_symbol_iterator_protocol(&method.name) {
                         let (method_type, is_method) = match method.modifier {
                             PropertyModifier::None => {
                                 (self.type_of_function_like(&method.function, scope), true)
@@ -11782,8 +11885,12 @@ impl<'src> Binder<'src> {
                             }
                             PropertyModifier::Set => continue,
                         };
-                        iterator_property =
-                            Some(IteratorProperty::new(method_type, false).with_method(is_method));
+                        let property =
+                            IteratorProperty::new(method_type, false).with_method(is_method);
+                        match protocol {
+                            ForOfMode::Sync => iterator_property = Some(property),
+                            ForOfMode::Async => async_iterator_property = Some(property),
+                        }
                         continue;
                     }
                     if let Some(name) = self.property_key(&method.name) {
@@ -11867,6 +11974,12 @@ impl<'src> Binder<'src> {
                         {
                             iterator_property = Some(source_iterator);
                         }
+                        if let Some(source_iterator) = object
+                            .async_iterator_property
+                            .filter(IteratorProperty::spreadable)
+                        {
+                            async_iterator_property = Some(source_iterator);
+                        }
                         for source_property in &object.properties {
                             let fresh = PropertyType::new(
                                 source_property.name.as_ref(),
@@ -11889,7 +12002,7 @@ impl<'src> Binder<'src> {
             index_signatures: Vec::new(),
             generator_return: None,
             iterator_property,
-            async_iterator_property: None,
+            async_iterator_property,
         })
     }
 
