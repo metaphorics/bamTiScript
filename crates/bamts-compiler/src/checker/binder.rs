@@ -7100,8 +7100,12 @@ impl<'src> Binder<'src> {
                     .collect()
             });
             let base = self.resolve_named_type_symbol(base_symbol);
-            let base_instance =
-                self.instantiate_explicit_type_arguments(base_symbol, explicit.as_deref(), base);
+            let base_instance = self.instantiate_explicit_type_arguments(
+                base_symbol,
+                explicit.as_deref(),
+                base,
+                heritage.expression.range(),
+            );
             if let Some(base_view) = self.types.prepare_applied_class_view(base_instance)
                 && let Type::ObjectType(base_props) = self.types.get(base_view).clone()
             {
@@ -7151,8 +7155,12 @@ impl<'src> Binder<'src> {
                     .collect()
             });
             let base = self.resolve_named_type_symbol(base_symbol);
-            let base_instance =
-                self.instantiate_explicit_type_arguments(base_symbol, explicit.as_deref(), base);
+            let base_instance = self.instantiate_explicit_type_arguments(
+                base_symbol,
+                explicit.as_deref(),
+                base,
+                heritage.expression.range(),
+            );
             if let Type::AppliedClass { arguments, .. } = self.types.get(base_instance).clone() {
                 base_arguments = arguments;
             }
@@ -9668,6 +9676,7 @@ impl<'src> Binder<'src> {
                             symbol,
                             explicit_arguments.as_deref(),
                             base,
+                            range,
                         )
                     }
                     None => {
@@ -9704,6 +9713,7 @@ impl<'src> Binder<'src> {
                     symbol,
                     explicit_arguments.as_deref(),
                     base,
+                    range,
                 )
             }
             EntityName::Missing(_) => {
@@ -9718,87 +9728,87 @@ impl<'src> Binder<'src> {
         symbol: SymbolId,
         arguments: Option<&[TypeId]>,
         base: TypeId,
+        diagnostic_range: TextRange,
     ) -> TypeId {
-        if let Some((class_symbol, _)) = self.types.class_identity(base) {
-            let class_parameters = self.types.class_type_parameters(class_symbol).to_vec();
-            if !class_parameters.is_empty() {
-                let bounds = self
-                    .types
+        let (parameters, bounds) = if let Some((class_symbol, _)) = self.types.class_identity(base)
+        {
+            (
+                self.types.class_type_parameters(class_symbol).to_vec(),
+                self.types
                     .class_type_parameter_bounds(class_symbol)
-                    .to_vec();
-                let mut inferred = Vec::with_capacity(class_parameters.len());
-                for (index, parameter) in class_parameters.iter().enumerate() {
-                    let explicit = arguments
-                        .and_then(|arguments| arguments.get(index))
-                        .copied();
-                    let type_id = match (explicit, bounds.get(index).and_then(|b| b.default())) {
-                        (Some(type_id), _) => type_id,
-                        (None, Some(default)) => InferredTypeArguments::new(inferred.clone())
-                            .instantiate(&mut self.types, default),
-                        (None, None) => self.types.any(),
-                    };
-                    inferred.push(InferredTypeArgument::new(
-                        *parameter,
-                        type_id,
-                        if explicit.is_some() {
-                            InferenceProvenance::Explicit
-                        } else {
-                            InferenceProvenance::Default
-                        },
-                    ));
-                }
-                let instantiation = InferredTypeArguments::new(inferred);
-                return instantiation.instantiate(&mut self.types, base);
-            }
-        }
-        let Some(definition) = self.type_defs.get(&symbol).copied() else {
-            return base;
-        };
-        let (type_scope, type_parameters) = match definition {
-            TypeDef::Alias {
-                scope,
-                type_parameters,
-                ..
-            } => (scope, type_parameters),
-            TypeDef::Interface {
-                scope,
-                type_parameters,
-                ..
-            } => (scope, type_parameters),
-            TypeDef::Enum { .. } => return base,
-        };
-        let Some(list) = type_parameters else {
-            return base;
-        };
-        let parameters = &list.parameters;
-        if parameters.is_empty() {
-            return base;
-        }
-        let mut inferred = Vec::with_capacity(parameters.len());
-        for (index, parameter) in parameters.iter().enumerate() {
-            let data = parameter.data();
-            let name = self.identifier_text(&data.name);
-            let Some(parameter_symbol) = self.scopes[type_scope.0 as usize]
-                .types
-                .get(name.as_ref())
-                .copied()
-            else {
-                continue;
+                    .to_vec(),
+            )
+        } else {
+            let Some(definition) = self.type_defs.get(&symbol).copied() else {
+                return base;
             };
+            match definition {
+                TypeDef::Alias {
+                    scope,
+                    type_parameters,
+                    ..
+                }
+                | TypeDef::Interface {
+                    scope,
+                    type_parameters,
+                    ..
+                } => self.signature_type_parameters(type_parameters, scope),
+                TypeDef::Enum { .. } => (Vec::new(), Vec::new()),
+            }
+        };
+        let inferred =
+            self.resolve_explicit_type_arguments(&parameters, &bounds, arguments, diagnostic_range);
+        if inferred.is_empty() {
+            return base;
+        }
+        InferredTypeArguments::new(inferred).instantiate(&mut self.types, base)
+    }
+
+    fn resolve_explicit_type_arguments(
+        &mut self,
+        parameters: &[SymbolId],
+        bounds: &[TypeParameterBounds],
+        arguments: Option<&[TypeId]>,
+        diagnostic_range: TextRange,
+    ) -> Vec<InferredTypeArgument> {
+        let provided = arguments.map_or(0, <[TypeId]>::len);
+        let required = bounds
+            .iter()
+            .filter(|bound| bound.default().is_none())
+            .count();
+        if provided < required || provided > parameters.len() {
+            self.emit(
+                ARGUMENT_COUNT_MISMATCH,
+                diagnostic_range,
+                ARGUMENT_COUNT_MISMATCH_MESSAGE,
+            );
+        }
+
+        let mut inferred = Vec::with_capacity(parameters.len());
+        for (index, parameter) in parameters.iter().copied().enumerate() {
             let explicit = arguments
                 .and_then(|arguments| arguments.get(index))
                 .copied();
-            let type_id = match (explicit, data.default.as_ref()) {
-                (Some(type_id), _) => type_id,
-                (None, Some(default)) => {
-                    let default = self.resolve_type(default, type_scope);
-                    InferredTypeArguments::new(inferred.clone())
-                        .instantiate(&mut self.types, default)
-                }
-                (None, None) => self.types.any(),
-            };
+            let substitution = InferredTypeArguments::new(inferred.clone());
+            let default = bounds
+                .get(index)
+                .and_then(|bound| bound.default())
+                .map(|default| substitution.instantiate(&mut self.types, default));
+            let type_id = explicit.or(default).unwrap_or_else(|| self.types.any());
+            if let Some(constraint) = bounds
+                .get(index)
+                .and_then(|bound| bound.constraint())
+                .map(|constraint| substitution.instantiate(&mut self.types, constraint))
+                && !self.types_assignable(type_id, constraint)
+            {
+                self.emit(
+                    ARGUMENT_NOT_ASSIGNABLE,
+                    diagnostic_range,
+                    ARGUMENT_NOT_ASSIGNABLE_MESSAGE,
+                );
+            }
             inferred.push(InferredTypeArgument::new(
-                parameter_symbol,
+                parameter,
                 type_id,
                 if explicit.is_some() {
                     InferenceProvenance::Explicit
@@ -9807,11 +9817,7 @@ impl<'src> Binder<'src> {
                 },
             ));
         }
-        if inferred.is_empty() {
-            return base;
-        }
-        let instantiation = InferredTypeArguments::new(inferred);
-        instantiation.instantiate(&mut self.types, base)
+        inferred
     }
 
     fn resolve_named_type_symbol(&mut self, symbol: SymbolId) -> TypeId {

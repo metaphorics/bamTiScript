@@ -7527,4 +7527,87 @@ mod tests {
         );
         assert!(checker_codes(&result).is_empty());
     }
+
+    #[test]
+    fn type_reference_missing_type_argument_reports_count() {
+        let result = check_text(
+            "type Pair<T, U> = [T, U];\
+             interface InterfacePair<T, U> { first: T; second: U; }\
+             class ClassPair<T, U> { first!: T; second!: U; }\
+             type A = Pair<number>;\
+             type B = InterfacePair<number>;\
+             type C = ClassPair<number>;",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            [
+                super::ARGUMENT_COUNT_MISMATCH.as_str(),
+                super::ARGUMENT_COUNT_MISMATCH.as_str(),
+                super::ARGUMENT_COUNT_MISMATCH.as_str()
+            ]
+        );
+    }
+
+    #[test]
+    fn type_reference_extra_type_argument_reports_count() {
+        let result = check_text("type One<T> = T; type Bad = One<number, string>;");
+        assert_eq!(
+            checker_codes(&result),
+            [super::ARGUMENT_COUNT_MISMATCH.as_str()]
+        );
+    }
+
+    #[test]
+    fn type_reference_type_arguments_on_nongeneric_report_count() {
+        let result = check_text(
+            "type Plain = number;\
+             interface PlainInterface { value: number; }\
+             class PlainClass {}\
+             type A = Plain<string>;\
+             type B = PlainInterface<string>;\
+             type C = PlainClass<string>;",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            [
+                super::ARGUMENT_COUNT_MISMATCH.as_str(),
+                super::ARGUMENT_COUNT_MISMATCH.as_str(),
+                super::ARGUMENT_COUNT_MISMATCH.as_str()
+            ]
+        );
+    }
+
+    #[test]
+    fn type_reference_simple_constraint_violation() {
+        let result =
+            check_text("type Box<T extends string> = { value: T }; type Bad = Box<number>;");
+        assert_eq!(checker_codes(&result), [ARGUMENT_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    #[test]
+    fn type_reference_dependent_constraint_violation() {
+        let result =
+            check_text("type Pair<T, U extends T> = [T, U]; type Bad = Pair<string, number>;");
+        assert_eq!(checker_codes(&result), [ARGUMENT_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    #[test]
+    fn type_reference_default_arguments_resolve() {
+        let result = check_text(
+            "type Box<T extends string = 'ok'> = { value: T };\
+             const value: Box = { value: 'ok' };",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn call_expression_generic_validation_unchanged() {
+        let result =
+            check_text("declare function take<T extends string>(value: T): T; take<number>(1);");
+        assert!(
+            checker_codes(&result).contains(&ARGUMENT_NOT_ASSIGNABLE.as_str()),
+            "{:?}",
+            checker_codes(&result)
+        );
+    }
 }
