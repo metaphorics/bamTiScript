@@ -10006,22 +10006,66 @@ impl<'src> Binder<'src> {
             );
         }
 
-        let mut inferred = Vec::with_capacity(parameters.len());
-        for (index, parameter) in parameters.iter().copied().enumerate() {
-            let explicit = arguments
+        let mut resolved: Vec<TypeId> = (0..parameters.len())
+            .map(|index| {
+                arguments
+                    .and_then(|arguments| arguments.get(index))
+                    .copied()
+                    .unwrap_or_else(|| self.types.any())
+            })
+            .collect();
+        for index in 0..parameters.len() {
+            if arguments
                 .and_then(|arguments| arguments.get(index))
-                .copied();
-            let substitution = InferredTypeArguments::new(inferred.clone());
-            let default = bounds
+                .is_some()
+            {
+                continue;
+            }
+            let substitution = InferredTypeArguments::new(
+                parameters
+                    .iter()
+                    .copied()
+                    .zip(resolved.iter().copied())
+                    .map(|(symbol, type_id)| {
+                        InferredTypeArgument::new(symbol, type_id, InferenceProvenance::Default)
+                    })
+                    .collect(),
+            );
+            if let Some(default) = bounds
                 .get(index)
                 .and_then(|bound| bound.default())
-                .map(|default| substitution.instantiate(&mut self.types, default));
-            let type_id = explicit.or(default).unwrap_or_else(|| self.types.any());
+                .map(|default| substitution.instantiate(&mut self.types, default))
+            {
+                resolved[index] = default;
+            }
+        }
+        let inferred: Vec<_> = parameters
+            .iter()
+            .copied()
+            .zip(resolved)
+            .enumerate()
+            .map(|(index, (parameter, type_id))| {
+                let explicit = arguments
+                    .and_then(|arguments| arguments.get(index))
+                    .is_some();
+                InferredTypeArgument::new(
+                    parameter,
+                    type_id,
+                    if explicit {
+                        InferenceProvenance::Explicit
+                    } else {
+                        InferenceProvenance::Default
+                    },
+                )
+            })
+            .collect();
+        let substitution = InferredTypeArguments::new(inferred.clone());
+        for (index, argument) in inferred.iter().enumerate() {
             if let Some(constraint) = bounds
                 .get(index)
                 .and_then(|bound| bound.constraint())
                 .map(|constraint| substitution.instantiate(&mut self.types, constraint))
-                && !self.types_assignable(type_id, constraint)
+                && !self.types_assignable(argument.type_id(), constraint)
             {
                 self.emit(
                     ARGUMENT_NOT_ASSIGNABLE,
@@ -10029,15 +10073,6 @@ impl<'src> Binder<'src> {
                     ARGUMENT_NOT_ASSIGNABLE_MESSAGE,
                 );
             }
-            inferred.push(InferredTypeArgument::new(
-                parameter,
-                type_id,
-                if explicit.is_some() {
-                    InferenceProvenance::Explicit
-                } else {
-                    InferenceProvenance::Default
-                },
-            ));
         }
         inferred
     }

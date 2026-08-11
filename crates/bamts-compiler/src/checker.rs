@@ -7928,6 +7928,17 @@ mod tests {
     }
 
     #[test]
+    fn type_reference_forward_constraint_uses_complete_substitution() {
+        let valid =
+            check_text("type Pair<T extends U, U> = [T, U]; type Good = Pair<number, number>;");
+        assert!(checker_codes(&valid).is_empty());
+
+        let invalid =
+            check_text("type Pair<T extends U, U> = [T, U]; type Bad = Pair<number, string>;");
+        assert_eq!(checker_codes(&invalid), [ARGUMENT_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    #[test]
     fn type_reference_default_arguments_resolve() {
         let result = check_text(
             "type Box<T extends string = 'ok'> = { value: T };\
