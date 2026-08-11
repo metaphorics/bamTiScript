@@ -1054,7 +1054,8 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             (Some(Decoded::Number(a)), Some(Decoded::Int32(b)))
             | (Some(Decoded::Int32(b)), Some(Decoded::Number(a))) => {
-                let b_f64 = f64::from(b);
+                // Interpret the two's-complement u32 payload as a signed i32.
+                let b_f64 = f64::from(b as i32);
                 if a == 0.0 && b_f64 == 0.0 {
                     return a.is_sign_positive();
                 }

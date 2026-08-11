@@ -488,12 +488,15 @@ fn same_value<H: Host>(machine: &Machine<'_, H>, left: Value, right: Value) -> b
         }
         (Some(Decoded::Number(a)), Some(Decoded::Int32(b)))
         | (Some(Decoded::Int32(b)), Some(Decoded::Number(a))) => {
-            let b_f64 = f64::from(b);
-            // b is an Int32 payload, so b_f64 is always finite — never NaN.
-            // Only a can be NaN, and NaN compares unequal to every finite
-            // f64, so SameValue(NaN, <int>) correctly falls through to false
-            // without a dedicated guard. The +0/-0 split still matters:
-            // Int32(0) maps to +0.0, so a negative zero must not match it.
+            // The Int32 payload is a two's-complement u32; interpret it as a
+            // signed i32 before converting to f64 so negative values compare
+            // to their mathematical Number equivalents.
+            let b_f64 = f64::from(b as i32);
+            // b_f64 is always finite — never NaN. Only a can be NaN, and NaN
+            // compares unequal to every finite f64, so SameValue(NaN, <int>)
+            // correctly falls through to false without a dedicated guard. The
+            // +0/-0 split still matters: Int32(0) maps to +0.0, so a negative
+            // zero must not match it.
             if a == 0.0 && b_f64 == 0.0 {
                 return a.is_sign_positive();
             }
@@ -3408,6 +3411,92 @@ mod tests {
         assert!(
             same_value(&machine, Value::number(5.0), int_five),
             "5.0 === Int32(5)"
+        );
+    }
+
+    #[test]
+    fn same_value_negative_int32_matches_equivalent_number() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let machine = Machine::new(&module, &mut host, Limits::default());
+
+        let neg_one_number = Value::number(-1.0);
+        let neg_one_int32 = Value::int32((-1i32) as u32);
+
+        assert!(
+            same_value(&machine, neg_one_number, neg_one_int32),
+            "-1.0 === Int32(-1) under SameValue"
+        );
+        assert!(
+            same_value(&machine, neg_one_int32, neg_one_number),
+            "Int32(-1) === -1.0 under SameValue (symmetric)"
+        );
+
+        // Representation independence: the raw u32 payload 0xFFFF_FFFF must
+        // not be confused with the positive Number 4_294_967_295.0.
+        let large_unsigned = Value::number(4_294_967_295.0);
+        assert!(
+            !same_value(&machine, large_unsigned, neg_one_int32),
+            "4_294_967_295.0 !== Int32(-1)"
+        );
+
+        // NaN and signed zero must remain untouched.
+        assert!(
+            !same_value(&machine, Value::number(f64::NAN), neg_one_int32),
+            "NaN !== Int32(-1) under SameValue"
+        );
+        assert!(
+            !same_value(&machine, Value::number(-0.0), Value::int32(0)),
+            "-0.0 !== Int32(0) under SameValue"
+        );
+    }
+
+    #[test]
+    fn redefining_non_writable_property_across_representations_succeeds() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = ordinary_object(&mut machine);
+        let key = allocate_string(&mut machine, EcmaString::encode("x")).unwrap();
+
+        // Initial value is an Int32 -1 (0xFFFF_FFFF payload).
+        let initial = ordinary_object(&mut machine);
+        machine
+            .set_data_property(initial, "value", Value::int32((-1i32) as u32))
+            .unwrap();
+        machine
+            .set_data_property(initial, "writable", Value::FALSE)
+            .unwrap();
+        machine
+            .set_data_property(initial, "configurable", Value::FALSE)
+            .unwrap();
+        machine
+            .set_data_property(initial, "enumerable", Value::FALSE)
+            .unwrap();
+        call_object(&mut machine, "defineProperty", &[target, key, initial]).unwrap();
+
+        // Redefine with the same mathematical value as a Number -1.0.
+        let redefinition = ordinary_object(&mut machine);
+        machine
+            .set_data_property(redefinition, "value", Value::number(-1.0))
+            .unwrap();
+        machine
+            .set_data_property(redefinition, "writable", Value::FALSE)
+            .unwrap();
+        machine
+            .set_data_property(redefinition, "configurable", Value::FALSE)
+            .unwrap();
+        machine
+            .set_data_property(redefinition, "enumerable", Value::FALSE)
+            .unwrap();
+
+        call_object(&mut machine, "defineProperty", &[target, key, redefinition])
+            .expect("redefinition with representation-independent SameValue must succeed");
+
+        assert_eq!(
+            machine.get_named_property(target, "x").unwrap(),
+            Value::number(-1.0),
+            "property value must use the new Number representation"
         );
     }
 }
