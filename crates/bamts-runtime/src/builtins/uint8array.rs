@@ -22,6 +22,8 @@ pub(super) fn install<H: Host>(
     let constructor = install_function(heap, builtins, "Uint8Array", 1, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     define_data(heap, prototype, "constructor", constructor);
+    let length = install_function(heap, builtins, "get length", 0, length_getter::<H>);
+    define_getter(heap, prototype, "length", length);
     let join = install_function(heap, builtins, "join", 1, join::<H> as BuiltinHandler<H>);
     define_data(heap, prototype, "join", join);
     let iterator = install_function(
@@ -78,16 +80,7 @@ fn constructor<H: Host>(
             }
         }
     };
-    let mut properties = PropertyMap::default();
-    properties.insert(
-        PropertyKey::Named(EcmaString::encode("length")),
-        Property::Data {
-            value: crate::number_value(length as f64),
-            writable: false,
-            enumerable: false,
-            configurable: false,
-        },
-    );
+    let properties = PropertyMap::default();
     machine
         .ensure_allocation_capacity(
             1,
@@ -131,6 +124,43 @@ fn constructor<H: Host>(
         })
         .map_err(EvalFailure::Runtime)?;
     Ok(BuiltinOutcome::Value(value))
+}
+
+fn length_getter<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let index = machine
+        .runtime_slot(this)
+        .map_err(EvalFailure::Runtime)?
+        .ok_or_else(|| {
+            type_error("Uint8Array.prototype.length getter called on incompatible receiver")
+        })?;
+    let HeapEntry::Uint8Array { bytes, .. } = &machine.heap[index] else {
+        return Err(type_error(
+            "Uint8Array.prototype.length getter called on incompatible receiver",
+        ));
+    };
+    Ok(BuiltinOutcome::Value(crate::number_value(
+        bytes.len() as f64
+    )))
+}
+
+fn define_getter(heap: &mut [HeapEntry], object: Value, name: &str, getter: Value) {
+    let HeapEntry::Object { properties, .. } = &mut heap[heap_index(object)] else {
+        panic!("accessor target must be an ordinary object");
+    };
+    properties.insert(
+        PropertyKey::Named(EcmaString::encode(name)),
+        Property::Accessor {
+            getter: Some(getter),
+            setter: None,
+            enumerable: false,
+            configurable: true,
+        },
+    );
 }
 
 /// ToIndex for the TypedArray(length) constructor: ToIntegerOrInfinity, then
@@ -444,6 +474,41 @@ mod tests {
             panic!("constructor returns an object")
         };
         value
+    }
+
+    #[test]
+    fn uint8array_length_is_an_inherited_branded_accessor() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let typed = construct(&mut machine, Value::int32(3));
+        let key = PropertyKey::Named(EcmaString::encode("length"));
+
+        assert!(machine.own_descriptor(typed, &key).unwrap().is_none());
+        assert_eq!(
+            machine.get_named_property(typed, "length").unwrap(),
+            Value::int32(3)
+        );
+
+        let prototype = machine.intrinsics.builtins.uint8array_prototype();
+        let descriptor = machine
+            .own_descriptor(prototype, &key)
+            .unwrap()
+            .expect("prototype has length accessor");
+        let Property::Accessor {
+            getter: Some(getter),
+            setter: None,
+            enumerable: false,
+            configurable: true,
+        } = descriptor
+        else {
+            panic!("length is a configurable, non-enumerable getter");
+        };
+        let plain = ordinary_object(&mut machine);
+        assert!(matches!(
+            machine.call_value(getter, plain, &[]),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
     }
 
     #[test]
