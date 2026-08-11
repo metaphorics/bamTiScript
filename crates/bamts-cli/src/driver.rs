@@ -787,7 +787,11 @@ fn cache_root_from_env_values(
         return ensure_private_cache_root(PathBuf::from(path).join("bamts"));
     }
     if let Some(path) = home {
-        return ensure_private_cache_root(PathBuf::from(path).join(".cache/bamts"));
+        match ensure_private_cache_root(PathBuf::from(path).join(".cache/bamts")) {
+            Ok(root) => return Ok(root),
+            Err(DriverError::UnsafeFallbackCacheRoot { .. }) => {}
+            Err(error) => return Err(error),
+        }
     }
     ensure_private_cache_root(fallback_cache_root_path()?)
 }
@@ -831,13 +835,13 @@ fn ensure_private_cache_root(path: PathBuf) -> Result<PathBuf, DriverError> {
         parent
     };
 
-    if let Err(source) = fs::create_dir_all(parent) {
-        if source.kind() != io::ErrorKind::AlreadyExists {
-            return Err(DriverError::CreateDirectory {
-                path: parent.to_owned(),
-                source,
-            });
-        }
+    if let Err(source) = fs::create_dir_all(parent)
+        && source.kind() != io::ErrorKind::AlreadyExists
+    {
+        return Err(DriverError::CreateDirectory {
+            path: parent.to_owned(),
+            source,
+        });
     }
 
     #[cfg(unix)]
@@ -1298,6 +1302,34 @@ mod tests {
         let parent = super::validate_private_cache_parent_chain(&std::env::temp_dir()).unwrap();
         let expected = parent.join(format!("bamts-cache-{}", super::effective_uid().unwrap()));
         assert_eq!(super::fallback_cache_root_path().unwrap(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_cache_root_falls_back_when_existing_root_is_unsafe() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::Ordering;
+
+        let home = std::env::temp_dir().join(format!(
+            "bamts-cli-unsafe-home-cache-{}-{}",
+            std::process::id(),
+            super::NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let unsafe_root = home.join(".cache/bamts");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&unsafe_root).expect("create unsafe HOME cache fixture");
+        let mut permissions = std::fs::metadata(&unsafe_root)
+            .expect("unsafe HOME cache metadata")
+            .permissions();
+        permissions.set_mode(0o777);
+        std::fs::set_permissions(&unsafe_root, permissions).expect("chmod unsafe HOME cache");
+
+        let root = super::cache_root_from_env_values(None, None, Some(home.as_os_str()))
+            .expect("unsafe HOME cache must use the private per-user fallback");
+
+        assert_eq!(root, super::fallback_cache_root_path().unwrap());
+        assert_ne!(root, unsafe_root);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[cfg(unix)]
