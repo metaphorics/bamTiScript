@@ -192,6 +192,7 @@ fn to_string<H: Host>(
     output.push_unit(u16::from(b'/'));
     append_canonical_source(&pattern, &mut output);
     output.push_unit(u16::from(b'/'));
+    let flags = canonical_flags(&flags);
     for &unit in flags.as_units() {
         output.push_unit(unit);
     }
@@ -734,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn flags_getter_returns_canonical_ordering_for_multi_flag_regex() {
+    fn flags_getter_and_to_string_use_canonical_ordering() {
         // The flags accessor must canonicalize the stored flag string into
         // the standard gimsuy order without recompiling the pattern. A
         // regex constructed with out-of-order flags ("mig") must report
@@ -754,6 +755,16 @@ mod tests {
             machine.to_string(flags_value).unwrap(),
             EcmaString::encode("gim"),
             "flags_getter must return flags in canonical gimsuy order"
+        );
+        let BuiltinOutcome::Value(stringified) =
+            to_string(&mut machine, regexp, &[], false).unwrap()
+        else {
+            panic!("to_string returns a value");
+        };
+        assert_eq!(
+            machine.to_string(stringified).unwrap(),
+            EcmaString::encode("/x/gim"),
+            "RegExp toString must use canonical flag order"
         );
 
         // Also verify the full flag set in reverse order ("yusmig") → "gimsuy".
