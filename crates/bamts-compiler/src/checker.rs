@@ -7493,4 +7493,38 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn optional_call_nullish_function_union_returns_union_with_undefined() {
+        let result = check_text_strict_null(
+            "declare let f: (() => number) | undefined;\
+             const value: number | undefined = f?.();\
+             const wrong: string = f?.();",
+        );
+        assert_eq!(checker_codes(&result), [TYPE_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    #[test]
+    fn ordinary_call_on_nullish_function_union_is_not_callable() {
+        let result =
+            check_text_strict_null("declare let f: (() => number) | undefined; const value = f();");
+        assert_eq!(checker_codes(&result), [EXPRESSION_NOT_CALLABLE.as_str()]);
+    }
+
+    #[test]
+    fn optional_call_retains_non_nullish_non_callable_diagnostic() {
+        let result = check_text_strict_null(
+            "declare let f: (() => number) | number | undefined; const value = f?.();",
+        );
+        assert_eq!(checker_codes(&result), [EXPRESSION_NOT_CALLABLE.as_str()]);
+    }
+
+    #[test]
+    fn optional_member_call_result_and_diagnostics() {
+        let result = check_text_strict_null(
+            "declare let object: { method(): number } | undefined;\
+             const value: number | undefined = object?.method();",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
 }

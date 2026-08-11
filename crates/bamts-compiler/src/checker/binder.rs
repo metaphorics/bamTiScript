@@ -8172,8 +8172,27 @@ impl<'src> Binder<'src> {
             return CallEvaluation::success(self.types.any());
         }
 
+        let optional = call.optional
+            || matches!(
+                call.callee.data(),
+                Expression::Member(member) if member.optional
+            );
+        let short_circuits = optional
+            && match self.types.get(callee_type) {
+                Type::Null | Type::Undefined => true,
+                Type::Union(members) => members
+                    .iter()
+                    .any(|member| matches!(self.types.get(*member), Type::Null | Type::Undefined)),
+                _ => false,
+            };
+        let callable_type = if short_circuits {
+            self.types.non_nullable(callee_type)
+        } else {
+            callee_type
+        };
+
         let arguments = self.resolve_call_arguments(&call.arguments, scope);
-        let groups = self.call_signature_groups(&call.callee, callee_type);
+        let groups = self.call_signature_groups(&call.callee, callable_type);
         if groups.is_empty() {
             return CallEvaluation::failure(CallMismatch::NotCallable);
         }
@@ -8181,12 +8200,19 @@ impl<'src> Binder<'src> {
             .type_arguments
             .as_ref()
             .map(|arguments| self.resolve_type_arguments(Some(arguments), scope));
-        self.evaluate_signature_groups(
+        let mut evaluation = self.evaluate_signature_groups(
             groups,
             &arguments,
             explicit_types.as_deref(),
             call.callee.range(),
-        )
+        );
+        if short_circuits && let Some(return_type) = evaluation.return_type {
+            evaluation.return_type = Some(
+                self.types
+                    .union(&[return_type, self.types.undefined_type()]),
+            );
+        }
+        evaluation
     }
 
     fn check_new(&mut self, new: &'src NewExpression, scope: ScopeId, range: TextRange) {
