@@ -2875,6 +2875,12 @@ enum WriteFunctionBody<'src> {
     Missing,
 }
 
+#[derive(Clone, Copy)]
+struct ReturnContext {
+    expected: Option<TypeId>,
+    await_expression: bool,
+}
+
 pub(crate) struct Binder<'src> {
     pub(crate) source: &'src SourceFile,
     intrinsics: GlobalEnvironment,
@@ -2997,8 +3003,8 @@ pub(crate) struct Binder<'src> {
     return_types: HashMap<NodeId, Vec<TypeId>>,
     /// Stack of function body node ids currently being resolved, innermost last.
     function_body_stack: Vec<NodeId>,
-    /// Annotated return contract for the function body currently being resolved.
-    expected_return_types: Vec<Option<TypeId>>,
+    /// Return contract for each function body currently being resolved.
+    return_contexts: Vec<ReturnContext>,
     /// Enclosing `this` types for `this` expressions, innermost last.
     this_context: Vec<TypeId>,
     /// Whether the current binding context is inside a `declare` directive.
@@ -3093,7 +3099,7 @@ impl<'src> Binder<'src> {
             suppress_used_before_assigned: false,
             return_types: HashMap::new(),
             function_body_stack: Vec::new(),
-            expected_return_types: Vec::new(),
+            return_contexts: Vec::new(),
             this_context: Vec::new(),
             ambient_binding: false,
             is_declaration_file: source.source_text().is_declaration_file(),
@@ -5787,7 +5793,8 @@ impl<'src> Binder<'src> {
             Statement::Labeled(statement) => self.resolve_statement(&statement.body, scope),
             Statement::ImportEquals(_) => {}
             Statement::Return(return_statement) => {
-                let expected = self.expected_return_types.last().copied().flatten();
+                let context = self.return_contexts.last().copied();
+                let expected = context.and_then(|context| context.expected);
                 let return_type = return_statement
                     .argument
                     .as_ref()
@@ -5799,6 +5806,11 @@ impl<'src> Binder<'src> {
                         }
                     })
                     .unwrap_or_else(|| self.types.undefined_type());
+                let return_type = if context.is_some_and(|context| context.await_expression) {
+                    self.awaited_type(return_type)
+                } else {
+                    return_type
+                };
                 let compatible = if return_statement.argument.is_some() {
                     expected.is_none_or(|expected| self.types_assignable(return_type, expected))
                 } else if let Some(expected) = expected {
@@ -6283,13 +6295,16 @@ impl<'src> Binder<'src> {
         } else {
             annotated_return_type.map(|return_type| {
                 if function.is_async {
-                    self.promise_value_type(return_type).unwrap_or(return_type)
+                    self.awaited_type(return_type)
                 } else {
                     return_type
                 }
             })
         };
-        self.expected_return_types.push(expected_return_type);
+        self.return_contexts.push(ReturnContext {
+            expected: expected_return_type,
+            await_expression: function.is_async,
+        });
         self.this_context.push(this_type);
         if let Some(body_id) = function.body.as_ref().and_then(FunctionBody::id) {
             self.return_types.entry(body_id).or_default();
@@ -6359,7 +6374,7 @@ impl<'src> Binder<'src> {
             let popped = self.function_body_stack.pop();
             debug_assert_eq!(popped, Some(body_id));
         }
-        self.expected_return_types.pop();
+        self.return_contexts.pop();
         self.this_context.pop();
         self.new_target_contexts.truncate(new_target_marker);
         let popped_context = self.super_call_contexts.pop();
@@ -7963,12 +7978,15 @@ impl<'src> Binder<'src> {
                 let expected_return_type = arrow.return_type.as_ref().map(|annotation| {
                     let return_type = self.resolve_type(&annotation.data().type_node, child);
                     if arrow.is_async {
-                        self.promise_value_type(return_type).unwrap_or(return_type)
+                        self.awaited_type(return_type)
                     } else {
                         return_type
                     }
                 });
-                self.expected_return_types.push(expected_return_type);
+                self.return_contexts.push(ReturnContext {
+                    expected: expected_return_type,
+                    await_expression: arrow.is_async,
+                });
                 let block_body_id = match &arrow.body {
                     FunctionBody::Block(block) => {
                         let body_id = block.id();
@@ -7991,8 +8009,17 @@ impl<'src> Binder<'src> {
                     }
                     FunctionBody::Expression(inner) => {
                         binder.resolve_expr(inner, child);
-                        if let Some(Some(expected)) = binder.expected_return_types.last().copied() {
+                        if let Some(expected) = binder
+                            .return_contexts
+                            .last()
+                            .and_then(|context| context.expected)
+                        {
                             let actual = binder.type_of_expr_with_target(inner, expected, child);
+                            let actual = if arrow.is_async {
+                                binder.awaited_type(actual)
+                            } else {
+                                actual
+                            };
                             if !binder.types_assignable(actual, expected) {
                                 binder.emit(
                                     TYPE_NOT_ASSIGNABLE,
@@ -8010,7 +8037,7 @@ impl<'src> Binder<'src> {
                     let popped = self.function_body_stack.pop();
                     debug_assert_eq!(popped, Some(body_id));
                 }
-                self.expected_return_types.pop();
+                self.return_contexts.pop();
                 let popped_context = self.super_call_contexts.pop();
                 debug_assert_eq!(popped_context, Some(SuperCallContext::NonConstructor));
             }
@@ -11005,6 +11032,31 @@ impl<'src> Binder<'src> {
         self.types.property_type(promise, "__bamts_promise_value")
     }
 
+    fn awaited_type(&mut self, value: TypeId) -> TypeId {
+        self.awaited_type_inner(value, &mut HashSet::new())
+    }
+
+    fn awaited_type_inner(&mut self, value: TypeId, visiting: &mut HashSet<TypeId>) -> TypeId {
+        if !visiting.insert(value) {
+            return value;
+        }
+        let awaited = match self.types.get(value).clone() {
+            Type::Union(members) => {
+                let mut awaited = Vec::with_capacity(members.len());
+                for member in members {
+                    awaited.push(self.awaited_type_inner(member, visiting));
+                }
+                self.types.union(&awaited)
+            }
+            _ => match self.promise_value_type(value) {
+                Some(payload) => self.awaited_type_inner(payload, visiting),
+                None => value,
+            },
+        };
+        visiting.remove(&value);
+        awaited
+    }
+
     // -- expression typing (bounded, permissive) -------------------------------
 
     pub(crate) fn type_of_expr(&mut self, expression: &'src Expr, scope: ScopeId) -> TypeId {
@@ -11556,7 +11608,7 @@ impl<'src> Binder<'src> {
             }
             Expression::Await(await_expression) => {
                 let operand = self.type_of_expr(&await_expression.argument, scope);
-                self.promise_value_type(operand).unwrap_or(operand)
+                self.awaited_type(operand)
             }
             Expression::TaggedTemplate(tagged) => {
                 let callee_type = self.type_of_expr(&tagged.tag, scope);
@@ -11874,7 +11926,14 @@ impl<'src> Binder<'src> {
             return self.resolve_type(&annotation.data().type_node, parent);
         }
         match &function.body {
-            Some(FunctionBody::Expression(expression)) => self.type_of_expr(expression, parent),
+            Some(FunctionBody::Expression(expression)) => {
+                let return_type = self.type_of_expr(expression, parent);
+                if function.is_async {
+                    self.awaited_type(return_type)
+                } else {
+                    return_type
+                }
+            }
             Some(FunctionBody::Block(block)) => {
                 let Some(returns) = self.return_types.get(&block.id()).cloned() else {
                     return self.types.any();
@@ -11892,7 +11951,14 @@ impl<'src> Binder<'src> {
         parent: ScopeId,
     ) -> TypeId {
         match &arrow.body {
-            FunctionBody::Expression(expression) => self.type_of_expr(expression, parent),
+            FunctionBody::Expression(expression) => {
+                let return_type = self.type_of_expr(expression, parent);
+                if arrow.is_async {
+                    self.awaited_type(return_type)
+                } else {
+                    return_type
+                }
+            }
             FunctionBody::Block(block) => {
                 let Some(returns) = self.return_types.get(&block.id()).cloned() else {
                     return self.types.any();

@@ -5819,6 +5819,63 @@ mod tests {
             check_text("function* value(): Generator<Missing, string, unknown> { return 'done'; }");
         assert_eq!(checker_codes(&missing), [CANNOT_FIND_TYPE.as_str()]);
     }
+
+    #[test]
+    fn async_generator_returns_await_promise_values() {
+        let accepted = check_text(
+            "declare const promised: Promise<string>;\
+             declare const nested: Promise<Promise<string>>;\
+             declare const shared: Promise<Promise<string>> | Promise<string>;\
+             async function* generator(): AsyncGenerator<number, string, unknown> {\
+                 yield 1;\
+                 return nested;\
+             }\
+             async function functionDeclaration(): Promise<string> { return nested; }\
+             async function sharedPayload(): Promise<string> { return shared; }\
+             const arrow = async (): Promise<string> => promised;\
+             const blockArrow = async (): Promise<string> => { return nested; };\
+             const inferredArrow = async () => shared;\
+             const inferredArrowResult: Promise<string> = inferredArrow();\
+             async function inferred() { return promised; }\
+             const inferredResult: Promise<string> = inferred();",
+        );
+        assert!(
+            checker_codes(&accepted).is_empty(),
+            "{:?}",
+            checker_codes(&accepted)
+        );
+
+        let rejected = check_text(
+            "declare const promised: Promise<string>;\
+             declare const nested: Promise<Promise<string>>;\
+             function* generator(): Generator<number, string, unknown> {\
+                 yield 1;\
+                 return promised;\
+             }\
+             function functionDeclaration(): string { return promised; }\
+             const arrow = (): string => promised;\
+             async function* directCompletion(): AsyncGenerator<number, Promise<string>, unknown> {\
+                 return 'done';\
+             }\
+             async function* nestedCompletion(): AsyncGenerator<number, Promise<string>, unknown> {\
+                 return nested;\
+             }\
+             async function outer(): Promise<void> {\
+                 function nestedSync(): string { return promised; }\
+             }",
+        );
+        assert_eq!(
+            checker_codes(&rejected),
+            [
+                "BAMTS-C004",
+                "BAMTS-C004",
+                "BAMTS-C004",
+                "BAMTS-C004",
+                "BAMTS-C004",
+                "BAMTS-C004",
+            ]
+        );
+    }
     #[test]
     fn annotated_generator_returns_do_not_check_body_fallthrough() {
         let result = check_text(
