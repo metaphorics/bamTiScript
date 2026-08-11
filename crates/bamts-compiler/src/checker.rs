@@ -201,6 +201,8 @@ pub const ASSIGNMENT_TO_CONST: DiagnosticCode = DiagnosticCode::new("BAMTS-C060"
 pub const INVALID_INDEXED_ACCESS_KEY: DiagnosticCode = DiagnosticCode::new("BAMTS-C064");
 /// Diagnostic emitted when a `for...of` operand is not iterable.
 pub const FOR_OF_ITERABLE_REQUIRED: DiagnosticCode = DiagnosticCode::new("BAMTS-C065");
+/// Diagnostic emitted when a `new` expression selects an abstract construct signature.
+pub const ABSTRACT_CONSTRUCTOR: DiagnosticCode = DiagnosticCode::new("BAMTS-C066");
 const PROPERTY_NOT_INITIALIZED_MESSAGE: &str =
     "Property has no initializer and is not definitely assigned in the constructor.";
 const ASSIGNMENT_TO_FUNCTION_MESSAGE: &str = "Cannot assign to a function.";
@@ -263,6 +265,7 @@ pub(crate) const SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE: &str =
     "'super' cannot be referenced in constructor arguments.";
 const DERIVED_CONSTRUCTOR_MISSING_SUPER_MESSAGE: &str =
     "Constructors for derived classes must contain a 'super' call.";
+const ABSTRACT_CONSTRUCTOR_MESSAGE: &str = "Cannot create an instance of an abstract class.";
 const ARGUMENT_NOT_ASSIGNABLE_MESSAGE: &str = "Argument type is not assignable to parameter type.";
 const ARGUMENT_COUNT_MISMATCH_MESSAGE: &str =
     "Supplied arguments do not match the expected parameter count.";
@@ -7272,6 +7275,64 @@ mod tests {
              declare const Factory: Factory; new Factory('wrong');",
         );
         assert_eq!(checker_codes(&wrong_argument), ["BAMTS-C053"]);
+    }
+
+    #[test]
+    fn abstract_classes_and_value_aliases_cannot_be_constructed() {
+        for source in [
+            "abstract class Base {} new Base();",
+            "abstract class Base {} const Alias = Base; new Alias();",
+        ] {
+            let result = check_text(source);
+            assert_eq!(
+                checker_codes(&result),
+                ["BAMTS-C066"],
+                "{source}: {:?}",
+                checker_codes(&result)
+            );
+        }
+    }
+
+    #[test]
+    fn abstract_construct_types_are_directional_and_not_constructable() {
+        let construction = check_text(
+            "declare const Factory: abstract new () => object;\
+             new Factory();",
+        );
+        assert_eq!(checker_codes(&construction), ["BAMTS-C066"]);
+
+        let relation = check_text(
+            "type AbstractFactory = abstract new () => object;\
+             type ConcreteFactory = new () => object;\
+             declare const abstractFactory: AbstractFactory;\
+             declare const concreteFactory: ConcreteFactory;\
+             const acceptsAbstract: AbstractFactory = concreteFactory;\
+             const rejectsAbstract: ConcreteFactory = abstractFactory;",
+        );
+        assert_eq!(checker_codes(&relation), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn concrete_subclasses_clear_inherited_abstract_constructors() {
+        let result = check_text(
+            "abstract class Box<T> { constructor(value: T) {} }\
+             new Box<number>(1);\
+             class Concrete extends Box<string> {}\
+             new Concrete('ok');",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C066"]);
+    }
+
+    #[test]
+    fn imported_abstract_class_constructors_remain_abstract() {
+        let result = linked(
+            &[
+                "export abstract class Base {}",
+                "import { Base } from './a'; new Base();",
+            ],
+            &[(1, 0, 0)],
+        );
+        assert_eq!(program_codes(&result), ["BAMTS-C066"]);
     }
 
     #[test]

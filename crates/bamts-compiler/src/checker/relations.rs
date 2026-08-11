@@ -21,7 +21,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use super::binder::{
-    FunctionSignature, ObjectType, PropertyType, SymbolId, TupleShape, Type, TypeId, TypeTable,
+    ConstructEntry, FunctionSignature, ObjectType, PropertyType, SymbolId, TupleShape, Type,
+    TypeId, TypeTable,
 };
 use crate::syntax::Accessibility;
 /// are computed without being stored; results stay deterministic because the
@@ -702,7 +703,7 @@ impl<'table> TypeRelations<'table> {
                 &target.call_signatures,
                 strictness,
             )
-            && self.signature_sets_relate(
+            && self.construct_sets_relate(
                 &source.construct_signatures,
                 &target.construct_signatures,
                 strictness,
@@ -840,7 +841,7 @@ impl<'table> TypeRelations<'table> {
             &combined.call_signatures,
             &target.call_signatures,
             strictness,
-        ) && self.signature_sets_relate(
+        ) && self.construct_sets_relate(
             &combined.construct_signatures,
             &target.construct_signatures,
             strictness,
@@ -857,6 +858,20 @@ impl<'table> TypeRelations<'table> {
             source
                 .iter()
                 .any(|have| self.function_relates(have, want, strictness))
+        })
+    }
+
+    fn construct_sets_relate(
+        &self,
+        source: &[ConstructEntry],
+        target: &[ConstructEntry],
+        strictness: Strictness,
+    ) -> bool {
+        target.iter().all(|want| {
+            source.iter().any(|have| {
+                (want.is_abstract || !have.is_abstract)
+                    && self.function_relates(&have.signature, &want.signature, strictness)
+            })
         })
     }
 

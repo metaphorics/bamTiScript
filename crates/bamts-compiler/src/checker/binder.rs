@@ -25,7 +25,7 @@ use super::narrowing::{
 };
 use super::relations::{TypeRelation, TypeRelations};
 use super::{
-    ACCESSOR_THIS_PARAMETER, AMBIENT_IMPLEMENTATION, ARGUMENT_COUNT_MISMATCH,
+    ABSTRACT_CONSTRUCTOR, ACCESSOR_THIS_PARAMETER, AMBIENT_IMPLEMENTATION, ARGUMENT_COUNT_MISMATCH,
     ARGUMENT_NOT_ASSIGNABLE, ASSIGNMENT_TO_CONST, ASSIGNMENT_TO_FUNCTION, ASSIGNMENT_TO_NAMESPACE,
     ASSIGNMENT_TO_READONLY, AWAIT_USING_DECLARATION_IN_FOR_IN, BARE_SUPER_EXPRESSION,
     CANNOT_FIND_NAME, CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED,
@@ -44,7 +44,7 @@ use super::{
     USING_DECLARATION_MISSING_INITIALIZER, WITH_STATEMENT_NOT_ALLOWED,
 };
 use super::{
-    ACCESSOR_THIS_PARAMETER_MESSAGE, AMBIENT_IMPLEMENTATION_MESSAGE,
+    ABSTRACT_CONSTRUCTOR_MESSAGE, ACCESSOR_THIS_PARAMETER_MESSAGE, AMBIENT_IMPLEMENTATION_MESSAGE,
     ARGUMENT_COUNT_MISMATCH_MESSAGE, ARGUMENT_NOT_ASSIGNABLE_MESSAGE, ASSIGNMENT_TO_CONST_MESSAGE,
     ASSIGNMENT_TO_FUNCTION_MESSAGE, ASSIGNMENT_TO_NAMESPACE_MESSAGE,
     ASSIGNMENT_TO_READONLY_MESSAGE, AWAIT_USING_DECLARATION_IN_FOR_IN_MESSAGE,
@@ -472,7 +472,7 @@ pub struct IndexSignature {
 pub struct ObjectType {
     pub(crate) properties: Vec<PropertyType>,
     pub(crate) call_signatures: Vec<FunctionSignature>,
-    pub(crate) construct_signatures: Vec<FunctionSignature>,
+    pub(crate) construct_signatures: Vec<ConstructEntry>,
     pub(crate) index_signatures: Vec<IndexSignature>,
 }
 
@@ -655,6 +655,37 @@ impl FunctionSignature {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ConstructEntry {
+    pub(crate) signature: FunctionSignature,
+    pub(crate) is_abstract: bool,
+}
+
+trait SignatureCandidate {
+    fn signature(&self) -> &FunctionSignature;
+    fn is_abstract(&self) -> bool;
+}
+
+impl SignatureCandidate for FunctionSignature {
+    fn signature(&self) -> &FunctionSignature {
+        self
+    }
+
+    fn is_abstract(&self) -> bool {
+        false
+    }
+}
+
+impl SignatureCandidate for ConstructEntry {
+    fn signature(&self) -> &FunctionSignature {
+        &self.signature
+    }
+
+    fn is_abstract(&self) -> bool {
+        self.is_abstract
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum CallMismatch {
     NotCallable,
@@ -665,6 +696,7 @@ enum CallMismatch {
 #[derive(Clone, Debug)]
 struct CallEvaluation {
     return_type: Option<TypeId>,
+    abstract_constructor: bool,
     mismatches: Vec<CallMismatch>,
 }
 
@@ -672,6 +704,7 @@ impl CallEvaluation {
     fn success(return_type: TypeId) -> Self {
         Self {
             return_type: Some(return_type),
+            abstract_constructor: false,
             mismatches: Vec::new(),
         }
     }
@@ -679,6 +712,7 @@ impl CallEvaluation {
     fn failure(mismatch: CallMismatch) -> Self {
         Self {
             return_type: None,
+            abstract_constructor: false,
             mismatches: vec![mismatch],
         }
     }
@@ -686,6 +720,7 @@ impl CallEvaluation {
     fn failure_all(mismatches: Vec<CallMismatch>) -> Self {
         Self {
             return_type: None,
+            abstract_constructor: false,
             mismatches,
         }
     }
@@ -2220,8 +2255,15 @@ impl TypeTable {
                     let construct_signatures = object
                         .construct_signatures
                         .into_iter()
-                        .map(|signature| {
-                            copy_signature(target, source, signature, imported, next_symbol)
+                        .map(|entry| ConstructEntry {
+                            signature: copy_signature(
+                                target,
+                                source,
+                                entry.signature,
+                                imported,
+                                next_symbol,
+                            ),
+                            is_abstract: entry.is_abstract,
                         })
                         .collect();
                     let index_signatures = object
@@ -7209,7 +7251,7 @@ impl<'src> Binder<'src> {
         instance_type: TypeId,
         base_static: Option<&ObjectType>,
         base_arguments: &[TypeId],
-    ) -> Vec<FunctionSignature> {
+    ) -> Vec<ConstructEntry> {
         let overloads: Vec<_> = class
             .members
             .iter()
@@ -7231,7 +7273,7 @@ impl<'src> Binder<'src> {
             return overloads
                 .into_iter()
                 .map(|parameters| {
-                    self.class_construct_signature(class, parameters, scope, instance_type)
+                    self.class_construct_entry(class, parameters, scope, instance_type)
                 })
                 .collect();
         }
@@ -7239,19 +7281,20 @@ impl<'src> Binder<'src> {
             ClassMember::Constructor(constructor) => Some(constructor.parameters.as_slice()),
             _ => None,
         }) {
-            return vec![self.class_construct_signature(class, parameters, scope, instance_type)];
+            return vec![self.class_construct_entry(class, parameters, scope, instance_type)];
         }
         if let Some(base_static) = base_static
             && !base_static.construct_signatures.is_empty()
         {
             let mut inherited = Vec::with_capacity(base_static.construct_signatures.len());
-            for signature in &base_static.construct_signatures {
-                let javascript = signature.javascript;
+            for entry in &base_static.construct_signatures {
+                let javascript = entry.signature.javascript;
                 let mut signature =
-                    if signature.type_parameters.is_empty() || base_arguments.is_empty() {
-                        signature.clone()
+                    if entry.signature.type_parameters.is_empty() || base_arguments.is_empty() {
+                        entry.signature.clone()
                     } else {
-                        let arguments = signature
+                        let arguments = entry
+                            .signature
                             .type_parameters
                             .iter()
                             .copied()
@@ -7265,7 +7308,7 @@ impl<'src> Binder<'src> {
                             })
                             .collect();
                         let type_id = InferredTypeArguments::new(arguments)
-                            .instantiate_signature(&mut self.types, signature);
+                            .instantiate_signature(&mut self.types, &entry.signature);
                         let Type::Function(signature) = self.types.get(type_id) else {
                             unreachable!("instantiated constructor must remain a function");
                         };
@@ -7273,20 +7316,23 @@ impl<'src> Binder<'src> {
                     };
                 signature.javascript = javascript;
                 signature.return_type = instance_type;
-                inherited.push(signature);
+                inherited.push(ConstructEntry {
+                    signature,
+                    is_abstract: class.modifiers.is_abstract,
+                });
             }
             return inherited;
         }
-        vec![self.class_construct_signature(class, &[], scope, instance_type)]
+        vec![self.class_construct_entry(class, &[], scope, instance_type)]
     }
 
-    fn class_construct_signature(
+    fn class_construct_entry(
         &mut self,
         class: &'src ClassDeclaration,
         parameters: &'src [ParameterNode],
         scope: ScopeId,
         instance_type: TypeId,
-    ) -> FunctionSignature {
+    ) -> ConstructEntry {
         let signature_type = self.signature_type_with_return(
             class.type_parameters.as_ref(),
             parameters,
@@ -7296,7 +7342,10 @@ impl<'src> Binder<'src> {
         let Type::Function(signature) = self.types.get(signature_type) else {
             unreachable!("class constructor signature must be a function type");
         };
-        signature.clone()
+        ConstructEntry {
+            signature: signature.clone(),
+            is_abstract: class.modifiers.is_abstract,
+        }
     }
 
     fn constructor_property_assignments(
@@ -8342,6 +8391,13 @@ impl<'src> Binder<'src> {
         }
         let callee_type = self.type_of_expr(&new.callee, scope);
         let evaluation = self.evaluate_new(new, scope, callee_type);
+        if evaluation.abstract_constructor {
+            self.emit(
+                ABSTRACT_CONSTRUCTOR,
+                new.callee.range(),
+                ABSTRACT_CONSTRUCTOR_MESSAGE,
+            );
+        }
         for mismatch in evaluation.mismatches {
             let (code, diagnostic_range, message) = match mismatch {
                 CallMismatch::NotCallable => (
@@ -8390,9 +8446,9 @@ impl<'src> Binder<'src> {
         )
     }
 
-    fn evaluate_signature_groups(
+    fn evaluate_signature_groups<C: SignatureCandidate>(
         &mut self,
-        groups: Vec<Vec<FunctionSignature>>,
+        groups: Vec<Vec<C>>,
         arguments: &[ResolvedCallArgument],
         explicit_types: Option<&[TypeId]>,
         diagnostic_range: TextRange,
@@ -8405,16 +8461,19 @@ impl<'src> Binder<'src> {
             })
             .collect();
         let mut return_types = Vec::with_capacity(groups.len());
+        let mut abstract_constructor = false;
         for group in groups {
             let mut group_mismatches = vec![CallMismatch::ArgumentCount];
             let mut selected = None;
-            for signature in group {
+            for candidate in group {
+                let is_abstract = candidate.is_abstract();
+                let signature = candidate.signature();
                 let instantiated = match explicit_types {
                     Some(explicit) => {
-                        self.explicit_function_signature(&signature, explicit, diagnostic_range)
+                        self.explicit_function_signature(signature, explicit, diagnostic_range)
                     }
                     None => self
-                        .inferred_function_signature(&signature, &inference_types)
+                        .inferred_function_signature(signature, &inference_types)
                         .ok_or(CallMismatch::ArgumentType(diagnostic_range)),
                 };
                 let signature = match instantiated {
@@ -8426,17 +8485,20 @@ impl<'src> Binder<'src> {
                 };
                 let mismatches = self.signature_argument_mismatches(&signature, arguments);
                 if mismatches.is_empty() {
-                    selected = Some(signature.return_type());
+                    selected = Some((signature.return_type(), is_abstract));
                     break;
                 }
                 group_mismatches = mismatches;
             }
-            let Some(return_type) = selected else {
+            let Some((return_type, is_abstract)) = selected else {
                 return CallEvaluation::failure_all(group_mismatches);
             };
             return_types.push(return_type);
+            abstract_constructor |= is_abstract;
         }
-        CallEvaluation::success(self.types.union(&return_types))
+        let mut evaluation = CallEvaluation::success(self.types.union(&return_types));
+        evaluation.abstract_constructor = abstract_constructor;
+        evaluation
     }
 
     fn resolve_call_arguments(
@@ -8666,10 +8728,7 @@ impl<'src> Binder<'src> {
         }
     }
 
-    fn construct_signature_groups_for_type(
-        &mut self,
-        type_id: TypeId,
-    ) -> Vec<Vec<FunctionSignature>> {
+    fn construct_signature_groups_for_type(&mut self, type_id: TypeId) -> Vec<Vec<ConstructEntry>> {
         if let Some(view) = self.types.prepare_applied_class_view(type_id) {
             return self.construct_signature_groups_for_type(view);
         }
@@ -9498,6 +9557,18 @@ impl<'src> Binder<'src> {
             }
             TypeNode::Object(object) => self.resolve_object_type(&object.members, scope),
             TypeNode::Function(function) => self.resolve_function_type(function, scope),
+            TypeNode::Constructor(constructor) => {
+                let signature = self.resolve_function_signature(&constructor.function, scope);
+                self.types.object_type_with_members(ObjectType {
+                    properties: Vec::new(),
+                    call_signatures: Vec::new(),
+                    construct_signatures: vec![ConstructEntry {
+                        signature,
+                        is_abstract: constructor.is_abstract,
+                    }],
+                    index_signatures: Vec::new(),
+                })
+            }
             TypeNode::Parenthesized(inner) => self.resolve_type(inner, scope),
             TypeNode::Tuple(tuple) => {
                 let mut shape = TupleShape {
@@ -10372,9 +10443,11 @@ impl<'src> Binder<'src> {
                             MISSING_METHOD_RETURN_TYPE_MESSAGE,
                         );
                     }
-                    object
-                        .construct_signatures
-                        .push(self.resolve_function_signature(&construct.function.function, scope));
+                    object.construct_signatures.push(ConstructEntry {
+                        signature: self
+                            .resolve_function_signature(&construct.function.function, scope),
+                        is_abstract: construct.function.is_abstract,
+                    });
                 }
                 TypeMember::Index(index) => {
                     let parameters = index

@@ -50,8 +50,8 @@
 //! diagnostics can attribute a type argument to its source.
 
 use super::binder::{
-    FunctionParameter, FunctionSignature, IndexSignature, ObjectType, PropertyType, SymbolId,
-    TupleShape, Type, TypeId, TypeParameterBounds, TypeTable,
+    ConstructEntry, FunctionParameter, FunctionSignature, IndexSignature, ObjectType, PropertyType,
+    SymbolId, TupleShape, Type, TypeId, TypeParameterBounds, TypeTable,
 };
 use super::relations::TypeRelations;
 
@@ -349,16 +349,19 @@ impl InferredTypeArguments {
                 let construct_signatures = object
                     .construct_signatures
                     .iter()
-                    .map(|signature| {
+                    .map(|entry| {
                         let type_id = self.instantiate_function(
                             table,
-                            signature.type_parameters(),
-                            signature,
+                            entry.signature.type_parameters(),
+                            &entry.signature,
                         );
                         let Type::Function(signature) = table.get(type_id) else {
                             unreachable!("function instantiation returns a function type");
                         };
-                        signature.clone()
+                        ConstructEntry {
+                            signature: signature.clone(),
+                            is_abstract: entry.is_abstract,
+                        }
                     })
                     .collect();
                 let index_signatures = object
