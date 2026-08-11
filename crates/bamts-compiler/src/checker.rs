@@ -5783,6 +5783,41 @@ mod tests {
     }
 
     #[test]
+    fn annotated_generators_check_completion_returns_and_fallthrough() {
+        for source in [
+            "function* value(): Generator<number, string, unknown> { yield 1; return 'done'; }",
+            "async function* value(): AsyncGenerator<number, string, unknown> { yield 1; return 'done'; }",
+            "type Completion<R> = Generator<number, R, unknown>; function* value(): Completion<string> { yield 1; return 'done'; }",
+        ] {
+            let result = check_text(source);
+            assert!(
+                checker_codes(&result).is_empty(),
+                "{source}: {:?}",
+                checker_codes(&result)
+            );
+        }
+
+        for source in [
+            "function* value(): Generator<number, string, unknown> { yield 1; }",
+            "async function* value(): AsyncGenerator<number, string, unknown> { yield 1; }",
+            "function* value(): Generator<number, string, unknown> { return 1; }",
+            "type Completion<R> = Generator<number, R, unknown>; function* value(): Completion<string> { return 1; }",
+            "type Completion = Generator<number, string, unknown>; function* value(): Completion { yield 1; }",
+        ] {
+            let result = check_text(source);
+            assert_eq!(
+                checker_codes(&result),
+                ["BAMTS-C004"],
+                "{source}: {:?}",
+                checker_codes(&result)
+            );
+        }
+
+        let missing =
+            check_text("function* value(): Generator<Missing, string, unknown> { return 'done'; }");
+        assert_eq!(checker_codes(&missing), [CANNOT_FIND_TYPE.as_str()]);
+    }
+    #[test]
     fn annotated_generator_returns_do_not_check_body_fallthrough() {
         let result = check_text(
             "function* sync(): Generator<number> { yield 1; }\

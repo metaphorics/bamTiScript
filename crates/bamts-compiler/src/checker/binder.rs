@@ -6194,6 +6194,72 @@ impl<'src> Binder<'src> {
         }
     }
 
+    fn generator_completion_type(
+        &mut self,
+        annotation: &'src Ty,
+        scope: ScopeId,
+    ) -> Option<TypeId> {
+        let mut aliases = HashSet::new();
+        self.generator_completion_type_inner(annotation, scope, &mut aliases)
+    }
+
+    fn generator_completion_type_inner(
+        &mut self,
+        annotation: &'src Ty,
+        scope: ScopeId,
+        aliases: &mut HashSet<SymbolId>,
+    ) -> Option<TypeId> {
+        let TypeNode::Reference(reference) = annotation.data() else {
+            return None;
+        };
+        let EntityName::Identifier(identifier) = &reference.name else {
+            return None;
+        };
+        let name = self.identifier_text(identifier);
+        let symbol = self.lookup_type(scope, &name)?;
+        if matches!(name.as_ref(), "Generator" | "AsyncGenerator")
+            && matches!(
+                self.symbols[symbol.get() as usize].kind,
+                SymbolKind::IntrinsicType
+            )
+        {
+            let completion = reference
+                .type_arguments
+                .as_ref()
+                .and_then(|arguments| arguments.arguments.get(1));
+            return Some(match completion {
+                Some(argument) => self.resolve_type(argument, scope),
+                None => self.types.any(),
+            });
+        }
+        let TypeDef::Alias {
+            scope: alias_scope,
+            type_parameters,
+            node,
+        } = self.type_defs.get(&symbol).copied()?
+        else {
+            return None;
+        };
+        if !aliases.insert(symbol) {
+            return None;
+        }
+        let (parameters, bounds) = self.signature_type_parameters(type_parameters, alias_scope);
+        let arguments: Option<Vec<_>> = reference.type_arguments.as_ref().map(|arguments| {
+            arguments
+                .arguments
+                .iter()
+                .map(|argument| self.resolve_type(argument, scope))
+                .collect()
+        });
+        let inferred =
+            self.complete_explicit_type_arguments(&parameters, &bounds, arguments.as_deref());
+        let completion = self.generator_completion_type_inner(node, alias_scope, aliases);
+        aliases.remove(&symbol);
+        completion.map(|completion| {
+            InferredTypeArguments::new(inferred).instantiate(&mut self.types, completion)
+        })
+    }
+
     fn resolve_function(
         &mut self,
         function: &'src FunctionLike,
@@ -6230,13 +6296,19 @@ impl<'src> Binder<'src> {
             .return_type
             .as_ref()
             .map(|annotation| self.resolve_type(&annotation.data().type_node, scope));
-        let expected_return_type = annotated_return_type.map(|return_type| {
-            if function.is_async {
-                self.promise_value_type(return_type).unwrap_or(return_type)
-            } else {
-                return_type
-            }
-        });
+        let expected_return_type = if function.is_generator {
+            function.return_type.as_ref().and_then(|annotation| {
+                self.generator_completion_type(&annotation.data().type_node, scope)
+            })
+        } else {
+            annotated_return_type.map(|return_type| {
+                if function.is_async {
+                    self.promise_value_type(return_type).unwrap_or(return_type)
+                } else {
+                    return_type
+                }
+            })
+        };
         self.expected_return_types.push(expected_return_type);
         self.this_context.push(this_type);
         if let Some(body_id) = function.body.as_ref().and_then(FunctionBody::id) {
@@ -6263,17 +6335,15 @@ impl<'src> Binder<'src> {
             Some(FunctionBody::Expression(expression)) => binder.resolve_expr(expression, scope),
             _ => {}
         });
-        if !function.is_generator
-            && let Some(body) = function.body.as_ref()
-        {
+        if let Some(body) = function.body.as_ref() {
             self.check_annotated_return_fallthrough(body, expected_return_type);
         }
         if !is_declaration {
             self.pop_reassigned_scope();
         }
         if let Some(symbol) = function_symbol {
-            let return_type = if let Some(annotation) = &function.return_type {
-                self.resolve_type(&annotation.data().type_node, scope)
+            let return_type = if let Some(return_type) = annotated_return_type {
+                return_type
             } else {
                 let inferred = self.inferred_return_type(function, scope);
                 if function.is_async {
@@ -10006,6 +10076,31 @@ impl<'src> Binder<'src> {
             );
         }
 
+        let inferred = self.complete_explicit_type_arguments(parameters, bounds, arguments);
+        let substitution = InferredTypeArguments::new(inferred.clone());
+        for (index, argument) in inferred.iter().enumerate() {
+            if let Some(constraint) = bounds
+                .get(index)
+                .and_then(|bound| bound.constraint())
+                .map(|constraint| substitution.instantiate(&mut self.types, constraint))
+                && !self.types_assignable(argument.type_id(), constraint)
+            {
+                self.emit(
+                    ARGUMENT_NOT_ASSIGNABLE,
+                    diagnostic_range,
+                    ARGUMENT_NOT_ASSIGNABLE_MESSAGE,
+                );
+            }
+        }
+        inferred
+    }
+
+    fn complete_explicit_type_arguments(
+        &mut self,
+        parameters: &[SymbolId],
+        bounds: &[TypeParameterBounds],
+        arguments: Option<&[TypeId]>,
+    ) -> Vec<InferredTypeArgument> {
         let mut resolved: Vec<TypeId> = (0..parameters.len())
             .map(|index| {
                 arguments
@@ -10039,7 +10134,7 @@ impl<'src> Binder<'src> {
                 resolved[index] = default;
             }
         }
-        let inferred: Vec<_> = parameters
+        parameters
             .iter()
             .copied()
             .zip(resolved)
@@ -10058,23 +10153,7 @@ impl<'src> Binder<'src> {
                     },
                 )
             })
-            .collect();
-        let substitution = InferredTypeArguments::new(inferred.clone());
-        for (index, argument) in inferred.iter().enumerate() {
-            if let Some(constraint) = bounds
-                .get(index)
-                .and_then(|bound| bound.constraint())
-                .map(|constraint| substitution.instantiate(&mut self.types, constraint))
-                && !self.types_assignable(argument.type_id(), constraint)
-            {
-                self.emit(
-                    ARGUMENT_NOT_ASSIGNABLE,
-                    diagnostic_range,
-                    ARGUMENT_NOT_ASSIGNABLE_MESSAGE,
-                );
-            }
-        }
-        inferred
+            .collect()
     }
 
     fn resolve_named_type_symbol(&mut self, symbol: SymbolId) -> TypeId {
