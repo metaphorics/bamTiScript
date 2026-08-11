@@ -761,6 +761,11 @@ impl<'table> TypeRelations<'table> {
                 target.iterator_property.as_ref(),
                 strictness,
             )
+            && self.iterator_property_relates(
+                source.async_iterator_property.as_ref(),
+                target.async_iterator_property.as_ref(),
+                strictness,
+            )
             && self.signature_sets_relate(
                 &source.call_signatures,
                 &target.call_signatures,
@@ -884,7 +889,26 @@ impl<'table> TypeRelations<'table> {
                 })
             })
         });
-        if !properties_relate || !generator_return_relates || !iterator_property_relates {
+        let async_iterator_property_relates =
+            target
+                .async_iterator_property
+                .as_ref()
+                .is_none_or(|target| {
+                    sources.iter().any(|source| {
+                        self.relation_object_view(*source).is_some_and(|object| {
+                            self.iterator_property_relates(
+                                object.async_iterator_property.as_ref(),
+                                Some(target),
+                                strictness,
+                            )
+                        })
+                    })
+                });
+        if !properties_relate
+            || !generator_return_relates
+            || !iterator_property_relates
+            || !async_iterator_property_relates
+        {
             return false;
         }
 
@@ -895,6 +919,7 @@ impl<'table> TypeRelations<'table> {
             index_signatures: Vec::new(),
             generator_return: None,
             iterator_property: None,
+            async_iterator_property: None,
         };
         let mut has_object = false;
         for source in sources {
@@ -925,6 +950,7 @@ impl<'table> TypeRelations<'table> {
             index_signatures: target.index_signatures.clone(),
             generator_return: None,
             iterator_property: None,
+            async_iterator_property: None,
         };
         self.signature_sets_relate(
             &combined.call_signatures,

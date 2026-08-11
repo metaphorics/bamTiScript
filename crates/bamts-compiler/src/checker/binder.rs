@@ -555,6 +555,7 @@ pub struct ObjectType {
     pub(crate) index_signatures: Vec<IndexSignature>,
     pub(crate) generator_return: Option<TypeId>,
     pub(crate) iterator_property: Option<IteratorProperty>,
+    pub(crate) async_iterator_property: Option<IteratorProperty>,
 }
 
 impl ObjectType {
@@ -2067,6 +2068,7 @@ impl TypeTable {
             index_signatures: Vec::new(),
             generator_return: None,
             iterator_property: None,
+            async_iterator_property: None,
         })
     }
     /// Interns an object type after canonically ordering its members by name.
@@ -2449,6 +2451,18 @@ impl TypeTable {
                         .with_method(property.is_method())
                         .with_spreadable(property.spreadable())
                     });
+                    let async_iterator_property = object.async_iterator_property.map(|property| {
+                        let declaring_class = property.declaring_class().map(|symbol| {
+                            remap_symbol(target, source, symbol, imported, next_symbol)
+                        });
+                        IteratorProperty::new(
+                            copy(target, source, property.type_id(), imported, next_symbol),
+                            property.optional(),
+                        )
+                        .with_accessibility(property.access(), declaring_class)
+                        .with_method(property.is_method())
+                        .with_spreadable(property.spreadable())
+                    });
                     target.object_type_with_members(ObjectType {
                         properties,
                         call_signatures,
@@ -2456,6 +2470,7 @@ impl TypeTable {
                         index_signatures,
                         generator_return,
                         iterator_property,
+                        async_iterator_property,
                     })
                 }
                 Type::Function(signature) => {
@@ -7491,6 +7506,7 @@ impl<'src> Binder<'src> {
             index_signatures: Vec::new(),
             generator_return: None,
             iterator_property,
+            async_iterator_property: None,
         });
         let Some(owner) = owner else {
             return raw;
@@ -7575,6 +7591,7 @@ impl<'src> Binder<'src> {
             index_signatures: Vec::new(),
             generator_return: None,
             iterator_property,
+            async_iterator_property: None,
         })
     }
 
@@ -10067,6 +10084,7 @@ impl<'src> Binder<'src> {
                     index_signatures: Vec::new(),
                     generator_return: None,
                     iterator_property: None,
+                    async_iterator_property: None,
                 })
             }
             TypeNode::Parenthesized(inner) => self.resolve_type(inner, scope),
@@ -10361,6 +10379,7 @@ impl<'src> Binder<'src> {
                                 index_signatures: Vec::new(),
                                 generator_return: Some(return_type),
                                 iterator_property: None,
+                                async_iterator_property: None,
                             });
                             return self.types.intersection(vec![iterable, marker]);
                         }
@@ -10850,6 +10869,7 @@ impl<'src> Binder<'src> {
                     index_signatures: Vec::new(),
                     generator_return: None,
                     iterator_property: None,
+                    async_iterator_property: None,
                 };
                 for interface in declarations {
                     let base =
@@ -11017,6 +11037,7 @@ impl<'src> Binder<'src> {
             index_signatures: Vec::new(),
             generator_return: None,
             iterator_property: None,
+            async_iterator_property: None,
         };
         for member in members {
             match member.data() {
@@ -11288,6 +11309,7 @@ impl<'src> Binder<'src> {
                     index_signatures: Vec::new(),
                     generator_return: None,
                     iterator_property: None,
+                    async_iterator_property: None,
                 };
                 let mut found = false;
                 for member in members {
@@ -11867,6 +11889,7 @@ impl<'src> Binder<'src> {
             index_signatures: Vec::new(),
             generator_return: None,
             iterator_property,
+            async_iterator_property: None,
         })
     }
 
