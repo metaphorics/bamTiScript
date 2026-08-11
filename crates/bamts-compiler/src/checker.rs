@@ -6411,6 +6411,117 @@ mod tests {
     }
 
     #[test]
+    fn known_iterables_with_error_elements_are_not_reported_as_non_iterable() {
+        let result = check_text(
+            "declare const array: Array<MissingArrayElement>;\
+             declare const iterator: IterableIterator<MissingIteratorElement>;\
+             for (const value of array) { value; }\
+             for (const value of iterator) { value; }",
+        );
+        let codes = checker_codes(&result);
+        assert!(codes.contains(&CANNOT_FIND_TYPE.as_str()));
+        assert!(!codes.contains(&super::FOR_OF_ITERABLE_REQUIRED.as_str()));
+    }
+
+    #[test]
+    fn iterator_whose_next_never_returns_is_still_iterable() {
+        let result = check_text(
+            "declare const iterator: {\
+                 [Symbol.iterator](): { next(): never };\
+             };\
+             for (const value of iterator) {\
+                 const unreachable: never = value;\
+             }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn for_of_requires_every_union_member_to_be_iterable_and_rejects_unknown() {
+        let result = check_text(
+            "declare const mixed: number[] | number;\
+             declare const opaque: unknown;\
+             for (const value of mixed) { value; }\
+             for (const value of opaque) { value; }",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            [
+                super::FOR_OF_ITERABLE_REQUIRED.as_str(),
+                super::FOR_OF_ITERABLE_REQUIRED.as_str(),
+            ]
+        );
+    }
+
+    #[test]
+    fn error_recovery_does_not_hide_non_iterable_union_members() {
+        let result = check_text(
+            "declare const mixed: MissingIterable | number;\
+             declare const iterator: {\
+                 [Symbol.iterator](): MissingIterator | number;\
+             };\
+             for (const value of mixed) { value; }\
+             for (const value of iterator) { value; }",
+        );
+        let codes = checker_codes(&result);
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|code| **code == CANNOT_FIND_TYPE.as_str())
+                .count(),
+            2
+        );
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|code| **code == super::FOR_OF_ITERABLE_REQUIRED.as_str())
+                .count(),
+            2
+        );
+        assert_eq!(codes.len(), 4);
+    }
+
+    #[test]
+    fn constrained_type_parameter_uses_its_iterator_protocol() {
+        let result = check_text(
+            "function consume<T extends IterableIterator<number>>(iterator: T) {\
+                 for (const value of iterator) {\
+                     const numberValue: number = value;\
+                 }\
+             }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn optional_next_does_not_guarantee_iterability() {
+        let result = check_text(
+            "declare const iterator: {\
+                 [Symbol.iterator](): { next?(): { value: number, done: false } };\
+             };\
+             for (const value of iterator) { value; }",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            [super::FOR_OF_ITERABLE_REQUIRED.as_str()]
+        );
+    }
+
+    #[test]
+    fn iterator_object_intersection_supplies_next_protocol() {
+        let result = check_text(
+            "declare const iterator: {\
+                 [Symbol.iterator](): ({\
+                     next(): { value: number, done: false };\
+                 } & { tag: string });\
+             };\
+             for (const value of iterator) {\
+                 const numberValue: number = value;\
+             }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+    #[test]
     fn string_property_cannot_forge_structural_iterator_metadata() {
         let result = check_text(
             "const iterable = {\

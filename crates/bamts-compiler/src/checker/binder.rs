@@ -5825,16 +5825,17 @@ impl<'src> Binder<'src> {
                 let child = self.new_scope(ScopeKind::For, Some(scope));
                 self.resolve_expr(&for_statement.iterable, child);
                 let iterable_type = self.type_of_expr(&for_statement.iterable, child);
-                let element_type = self.iteration_element_type(iterable_type);
-                if element_type == self.types.error_type()
-                    && iterable_type != self.types.error_type()
-                {
-                    self.emit(
-                        FOR_OF_ITERABLE_REQUIRED,
-                        for_statement.iterable.range(),
-                        FOR_OF_ITERABLE_REQUIRED_MESSAGE,
-                    );
-                }
+                let element_type = match self.iteration_element_type(iterable_type) {
+                    Some(element_type) => element_type,
+                    None => {
+                        self.emit(
+                            FOR_OF_ITERABLE_REQUIRED,
+                            for_statement.iterable.range(),
+                            FOR_OF_ITERABLE_REQUIRED_MESSAGE,
+                        );
+                        self.types.error_type()
+                    }
+                };
                 self.resolve_for_of_binding(
                     &for_statement.binding,
                     child,
@@ -9228,14 +9229,22 @@ impl<'src> Binder<'src> {
 
     fn iterator_object_element_type(&mut self, iterator: TypeId) -> Option<TypeId> {
         match self.types.get(iterator).clone() {
-            Type::Any => Some(iterator),
+            Type::Any | Type::Never | Type::Error => Some(iterator),
             Type::Array(_) | Type::Tuple(_) => self.array_element_type(iterator),
             Type::Union(members) => {
+                let error = self.types.error_type();
+                let mut has_error = false;
                 let mut elements = Vec::with_capacity(members.len());
                 for member in members {
-                    elements.push(self.iterator_object_element_type(member)?);
+                    let element = self.iterator_object_element_type(member)?;
+                    has_error |= element == error;
+                    elements.push(element);
                 }
-                Some(self.types.union(&elements))
+                if has_error {
+                    Some(error)
+                } else {
+                    Some(self.types.union(&elements))
+                }
             }
             Type::Named(_) | Type::AppliedClass { .. } => {
                 let view = self.types.named_structural_view(iterator);
@@ -9244,10 +9253,31 @@ impl<'src> Binder<'src> {
                     .then(|| self.iterator_object_element_type(view))
                     .flatten()
             }
+            Type::Intersection(members) => {
+                let error = self.types.error_type();
+                let mut elements = Vec::with_capacity(members.len());
+                for member in members {
+                    let Some(element) = self.iterator_object_element_type(member) else {
+                        continue;
+                    };
+                    if element == error {
+                        return Some(error);
+                    }
+                    elements.push(element);
+                }
+                match elements.len() {
+                    0 => None,
+                    1 => Some(elements[0]),
+                    _ => Some(self.types.intersection(elements)),
+                }
+            }
             Type::ObjectType(_) => {
-                let next = self.types.property_type(iterator, "next")?;
+                let next = self.types.read_property_type(iterator, "next")?;
                 let result = self.zero_argument_return_type(next)?;
-                if matches!(self.types.get(result), Type::Any) {
+                if matches!(
+                    self.types.get(result),
+                    Type::Any | Type::Never | Type::Error
+                ) {
                     return Some(result);
                 }
                 self.types.property_type(result, "value")
@@ -9257,55 +9287,72 @@ impl<'src> Binder<'src> {
     }
 
     fn structural_iterator_element_type(&mut self, method: TypeId) -> Option<TypeId> {
+        if matches!(
+            self.types.get(method),
+            Type::Any | Type::Never | Type::Error
+        ) {
+            return Some(method);
+        }
         let iterator = self.zero_argument_return_type(method)?;
         self.iterator_object_element_type(iterator)
     }
 
-    fn iteration_element_type(&mut self, iterable: TypeId) -> TypeId {
+    fn iteration_element_type(&mut self, iterable: TypeId) -> Option<TypeId> {
         match self.types.get(iterable).clone() {
-            Type::Array(element) => element,
+            Type::Array(element) => Some(element),
             Type::Tuple(shape) => {
                 let mut elements = shape.all_element_types();
                 if (shape.required as usize) < shape.prefix.len() {
                     elements.push(self.types.undefined_type());
                 }
-                self.types.union(&elements)
+                Some(self.types.union(&elements))
             }
             Type::ObjectType(object) => {
-                let Some(property) = object.iterator_property else {
-                    return self.types.error_type();
-                };
+                let property = object.iterator_property?;
                 if property.optional() {
-                    return self.types.error_type();
+                    return None;
                 }
                 self.structural_iterator_element_type(property.type_id())
-                    .unwrap_or_else(|| self.types.error_type())
             }
-            Type::String | Type::StringLiteral(_) => self.types.string(),
-            Type::Any | Type::Unknown => iterable,
+            Type::String | Type::StringLiteral(_) => Some(self.types.string()),
+            Type::Any | Type::Never | Type::Error => Some(iterable),
             Type::Union(members) => {
-                let element: Vec<TypeId> = members
-                    .iter()
-                    .map(|&member| self.iteration_element_type(member))
-                    .collect();
-                self.types.union(&element)
+                let error = self.types.error_type();
+                let mut has_error = false;
+                let mut elements = Vec::with_capacity(members.len());
+                for member in members {
+                    let element = self.iteration_element_type(member)?;
+                    has_error |= element == error;
+                    elements.push(element);
+                }
+                if has_error {
+                    Some(error)
+                } else {
+                    Some(self.types.union(&elements))
+                }
             }
             Type::Intersection(members) => {
                 let error = self.types.error_type();
-                let elements: Vec<TypeId> = members
-                    .iter()
-                    .filter_map(|&member| {
-                        let element = self.iteration_element_type(member);
-                        (element != error).then_some(element)
-                    })
-                    .collect();
+                let mut elements = Vec::with_capacity(members.len());
+                for member in members {
+                    let Some(element) = self.iteration_element_type(member) else {
+                        continue;
+                    };
+                    if element == error {
+                        return Some(error);
+                    }
+                    elements.push(element);
+                }
                 match elements.len() {
-                    0 => error,
-                    1 => elements[0],
-                    _ => self.types.intersection(elements),
+                    0 => None,
+                    1 => Some(elements[0]),
+                    _ => Some(self.types.intersection(elements)),
                 }
             }
             Type::Named(symbol) => {
+                if let Some(constraint) = self.type_parameter_effective_constraint(iterable) {
+                    return self.iteration_element_type(constraint);
+                }
                 let resolved = self.resolve_named_type_symbol(symbol);
                 let view = self.types.named_structural_view(resolved);
                 if view != resolved {
@@ -9313,16 +9360,16 @@ impl<'src> Binder<'src> {
                 } else if resolved != iterable {
                     self.iteration_element_type(resolved)
                 } else {
-                    self.types.error_type()
+                    None
                 }
             }
             Type::AppliedClass { .. } => {
-                let Some(view) = self.types.prepare_applied_class_view(iterable) else {
-                    return self.types.error_type();
-                };
-                self.iteration_element_type(view)
+                let view = self.types.prepare_applied_class_view(iterable)?;
+                (view != iterable)
+                    .then(|| self.iteration_element_type(view))
+                    .flatten()
             }
-            _ => self.types.error_type(),
+            _ => None,
         }
     }
 
