@@ -10409,10 +10409,12 @@ impl<'src> Binder<'src> {
                         .iter()
                         .find(|property| property.name() == base_property.name());
                     let incompatible = declared.is_some_and(|property| {
-                        !self.types_assignable(property.type_id(), base_property.type_id())
+                        (property.optional() && !base_property.optional())
+                            || !self.types_assignable(property.type_id(), base_property.type_id())
                     }) || inherited.is_some_and(|property| {
-                        !TypeRelations::new(&self.types)
-                            .equivalent(property.type_id(), base_property.type_id())
+                        property.optional() != base_property.optional()
+                            || !TypeRelations::new(&self.types)
+                                .equivalent(property.type_id(), base_property.type_id())
                     });
                     if incompatible {
                         self.emit(

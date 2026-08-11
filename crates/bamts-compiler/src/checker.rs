@@ -7968,6 +7968,21 @@ mod tests {
     }
 
     #[test]
+    fn interface_rejects_optional_override_of_required_property() {
+        let invalid = check_text(
+            "interface Base { value: number; }\
+             interface Derived extends Base { value?: number; }",
+        );
+        assert_eq!(checker_codes(&invalid), [TYPE_NOT_ASSIGNABLE.as_str()]);
+
+        let valid = check_text(
+            "interface Base { value?: number; }\
+             interface Derived extends Base { value: number; }",
+        );
+        assert!(checker_codes(&valid).is_empty());
+    }
+
+    #[test]
     fn interface_rejects_conflicting_multiple_bases() {
         let result = check_text(
             "interface Left { value: number; }\
