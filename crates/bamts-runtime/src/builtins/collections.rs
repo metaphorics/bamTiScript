@@ -11,6 +11,7 @@ use crate::{
     CollectionKind, EvalFailure, HeapEntry, Host, IterationKind, Machine, Property, PropertyKey,
     PropertyMap, ResumeCompletion,
 };
+use bamts_bytecode::IteratorKind;
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -445,20 +446,43 @@ fn map_like_constructor<H: Host>(
         .copied()
         .filter(|value| !matches!(value.decode(), Some(Decoded::Null | Decoded::Undefined)))
     {
-        let entries = machine.iterable_values(source)?;
-        for entry in entries {
-            if !machine.is_object(entry) {
-                return Err(type_error("Iterator value is not an entry object"));
+        let iterator = machine.create_iterator(source, IteratorKind::Sync)?;
+        loop {
+            let (done, entry) = machine.iterator_next(iterator)?;
+            if done {
+                break;
             }
-            let key = machine.get_named_property(entry, "0")?;
-            let value = machine.get_named_property(entry, "1")?;
-            if kind == CollectionKind::WeakMap {
-                require_weak_key(machine, key)?;
+            let inserted = (|| {
+                if !machine.is_object(entry) {
+                    return Err(type_error("Iterator value is not an entry object"));
+                }
+                let key = machine.get_named_property(entry, "0")?;
+                let value = machine.get_named_property(entry, "1")?;
+                if kind == CollectionKind::WeakMap {
+                    require_weak_key(machine, key)?;
+                }
+                map_put(machine, object, key, value, kind)
+            })();
+            if let Err(failure) = inserted {
+                return Err(close_iterator_preserving_failure(
+                    machine, iterator, failure,
+                ));
             }
-            map_put(machine, object, key, value, kind)?;
         }
     }
     Ok(BuiltinOutcome::Value(object))
+}
+
+fn close_iterator_preserving_failure<H: Host>(
+    machine: &mut Machine<'_, H>,
+    iterator: Value,
+    failure: EvalFailure,
+) -> EvalFailure {
+    let (close, _) = machine.close_iterator_raw(iterator);
+    match close {
+        Err(EvalFailure::Runtime(kind)) => EvalFailure::Runtime(kind),
+        _ => failure,
+    }
 }
 
 fn set_like_constructor<H: Host>(
@@ -2710,5 +2734,378 @@ mod tests {
                 .expect("prototype has constructor");
             assert_eq!(ctor, ctor_before);
         }
+    }
+
+    use crate::intrinsics::{BuiltinDef, BuiltinHandler, native_function};
+
+    fn native_callback(
+        machine: &mut Machine<'_, TestHost>,
+        name: &'static str,
+        handler: BuiltinHandler<TestHost>,
+    ) -> Value {
+        let id = machine.intrinsics.builtins.register(BuiltinDef {
+            name,
+            length: 0,
+            handler,
+        });
+        native_function(&mut machine.heap, id, name, 0)
+    }
+
+    fn push_log(machine: &mut Machine<'_, TestHost>, event: u32) {
+        let log = machine.test_global("log").unwrap();
+        machine.array_push(log, Value::int32(event)).unwrap();
+    }
+
+    fn get_iter_callback(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let iter = machine.test_global("testIterator").unwrap();
+        Ok(BuiltinOutcome::Value(iter))
+    }
+
+    fn make_custom_iterator_source(
+        machine: &mut Machine<'_, TestHost>,
+        next_fn: Value,
+        return_fn: Value,
+    ) -> Value {
+        let iter = ordinary_object(machine);
+        machine.set_data_property(iter, "next", next_fn).unwrap();
+        machine
+            .set_data_property(iter, "return", return_fn)
+            .unwrap();
+        machine.test_set_global("testIterator", iter);
+
+        let get_iter = native_callback(machine, "custom Symbol.iterator", get_iter_callback);
+        let iterable = ordinary_object(machine);
+        let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
+        let iterator_key = machine
+            .to_property_key(iterator_symbol)
+            .expect("Symbol.iterator is a property key");
+        machine
+            .set_data_property_key(iterable, iterator_key, get_iter)
+            .expect("iterator install succeeds");
+        iterable
+    }
+
+    fn define_getter(
+        machine: &mut Machine<'_, TestHost>,
+        target: Value,
+        key_str: &str,
+        getter_fn: Value,
+    ) {
+        let descriptor = ordinary_object(machine);
+        machine
+            .set_data_property(descriptor, "get", getter_fn)
+            .unwrap();
+        machine
+            .set_data_property(descriptor, "configurable", Value::TRUE)
+            .unwrap();
+        machine
+            .set_data_property(descriptor, "enumerable", Value::TRUE)
+            .unwrap();
+        let object_ctor = machine.intrinsics.global("Object").unwrap();
+        let define_prop = machine
+            .get_named_property(object_ctor, "defineProperty")
+            .unwrap();
+        let key_val = machine
+            .allocate(HeapEntry::String(EcmaString::encode(key_str)))
+            .unwrap();
+        machine
+            .call_value(define_prop, object_ctor, &[target, key_val, descriptor])
+            .unwrap();
+    }
+
+    // ---- iteration order and abrupt close tests ---------------------------
+
+    fn order_next_callback(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let count = match machine.test_global("nextCount") {
+            Some(v) => match v.decode() {
+                Some(Decoded::Int32(n)) => n,
+                _ => 0,
+            },
+            None => 0,
+        };
+        if count == 0 {
+            machine.test_set_global("nextCount", Value::int32(1));
+            push_log(machine, 10); // NEXT_0
+            let entry = machine.test_global("testEntry").unwrap();
+            let res = ordinary_object(machine);
+            machine.set_data_property(res, "done", Value::FALSE)?;
+            machine.set_data_property(res, "value", entry)?;
+            Ok(BuiltinOutcome::Value(res))
+        } else {
+            machine.test_set_global("nextCount", Value::int32(2));
+            push_log(machine, 40); // PUT (recorded before NEXT_1)
+            push_log(machine, 50); // NEXT_1
+            let res = ordinary_object(machine);
+            machine.set_data_property(res, "done", Value::TRUE)?;
+            machine.set_data_property(res, "value", Value::UNDEFINED)?;
+            Ok(BuiltinOutcome::Value(res))
+        }
+    }
+
+    fn order_get_0_callback(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        push_log(machine, 20); // GET_0
+        Ok(BuiltinOutcome::Value(Value::int32(1)))
+    }
+
+    fn order_get_1_callback(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        push_log(machine, 30); // GET_1
+        Ok(BuiltinOutcome::Value(Value::int32(100)))
+    }
+
+    fn order_return_callback(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        push_log(machine, 60); // RETURN
+        let res = ordinary_object(machine);
+        machine.set_data_property(res, "done", Value::TRUE)?;
+        Ok(BuiltinOutcome::Value(res))
+    }
+
+    #[test]
+    fn map_constructor_iterator_and_entry_evaluation_order() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let log = allocate_array(&mut machine, Vec::new()).unwrap();
+        machine.test_set_global("log", log);
+        machine.test_set_global("nextCount", Value::int32(0));
+
+        let entry = ordinary_object(&mut machine);
+        let get0 = native_callback(&mut machine, "get 0", order_get_0_callback);
+        let get1 = native_callback(&mut machine, "get 1", order_get_1_callback);
+        define_getter(&mut machine, entry, "0", get0);
+        define_getter(&mut machine, entry, "1", get1);
+        machine.test_set_global("testEntry", entry);
+
+        let next = native_callback(&mut machine, "next", order_next_callback);
+        let ret = native_callback(&mut machine, "return", order_return_callback);
+        let source = make_custom_iterator_source(&mut machine, next, ret);
+
+        let map = construct_builtin(&mut machine, "Map", &[source]);
+        let entries = collection_entries(&machine, map);
+        assert_eq!(entries, vec![(Value::int32(1), Value::int32(100))]);
+
+        let events = machine.array_elements(log).unwrap().unwrap();
+        let event_nums: Vec<u32> = events
+            .iter()
+            .map(|v| match v.decode() {
+                Some(Decoded::Int32(n)) => n,
+                _ => 0,
+            })
+            .collect();
+
+        // Pin order: next0 (10), get0 (20), get1 (30), put (40), next1 (50)
+        assert_eq!(
+            event_nums,
+            vec![10, 20, 30, 40, 50],
+            "Map constructor must process entries lazily in order: next0, get0, get1, put, next1"
+        );
+    }
+
+    fn failing_entry_next_callback(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let count = match machine.test_global("nextCount") {
+            Some(v) => match v.decode() {
+                Some(Decoded::Int32(n)) => n,
+                _ => 0,
+            },
+            None => 0,
+        };
+        machine.test_set_global("nextCount", Value::int32(count + 1));
+        push_log(machine, 10); // NEXT_0
+        let entry = machine.test_global("testEntry").unwrap();
+        let res = ordinary_object(machine);
+        machine.set_data_property(res, "done", Value::FALSE)?;
+        machine.set_data_property(res, "value", entry)?;
+        Ok(BuiltinOutcome::Value(res))
+    }
+
+    fn failing_get_1_callback(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        push_log(machine, 70); // GET_1_THROW
+        Err(type_error("entry value getter failed"))
+    }
+
+    #[test]
+    fn map_constructor_closes_iterator_on_entry_property_failure() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let log = allocate_array(&mut machine, Vec::new()).unwrap();
+        machine.test_set_global("log", log);
+        machine.test_set_global("nextCount", Value::int32(0));
+
+        let entry = ordinary_object(&mut machine);
+        let get0 = native_callback(&mut machine, "get 0", order_get_0_callback);
+        let get1 = native_callback(&mut machine, "failing get 1", failing_get_1_callback);
+        define_getter(&mut machine, entry, "0", get0);
+        define_getter(&mut machine, entry, "1", get1);
+        machine.test_set_global("testEntry", entry);
+
+        let next = native_callback(&mut machine, "next", failing_entry_next_callback);
+        let ret = native_callback(&mut machine, "return", order_return_callback);
+        let source = make_custom_iterator_source(&mut machine, next, ret);
+
+        let id = builtin_id(&machine, "Map");
+        let result = machine.call_builtin(id, Value::UNDEFINED, &[source], true);
+        assert!(
+            result.is_err(),
+            "Map constructor must fail when entry get throws"
+        );
+
+        let events = machine.array_elements(log).unwrap().unwrap();
+        let event_nums: Vec<u32> = events
+            .iter()
+            .map(|v| match v.decode() {
+                Some(Decoded::Int32(n)) => n,
+                _ => 0,
+            })
+            .collect();
+
+        // Pin abrupt close: next0 (10), get0 (20), get1_throw (70), return (60)
+        assert_eq!(
+            event_nums,
+            vec![10, 20, 70, 60],
+            "Entry property failure must trigger iterator return hook"
+        );
+
+        let next_count = match machine.test_global("nextCount").unwrap().decode() {
+            Some(Decoded::Int32(n)) => n,
+            _ => 0,
+        };
+        assert_eq!(
+            next_count, 1,
+            "No second next call must occur after entry failure"
+        );
+    }
+
+    fn throwing_next_callback(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        push_log(machine, 80); // NEXT_THROW
+        Err(type_error("iterator next failed"))
+    }
+
+    #[test]
+    fn map_constructor_does_not_close_iterator_on_next_failure() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let log = allocate_array(&mut machine, Vec::new()).unwrap();
+        machine.test_set_global("log", log);
+
+        let next = native_callback(&mut machine, "throwing next", throwing_next_callback);
+        let ret = native_callback(&mut machine, "return", order_return_callback);
+        let source = make_custom_iterator_source(&mut machine, next, ret);
+
+        let id = builtin_id(&machine, "Map");
+        let result = machine.call_builtin(id, Value::UNDEFINED, &[source], true);
+        assert!(
+            result.is_err(),
+            "Map constructor must fail when iterator next throws"
+        );
+
+        let events = machine.array_elements(log).unwrap().unwrap();
+        let event_nums: Vec<u32> = events
+            .iter()
+            .map(|v| match v.decode() {
+                Some(Decoded::Int32(n)) => n,
+                _ => 0,
+            })
+            .collect();
+
+        assert_eq!(
+            event_nums,
+            vec![80],
+            "Throwing next() must not call iterator return hook"
+        );
+    }
+
+    #[test]
+    fn weak_map_constructor_closes_iterator_on_invalid_key() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let log = allocate_array(&mut machine, Vec::new()).unwrap();
+        machine.test_set_global("log", log);
+        machine.test_set_global("nextCount", Value::int32(0));
+
+        // Entry with primitive key for WeakMap
+        let entry = entry_pair(&mut machine, Value::int32(42), Value::int32(100));
+        machine.test_set_global("testEntry", entry);
+
+        let next = native_callback(&mut machine, "next", failing_entry_next_callback);
+        let ret = native_callback(&mut machine, "return", order_return_callback);
+        let source = make_custom_iterator_source(&mut machine, next, ret);
+
+        let id = builtin_id(&machine, "WeakMap");
+        let result = machine.call_builtin(id, Value::UNDEFINED, &[source], true);
+        assert!(
+            result.is_err(),
+            "WeakMap constructor must fail on primitive key"
+        );
+
+        let events = machine.array_elements(log).unwrap().unwrap();
+        let event_nums: Vec<u32> = events
+            .iter()
+            .map(|v| match v.decode() {
+                Some(Decoded::Int32(n)) => n,
+                _ => 0,
+            })
+            .collect();
+
+        // Pin abrupt close: next0 (10), return (60)
+        assert_eq!(
+            event_nums,
+            vec![10, 60],
+            "WeakMap invalid key failure must trigger iterator return hook"
+        );
+
+        let next_count = match machine.test_global("nextCount").unwrap().decode() {
+            Some(Decoded::Int32(n)) => n,
+            _ => 0,
+        };
+        assert_eq!(
+            next_count, 1,
+            "No second next call must occur after WeakMap key failure"
+        );
     }
 }
