@@ -1171,11 +1171,11 @@ pub(crate) fn enum_declaration(statement: &Stmt) -> Option<(&EnumDeclaration, No
 #[cfg(test)]
 mod tests {
     use super::cook_member_property_name;
-    use crate::syntax::{Expression, MemberProperty, SourceFile, Statement};
     use super::{ENUM_ARITHMETIC_LEFT_NOT_NUMBER, ENUM_ARITHMETIC_RIGHT_NOT_NUMBER};
     use crate::checker::{SemanticModel, check};
     use crate::diagnostic::Recovered;
     use crate::source::{ScriptKind, SourceId, SourceText};
+    use crate::syntax::{Expression, MemberProperty, SourceFile, Statement};
     use crate::{parser, scanner};
     use std::sync::Arc;
 
@@ -1263,7 +1263,9 @@ mod tests {
             .iter()
             .map(|property| cook_member_property_name(&source, property))
             .collect();
-        let first = names[0].as_ref().expect("first access should produce a name");
+        let first = names[0]
+            .as_ref()
+            .expect("first access should produce a name");
         for name in &names[1..] {
             assert_eq!(
                 name.as_ref().map(|n| n.to_utf8_lossy()),
