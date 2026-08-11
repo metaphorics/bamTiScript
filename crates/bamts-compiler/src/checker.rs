@@ -7610,4 +7610,33 @@ mod tests {
             checker_codes(&result)
         );
     }
+
+    #[test]
+    fn interface_rejects_incompatible_derived_redeclaration() {
+        let result = check_text(
+            "interface Base { value: number; }\
+             interface Derived extends Base { value: string; }",
+        );
+        assert_eq!(checker_codes(&result), [TYPE_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    #[test]
+    fn interface_rejects_conflicting_multiple_bases() {
+        let result = check_text(
+            "interface Left { value: number; }\
+             interface Right { value: string; }\
+             interface Derived extends Left, Right {}",
+        );
+        assert_eq!(checker_codes(&result), [TYPE_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    #[test]
+    fn interface_accepts_compatible_and_equivalent_inheritance() {
+        let result = check_text(
+            "interface Left { value: number; }\
+             interface Right { value: number; }\
+             interface Derived extends Left, Right { value: number; }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
 }

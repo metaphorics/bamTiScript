@@ -10134,6 +10134,7 @@ impl<'src> Binder<'src> {
         members: &'src [crate::syntax::TypeMemberNode],
     ) -> TypeId {
         let mut object = self.resolve_type_members(members, scope);
+        let declared_properties = object.properties.len();
         for base in extends {
             let base_type = self.resolve_type_reference(
                 base,
@@ -10142,8 +10143,27 @@ impl<'src> Binder<'src> {
                 NodeId::default_range(),
             );
             let base_view = self.types.named_structural_view(base_type);
-            if let Type::ObjectType(base_object) = self.types.get(base_view) {
+            if let Type::ObjectType(base_object) = self.types.get(base_view).clone() {
                 for base_property in &base_object.properties {
+                    let declared = object.properties[..declared_properties]
+                        .iter()
+                        .find(|property| property.name() == base_property.name());
+                    let inherited = object.properties[declared_properties..]
+                        .iter()
+                        .find(|property| property.name() == base_property.name());
+                    let incompatible = declared.is_some_and(|property| {
+                        !self.types_assignable(property.type_id(), base_property.type_id())
+                    }) || inherited.is_some_and(|property| {
+                        !TypeRelations::new(&self.types)
+                            .equivalent(property.type_id(), base_property.type_id())
+                    });
+                    if incompatible {
+                        self.emit(
+                            TYPE_NOT_ASSIGNABLE,
+                            self.entity_name_range(&base.name),
+                            NOT_ASSIGNABLE_MESSAGE,
+                        );
+                    }
                     object.properties.push(base_property.clone());
                 }
                 for base_signature in &base_object.call_signatures {
