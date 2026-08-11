@@ -500,12 +500,23 @@ fn set_like_constructor<H: Host>(
         .copied()
         .filter(|value| !matches!(value.decode(), Some(Decoded::Null | Decoded::Undefined)))
     {
-        let values = machine.iterable_values(source)?;
-        for value in values {
-            if kind == CollectionKind::WeakSet {
-                require_weak_key(machine, value)?;
+        let iterator = machine.create_iterator(source, IteratorKind::Sync)?;
+        loop {
+            let (done, value) = machine.iterator_next(iterator)?;
+            if done {
+                break;
             }
-            set_put(machine, object, value, kind)?;
+            let inserted = (|| {
+                if kind == CollectionKind::WeakSet {
+                    require_weak_key(machine, value)?;
+                }
+                set_put(machine, object, value, kind)
+            })();
+            if let Err(failure) = inserted {
+                return Err(close_iterator_preserving_failure(
+                    machine, iterator, failure,
+                ));
+            }
         }
     }
     Ok(BuiltinOutcome::Value(object))
@@ -3056,6 +3067,70 @@ mod tests {
             vec![80],
             "Throwing next() must not call iterator return hook"
         );
+    }
+
+    fn weak_set_invalid_next_callback(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let count = match machine.test_global("nextCount") {
+            Some(value) => match value.decode() {
+                Some(Decoded::Int32(count)) => count,
+                _ => 0,
+            },
+            None => 0,
+        };
+        machine.test_set_global("nextCount", Value::int32(count + 1));
+        push_log(machine, if count == 0 { 10 } else { 40 });
+
+        let result = ordinary_object(machine);
+        machine
+            .set_data_property(result, "done", Value::FALSE)
+            .unwrap();
+        machine
+            .set_data_property(result, "value", Value::int32(42))
+            .unwrap();
+        Ok(BuiltinOutcome::Value(result))
+    }
+
+    #[test]
+    fn weak_set_constructor_closes_before_requesting_next_invalid_value() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let log = allocate_array(&mut machine, Vec::new()).unwrap();
+        machine.test_set_global("log", log);
+        machine.test_set_global("nextCount", Value::int32(0));
+
+        let next = native_callback(&mut machine, "next", weak_set_invalid_next_callback);
+        let ret = native_callback(&mut machine, "return", order_return_callback);
+        let source = make_custom_iterator_source(&mut machine, next, ret);
+
+        let id = builtin_id(&machine, "WeakSet");
+        let result = machine.call_builtin(id, Value::UNDEFINED, &[source], true);
+        assert_type_error(result);
+
+        let events = machine.array_elements(log).unwrap().unwrap();
+        let event_nums: Vec<u32> = events
+            .iter()
+            .map(|value| match value.decode() {
+                Some(Decoded::Int32(number)) => number,
+                _ => 0,
+            })
+            .collect();
+        assert_eq!(event_nums, vec![10, 60]);
+
+        let next_count = match machine.test_global("nextCount") {
+            Some(value) => match value.decode() {
+                Some(Decoded::Int32(count)) => count,
+                _ => 0,
+            },
+            None => 0,
+        };
+        assert_eq!(next_count, 1);
     }
 
     #[test]
