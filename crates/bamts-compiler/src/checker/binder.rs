@@ -10,7 +10,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use bamts_bytecode::EcmaString;
+use bamts_bytecode::{EcmaString, format_number};
 
 use super::AnalysisFacts;
 use super::ProgramCheckOptions;
@@ -10741,7 +10741,7 @@ impl<'src> Binder<'src> {
             PropertyName::String(string) => string_value(self.text(string.data().token()))
                 .map(|value| Self::semantic_property_key(&value)),
             PropertyName::Number(number) => {
-                number_value(self.text(number.data().token())).map(enum_plan::number_name)
+                number_value(self.text(number.data().token())).map(format_number)
             }
             PropertyName::Computed(expression) => match expression.data() {
                 Expression::Literal(Literal::String(string)) => {
@@ -10749,7 +10749,7 @@ impl<'src> Binder<'src> {
                         .map(|value| Self::semantic_property_key(&value))
                 }
                 Expression::Literal(Literal::Number(number)) => {
-                    number_value(self.text(number.data().token())).map(enum_plan::number_name)
+                    number_value(self.text(number.data().token())).map(format_number)
                 }
                 _ => None,
             },

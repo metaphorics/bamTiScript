@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use bamts_bytecode::{EcmaString, EcmaStringBuilder, NumberBits};
+use bamts_bytecode::{EcmaString, EcmaStringBuilder, NumberBits, format_number};
 
 use crate::checker::{SemanticModel, SymbolId, SymbolKind};
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
@@ -359,7 +359,7 @@ pub(crate) fn cook_member_name(
         PropertyName::Number(number) => source
             .token_text(number.data().token())
             .and_then(number_value)
-            .map(|value| EcmaString::encode(&number_name(value))),
+            .map(|value| EcmaString::encode(&format_number(value))),
         PropertyName::Private(_) | PropertyName::Computed(_) | PropertyName::Missing(_) => None,
     }
 }
@@ -1080,7 +1080,7 @@ pub(crate) fn cook_member_property_name(
             Expression::Literal(Literal::Number(number)) => source
                 .token_text(number.data().token())
                 .and_then(number_value)
-                .map(|value| EcmaString::encode(&number_name(value))),
+                .map(|value| EcmaString::encode(&format_number(value))),
             _ => None,
         },
         MemberProperty::Private(_) => None,
@@ -1133,19 +1133,6 @@ fn to_u32(value: f64) -> u32 {
     modulo as u32
 }
 
-pub(crate) fn number_name(value: f64) -> String {
-    if value == 0.0 {
-        "0".to_owned()
-    } else if value.fract() == 0.0
-        && value.is_finite()
-        && (0.0..=9_007_199_254_740_991.0).contains(&value)
-    {
-        format!("{}", value as u64)
-    } else {
-        format!("{value}")
-    }
-}
-
 fn error(
     source: SourceId,
     code: DiagnosticCode,
@@ -1170,8 +1157,8 @@ pub(crate) fn enum_declaration(statement: &Stmt) -> Option<(&EnumDeclaration, No
 
 #[cfg(test)]
 mod tests {
-    use super::cook_member_property_name;
     use super::{ENUM_ARITHMETIC_LEFT_NOT_NUMBER, ENUM_ARITHMETIC_RIGHT_NOT_NUMBER};
+    use super::{cook_member_name, cook_member_property_name};
     use crate::checker::{SemanticModel, check};
     use crate::diagnostic::Recovered;
     use crate::source::{ScriptKind, SourceId, SourceText};
@@ -1274,5 +1261,33 @@ mod tests {
             );
         }
         assert_eq!(first.to_utf8_lossy(), "1000");
+    }
+
+    #[test]
+    fn exponent_boundary_numeric_names_use_ecmascript_format() {
+        let source = source_text("enum E { 1e21, 1e-7 }\no[1e21]; o[1e-7];");
+        let Statement::Enum(declaration) = source.statements()[0].data() else {
+            panic!("first statement should be an enum declaration");
+        };
+        let declared: Vec<String> = declaration
+            .members
+            .iter()
+            .map(|member| {
+                cook_member_name(&source, &member.data().name)
+                    .expect("numeric enum member should have a cooked name")
+                    .to_utf8_lossy()
+            })
+            .collect();
+        assert_eq!(declared, ["1e+21", "1e-7"]);
+
+        let accessed: Vec<String> = member_properties(&source)
+            .into_iter()
+            .map(|property| {
+                cook_member_property_name(&source, property)
+                    .expect("computed numeric access should have a cooked name")
+                    .to_utf8_lossy()
+            })
+            .collect();
+        assert_eq!(accessed, ["1e+21", "1e-7"]);
     }
 }

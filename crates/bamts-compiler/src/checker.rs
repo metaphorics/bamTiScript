@@ -6425,6 +6425,10 @@ mod tests {
             r#"const value: { a: number } = { ["\x61"]: 1 };"#,
             r#"const value: { a: number } = { "\u0061": 1 };"#,
             "const value: { 1: number } = { [0x1]: 1 };",
+            r#"const value: { "1e+21": number } = { 1e21: 1 };"#,
+            r#"const value: { "1e-7": number } = { 1e-7: 1 };"#,
+            r#"const value: { "1e+21": number } = { [1e21]: 1 };"#,
+            r#"const value: { "1e-7": number } = { [1e-7]: 1 };"#,
         ] {
             let result = check_text(source);
             assert!(
