@@ -29,16 +29,16 @@ use super::{
     ARGUMENT_NOT_ASSIGNABLE, ASSIGNMENT_TO_CONST, ASSIGNMENT_TO_FUNCTION, ASSIGNMENT_TO_NAMESPACE,
     ASSIGNMENT_TO_READONLY, AWAIT_USING_DECLARATION_IN_FOR_IN, BARE_SUPER_EXPRESSION,
     CANNOT_FIND_NAME, CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED,
-    CONSTRUCTOR_TYPE_PARAMETERS, DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE,
-    EXPRESSION_NOT_CONSTRUCTABLE, FOR_IN_LEFT_HAND_SIDE_INVALID, FOR_OF_ITERABLE_REQUIRED,
-    FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT, FUNCTION_IMPLEMENTATION_WRONG_NAME,
-    FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS,
-    IMPORT_CONFLICTS_WITH_LOCAL, INVALID_ASSIGNMENT_TARGET, INVALID_INDEXED_ACCESS_KEY,
-    MEMBER_NOT_ACCESSIBLE, MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT,
-    NEW_TARGET_OUTSIDE_FUNCTION, PARAMETER_DECORATOR_NOT_SUPPORTED, PROPERTY_DOES_NOT_EXIST,
-    PROPERTY_NOT_INITIALIZED, SET_ACCESSOR_PARAMETER_INITIALIZER,
-    STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT, STRICT_NULL_MEMBER_ACCESS,
-    SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
+    CONSTRUCTOR_TYPE_PARAMETERS, DERIVED_CONSTRUCTOR_MISSING_SUPER, DUPLICATE_DECLARATION,
+    EXPRESSION_NOT_CALLABLE, EXPRESSION_NOT_CONSTRUCTABLE, FOR_IN_LEFT_HAND_SIDE_INVALID,
+    FOR_OF_ITERABLE_REQUIRED, FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT,
+    FUNCTION_IMPLEMENTATION_WRONG_NAME, FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION,
+    GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS, IMPORT_CONFLICTS_WITH_LOCAL,
+    INVALID_ASSIGNMENT_TARGET, INVALID_INDEXED_ACCESS_KEY, MEMBER_NOT_ACCESSIBLE,
+    MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT, NEW_TARGET_OUTSIDE_FUNCTION,
+    PARAMETER_DECORATOR_NOT_SUPPORTED, PROPERTY_DOES_NOT_EXIST, PROPERTY_NOT_INITIALIZED,
+    SET_ACCESSOR_PARAMETER_INITIALIZER, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT,
+    STRICT_NULL_MEMBER_ACCESS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
     SUPER_REFERENCE_NON_DERIVED, TYPE_NOT_ASSIGNABLE, USED_BEFORE_ASSIGNED,
     USING_DECLARATION_BINDING_PATTERN, USING_DECLARATION_IN_FOR_IN,
     USING_DECLARATION_MISSING_INITIALIZER, WITH_STATEMENT_NOT_ALLOWED,
@@ -50,15 +50,15 @@ use super::{
     ASSIGNMENT_TO_READONLY_MESSAGE, AWAIT_USING_DECLARATION_IN_FOR_IN_MESSAGE,
     BARE_SUPER_EXPRESSION_MESSAGE, CANNOT_FIND_NAME_MESSAGE, CANNOT_FIND_NAMESPACE_MESSAGE,
     CANNOT_FIND_TYPE_MESSAGE, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED_MESSAGE,
-    CONSTRUCTOR_TYPE_PARAMETERS_MESSAGE, DUPLICATE_MESSAGE, EXPRESSION_NOT_CALLABLE_MESSAGE,
-    EXPRESSION_NOT_CONSTRUCTABLE_MESSAGE, FOR_IN_LEFT_HAND_SIDE_INVALID_MESSAGE,
-    FOR_OF_ITERABLE_REQUIRED_MESSAGE, FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT_MESSAGE,
-    FUNCTION_IMPLEMENTATION_WRONG_NAME_MESSAGE, FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION_MESSAGE,
-    GET_ACCESSOR_NO_RETURN_MESSAGE, GET_ACCESSOR_PARAMETERS_MESSAGE,
-    IMPORT_CONFLICTS_WITH_LOCAL_MESSAGE, INVALID_ASSIGNMENT_TARGET_MESSAGE,
-    INVALID_INDEXED_ACCESS_KEY_MESSAGE, MEMBER_NOT_ACCESSIBLE_MESSAGE,
-    MISSING_METHOD_RETURN_TYPE_MESSAGE, MIXED_EXPORT_ASSIGNMENT_MESSAGE,
-    NEW_TARGET_OUTSIDE_FUNCTION_MESSAGE, NOT_ASSIGNABLE_MESSAGE,
+    CONSTRUCTOR_TYPE_PARAMETERS_MESSAGE, DERIVED_CONSTRUCTOR_MISSING_SUPER_MESSAGE,
+    DUPLICATE_MESSAGE, EXPRESSION_NOT_CALLABLE_MESSAGE, EXPRESSION_NOT_CONSTRUCTABLE_MESSAGE,
+    FOR_IN_LEFT_HAND_SIDE_INVALID_MESSAGE, FOR_OF_ITERABLE_REQUIRED_MESSAGE,
+    FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT_MESSAGE, FUNCTION_IMPLEMENTATION_WRONG_NAME_MESSAGE,
+    FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION_MESSAGE, GET_ACCESSOR_NO_RETURN_MESSAGE,
+    GET_ACCESSOR_PARAMETERS_MESSAGE, IMPORT_CONFLICTS_WITH_LOCAL_MESSAGE,
+    INVALID_ASSIGNMENT_TARGET_MESSAGE, INVALID_INDEXED_ACCESS_KEY_MESSAGE,
+    MEMBER_NOT_ACCESSIBLE_MESSAGE, MISSING_METHOD_RETURN_TYPE_MESSAGE,
+    MIXED_EXPORT_ASSIGNMENT_MESSAGE, NEW_TARGET_OUTSIDE_FUNCTION_MESSAGE, NOT_ASSIGNABLE_MESSAGE,
     PARAMETER_DECORATOR_NOT_SUPPORTED_MESSAGE, PROPERTY_DOES_NOT_EXIST_MESSAGE,
     PROPERTY_NOT_INITIALIZED_MESSAGE, SET_ACCESSOR_PARAMETER_INITIALIZER_MESSAGE,
     STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT_MESSAGE, STRICT_NULL_MEMBER_ACCESS_MESSAGE,
@@ -2862,6 +2862,8 @@ pub(crate) struct Binder<'src> {
     /// last. Empty means top level, which behaves as
     /// [`SuperCallContext::NonConstructor`].
     super_call_contexts: Vec<SuperCallContext>,
+    /// Legal `super()` presence for active derived constructor bodies.
+    derived_constructor_super_presence: Vec<bool>,
     /// Whether each lexically enclosing class has a base class, innermost last.
     class_derived_stack: Vec<bool>,
     /// Own readonly storage properties for each lexically enclosing class.
@@ -2980,6 +2982,7 @@ impl<'src> Binder<'src> {
             reassigned_flow_roots: HashSet::new(),
             reassigned_flow_roots_stack: Vec::new(),
             super_call_contexts: Vec::new(),
+            derived_constructor_super_presence: Vec::new(),
             class_derived_stack: Vec::new(),
             constructor_writable_readonly_properties: Vec::new(),
             readonly_assignment_targets: HashSet::new(),
@@ -7639,6 +7642,10 @@ impl<'src> Binder<'src> {
                     popped_parameters,
                     Some(SuperCallContext::ConstructorParameters { derived })
                 );
+                let track_super = derived && !ambient && !constructor.body.range().is_empty();
+                if track_super {
+                    self.derived_constructor_super_presence.push(false);
+                }
                 self.super_call_contexts.push(if derived {
                     SuperCallContext::DerivedConstructor
                 } else {
@@ -7651,6 +7658,19 @@ impl<'src> Binder<'src> {
                     binder.bind_statements(&constructor.body.data().statements, child);
                     binder.resolve_statements(&constructor.body.data().statements, child);
                 });
+                if track_super {
+                    let called = self
+                        .derived_constructor_super_presence
+                        .pop()
+                        .expect("tracked derived constructor has a presence entry");
+                    if !called {
+                        self.emit(
+                            DERIVED_CONSTRUCTOR_MISSING_SUPER,
+                            constructor.body.range(),
+                            DERIVED_CONSTRUCTOR_MISSING_SUPER_MESSAGE,
+                        );
+                    }
+                }
                 self.pop_reassigned_scope();
                 self.this_context.pop();
                 self.new_target_contexts.truncate(new_target_marker);
@@ -8050,7 +8070,12 @@ impl<'src> Binder<'src> {
             .copied()
             .unwrap_or(SuperCallContext::NonConstructor);
         let (code, message) = match context {
-            SuperCallContext::DerivedConstructor => return,
+            SuperCallContext::DerivedConstructor => {
+                if let Some(called) = self.derived_constructor_super_presence.last_mut() {
+                    *called = true;
+                }
+                return;
+            }
             SuperCallContext::BaseConstructor
             | SuperCallContext::ConstructorParameters { derived: false } => (
                 SUPER_REFERENCE_NON_DERIVED,

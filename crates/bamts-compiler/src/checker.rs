@@ -105,6 +105,8 @@ pub const SUPER_CALL_OUTSIDE_CONSTRUCTOR: DiagnosticCode = DiagnosticCode::new("
 /// Diagnostic emitted when a `super(...)` call appears in constructor parameter
 /// initializers.
 pub const SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS: DiagnosticCode = DiagnosticCode::new("BAMTS-C027");
+/// Diagnostic emitted when a derived constructor has no legal `super()` call.
+pub const DERIVED_CONSTRUCTOR_MISSING_SUPER: DiagnosticCode = DiagnosticCode::new("BAMTS-C068");
 
 const DUPLICATE_MESSAGE: &str = "A block-scoped declaration cannot redeclare an existing binding.";
 const CANNOT_FIND_NAME_MESSAGE: &str = "Cannot find name in any enclosing scope.";
@@ -259,6 +261,8 @@ pub(crate) const SUPER_REFERENCE_NON_DERIVED_MESSAGE: &str =
 pub(crate) const SUPER_CALL_OUTSIDE_CONSTRUCTOR_MESSAGE: &str = "Super calls are not permitted outside constructors or in nested functions inside constructors.";
 pub(crate) const SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE: &str =
     "'super' cannot be referenced in constructor arguments.";
+const DERIVED_CONSTRUCTOR_MISSING_SUPER_MESSAGE: &str =
+    "Constructors for derived classes must contain a 'super' call.";
 const ARGUMENT_NOT_ASSIGNABLE_MESSAGE: &str = "Argument type is not assignable to parameter type.";
 const ARGUMENT_COUNT_MISMATCH_MESSAGE: &str =
     "Supplied arguments do not match the expected parameter count.";
@@ -1865,9 +1869,9 @@ fn imported_enum_error(
 mod tests {
     use super::{
         ARGUMENT_NOT_ASSIGNABLE, BARE_SUPER_EXPRESSION, CANNOT_FIND_NAME, CANNOT_FIND_NAMESPACE,
-        CANNOT_FIND_TYPE, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED, DUPLICATE_DECLARATION,
-        EXPRESSION_NOT_CALLABLE, IMPORTED_CONST_ENUM_AMBIGUOUS, IMPORTED_CONST_ENUM_CYCLE,
-        IMPORTED_CONST_ENUM_NONCONSTANT, MIXED_EXPORT_ASSIGNMENT,
+        CANNOT_FIND_TYPE, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED, DERIVED_CONSTRUCTOR_MISSING_SUPER,
+        DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE, IMPORTED_CONST_ENUM_AMBIGUOUS,
+        IMPORTED_CONST_ENUM_CYCLE, IMPORTED_CONST_ENUM_NONCONSTANT, MIXED_EXPORT_ASSIGNMENT,
         PARAMETER_DECORATOR_NOT_SUPPORTED, PROPERTY_DOES_NOT_EXIST, ProgramCheckInput,
         ProgramCheckOptions, PropertyType, ResolvedModuleEdge, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS,
         SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_REFERENCE_NON_DERIVED, ScopeKind, SymbolKind,
@@ -5005,6 +5009,65 @@ mod tests {
                 "{bare}"
             );
         }
+    }
+
+    #[test]
+    fn derived_constructor_requires_super_call() {
+        for accepted in [
+            "class D extends Object { constructor() { super(); } }",
+            "class D extends Object { constructor(flag: boolean) { if (flag) super(); } }",
+            "class D extends Object { constructor(flag: boolean) { while (flag) super(); } }",
+            "class D extends Object { constructor() { if (false) super(); } }",
+            "class D extends Object {}",
+            "class B { constructor() {} }",
+        ] {
+            let result = check_text(accepted);
+            assert!(
+                !checker_codes(&result).contains(&DERIVED_CONSTRUCTOR_MISSING_SUPER.as_str()),
+                "{accepted}: {:?}",
+                checker_codes(&result)
+            );
+        }
+
+        for missing in [
+            "class D extends Object { constructor() {} }",
+            "class D extends Object { constructor() { return {}; } }",
+            "class D extends Object { constructor() { throw 1; } }",
+            "class D extends Object { constructor() { while (true) {} } }",
+        ] {
+            let result = check_text(missing);
+            assert!(
+                checker_codes(&result).contains(&DERIVED_CONSTRUCTOR_MISSING_SUPER.as_str()),
+                "{missing}: {:?}",
+                checker_codes(&result)
+            );
+        }
+
+        let parameter = check_text("class D extends Object { constructor(value = super()) {} }");
+        assert!(checker_codes(&parameter).contains(&SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS.as_str()));
+        assert!(checker_codes(&parameter).contains(&DERIVED_CONSTRUCTOR_MISSING_SUPER.as_str()));
+
+        let nested_function = check_text(
+            "class D extends Object { constructor() { const call = () => super(); call; } }",
+        );
+        assert!(checker_codes(&nested_function).contains(&SUPER_CALL_OUTSIDE_CONSTRUCTOR.as_str()));
+        assert!(
+            checker_codes(&nested_function).contains(&DERIVED_CONSTRUCTOR_MISSING_SUPER.as_str())
+        );
+
+        let nested_class = check_text(
+            "class D extends Object { constructor() {\
+                 class N extends Object { constructor() { super(); } }\
+                 N;\
+             } }",
+        );
+        assert_eq!(
+            checker_codes(&nested_class)
+                .into_iter()
+                .filter(|code| *code == DERIVED_CONSTRUCTOR_MISSING_SUPER.as_str())
+                .count(),
+            1
+        );
     }
 
     #[test]
