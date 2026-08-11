@@ -7251,6 +7251,24 @@ mod tests {
     }
 
     #[test]
+    fn nested_and_naked_covariant_candidates_choose_common_supertype() {
+        let result = check_text(
+            "declare function lowerBound<T extends number>(\
+                 array: readonly T[],\
+                 needle: T,\
+                 comparator: (item: T, needle: T) => number\
+             ): number;\
+             declare const values: number[];\
+             lowerBound(values, 1, (left, right) => left - right);",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
     fn tagged_template_with_callable_tag_returns_signature_type() {
         let result = check_text(
             "function tag(strings: string[], ...values: number[]): string { return ''; }\

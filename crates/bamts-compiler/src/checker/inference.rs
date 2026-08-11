@@ -919,10 +919,14 @@ impl<'table> InferenceContext<'table> {
             .iter()
             .map(|candidate| candidate.priority)
             .max()?;
-        // Distinct candidates of the winning tier, in encounter order.
+        // Naked and nested covariant evidence selects one common supertype.
+        // Low-priority contravariant evidence stays in its own tier.
         let mut tier: Vec<&InferenceCandidate> = Vec::new();
         for candidate in candidates {
-            if candidate.priority == best_priority
+            let include = candidate.priority == best_priority
+                || (best_priority == InferencePriority::Top
+                    && candidate.priority == InferencePriority::Middle);
+            if include
                 && !tier
                     .iter()
                     .any(|existing| existing.type_id == candidate.type_id)
@@ -1456,6 +1460,8 @@ mod tests {
             let resolved = inferred.get(parameter(1)).expect("resolved");
             table.get(resolved).clone()
         };
-        assert_eq!(run(), run());
+        let resolved = run();
+        assert_eq!(resolved, Type::Number);
+        assert_eq!(resolved, run());
     }
 }
