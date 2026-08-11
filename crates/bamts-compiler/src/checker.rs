@@ -5750,6 +5750,19 @@ mod tests {
     }
 
     #[test]
+    fn annotated_generator_returns_do_not_check_body_fallthrough() {
+        let result = check_text(
+            "function* sync(): Generator<number> { yield 1; }\
+             async function* asynchronous(): AsyncGenerator<number> { yield 1; }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
+    }
+
+    #[test]
     fn awaited_expressions_preserve_non_promise_types_and_unwrap_promise_payloads() {
         let result = check_text(
             "declare let p: Promise<number>;\

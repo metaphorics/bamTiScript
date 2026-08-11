@@ -6253,7 +6253,9 @@ impl<'src> Binder<'src> {
             Some(FunctionBody::Expression(expression)) => binder.resolve_expr(expression, scope),
             _ => {}
         });
-        if let Some(body) = function.body.as_ref() {
+        if !function.is_generator
+            && let Some(body) = function.body.as_ref()
+        {
             self.check_annotated_return_fallthrough(body, expected_return_type);
         }
         if !is_declaration {
