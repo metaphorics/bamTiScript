@@ -11694,6 +11694,18 @@ impl<'src> Binder<'src> {
         }
     }
 
+    fn statements_have_reachable_unlabeled_break(&self, statements: &'src [Stmt]) -> bool {
+        for statement in statements {
+            if Self::loop_body_has_unlabeled_break(statement.data(), 0) {
+                return true;
+            }
+            if self.statement_prevents_function_completion(statement.data()) {
+                return false;
+            }
+        }
+        false
+    }
+
     fn statement_prevents_function_completion(&self, statement: &'src Statement) -> bool {
         match statement {
             Statement::Return(_) | Statement::Throw(_) => true,
@@ -11727,10 +11739,7 @@ impl<'src> Binder<'src> {
                     .iter()
                     .any(|case| case.data().test.is_none());
                 let has_break = switch_stmt.cases.iter().any(|case| {
-                    case.data()
-                        .consequent
-                        .iter()
-                        .any(|statement| Self::loop_body_has_unlabeled_break(statement.data(), 0))
+                    self.statements_have_reachable_unlabeled_break(&case.data().consequent)
                 });
                 has_default
                     && !has_break

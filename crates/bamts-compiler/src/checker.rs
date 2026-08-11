@@ -5760,6 +5760,7 @@ mod tests {
             "function value(x: number): number { while (true) { switch (x) { case 0: break; } } }",
             "function value(): number { while (true) { while (true) { break; } } }",
             "function value(x: number): number { switch (x) { case 0: return 1; default: return 2; } }",
+            "function value(x: number): number { switch (x) { default: return 1; break; } }",
         ] {
             let result = check_text(source);
             assert!(
