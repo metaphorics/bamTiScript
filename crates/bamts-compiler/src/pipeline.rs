@@ -428,15 +428,20 @@ fn resolved_checker_edges(
                 .expect("resolved module has one parsed source");
             let nodes = SourceEdgeNodeIndex::new(source);
             module.dependencies().iter().filter_map(move |edge| {
-                let ModuleTarget::Local(to) = edge.target() else {
-                    return None;
+                let to = if let Some(ModuleTarget::Local(to)) = edge.type_target() {
+                    *to
+                } else {
+                    let ModuleTarget::Local(to) = edge.target() else {
+                        return None;
+                    };
+                    *to
                 };
                 Some(ResolvedModuleEdge {
                     from: module.source_id(),
                     specifier: nodes
                         .node_for(edge.range())
                         .expect("every resolved edge specifier range belongs to its parsed source"),
-                    to: *to,
+                    to,
                 })
             })
         })
@@ -978,6 +983,101 @@ mod tests {
         seen.sort();
         seen.dedup();
         assert_eq!(seen.len(), before, "diagnostic duplicated across modules");
+
+        fs::remove_dir_all(root_path).unwrap();
+    }
+
+    #[test]
+    fn resolved_checker_edges_prefer_declaration_overlay() {
+        use std::{
+            fs,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+
+        use crate::{
+            parser,
+            program::{ModuleTarget, ProgramLoader},
+            project::{ProjectConfig, ProjectRoot},
+            scanner,
+        };
+
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let root_path = std::env::temp_dir().join(format!(
+            "bamts-pipeline-overlay-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root_path).unwrap();
+        fs::create_dir_all(root_path.join("queue")).unwrap();
+        let write = |name: &str, source: &str| fs::write(root_path.join(name), source).unwrap();
+        write("main.ts", "import Queue from \"./queue/index.js\";");
+        write(
+            "queue/index.js",
+            "export default class Queue { enqueue(value) {} }",
+        );
+        write(
+            "queue/index.d.ts",
+            "export default class Queue<T> implements Iterable<T> {\n    constructor();\n    enqueue(value: T): void;\n    [Symbol.iterator](): IterableIterator<T>;\n}",
+        );
+
+        let root = ProjectRoot::new(fs::canonicalize(&root_path).unwrap()).unwrap();
+        let config = ProjectConfig::parse(&root, root_path.join("tsconfig.json"), "{}").unwrap();
+        let program = ProgramLoader::new(&root, config.options())
+            .unwrap()
+            .load("main.ts")
+            .unwrap();
+
+        let files: Vec<_> = program
+            .modules()
+            .iter()
+            .map(|module| {
+                parser::parse(scanner::scan(
+                    module.source_id(),
+                    module.script_kind(),
+                    Arc::clone(module.source()),
+                ))
+            })
+            .collect();
+
+        let main_id = program.entrypoint_id();
+        let main_module = program
+            .modules()
+            .iter()
+            .find(|module| module.source_id() == main_id)
+            .unwrap();
+        let js_id = program
+            .modules()
+            .iter()
+            .find(|module| module.path().ends_with("queue/index.js"))
+            .unwrap()
+            .source_id();
+        let dts_id = program
+            .modules()
+            .iter()
+            .find(|module| module.path().ends_with("queue/index.d.ts"))
+            .unwrap()
+            .source_id();
+
+        let edges = super::resolved_checker_edges(&program, &files);
+        assert_eq!(edges.len(), 1, "one edge is emitted per local dependency");
+
+        let main_file = files
+            .iter()
+            .find(|file| file.product().source_id() == main_id)
+            .unwrap()
+            .product();
+        let import_id = main_file.statements()[0].id();
+
+        assert_eq!(edges[0].from, main_id);
+        assert_eq!(
+            edges[0].to, dts_id,
+            "checker edge must target the declaration overlay, not the runtime .js file"
+        );
+        assert_eq!(edges[0].specifier, import_id);
+
+        let edge = &main_module.dependencies()[0];
+        assert_eq!(edge.target(), &ModuleTarget::Local(js_id));
+        assert_eq!(edge.type_target(), Some(&ModuleTarget::Local(dts_id)));
 
         fs::remove_dir_all(root_path).unwrap();
     }

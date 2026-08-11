@@ -68,12 +68,14 @@ impl ModuleTarget {
     }
 }
 
-/// One source-anchored, resolved dependency.
+/// One source-anchored, resolved dependency. `target` is the runtime and lowering
+/// identity; `type_target` is a checker-only declaration overlay when one exists.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModuleEdge {
     kind: ModuleEdgeKind,
     specifier: Arc<str>,
     target: ModuleTarget,
+    type_target: Option<ModuleTarget>,
     range: TextRange,
 }
 
@@ -91,6 +93,11 @@ impl ModuleEdge {
     #[must_use]
     pub const fn target(&self) -> &ModuleTarget {
         &self.target
+    }
+
+    #[must_use]
+    pub const fn type_target(&self) -> Option<&ModuleTarget> {
+        self.type_target.as_ref()
     }
 
     #[must_use]
@@ -142,8 +149,11 @@ impl ResolvedModule {
 
 /// The canonical whole-program value shared by every compiler and execution phase.
 ///
-/// Modules are stored in deterministic dependency-first DFS postorder. Cycles are
-/// retained as ordinary edges; each canonical file still appears exactly once.
+/// Runtime and type-only modules are stored in deterministic dependency-first DFS
+/// postorder. Declaration overlays are appended afterward in deterministic discovery
+/// order. Cycles remain ordinary edges; each canonical file appears exactly once.
+/// Overlays are reachable only through [`ModuleEdge::type_target`], so eager runtime
+/// closure and lowering continue to follow only [`ModuleEdge::target`].
 #[derive(Clone, Debug)]
 pub struct ResolvedProgram {
     root: ProjectRoot,
@@ -471,9 +481,12 @@ impl ProgramLoader {
             loader: self,
             identities: HashMap::new(),
             modules: Vec::new(),
+            overlay_worklist: Vec::new(),
+            type_overlays: Vec::new(),
             session_bytes: 0,
         };
         let entrypoint = state.visit(entrypoint)?;
+        state.load_declaration_overlays()?;
         let module_indices = state
             .modules
             .iter()
@@ -572,18 +585,47 @@ impl ProgramLoader {
         &self,
         importer: &Path,
         edge: &UnresolvedEdge,
-    ) -> Result<ResolvedEdgeTarget, ProgramLoadError> {
+    ) -> Result<ResolvedEdge, ProgramLoadError> {
         if edge.specifier.starts_with("node:") {
-            return Ok(ResolvedEdgeTarget::External(Arc::clone(&edge.specifier)));
+            return Ok(ResolvedEdge {
+                target: ResolvedEdgeTarget::External(Arc::clone(&edge.specifier)),
+                type_overlay: None,
+            });
         }
 
-        let flavor = match edge.kind {
-            ModuleEdgeKind::TypeOnly => ResolutionFlavor::Types,
-            ModuleEdgeKind::StaticRuntime | ModuleEdgeKind::DynamicRuntime => {
-                ResolutionFlavor::Runtime
-            }
+        let flavor = if edge.kind == ModuleEdgeKind::TypeOnly || is_declaration_path(importer) {
+            ResolutionFlavor::Types
+        } else {
+            ResolutionFlavor::Runtime
         };
-        let selected = if edge.specifier.starts_with("./") || edge.specifier.starts_with("../") {
+        if let Some(target) = self.resolve_local(importer, edge, flavor)? {
+            let type_overlay = self.type_overlay(importer, edge, &target);
+            return Ok(ResolvedEdge {
+                target,
+                type_overlay,
+            });
+        }
+        if flavor == ResolutionFlavor::Types && split_package_specifier(&edge.specifier).is_some() {
+            return Ok(ResolvedEdge {
+                target: ResolvedEdgeTarget::External(Arc::clone(&edge.specifier)),
+                type_overlay: None,
+            });
+        }
+        Err(ProgramLoadError::UnresolvedModule(diagnostic(
+            importer,
+            &edge.specifier,
+            edge.kind,
+            edge.range,
+        )))
+    }
+
+    fn resolve_local(
+        &self,
+        importer: &Path,
+        edge: &UnresolvedEdge,
+        flavor: ResolutionFlavor,
+    ) -> Result<Option<ResolvedEdgeTarget>, ProgramLoadError> {
+        if edge.specifier.starts_with("./") || edge.specifier.starts_with("../") {
             let plan = plan_relative_module(
                 &self.root,
                 importer,
@@ -595,32 +637,39 @@ impl ProgramLoader {
                 diagnostic: diagnostic(importer, &edge.specifier, edge.kind, edge.range),
                 source,
             })?;
-            self.canonical_selection(plan.candidates(), flavor)?
-                .map(ResolvedEdgeTarget::Local)
-        } else if edge.specifier.starts_with('#') {
-            self.resolve_package_import(importer, edge, flavor)?
-        } else {
-            match self.resolve_mapped(&edge.specifier, flavor)? {
-                Some(mapped) => Some(ResolvedEdgeTarget::Local(mapped)),
-                None => self
-                    .resolve_package(importer, edge, flavor)?
-                    .map(ResolvedEdgeTarget::Local),
-            }
+            return Ok(self
+                .canonical_selection(plan.candidates(), flavor)?
+                .map(ResolvedEdgeTarget::Local));
+        }
+        if edge.specifier.starts_with('#') {
+            return self.resolve_package_import(importer, edge, flavor);
+        }
+        Ok(match self.resolve_mapped(&edge.specifier, flavor)? {
+            Some(mapped) => Some(ResolvedEdgeTarget::Local(mapped)),
+            None => self
+                .resolve_package(importer, edge, flavor)?
+                .map(ResolvedEdgeTarget::Local),
+        })
+    }
+
+    fn type_overlay(
+        &self,
+        importer: &Path,
+        edge: &UnresolvedEdge,
+        runtime_target: &ResolvedEdgeTarget,
+    ) -> Option<PathBuf> {
+        if edge.kind == ModuleEdgeKind::TypeOnly || is_declaration_path(importer) {
+            return None;
+        }
+        let ResolvedEdgeTarget::Local(runtime_path) = runtime_target else {
+            return None;
         };
-        if let Some(target) = selected {
-            return Ok(target);
-        }
-        if edge.kind == ModuleEdgeKind::TypeOnly
-            && split_package_specifier(&edge.specifier).is_some()
-        {
-            return Ok(ResolvedEdgeTarget::External(Arc::clone(&edge.specifier)));
-        }
-        Err(ProgramLoadError::UnresolvedModule(diagnostic(
-            importer,
-            &edge.specifier,
-            edge.kind,
-            edge.range,
-        )))
+        let Ok(Some(ResolvedEdgeTarget::Local(type_path))) =
+            self.resolve_local(importer, edge, ResolutionFlavor::Types)
+        else {
+            return None;
+        };
+        (type_path != *runtime_path).then_some(type_path)
     }
 
     fn resolve_mapped(
@@ -760,6 +809,18 @@ enum ResolvedEdgeTarget {
     External(Arc<str>),
 }
 
+#[derive(Clone, Debug)]
+struct ResolvedEdge {
+    target: ResolvedEdgeTarget,
+    type_overlay: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingEdge {
+    edge: UnresolvedEdge,
+    type_overlay: Option<PathBuf>,
+}
+
 /// Accumulates `added` UTF-8 source bytes into the session budget, returning
 /// the new total, or the budget-breaching total once
 /// [`MAX_SESSION_SOURCE_BYTES`] would be exceeded.
@@ -775,11 +836,75 @@ struct LoadState<'a> {
     loader: &'a ProgramLoader,
     identities: HashMap<PathBuf, SourceId>,
     modules: Vec<ResolvedModule>,
+    overlay_worklist: Vec<PathBuf>,
+    type_overlays: Vec<(SourceId, usize, PathBuf)>,
     /// UTF-8 bytes loaded so far, checked against `MAX_SESSION_SOURCE_BYTES`.
     session_bytes: usize,
 }
+#[derive(Clone)]
+struct Frame {
+    path: PathBuf,
+    source_id: SourceId,
+    script_kind: ScriptKind,
+    source: Arc<SourceText>,
+    remaining: std::vec::IntoIter<UnresolvedEdge>,
+    dependencies: Vec<ModuleEdge>,
+    /// Local edge whose target visit is in flight (child on the stack).
+    pending_edge: Option<PendingEdge>,
+}
 
 impl LoadState<'_> {
+    fn complete_local_edge(
+        frame: &mut Frame,
+        pending: PendingEdge,
+        runtime_target: SourceId,
+        type_overlays: &mut Vec<(SourceId, usize, PathBuf)>,
+        overlay_worklist: &mut Vec<PathBuf>,
+    ) {
+        let dependency_index = frame.dependencies.len();
+        frame.dependencies.push(ModuleEdge {
+            kind: pending.edge.kind,
+            specifier: pending.edge.specifier,
+            target: ModuleTarget::Local(runtime_target),
+            type_target: None,
+            range: pending.edge.range,
+        });
+        if let Some(path) = pending.type_overlay {
+            type_overlays.push((frame.source_id, dependency_index, path.clone()));
+            overlay_worklist.push(path);
+        }
+    }
+
+    fn load_declaration_overlays(&mut self) -> Result<(), ProgramLoadError> {
+        let mut next = 0;
+        while next < self.overlay_worklist.len() {
+            let path = self.overlay_worklist[next].clone();
+            next += 1;
+            if !self.identities.contains_key(&path) {
+                self.visit(path)?;
+            }
+        }
+
+        let module_indices: HashMap<SourceId, usize> = self
+            .modules
+            .iter()
+            .enumerate()
+            .map(|(index, module)| (module.source_id(), index))
+            .collect();
+        for (importer, dependency_index, path) in &self.type_overlays {
+            let type_source_id = *self
+                .identities
+                .get(path)
+                .expect("every recorded declaration overlay was loaded");
+            let module_index = module_indices[importer];
+            let module = &mut self.modules[module_index];
+            let mut dependencies = module.dependencies.to_vec();
+            dependencies[*dependency_index].type_target = Some(ModuleTarget::Local(type_source_id));
+            module.dependencies = Arc::from(dependencies);
+        }
+        Ok(())
+    }
+
     /// Loads `entrypoint` and its local import graph with an explicit stack.
     ///
     /// SourceIds are assigned in DFS preorder (first discovery). Modules are
@@ -787,17 +912,6 @@ impl LoadState<'_> {
     /// already present in `identities` is reused immediately, which both
     /// deduplicates diamonds and retains cycle edges without re-entering.
     fn visit(&mut self, entrypoint: PathBuf) -> Result<SourceId, ProgramLoadError> {
-        struct Frame {
-            path: PathBuf,
-            source_id: SourceId,
-            script_kind: ScriptKind,
-            source: Arc<SourceText>,
-            remaining: std::vec::IntoIter<UnresolvedEdge>,
-            dependencies: Vec<ModuleEdge>,
-            /// Local edge whose target visit is in flight (child on the stack).
-            pending_edge: Option<UnresolvedEdge>,
-        }
-
         enum Resume {
             Enter(PathBuf),
             Advance,
@@ -813,15 +927,16 @@ impl LoadState<'_> {
                         let Some(parent) = stack.last_mut() else {
                             return Ok(source_id);
                         };
-                        let edge = parent.pending_edge.take().expect(
+                        let pending = parent.pending_edge.take().expect(
                             "deduplicated or cyclic local resume belongs to a pending edge",
                         );
-                        parent.dependencies.push(ModuleEdge {
-                            kind: edge.kind,
-                            specifier: edge.specifier,
-                            target: ModuleTarget::Local(source_id),
-                            range: edge.range,
-                        });
+                        Self::complete_local_edge(
+                            parent,
+                            pending,
+                            source_id,
+                            &mut self.type_overlays,
+                            &mut self.overlay_worklist,
+                        );
                         resume = Resume::Advance;
                         continue;
                     }
@@ -881,16 +996,20 @@ impl LoadState<'_> {
                             let Some(edge) = frame.remaining.next() else {
                                 break None;
                             };
-                            match self.loader.resolve_edge(&frame.path, &edge)? {
+                            let resolved = self.loader.resolve_edge(&frame.path, &edge)?;
+                            let target = resolved.target;
+                            let type_overlay = resolved.type_overlay;
+                            match target {
                                 ResolvedEdgeTarget::Local(target_path) => {
-                                    frame.pending_edge = Some(edge);
+                                    frame.pending_edge = Some(PendingEdge { edge, type_overlay });
                                     break Some(target_path);
                                 }
                                 ResolvedEdgeTarget::External(specifier) => {
                                     frame.dependencies.push(ModuleEdge {
                                         kind: edge.kind,
-                                        specifier: edge.specifier,
+                                        specifier: Arc::clone(&edge.specifier),
                                         target: ModuleTarget::External(specifier),
+                                        type_target: None,
                                         range: edge.range,
                                     });
                                 }
@@ -917,16 +1036,17 @@ impl LoadState<'_> {
                     let Some(parent) = stack.last_mut() else {
                         return Ok(source_id);
                     };
-                    let edge = parent
+                    let pending = parent
                         .pending_edge
                         .take()
                         .expect("finished child always completes a parent local edge");
-                    parent.dependencies.push(ModuleEdge {
-                        kind: edge.kind,
-                        specifier: edge.specifier,
-                        target: ModuleTarget::Local(source_id),
-                        range: edge.range,
-                    });
+                    Self::complete_local_edge(
+                        parent,
+                        pending,
+                        source_id,
+                        &mut self.type_overlays,
+                        &mut self.overlay_worklist,
+                    );
                     resume = Resume::Advance;
                 }
             }
@@ -4660,5 +4780,142 @@ mod tests {
             .code(),
             Some(super::SESSION_TOO_LARGE)
         );
+    }
+
+    fn target_name<'a>(
+        program: &'a super::ResolvedProgram,
+        target: &super::ModuleTarget,
+    ) -> &'a str {
+        let source_id = target.local_source_id().expect("local target");
+        program
+            .module(source_id)
+            .unwrap()
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+    }
+
+    #[test]
+    fn declaration_overlay_resolves_beside_runtime_target() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "import Queue from './index.js';");
+        fixture.write("index.js", "export default class Queue {}");
+        fixture.write(
+            "index.d.ts",
+            "export default class Queue<ValueType> implements Iterable<ValueType> {}",
+        );
+        let resolved = fixture.loader().load("main.ts").unwrap();
+        let main = resolved.entrypoint();
+        assert_eq!(main.dependencies().len(), 1);
+        let edge = &main.dependencies()[0];
+        assert_eq!(target_name(&resolved, edge.target()), "index.js");
+        assert_eq!(
+            target_name(&resolved, edge.type_target().expect("overlay edge")),
+            "index.d.ts"
+        );
+        assert_eq!(names(&resolved), ["index.js", "main.ts", "index.d.ts"]);
+        let runtime_names: Vec<_> = resolved
+            .runtime_modules()
+            .iter()
+            .map(|m| m.path().file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(runtime_names, ["index.js", "main.ts"]);
+    }
+
+    #[test]
+    fn declaration_overlay_dependencies_resolve_in_the_types_flavor() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "import Queue from './index.js';");
+        fixture.write("index.js", "export default class Queue {}");
+        fixture.write(
+            "index.d.ts",
+            "import { Shape } from './types.js';\
+             export default class Queue { value: Shape; }",
+        );
+        fixture.write("types.js", "export const Shape = class {};");
+        fixture.write("types.d.ts", "export interface Shape { value: number; }");
+
+        let resolved = fixture.loader().load("main.ts").unwrap();
+        assert_eq!(
+            names(&resolved),
+            ["index.js", "main.ts", "types.d.ts", "index.d.ts"]
+        );
+        let overlay = resolved
+            .modules()
+            .iter()
+            .find(|module| module.path().ends_with("index.d.ts"))
+            .expect("declaration overlay");
+        let dependency = &overlay.dependencies()[0];
+        assert_eq!(dependency.kind(), ModuleEdgeKind::StaticRuntime);
+        assert_eq!(target_name(&resolved, dependency.target()), "types.d.ts");
+        assert!(dependency.type_target().is_none());
+    }
+
+    #[test]
+    fn declaration_overlay_preserves_external_type_dependencies() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "import Queue from './index.js';");
+        fixture.write("index.js", "export default class Queue {}");
+        fixture.write(
+            "index.d.ts",
+            "import { Shape } from 'external-types';\
+             export default class Queue { value: Shape; }",
+        );
+
+        let resolved = fixture.loader().load("main.ts").unwrap();
+        let overlay = resolved
+            .modules()
+            .iter()
+            .find(|module| module.path().ends_with("index.d.ts"))
+            .expect("declaration overlay");
+        let dependency = &overlay.dependencies()[0];
+        assert_eq!(dependency.kind(), ModuleEdgeKind::StaticRuntime);
+        assert_eq!(
+            dependency.target().external_specifier(),
+            Some("external-types")
+        );
+        assert!(dependency.type_target().is_none());
+    }
+
+    #[test]
+    fn declaration_overlays_append_in_import_discovery_order() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "import './a.js'; import './b.js';");
+        fixture.write("a.js", "export const a = 1;");
+        fixture.write("a.d.ts", "export declare const a: number;");
+        fixture.write("b.js", "export const b = 1;");
+        fixture.write("b.d.ts", "export declare const b: number;");
+
+        let resolved = fixture.loader().load("main.ts").unwrap();
+        assert_eq!(
+            names(&resolved),
+            ["a.js", "b.js", "main.ts", "a.d.ts", "b.d.ts"]
+        );
+    }
+
+    #[test]
+    fn declaration_overlay_absent_falls_back_to_runtime_source() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "import Queue from './index.js';");
+        fixture.write("index.js", "export default class Queue {}");
+        let resolved = fixture.loader().load("main.ts").unwrap();
+        let edge = &resolved.entrypoint().dependencies()[0];
+        assert_eq!(target_name(&resolved, edge.target()), "index.js");
+        assert!(edge.type_target().is_none());
+        assert_eq!(names(&resolved), ["index.js", "main.ts"]);
+    }
+
+    #[test]
+    fn type_only_edge_has_no_overlay() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "import type { Shape } from './shape';");
+        fixture.write("shape.d.ts", "export interface Shape { x: number; }");
+        let resolved = fixture.loader().load("main.ts").unwrap();
+        let edge = &resolved.entrypoint().dependencies()[0];
+        assert_eq!(edge.kind(), super::ModuleEdgeKind::TypeOnly);
+        assert_eq!(target_name(&resolved, edge.target()), "shape.d.ts");
+        assert!(edge.type_target().is_none());
     }
 }
