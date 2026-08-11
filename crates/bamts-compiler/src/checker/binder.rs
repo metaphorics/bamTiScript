@@ -6392,7 +6392,7 @@ impl<'src> Binder<'src> {
     fn resolve_class(&mut self, class: &'src ClassDeclaration, parent: ScopeId) {
         let ambient =
             class.modifiers.is_declare || self.ambient_stack.last().copied().unwrap_or(false);
-        self.resolve_class_body(class, parent, false, ambient);
+        let _ = self.resolve_class_body(class, parent, false, ambient);
     }
 
     fn is_this_parameter(&self, parameter: &'src ParameterNode) -> bool {
@@ -6486,8 +6486,12 @@ impl<'src> Binder<'src> {
         }
     }
 
-    fn resolve_class_expression(&mut self, class: &'src ClassDeclaration, parent: ScopeId) {
-        self.resolve_class_body(class, parent, true, false);
+    fn resolve_class_expression(
+        &mut self,
+        class: &'src ClassDeclaration,
+        parent: ScopeId,
+    ) -> TypeId {
+        self.resolve_class_body(class, parent, true, false)
     }
 
     fn class_member_method_name(
@@ -6668,7 +6672,7 @@ impl<'src> Binder<'src> {
         parent: ScopeId,
         bind_internal_name: bool,
         ambient: bool,
-    ) {
+    ) -> TypeId {
         // A class nested inside a constructor does not inherit its super-call
         // legality: only the constructor body itself may call `super(...)`.
         self.super_call_contexts
@@ -6770,9 +6774,9 @@ impl<'src> Binder<'src> {
             self.resolve_class_member(member.data(), scope, ambient);
         }
         let instance_type = self.class_instance_type(class, scope, owner, ClassState::Final);
+        let static_type = self.class_static_type(class, scope, instance_type);
         if let Some(owner) = owner {
             self.class_instance_types.insert(owner, instance_type);
-            let static_type = self.class_static_type(class, scope, instance_type);
             self.symbol_types[owner.get() as usize] = static_type;
         }
         for (implemented_type, range) in implemented_types {
@@ -6788,6 +6792,7 @@ impl<'src> Binder<'src> {
             let popped_owner = self.class_owner_stack.pop();
             debug_assert_eq!(popped_owner, Some(owner));
         }
+        static_type
     }
     fn check_class_property_initialization(
         &mut self,
@@ -7713,7 +7718,12 @@ impl<'src> Binder<'src> {
             Expression::Function(function) => {
                 self.resolve_function(&function.function, scope, true, false, self.types.any())
             }
-            Expression::Class(class) => self.resolve_class_expression(&class.class, scope),
+            Expression::Class(class) => {
+                let type_id = self.resolve_class_expression(&class.class, scope);
+                if self.node_types.insert(expression.id(), type_id).is_none() {
+                    self.typed_expressions.push((expression.range(), type_id));
+                }
+            }
             Expression::Arrow(arrow) => {
                 let child = self.new_scope(ScopeKind::Function, Some(scope));
                 // Arrows capture `this` but never inherit super-call legality.
@@ -10825,6 +10835,7 @@ impl<'src> Binder<'src> {
                 self.type_of_conditional_expr(conditional, None, scope)
             }
             Expression::Function(function) => self.type_of_function_like(&function.function, scope),
+            Expression::Class(class) => self.resolve_class_expression(&class.class, scope),
             Expression::Arrow(arrow) => self.type_of_arrow(arrow, scope),
             Expression::Member(member) => self.type_of_member(
                 &member.object,

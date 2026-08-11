@@ -2848,6 +2848,45 @@ mod tests {
     }
 
     #[test]
+    fn anonymous_class_expression_types_constructed_instances() {
+        let result = check_text(
+            "const instance = new (class { value: number = 1 })();\
+             const value: number = instance.value;",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn anonymous_class_expression_diagnoses_incompatible_assignment() {
+        let result = check_text(
+            "const instance = new (class { value: number = 1 })();\
+             const incompatible: { missing: string } = instance;",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn named_class_expression_types_constructed_instances_and_self_reference() {
+        let result = check_text(
+            "const C = class Inner {\
+                 value: number = 1;\
+                 static make(): Inner { return new Inner(); }\
+             };\
+             const value: number = C.make().value;",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn named_class_expression_diagnoses_incompatible_assignment() {
+        let result = check_text(
+            "const C = class Inner { value: number = 1 };\
+             const incompatible: { missing: string } = new C();",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
     fn decorated_named_class_expression_static_block_binds_its_internal_name() {
         let result = check_text(
             "function deco(_value: unknown, _context: unknown) {}\
