@@ -1112,6 +1112,7 @@ impl TypeTable {
                 let index = name.parse::<usize>().ok()?;
                 self.tuple_index_type(&shape, index)
             }
+            Type::Array(element) => name.parse::<usize>().is_ok().then_some(element),
             Type::Union(members) => {
                 let mut found = Vec::with_capacity(members.len());
                 for member in members {
@@ -1184,6 +1185,7 @@ impl TypeTable {
                 let index = name.parse::<usize>().ok()?;
                 self.tuple_index_type(&shape, index)
             }
+            Type::Array(element) => name.parse::<usize>().is_ok().then_some(element),
             Type::Union(members) => {
                 let mut found = Vec::with_capacity(members.len());
                 for member in members {
@@ -8941,6 +8943,14 @@ impl<'src> Binder<'src> {
                     Some(self.types.any())
                 }
             }
+            Type::Array(_) => {
+                let property = if read {
+                    self.types.read_property_type(object_type, name)
+                } else {
+                    self.types.property_type(object_type, name)
+                };
+                Some(property.unwrap_or_else(|| self.types.any()))
+            }
             Type::AppliedClass { .. } => {
                 if let Some(view) = self.types.prepare_applied_class_view(object_type) {
                     return self.property_type_for_member(view, name, range, read);
@@ -8967,7 +8977,6 @@ impl<'src> Binder<'src> {
             | Type::NumberLiteral(_)
             | Type::StringLiteral(_)
             | Type::BigIntLiteral(_)
-            | Type::Array(_)
             | Type::Function(_)
             | Type::NumericEnum(_)
             | Type::Keyof(_)

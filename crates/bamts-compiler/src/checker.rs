@@ -6924,7 +6924,7 @@ mod tests {
              const configuredMode: Mode = config.mode;\
              declare function modes(): Mode[];\
              const list = modes();\
-             list[0] = 'other';\
+             list[0] = 'strict';\
              const first: Mode = list[0];\
              const fresh = { mode: 'strict' };\
              fresh.mode = 'loose';\
@@ -6947,6 +6947,31 @@ mod tests {
             panic!("fresh list is an array");
         };
         assert_eq!(*fresh_element, model.types().string());
+    }
+
+    #[test]
+    fn array_numeric_index_read_is_assignable_to_element() {
+        let result = check_text("declare const values: number[]; const value: number = values[0];");
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn array_numeric_index_read_rejects_incompatible_target() {
+        let result = check_text("declare const values: number[]; const value: string = values[0];");
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn array_numeric_index_write_rejects_incompatible_source() {
+        let result = check_text("declare const values: number[]; values[0] = 'bad';");
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn array_named_properties_remain_permissive() {
+        let result =
+            check_text("declare const values: number[]; const label: string = values.tag;");
+        assert!(checker_codes(&result).is_empty());
     }
 
     #[test]
