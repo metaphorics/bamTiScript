@@ -10745,6 +10745,14 @@ impl<'src> Binder<'src> {
                 if candidates.is_empty() {
                     return Vec::new();
                 }
+                if candidates.iter().any(|candidate| {
+                    candidate.properties.is_empty()
+                        && candidate.call_signatures.is_empty()
+                        && candidate.construct_signatures.is_empty()
+                        && candidate.index_signatures.is_empty()
+                }) {
+                    return Vec::new();
+                }
                 let candidates = self.filter_discriminated_candidates(object, candidates);
                 if candidates.is_empty() {
                     return Vec::new();

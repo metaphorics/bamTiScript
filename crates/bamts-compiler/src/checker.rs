@@ -6189,6 +6189,22 @@ mod tests {
     }
 
     #[test]
+    fn fresh_object_empty_targets_accept_properties() {
+        for source in [
+            "const value: {} = { extra: 1 };",
+            "interface Empty {} const value: Empty = { extra: 1 };",
+            "const value: {} | { known: number } = { extra: 1 };",
+        ] {
+            let result = check_text(source);
+            assert!(
+                checker_codes(&result).is_empty(),
+                "{source}: {:?}",
+                checker_codes(&result)
+            );
+        }
+    }
+
+    #[test]
     fn fresh_object_excess_properties_are_checked_recursively() {
         for source in [
             "const value: { nested: { ok: number } } = { nested: { ok: 1, extra: 2 } };",
