@@ -2643,15 +2643,15 @@ struct ImportEqualsTarget {
     ty: Option<SymbolId>,
 }
 
-/// One imported binding's resolved type fact, carried across module
-/// boundaries so a target binder can install the source's structural type
-/// before it resolves statements. `source_types` borrows the source file's
-/// [`TypeTable`]; `type_id` is the source-table identity to copy.
+/// One imported binding's resolved value and type facts, carried across module
+/// boundaries so a target binder can install both source-table identities
+/// before it resolves statements.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ImportedSymbolType<'a> {
     pub symbol: SymbolId,
     pub source_types: &'a TypeTable,
-    pub type_id: TypeId,
+    pub value_type_id: TypeId,
+    pub type_plane_id: Option<TypeId>,
 }
 
 /// A named type definition kept by reference for lazy, memoized resolution.
@@ -3034,6 +3034,7 @@ pub(crate) struct Binder<'src> {
     import_equals_symbols: HashMap<NodeId, SymbolId>,
     qualified_import_paths: HashMap<NodeId, Box<[SymbolId]>>,
     import_equals_targets: HashMap<SymbolId, ImportEqualsTarget>,
+    imported_type_planes: HashMap<SymbolId, TypeId>,
     hoisted_declaration_symbols: HashMap<HoistedDeclarationIdentity, SymbolId>,
     /// JSX expression node → checked element result type, recorded by
     /// [`super::jsx`] during expression resolution.
@@ -3182,6 +3183,7 @@ impl<'src> Binder<'src> {
             import_equals_symbols: HashMap::new(),
             qualified_import_paths: HashMap::new(),
             import_equals_targets: HashMap::new(),
+            imported_type_planes: HashMap::new(),
             hoisted_declaration_symbols: HashMap::new(),
             class_instance_types: HashMap::new(),
             class_method_signature_scopes: HashMap::new(),
@@ -3390,14 +3392,23 @@ impl<'src> Binder<'src> {
             let identities = imported_by_source
                 .entry(std::ptr::from_ref(imported.source_types))
                 .or_default();
-            let type_id = self.types.import_type(
+            let value_type_id = self.types.import_type(
                 imported.source_types,
-                imported.type_id,
+                imported.value_type_id,
                 identities,
                 &mut next_imported_symbol,
             );
-            self.symbol_types[imported.symbol.get() as usize] = type_id;
-            self.type_state[imported.symbol.get() as usize] = TypeState::Done(type_id);
+            if let Some(source_type_id) = imported.type_plane_id {
+                let type_id = self.types.import_type(
+                    imported.source_types,
+                    source_type_id,
+                    identities,
+                    &mut next_imported_symbol,
+                );
+                self.imported_type_planes.insert(imported.symbol, type_id);
+            }
+            self.symbol_types[imported.symbol.get() as usize] = value_type_id;
+            self.type_state[imported.symbol.get() as usize] = TypeState::Done(value_type_id);
         }
         self.resolve_statements(statements, scope);
         self.check_export_assignment_conflicts();
@@ -10593,7 +10604,11 @@ impl<'src> Binder<'src> {
             SymbolKind::IntrinsicType if self.types.is_object_symbol(symbol) => {
                 self.types.named(symbol)
             }
-            SymbolKind::Import => self.resolve_import_equals_type_symbol(symbol),
+            SymbolKind::Import => self
+                .imported_type_planes
+                .get(&symbol)
+                .copied()
+                .unwrap_or_else(|| self.resolve_import_equals_type_symbol(symbol)),
             _ => self.types.error_type(),
         }
     }

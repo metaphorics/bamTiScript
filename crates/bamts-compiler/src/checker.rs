@@ -945,7 +945,8 @@ fn collect_imported_types_for_source<'a>(
                 imported_types.push(ImportedSymbolType {
                     symbol,
                     source_types: target_model.types(),
-                    type_id: namespace_type,
+                    value_type_id: namespace_type,
+                    type_plane_id: None,
                 });
             }
             Some(ImportBinding::Named(specifiers)) => {
@@ -999,15 +1000,31 @@ fn build_imported_symbol_type<'a>(
         files,
     )?;
     let source_model = files.get(&linked.source)?;
-    let source_type_id = source_model.symbol_type(linked.symbol);
-    let source_type = source_model.types().get(source_type_id);
-    if matches!(source_type, Type::Error | Type::Any | Type::Unknown) {
+    let value_type_id = source_model.symbol_type(linked.symbol);
+    let value_type = source_model.types().get(value_type_id);
+    if matches!(value_type, Type::Error | Type::Any | Type::Unknown) {
         return None;
     }
+    let type_plane_id = match (source_model.symbol(linked.symbol).kind(), value_type) {
+        (SymbolKind::Class, Type::ObjectType(object)) => {
+            let mut signatures = object.construct_signatures.iter();
+            signatures.next().and_then(|first| {
+                let return_type = first.signature.return_type();
+                matches!(
+                    source_model.types().get(return_type),
+                    Type::AppliedClass { symbol, .. } if *symbol == linked.symbol
+                )
+                .then_some(return_type)
+                .filter(|_| signatures.all(|entry| entry.signature.return_type() == return_type))
+            })
+        }
+        _ => None,
+    };
     Some(ImportedSymbolType {
         symbol,
         source_types: source_model.types(),
-        type_id: source_type_id,
+        value_type_id,
+        type_plane_id,
     })
 }
 
@@ -5495,6 +5512,47 @@ mod tests {
             program_codes(&wrong_member_arg).contains(&super::ARGUMENT_NOT_ASSIGNABLE.as_str()),
             "{:?}",
             program_codes(&wrong_member_arg)
+        );
+    }
+
+    #[test]
+    fn imported_generic_class_retains_instance_type_across_modules() {
+        let checked = linked(
+            &[
+                "export default class Queue<T> {\
+                    [Symbol.iterator](): IterableIterator<T> { throw 0; }\
+                    drain(): IterableIterator<T> { throw 0; }\
+                }",
+                "import Queue from './a';\
+                 declare const queue: Queue<number>;\
+                 for (const value of queue.drain()) { const n: number = value; }\
+                 for (const value of queue) { const n: number = value; }",
+            ],
+            &[(1, 0, 0)],
+        );
+        assert!(
+            program_codes(&checked).is_empty(),
+            "{:?}",
+            program_codes(&checked)
+        );
+    }
+
+    #[test]
+    fn imported_class_type_survives_named_alias_and_reexport() {
+        let checked = linked(
+            &[
+                "export class Item { value: number = 1; }",
+                "export { Item as Renamed } from './a';",
+                "import { Renamed as Alias } from './b';\
+                 declare const item: Alias;\
+                 const value: number = item.value;",
+            ],
+            &[(1, 0, 0), (2, 0, 1)],
+        );
+        assert!(
+            program_codes(&checked).is_empty(),
+            "{:?}",
+            program_codes(&checked)
         );
     }
 
