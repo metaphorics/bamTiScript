@@ -1544,6 +1544,41 @@ mod tests {
         assert_eq!(*next_order, 1_025);
     }
 
+    #[test]
+    fn structured_clone_rejects_weak_collections() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let structured_clone = machine.intrinsics.global("structuredClone").unwrap();
+
+        for name in ["WeakMap", "WeakSet"] {
+            let weak_collection = construct_builtin(&mut machine, name, &[]);
+            let key = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    extensible: true,
+                    boxed_primitive: None,
+                })
+                .unwrap();
+            let method_name = if name == "WeakMap" { "set" } else { "add" };
+            let method = machine
+                .get_named_property(weak_collection, method_name)
+                .unwrap();
+            if name == "WeakMap" {
+                machine
+                    .call_value(method, weak_collection, &[key, Value::int32(1)])
+                    .unwrap();
+            } else {
+                machine.call_value(method, weak_collection, &[key]).unwrap();
+            }
+            assert!(matches!(
+                machine.call_value(structured_clone, Value::UNDEFINED, &[weak_collection]),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+        }
+    }
+
     fn constructor_name(machine: &mut Machine<'_, TestHost>, constructor: Value) -> EcmaString {
         let name = machine
             .get_named_property(constructor, "name")

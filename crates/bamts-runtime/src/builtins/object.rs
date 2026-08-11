@@ -9,8 +9,8 @@ use super::{
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{
-    BoundCallable, EvalFailure, HeapEntry, Host, Machine, NativeCallable, Property, PropertyKey,
-    PropertyMap, RuntimeErrorKind,
+    BoundCallable, CollectionKind, EvalFailure, HeapEntry, Host, Machine, NativeCallable, Property,
+    PropertyKey, PropertyMap, RuntimeErrorKind,
 };
 
 pub(super) fn install<H: Host>(
@@ -1100,6 +1100,15 @@ fn clone_value<H: Host>(
         .ok_or_else(|| type_error("cannot clone host object"))?;
     if let Some(clone) = seen.get(&index) {
         return Ok(*clone);
+    }
+    if matches!(
+        &machine.heap[index],
+        HeapEntry::Collection {
+            kind: CollectionKind::WeakMap | CollectionKind::WeakSet,
+            ..
+        }
+    ) {
+        return Err(type_error("value could not be cloned"));
     }
     match machine.heap[index].clone() {
         HeapEntry::String(text) => allocate_string(machine, text),
