@@ -5691,6 +5691,62 @@ mod tests {
     }
 
     #[test]
+    fn annotated_return_fallthrough_is_diagnosed() {
+        for source in [
+            "function value(): number {}",
+            "function value(flag: boolean): number { if (flag) return 1; }",
+            "const value = (): number => {};",
+            "async function value(): Promise<number> {}",
+            "function value(): number { while (true) { break; } }",
+        ] {
+            let result = check_text(source);
+            assert_eq!(
+                checker_codes(&result),
+                ["BAMTS-C004"],
+                "{source}: {:?}",
+                checker_codes(&result)
+            );
+        }
+    }
+
+    #[test]
+    fn annotated_return_fallthrough_accepts_undefined_and_noncompleting_bodies() {
+        for source in [
+            "function value(): void {}",
+            "function value(): undefined {}",
+            "function value(): any {}",
+            "function value(): unknown {}",
+            "function value(flag: boolean): number { if (flag) return 1; return 2; }",
+            "function value(): number { throw new Error(); }",
+            "function value(): number { while (true) {} }",
+            "function value(): number { do {} while (true); }",
+            "function value(): number { for (;;) {} }",
+            "function value(): number { for (; true;) {} }",
+            "function value(x: number): number { while (true) { switch (x) { case 0: break; } } }",
+            "function value(): number { while (true) { while (true) { break; } } }",
+        ] {
+            let result = check_text(source);
+            assert!(
+                checker_codes(&result).is_empty(),
+                "{source}: {:?}",
+                checker_codes(&result)
+            );
+        }
+    }
+
+    #[test]
+    fn annotated_return_mismatch_and_fallthrough_are_distinct_errors() {
+        let result =
+            check_text("function value(flag: boolean): number { if (flag) return 'wrong'; }");
+        assert_eq!(
+            checker_codes(&result),
+            ["BAMTS-C004", "BAMTS-C004"],
+            "{:?}",
+            checker_codes(&result)
+        );
+    }
+
+    #[test]
     fn awaited_expressions_preserve_non_promise_types_and_unwrap_promise_payloads() {
         let result = check_text(
             "declare let p: Promise<number>;\

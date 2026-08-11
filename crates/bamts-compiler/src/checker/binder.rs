@@ -6211,6 +6211,9 @@ impl<'src> Binder<'src> {
             Some(FunctionBody::Expression(expression)) => binder.resolve_expr(expression, scope),
             _ => {}
         });
+        if let Some(body) = function.body.as_ref() {
+            self.check_annotated_return_fallthrough(body, expected_return_type);
+        }
         if !is_declaration {
             self.pop_reassigned_scope();
         }
@@ -7451,6 +7454,90 @@ impl<'src> Binder<'src> {
                         .as_ref()
                         .is_some_and(|alt| Self::statement_always_exits(alt.data()))
             }
+            Statement::For(for_stmt) => {
+                for_stmt
+                    .test
+                    .as_ref()
+                    .is_none_or(|test| Self::is_true_literal(test.data()))
+                    && !Self::loop_body_has_unlabeled_break(for_stmt.body.data(), 0)
+            }
+            Statement::While(while_stmt) => {
+                Self::is_true_literal(while_stmt.test.data())
+                    && !Self::loop_body_has_unlabeled_break(while_stmt.body.data(), 0)
+            }
+            Statement::DoWhile(do_while) => {
+                Self::is_true_literal(do_while.test.data())
+                    && !Self::loop_body_has_unlabeled_break(do_while.body.data(), 0)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_true_literal(expression: &Expression) -> bool {
+        matches!(
+            expression,
+            Expression::Literal(Literal::Boolean(literal))
+                if literal.data().token().kind() == TokenKind::KwTrue
+        )
+    }
+
+    fn loop_body_has_unlabeled_break(statement: &'src Statement, depth: usize) -> bool {
+        let nested =
+            |statement: &'src Statement| Self::loop_body_has_unlabeled_break(statement, depth + 1);
+        match statement {
+            Statement::Break(jump) => jump.label.is_none() && depth == 0,
+            Statement::Block(block) => block
+                .data()
+                .statements
+                .iter()
+                .any(|statement| Self::loop_body_has_unlabeled_break(statement.data(), depth)),
+            Statement::If(if_stmt) => {
+                Self::loop_body_has_unlabeled_break(if_stmt.consequent.data(), depth)
+                    || if_stmt.alternate.as_ref().is_some_and(|alternate| {
+                        Self::loop_body_has_unlabeled_break(alternate.data(), depth)
+                    })
+            }
+            Statement::Switch(switch_stmt) => switch_stmt.cases.iter().any(|case| {
+                case.data()
+                    .consequent
+                    .iter()
+                    .any(|statement| nested(statement.data()))
+            }),
+            Statement::For(for_stmt) => nested(for_stmt.body.data()),
+            Statement::ForIn(for_stmt) => nested(for_stmt.body.data()),
+            Statement::ForOf(for_stmt) => nested(for_stmt.body.data()),
+            Statement::While(while_stmt) => nested(while_stmt.body.data()),
+            Statement::DoWhile(do_while) => nested(do_while.body.data()),
+            Statement::Try(try_stmt) => {
+                try_stmt
+                    .block
+                    .data()
+                    .statements
+                    .iter()
+                    .any(|statement| Self::loop_body_has_unlabeled_break(statement.data(), depth))
+                    || try_stmt.handler.as_ref().is_some_and(|handler| {
+                        handler
+                            .data()
+                            .body
+                            .data()
+                            .statements
+                            .iter()
+                            .any(|statement| {
+                                Self::loop_body_has_unlabeled_break(statement.data(), depth)
+                            })
+                    })
+                    || try_stmt.finalizer.as_ref().is_some_and(|finalizer| {
+                        finalizer.data().statements.iter().any(|statement| {
+                            Self::loop_body_has_unlabeled_break(statement.data(), depth)
+                        })
+                    })
+            }
+            Statement::With(with_stmt) => {
+                Self::loop_body_has_unlabeled_break(with_stmt.body.data(), depth)
+            }
+            Statement::Labeled(labeled) => {
+                Self::loop_body_has_unlabeled_break(labeled.body.data(), depth)
+            }
             _ => false,
         }
     }
@@ -7805,6 +7892,7 @@ impl<'src> Binder<'src> {
                     }
                     FunctionBody::Missing(_) => {}
                 });
+                self.check_annotated_return_fallthrough(&arrow.body, expected_return_type);
                 self.pop_reassigned_scope();
                 if let Some(body_id) = block_body_id {
                     let popped = self.function_body_stack.pop();
@@ -11064,6 +11152,23 @@ impl<'src> Binder<'src> {
             .statements
             .iter()
             .any(|stmt| Self::statement_always_exits(stmt.data()))
+    }
+
+    fn check_annotated_return_fallthrough(
+        &mut self,
+        body: &'src FunctionBody,
+        expected: Option<TypeId>,
+    ) {
+        let (FunctionBody::Block(block), Some(expected)) = (body, expected) else {
+            return;
+        };
+        if Self::block_can_complete_normally(block.data())
+            && !self
+                .types
+                .assignable_with_strict_null(self.types.undefined_type(), expected)
+        {
+            self.emit(TYPE_NOT_ASSIGNABLE, block.range(), NOT_ASSIGNABLE_MESSAGE);
+        }
     }
 
     fn inferred_block_return_type(
