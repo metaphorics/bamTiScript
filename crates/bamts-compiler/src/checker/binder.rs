@@ -11542,11 +11542,152 @@ impl<'src> Binder<'src> {
         )
     }
 
-    fn block_can_complete_normally(block: &'src crate::syntax::Block) -> bool {
+    fn statements_break_to_label(&self, statements: &'src [Stmt], label: &str) -> bool {
+        for statement in statements {
+            if self.statement_breaks_to_label(statement.data(), label) {
+                return true;
+            }
+            if self.statement_prevents_function_completion(statement.data()) {
+                return false;
+            }
+        }
+        false
+    }
+
+    fn statement_breaks_to_label(&self, statement: &'src Statement, label: &str) -> bool {
+        match statement {
+            Statement::Break(jump) => jump
+                .label
+                .as_ref()
+                .is_some_and(|candidate| self.identifier_text(candidate) == label),
+            Statement::Block(block) => {
+                self.statements_break_to_label(&block.data().statements, label)
+            }
+            Statement::If(if_stmt) => {
+                self.statement_breaks_to_label(if_stmt.consequent.data(), label)
+                    || if_stmt.alternate.as_ref().is_some_and(|alternate| {
+                        self.statement_breaks_to_label(alternate.data(), label)
+                    })
+            }
+            Statement::Switch(switch_stmt) => switch_stmt
+                .cases
+                .iter()
+                .any(|case| self.statements_break_to_label(&case.data().consequent, label)),
+            Statement::For(for_stmt) => self.statement_breaks_to_label(for_stmt.body.data(), label),
+            Statement::ForIn(for_stmt) => {
+                self.statement_breaks_to_label(for_stmt.body.data(), label)
+            }
+            Statement::ForOf(for_stmt) => {
+                self.statement_breaks_to_label(for_stmt.body.data(), label)
+            }
+            Statement::While(while_stmt) => {
+                self.statement_breaks_to_label(while_stmt.body.data(), label)
+            }
+            Statement::DoWhile(do_while) => {
+                self.statement_breaks_to_label(do_while.body.data(), label)
+            }
+            Statement::Try(try_stmt) => {
+                let finalizer_breaks = try_stmt.finalizer.as_ref().is_some_and(|finalizer| {
+                    self.statements_break_to_label(&finalizer.data().statements, label)
+                });
+                let finalizer_completes = try_stmt
+                    .finalizer
+                    .as_ref()
+                    .is_none_or(|finalizer| self.block_can_complete_normally(finalizer.data()));
+                finalizer_breaks
+                    || (finalizer_completes
+                        && (self
+                            .statements_break_to_label(&try_stmt.block.data().statements, label)
+                            || try_stmt.handler.as_ref().is_some_and(|handler| {
+                                self.statements_break_to_label(
+                                    &handler.data().body.data().statements,
+                                    label,
+                                )
+                            })))
+            }
+            Statement::With(with_stmt) => {
+                self.statement_breaks_to_label(with_stmt.body.data(), label)
+            }
+            Statement::Labeled(labeled) => {
+                self.statement_breaks_to_label(labeled.body.data(), label)
+            }
+            _ => false,
+        }
+    }
+
+    fn statement_prevents_function_completion(&self, statement: &'src Statement) -> bool {
+        match statement {
+            Statement::Return(_) | Statement::Throw(_) => true,
+            Statement::Break(_) | Statement::Continue(_) => false,
+            Statement::Block(block) => !self.block_can_complete_normally(block.data()),
+            Statement::Labeled(labeled) => {
+                let label = self.identifier_text(&labeled.label);
+                !self.statement_breaks_to_label(labeled.body.data(), &label)
+                    && self.statement_prevents_function_completion(labeled.body.data())
+            }
+            Statement::If(if_stmt) => {
+                self.statement_prevents_function_completion(if_stmt.consequent.data())
+                    && if_stmt.alternate.as_ref().is_some_and(|alternate| {
+                        self.statement_prevents_function_completion(alternate.data())
+                    })
+            }
+            Statement::For(for_stmt) => {
+                for_stmt
+                    .test
+                    .as_ref()
+                    .is_none_or(|test| Self::is_true_literal(test.data()))
+                    && !Self::loop_body_has_unlabeled_break(for_stmt.body.data(), 0)
+            }
+            Statement::While(while_stmt) => {
+                Self::is_true_literal(while_stmt.test.data())
+                    && !Self::loop_body_has_unlabeled_break(while_stmt.body.data(), 0)
+            }
+            Statement::Switch(switch_stmt) => {
+                let has_default = switch_stmt
+                    .cases
+                    .iter()
+                    .any(|case| case.data().test.is_none());
+                let has_break = switch_stmt.cases.iter().any(|case| {
+                    case.data()
+                        .consequent
+                        .iter()
+                        .any(|statement| Self::loop_body_has_unlabeled_break(statement.data(), 0))
+                });
+                has_default
+                    && !has_break
+                    && switch_stmt.cases.last().is_some_and(|case| {
+                        case.data().consequent.iter().any(|statement| {
+                            self.statement_prevents_function_completion(statement.data())
+                        })
+                    })
+            }
+            Statement::DoWhile(do_while) => {
+                Self::is_true_literal(do_while.test.data())
+                    && !Self::loop_body_has_unlabeled_break(do_while.body.data(), 0)
+            }
+            Statement::Try(try_stmt) => {
+                let finalizer_prevents = try_stmt
+                    .finalizer
+                    .as_ref()
+                    .is_some_and(|finalizer| !self.block_can_complete_normally(finalizer.data()));
+                finalizer_prevents
+                    || (!self.block_can_complete_normally(try_stmt.block.data())
+                        && try_stmt.handler.as_ref().is_none_or(|handler| {
+                            !self.block_can_complete_normally(handler.data().body.data())
+                        }))
+            }
+            Statement::With(with_stmt) => {
+                self.statement_prevents_function_completion(with_stmt.body.data())
+            }
+            _ => false,
+        }
+    }
+
+    fn block_can_complete_normally(&self, block: &'src crate::syntax::Block) -> bool {
         !block
             .statements
             .iter()
-            .any(|stmt| Self::statement_always_exits(stmt.data()))
+            .any(|statement| self.statement_prevents_function_completion(statement.data()))
     }
 
     fn check_annotated_return_fallthrough(
@@ -11557,7 +11698,7 @@ impl<'src> Binder<'src> {
         let (FunctionBody::Block(block), Some(expected)) = (body, expected) else {
             return;
         };
-        if Self::block_can_complete_normally(block.data())
+        if self.block_can_complete_normally(block.data())
             && !self
                 .types
                 .assignable_with_strict_null(self.types.undefined_type(), expected)
@@ -11575,7 +11716,7 @@ impl<'src> Binder<'src> {
             return self.types.void();
         }
         let mut members: Vec<TypeId> = returns.to_vec();
-        let can_complete_normally = Self::block_can_complete_normally(block);
+        let can_complete_normally = self.block_can_complete_normally(block);
         let has_value = members.iter().any(|&t| t != self.types.undefined_type());
         if can_complete_normally && has_value {
             members.push(self.types.undefined_type());

@@ -5704,11 +5704,40 @@ mod tests {
             "const value = (): number => {};",
             "async function value(): Promise<number> {}",
             "function value(): number { while (true) { break; } }",
+            "function value(x: number): number { switch (x) { case 0: return 1; } }",
         ] {
             let result = check_text(source);
             assert_eq!(
                 checker_codes(&result),
                 ["BAMTS-C004"],
+                "{source}: {:?}",
+                checker_codes(&result)
+            );
+        }
+    }
+
+    #[test]
+    fn annotated_return_fallthrough_tracks_labeled_breaks() {
+        for source in [
+            "function value(): number { label: { break label; } }",
+            "function value(): number { label: while (true) { break label; } }",
+        ] {
+            let result = check_text(source);
+            assert_eq!(
+                checker_codes(&result),
+                ["BAMTS-C004"],
+                "{source}: {:?}",
+                checker_codes(&result)
+            );
+        }
+        for source in [
+            "function value(): number { label: { return 1; } }",
+            "function value(): number { label: { return 1; break label; } }",
+            "function value(): number { label: try { break label; } finally { return 1; } }",
+        ] {
+            let result = check_text(source);
+            assert!(
+                checker_codes(&result).is_empty(),
                 "{source}: {:?}",
                 checker_codes(&result)
             );
@@ -5730,6 +5759,7 @@ mod tests {
             "function value(): number { for (; true;) {} }",
             "function value(x: number): number { while (true) { switch (x) { case 0: break; } } }",
             "function value(): number { while (true) { while (true) { break; } } }",
+            "function value(x: number): number { switch (x) { case 0: return 1; default: return 2; } }",
         ] {
             let result = check_text(source);
             assert!(
