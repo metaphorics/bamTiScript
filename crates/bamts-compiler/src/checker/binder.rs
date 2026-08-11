@@ -3036,6 +3036,7 @@ enum WriteFunctionBody<'src> {
 struct ReturnContext {
     expected: Option<TypeId>,
     await_expression: bool,
+    generator_protocol: Option<ForOfMode>,
 }
 
 pub(crate) struct Binder<'src> {
@@ -3159,6 +3160,8 @@ pub(crate) struct Binder<'src> {
     /// Accumulated return expression types per function body node, used to
     /// infer function and getter return types when no annotation is present.
     return_types: HashMap<NodeId, Vec<TypeId>>,
+    /// Accumulated yielded element types per generator body node.
+    yield_types: HashMap<NodeId, Vec<TypeId>>,
     /// Stack of function body node ids currently being resolved, innermost last.
     function_body_stack: Vec<NodeId>,
     /// Return contract for each function body currently being resolved.
@@ -3257,6 +3260,7 @@ impl<'src> Binder<'src> {
             declarator_symbols: HashMap::new(),
             suppress_used_before_assigned: false,
             return_types: HashMap::new(),
+            yield_types: HashMap::new(),
             function_body_stack: Vec::new(),
             return_contexts: Vec::new(),
             this_context: Vec::new(),
@@ -6468,10 +6472,16 @@ impl<'src> Binder<'src> {
         self.return_contexts.push(ReturnContext {
             expected: expected_return_type,
             await_expression: function.is_async,
+            generator_protocol: function.is_generator.then_some(if function.is_async {
+                ForOfMode::Async
+            } else {
+                ForOfMode::Sync
+            }),
         });
         self.this_context.push(this_type);
         if let Some(body_id) = function.body.as_ref().and_then(FunctionBody::id) {
             self.return_types.entry(body_id).or_default();
+            self.yield_types.entry(body_id).or_default();
             self.function_body_stack.push(body_id);
         }
         let body_flow = if is_declaration {
@@ -6501,16 +6511,8 @@ impl<'src> Binder<'src> {
             self.pop_reassigned_scope();
         }
         if let Some(symbol) = function_symbol {
-            let return_type = if let Some(return_type) = annotated_return_type {
-                return_type
-            } else {
-                let inferred = self.inferred_return_type(function, scope);
-                if function.is_async {
-                    self.promise_type(inferred)
-                } else {
-                    inferred
-                }
-            };
+            let return_type = annotated_return_type
+                .unwrap_or_else(|| self.inferred_function_return_type(function, scope));
             let (type_parameters, type_parameter_bounds) =
                 self.signature_type_parameters(function.type_parameters.as_ref(), scope);
             let mut function_parameters = Vec::with_capacity(function.parameters.len());
@@ -8326,6 +8328,7 @@ impl<'src> Binder<'src> {
                 self.return_contexts.push(ReturnContext {
                     expected: expected_return_type,
                     await_expression: arrow.is_async,
+                    generator_protocol: None,
                 });
                 let block_body_id = match &arrow.body {
                     FunctionBody::Block(block) => {
@@ -8448,6 +8451,53 @@ impl<'src> Binder<'src> {
             Expression::Yield(yield_expression) => {
                 if let Some(argument) = &yield_expression.argument {
                     self.resolve_expr(argument, scope);
+                }
+                let protocol = self
+                    .return_contexts
+                    .last()
+                    .and_then(|context| context.generator_protocol);
+                if let Some(protocol) = protocol
+                    && let Some(body_id) = self.function_body_stack.last().copied()
+                {
+                    let yield_type = if yield_expression.delegate {
+                        match &yield_expression.argument {
+                            Some(argument) => {
+                                let iterable = self.type_of_expr(argument, scope);
+                                match self.iteration_element_type(iterable, protocol) {
+                                    Some(element) => element,
+                                    None => {
+                                        self.emit(
+                                            FOR_OF_ITERABLE_REQUIRED,
+                                            argument.range(),
+                                            FOR_OF_ITERABLE_REQUIRED_MESSAGE,
+                                        );
+                                        self.types.error_type()
+                                    }
+                                }
+                            }
+                            None => {
+                                self.emit(
+                                    FOR_OF_ITERABLE_REQUIRED,
+                                    expression.range(),
+                                    FOR_OF_ITERABLE_REQUIRED_MESSAGE,
+                                );
+                                self.types.error_type()
+                            }
+                        }
+                    } else {
+                        let value = match &yield_expression.argument {
+                            Some(argument) => self.type_of_expr(argument, scope),
+                            None => self.types.undefined_type(),
+                        };
+                        match protocol {
+                            ForOfMode::Sync => value,
+                            ForOfMode::Async => self.awaited_type(value),
+                        }
+                    };
+                    self.yield_types
+                        .entry(body_id)
+                        .or_default()
+                        .push(yield_type);
                 }
             }
             Expression::Unary(unary) => self.resolve_expr(&unary.argument, scope),
@@ -10553,22 +10603,12 @@ impl<'src> Binder<'src> {
                             } else {
                                 ForOfMode::Sync
                             };
-                            let iterable = self.intrinsic_iterable_iterator_type(
+                            return self.intrinsic_generator_type(
                                 yield_type,
                                 return_type,
                                 next_type,
                                 protocol,
                             );
-                            let marker = self.types.object_type_with_members(ObjectType {
-                                properties: Vec::new(),
-                                call_signatures: Vec::new(),
-                                construct_signatures: Vec::new(),
-                                index_signatures: Vec::new(),
-                                generator_return: Some(return_type),
-                                iterator_property: None,
-                                async_iterator_property: None,
-                            });
-                            return self.types.intersection(vec![iterable, marker]);
                         }
                         if matches!(
                             name.as_ref(),
@@ -11865,6 +11905,27 @@ impl<'src> Binder<'src> {
         self.types.intersection(vec![iterator, iterable])
     }
 
+    fn intrinsic_generator_type(
+        &mut self,
+        yield_type: TypeId,
+        return_type: TypeId,
+        next_type: TypeId,
+        protocol: ForOfMode,
+    ) -> TypeId {
+        let iterable =
+            self.intrinsic_iterable_iterator_type(yield_type, return_type, next_type, protocol);
+        let marker = self.types.object_type_with_members(ObjectType {
+            properties: Vec::new(),
+            call_signatures: Vec::new(),
+            construct_signatures: Vec::new(),
+            index_signatures: Vec::new(),
+            generator_return: Some(return_type),
+            iterator_property: None,
+            async_iterator_property: None,
+        });
+        self.types.intersection(vec![iterable, marker])
+    }
+
     fn promise_type(&mut self, value: TypeId) -> TypeId {
         let any = self.types.any();
         self.types.object_type(vec![
@@ -12563,14 +12624,7 @@ impl<'src> Binder<'src> {
     ) -> TypeId {
         let return_type = match &function.return_type {
             Some(annotation) => self.resolve_type(&annotation.data().type_node, scope),
-            None => {
-                let inferred = self.inferred_return_type(function, scope);
-                if function.is_async {
-                    self.promise_type(inferred)
-                } else {
-                    inferred
-                }
-            }
+            None => self.inferred_function_return_type(function, scope),
         };
         self.signature_type_with_return(
             function.type_parameters.as_ref(),
@@ -12816,6 +12870,40 @@ impl<'src> Binder<'src> {
         }
         let return_type = self.types.union(&members);
         self.types.widen_fresh_literal(return_type)
+    }
+
+    fn inferred_function_return_type(
+        &mut self,
+        function: &'src FunctionLike,
+        parent: ScopeId,
+    ) -> TypeId {
+        let completion = self.inferred_return_type(function, parent);
+        if function.is_generator {
+            let yields = function
+                .body
+                .as_ref()
+                .and_then(FunctionBody::id)
+                .and_then(|body| self.yield_types.get(&body))
+                .cloned()
+                .unwrap_or_default();
+            let yield_type = if yields.is_empty() {
+                self.types.never()
+            } else {
+                let union = self.types.union(&yields);
+                self.types.widen_fresh_literal(union)
+            };
+            let next_type = self.types.unknown();
+            let protocol = if function.is_async {
+                ForOfMode::Async
+            } else {
+                ForOfMode::Sync
+            };
+            self.intrinsic_generator_type(yield_type, completion, next_type, protocol)
+        } else if function.is_async {
+            self.promise_type(completion)
+        } else {
+            completion
+        }
     }
 
     fn inferred_return_type(&mut self, function: &'src FunctionLike, parent: ScopeId) -> TypeId {

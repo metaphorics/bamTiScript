@@ -5879,6 +5879,90 @@ mod tests {
     }
 
     #[test]
+    fn inferred_generator_functions_preserve_yield_and_completion_types() {
+        let result = check_text(
+            "function* values() { yield 1; return 'done'; }\
+             const iterator = values();\
+             const step = iterator.next();\
+             if (step.done === true) {\
+                 const completion: string = step.value;\
+             } else {\
+                 const yielded: number = step.value;\
+             }\
+             for (const value of iterator) { const yielded: number = value; }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn inferred_async_generator_methods_form_async_iterables() {
+        let result = check_text(
+            "declare const promised: Promise<number>;\
+             const iterable = {\
+                 async *[Symbol.asyncIterator]() { yield promised; }\
+             };\
+             async function consume(): Promise<void> {\
+                 for await (const value of iterable) {\
+                     const yielded: number = value;\
+                 }\
+             }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn inferred_generator_delegation_uses_protocol_element_types() {
+        let result = check_text(
+            "declare const promised: Promise<number>;\
+             function* children() { yield 1; }\
+             function* syncValues() { yield* children(); }\
+             async function* asyncValues() { yield* [promised]; }\
+             for (const value of syncValues()) { const invalid: string = value; }\
+             async function consume(): Promise<void> {\
+                 for await (const value of asyncValues()) {\
+                     const invalid: string = value;\
+                 }\
+             }",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004", "BAMTS-C004"]);
+    }
+
+    #[test]
+    fn inferred_generators_reject_invalid_delegation() {
+        let result = check_text(
+            "function* syncValues() { yield* 1; }\
+             async function* asyncValues() { yield* 1; }",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            [
+                super::FOR_OF_ITERABLE_REQUIRED.as_str(),
+                super::FOR_OF_ITERABLE_REQUIRED.as_str(),
+            ]
+        );
+    }
+
+    #[test]
+    fn inferred_generator_yields_ignore_nested_functions() {
+        let result = check_text(
+            "function* outer() {\
+                 function* inner() { yield 'nested'; }\
+                 yield 1;\
+             }\
+             for (const value of outer()) { const invalid: string = value; }",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
     fn async_generator_returns_await_promise_values() {
         let accepted = check_text(
             "declare const promised: Promise<string>;\
