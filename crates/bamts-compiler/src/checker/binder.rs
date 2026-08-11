@@ -476,6 +476,7 @@ pub struct ObjectType {
     pub(crate) call_signatures: Vec<FunctionSignature>,
     pub(crate) construct_signatures: Vec<ConstructEntry>,
     pub(crate) index_signatures: Vec<IndexSignature>,
+    pub(crate) generator_return: Option<TypeId>,
 }
 
 impl ObjectType {
@@ -1181,6 +1182,43 @@ impl TypeTable {
             Type::AppliedClass { .. } => self
                 .prepare_applied_class_view(ty)
                 .and_then(|view| self.property_type(view, name)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn generator_return_type(&mut self, ty: TypeId) -> Option<TypeId> {
+        let ty = self.named_structural_view(ty);
+        let ty = match self.get(ty) {
+            Type::Named(symbol) => self
+                .classes
+                .get(symbol)
+                .and_then(|metadata| metadata.template.as_ref())
+                .map_or(ty, |template| template.raw),
+            _ => ty,
+        };
+        match self.get(ty).clone() {
+            Type::ObjectType(object) => object.generator_return,
+            Type::Union(members) => {
+                let mut returns = Vec::with_capacity(members.len());
+                for member in members {
+                    returns.push(self.generator_return_type(member)?);
+                }
+                Some(self.union(&returns))
+            }
+            Type::Intersection(members) => {
+                let returns: Vec<TypeId> = members
+                    .iter()
+                    .filter_map(|&member| self.generator_return_type(member))
+                    .collect();
+                match returns.len() {
+                    0 => None,
+                    1 => Some(returns[0]),
+                    _ => Some(self.intersection(returns)),
+                }
+            }
+            Type::AppliedClass { .. } => self
+                .prepare_applied_class_view(ty)
+                .and_then(|view| self.generator_return_type(view)),
             _ => None,
         }
     }
@@ -1930,6 +1968,7 @@ impl TypeTable {
             call_signatures: Vec::new(),
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
+            generator_return: None,
         })
     }
     /// Interns an object type after canonically ordering its members by name.
@@ -2297,11 +2336,15 @@ impl TypeTable {
                             ),
                         })
                         .collect();
+                    let generator_return = object.generator_return.map(|return_type| {
+                        copy(target, source, return_type, imported, next_symbol)
+                    });
                     target.object_type_with_members(ObjectType {
                         properties,
                         call_signatures,
                         construct_signatures,
                         index_signatures,
+                        generator_return,
                     })
                 }
                 Type::Function(signature) => {
@@ -6194,70 +6237,8 @@ impl<'src> Binder<'src> {
         }
     }
 
-    fn generator_completion_type(
-        &mut self,
-        annotation: &'src Ty,
-        scope: ScopeId,
-    ) -> Option<TypeId> {
-        let mut aliases = HashSet::new();
-        self.generator_completion_type_inner(annotation, scope, &mut aliases)
-    }
-
-    fn generator_completion_type_inner(
-        &mut self,
-        annotation: &'src Ty,
-        scope: ScopeId,
-        aliases: &mut HashSet<SymbolId>,
-    ) -> Option<TypeId> {
-        let TypeNode::Reference(reference) = annotation.data() else {
-            return None;
-        };
-        let EntityName::Identifier(identifier) = &reference.name else {
-            return None;
-        };
-        let name = self.identifier_text(identifier);
-        let symbol = self.lookup_type(scope, &name)?;
-        if matches!(name.as_ref(), "Generator" | "AsyncGenerator")
-            && matches!(
-                self.symbols[symbol.get() as usize].kind,
-                SymbolKind::IntrinsicType
-            )
-        {
-            let completion = reference
-                .type_arguments
-                .as_ref()
-                .and_then(|arguments| arguments.arguments.get(1));
-            return Some(match completion {
-                Some(argument) => self.resolve_type(argument, scope),
-                None => self.types.any(),
-            });
-        }
-        let TypeDef::Alias {
-            scope: alias_scope,
-            type_parameters,
-            node,
-        } = self.type_defs.get(&symbol).copied()?
-        else {
-            return None;
-        };
-        if !aliases.insert(symbol) {
-            return None;
-        }
-        let (parameters, bounds) = self.signature_type_parameters(type_parameters, alias_scope);
-        let arguments: Option<Vec<_>> = reference.type_arguments.as_ref().map(|arguments| {
-            arguments
-                .arguments
-                .iter()
-                .map(|argument| self.resolve_type(argument, scope))
-                .collect()
-        });
-        let inferred =
-            self.complete_explicit_type_arguments(&parameters, &bounds, arguments.as_deref());
-        let completion = self.generator_completion_type_inner(node, alias_scope, aliases);
-        aliases.remove(&symbol);
-        completion.map(|completion| {
-            InferredTypeArguments::new(inferred).instantiate(&mut self.types, completion)
-        })
+    fn generator_completion_type(&mut self, annotation: TypeId) -> Option<TypeId> {
+        self.types.generator_return_type(annotation)
     }
 
     fn resolve_function(
@@ -6297,9 +6278,8 @@ impl<'src> Binder<'src> {
             .as_ref()
             .map(|annotation| self.resolve_type(&annotation.data().type_node, scope));
         let expected_return_type = if function.is_generator {
-            function.return_type.as_ref().and_then(|annotation| {
-                self.generator_completion_type(&annotation.data().type_node, scope)
-            })
+            annotated_return_type
+                .and_then(|return_type| self.generator_completion_type(return_type))
         } else {
             annotated_return_type.map(|return_type| {
                 if function.is_async {
@@ -7323,6 +7303,7 @@ impl<'src> Binder<'src> {
             call_signatures: Vec::new(),
             construct_signatures,
             index_signatures: Vec::new(),
+            generator_return: None,
         })
     }
 
@@ -8979,6 +8960,21 @@ impl<'src> Binder<'src> {
                     .collect();
                 self.types.union(&element)
             }
+            Type::Intersection(members) => {
+                let error = self.types.error_type();
+                let elements: Vec<TypeId> = members
+                    .iter()
+                    .filter_map(|&member| {
+                        let element = self.iteration_element_type(member);
+                        (element != error).then_some(element)
+                    })
+                    .collect();
+                match elements.len() {
+                    0 => error,
+                    1 => elements[0],
+                    _ => self.types.intersection(elements),
+                }
+            }
             Type::Named(symbol) => {
                 let resolved = self.resolve_named_type_symbol(symbol);
                 let view = self.types.named_structural_view(resolved);
@@ -9675,6 +9671,7 @@ impl<'src> Binder<'src> {
                         is_abstract: constructor.is_abstract,
                     }],
                     index_signatures: Vec::new(),
+                    generator_return: None,
                 })
             }
             TypeNode::Parenthesized(inner) => self.resolve_type(inner, scope),
@@ -9942,6 +9939,30 @@ impl<'src> Binder<'src> {
                                     .unwrap_or_else(|| self.types.any()),
                             );
                         }
+                        if matches!(name.as_ref(), "Generator" | "AsyncGenerator")
+                            && matches!(
+                                self.symbols[symbol.get() as usize].kind,
+                                SymbolKind::IntrinsicType
+                            )
+                        {
+                            let yield_type = explicit_arguments
+                                .as_deref()
+                                .and_then(|arguments| arguments.first().copied())
+                                .unwrap_or_else(|| self.types.any());
+                            let return_type = explicit_arguments
+                                .as_deref()
+                                .and_then(|arguments| arguments.get(1).copied())
+                                .unwrap_or_else(|| self.types.any());
+                            let iterable = self.types.array(yield_type);
+                            let marker = self.types.object_type_with_members(ObjectType {
+                                properties: Vec::new(),
+                                call_signatures: Vec::new(),
+                                construct_signatures: Vec::new(),
+                                index_signatures: Vec::new(),
+                                generator_return: Some(return_type),
+                            });
+                            return self.types.intersection(vec![iterable, marker]);
+                        }
                         if matches!(
                             name.as_ref(),
                             "Iterable"
@@ -9950,8 +9971,6 @@ impl<'src> Binder<'src> {
                                 | "AsyncIterable"
                                 | "AsyncIterableIterator"
                                 | "AsyncIterator"
-                                | "Generator"
-                                | "AsyncGenerator"
                         ) && matches!(
                             self.symbols[symbol.get() as usize].kind,
                             SymbolKind::IntrinsicType
@@ -10424,11 +10443,20 @@ impl<'src> Binder<'src> {
                     call_signatures: Vec::new(),
                     construct_signatures: Vec::new(),
                     index_signatures: Vec::new(),
+                    generator_return: None,
                 };
                 for interface in declarations {
                     let base =
                         self.resolve_interface_type(scope, &interface.extends, &interface.members);
                     if let Type::ObjectType(object) = self.types.get(base).clone() {
+                        merged.generator_return =
+                            match (merged.generator_return, object.generator_return) {
+                                (None, return_type) => return_type,
+                                (return_type, None) => return_type,
+                                (Some(left), Some(right)) => {
+                                    Some(self.types.intersection(vec![left, right]))
+                                }
+                            };
                         merged.properties.extend(object.properties);
                         for signature in object.call_signatures {
                             if !merged.call_signatures.contains(&signature) {
@@ -10478,6 +10506,12 @@ impl<'src> Binder<'src> {
                 NodeId::default(),
                 NodeId::default_range(),
             );
+            if let Some(return_type) = self.types.generator_return_type(base_type) {
+                object.generator_return = match object.generator_return {
+                    None => Some(return_type),
+                    Some(existing) => Some(self.types.intersection(vec![existing, return_type])),
+                };
+            }
             let base_view = self.types.named_structural_view(base_type);
             if let Type::ObjectType(base_object) = self.types.get(base_view).clone() {
                 for base_property in &base_object.properties {
@@ -10543,6 +10577,7 @@ impl<'src> Binder<'src> {
             call_signatures: Vec::new(),
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
+            generator_return: None,
         };
         for member in members {
             match member.data() {
@@ -10755,6 +10790,7 @@ impl<'src> Binder<'src> {
                     call_signatures: Vec::new(),
                     construct_signatures: Vec::new(),
                     index_signatures: Vec::new(),
+                    generator_return: None,
                 };
                 let mut found = false;
                 for member in members {

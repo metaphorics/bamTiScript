@@ -5804,6 +5804,7 @@ mod tests {
             "function* value(): Generator<number, string, unknown> { return 1; }",
             "type Completion<R> = Generator<number, R, unknown>; function* value(): Completion<string> { return 1; }",
             "type Completion = Generator<number, string, unknown>; function* value(): Completion { yield 1; }",
+            "type Completion<R> = Generator<number, R, unknown> & {}; function* value(): Completion<string> { yield 1; }",
         ] {
             let result = check_text(source);
             assert_eq!(
@@ -5828,6 +5829,77 @@ mod tests {
             checker_codes(&result).is_empty(),
             "{:?}",
             checker_codes(&result)
+        );
+    }
+
+    #[test]
+    fn generator_return_metadata_is_not_structurally_forgeable() {
+        let fake_annotation = check_text(
+            r#"type Fake = number[] & { "\0bamts.generator.return": string };
+               function* value(): Fake { yield 1; return 1; }"#,
+        );
+        assert!(
+            checker_codes(&fake_annotation).is_empty(),
+            "{:?}",
+            checker_codes(&fake_annotation)
+        );
+
+        for source in [
+            r#"declare const fake: number[] & { "\0bamts.generator.return": string };
+               const value: Generator<number, string, unknown> = fake;"#,
+            "declare const plain: number[];\
+             const value: Generator<number, string, unknown> = plain;",
+        ] {
+            let result = check_text(source);
+            assert_eq!(
+                checker_codes(&result),
+                ["BAMTS-C004"],
+                "{source}: {:?}",
+                checker_codes(&result)
+            );
+        }
+    }
+
+    #[test]
+    fn generator_return_metadata_controls_assignability_and_interface_completion() {
+        let compatible = check_text(
+            "declare const source: Generator<number, string, unknown>;\
+             const target: Generator<number, string, unknown> = source;",
+        );
+        assert!(
+            checker_codes(&compatible).is_empty(),
+            "{:?}",
+            checker_codes(&compatible)
+        );
+
+        let incompatible = check_text(
+            "declare const source: Generator<number, string, unknown>;\
+             const target: Generator<number, number, unknown> = source;",
+        );
+        assert_eq!(checker_codes(&incompatible), ["BAMTS-C004"]);
+
+        let inherited = check_text(
+            "interface Completion<R> extends Generator<number, R, unknown> {}\
+             function* good(): Completion<string> { yield 1; return 'done'; }\
+             function* bad(): Completion<string> { yield 1; return 1; }",
+        );
+        assert_eq!(checker_codes(&inherited), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn generator_intersections_preserve_yield_types_for_iteration() {
+        let result = check_text(
+            "type Completion<R> = Generator<number, R, unknown>;\
+             declare const direct: Generator<number, string, unknown>;\
+             declare const alias: Completion<string>;\
+             declare const extended: Completion<string> & { tag: true };\
+             for (const item of direct) { const invalid: string = item; }\
+             for (const item of alias) { const invalid: string = item; }\
+             for (const item of extended) { const invalid: string = item; }",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            ["BAMTS-C004", "BAMTS-C004", "BAMTS-C004"]
         );
     }
 

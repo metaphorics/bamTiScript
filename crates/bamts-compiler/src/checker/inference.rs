@@ -384,11 +384,15 @@ impl InferredTypeArguments {
                         value_type: self.instantiate(table, signature.value_type),
                     })
                     .collect();
+                let generator_return = object
+                    .generator_return
+                    .map(|return_type| self.instantiate(table, return_type));
                 table.object_type_with_members(ObjectType {
                     properties,
                     call_signatures,
                     construct_signatures,
                     index_signatures,
+                    generator_return,
                 })
             }
             Type::Function(signature) => {

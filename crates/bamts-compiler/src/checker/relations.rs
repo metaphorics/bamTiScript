@@ -671,6 +671,22 @@ impl<'table> TypeRelations<'table> {
         have.access() != Accessibility::Public && have.declaring_class() == want.declaring_class()
     }
 
+    fn generator_return_relates(
+        &self,
+        source: Option<TypeId>,
+        target: Option<TypeId>,
+        strictness: Strictness,
+    ) -> bool {
+        let Some(target) = target else {
+            return true;
+        };
+        source.is_some_and(|source| {
+            self.relates(source, target, strictness)
+                || (strictness == Strictness::Comparable
+                    && self.relates(target, source, strictness))
+        })
+    }
+
     fn object_relates(
         &self,
         source: &ObjectType,
@@ -698,6 +714,11 @@ impl<'table> TypeRelations<'table> {
             }
         });
         properties_relate
+            && self.generator_return_relates(
+                source.generator_return,
+                target.generator_return,
+                strictness,
+            )
             && self.signature_sets_relate(
                 &source.call_signatures,
                 &target.call_signatures,
@@ -799,7 +820,18 @@ impl<'table> TypeRelations<'table> {
             });
             satisfied || want.optional()
         });
-        if !properties_relate {
+        let generator_return_relates = target.generator_return.is_none_or(|target_return| {
+            sources.iter().any(|source| {
+                self.relation_object_view(*source).is_some_and(|object| {
+                    self.generator_return_relates(
+                        object.generator_return,
+                        Some(target_return),
+                        strictness,
+                    )
+                })
+            })
+        });
+        if !properties_relate || !generator_return_relates {
             return false;
         }
 
@@ -808,6 +840,7 @@ impl<'table> TypeRelations<'table> {
             call_signatures: Vec::new(),
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
+            generator_return: None,
         };
         let mut has_object = false;
         for source in sources {
@@ -836,6 +869,7 @@ impl<'table> TypeRelations<'table> {
             call_signatures: Vec::new(),
             construct_signatures: Vec::new(),
             index_signatures: target.index_signatures.clone(),
+            generator_return: None,
         };
         self.signature_sets_relate(
             &combined.call_signatures,
