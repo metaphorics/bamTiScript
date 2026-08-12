@@ -1255,6 +1255,7 @@ fn render_type_grouped(model: &SemanticModel, type_id: TypeId, group: bool) -> S
             render_type_grouped(model, *object, true),
             render_type_grouped(model, *index, false)
         ),
+        Type::This { .. } => "this".to_owned(),
         Type::Named(symbol) | Type::NumericEnum(symbol) => model.symbol(*symbol).name().to_owned(),
     }
 }
@@ -2476,6 +2477,27 @@ export const a2 = 3;
         );
     }
 
+    #[test]
+    fn render_type_preserves_polymorphic_this_identity() {
+        with_model(
+            "class Base {
+                 value = 1;
+                 method(): number { return this.value; }
+             }",
+            "tests/cases/compiler/polymorphicThis.ts",
+            |model| {
+                let this_type = model
+                    .typed_expressions()
+                    .iter()
+                    .map(|(_, type_id)| *type_id)
+                    .find(|type_id| matches!(model.types().get(*type_id), Type::This { .. }))
+                    .expect("method body has polymorphic this type");
+
+                assert_eq!(render_type(model, this_type), "this");
+            },
+        );
+    }
+
     /// H4 pin: an annotated scalar case the checker fully types reproduces its
     /// upstream `.types` baseline (marker, section, source echo, `>expr : type`
     /// records, and underline widths) under `compare_types`.
@@ -2712,7 +2734,7 @@ export const a2 = 3;
     }
 
     #[test]
-    fn class_method_this_resolves_to_instance_type() {
+    fn class_method_this_preserves_polymorphic_identity() {
         let logical = "tests/cases/compiler/thisPin.ts";
         let case_text = "class Ship { isSunk: boolean = false; }\n\
 class Board {\n\
@@ -2730,8 +2752,8 @@ class Board {\n\
             "this.ships should be Ship[]\n{baseline}"
         );
         assert!(
-            baseline.contains(">this : { allShipsSunk: () => any; ships: Ship[]; }"),
-            "this should be the Board instance shape\n{baseline}"
+            baseline.contains(">this : this"),
+            "this should preserve its polymorphic identity\n{baseline}"
         );
     }
 
