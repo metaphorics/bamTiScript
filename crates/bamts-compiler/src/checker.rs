@@ -7124,6 +7124,20 @@ mod tests {
     }
 
     #[test]
+    fn generic_iterable_parameters_infer_array_and_tuple_yields() {
+        let result = check_text(
+            "declare function first<T>(items: Iterable<T>): T;\
+             const numberValue: number = first([1, 2, 3]);\
+             const wrong: string = first([1, 2, 3]);\
+             declare const pair: [number, string];\
+             const unionValue: number | string = first(pair);\
+             declare const empty: [];\
+             const bottom: never = first(empty);",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
     fn structural_iterator_relations_compare_the_full_callable() {
         let result = check_text(
             "type Source = {\

@@ -814,6 +814,13 @@ impl<'table> InferenceContext<'table> {
                 }
             }
             Type::ObjectType(object) => {
+                let argument_type = match self.table.get(argument_type) {
+                    Type::Array(_) | Type::Tuple(_) => self
+                        .table
+                        .iterable_view(argument_type)
+                        .unwrap_or(argument_type),
+                    _ => argument_type,
+                };
                 if let Type::ObjectType(argument_object) = self.table.get(argument_type).clone() {
                     for property in object.properties {
                         if let Some(argument_property) = argument_object
@@ -829,6 +836,15 @@ impl<'table> InferenceContext<'table> {
                                 source,
                             );
                         }
+                    }
+                    if let (Some(parameter_iterator), Some(argument_iterator)) = (
+                        object.iterator_property.as_ref(),
+                        argument_object.iterator_property.as_ref(),
+                    ) && let (Some(parameter_yield), Some(argument_yield)) = (
+                        self.sync_iterator_yield(parameter_iterator.type_id()),
+                        self.sync_iterator_yield(argument_iterator.type_id()),
+                    ) {
+                        self.infer_types(parameter_yield, argument_yield, false, variance, source);
                     }
                 }
             }
@@ -904,6 +920,7 @@ impl<'table> InferenceContext<'table> {
                     );
                 }
             }
+
             Type::AppliedClass { symbol, arguments } => {
                 if let Type::AppliedClass {
                     symbol: argument_symbol,
@@ -926,6 +943,46 @@ impl<'table> InferenceContext<'table> {
                 }
             }
             _ => {}
+        }
+    }
+    fn sync_iterator_yield(&mut self, method: TypeId) -> Option<TypeId> {
+        let iterator = match self.table.get(method) {
+            Type::Any | Type::Never | Type::Error => return Some(method),
+            Type::Function(signature) => signature.return_type(),
+            _ => return None,
+        };
+        let next = self.table.property_type(iterator, "next")?;
+        let result = match self.table.get(next) {
+            Type::Any | Type::Never | Type::Error => return Some(next),
+            Type::Function(signature) => signature.return_type(),
+            _ => return None,
+        };
+        self.iterator_result_yield(result)
+    }
+
+    fn iterator_result_yield(&mut self, result: TypeId) -> Option<TypeId> {
+        match self.table.get(result).clone() {
+            Type::Any | Type::Never | Type::Error => Some(result),
+            Type::Union(members) => {
+                let mut yields = Vec::with_capacity(members.len());
+                for member in members {
+                    yields.push(self.iterator_result_yield(member)?);
+                }
+                Some(self.table.union(&yields))
+            }
+            Type::ObjectType(object) => {
+                let value = self.table.property_type(result, "value")?;
+                let completes = object.properties.iter().any(|property| {
+                    property.name() == "done"
+                        && !property.optional()
+                        && matches!(
+                            self.table.get(property.type_id()),
+                            Type::BooleanLiteral(true)
+                        )
+                });
+                Some(if completes { self.table.never() } else { value })
+            }
+            _ => None,
         }
     }
 
