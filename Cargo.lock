@@ -51,6 +51,10 @@ name = "bamts-bytecode"
 version = "0.1.0"
 
 [[package]]
+name = "bamts-cancel"
+version = "0.1.0"
+
+[[package]]
 name = "bamts-cli"
 version = "0.1.0"
 dependencies = [

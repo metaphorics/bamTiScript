@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/bamts-compiler",
+    "crates/bamts-cancel",
     "crates/bamts-bytecode",
     "crates/bamts-runtime",
     "crates/bamts-native",
@@ -21,6 +22,7 @@ repository = "https://github.com/metaphorics/bamTiScript"
 
 [workspace.dependencies]
 bamts = { path = "crates/bamts", version = "0.1.0" }
+bamts-cancel = { path = "crates/bamts-cancel", version = "0.1.0" }
 bamts-bytecode = { path = "crates/bamts-bytecode", version = "0.1.0" }
 bamts-cli = { path = "crates/bamts-cli", version = "0.1.0" }
 bamts-codegen = { path = "crates/bamts-codegen", version = "0.1.0" }

@@ -8,9 +8,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use toml::{Table, Value};
 
-const MEMBERS: [(&str, &str); 9] = [
+const MEMBERS: [(&str, &str); 10] = [
     ("bamts-compiler", "crates/bamts-compiler"),
     ("bamts-bytecode", "crates/bamts-bytecode"),
+    ("bamts-cancel", "crates/bamts-cancel"),
     ("bamts-runtime", "crates/bamts-runtime"),
     ("bamts-native", "crates/bamts-native"),
     ("bamts-node", "crates/bamts-node"),
@@ -970,6 +971,7 @@ fn validate_internal_graph(graph: &InternalGraph) -> Result<()> {
 fn expected_internal_graph() -> InternalGraph {
     let mut graph = BTreeMap::new();
     graph.insert("bamts-bytecode".to_owned(), BTreeMap::new());
+    graph.insert("bamts-cancel".to_owned(), BTreeMap::new());
     graph.insert("bamts-native".to_owned(), BTreeMap::new());
     graph.insert(
         "bamts-compiler".to_owned(),
