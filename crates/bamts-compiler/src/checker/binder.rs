@@ -6136,6 +6136,9 @@ impl<'src> Binder<'src> {
         statements: &'src [crate::syntax::Stmt],
         scope: ScopeId,
     ) {
+        if self.is_declaration_file || self.ambient_stack.last().copied().unwrap_or(false) {
+            return;
+        }
         let kind = self.scopes[scope.0 as usize].kind;
         if !matches!(kind, ScopeKind::Global | ScopeKind::Module) {
             return;
@@ -14614,6 +14617,29 @@ mod tests {
         };
         assert_eq!(active.parameters()[0].type_id(), model.types().any());
         assert_eq!(active.return_type(), model.types().any());
+    }
+
+    #[test]
+    fn declaration_file_functions_do_not_require_implementations() {
+        let (_, ambient) = bound_declaration("export function f(): void;");
+        assert!(
+            !ambient
+                .iter()
+                .any(|diagnostic| diagnostic.code() == FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION),
+            "{ambient:?}"
+        );
+
+        let (_, active) = bound("function f(): void;");
+        assert_eq!(
+            active
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.code() == FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION
+                })
+                .count(),
+            1,
+            "{active:?}"
+        );
     }
 
     #[test]
