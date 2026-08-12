@@ -9128,6 +9128,61 @@ mod tests {
     }
 
     #[test]
+    fn nested_same_class_applications_receive_structural_views() {
+        let accepted = check_text(
+            "abstract class AbstractType<Output = unknown> {
+                 abstract value: Output;
+             }
+             class Type<Output> extends AbstractType<Output> {
+                 value!: Output;
+                 optional(): Type<Output | undefined> {
+                     return this as Type<Output | undefined>;
+                 }
+             }
+             declare const source: Type<string>;
+             const base: AbstractType<string | undefined> = source.optional();",
+        );
+        assert!(
+            checker_codes(&accepted).is_empty(),
+            "{:?}",
+            accepted.diagnostics()
+        );
+
+        let rejected = check_text(
+            "abstract class AbstractType<Output = unknown> {
+                 abstract value: Output;
+             }
+             class Type<Output> extends AbstractType<Output> {
+                 value!: Output;
+                 optional(): Type<Output | undefined> {
+                     return this as Type<Output | undefined>;
+                 }
+             }
+             declare const source: Type<string>;
+             const wrong: AbstractType<number> = source.optional();",
+        );
+        assert_eq!(checker_codes(&rejected), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn recursively_expanding_class_views_remain_bounded() {
+        let result = check_text(
+            "declare class Expanding<T> {
+                 value: T;
+                 next(): Expanding<T[]>;
+             }
+             declare const root: Expanding<string>;
+             const once: Expanding<string[]> = root.next();
+             const twice: Expanding<string[][]> = once.next();",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
     fn unrelated_classes_do_not_gain_generic_base_compatibility() {
         let result = check_text(
             "abstract class AbstractType<Output = unknown> {\n\

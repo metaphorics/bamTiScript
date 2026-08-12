@@ -8,7 +8,7 @@
 //! into an immutable [`SemanticModel`] with canonical diagnostics.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use bamts_bytecode::{EcmaString, format_number};
 
@@ -1134,6 +1134,9 @@ pub struct TypeTable {
     /// Class heads whose shallow views are being materialized. Per-head
     /// recursion permits finite A-to-B expansion without unrolling A<T[]> forever.
     materializing_class_views: HashSet<SymbolId>,
+    /// Applied heads skipped by the per-symbol recursion guard. A bounded
+    /// outer drain gives each skipped head one later materialization attempt.
+    deferred_class_views: VecDeque<TypeId>,
     /// Completed structural body for an interface symbol. Recursive member
     /// references use `Type::Named(symbol)` as an inert head and expand through
     /// this single view after the body has been interned.
@@ -1171,6 +1174,7 @@ impl TypeTable {
             classes: HashMap::new(),
             applied_class_views: HashMap::new(),
             materializing_class_views: HashSet::new(),
+            deferred_class_views: VecDeque::new(),
             interface_structures: HashMap::new(),
         };
         table.error = table.intern(Type::Error);
@@ -1685,6 +1689,21 @@ impl TypeTable {
     }
 
     fn materialize_applied_class_view(&mut self, type_id: TypeId) {
+        self.materialize_one_applied_class_view(type_id);
+        if !self.materializing_class_views.is_empty() {
+            return;
+        }
+
+        let deferred = self.deferred_class_views.len();
+        for _ in 0..deferred {
+            let Some(type_id) = self.deferred_class_views.pop_front() else {
+                break;
+            };
+            self.materialize_one_applied_class_view(type_id);
+        }
+    }
+
+    fn materialize_one_applied_class_view(&mut self, type_id: TypeId) {
         let Type::AppliedClass { symbol, arguments } = self.get(type_id).clone() else {
             return;
         };
@@ -1705,6 +1724,7 @@ impl TypeTable {
             return;
         }
         if !self.materializing_class_views.insert(symbol) {
+            self.deferred_class_views.push_back(type_id);
             return;
         }
         let substitutions = metadata
