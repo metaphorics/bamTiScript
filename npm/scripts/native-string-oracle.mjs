@@ -38,7 +38,7 @@ const childSource = String.raw`
 import { basename } from "node:path";
 const units = (value) => Array.from({ length: value.length }, (_, index) => value.charCodeAt(index));
 const environment = Object.entries(process.env)
-  .filter(([key]) => key.startsWith("BAMTS_") || key.toLowerCase() === "path")
+  .filter(([key]) => key.includes("BAMTS") || key.toLowerCase() === "path")
   .sort(([left], [right]) => left.localeCompare(right))
   .map(([key, value]) => ({ key: units(key), value: units(value) }));
 process.stdout.write(JSON.stringify({
@@ -102,6 +102,8 @@ try {
     BAMTS_ASTRAL_VALUE: `astral-${astral}`,
     BAMTS_EMPTY: "",
     BAMTS_UNDEFINED: undefined,
+    "BAMTS_EQ=KEY": "equals-key-value",
+    "=BAMTS_LEADING_EQ": "leading-equals-value",
     PATH: "upper-path",
     Path: "mixed-path",
   };
