@@ -2,58 +2,14 @@
 
 use std::io::{self, Write};
 
-use bamts_cli::args::{help_message, load_error_message, parse_env_args, version_message};
-use bamts_cli::driver::{DriverError, execute};
-
 fn main() {
-    let exit_code = match parse_env_args() {
-        Ok(args) if args.help => write_stdout(help_message().as_bytes()),
-        Ok(args) if args.version => write_stdout(format!("{}\n", version_message()).as_bytes()),
-        Ok(args) => match execute(&args) {
-            Ok(outcome) => {
-                if write_stderr(&outcome.stderr) != 0 || write_stdout(&outcome.stdout) != 0 {
-                    1
-                } else {
-                    outcome.exit_code
-                }
-            }
-            Err(error) => report_driver_error(&error),
-        },
-        Err(error) => {
-            let message = format!("error: {error}\n\n{}", help_message());
-            if write_stderr(message.as_bytes()) == 0 {
-                2
-            } else {
-                1
-            }
-        }
+    let outcome = bamts_cli::cli::cli_outcome(std::env::args());
+    let exit_code = if write_stderr(&outcome.stderr) != 0 || write_stdout(&outcome.stdout) != 0 {
+        1
+    } else {
+        outcome.exit_code
     };
     std::process::exit(exit_code);
-}
-
-fn report_driver_error(error: &DriverError) -> i32 {
-    if error.is_usage_error() {
-        return report_usage_error(error);
-    }
-    if let DriverError::ProgramLoad(load_error) = error {
-        let _ = write_stderr(format!("{}\n", load_error_message(load_error)).as_bytes());
-        return 1;
-    }
-    let message = error.rendered_diagnostic().map_or_else(
-        || format!("error: {error}\n"),
-        |rendered| rendered.to_owned(),
-    );
-    let _ = write_stderr(message.as_bytes());
-    1
-}
-
-fn report_usage_error(error: &impl std::fmt::Display) -> i32 {
-    let message = format!("error: {error}\n\n{}", help_message());
-    if write_stderr(message.as_bytes()) == 0 {
-        2
-    } else {
-        1
-    }
 }
 
 fn write_stdout(bytes: &[u8]) -> i32 {

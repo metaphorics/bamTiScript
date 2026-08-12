@@ -328,8 +328,7 @@ pub struct AotPhaseTelemetry {
 
 /// Executes one already-parsed CLI command.
 pub fn execute(args: &CliArgs) -> Result<CommandOutcome, DriverError> {
-    let context = ExecutionContext::ambient()?;
-    execute_in_context(args, &context)
+    execute_with_telemetry(args).map(|(outcome, _telemetry)| outcome)
 }
 
 /// Executes one parsed command with explicit process inputs.
@@ -348,6 +347,9 @@ pub fn execute_in_context(
 pub fn execute_with_telemetry(
     args: &CliArgs,
 ) -> Result<(CommandOutcome, Option<AotPhaseTelemetry>), DriverError> {
+    if args.mode == Mode::Explain {
+        return explain(args);
+    }
     let context = ExecutionContext::ambient()?;
     execute_with_telemetry_in_context(args, &context)
 }
@@ -367,21 +369,23 @@ pub fn execute_with_telemetry_in_context(
                 Mode::Explain => unreachable!("explain handled without a program"),
             }
         }
-        Mode::Explain => {
-            let rule = args
-                .explain_rule
-                .as_deref()
-                .ok_or(DriverError::Usage(ArgsError::MissingExplainRule))?;
-            let explanation = crate::args::explain_rule(rule).map_err(DriverError::Usage)?;
-            Ok((
-                CommandOutcome {
-                    stdout: explanation.into_bytes(),
-                    ..CommandOutcome::default()
-                },
-                None,
-            ))
-        }
+        Mode::Explain => explain(args),
     }
+}
+
+fn explain(args: &CliArgs) -> Result<(CommandOutcome, Option<AotPhaseTelemetry>), DriverError> {
+    let rule = args
+        .explain_rule
+        .as_deref()
+        .ok_or(DriverError::Usage(ArgsError::MissingExplainRule))?;
+    let explanation = crate::args::explain_rule(rule).map_err(DriverError::Usage)?;
+    Ok((
+        CommandOutcome {
+            stdout: explanation.into_bytes(),
+            ..CommandOutcome::default()
+        },
+        None,
+    ))
 }
 
 fn levels(args: &CliArgs, project_root: &Path) -> Result<LintTable, DriverError> {
