@@ -651,6 +651,14 @@ impl<'a> NarrowingContext<'a> {
                 }
                 self.table.union(&kept)
             }
+            Type::This { constraint, .. } => {
+                let narrowed = self.narrow_discriminant(constraint, property, literal, negated);
+                if matches!(self.table.get(narrowed), Type::Never) {
+                    narrowed
+                } else {
+                    ty
+                }
+            }
             _ if self.discriminant_keeps(ty, property, literal, negated) => ty,
             Type::Never
             | Type::Void
@@ -694,6 +702,9 @@ impl<'a> NarrowingContext<'a> {
         is_async: bool,
     ) -> TypeId {
         let contextual_signature = match self.table.get(contextual) {
+            Type::This { constraint, .. } => {
+                return self.contextual_function(*constraint, parameters, body_return, is_async);
+            }
             Type::Function(signature) => Some(signature.clone()),
             Type::Error
             | Type::Intersection(_)
@@ -764,6 +775,7 @@ impl<'a> NarrowingContext<'a> {
     #[must_use]
     pub fn contextual_element_type(&mut self, contextual: TypeId) -> Option<TypeId> {
         match self.table.get(contextual).clone() {
+            Type::This { constraint, .. } => self.contextual_element_type(constraint),
             Type::Array(element) => Some(element),
             Type::Union(members) => {
                 let mut elements = Vec::with_capacity(members.len());
@@ -847,7 +859,8 @@ impl<'a> NarrowingContext<'a> {
             | Type::AppliedClass { .. }
             | Type::NumericEnum(_)
             | Type::Keyof(_)
-            | Type::IndexedAccess { .. } => ty,
+            | Type::IndexedAccess { .. }
+            | Type::This { .. } => ty,
         }
     }
 
@@ -929,6 +942,10 @@ impl<'a> NarrowingContext<'a> {
     /// types and as union members.
     fn filter(&mut self, ty: TypeId, decide: &dyn Fn(&Type) -> Narrow) -> TypeId {
         match self.table.get(ty).clone() {
+            Type::This { constraint, .. } => match decide(self.table.get(constraint)) {
+                Narrow::Keep | Narrow::Replace(_) => ty,
+                Narrow::Drop => self.table.never(),
+            },
             Type::Error | Type::Intersection(_) | Type::Any | Type::Unknown => ty,
             Type::Union(members) => {
                 let mut kept = Vec::with_capacity(members.len());
@@ -1046,7 +1063,8 @@ impl<'a> NarrowingContext<'a> {
                 | Type::AppliedClass { .. }
                 | Type::NumericEnum(_)
                 | Type::Keyof(_)
-                | Type::IndexedAccess { .. },
+                | Type::IndexedAccess { .. }
+                | Type::This { .. },
                 _,
             ) => self.table.never(),
         }
@@ -1084,7 +1102,8 @@ impl<'a> NarrowingContext<'a> {
             | Type::AppliedClass { .. }
             | Type::NumericEnum(_)
             | Type::Keyof(_)
-            | Type::IndexedAccess { .. } => {}
+            | Type::IndexedAccess { .. }
+            | Type::This { .. } => {}
         }
         match self.table.get(ty).clone() {
             Type::Error | Type::Intersection(_) | Type::Any | Type::Unknown | Type::Never => ty,
@@ -1121,7 +1140,8 @@ impl<'a> NarrowingContext<'a> {
             | Type::AppliedClass { .. }
             | Type::NumericEnum(_)
             | Type::Keyof(_)
-            | Type::IndexedAccess { .. } => ty,
+            | Type::IndexedAccess { .. }
+            | Type::This { .. } => ty,
         }
     }
 

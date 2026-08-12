@@ -153,6 +153,9 @@ pub struct Scope {
     /// scopes and class scopes only; namespace export scopes intentionally
     /// have no owner, since upstream renders export declarations bare.
     owner: Option<SymbolId>,
+    /// The class or interface that owns polymorphic `this` in this scope.
+    /// Interface scopes keep this separate from qualified-name ownership.
+    this_owner: Option<SymbolId>,
 }
 
 impl Scope {
@@ -341,8 +344,11 @@ pub struct PropertyType {
     /// always [`Accessibility::Public`] with no declaring class.
     access: Accessibility,
     /// The class symbol that declared this property. `None` for structural
-    /// object/interface properties.
+    /// object/interface properties. This field controls access compatibility.
     declaring_class: Option<SymbolId>,
+    /// Class and interface symbols whose polymorphic `this` appears in this
+    /// property's type. Access control does not use this provenance.
+    declaring_types: Vec<SymbolId>,
     /// Whether this property was declared as a method member. Used when
     /// merging same-name overloads in object types.
     is_method: bool,
@@ -359,6 +365,7 @@ impl PropertyType {
             type_id,
             access: Accessibility::Public,
             declaring_class: None,
+            declaring_types: Vec::new(),
             is_method: false,
         }
     }
@@ -383,6 +390,27 @@ impl PropertyType {
     ) -> Self {
         self.access = access;
         self.declaring_class = declaring_class;
+        if let Some(owner) = declaring_class
+            && !self.declaring_types.contains(&owner)
+        {
+            self.declaring_types.push(owner);
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn with_declaring_type(mut self, declaring_type: Option<SymbolId>) -> Self {
+        if let Some(owner) = declaring_type
+            && !self.declaring_types.contains(&owner)
+        {
+            self.declaring_types.push(owner);
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn with_declaring_types(mut self, declaring_types: Vec<SymbolId>) -> Self {
+        self.declaring_types = declaring_types;
         self
     }
 
@@ -431,6 +459,11 @@ impl PropertyType {
     pub const fn declaring_class(&self) -> Option<SymbolId> {
         self.declaring_class
     }
+
+    #[must_use]
+    pub fn declaring_types(&self) -> &[SymbolId] {
+        &self.declaring_types
+    }
 }
 
 impl PartialEq for PropertyType {
@@ -442,6 +475,7 @@ impl PartialEq for PropertyType {
             && self.type_id == other.type_id
             && self.access == other.access
             && self.declaring_class == other.declaring_class
+            && self.declaring_types == other.declaring_types
             && self.is_method == other.is_method
     }
 }
@@ -457,6 +491,7 @@ impl std::hash::Hash for PropertyType {
         self.type_id.hash(state);
         self.access.hash(state);
         self.declaring_class.hash(state);
+        self.declaring_types.hash(state);
         self.is_method.hash(state);
     }
 }
@@ -467,6 +502,7 @@ pub(crate) struct IteratorProperty {
     optional: bool,
     access: Accessibility,
     declaring_class: Option<SymbolId>,
+    declaring_types: Vec<SymbolId>,
     is_method: bool,
     spreadable: bool,
 }
@@ -478,6 +514,7 @@ impl IteratorProperty {
             optional,
             access: Accessibility::Public,
             declaring_class: None,
+            declaring_types: Vec::new(),
             is_method: false,
             spreadable: true,
         }
@@ -491,6 +528,25 @@ impl IteratorProperty {
     ) -> Self {
         self.access = access;
         self.declaring_class = declaring_class;
+        if let Some(owner) = declaring_class
+            && !self.declaring_types.contains(&owner)
+        {
+            self.declaring_types.push(owner);
+        }
+        self
+    }
+
+    #[must_use]
+    fn with_declaring_type(mut self, declaring_type: SymbolId) -> Self {
+        if !self.declaring_types.contains(&declaring_type) {
+            self.declaring_types.push(declaring_type);
+        }
+        self
+    }
+
+    #[must_use]
+    fn with_declaring_types(mut self, declaring_types: Vec<SymbolId>) -> Self {
+        self.declaring_types = declaring_types;
         self
     }
 
@@ -529,6 +585,10 @@ impl IteratorProperty {
         self.declaring_class
     }
 
+    pub(crate) fn declaring_types(&self) -> &[SymbolId] {
+        &self.declaring_types
+    }
+
     pub(crate) const fn is_method(&self) -> bool {
         self.is_method
     }
@@ -544,6 +604,7 @@ pub struct IndexSignature {
     pub(crate) readonly: bool,
     pub(crate) parameters: Vec<FunctionParameter>,
     pub(crate) value_type: TypeId,
+    pub(crate) declaring_types: Vec<SymbolId>,
 }
 
 /// The members retained by an interned structural object type.
@@ -659,6 +720,7 @@ pub struct FunctionSignature {
     type_parameter_bounds: Vec<TypeParameterBounds>,
     parameters: Vec<FunctionParameter>,
     return_type: TypeId,
+    declaring_types: Vec<SymbolId>,
     javascript: bool,
 }
 
@@ -668,6 +730,7 @@ impl PartialEq for FunctionSignature {
             && self.type_parameter_bounds == other.type_parameter_bounds
             && self.parameters == other.parameters
             && self.return_type == other.return_type
+            && self.declaring_types == other.declaring_types
             && self.javascript == other.javascript
     }
 }
@@ -680,6 +743,7 @@ impl std::hash::Hash for FunctionSignature {
         self.type_parameter_bounds.hash(state);
         self.parameters.hash(state);
         self.return_type.hash(state);
+        self.declaring_types.hash(state);
         self.javascript.hash(state);
     }
 }
@@ -703,6 +767,17 @@ impl FunctionSignature {
     #[must_use]
     pub const fn return_type(&self) -> TypeId {
         self.return_type
+    }
+
+    #[must_use]
+    pub fn declaring_types(&self) -> &[SymbolId] {
+        &self.declaring_types
+    }
+
+    #[must_use]
+    pub(crate) fn with_declaring_types(mut self, declaring_types: Vec<SymbolId>) -> Self {
+        self.declaring_types = declaring_types;
+        self
     }
 
     #[must_use]
@@ -1050,6 +1125,12 @@ pub enum Type {
         object: TypeId,
         index: TypeId,
     },
+    /// A receiver-bound `this` type. The owner isolates markers from nested
+    /// foreign types; the constraint names its declaring class or interface.
+    This {
+        owner: SymbolId,
+        constraint: TypeId,
+    },
 }
 
 #[derive(Debug)]
@@ -1353,6 +1434,14 @@ impl TypeTable {
                     return None;
                 }
                 let optional = properties.iter().all(IteratorProperty::optional);
+                let mut declaring_types = Vec::new();
+                for property in &properties {
+                    for &owner in property.declaring_types() {
+                        if !declaring_types.contains(&owner) {
+                            declaring_types.push(owner);
+                        }
+                    }
+                }
                 let mut types = properties.iter().map(IteratorProperty::type_id);
                 let first = types.next().expect("iterator properties are not empty");
                 let type_id = match types.next() {
@@ -1364,7 +1453,7 @@ impl TypeTable {
                             .collect(),
                     ),
                 };
-                Some(IteratorProperty::new(type_id, optional))
+                Some(IteratorProperty::new(type_id, optional).with_declaring_types(declaring_types))
             }
             _ => None,
         }
@@ -2330,6 +2419,11 @@ impl TypeTable {
         self.intern(Type::Named(symbol))
     }
 
+    /// Interns a receiver-bound `this` type for one declaring owner.
+    pub fn this_type(&mut self, owner: SymbolId, constraint: TypeId) -> TypeId {
+        self.intern(Type::This { owner, constraint })
+    }
+
     /// Interns a numeric enum value type.
     pub fn numeric_enum(&mut self, symbol: SymbolId) -> TypeId {
         self.intern(Type::NumericEnum(symbol))
@@ -2455,6 +2549,14 @@ impl TypeTable {
                         break;
                     }
                 }
+                let mut declaring_types = Vec::new();
+                for member in group {
+                    for &owner in member.declaring_types() {
+                        if !declaring_types.contains(&owner) {
+                            declaring_types.push(owner);
+                        }
+                    }
+                }
                 if can_merge && !overloads.is_empty() {
                     let type_id = if overloads.len() == 1 {
                         overloads[0]
@@ -2466,6 +2568,7 @@ impl TypeTable {
                             .with_readonly(first.readonly())
                             .with_getter_only(first.getter_only())
                             .with_accessibility(first.access(), first.declaring_class())
+                            .with_declaring_types(declaring_types)
                             .with_method(true);
                 }
             }
@@ -2519,8 +2622,13 @@ impl TypeTable {
             type_parameter_bounds,
             parameters,
             return_type,
+            declaring_types: Vec::new(),
             javascript,
         }))
+    }
+
+    pub(crate) fn function_signature(&mut self, signature: FunctionSignature) -> TypeId {
+        self.intern(Type::Function(signature))
     }
 
     /// Interns a union, normalizing absorption, `never` removal, and duplicates.
@@ -2735,6 +2843,13 @@ impl TypeTable {
                             let declaring_class = property.declaring_class().map(|symbol| {
                                 remap_symbol(target, source, symbol, imported, next_symbol)
                             });
+                            let declaring_types = property
+                                .declaring_types()
+                                .iter()
+                                .map(|&symbol| {
+                                    remap_symbol(target, source, symbol, imported, next_symbol)
+                                })
+                                .collect();
                             PropertyType::new(
                                 property.name.clone(),
                                 property.optional,
@@ -2743,6 +2858,7 @@ impl TypeTable {
                             .with_readonly(property.readonly)
                             .with_getter_only(property.getter_only)
                             .with_accessibility(property.access(), declaring_class)
+                            .with_declaring_types(declaring_types)
                             .with_method(property.is_method)
                         })
                         .collect();
@@ -2786,6 +2902,13 @@ impl TypeTable {
                                 imported,
                                 next_symbol,
                             ),
+                            declaring_types: signature
+                                .declaring_types
+                                .into_iter()
+                                .map(|symbol| {
+                                    remap_symbol(target, source, symbol, imported, next_symbol)
+                                })
+                                .collect(),
                         })
                         .collect();
                     let generator_return = object.generator_return.map(|return_type| {
@@ -2795,11 +2918,19 @@ impl TypeTable {
                         let declaring_class = property.declaring_class().map(|symbol| {
                             remap_symbol(target, source, symbol, imported, next_symbol)
                         });
+                        let declaring_types = property
+                            .declaring_types()
+                            .iter()
+                            .map(|&symbol| {
+                                remap_symbol(target, source, symbol, imported, next_symbol)
+                            })
+                            .collect();
                         IteratorProperty::new(
                             copy(target, source, property.type_id(), imported, next_symbol),
                             property.optional(),
                         )
                         .with_accessibility(property.access(), declaring_class)
+                        .with_declaring_types(declaring_types)
                         .with_method(property.is_method())
                         .with_spreadable(property.spreadable())
                     });
@@ -2807,11 +2938,19 @@ impl TypeTable {
                         let declaring_class = property.declaring_class().map(|symbol| {
                             remap_symbol(target, source, symbol, imported, next_symbol)
                         });
+                        let declaring_types = property
+                            .declaring_types()
+                            .iter()
+                            .map(|&symbol| {
+                                remap_symbol(target, source, symbol, imported, next_symbol)
+                            })
+                            .collect();
                         IteratorProperty::new(
                             copy(target, source, property.type_id(), imported, next_symbol),
                             property.optional(),
                         )
                         .with_accessibility(property.access(), declaring_class)
+                        .with_declaring_types(declaring_types)
                         .with_method(property.is_method())
                         .with_spreadable(property.spreadable())
                     });
@@ -2854,6 +2993,11 @@ impl TypeTable {
                     let object = copy(target, source, object, imported, next_symbol);
                     let index = copy(target, source, index, imported, next_symbol);
                     target.indexed_access(object, index)
+                }
+                Type::This { owner, constraint } => {
+                    let owner = remap_symbol(target, source, owner, imported, next_symbol);
+                    let constraint = copy(target, source, constraint, imported, next_symbol);
+                    target.this_type(owner, constraint)
                 }
             };
             imported.types.insert(source_id, type_id);
@@ -2958,6 +3102,11 @@ impl TypeTable {
             next_symbol: &mut u32,
         ) -> FunctionSignature {
             let javascript = signature.javascript;
+            let declaring_types = signature
+                .declaring_types
+                .iter()
+                .map(|&symbol| remap_symbol(target, source, symbol, imported, next_symbol))
+                .collect();
             let type_parameters = signature
                 .type_parameters
                 .into_iter()
@@ -2979,6 +3128,7 @@ impl TypeTable {
                 type_parameter_bounds,
                 parameters,
                 return_type,
+                declaring_types,
                 javascript,
             }
         }
@@ -4334,6 +4484,7 @@ impl<'src> Binder<'src> {
             types: BTreeMap::new(),
             strict,
             owner: None,
+            this_owner: None,
         });
         id
     }
@@ -4342,6 +4493,10 @@ impl<'src> Binder<'src> {
     /// afterwards inherit it as their qualified-name parent. Idempotent.
     fn set_scope_owner(&mut self, scope: ScopeId, owner: SymbolId) {
         self.scopes[scope.0 as usize].owner = Some(owner);
+    }
+
+    fn set_scope_this_owner(&mut self, scope: ScopeId, owner: SymbolId) {
+        self.scopes[scope.0 as usize].this_owner = Some(owner);
     }
 
     /// Walks outward to the nearest function-like, namespace-export, or module
@@ -5181,6 +5336,7 @@ impl<'src> Binder<'src> {
         );
         let type_scope = self.new_scope(ScopeKind::Block, Some(scope));
         self.bind_type_parameter_names(interface.type_parameters.as_ref(), type_scope);
+        self.set_scope_this_owner(type_scope, id);
         self.interface_merges.entry(id).or_default().push(interface);
         self.type_defs.entry(id).or_insert(TypeDef::Interface {
             scope: type_scope,
@@ -7469,11 +7625,18 @@ impl<'src> Binder<'src> {
     ) -> IteratorProperty {
         debug_assert_eq!(left.access(), right.access());
         debug_assert_eq!(left.declaring_class(), right.declaring_class());
+        let mut declaring_types = left.declaring_types().to_vec();
+        for &owner in right.declaring_types() {
+            if !declaring_types.contains(&owner) {
+                declaring_types.push(owner);
+            }
+        }
         let type_id = self
             .types
             .intersection_ordered(vec![left.type_id(), right.type_id()]);
         IteratorProperty::new(type_id, left.optional() && right.optional())
             .with_accessibility(left.access(), left.declaring_class())
+            .with_declaring_types(declaring_types)
             .with_method(left.is_method() || right.is_method())
             .with_spreadable(left.spreadable() && right.spreadable())
     }
@@ -8436,9 +8599,7 @@ impl<'src> Binder<'src> {
                 .get(&owner)
                 .copied()
                 .unwrap_or_else(|| self.types.any());
-            self.types
-                .prepare_applied_class_view(instance)
-                .unwrap_or(instance)
+            self.types.this_type(owner, instance)
         }
     }
 
@@ -9496,19 +9657,31 @@ impl<'src> Binder<'src> {
     }
 
     fn call_signature_groups_for_type(&mut self, type_id: TypeId) -> Vec<Vec<FunctionSignature>> {
+        self.call_signature_groups_for_type_raw(type_id, type_id)
+    }
+
+    fn call_signature_groups_for_type_raw(
+        &mut self,
+        type_id: TypeId,
+        receiver: TypeId,
+    ) -> Vec<Vec<FunctionSignature>> {
         if let Some(view) = self.types.prepare_applied_class_view(type_id) {
-            return self.call_signature_groups_for_type(view);
+            return self.call_signature_groups_for_type_raw(view, receiver);
         }
-        match self.types.get(type_id) {
-            Type::Function(signature) => vec![vec![signature.clone()]],
+        match self.types.get(type_id).clone() {
+            Type::Function(signature) => vec![vec![signature]],
             Type::ObjectType(object) if !object.call_signatures.is_empty() => {
-                vec![object.call_signatures.clone()]
+                let signatures = object
+                    .call_signatures
+                    .iter()
+                    .map(|signature| self.project_this_signature(signature, receiver))
+                    .collect();
+                vec![signatures]
             }
             Type::Union(members) => {
-                let members = members.clone();
                 let mut groups = Vec::with_capacity(members.len());
                 for member in members {
-                    let member_groups = self.call_signature_groups_for_type(member);
+                    let member_groups = self.call_signature_groups_for_type_raw(member, receiver);
                     if member_groups.is_empty() {
                         return Vec::new();
                     }
@@ -9517,10 +9690,9 @@ impl<'src> Binder<'src> {
                 groups
             }
             Type::Intersection(members) => {
-                let members = members.clone();
                 let signatures: Vec<_> = members
                     .iter()
-                    .flat_map(|member| self.call_signature_groups_for_type(*member))
+                    .flat_map(|member| self.call_signature_groups_for_type_raw(*member, receiver))
                     .flatten()
                     .collect();
                 if signatures.is_empty() {
@@ -9529,19 +9701,19 @@ impl<'src> Binder<'src> {
                     vec![signatures]
                 }
             }
-            Type::Named(symbol) if self.types.interface_structure(*symbol).is_some() => {
+            Type::Named(symbol) if self.types.interface_structure(symbol).is_some() => {
                 let view = self.types.named_structural_view(type_id);
-                self.call_signature_groups_for_type(view)
+                self.call_signature_groups_for_type_raw(view, receiver)
             }
             Type::Named(symbol) => {
                 let resolved = self
                     .types
-                    .type_parameter_constraint(*symbol)
+                    .type_parameter_constraint(symbol)
                     .unwrap_or(self.symbol_types[symbol.get() as usize]);
                 if resolved == type_id {
                     Vec::new()
                 } else {
-                    self.call_signature_groups_for_type(resolved)
+                    self.call_signature_groups_for_type_raw(resolved, receiver)
                 }
             }
             _ => Vec::new(),
@@ -9549,18 +9721,34 @@ impl<'src> Binder<'src> {
     }
 
     fn construct_signature_groups_for_type(&mut self, type_id: TypeId) -> Vec<Vec<ConstructEntry>> {
+        self.construct_signature_groups_for_type_raw(type_id, type_id)
+    }
+
+    fn construct_signature_groups_for_type_raw(
+        &mut self,
+        type_id: TypeId,
+        receiver: TypeId,
+    ) -> Vec<Vec<ConstructEntry>> {
         if let Some(view) = self.types.prepare_applied_class_view(type_id) {
-            return self.construct_signature_groups_for_type(view);
+            return self.construct_signature_groups_for_type_raw(view, receiver);
         }
-        match self.types.get(type_id) {
+        match self.types.get(type_id).clone() {
             Type::ObjectType(object) if !object.construct_signatures.is_empty() => {
-                vec![object.construct_signatures.clone()]
+                let signatures = object
+                    .construct_signatures
+                    .iter()
+                    .map(|entry| ConstructEntry {
+                        signature: self.project_this_signature(&entry.signature, receiver),
+                        is_abstract: entry.is_abstract,
+                    })
+                    .collect();
+                vec![signatures]
             }
             Type::Union(members) => {
-                let members = members.clone();
                 let mut groups = Vec::with_capacity(members.len());
                 for member in members {
-                    let member_groups = self.construct_signature_groups_for_type(member);
+                    let member_groups =
+                        self.construct_signature_groups_for_type_raw(member, receiver);
                     if member_groups.is_empty() {
                         return Vec::new();
                     }
@@ -9569,10 +9757,11 @@ impl<'src> Binder<'src> {
                 groups
             }
             Type::Intersection(members) => {
-                let members = members.clone();
                 let signatures: Vec<_> = members
                     .iter()
-                    .flat_map(|member| self.construct_signature_groups_for_type(*member))
+                    .flat_map(|member| {
+                        self.construct_signature_groups_for_type_raw(*member, receiver)
+                    })
                     .flatten()
                     .collect();
                 if signatures.is_empty() {
@@ -9581,19 +9770,19 @@ impl<'src> Binder<'src> {
                     vec![signatures]
                 }
             }
-            Type::Named(symbol) if self.types.interface_structure(*symbol).is_some() => {
+            Type::Named(symbol) if self.types.interface_structure(symbol).is_some() => {
                 let view = self.types.named_structural_view(type_id);
-                self.construct_signature_groups_for_type(view)
+                self.construct_signature_groups_for_type_raw(view, receiver)
             }
             Type::Named(symbol) => {
                 let resolved = self
                     .types
-                    .type_parameter_constraint(*symbol)
+                    .type_parameter_constraint(symbol)
                     .unwrap_or(self.symbol_types[symbol.get() as usize]);
                 if resolved == type_id {
                     Vec::new()
                 } else {
-                    self.construct_signature_groups_for_type(resolved)
+                    self.construct_signature_groups_for_type_raw(resolved, receiver)
                 }
             }
             _ => Vec::new(),
@@ -9830,7 +10019,7 @@ impl<'src> Binder<'src> {
     }
 
     fn iteration_element_type(&mut self, iterable: TypeId, mode: ForOfMode) -> Option<TypeId> {
-        let element = self.iteration_element_type_inner(iterable, mode)?;
+        let element = self.iteration_element_type_inner(iterable, mode, iterable)?;
         Some(match mode {
             ForOfMode::Sync => element,
             ForOfMode::Async => self.awaited_type(element),
@@ -9841,6 +10030,7 @@ impl<'src> Binder<'src> {
         &mut self,
         iterable: TypeId,
         mode: ForOfMode,
+        receiver: TypeId,
     ) -> Option<TypeId> {
         match self.types.get(iterable).clone() {
             Type::Array(element) => Some(element),
@@ -9856,7 +10046,12 @@ impl<'src> Binder<'src> {
                     && let Some(property) = object.async_iterator_property
                     && !property.optional()
                 {
-                    let method = property.type_id();
+                    let method = self.project_this_type_for_owners(
+                        property.type_id(),
+                        property.declaring_types(),
+                        None,
+                        receiver,
+                    );
                     let passthrough = matches!(
                         self.types.get(method),
                         Type::Any | Type::Never | Type::Error
@@ -9869,7 +10064,13 @@ impl<'src> Binder<'src> {
                 if property.optional() {
                     return None;
                 }
-                self.structural_iterator_element_type(property.type_id(), ForOfMode::Sync)
+                let method = self.project_this_type_for_owners(
+                    property.type_id(),
+                    property.declaring_types(),
+                    None,
+                    receiver,
+                );
+                self.structural_iterator_element_type(method, ForOfMode::Sync)
             }
             Type::String | Type::StringLiteral(_) => Some(self.types.string()),
             Type::Any | Type::Never | Type::Error => Some(iterable),
@@ -9878,7 +10079,7 @@ impl<'src> Binder<'src> {
                 let mut has_error = false;
                 let mut elements = Vec::with_capacity(members.len());
                 for member in members {
-                    let element = self.iteration_element_type_inner(member, mode)?;
+                    let element = self.iteration_element_type_inner(member, mode, receiver)?;
                     has_error |= element == error;
                     elements.push(element);
                 }
@@ -9894,7 +10095,12 @@ impl<'src> Binder<'src> {
                         self.types.iterator_property_of(iterable, ForOfMode::Async)
                     && !property.optional()
                 {
-                    let method = property.type_id();
+                    let method = self.project_this_type_for_owners(
+                        property.type_id(),
+                        property.declaring_types(),
+                        None,
+                        receiver,
+                    );
                     let passthrough = matches!(
                         self.types.get(method),
                         Type::Any | Type::Never | Type::Error
@@ -9906,13 +10112,19 @@ impl<'src> Binder<'src> {
                 if let Some(property) = self.types.iterator_property_of(iterable, ForOfMode::Sync)
                     && !property.optional()
                 {
-                    return self
-                        .structural_iterator_element_type(property.type_id(), ForOfMode::Sync);
+                    let method = self.project_this_type_for_owners(
+                        property.type_id(),
+                        property.declaring_types(),
+                        None,
+                        receiver,
+                    );
+                    return self.structural_iterator_element_type(method, ForOfMode::Sync);
                 }
                 let error = self.types.error_type();
                 let mut elements = Vec::with_capacity(members.len());
                 for member in members {
-                    let Some(element) = self.iteration_element_type_inner(member, ForOfMode::Sync)
+                    let Some(element) =
+                        self.iteration_element_type_inner(member, ForOfMode::Sync, receiver)
                     else {
                         continue;
                     };
@@ -9929,14 +10141,14 @@ impl<'src> Binder<'src> {
             }
             Type::Named(symbol) => {
                 if let Some(constraint) = self.type_parameter_effective_constraint(iterable) {
-                    return self.iteration_element_type_inner(constraint, mode);
+                    return self.iteration_element_type_inner(constraint, mode, receiver);
                 }
                 let resolved = self.resolve_named_type_symbol(symbol);
                 let view = self.types.named_structural_view(resolved);
                 if view != resolved {
-                    self.iteration_element_type_inner(view, mode)
+                    self.iteration_element_type_inner(view, mode, receiver)
                 } else if resolved != iterable {
-                    self.iteration_element_type_inner(resolved, mode)
+                    self.iteration_element_type_inner(resolved, mode, receiver)
                 } else {
                     None
                 }
@@ -9944,7 +10156,7 @@ impl<'src> Binder<'src> {
             Type::AppliedClass { .. } => {
                 let view = self.types.prepare_applied_class_view(iterable)?;
                 (view != iterable)
-                    .then(|| self.iteration_element_type_inner(view, mode))
+                    .then(|| self.iteration_element_type_inner(view, mode, receiver))
                     .flatten()
             }
             _ => None,
@@ -10086,12 +10298,68 @@ impl<'src> Binder<'src> {
         )
     }
 
+    fn project_this_type(
+        &mut self,
+        type_id: TypeId,
+        owner: Option<SymbolId>,
+        receiver: TypeId,
+    ) -> TypeId {
+        owner.map_or(type_id, |owner| {
+            InferredTypeArguments::for_this(owner, receiver).instantiate(&mut self.types, type_id)
+        })
+    }
+
+    fn project_this_type_for_owners(
+        &mut self,
+        mut type_id: TypeId,
+        owners: &[SymbolId],
+        fallback: Option<SymbolId>,
+        receiver: TypeId,
+    ) -> TypeId {
+        if owners.is_empty() {
+            return self.project_this_type(type_id, fallback, receiver);
+        }
+        for &owner in owners {
+            type_id = self.project_this_type(type_id, Some(owner), receiver);
+        }
+        type_id
+    }
+
+    fn project_this_signature(
+        &mut self,
+        signature: &FunctionSignature,
+        receiver: TypeId,
+    ) -> FunctionSignature {
+        let mut projected = signature.clone();
+        for &owner in signature.declaring_types() {
+            let type_id = InferredTypeArguments::for_this(owner, receiver)
+                .instantiate_signature(&mut self.types, &projected);
+            let Type::Function(next) = self.types.get(type_id) else {
+                unreachable!("signature instantiation returns a function");
+            };
+            projected = next.clone();
+        }
+        projected
+    }
+
     fn property_type_for_member(
         &mut self,
         object_type: TypeId,
         name: &str,
         range: TextRange,
         read: bool,
+    ) -> Option<TypeId> {
+        self.property_type_for_member_raw(object_type, name, range, read, object_type, None)
+    }
+
+    fn property_type_for_member_raw(
+        &mut self,
+        object_type: TypeId,
+        name: &str,
+        range: TextRange,
+        read: bool,
+        receiver: TypeId,
+        owner_hint: Option<SymbolId>,
     ) -> Option<TypeId> {
         match self.types.get(object_type).clone() {
             Type::ObjectType(object) => {
@@ -10104,10 +10372,15 @@ impl<'src> Binder<'src> {
                         self.emit(MEMBER_NOT_ACCESSIBLE, range, MEMBER_NOT_ACCESSIBLE_MESSAGE);
                         return Some(self.types.error_type());
                     }
-                    let type_id = property.type_id();
+                    let mut type_id = self.project_this_type_for_owners(
+                        property.type_id(),
+                        property.declaring_types(),
+                        owner_hint,
+                        receiver,
+                    );
                     if read && property.optional() {
                         let undefined = self.types.undefined_type();
-                        return Some(self.types.union(&[type_id, undefined]));
+                        type_id = self.types.union(&[type_id, undefined]);
                     }
                     return Some(type_id);
                 }
@@ -10119,7 +10392,13 @@ impl<'src> Binder<'src> {
                                 && matches!(self.types.get(parameter.type_id()), Type::Number))
                     })
                 }) {
-                    return Some(signature.value_type);
+                    let type_id = self.project_this_type_for_owners(
+                        signature.value_type,
+                        &signature.declaring_types,
+                        owner_hint,
+                        receiver,
+                    );
+                    return Some(type_id);
                 }
                 if self.is_typescript() {
                     self.emit(
@@ -10138,7 +10417,14 @@ impl<'src> Binder<'src> {
                 if view == object_type {
                     None
                 } else {
-                    self.property_type_for_member(view, name, range, read)
+                    self.property_type_for_member_raw(
+                        view,
+                        name,
+                        range,
+                        read,
+                        receiver,
+                        Some(symbol),
+                    )
                 }
             }
             Type::Union(members) => {
@@ -10156,8 +10442,9 @@ impl<'src> Binder<'src> {
                 }
                 let mut found = Vec::with_capacity(members.len());
                 for member in members {
-                    let member_property =
-                        self.property_type_for_member(member, name, range, read)?;
+                    let member_property = self.property_type_for_member_raw(
+                        member, name, range, read, receiver, owner_hint,
+                    )?;
                     if member_property == self.types.error_type() {
                         return Some(self.types.error_type());
                     }
@@ -10172,9 +10459,12 @@ impl<'src> Binder<'src> {
             Type::Intersection(members) => {
                 let mut found = Vec::with_capacity(members.len());
                 for member in members {
-                    let resolved = match self.types.get(member) {
-                        Type::Named(symbol) => self.resolve_named_type_symbol(*symbol),
-                        _ => member,
+                    let (resolved, member_owner) = match self.types.get(member).clone() {
+                        Type::Named(symbol) => {
+                            (self.resolve_named_type_symbol(symbol), Some(symbol))
+                        }
+                        Type::AppliedClass { symbol, .. } => (member, Some(symbol)),
+                        _ => (member, owner_hint),
                     };
                     let view = self.types.named_structural_view(resolved);
                     let property = match self.types.get(view).clone() {
@@ -10185,7 +10475,7 @@ impl<'src> Binder<'src> {
                         _ => self.types.property_type(view, name),
                     };
                     if let Some(property) = property {
-                        found.push(property);
+                        found.push(self.project_this_type(property, member_owner, receiver));
                     }
                 }
                 match found.len() {
@@ -10212,7 +10502,7 @@ impl<'src> Binder<'src> {
                     self.types.property_type(object_type, name)
                 };
                 if let Some(type_id) = property {
-                    Some(type_id)
+                    Some(self.project_this_type(type_id, owner_hint, receiver))
                 } else if self.is_typescript() {
                     self.emit(
                         PROPERTY_DOES_NOT_EXIST,
@@ -10230,16 +10520,38 @@ impl<'src> Binder<'src> {
                 } else {
                     self.types.property_type(object_type, name)
                 };
-                Some(property.unwrap_or_else(|| self.types.any()))
+                Some(
+                    property
+                        .map(|property| self.project_this_type(property, owner_hint, receiver))
+                        .unwrap_or_else(|| self.types.any()),
+                )
             }
-            Type::AppliedClass { .. } => {
+            Type::AppliedClass { symbol, .. } => {
                 if let Some(view) = self.types.prepare_applied_class_view(object_type) {
-                    return self.property_type_for_member(view, name, range, read);
+                    return self.property_type_for_member_raw(
+                        view,
+                        name,
+                        range,
+                        read,
+                        receiver,
+                        Some(symbol),
+                    );
                 }
                 None
             }
+            Type::This {
+                owner, constraint, ..
+            } => self.property_type_for_member_raw(
+                constraint,
+                name,
+                range,
+                read,
+                receiver,
+                Some(owner),
+            ),
             Type::Function(signature) if name == "call" => {
-                Some(self.function_call_member_type(&signature))
+                let property = self.function_call_member_type(&signature);
+                Some(self.project_this_type(property, owner_hint, receiver))
             }
             Type::Error
             | Type::Any
@@ -10299,6 +10611,7 @@ impl<'src> Binder<'src> {
                 }
                 false
             }
+            Type::This { constraint, .. } => self.property_is_readonly(constraint, name),
             _ => false,
         }
     }
@@ -10535,6 +10848,20 @@ impl<'src> Binder<'src> {
         }
         false
     }
+    fn enclosing_this_owner(&self, mut scope: ScopeId) -> Option<SymbolId> {
+        loop {
+            let lexical = &self.scopes[scope.0 as usize];
+            if let Some(owner) = lexical.this_owner.or(lexical.owner)
+                && matches!(
+                    self.symbols[owner.get() as usize].kind,
+                    SymbolKind::Class | SymbolKind::Interface
+                )
+            {
+                return Some(owner);
+            }
+            scope = lexical.parent?;
+        }
+    }
     /// Returns the nearest scope that is a function/class boundary or a script
     /// unit (global, module, namespace). Used-before-assigned diagnostics are
     /// only emitted when the declaration and the use share the same boundary.
@@ -10636,6 +10963,21 @@ impl<'src> Binder<'src> {
                     iterator_property: None,
                     async_iterator_property: None,
                 })
+            }
+            TypeNode::This => {
+                let Some(owner) = self.enclosing_this_owner(scope) else {
+                    return self.types.error_type();
+                };
+                let constraint = match self.symbols[owner.get() as usize].kind {
+                    SymbolKind::Class => self
+                        .class_instance_types
+                        .get(&owner)
+                        .copied()
+                        .unwrap_or_else(|| self.types.error_type()),
+                    SymbolKind::Interface => self.types.named(owner),
+                    _ => self.types.error_type(),
+                };
+                self.types.this_type(owner, constraint)
             }
             TypeNode::Parenthesized(inner) => self.resolve_type(inner, scope),
             TypeNode::Tuple(tuple) => {
@@ -11541,6 +11883,26 @@ impl<'src> Binder<'src> {
         members: &'src [crate::syntax::TypeMemberNode],
     ) -> TypeId {
         let mut object = self.resolve_type_members(members, scope);
+        if let Some(owner) = self.scopes[scope.0 as usize].this_owner {
+            for property in &mut object.properties {
+                property.declaring_types.push(owner);
+            }
+            for signature in &mut object.call_signatures {
+                signature.declaring_types.push(owner);
+            }
+            for entry in &mut object.construct_signatures {
+                entry.signature.declaring_types.push(owner);
+            }
+            for signature in &mut object.index_signatures {
+                signature.declaring_types.push(owner);
+            }
+            if let Some(property) = object.iterator_property.take() {
+                object.iterator_property = Some(property.with_declaring_type(owner));
+            }
+            if let Some(property) = object.async_iterator_property.take() {
+                object.async_iterator_property = Some(property.with_declaring_type(owner));
+            }
+        }
         let declared_properties = object.properties.len();
         let declared_iterator = object.iterator_property.is_some();
         let declared_async_iterator = object.async_iterator_property.is_some();
@@ -11797,6 +12159,7 @@ impl<'src> Binder<'src> {
                         readonly: index.readonly,
                         parameters,
                         value_type,
+                        declaring_types: Vec::new(),
                     });
                 }
                 TypeMember::Missing(_) => {}
@@ -11845,6 +12208,7 @@ impl<'src> Binder<'src> {
             type_parameter_bounds,
             parameters,
             return_type,
+            declaring_types: Vec::new(),
             javascript: false,
         }
     }
@@ -13374,6 +13738,7 @@ impl<'src> Binder<'src> {
             type_parameter_bounds: Vec::new(),
             parameters: instantiated_parameters,
             return_type: instantiated_return,
+            declaring_types: signature.declaring_types().to_vec(),
             javascript: signature.javascript(),
         })
     }
@@ -13422,6 +13787,7 @@ impl<'src> Binder<'src> {
             type_parameter_bounds: Vec::new(),
             parameters: instantiated_parameters,
             return_type: instantiated_return,
+            declaring_types: signature.declaring_types().to_vec(),
             javascript: signature.javascript(),
         })
     }

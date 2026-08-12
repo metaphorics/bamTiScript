@@ -9183,6 +9183,110 @@ mod tests {
     }
 
     #[test]
+    fn polymorphic_this_tracks_the_call_receiver() {
+        let result = check_text(
+            "class Base {
+                 chain(): this { return this; }
+             }
+             class Derived extends Base { derived = 1; }
+             const value: Derived = new Derived().chain();
+             const wrong: number = new Derived().chain();",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn polymorphic_this_rejects_a_base_instance_return() {
+        let result = check_text(
+            "class Base {
+                 clone(): this { return new Base(); }
+             }",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn inherited_interface_this_tracks_the_call_receiver() {
+        let result = check_text(
+            "interface Base {
+                 chain(): this;
+             }
+             interface Derived extends Base { derived: number; }
+             declare const source: Derived;
+             const value: Derived = source.chain();
+             const wrong: number = source.chain();",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn generic_interface_this_survives_instantiation() {
+        let result = check_text(
+            "interface Base<T> {
+                 value: T;
+                 chain(): this;
+             }
+             interface Derived<T> extends Base<T> { derived: T; }
+             declare const source: Derived<string>;
+             const value: Derived<string> = source.chain();
+             const wrong: Derived<number> = source.chain();",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn interface_call_and_index_this_project_parameters_and_results() {
+        let result = check_text(
+            "interface Base {
+                 (value: this): this;
+                 [key: string]: this;
+             }
+             interface Derived extends Base { derived: number; }
+             declare const source: Derived;
+             const called: Derived = source(source);
+             const wrongCall: number = source(source);
+             source({} as Base);
+             const indexed: Derived = source['value'];
+             const wrongIndex: number = source['value'];",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            ["BAMTS-C004", "BAMTS-C053", "BAMTS-C004"]
+        );
+    }
+
+    #[test]
+    fn interface_construct_this_projects_parameters_and_results() {
+        let result = check_text(
+            "interface Base {
+                 new (value: this): this;
+             }
+             interface Derived extends Base { derived: number; }
+             declare const source: Derived;
+             const value: Derived = new source(source);
+             const wrong: number = new source(source);
+             new source({} as Base);",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004", "BAMTS-C053"]);
+    }
+
+    #[test]
+    fn interface_iterator_this_projects_elements() {
+        let result = check_text(
+            "interface Base {
+                 [Symbol.iterator](): Iterator<this>;
+             }
+             interface Derived extends Base { derived: number; }
+             declare const source: Derived;
+             for (const item of source) {
+                 const value: Derived = item;
+                 const wrong: number = item;
+             }",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
     fn unrelated_classes_do_not_gain_generic_base_compatibility() {
         let result = check_text(
             "abstract class AbstractType<Output = unknown> {\n\

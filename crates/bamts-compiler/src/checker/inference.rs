@@ -197,6 +197,7 @@ impl InferredTypeArgument {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InferredTypeArguments {
     arguments: Box<[InferredTypeArgument]>,
+    this_receiver: Option<(SymbolId, TypeId)>,
 }
 
 impl InferredTypeArguments {
@@ -221,6 +222,15 @@ impl InferredTypeArguments {
     pub fn new(arguments: Vec<InferredTypeArgument>) -> Self {
         Self {
             arguments: arguments.into_boxed_slice(),
+            this_receiver: None,
+        }
+    }
+
+    #[must_use]
+    pub fn for_this(owner: SymbolId, receiver: TypeId) -> Self {
+        Self {
+            arguments: Box::new([]),
+            this_receiver: Some((owner, receiver)),
         }
     }
 
@@ -278,6 +288,16 @@ impl InferredTypeArguments {
     pub fn instantiate(&self, table: &mut TypeTable, ty: TypeId) -> TypeId {
         match table.get(ty).clone() {
             Type::Named(symbol) => self.get(symbol).unwrap_or(ty),
+            Type::This { owner, constraint } => {
+                if let Some((expected, receiver)) = self.this_receiver
+                    && expected == owner
+                {
+                    receiver
+                } else {
+                    let constraint = self.instantiate(table, constraint);
+                    table.this_type(owner, constraint)
+                }
+            }
             Type::Array(element) => {
                 let element = self.instantiate(table, element);
                 table.array(element)
@@ -328,6 +348,7 @@ impl InferredTypeArguments {
                         .with_readonly(property.readonly())
                         .with_getter_only(property.getter_only())
                         .with_accessibility(property.access(), property.declaring_class())
+                        .with_declaring_types(property.declaring_types().to_vec())
                         .with_method(property.is_method())
                     })
                     .collect();
@@ -382,6 +403,7 @@ impl InferredTypeArguments {
                             })
                             .collect(),
                         value_type: self.instantiate(table, signature.value_type),
+                        declaring_types: signature.declaring_types.clone(),
                     })
                     .collect();
                 let generator_return = object
@@ -496,12 +518,23 @@ impl InferredTypeArguments {
             }
         }
         let return_type = self.instantiate(table, signature.return_type());
-        table.function_with_parameter_bounds(
+        let type_id = table.function_with_parameter_bounds(
             type_parameters.to_vec(),
             bounds,
             parameters,
             return_type,
             signature.javascript(),
+        );
+        if signature.declaring_types().is_empty() {
+            return type_id;
+        }
+        let Type::Function(instantiated) = table.get(type_id) else {
+            unreachable!("function construction returns a function type");
+        };
+        table.function_signature(
+            instantiated
+                .clone()
+                .with_declaring_types(signature.declaring_types().to_vec()),
         )
     }
 }
@@ -610,6 +643,7 @@ impl<'table> InferenceContext<'table> {
         }
         InferredTypeArguments {
             arguments: resolved.into_boxed_slice(),
+            this_receiver: None,
         }
     }
 

@@ -325,6 +325,7 @@ impl<'src> Binder<'src> {
             | Type::AppliedClass { .. }
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
+            | Type::This { .. }
             | Type::Union(_) => None,
             Type::Never
             | Type::Void

@@ -302,6 +302,22 @@ impl<'table> TypeRelations<'table> {
                     Strictness::Assignable | Strictness::StrictNull | Strictness::Comparable
                 )
             }
+            (
+                Type::This {
+                    owner: source_owner,
+                    constraint: source_constraint,
+                },
+                Type::This {
+                    owner: target_owner,
+                    constraint: target_constraint,
+                },
+            ) => {
+                source_owner == target_owner
+                    && self.relates(*source_constraint, *target_constraint, strictness)
+            }
+            (Type::This { constraint, .. }, _) => self.relates(*constraint, target, strictness),
+            (Type::Never, Type::This { .. }) => true,
+            (_, Type::This { .. }) => false,
             (Type::Named(symbol), _)
                 if strictness == Strictness::Comparable && self.is_erased_parameter(*symbol) =>
             {
@@ -597,6 +613,7 @@ impl<'table> TypeRelations<'table> {
                 | Type::Function(_)
                 | Type::Named(_)
                 | Type::AppliedClass { .. }
+                | Type::This { .. }
         )
     }
     fn contains_undefined(&self, type_id: TypeId) -> bool {
@@ -632,7 +649,8 @@ impl<'table> TypeRelations<'table> {
             | Type::Named(_)
             | Type::NumericEnum(_)
             | Type::Keyof(_)
-            | Type::IndexedAccess { .. } => false,
+            | Type::IndexedAccess { .. }
+            | Type::This { .. } => false,
         }
     }
 
