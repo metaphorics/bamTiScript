@@ -6,11 +6,11 @@ child process rather than embedding the compiler in Node.
 
 ## Pre-release status
 
-This package is prepared for a future npm release. It is not published, and the
-Rust workspace does not yet define the `bamts` binary that the platform packages
-will contain. Installing this source package does not provide a working compiler.
-Once the binary exists and a platform artifact is installed, use `run(args)` to
-execute it.
+This package is prepared for a future npm release and is not published. The Rust
+workspace defines the `bamts` binary, but the platform artifact packages do not
+ship yet. Installing this source package does not provide a working compiler.
+After the native artifacts are published, `run(args)` will execute the matching
+platform binary.
 
 ```js
 import { run } from "bamti";
