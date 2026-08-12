@@ -1052,6 +1052,20 @@ pub enum Type {
     },
 }
 
+#[derive(Debug)]
+pub(super) enum ConstraintTypeExpr {
+    Id(TypeId),
+    Opaque,
+    Union(Box<[ConstraintTypeExpr]>),
+    Intersection(Box<[ConstraintTypeExpr]>),
+}
+
+#[derive(Debug)]
+pub(super) enum IndexedAccessConstraint {
+    Reduced(ConstraintTypeExpr),
+    Invalid,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ClassState {
     Provisional,
@@ -1822,6 +1836,293 @@ impl TypeTable {
     pub fn indexed_access(&mut self, object: TypeId, index: TypeId) -> TypeId {
         self.try_reduce_indexed_access(object, index)
             .unwrap_or_else(|| self.intern(Type::IndexedAccess { object, index }))
+    }
+
+    pub(super) fn indexed_access_constraint_view(&self, source: TypeId) -> IndexedAccessConstraint {
+        let Type::IndexedAccess { object, index } = self.get(source) else {
+            return IndexedAccessConstraint::Invalid;
+        };
+        let mut active = HashSet::new();
+        self.indexed_access_constraint(*object, *index, &mut active)
+    }
+
+    fn indexed_access_constraint(
+        &self,
+        object: TypeId,
+        index: TypeId,
+        active: &mut HashSet<(TypeId, TypeId)>,
+    ) -> IndexedAccessConstraint {
+        let Ok(index) = self.type_parameter_constraint_view(index) else {
+            return IndexedAccessConstraint::Reduced(ConstraintTypeExpr::Opaque);
+        };
+        let Ok(object) = self.type_parameter_constraint_view(object) else {
+            return IndexedAccessConstraint::Reduced(ConstraintTypeExpr::Opaque);
+        };
+        let pair = (object, index);
+        if !active.insert(pair) {
+            return IndexedAccessConstraint::Reduced(ConstraintTypeExpr::Opaque);
+        }
+
+        let result = self.indexed_access_constraint_inner(object, index, active);
+        active.remove(&pair);
+        result
+    }
+
+    fn type_parameter_constraint_view(&self, type_id: TypeId) -> Result<TypeId, ()> {
+        let mut current = type_id;
+        let mut seen = HashSet::new();
+        loop {
+            if !seen.insert(current) {
+                return Err(());
+            }
+            let Type::Named(symbol) = self.get(current) else {
+                return Ok(current);
+            };
+            let Some(constraint) = self.type_parameter_constraint(*symbol) else {
+                return Ok(current);
+            };
+            current = constraint;
+        }
+    }
+
+    fn indexed_access_constraint_inner(
+        &self,
+        object: TypeId,
+        index: TypeId,
+        active: &mut HashSet<(TypeId, TypeId)>,
+    ) -> IndexedAccessConstraint {
+        if let Type::Union(indexes) = self.get(index) {
+            let mut members = Vec::with_capacity(indexes.len());
+            for &index in indexes {
+                match self.indexed_access_constraint(object, index, active) {
+                    IndexedAccessConstraint::Reduced(member) => members.push(member),
+                    IndexedAccessConstraint::Invalid => {
+                        return IndexedAccessConstraint::Invalid;
+                    }
+                }
+            }
+            return self.constraint_union(members);
+        }
+
+        let object = self.constraint_structural_view(object);
+        match self.get(object) {
+            Type::Union(objects) => {
+                let mut members = Vec::with_capacity(objects.len());
+                for &object in objects {
+                    match self.indexed_access_constraint(object, index, active) {
+                        IndexedAccessConstraint::Reduced(member) => members.push(member),
+                        IndexedAccessConstraint::Invalid => {
+                            return IndexedAccessConstraint::Invalid;
+                        }
+                    }
+                }
+                self.constraint_union(members)
+            }
+            Type::Intersection(objects) => {
+                let mut members = Vec::with_capacity(objects.len());
+                for &object in objects {
+                    match self.indexed_access_constraint(object, index, active) {
+                        IndexedAccessConstraint::Reduced(member) => members.push(member),
+                        IndexedAccessConstraint::Invalid => {}
+                    }
+                }
+                if members.is_empty() {
+                    return IndexedAccessConstraint::Invalid;
+                }
+                self.constraint_intersection(members)
+            }
+            _ => self.indexed_access_constraint_leaf(object, index),
+        }
+    }
+
+    fn constraint_structural_view(&self, type_id: TypeId) -> TypeId {
+        let named = self.named_structural_view(type_id);
+        if named != type_id {
+            return named;
+        }
+        match self.get(type_id) {
+            Type::AppliedClass { .. } => self.applied_class_view(type_id).unwrap_or(type_id),
+            _ => type_id,
+        }
+    }
+
+    fn constraint_type_expr(&self, type_id: TypeId) -> ConstraintTypeExpr {
+        match self.get(type_id) {
+            Type::Union(members) => ConstraintTypeExpr::Union(
+                members
+                    .iter()
+                    .map(|member| self.constraint_type_expr(*member))
+                    .collect(),
+            ),
+            Type::Intersection(members) => ConstraintTypeExpr::Intersection(
+                members
+                    .iter()
+                    .map(|member| self.constraint_type_expr(*member))
+                    .collect(),
+            ),
+            _ => ConstraintTypeExpr::Id(type_id),
+        }
+    }
+
+    fn indexed_access_constraint_leaf(
+        &self,
+        object: TypeId,
+        index: TypeId,
+    ) -> IndexedAccessConstraint {
+        match self.get(index) {
+            Type::StringLiteral(name) => {
+                let Ok(name) = name.to_utf8_strict() else {
+                    return IndexedAccessConstraint::Invalid;
+                };
+                let key = name
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|number| format_number(*number) == name)
+                    .map_or(self.string(), |_| self.number());
+                self.named_index_constraint(object, &name, key)
+            }
+            Type::NumberLiteral(name) => self.named_index_constraint(object, name, self.number()),
+            Type::String => self.index_signature_constraint(object, self.string()),
+            Type::Number => self.number_index_constraint(object),
+            Type::Symbol => self.index_signature_constraint(object, self.symbol_type()),
+            Type::Any => IndexedAccessConstraint::Reduced(self.constraint_type_expr(self.any())),
+            Type::Never => {
+                IndexedAccessConstraint::Reduced(self.constraint_type_expr(self.never()))
+            }
+            Type::Named(_)
+            | Type::Keyof(_)
+            | Type::IndexedAccess { .. }
+            | Type::Intersection(_) => IndexedAccessConstraint::Reduced(ConstraintTypeExpr::Opaque),
+            _ => IndexedAccessConstraint::Invalid,
+        }
+    }
+
+    fn named_index_constraint(
+        &self,
+        object: TypeId,
+        name: &str,
+        key: TypeId,
+    ) -> IndexedAccessConstraint {
+        match self.get(object) {
+            Type::ObjectType(object_type) => {
+                if let Some(property) = object_type
+                    .properties
+                    .iter()
+                    .find(|property| property.name() == name)
+                {
+                    return IndexedAccessConstraint::Reduced(
+                        self.constraint_type_expr(property.type_id()),
+                    );
+                }
+                self.index_signature_constraint(object, key)
+            }
+            Type::Tuple(shape) => {
+                let Ok(index) = name.parse::<usize>() else {
+                    return IndexedAccessConstraint::Invalid;
+                };
+                let mut elements = shape.element_types_at(index);
+                if elements.is_empty() {
+                    return IndexedAccessConstraint::Invalid;
+                }
+                if index >= shape.min_arity() {
+                    elements.push(self.undefined_type());
+                }
+                self.constraint_union(
+                    elements
+                        .into_iter()
+                        .map(|element| self.constraint_type_expr(element))
+                        .collect(),
+                )
+            }
+            Type::Array(element) if key == self.number() => {
+                IndexedAccessConstraint::Reduced(self.constraint_type_expr(*element))
+            }
+            Type::Any | Type::Error => {
+                IndexedAccessConstraint::Reduced(self.constraint_type_expr(object))
+            }
+            Type::Unknown => {
+                IndexedAccessConstraint::Reduced(self.constraint_type_expr(self.unknown()))
+            }
+            Type::Never => {
+                IndexedAccessConstraint::Reduced(self.constraint_type_expr(self.never()))
+            }
+            Type::Named(_) | Type::AppliedClass { .. } => {
+                IndexedAccessConstraint::Reduced(ConstraintTypeExpr::Opaque)
+            }
+            _ => IndexedAccessConstraint::Invalid,
+        }
+    }
+
+    fn number_index_constraint(&self, object: TypeId) -> IndexedAccessConstraint {
+        match self.get(object) {
+            Type::Array(element) => {
+                IndexedAccessConstraint::Reduced(self.constraint_type_expr(*element))
+            }
+            Type::Tuple(shape) => self.constraint_union(
+                shape
+                    .all_element_types()
+                    .into_iter()
+                    .map(|element| self.constraint_type_expr(element))
+                    .collect(),
+            ),
+            Type::ObjectType(_) => self.index_signature_constraint(object, self.number()),
+            Type::Any | Type::Error => {
+                IndexedAccessConstraint::Reduced(self.constraint_type_expr(object))
+            }
+            Type::Unknown => {
+                IndexedAccessConstraint::Reduced(self.constraint_type_expr(self.unknown()))
+            }
+            Type::Never => {
+                IndexedAccessConstraint::Reduced(self.constraint_type_expr(self.never()))
+            }
+            Type::Named(_) | Type::AppliedClass { .. } => {
+                IndexedAccessConstraint::Reduced(ConstraintTypeExpr::Opaque)
+            }
+            _ => IndexedAccessConstraint::Invalid,
+        }
+    }
+
+    fn index_signature_constraint(&self, object: TypeId, key: TypeId) -> IndexedAccessConstraint {
+        let Type::ObjectType(object) = self.get(object) else {
+            return IndexedAccessConstraint::Invalid;
+        };
+        let find = |wanted| {
+            object.index_signatures.iter().find(|signature| {
+                signature
+                    .parameters
+                    .first()
+                    .is_some_and(|parameter| parameter.type_id() == wanted)
+            })
+        };
+        let signature =
+            find(key).or_else(|| (key == self.number()).then(|| find(self.string()))?);
+        signature.map_or(IndexedAccessConstraint::Invalid, |signature| {
+            IndexedAccessConstraint::Reduced(self.constraint_type_expr(signature.value_type))
+        })
+    }
+
+    fn constraint_union(&self, members: Vec<ConstraintTypeExpr>) -> IndexedAccessConstraint {
+        match members.len() {
+            0 => IndexedAccessConstraint::Reduced(self.constraint_type_expr(self.never())),
+            1 => IndexedAccessConstraint::Reduced(
+                members.into_iter().next().expect("one member exists"),
+            ),
+            _ => IndexedAccessConstraint::Reduced(ConstraintTypeExpr::Union(
+                members.into_boxed_slice(),
+            )),
+        }
+    }
+
+    fn constraint_intersection(&self, members: Vec<ConstraintTypeExpr>) -> IndexedAccessConstraint {
+        match members.len() {
+            0 => IndexedAccessConstraint::Reduced(self.constraint_type_expr(self.unknown())),
+            1 => IndexedAccessConstraint::Reduced(
+                members.into_iter().next().expect("one member exists"),
+            ),
+            _ => IndexedAccessConstraint::Reduced(ConstraintTypeExpr::Intersection(
+                members.into_boxed_slice(),
+            )),
+        }
     }
 
     fn try_reduce_indexed_access(&mut self, object: TypeId, index: TypeId) -> Option<TypeId> {

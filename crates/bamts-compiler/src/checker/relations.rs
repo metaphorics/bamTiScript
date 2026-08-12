@@ -20,10 +20,13 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
+use bamts_bytecode::MAX_BIGINT_BYTES;
+
 use super::binder::{
-    ConstructEntry, FunctionSignature, IteratorProperty, ObjectType, PropertyType, SymbolId,
-    TupleShape, Type, TypeId, TypeTable,
+    ConstraintTypeExpr, ConstructEntry, FunctionSignature, IndexedAccessConstraint,
+    IteratorProperty, ObjectType, PropertyType, SymbolId, TupleShape, Type, TypeId, TypeTable,
 };
+use crate::literal::{MAX_BIGINT_CONVERSION_LIMB_OPS, canonical_bigint_text, number_value};
 use crate::syntax::Accessibility;
 /// are computed without being stored; results stay deterministic because the
 /// algebra itself never depends on cache state.
@@ -73,6 +76,17 @@ enum Strictness {
     /// Symmetric overlap used by TypeScript assertions. Union sources need one
     /// related constituent rather than every constituent.
     Comparable,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PrimitiveDomain {
+    Null,
+    Undefined,
+    Boolean,
+    Number,
+    BigInt,
+    String,
+    Symbol,
 }
 
 #[derive(Clone, Copy)]
@@ -336,6 +350,17 @@ impl<'table> TypeRelations<'table> {
                     .expect("guard checked constraint");
                 constraint != source && self.relates(constraint, target, strictness)
             }
+            // A deferred indexed access carries relation evidence from its type-parameter
+            // constraints. Keep the indexed-access identity intact: deriving this view
+            // must not mutate the interned table or erase generic correlations.
+            (Type::IndexedAccess { .. }, _) => {
+                match self.table.indexed_access_constraint_view(source) {
+                    IndexedAccessConstraint::Reduced(expression) => {
+                        self.constraint_source_relates(&expression, target, strictness)
+                    }
+                    IndexedAccessConstraint::Invalid => false,
+                }
+            }
             // An interface with a completed structural body expands through that body
             // once. The `visiting` set in `relates` terminates recursive self and mutual
             // interface pairs; returned member types that are the interface's own head stay inert.
@@ -477,8 +502,7 @@ impl<'table> TypeRelations<'table> {
                 | Type::Named(_)
                 | Type::AppliedClass { .. }
                 | Type::NumericEnum(_)
-                | Type::Keyof(_)
-                | Type::IndexedAccess { .. },
+                | Type::Keyof(_),
                 _,
             ) => false,
         }
@@ -828,6 +852,152 @@ impl<'table> TypeRelations<'table> {
                 && self.relates(target.type_id(), source.type_id(), strictness))
             || (target.is_method()
                 && self.method_overloads_relate(source.type_id(), target.type_id(), strictness))
+    }
+
+    fn constraint_source_relates(
+        &self,
+        expression: &ConstraintTypeExpr,
+        target: TypeId,
+        strictness: Strictness,
+    ) -> bool {
+        self.constraint_clauses_relate(vec![expression], Vec::new(), target, strictness)
+    }
+
+    fn constraint_clauses_relate<'expression>(
+        &self,
+        mut pending: Vec<&'expression ConstraintTypeExpr>,
+        mut known: Vec<TypeId>,
+        target: TypeId,
+        strictness: Strictness,
+    ) -> bool {
+        loop {
+            let Some(expression) = pending.pop() else {
+                return self.constraint_clause_relates(&known, target, strictness);
+            };
+            match expression {
+                ConstraintTypeExpr::Id(type_id) => known.push(*type_id),
+                ConstraintTypeExpr::Opaque => {}
+                ConstraintTypeExpr::Intersection(members) => {
+                    pending.extend(members.iter().rev());
+                }
+                ConstraintTypeExpr::Union(members) => {
+                    let relates = |member: &'expression ConstraintTypeExpr| {
+                        let mut branch = pending.clone();
+                        branch.push(member);
+                        self.constraint_clauses_relate(branch, known.clone(), target, strictness)
+                    };
+                    return if strictness == Strictness::Comparable {
+                        members.iter().any(relates)
+                    } else {
+                        members.iter().all(relates)
+                    };
+                }
+            }
+        }
+    }
+
+    fn constraint_clause_relates(
+        &self,
+        known: &[TypeId],
+        target: TypeId,
+        strictness: Strictness,
+    ) -> bool {
+        if self.constraint_clause_is_never(known) {
+            return true;
+        }
+        match self.table.get(target) {
+            Type::Union(targets) => {
+                return targets
+                    .iter()
+                    .any(|target| self.constraint_clause_relates(known, *target, strictness));
+            }
+            Type::Intersection(targets) => {
+                return targets
+                    .iter()
+                    .all(|target| self.constraint_clause_relates(known, *target, strictness));
+            }
+            _ => {}
+        }
+        if known
+            .iter()
+            .any(|source| self.relates(*source, target, strictness))
+        {
+            return true;
+        }
+        let Type::ObjectType(target) = self.table.get(target) else {
+            return false;
+        };
+        self.intersection_object_relates(known, target, strictness)
+    }
+
+    fn constraint_clause_is_never(&self, known: &[TypeId]) -> bool {
+        known
+            .iter()
+            .any(|type_id| matches!(self.table.get(*type_id), Type::Never))
+            || known.iter().enumerate().any(|(index, left)| {
+                known[index + 1..]
+                    .iter()
+                    .any(|right| self.constraint_ids_disjoint(*left, *right))
+            })
+    }
+
+    fn constraint_ids_disjoint(&self, left: TypeId, right: TypeId) -> bool {
+        let left = self.table.get(left);
+        let right = self.table.get(right);
+        if matches!(left, Type::Never) || matches!(right, Type::Never) {
+            return true;
+        }
+        let Some(left_domain) = Self::primitive_domain(left) else {
+            return false;
+        };
+        let Some(right_domain) = Self::primitive_domain(right) else {
+            return false;
+        };
+        if left_domain != right_domain {
+            return true;
+        }
+        match (left, right) {
+            (Type::BooleanLiteral(left), Type::BooleanLiteral(right)) => left != right,
+            (Type::NumberLiteral(left), Type::NumberLiteral(right)) => {
+                match (number_value(left), number_value(right)) {
+                    (Some(left), Some(right)) => left != right,
+                    _ => false,
+                }
+            }
+            (Type::StringLiteral(left), Type::StringLiteral(right)) => left != right,
+            (Type::BigIntLiteral(left), Type::BigIntLiteral(right)) => {
+                let left = canonical_bigint_text(
+                    left,
+                    MAX_BIGINT_BYTES as usize,
+                    MAX_BIGINT_CONVERSION_LIMB_OPS,
+                );
+                let right = canonical_bigint_text(
+                    right,
+                    MAX_BIGINT_BYTES as usize,
+                    MAX_BIGINT_CONVERSION_LIMB_OPS,
+                );
+                match (left, right) {
+                    (Ok(left), Ok(right)) => left != right,
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn primitive_domain(type_: &Type) -> Option<PrimitiveDomain> {
+        match type_ {
+            Type::Null => Some(PrimitiveDomain::Null),
+            Type::Undefined => Some(PrimitiveDomain::Undefined),
+            Type::Boolean | Type::BooleanLiteral(_) => Some(PrimitiveDomain::Boolean),
+            Type::Number | Type::NumberLiteral(_) | Type::NumericEnum(_) => {
+                Some(PrimitiveDomain::Number)
+            }
+            Type::BigInt | Type::BigIntLiteral(_) => Some(PrimitiveDomain::BigInt),
+            Type::String | Type::StringLiteral(_) => Some(PrimitiveDomain::String),
+            Type::Symbol => Some(PrimitiveDomain::Symbol),
+            _ => None,
+        }
     }
     fn relation_object_view(&self, type_id: TypeId) -> Option<&ObjectType> {
         let type_id = match self.table.get(type_id) {

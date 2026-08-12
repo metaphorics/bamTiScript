@@ -7639,6 +7639,139 @@ mod tests {
     }
 
     #[test]
+    fn constrained_indexed_access_relates_through_its_base_constraint() {
+        let accepted = check_text(
+            "declare class AbstractType<Output = unknown> { abstract: Output; }\
+             declare class Type<Output = unknown> extends AbstractType<Output> { value: Output; }\
+             type Infer<T extends AbstractType> = T;\
+             interface ArrayReference<Options extends Type[]> {\
+                 value: Infer<Options[number]>;\
+             }\
+             interface TupleReference<Options extends [Type, Type]> {\
+                 value: Infer<Options[number]>;\
+             }\
+             function assign<Options extends Type[]>(value: Options[number]): AbstractType {\
+                 return value;\
+             }",
+        );
+        assert!(
+            checker_codes(&accepted).is_empty(),
+            "{:?}",
+            accepted.diagnostics()
+        );
+
+        let rejected = check_text(
+            "declare class AbstractType { abstract: number; }\
+             declare class Type extends AbstractType { value: number; }\
+             declare class OtherType { other: string; }\
+             type RequireOther<T extends OtherType> = T;\
+             interface Invalid<Options extends Type[]> {\
+                 value: RequireOther<Options[number]>;\
+             }",
+        );
+        assert_eq!(checker_codes(&rejected), ["BAMTS-C053"]);
+    }
+
+    #[test]
+    fn constrained_indexed_access_uses_intersections_and_index_signatures() {
+        let result = check_text(
+            "interface StringIndex { [key: string]: boolean; }\
+             interface MixedIndex {\
+                 [key: string]: string | number;\
+                 [key: number]: number;\
+             }\
+             interface Numeric { [key: number]: string; }\
+             declare class Nominal { c: number; }\
+             function fromIntersection<T extends { a: string } & { b: number }>(\
+                 value: T['a']\
+             ): string {\
+                 return value;\
+             }\
+             function fromKnownIntersection<T extends { a: string } & Nominal>(
+                 value: T['a']
+             ): string {
+                 return value;
+             }\
+             function fromStringIndex<T extends StringIndex>(value: T[number]): boolean {\
+                 return value;\
+             }\
+             function fromNumberIndex<T extends MixedIndex>(value: T[0]): number {\
+                 return value;\
+             }\
+             function fromNegativeIndex<T extends Numeric>(value: T[-1]): string {\
+                 return value;\
+             }\
+             function fromFractionalIndex<T extends Numeric>(value: T[1.5]): string {\
+                 return value;\
+             }\
+             function fromImpossibleIntersection<
+                 T extends { a: string } & { a: number }
+             >(value: T['a']): boolean {
+                 return value;
+             }\
+             function fromNumericBottom<T extends { a: 1 } & { a: 2 }>(
+                 value: T['a']
+             ): string {
+                 return value;
+             }\
+             function fromBigIntBottom<T extends { a: 1n } & { a: 2n }>(
+                 value: T['a']
+             ): string {
+                 return value;
+             }\
+             function fromNestedIntersection<
+                 T extends { a: { x: string } }
+                     & ({ a: { y: number } } & { a: { z: boolean } })
+             >(
+                 value: T['a']
+             ): { x: string; y: number; z: boolean } {
+                 return value;
+             }\
+             function fromOverlappingUnions<
+                 T extends { a: 1 | 2 } & { a: 2 | 3 }
+             >(value: T['a']): 2 {
+                 return value;
+             }\
+             function fromDistributedIntersection<
+                 T extends ({ a: { x: string } } | { a: { b: number } })
+                     & { a: { x: string } }
+             >(value: T['a']): { x: string } {
+                 return value;
+             }\
+             function fromUnionWithSibling<
+                 T extends (
+                     { a: { x: string } }
+                     | { a: { x: string; y: number } }
+                 ) & { a: { z: boolean } }
+             >(value: T['a']): { x: string; z: boolean } {
+                 return value;
+             }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+
+        let equivalent_literals = check_text(
+            "function sameNumber<T extends { a: 1 } & { a: 1.0 }>(
+                 value: T['a']
+             ): string {
+                 return value;
+             }\
+             function sameBigInt<T extends { a: 1n } & { a: 0x1n }>(
+                 value: T['a']
+             ): string {
+                 return value;
+             }",
+        );
+        assert_eq!(
+            checker_codes(&equivalent_literals),
+            ["BAMTS-C004", "BAMTS-C004"]
+        );
+    }
+
+    #[test]
     fn generic_inference_widens_only_unconstrained_primitive_candidates() {
         let result = check_text(
             "declare function infer<T>(value: T): T;\

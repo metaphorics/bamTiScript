@@ -1,6 +1,9 @@
 #![allow(clippy::too_many_lines)]
 use crate::enum_plan::{EnumFacts, EnumMemberPlan, EnumScalar, EnumValue};
-use crate::literal::{cook_escapes, number_value, string_value};
+use crate::literal::{
+    BigIntTextError, MAX_BIGINT_CONVERSION_LIMB_OPS, canonical_bigint_text, cook_escapes,
+    number_value, string_value,
+};
 use crate::namespace_plan::{ContainerAcquisition, NamespaceFacts};
 pub use crate::program::{
     ExecutableModuleProvenance, ExecutableProgram, ProgramLowerError, ProgramLowerErrorKind,
@@ -10137,145 +10140,6 @@ fn split_regex(lexeme: &str) -> Option<(String, String)> {
     let pattern = &lexeme[..last_slash];
     let flags = &lexeme[last_slash + 1..];
     Some((pattern.to_owned(), flags.to_owned()))
-}
-const MAX_BIGINT_CONVERSION_LIMB_OPS: usize = 1 << 24;
-/// Failure while canonicalizing BigInt source text.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BigIntTextError {
-    Invalid,
-    Bytes,
-    Work,
-}
-/// Canonicalizes a BigInt lexeme to bounded decimal text.
-fn canonical_bigint_text(
-    lexeme: &str,
-    max_bytes: usize,
-    max_limb_ops: usize,
-) -> Result<String, BigIntTextError> {
-    const LIMB_BASE: u64 = 1_000_000_000;
-    const DECIMAL_LIMB_DIGITS: usize = 9;
-    const LOG10_2_UPPER_NUMERATOR: usize = 30_103;
-    const LOG10_2_UPPER_DENOMINATOR: usize = 100_000;
-    let literal = lexeme.strip_suffix('n').ok_or(BigIntTextError::Invalid)?;
-    let (digits, radix) = literal
-        .strip_prefix("0x")
-        .or_else(|| literal.strip_prefix("0X"))
-        .map(|digits| (digits, 16))
-        .or_else(|| {
-            literal
-                .strip_prefix("0o")
-                .or_else(|| literal.strip_prefix("0O"))
-                .map(|digits| (digits, 8))
-        })
-        .or_else(|| {
-            literal
-                .strip_prefix("0b")
-                .or_else(|| literal.strip_prefix("0B"))
-                .map(|digits| (digits, 2))
-        })
-        .unwrap_or((literal, 10));
-    if digits.is_empty() {
-        return Err(BigIntTextError::Invalid);
-    }
-    let mut previous_was_digit = false;
-    let mut significant_digits = 0_usize;
-    let mut first_significant_bits = 0_usize;
-    for character in digits.chars() {
-        if character == '_' {
-            if !previous_was_digit {
-                return Err(BigIntTextError::Invalid);
-            }
-            previous_was_digit = false;
-            continue;
-        }
-        let digit = character.to_digit(radix).ok_or(BigIntTextError::Invalid)?;
-        previous_was_digit = true;
-        if first_significant_bits == 0 {
-            if digit == 0 {
-                continue;
-            }
-            first_significant_bits = (u32::BITS - digit.leading_zeros()) as usize;
-        }
-        significant_digits = significant_digits
-            .checked_add(1)
-            .ok_or(BigIntTextError::Work)?;
-    }
-    if !previous_was_digit {
-        return Err(BigIntTextError::Invalid);
-    }
-    if radix == 10 {
-        let output_bytes = significant_digits.max(1);
-        if output_bytes > max_bytes {
-            return Err(BigIntTextError::Bytes);
-        }
-        let mut output = String::with_capacity(output_bytes);
-        let mut significant = false;
-        for character in digits.chars().filter(|character| *character != '_') {
-            if character != '0' || significant {
-                significant = true;
-                output.push(character);
-            }
-        }
-        if output.is_empty() {
-            output.push('0');
-        }
-        return Ok(output);
-    }
-    let bit_length = significant_digits
-        .saturating_sub(1)
-        .checked_mul(radix.trailing_zeros() as usize)
-        .and_then(|remaining| remaining.checked_add(first_significant_bits))
-        .ok_or(BigIntTextError::Work)?;
-    let max_decimal_bytes = if bit_length == 0 {
-        1
-    } else {
-        bit_length
-            .checked_mul(LOG10_2_UPPER_NUMERATOR)
-            .and_then(|value| value.checked_add(LOG10_2_UPPER_DENOMINATOR - 1))
-            .map(|value| value / LOG10_2_UPPER_DENOMINATOR)
-            .ok_or(BigIntTextError::Work)?
-    };
-    if max_decimal_bytes > max_bytes {
-        return Err(BigIntTextError::Bytes);
-    }
-    let max_limb_count = max_decimal_bytes.div_ceil(DECIMAL_LIMB_DIGITS);
-    let worst_case_limb_ops = significant_digits
-        .checked_mul(max_limb_count)
-        .ok_or(BigIntTextError::Work)?;
-    if worst_case_limb_ops > max_limb_ops {
-        return Err(BigIntTextError::Work);
-    }
-    let mut limbs = vec![0_u32];
-    let mut significant = false;
-    for character in digits.chars().filter(|character| *character != '_') {
-        let digit = u64::from(
-            character
-                .to_digit(radix)
-                .expect("validated BigInt digit remains valid"),
-        );
-        if digit == 0 && !significant {
-            continue;
-        }
-        significant = true;
-        let mut carry = digit;
-        for limb in &mut limbs {
-            let value = u64::from(*limb) * u64::from(radix) + carry;
-            *limb = (value % LIMB_BASE) as u32;
-            carry = value / LIMB_BASE;
-        }
-        if carry != 0 {
-            limbs.push(carry as u32);
-        }
-    }
-    let mut output = limbs.pop().ok_or(BigIntTextError::Invalid)?.to_string();
-    for limb in limbs.iter().rev() {
-        use std::fmt::Write as _;
-        write!(output, "{limb:09}").expect("writing to String cannot fail");
-    }
-    if output.len() > max_bytes {
-        return Err(BigIntTextError::Bytes);
-    }
-    Ok(output)
 }
 fn number_constant(value: f64) -> Constant {
     if value.fract() == 0.0
