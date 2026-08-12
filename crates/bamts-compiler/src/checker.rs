@@ -9165,6 +9165,35 @@ mod tests {
     }
 
     #[test]
+    fn tuple_type_argument_constraints_wait_for_complete_class_views() {
+        let accepted = check_text_strict_null(
+            "class Type<Output = unknown> {
+                 nullable(): UnionType<[Type<null>, this]> { throw 0; }
+             }
+             class UnionType<Options extends Type[] = Type[]> extends Type<unknown> {}
+             declare const source: Type<null>;
+             const target: Type = source;",
+        );
+
+        assert!(
+            checker_codes(&accepted).is_empty(),
+            "{:?}",
+            accepted.diagnostics()
+        );
+    }
+
+    #[test]
+    fn final_constraint_validation_rejects_invalid_tuple_type_arguments() {
+        let result = check_text_strict_null(
+            "class Type<Output = unknown> {}
+             class UnionType<Options extends Type[] = Type[]> extends Type<unknown> {}
+             type Invalid = UnionType<[string]>;",
+        );
+
+        assert_eq!(checker_codes(&result), [ARGUMENT_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    #[test]
     fn recursively_expanding_class_views_remain_bounded() {
         let result = check_text(
             "declare class Expanding<T> {

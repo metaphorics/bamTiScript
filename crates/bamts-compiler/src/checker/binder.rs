@@ -3510,6 +3510,13 @@ struct ReturnContext {
     generator_protocol: Option<ForOfMode>,
 }
 
+#[derive(Clone, Copy)]
+struct PendingConstraintCheck {
+    argument: TypeId,
+    constraint: TypeId,
+    range: TextRange,
+}
+
 pub(crate) struct Binder<'src> {
     pub(crate) source: &'src SourceFile,
     intrinsics: GlobalEnvironment,
@@ -3529,6 +3536,7 @@ pub(crate) struct Binder<'src> {
     typed_expressions: Vec<(TextRange, TypeId)>,
     symbol_references: Vec<(TextRange, SymbolId)>,
     pub(crate) diagnostics: Vec<Diagnostic>,
+    pending_constraint_checks: Vec<PendingConstraintCheck>,
     pub(crate) types: TypeTable,
     module_scope: ScopeId,
     global_scope: ScopeId,
@@ -3682,6 +3690,7 @@ impl<'src> Binder<'src> {
             typed_expressions: Vec::new(),
             symbol_references: Vec::new(),
             diagnostics: Vec::new(),
+            pending_constraint_checks: Vec::new(),
             types: TypeTable::new(),
             module_scope: ScopeId(0),
             global_scope: ScopeId(0),
@@ -3935,7 +3944,21 @@ impl<'src> Binder<'src> {
             self.type_state[imported.symbol.get() as usize] = TypeState::Done(value_type_id);
         }
         self.resolve_statements(statements, scope);
+        self.validate_pending_constraints();
         self.check_export_assignment_conflicts();
+    }
+
+    fn validate_pending_constraints(&mut self) {
+        let pending = std::mem::take(&mut self.pending_constraint_checks);
+        for check in pending {
+            if !self.types_assignable(check.argument, check.constraint) {
+                self.emit(
+                    ARGUMENT_NOT_ASSIGNABLE,
+                    check.range,
+                    ARGUMENT_NOT_ASSIGNABLE_MESSAGE,
+                );
+            }
+        }
     }
 
     fn is_declaration_statement(statement: &Statement) -> bool {
@@ -11463,13 +11486,12 @@ impl<'src> Binder<'src> {
                 .get(index)
                 .and_then(|bound| bound.constraint())
                 .map(|constraint| substitution.instantiate(&mut self.types, constraint))
-                && !self.types_assignable(argument.type_id(), constraint)
             {
-                self.emit(
-                    ARGUMENT_NOT_ASSIGNABLE,
-                    diagnostic_range,
-                    ARGUMENT_NOT_ASSIGNABLE_MESSAGE,
-                );
+                self.pending_constraint_checks.push(PendingConstraintCheck {
+                    argument: argument.type_id(),
+                    constraint,
+                    range: diagnostic_range,
+                });
             }
         }
         inferred
