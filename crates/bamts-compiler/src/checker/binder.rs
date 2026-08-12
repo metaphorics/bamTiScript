@@ -7415,7 +7415,7 @@ impl<'src> Binder<'src> {
         members: &'src [crate::syntax::ClassMemberNode],
         ambient: bool,
     ) {
-        if ambient {
+        if self.is_declaration_file || ambient {
             // Ambient classes (declare class, .d.ts, or inside declare namespace)
             // carry signature-only members that do not require implementations.
             return;
@@ -14722,6 +14722,18 @@ mod tests {
                 .count(),
             1,
             "{active:?}"
+        );
+    }
+
+    #[test]
+    fn declaration_file_class_methods_do_not_require_implementations() {
+        let (_, diagnostics) =
+            bound_declaration("export class Queue<T> { drain(): IterableIterator<T>; }");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code() == FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION),
+            "{diagnostics:?}"
         );
     }
 
