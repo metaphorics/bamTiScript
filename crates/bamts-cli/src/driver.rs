@@ -24,6 +24,7 @@ use bamts_compiler::{
 use bamts_runtime::{Limits, run_linked_program};
 
 use crate::args::{ArgsError, CliArgs, ExecutionTarget, Mode};
+use crate::context::ExecutionContext;
 use crate::diagnostics::{self, DiagnosticSource, TruncationNotice};
 
 const NODE_STATICLIB: &[u8] = include_bytes!(env!("BAMTS_NODE_STATICLIB"));
@@ -310,7 +311,16 @@ pub struct AotPhaseTelemetry {
 
 /// Executes one already-parsed CLI command.
 pub fn execute(args: &CliArgs) -> Result<CommandOutcome, DriverError> {
-    execute_with_telemetry(args).map(|(outcome, _telemetry)| outcome)
+    let context = ExecutionContext::ambient()?;
+    execute_in_context(args, &context)
+}
+
+/// Executes one parsed command with explicit process inputs.
+pub fn execute_in_context(
+    args: &CliArgs,
+    context: &ExecutionContext,
+) -> Result<CommandOutcome, DriverError> {
+    execute_with_telemetry_in_context(args, context).map(|(outcome, _telemetry)| outcome)
 }
 
 /// [`execute`] plus AOT phase telemetry.
@@ -321,13 +331,22 @@ pub fn execute(args: &CliArgs) -> Result<CommandOutcome, DriverError> {
 pub fn execute_with_telemetry(
     args: &CliArgs,
 ) -> Result<(CommandOutcome, Option<AotPhaseTelemetry>), DriverError> {
+    let context = ExecutionContext::ambient()?;
+    execute_with_telemetry_in_context(args, &context)
+}
+
+/// [`execute_in_context`] plus AOT phase telemetry.
+pub fn execute_with_telemetry_in_context(
+    args: &CliArgs,
+    context: &ExecutionContext,
+) -> Result<(CommandOutcome, Option<AotPhaseTelemetry>), DriverError> {
     match args.mode {
         Mode::Check | Mode::Compile | Mode::Run => {
-            let frontend = load_program_frontend(args)?;
+            let frontend = load_program_frontend(args, context)?;
             match args.mode {
                 Mode::Check => Ok((check(args, &frontend)?, None)),
-                Mode::Compile => Ok((compile(args, &frontend)?, None)),
-                Mode::Run => run(args, &frontend),
+                Mode::Compile => Ok((compile(args, &frontend, context)?, None)),
+                Mode::Run => run(args, &frontend, context),
                 Mode::Explain => unreachable!("explain handled without a program"),
             }
         }
@@ -436,6 +455,7 @@ fn check(args: &CliArgs, frontend: &LoadedProgramFrontend) -> Result<CommandOutc
 fn compile(
     args: &CliArgs,
     frontend: &LoadedProgramFrontend,
+    context: &ExecutionContext,
 ) -> Result<CommandOutcome, DriverError> {
     if !args.extra_inputs.is_empty() {
         return Err(DriverError::MultipleCompileInputs);
@@ -462,8 +482,8 @@ fn compile(
     }
     let object =
         bamts_codegen::compile_aot(executable.wire(), HOST_TARGET).map_err(DriverError::Aot)?;
-    let destination = output_path(args, entrypoint)?;
-    link_executable(&object.bytes, &destination)?;
+    let destination = output_path(args, entrypoint, context)?;
+    link_executable(&object.bytes, &destination, context)?;
     Ok(CommandOutcome {
         stderr: warnings.into_bytes(),
         truncation,
@@ -474,6 +494,7 @@ fn compile(
 fn run(
     args: &CliArgs,
     frontend: &LoadedProgramFrontend,
+    context: &ExecutionContext,
 ) -> Result<(CommandOutcome, Option<AotPhaseTelemetry>), DriverError> {
     let entrypoint = required_entrypoint(args)?;
     let (warnings, truncation) = require_clean_frontend(args, frontend)?;
@@ -486,7 +507,7 @@ fn run(
         )),
         ExecutionTarget::Aot => {
             let (outcome, telemetry) =
-                run_aot(args, entrypoint, warnings, truncation, &executable)?;
+                run_aot(args, entrypoint, warnings, truncation, &executable, context)?;
             Ok((outcome, Some(telemetry)))
         }
     }
@@ -528,6 +549,7 @@ fn run_aot(
     warnings: String,
     truncation: Option<TruncationNotice>,
     executable: &bamts_compiler::program::ExecutableProgram,
+    context: &ExecutionContext,
 ) -> Result<(CommandOutcome, AotPhaseTelemetry), DriverError> {
     if BUILD_TARGET != HOST_TARGET {
         return Err(DriverError::CrossTargetLink {
@@ -540,7 +562,7 @@ fn run_aot(
         bamts_codegen::compile_aot(executable.wire(), HOST_TARGET).map_err(DriverError::Aot)?;
     let object_wall_ms = elapsed_ms(object_started);
     let id = NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-    let root = cache_root()?;
+    let root = cache_root(context)?;
     let run_dir = root.join("run");
     fs::create_dir_all(&run_dir).map_err(|source| DriverError::CreateDirectory {
         path: run_dir.clone(),
@@ -553,11 +575,14 @@ fn run_aot(
     ));
     require_within_cache_root(&destination, &root)?;
     let link_started = Instant::now();
-    link_executable(&object.bytes, &destination)?;
+    link_executable(&object.bytes, &destination, context)?;
     let link_wall_ms = elapsed_ms(link_started);
     let launch_token = format!("{}-{id}", std::process::id());
     let run_started = Instant::now();
     let output = Command::new(&destination)
+        .current_dir(context.cwd())
+        .env_clear()
+        .envs(context.envs())
         .env(bamts_node::AOT_ENTRYPOINT_ENV, entrypoint.as_os_str())
         .env(bamts_node::AOT_LAUNCH_TOKEN_ENV, &launch_token)
         .arg(launch_token)
@@ -613,9 +638,13 @@ fn required_entrypoint(args: &CliArgs) -> Result<&Path, DriverError> {
         .ok_or(DriverError::MissingEntrypoint)
 }
 
-fn output_path(args: &CliArgs, entrypoint: &Path) -> Result<PathBuf, DriverError> {
+fn output_path(
+    args: &CliArgs,
+    entrypoint: &Path,
+    context: &ExecutionContext,
+) -> Result<PathBuf, DriverError> {
     if let Some(file) = &args.output.file {
-        return Ok(PathBuf::from(file));
+        return Ok(context.resolve_path(file));
     }
     let file_name = entrypoint
         .file_stem()
@@ -624,7 +653,7 @@ fn output_path(args: &CliArgs, entrypoint: &Path) -> Result<PathBuf, DriverError
     let mut file_name = file_name.to_os_string();
     file_name.push(std::env::consts::EXE_SUFFIX);
     if let Some(directory) = &args.output.dir {
-        let directory = PathBuf::from(directory);
+        let directory = context.resolve_path(directory);
         fs::create_dir_all(&directory).map_err(|source| DriverError::CreateDirectory {
             path: directory.clone(),
             source,
@@ -634,14 +663,18 @@ fn output_path(args: &CliArgs, entrypoint: &Path) -> Result<PathBuf, DriverError
     Ok(entrypoint.with_file_name(file_name))
 }
 
-fn link_executable(object: &[u8], destination: &Path) -> Result<(), DriverError> {
+fn link_executable(
+    object: &[u8],
+    destination: &Path,
+    context: &ExecutionContext,
+) -> Result<(), DriverError> {
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|source| DriverError::CreateDirectory {
         path: parent.to_owned(),
         source,
     })?;
-    let archive = cached_node_archive()?;
-    let compiler = discover_toolchain()?;
+    let archive = cached_node_archive(context)?;
+    let compiler = discover_toolchain(context)?;
     let temporary = TemporaryLinkFiles::create(parent, destination)?;
     fs::write(&temporary.object, object).map_err(|source| DriverError::WriteObject {
         path: temporary.object.clone(),
@@ -650,6 +683,9 @@ fn link_executable(object: &[u8], destination: &Path) -> Result<(), DriverError>
 
     let mut command = Command::new(&compiler);
     command
+        .current_dir(context.cwd())
+        .env_clear()
+        .envs(context.envs())
         .arg(&temporary.object)
         .arg(&archive)
         .arg("-o")
@@ -671,13 +707,21 @@ fn link_executable(object: &[u8], destination: &Path) -> Result<(), DriverError>
     publish_linked_executable(&temporary.executable, destination)
 }
 
-fn discover_toolchain() -> Result<OsString, DriverError> {
-    let program = std::env::var_os("CC").unwrap_or_else(|| OsString::from("cc"));
-    probe_toolchain(program)
+fn discover_toolchain(context: &ExecutionContext) -> Result<OsString, DriverError> {
+    let program = context
+        .env("CC")
+        .map(OsStr::to_os_string)
+        .unwrap_or_else(|| OsString::from("cc"));
+    probe_toolchain(program, context)
 }
 
-fn probe_toolchain(program: OsString) -> Result<OsString, DriverError> {
-    let probe = Command::new(&program).arg("--version").output();
+fn probe_toolchain(program: OsString, context: &ExecutionContext) -> Result<OsString, DriverError> {
+    let probe = Command::new(&program)
+        .current_dir(context.cwd())
+        .env_clear()
+        .envs(context.envs())
+        .arg("--version")
+        .output();
     match probe {
         Ok(output) if output.status.success() => Ok(program),
         Ok(output) => Err(DriverError::ToolchainRejected {
@@ -691,8 +735,8 @@ fn probe_toolchain(program: OsString) -> Result<OsString, DriverError> {
     }
 }
 
-fn cached_node_archive() -> Result<PathBuf, DriverError> {
-    let cache_dir = cache_root()?.join("runtime");
+fn cached_node_archive(context: &ExecutionContext) -> Result<PathBuf, DriverError> {
+    let cache_dir = cache_root(context)?.join("runtime");
     fs::create_dir_all(&cache_dir).map_err(|source| DriverError::CacheArchive {
         path: cache_dir.clone(),
         source,
@@ -756,11 +800,12 @@ fn write_cached_archive(file: &mut File, path: &Path) -> Result<(), DriverError>
         })
 }
 
-fn cache_root() -> Result<PathBuf, DriverError> {
+fn cache_root(context: &ExecutionContext) -> Result<PathBuf, DriverError> {
     cache_root_from_env_values(
-        std::env::var_os("BAMTS_CACHE_DIR").as_deref(),
-        std::env::var_os("XDG_CACHE_HOME").as_deref(),
-        std::env::var_os("HOME").as_deref(),
+        context.env("BAMTS_CACHE_DIR"),
+        context.env("XDG_CACHE_HOME"),
+        context.env("HOME"),
+        context,
     )
 }
 
@@ -768,49 +813,56 @@ fn cache_root_from_env_values(
     bamts_cache_dir: Option<&OsStr>,
     xdg_cache_home: Option<&OsStr>,
     home: Option<&OsStr>,
+    context: &ExecutionContext,
 ) -> Result<PathBuf, DriverError> {
     if let Some(path) = bamts_cache_dir {
-        return ensure_private_cache_root(PathBuf::from(path));
+        return ensure_private_cache_root(context.resolve_path(path), context);
     }
     if let Some(path) = xdg_cache_home {
-        return ensure_private_cache_root(PathBuf::from(path).join("bamts"));
+        return ensure_private_cache_root(context.resolve_path(path).join("bamts"), context);
     }
     if let Some(path) = home {
-        match ensure_private_cache_root(PathBuf::from(path).join(".cache/bamts")) {
+        match ensure_private_cache_root(context.resolve_path(path).join(".cache/bamts"), context) {
             Ok(root) => return Ok(root),
             Err(DriverError::UnsafeFallbackCacheRoot { .. }) => {}
             Err(error) => return Err(error),
         }
     }
-    ensure_private_cache_root(fallback_cache_root_path()?)
+    ensure_private_cache_root(fallback_cache_root_path(context)?, context)
 }
 
 #[cfg(unix)]
-fn fallback_cache_root_path() -> Result<PathBuf, DriverError> {
-    let parent = validate_private_cache_parent_chain(&std::env::temp_dir())?;
-    Ok(parent.join(format!("bamts-cache-{}", fallback_cache_user_key()?)))
+fn fallback_cache_root_path(context: &ExecutionContext) -> Result<PathBuf, DriverError> {
+    let parent = validate_private_cache_parent_chain(context.temp_dir(), context)?;
+    Ok(parent.join(format!("bamts-cache-{}", fallback_cache_user_key(context)?)))
 }
 
 #[cfg(not(unix))]
-fn fallback_cache_root_path() -> Result<PathBuf, DriverError> {
-    Ok(std::env::temp_dir().join(format!("bamts-cache-{}", fallback_cache_user_key()?)))
+fn fallback_cache_root_path(context: &ExecutionContext) -> Result<PathBuf, DriverError> {
+    Ok(context
+        .temp_dir()
+        .join(format!("bamts-cache-{}", fallback_cache_user_key(context)?)))
 }
 
 #[cfg(unix)]
-fn fallback_cache_user_key() -> Result<String, DriverError> {
-    Ok(effective_uid()?.to_string())
+fn fallback_cache_user_key(context: &ExecutionContext) -> Result<String, DriverError> {
+    Ok(effective_uid(context)?.to_string())
 }
 
 #[cfg(not(unix))]
-fn fallback_cache_user_key() -> Result<String, DriverError> {
-    Ok(std::env::var_os("USERNAME")
-        .or_else(|| std::env::var_os("USER"))
+fn fallback_cache_user_key(context: &ExecutionContext) -> Result<String, DriverError> {
+    Ok(context
+        .env("USERNAME")
+        .or_else(|| context.env("USER"))
         .map(|value| value.to_string_lossy().into_owned())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "default".to_owned()))
 }
 
-fn ensure_private_cache_root(path: PathBuf) -> Result<PathBuf, DriverError> {
+fn ensure_private_cache_root(
+    path: PathBuf,
+    context: &ExecutionContext,
+) -> Result<PathBuf, DriverError> {
     let parent = path
         .parent()
         .ok_or_else(|| DriverError::UnsafeFallbackCacheRoot { path: path.clone() })?;
@@ -835,7 +887,7 @@ fn ensure_private_cache_root(path: PathBuf) -> Result<PathBuf, DriverError> {
 
     #[cfg(unix)]
     let path = {
-        let canonical_parent = validate_private_cache_parent_chain(parent)?;
+        let canonical_parent = validate_private_cache_parent_chain(parent, context)?;
         canonical_parent.join(name)
     };
 
@@ -846,7 +898,7 @@ fn ensure_private_cache_root(path: PathBuf) -> Result<PathBuf, DriverError> {
             return Err(DriverError::CreateDirectory { path, source });
         }
     }
-    validate_private_cache_dir(&path)?;
+    validate_private_cache_dir(&path, context)?;
     Ok(path)
 }
 
@@ -862,14 +914,17 @@ fn create_private_cache_dir(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn validate_private_cache_parent_chain(path: &Path) -> Result<PathBuf, DriverError> {
+fn validate_private_cache_parent_chain(
+    path: &Path,
+    context: &ExecutionContext,
+) -> Result<PathBuf, DriverError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let canonical = fs::canonicalize(path).map_err(|source| DriverError::CreateDirectory {
         path: path.to_owned(),
         source,
     })?;
-    let euid = effective_uid()?;
+    let euid = effective_uid(context)?;
     for ancestor in canonical.ancestors() {
         let metadata =
             fs::symlink_metadata(ancestor).map_err(|source| DriverError::CreateDirectory {
@@ -890,14 +945,14 @@ fn validate_private_cache_parent_chain(path: &Path) -> Result<PathBuf, DriverErr
 }
 
 #[cfg(unix)]
-fn validate_private_cache_dir(path: &Path) -> Result<(), DriverError> {
+fn validate_private_cache_dir(path: &Path, context: &ExecutionContext) -> Result<(), DriverError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let metadata = fs::symlink_metadata(path).map_err(|source| DriverError::CreateDirectory {
         path: path.to_owned(),
         source,
     })?;
-    let euid = effective_uid()?;
+    let euid = effective_uid(context)?;
     let permissions = metadata.permissions().mode() & 0o777;
     if metadata.file_type().is_symlink()
         || !metadata.is_dir()
@@ -912,7 +967,7 @@ fn validate_private_cache_dir(path: &Path) -> Result<(), DriverError> {
 }
 
 #[cfg(not(unix))]
-fn validate_private_cache_dir(path: &Path) -> Result<(), DriverError> {
+fn validate_private_cache_dir(path: &Path, _context: &ExecutionContext) -> Result<(), DriverError> {
     let metadata = fs::metadata(path).map_err(|source| DriverError::CreateDirectory {
         path: path.to_owned(),
         source,
@@ -927,15 +982,15 @@ fn validate_private_cache_dir(path: &Path) -> Result<(), DriverError> {
 
 /// Probe the effective user id without `unsafe` through an atomic random file.
 #[cfg(unix)]
-fn effective_uid() -> Result<u32, DriverError> {
+fn effective_uid(context: &ExecutionContext) -> Result<u32, DriverError> {
     use std::os::unix::fs::MetadataExt;
 
-    let parent = std::env::temp_dir();
+    let parent = context.temp_dir();
     let probe = tempfile::Builder::new()
         .prefix(".bamts-euid-")
-        .tempfile_in(&parent)
+        .tempfile_in(parent)
         .map_err(|source| DriverError::CreateDirectory {
-            path: parent,
+            path: parent.to_path_buf(),
             source,
         })?;
     probe
@@ -1063,17 +1118,15 @@ struct LoadedProgramFrontend {
     output: ProgramFrontendOutput,
 }
 
-fn load_program_frontend(args: &CliArgs) -> Result<LoadedProgramFrontend, DriverError> {
+fn load_program_frontend(
+    args: &CliArgs,
+    context: &ExecutionContext,
+) -> Result<LoadedProgramFrontend, DriverError> {
     if !args.extra_inputs.is_empty() {
         return Err(DriverError::MultipleCompileInputs);
     }
     let entrypoint = required_entrypoint(args)?;
-    let current_directory = std::env::current_dir().map_err(|source| DriverError::ReadSource {
-        path: PathBuf::from("."),
-        source,
-    })?;
-    let current_directory = fs::canonicalize(&current_directory)
-        .map_err(|error| DriverError::ProgramLoad(ProgramLoadError::InvalidRoot(error)))?;
+    let current_directory = context.cwd();
     let absolute_entrypoint = if entrypoint.is_absolute() {
         entrypoint.to_path_buf()
     } else {
@@ -1084,8 +1137,8 @@ fn load_program_frontend(args: &CliArgs) -> Result<LoadedProgramFrontend, Driver
             path: absolute_entrypoint,
             source,
         })?;
-    let fallback_root = if absolute_entrypoint.starts_with(&current_directory) {
-        current_directory
+    let fallback_root = if absolute_entrypoint.starts_with(current_directory) {
+        current_directory.to_path_buf()
     } else {
         absolute_entrypoint
             .parent()
@@ -1169,7 +1222,16 @@ fn require_clean_frontend(
 pub fn compile_program(
     args: &CliArgs,
 ) -> Result<bamts_compiler::program::ExecutableProgram, DriverError> {
-    let frontend = load_program_frontend(args)?;
+    let context = ExecutionContext::ambient()?;
+    compile_program_in_context(args, &context)
+}
+
+/// Compiles with explicit process inputs.
+pub fn compile_program_in_context(
+    args: &CliArgs,
+    context: &ExecutionContext,
+) -> Result<bamts_compiler::program::ExecutableProgram, DriverError> {
+    let frontend = load_program_frontend(args, context)?;
     require_clean_frontend(args, &frontend)?;
     lower_program(&frontend.program, &frontend.output, lower_options(args))
         .map_err(DriverError::Lower)
@@ -1180,6 +1242,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
+    use std::{collections::BTreeMap, ffi::OsString};
 
     use bamts_compiler::lint::{LintLevel, SourceDialect, rule_by_name};
     use bamts_runtime::Host;
@@ -1191,6 +1254,18 @@ mod tests {
     use super::{
         DriverError, content_hash, execute_with_telemetry, levels, lower_options, probe_toolchain,
     };
+
+    fn ambient_context() -> crate::context::ExecutionContext {
+        crate::context::ExecutionContext::ambient().expect("ambient execution context")
+    }
+
+    fn explicit_context(
+        cwd: &Path,
+        env: impl IntoIterator<Item = (OsString, OsString)>,
+    ) -> crate::context::ExecutionContext {
+        crate::context::ExecutionContext::new(cwd, env.into_iter().collect::<BTreeMap<_, _>>())
+            .expect("explicit execution context")
+    }
     #[test]
     fn jit_exit_code_prefers_host_zero() {
         let mut host = bamts_node::NodeHost::new();
@@ -1206,9 +1281,123 @@ mod tests {
 
     #[test]
     fn missing_toolchain_is_typed() {
-        let error = probe_toolchain("/definitely/not/a/c/compiler".into())
+        let context = ambient_context();
+        let error = probe_toolchain("/definitely/not/a/c/compiler".into(), &context)
             .expect_err("missing compiler must fail");
         assert!(matches!(error, DriverError::ToolchainMissing { .. }));
+    }
+
+    #[test]
+    fn explicit_context_resolves_relative_entrypoint() {
+        let directory = tempfile::tempdir().expect("temporary project");
+        std::fs::write(directory.path().join("main.ts"), "const value: number = 1;")
+            .expect("write source");
+        let context = explicit_context(directory.path(), []);
+        let args = parse_args(["check", "main.ts"]).expect("arguments parse");
+
+        let outcome = super::execute_in_context(&args, &context).expect("context check");
+        assert_eq!(outcome.exit_code, 0);
+    }
+
+    #[test]
+    fn explicit_context_anchors_relative_output_paths() {
+        let directory = tempfile::tempdir().expect("temporary project");
+        let context = explicit_context(directory.path(), []);
+        let args =
+            parse_args(["compile", "--output", "dist/main", "main.ts"]).expect("arguments parse");
+
+        assert_eq!(
+            super::output_path(&args, Path::new("main.ts"), &context).unwrap(),
+            directory.path().join("dist/main")
+        );
+    }
+
+    #[test]
+    fn explicit_context_environment_controls_cache_and_toolchain() {
+        let directory = tempfile::tempdir().expect("temporary project");
+        let cache = std::env::temp_dir().join(format!(
+            "bamts-context-cache-{}-{}",
+            std::process::id(),
+            super::NEXT_CACHE_TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&cache);
+        let context = explicit_context(
+            directory.path(),
+            [
+                (
+                    OsString::from("BAMTS_CACHE_DIR"),
+                    cache.clone().into_os_string(),
+                ),
+                (
+                    OsString::from("CC"),
+                    OsString::from("/definitely/context/compiler"),
+                ),
+            ],
+        );
+
+        assert_eq!(super::cache_root(&context).unwrap(), cache);
+        assert!(matches!(
+            super::discover_toolchain(&context),
+            Err(DriverError::ToolchainMissing { program })
+                if program == std::ffi::OsStr::new("/definitely/context/compiler")
+        ));
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn explicit_contexts_keep_process_inputs_isolated() {
+        let first = tempfile::tempdir().expect("first directory");
+        let second = tempfile::tempdir().expect("second directory");
+        let first_context = explicit_context(
+            first.path(),
+            [(OsString::from("MARKER"), OsString::from("first"))],
+        );
+        let second_context = explicit_context(
+            second.path(),
+            [(OsString::from("MARKER"), OsString::from("second"))],
+        );
+
+        assert_eq!(first_context.cwd(), first.path());
+        assert_eq!(second_context.cwd(), second.path());
+        assert_eq!(
+            first_context.env("MARKER"),
+            Some(std::ffi::OsStr::new("first"))
+        );
+        assert_eq!(
+            second_context.env("MARKER"),
+            Some(std::ffi::OsStr::new("second"))
+        );
+    }
+
+    #[test]
+    fn explicit_contexts_anchor_relative_cache_paths_independently() {
+        let first = tempfile::tempdir().expect("first directory");
+        let second = tempfile::tempdir().expect("second directory");
+        #[cfg(unix)]
+        for directory in [&first, &second] {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(directory.path())
+                .expect("context directory metadata")
+                .permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(directory.path(), permissions)
+                .expect("secure context directory");
+        }
+        let relative = OsString::from(".bamts-cache");
+        let first_context = explicit_context(
+            first.path(),
+            [(OsString::from("BAMTS_CACHE_DIR"), relative.clone())],
+        );
+        let second_context = explicit_context(
+            second.path(),
+            [(OsString::from("BAMTS_CACHE_DIR"), relative)],
+        );
+
+        let first_root = super::cache_root(&first_context).expect("first cache");
+        let second_root = super::cache_root(&second_context).expect("second cache");
+        assert_eq!(first_root, first.path().join(".bamts-cache"));
+        assert_eq!(second_root, second.path().join(".bamts-cache"));
+        assert_ne!(first_root, second_root);
     }
 
     #[test]
@@ -1291,9 +1480,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn fallback_cache_root_has_stable_per_user_path() {
-        let parent = super::validate_private_cache_parent_chain(&std::env::temp_dir()).unwrap();
-        let expected = parent.join(format!("bamts-cache-{}", super::effective_uid().unwrap()));
-        assert_eq!(super::fallback_cache_root_path().unwrap(), expected);
+        let context = ambient_context();
+        let parent =
+            super::validate_private_cache_parent_chain(context.temp_dir(), &context).unwrap();
+        let expected = parent.join(format!(
+            "bamts-cache-{}",
+            super::effective_uid(&context).unwrap()
+        ));
+        assert_eq!(super::fallback_cache_root_path(&context).unwrap(), expected);
     }
 
     #[cfg(unix)]
@@ -1316,10 +1510,11 @@ mod tests {
         permissions.set_mode(0o777);
         std::fs::set_permissions(&unsafe_root, permissions).expect("chmod unsafe HOME cache");
 
-        let root = super::cache_root_from_env_values(None, None, Some(home.as_os_str()))
+        let context = ambient_context();
+        let root = super::cache_root_from_env_values(None, None, Some(home.as_os_str()), &context)
             .expect("unsafe HOME cache must use the private per-user fallback");
 
-        assert_eq!(root, super::fallback_cache_root_path().unwrap());
+        assert_eq!(root, super::fallback_cache_root_path(&context).unwrap());
         assert_ne!(root, unsafe_root);
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -1336,7 +1531,8 @@ mod tests {
             super::NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::remove_dir_all(&path);
-        let root = super::ensure_private_cache_root(path.clone())
+        let context = ambient_context();
+        let root = super::ensure_private_cache_root(path.clone(), &context)
             .expect("private fallback root should be created");
         let metadata = std::fs::symlink_metadata(&root).expect("metadata");
         assert!(metadata.is_dir());
@@ -1360,7 +1556,8 @@ mod tests {
         let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
         permissions.set_mode(0o710);
         std::fs::set_permissions(&path, permissions).expect("chmod");
-        let error = super::ensure_private_cache_root(path.clone())
+        let context = ambient_context();
+        let error = super::ensure_private_cache_root(path.clone(), &context)
             .expect_err("group/other bits must be rejected");
         assert!(matches!(error, DriverError::UnsafeFallbackCacheRoot { .. }));
         let _ = std::fs::remove_dir_all(&path);
@@ -1383,7 +1580,8 @@ mod tests {
         permissions.set_mode(0o777);
         std::fs::set_permissions(&parent, permissions).expect("chmod");
 
-        let error = super::ensure_private_cache_root(parent.join("cache"))
+        let context = ambient_context();
+        let error = super::ensure_private_cache_root(parent.join("cache"), &context)
             .expect_err("replaceable parent must be rejected");
 
         assert!(matches!(error, DriverError::UnsafeFallbackCacheRoot { .. }));
@@ -1403,12 +1601,13 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&path);
 
-        let root = super::cache_root_from_env_values(Some(path.as_os_str()), None, None)
+        let context = ambient_context();
+        let root = super::cache_root_from_env_values(Some(path.as_os_str()), None, None, &context)
             .expect("BAMTS_CACHE_DIR branch should create and validate a private cache root");
         let metadata = std::fs::symlink_metadata(&root).expect("metadata");
         assert!(metadata.is_dir());
         assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
-        assert_eq!(metadata.uid(), super::effective_uid().unwrap());
+        assert_eq!(metadata.uid(), super::effective_uid(&context).unwrap());
         let _ = std::fs::remove_dir_all(&path);
     }
 
@@ -1429,7 +1628,8 @@ mod tests {
         permissions.set_mode(0o777);
         std::fs::set_permissions(&path, permissions).expect("chmod");
 
-        let error = super::cache_root_from_env_values(Some(path.as_os_str()), None, None)
+        let context = ambient_context();
+        let error = super::cache_root_from_env_values(Some(path.as_os_str()), None, None, &context)
             .expect_err("world-writable env cache root must be rejected");
         assert!(matches!(error, DriverError::UnsafeFallbackCacheRoot { .. }));
         let _ = std::fs::remove_dir_all(&path);
