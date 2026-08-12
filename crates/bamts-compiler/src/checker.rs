@@ -2620,6 +2620,7 @@ mod tests {
             "Intl",
             "Iterator",
             "AsyncIterator",
+            "AbortSignal",
             "URL",
             "URLSearchParams",
             "TextEncoder",
@@ -2641,7 +2642,7 @@ mod tests {
                 | Int16Array | Uint16Array | Int32Array | Uint32Array
                 | BigInt64Array | BigUint64Array | Float16Array | Float32Array
                 | Float64Array | ArrayBuffer | SharedArrayBuffer | DataView
-                | Iterator | AsyncIterator | URL | URLSearchParams
+                | Iterator | AsyncIterator | AbortSignal | URL | URLSearchParams
                 | TextEncoder | TextDecoder;",
         );
         assert!(

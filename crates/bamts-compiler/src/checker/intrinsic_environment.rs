@@ -192,6 +192,7 @@ const STANDARD_TYPES: &[&str] = &[
     "Float16Array",
     "Float32Array",
     "Float64Array",
+    "AbortSignal",
     "URL",
     "URLSearchParams",
     "TextEncoder",
