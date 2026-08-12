@@ -1,0 +1,83 @@
+# bamTiScript
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust Edition: 2024](https://img.shields.io/badge/Rust_Edition-2024-orange.svg)](Cargo.toml)
+[![MSRV: 1.97.1](https://img.shields.io/badge/MSRV-1.97.1-blue.svg)](Cargo.toml)
+
+bamTiScript is a pre-release Rust toolchain that type-checks, runs, and compiles TypeScript. TypeScript 7.0.2 compatibility is in progress.
+
+## Naming conventions
+
+- Repository: `bamTiScript`
+- CLI binary: `bamts`
+- Workspace crates: `bamts`, `bamts-cli`, `bamts-compiler`, `bamts-runtime`, `bamts-codegen`, `bamts-bytecode`, `bamts-native`, `bamts-node`, and `bamts-verification`
+- npm packages: `bamti` and `bamti-cli` 0.1.0 are published, but their platform binary packages are unavailable
+
+## Quickstart
+
+Build the CLI from source, create a TypeScript entrypoint, type-check it, and run it:
+
+```bash
+cargo build --release -p bamts-cli
+
+cat > hello.ts <<'EOF'
+const message: string = "hello from bamts";
+process.stdout.write(`${message}\n`);
+EOF
+
+target/release/bamts check hello.ts
+target/release/bamts run --target jit hello.ts
+target/release/bamts compile --target aot -o hello hello.ts
+./hello
+```
+
+## Project status
+
+- Version `0.1.0` is pre-release.
+- npm package shims are published, but their platform binary packages are unavailable. Build the working CLI from source with Cargo.
+- The documented runtime target is Linux x64. AOT steps use the C compiler driver selected by `$CC`, defaulting to `cc`.
+
+## Current capabilities
+
+- Type checking with `text`, `pretty`, `json`, `github`, and `compact` diagnostic output
+- JIT execution with `run --target jit`
+- AOT execution and native binary compilation with `--target aot`
+- UTF-16 code-unit indexing for ECMAScript strings
+- A limited Node-style host surface that includes `process.stdout.write`
+
+## Explicit limitations
+
+- TypeScript 7.0.2 is the compatibility oracle and target, not a completed compatibility claim.
+- `compile` accepts one entrypoint per invocation and only the AOT target. `-o` selects the output path. Declaration generation and source-map output are rejected.
+- The host runtime implements a limited Node-style API surface. It does not provide full Node.js compatibility.
+- AOT output targets the host architecture. Cross-compilation and non-Linux runtime behavior are not verified.
+- The root workspace policy defaults to `unsafe_code = "forbid"`. Most crates inherit it. Native code generation, host export, verification, and FFI crates contain narrowly scoped, documented exceptions. This policy is not an end-to-end formal memory-safety guarantee.
+- The project publishes no performance benchmark or production-readiness claim.
+- Formal source artifacts target named properties. The current acceptance state is recorded in the proof ledger; complete compiler and runtime correctness is not proven.
+
+## Documentation
+
+* [Quickstart Guide](docs/tutorials/quickstart.md): Step-by-step source build and execution tutorial.
+* [CLI Reference](docs/reference/cli.md): Command flags, execution targets, exit codes, and budget limits.
+* [Diagnostics Reference](docs/reference/diagnostics.md): Diagnostic codes, output formats, UTF-16 column indexing, and error limits.
+* [Architecture Explanation](docs/explanation/architecture.md): High-level system architecture and component boundaries.
+* [Verification Explanation](docs/explanation/verification.md): Conformance testing, differential corpus, and formal verification models.
+* [Compiler Rules](crates/bamts-compiler/RULES.md): Type checker invariants and diagnostic rules.
+* [UTF-16 String Encoding Pattern](docs/solutions/architecture-patterns/exact-ecmascript-utf16-strings.md): UTF-16 string representation and runtime design.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local environment setup (Rust 1.97.1, Edition 2024) and mandatory unpiped validation gates:
+
+```bash
+cargo fmt --all --check
+cargo check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+Every commit must implement one logical concern and compile cleanly.
+
+## License
+
+Distributed under the [MIT License](LICENSE).
