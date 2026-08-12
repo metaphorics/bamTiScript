@@ -457,6 +457,14 @@ impl<'table> TypeRelations<'table> {
                 .iter()
                 .all(|&source| self.relates(source, *target_element, strictness)),
             (Type::Array(_), Type::Tuple(_)) => false,
+            (Type::Array(_) | Type::Tuple(_), Type::ObjectType(target_object))
+                if target_object.iterator_property.is_some()
+                    && target_object.index_signatures.is_empty() =>
+            {
+                self.table
+                    .iterable_view(source)
+                    .is_some_and(|view| self.relates(view, target, strictness))
+            }
             (Type::ObjectType(source), Type::ObjectType(target)) => {
                 self.object_relates(source, target, strictness)
             }

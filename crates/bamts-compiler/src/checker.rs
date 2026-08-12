@@ -7080,6 +7080,50 @@ mod tests {
     }
 
     #[test]
+    fn arrays_and_tuples_satisfy_structural_iterable_contracts() {
+        let result = check_text_strict_null(
+            "interface Numbers { [Symbol.iterator](): Iterator<number>; }\
+             const array: Numbers = [1, 2, 3];\
+             declare const pair: [number, string];\
+             const broad: Iterable<number | string> = pair;\
+             declare const optional: [number?];\
+             const maybe: Iterable<number | undefined> = optional;\
+             declare const empty: [];\
+             const bottom: Iterable<string> = empty;",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn array_and_tuple_iterable_relations_enforce_the_full_contract() {
+        for source in [
+            "const values: Iterable<string> = [1, 2, 3];",
+            "declare const pair: [number, string];\
+             const values: Iterable<number> = pair;",
+            "interface TaggedNumbers extends Iterable<number> { tag: string; }\
+             const values: TaggedNumbers = [1, 2, 3];",
+            "interface RichIterable {\
+                 [Symbol.iterator](): Iterator<number> & { close(): void };\
+             }\
+             const values: RichIterable = [1, 2, 3];",
+            "const values: AsyncIterable<number> = [1, 2, 3];",
+        ] {
+            let result = check_text(source);
+            assert_eq!(checker_codes(&result), ["BAMTS-C004"], "{source}");
+        }
+
+        let optional = check_text_strict_null(
+            "declare const values: [number?];\
+             const narrow: Iterable<number> = values;",
+        );
+        assert_eq!(checker_codes(&optional), ["BAMTS-C004"]);
+    }
+
+    #[test]
     fn structural_iterator_relations_compare_the_full_callable() {
         let result = check_text(
             "type Source = {\

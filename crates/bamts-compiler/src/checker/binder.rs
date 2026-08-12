@@ -1222,6 +1222,8 @@ pub struct TypeTable {
     /// references use `Type::Named(symbol)` as an inert head and expand through
     /// this single view after the body has been interned.
     interface_structures: HashMap<SymbolId, TypeId>,
+    /// Canonical synchronous iterable view for every array and tuple head.
+    iterable_views: HashMap<TypeId, TypeId>,
 }
 
 impl Default for TypeTable {
@@ -1257,6 +1259,7 @@ impl TypeTable {
             materializing_class_views: HashSet::new(),
             deferred_class_views: VecDeque::new(),
             interface_structures: HashMap::new(),
+            iterable_views: HashMap::new(),
         };
         table.error = table.intern(Type::Error);
         table.any = table.intern(Type::Any);
@@ -1288,6 +1291,10 @@ impl TypeTable {
     #[must_use]
     pub fn get(&self, id: TypeId) -> &Type {
         &self.types[id.0 as usize]
+    }
+
+    pub(crate) fn iterable_view(&self, source: TypeId) -> Option<TypeId> {
+        self.iterable_views.get(&source).copied()
     }
     /// Returns the type of a named property on a structural type, distributing
     /// over unions. `None` means the property is not present on the type.
@@ -2431,7 +2438,9 @@ impl TypeTable {
 
     /// Interns an array type over `element`.
     pub fn array(&mut self, element: TypeId) -> TypeId {
-        self.intern(Type::Array(element))
+        let array = self.intern(Type::Array(element));
+        self.ensure_iterable_view(array);
+        array
     }
 
     /// Interns a fixed-length tuple type.
@@ -2464,7 +2473,88 @@ impl TypeTable {
         {
             return self.array(rest);
         }
-        self.intern(Type::Tuple(shape))
+        let tuple = self.intern(Type::Tuple(shape));
+        self.ensure_iterable_view(tuple);
+        tuple
+    }
+
+    pub(crate) fn array_or_tuple_iteration_element(&mut self, type_id: TypeId) -> Option<TypeId> {
+        match self.get(type_id).clone() {
+            Type::Array(element) => Some(element),
+            Type::Tuple(shape) => {
+                let mut elements = shape.all_element_types();
+                if (shape.required as usize) < shape.prefix.len() {
+                    elements.push(self.undefined_type());
+                }
+                Some(self.union(&elements))
+            }
+            _ => None,
+        }
+    }
+
+    fn ensure_iterable_view(&mut self, source: TypeId) {
+        if self.iterable_views.contains_key(&source) {
+            return;
+        }
+        let yield_type = self
+            .array_or_tuple_iteration_element(source)
+            .expect("iterable view source is an array or tuple");
+        let any = self.any();
+        let view = self.sync_iterable_type(yield_type, any, any);
+        let replaced = self.iterable_views.insert(source, view);
+        debug_assert!(replaced.is_none());
+    }
+
+    fn sync_iterator_type(
+        &mut self,
+        yield_type: TypeId,
+        return_type: TypeId,
+        next_type: TypeId,
+    ) -> TypeId {
+        let done_false = self.boolean_literal(false);
+        let done_true = self.boolean_literal(true);
+        let yield_result = self.object_type(vec![
+            PropertyType::new("value", false, yield_type),
+            PropertyType::new("done", true, done_false),
+        ]);
+        let return_result = self.object_type(vec![
+            PropertyType::new("value", false, return_type),
+            PropertyType::new("done", false, done_true),
+        ]);
+        let result = self.union(&[yield_result, return_result]);
+        let next = self.function_with_parameters(
+            Vec::new(),
+            vec![FunctionParameter::new(
+                "value".to_owned(),
+                next_type,
+                true,
+                false,
+            )],
+            result,
+        );
+        self.object_type(vec![
+            PropertyType::new("next", false, next).with_method(true),
+        ])
+    }
+
+    fn sync_iterable_type(
+        &mut self,
+        yield_type: TypeId,
+        return_type: TypeId,
+        next_type: TypeId,
+    ) -> TypeId {
+        let iterator = self.sync_iterator_type(yield_type, return_type, next_type);
+        let method = self.function(Vec::new(), iterator);
+        let property = IteratorProperty::new(method, false).with_method(true);
+        self.object_type_with_members(ObjectType {
+            properties: Vec::new(),
+            call_signatures: Vec::new(),
+            construct_signatures: Vec::new(),
+            index_signatures: Vec::new(),
+            generator_return: None,
+            iterator_property: Some(property),
+            async_iterator_property: None,
+        })
     }
 
     /// Interns an intersection type without assigning source syntax semantics.
@@ -9887,17 +9977,7 @@ impl<'src> Binder<'src> {
     }
 
     fn array_element_type(&mut self, array_type: TypeId) -> Option<TypeId> {
-        match self.types.get(array_type).clone() {
-            Type::Array(element) => Some(element),
-            Type::Tuple(shape) => {
-                let mut elements = shape.all_element_types();
-                if (shape.required as usize) < shape.prefix.len() {
-                    elements.push(self.types.undefined_type());
-                }
-                Some(self.types.union(&elements))
-            }
-            _ => None,
-        }
+        self.types.array_or_tuple_iteration_element(array_type)
     }
 
     fn zero_argument_return_type(&mut self, callable: TypeId) -> Option<TypeId> {
@@ -10059,13 +10139,8 @@ impl<'src> Binder<'src> {
         receiver: TypeId,
     ) -> Option<TypeId> {
         match self.types.get(iterable).clone() {
-            Type::Array(element) => Some(element),
-            Type::Tuple(shape) => {
-                let mut elements = shape.all_element_types();
-                if (shape.required as usize) < shape.prefix.len() {
-                    elements.push(self.types.undefined_type());
-                }
-                Some(self.types.union(&elements))
+            Type::Array(_) | Type::Tuple(_) => {
+                self.types.array_or_tuple_iteration_element(iterable)
             }
             Type::ObjectType(object) => {
                 if mode == ForOfMode::Async
@@ -12554,34 +12629,38 @@ impl<'src> Binder<'src> {
         next_type: TypeId,
         protocol: ForOfMode,
     ) -> TypeId {
-        let done_false = self.types.boolean_literal(false);
-        let done_true = self.types.boolean_literal(true);
-        let yield_result = self.types.object_type(vec![
-            PropertyType::new("value", false, yield_type),
-            PropertyType::new("done", true, done_false),
-        ]);
-        let return_result = self.types.object_type(vec![
-            PropertyType::new("value", false, return_type),
-            PropertyType::new("done", false, done_true),
-        ]);
-        let result = self.types.union(&[yield_result, return_result]);
-        let next_result = match protocol {
-            ForOfMode::Sync => result,
-            ForOfMode::Async => self.promise_type(result),
-        };
-        let next = self.types.function_with_parameters(
-            Vec::new(),
-            vec![FunctionParameter::new(
-                "value".to_owned(),
-                next_type,
-                true,
-                false,
-            )],
-            next_result,
-        );
-        self.types.object_type(vec![
-            PropertyType::new("next", false, next).with_method(true),
-        ])
+        match protocol {
+            ForOfMode::Sync => self
+                .types
+                .sync_iterator_type(yield_type, return_type, next_type),
+            ForOfMode::Async => {
+                let done_false = self.types.boolean_literal(false);
+                let done_true = self.types.boolean_literal(true);
+                let yield_result = self.types.object_type(vec![
+                    PropertyType::new("value", false, yield_type),
+                    PropertyType::new("done", true, done_false),
+                ]);
+                let return_result = self.types.object_type(vec![
+                    PropertyType::new("value", false, return_type),
+                    PropertyType::new("done", false, done_true),
+                ]);
+                let result = self.types.union(&[yield_result, return_result]);
+                let next_result = self.promise_type(result);
+                let next = self.types.function_with_parameters(
+                    Vec::new(),
+                    vec![FunctionParameter::new(
+                        "value".to_owned(),
+                        next_type,
+                        true,
+                        false,
+                    )],
+                    next_result,
+                );
+                self.types.object_type(vec![
+                    PropertyType::new("next", false, next).with_method(true),
+                ])
+            }
+        }
     }
 
     fn intrinsic_iterable_type(
@@ -12591,22 +12670,26 @@ impl<'src> Binder<'src> {
         next_type: TypeId,
         protocol: ForOfMode,
     ) -> TypeId {
-        let iterator = self.intrinsic_iterator_type(yield_type, return_type, next_type, protocol);
-        let method = self.types.function(Vec::new(), iterator);
-        let property = IteratorProperty::new(method, false).with_method(true);
-        let (iterator_property, async_iterator_property) = match protocol {
-            ForOfMode::Sync => (Some(property), None),
-            ForOfMode::Async => (None, Some(property)),
-        };
-        self.types.object_type_with_members(ObjectType {
-            properties: Vec::new(),
-            call_signatures: Vec::new(),
-            construct_signatures: Vec::new(),
-            index_signatures: Vec::new(),
-            generator_return: None,
-            iterator_property,
-            async_iterator_property,
-        })
+        match protocol {
+            ForOfMode::Sync => self
+                .types
+                .sync_iterable_type(yield_type, return_type, next_type),
+            ForOfMode::Async => {
+                let iterator =
+                    self.intrinsic_iterator_type(yield_type, return_type, next_type, protocol);
+                let method = self.types.function(Vec::new(), iterator);
+                let property = IteratorProperty::new(method, false).with_method(true);
+                self.types.object_type_with_members(ObjectType {
+                    properties: Vec::new(),
+                    call_signatures: Vec::new(),
+                    construct_signatures: Vec::new(),
+                    index_signatures: Vec::new(),
+                    generator_return: None,
+                    iterator_property: None,
+                    async_iterator_property: Some(property),
+                })
+            }
+        }
     }
 
     fn intrinsic_iterable_iterator_type(
