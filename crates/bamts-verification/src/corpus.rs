@@ -103,7 +103,7 @@ pub const COMPARE_KEYS: [&str; 2] = ["stdout", "exit_code"];
 
 const COMMIT_LEN: usize = 40;
 const MIN_TIMEOUT_MS: u64 = 1;
-const MAX_TIMEOUT_MS: u64 = 60_000;
+const MAX_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 1 << 20;
 const READ_CHUNK: usize = 8192;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
