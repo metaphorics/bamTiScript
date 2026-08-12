@@ -3308,6 +3308,66 @@ fn directive_prologue_is_strict(source: &SourceFile, statements: &[Stmt]) -> boo
     false
 }
 
+fn diagnostic_suppression_lines(source: &SourceFile) -> HashSet<usize> {
+    let source_text = source.source_text();
+    let tokens = source.tokens();
+    let mut lines = HashSet::new();
+
+    for (index, token) in tokens.iter().enumerate() {
+        if !matches!(
+            token.kind(),
+            TokenKind::LineComment | TokenKind::BlockComment
+        ) {
+            continue;
+        }
+        let text = source.token_text(token).unwrap_or("");
+        let directive_line = match token.kind() {
+            TokenKind::LineComment => text,
+            TokenKind::BlockComment => text
+                .rsplit(['\n', '\r', '\u{2028}', '\u{2029}'])
+                .next()
+                .unwrap_or(""),
+            _ => unreachable!("comment token kind checked above"),
+        };
+        let body = directive_line
+            .trim_start()
+            .trim_start_matches(['/', '*'])
+            .trim_start();
+        let is_suppression = ["@ts-expect-error", "@ts-ignore"]
+            .iter()
+            .any(|directive| body.starts_with(directive));
+        if !is_suppression {
+            continue;
+        }
+
+        let directive_line = source_text
+            .line_column(token.range().end())
+            .expect("comment token range belongs to its source")
+            .0;
+        let Some(target) = tokens[index + 1..].iter().find(|candidate| {
+            !matches!(
+                candidate.kind(),
+                TokenKind::Whitespace
+                    | TokenKind::LineComment
+                    | TokenKind::BlockComment
+                    | TokenKind::Shebang
+                    | TokenKind::EndOfFile
+            )
+        }) else {
+            continue;
+        };
+        let target_line = source_text
+            .line_column(target.range().start())
+            .expect("token range belongs to its source")
+            .0;
+        if target_line > directive_line {
+            lines.insert(target_line);
+        }
+    }
+
+    lines
+}
+
 /// Returns whether an enum initializer is a numeric literal expression.
 pub(crate) fn is_numeric_enum_initializer(expression: &Expr) -> bool {
     match expression.data() {
@@ -3745,6 +3805,8 @@ pub(crate) struct Binder<'src> {
     /// Whether the source file is a `.d.ts`/`.d.mts`/`.d.cts` declaration file.
     /// Top-level statements in such files must be declarations.
     is_declaration_file: bool,
+    /// Source lines suppressed by `@ts-expect-error` or `@ts-ignore`.
+    diagnostic_suppression_lines: HashSet<usize>,
 }
 
 impl<'src> Binder<'src> {
@@ -3839,6 +3901,7 @@ impl<'src> Binder<'src> {
             this_context: Vec::new(),
             ambient_binding: false,
             is_declaration_file: source.source_text().is_declaration_file(),
+            diagnostic_suppression_lines: diagnostic_suppression_lines(source),
         };
         let global_scope = checker.new_scope(ScopeKind::Global, None);
         checker.global_scope = global_scope;
@@ -4633,6 +4696,15 @@ impl<'src> Binder<'src> {
     }
 
     pub(crate) fn emit(&mut self, code: DiagnosticCode, range: TextRange, message: &'static str) {
+        let line = self
+            .source
+            .source_text()
+            .line_column(range.start())
+            .expect("diagnostic range belongs to its source")
+            .0;
+        if self.diagnostic_suppression_lines.contains(&line) {
+            return;
+        }
         self.diagnostics.push(Diagnostic::error(
             code,
             self.source.source_id(),

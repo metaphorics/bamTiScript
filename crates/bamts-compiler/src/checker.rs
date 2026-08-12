@@ -2992,6 +2992,35 @@ mod tests {
     }
 
     #[test]
+    fn typescript_directives_suppress_only_the_next_code_line() {
+        let result = check_text(
+            "declare function takesString(value: string): void;\n\
+             takesString(0);\n\
+             // @ts-expect-error: deliberate compatibility case\n\
+             takesString(1);\n\
+             // @ts-ignore: deliberate compatibility case\n\
+             \n\
+             // intervening comment\n\
+             takesString(2);\n\
+             /* @ts-expect-error */ takesString(3);\n\
+             /* ordinary text\n\
+              * @ts-expect-error */\n\
+             takesString(4);\n\
+             /* @ts-expect-error\n\
+              * ordinary text */\n\
+             takesString(5);\n\
+             // @ts-expect-error(TODO)\n\
+             takesString(6);\n\
+             // @ts-ignore-because-generated\n\
+             takesString(7);",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            ["BAMTS-C053", "BAMTS-C053", "BAMTS-C053"]
+        );
+    }
+
+    #[test]
     fn explicit_type_arguments_instantiate_generic_call_signature() {
         let result = check_text(
             "function foo<T>(x: { bar: T; baz: T }): T { return x.bar; }\n\
