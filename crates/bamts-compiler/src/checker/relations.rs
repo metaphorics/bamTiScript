@@ -17,7 +17,7 @@
 //! applications with different arguments therefore remain distinct, while an
 //! exact repeated pair is a sound coinductive recursion boundary.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use bamts_bytecode::MAX_BIGINT_BYTES;
@@ -28,8 +28,8 @@ use super::binder::{
 };
 use crate::literal::{MAX_BIGINT_CONVERSION_LIMB_OPS, canonical_bigint_text, number_value};
 use crate::syntax::Accessibility;
-/// are computed without being stored; results stay deterministic because the
-/// algebra itself never depends on cache state.
+/// Completed structural relations are memoized up to this bound; beyond it,
+/// results stay deterministic because the algebra never depends on cache state.
 const RELATION_CACHE_CAPACITY: usize = 4096;
 
 /// A compatibility decision plus the intentional TypeScript hazards that made
@@ -63,7 +63,7 @@ pub enum RelationHazard {
 
 /// How a relation query treats TypeScript's intentional compatibility
 /// concessions.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum Strictness {
     /// Full assignability: every documented concession is accepted.
     Assignable,
@@ -95,6 +95,29 @@ enum ParameterVariance {
     Bivariant,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct RelationKey {
+    source: TypeId,
+    target: TypeId,
+    strictness: Strictness,
+    context: usize,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RelationContext {
+    parameter_aliases: Box<[(SymbolId, SymbolId)]>,
+    /// Comparable recursion only adds erased parameters, and erasure can only
+    /// relax a relation. One active identity therefore terminates recursive
+    /// signatures; completed results remain membership-sensitive and uncached.
+    erasure_active: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CachedRelation {
+    compatible: bool,
+    assumptions: Box<[RelationKey]>,
+}
+
 /// Relation queries over one interned [`TypeTable`].
 ///
 /// Construct once per relation-heavy pass and reuse it so the memoized pairs
@@ -102,9 +125,15 @@ enum ParameterVariance {
 /// short-lived instance per call.
 pub struct TypeRelations<'table> {
     table: &'table TypeTable,
-    cache: RefCell<HashMap<(TypeId, TypeId, Strictness), bool>>,
+    cache: RefCell<HashMap<RelationKey, Vec<CachedRelation>>>,
     /// Pairs currently being compared, to break recursive structural types.
-    visiting: RefCell<HashSet<(TypeId, TypeId, Strictness)>>,
+    visiting: RefCell<HashSet<RelationKey>>,
+    /// Coinductive assumptions consumed by each active relation frame.
+    dependency_stack: RefCell<Vec<HashSet<RelationKey>>>,
+    /// Interned identities for effective alias/erasure environments. Identity
+    /// zero is the empty environment.
+    contexts: RefCell<HashMap<RelationContext, usize>>,
+    active_context: Cell<usize>,
     /// Type parameters paired positionally by the generic signatures currently
     /// being compared, so `<T>(x: T) => T` relates to `<U>(x: U) => U`.
     /// Non-empty only inside such a comparison.
@@ -112,6 +141,8 @@ pub struct TypeRelations<'table> {
     /// Signature type parameters erased to `any` for the comparable relation.
     /// Non-empty only while one signature comparison is active.
     erased_parameters: RefCell<Vec<SymbolId>>,
+    #[cfg(test)]
+    computed_relations: Cell<usize>,
 }
 
 impl<'table> TypeRelations<'table> {
@@ -121,8 +152,13 @@ impl<'table> TypeRelations<'table> {
             table,
             cache: RefCell::new(HashMap::new()),
             visiting: RefCell::new(HashSet::new()),
+            dependency_stack: RefCell::new(Vec::new()),
+            contexts: RefCell::new(HashMap::new()),
+            active_context: Cell::new(0),
             parameter_aliases: RefCell::new(Vec::new()),
             erased_parameters: RefCell::new(Vec::new()),
+            #[cfg(test)]
+            computed_relations: Cell::new(0),
         }
     }
 
@@ -130,6 +166,11 @@ impl<'table> TypeRelations<'table> {
     #[must_use]
     pub fn cached_pairs(&self) -> usize {
         self.cache.borrow().len()
+    }
+
+    #[cfg(test)]
+    fn computed_relations(&self) -> usize {
+        self.computed_relations.get()
     }
 
     /// Returns whether a value of `source` may be assigned where `target` is
@@ -233,25 +274,56 @@ impl<'table> TypeRelations<'table> {
         if source == target {
             return true;
         }
-        let key = (source, target, strictness);
-        // Only structural queries are memoized; primitive pairs resolve in one
-        // match arm, so caching them would only spend memory. A result reached
-        // under a type-parameter alias holds only for that comparison, so it is
-        // never cached.
+        let relation = RelationKey {
+            source,
+            target,
+            strictness,
+            context: self.active_context.get(),
+        };
+        let comparable_erasure_active =
+            strictness == Strictness::Comparable && !self.erased_parameters.borrow().is_empty();
+        // A recursive Comparable visit may coinductively reuse the active
+        // erasure identity because nested signatures only add `any` leaves. A
+        // completed result cannot: whether a specific symbol is erased matters.
         let cacheable = (self.is_structural(source) || self.is_structural(target))
-            && self.parameter_aliases.borrow().is_empty()
-            && self.erased_parameters.borrow().is_empty();
-        if cacheable && let Some(result) = self.cache.borrow().get(&key) {
-            return *result;
+            && !comparable_erasure_active;
+        if cacheable {
+            let cached = {
+                let visiting = self.visiting.borrow();
+                self.cache.borrow().get(&relation).and_then(|entries| {
+                    entries
+                        .iter()
+                        .find(|entry| {
+                            !entry.compatible
+                                || entry
+                                    .assumptions
+                                    .iter()
+                                    .all(|assumption| visiting.contains(assumption))
+                        })
+                        .cloned()
+                })
+            };
+            if let Some(cached) = cached {
+                if cached.compatible
+                    && let Some(parent) = self.dependency_stack.borrow_mut().last_mut()
+                {
+                    parent.extend(cached.assumptions.iter().copied());
+                }
+                return cached.compatible;
+            }
         }
 
         let is_root = self.visiting.borrow().is_empty();
         {
             let mut visiting = self.visiting.borrow_mut();
-            if !visiting.insert(key) {
+            if !visiting.insert(relation) {
+                if let Some(parent) = self.dependency_stack.borrow_mut().last_mut() {
+                    parent.insert(relation);
+                }
                 return true;
             }
         }
+        self.dependency_stack.borrow_mut().push(HashSet::new());
 
         // Applications relate through their substituted structural views.
         // The in-progress key above uses the applied TypeIds themselves, so a
@@ -279,17 +351,75 @@ impl<'table> TypeRelations<'table> {
             self.relates_uncached(source, target, strictness)
         };
 
-        self.visiting.borrow_mut().remove(&key);
-        if cacheable && is_root {
+        let mut assumptions = self
+            .dependency_stack
+            .borrow_mut()
+            .pop()
+            .expect("active relation owns a dependency frame");
+        self.visiting.borrow_mut().remove(&relation);
+        if is_root {
+            assumptions.clear();
+        } else if let Some(parent) = self.dependency_stack.borrow_mut().last_mut() {
+            parent.extend(assumptions.iter().copied());
+        }
+        if cacheable && (result || assumptions.is_empty()) {
+            let mut assumptions: Vec<_> = assumptions.into_iter().collect();
+            assumptions.sort_unstable();
+            let cached = CachedRelation {
+                compatible: result,
+                assumptions: assumptions.into_boxed_slice(),
+            };
             let mut cache = self.cache.borrow_mut();
-            if cache.len() < RELATION_CACHE_CAPACITY {
-                cache.insert(key, result);
+            if cache.len() < RELATION_CACHE_CAPACITY || cache.contains_key(&relation) {
+                let entries = cache.entry(relation).or_default();
+                if !result {
+                    entries.clear();
+                    entries.push(cached);
+                } else if entries.iter().all(|entry| entry.compatible)
+                    && !entries.iter().any(|entry| {
+                        entry
+                            .assumptions
+                            .iter()
+                            .all(|assumption| cached.assumptions.binary_search(assumption).is_ok())
+                    })
+                {
+                    entries.retain(|entry| {
+                        !cached
+                            .assumptions
+                            .iter()
+                            .all(|assumption| entry.assumptions.binary_search(assumption).is_ok())
+                    });
+                    entries.push(cached);
+                }
             }
         }
         result
     }
 
+    fn refresh_context(&self) {
+        let mut parameter_aliases = self.parameter_aliases.borrow().clone();
+        parameter_aliases.sort_unstable();
+        parameter_aliases.dedup();
+        let erasure_active = !self.erased_parameters.borrow().is_empty();
+        if parameter_aliases.is_empty() && !erasure_active {
+            self.active_context.set(0);
+            return;
+        }
+
+        let context = RelationContext {
+            parameter_aliases: parameter_aliases.into_boxed_slice(),
+            erasure_active,
+        };
+        let mut contexts = self.contexts.borrow_mut();
+        let next = contexts.len() + 1;
+        self.active_context
+            .set(*contexts.entry(context).or_insert(next));
+    }
+
     fn relates_uncached(&self, source: TypeId, target: TypeId, strictness: Strictness) -> bool {
+        #[cfg(test)]
+        self.computed_relations
+            .set(self.computed_relations.get() + 1);
         let (from, to) = (self.table.get(source), self.table.get(target));
         match (from, to) {
             (Type::Error, _) | (_, Type::Error) => true,
@@ -559,6 +689,7 @@ impl<'table> TypeRelations<'table> {
         // may compare the outer substitutions in either direction. Distinct
         // generic declarations still require target-domain coverage.
         let added = source_parameters.len() * 2;
+        let previous_context = self.active_context.get();
         let mut aliases = self.parameter_aliases.borrow_mut();
         for (&source_parameter, &target_parameter) in
             source_parameters.iter().zip(target_parameters.iter())
@@ -567,6 +698,7 @@ impl<'table> TypeRelations<'table> {
             aliases.push((target_parameter, source_parameter));
         }
         drop(aliases);
+        self.refresh_context();
         let constraints_relate = source
             .type_parameter_bounds()
             .iter()
@@ -587,6 +719,8 @@ impl<'table> TypeRelations<'table> {
         let mut aliases = self.parameter_aliases.borrow_mut();
         let kept = aliases.len() - added;
         aliases.truncate(kept);
+        drop(aliases);
+        self.active_context.set(previous_context);
         result
     }
     fn with_erased_parameters(
@@ -596,14 +730,18 @@ impl<'table> TypeRelations<'table> {
         compare: impl FnOnce() -> bool,
     ) -> bool {
         let added = source.type_parameters().len() + target.type_parameters().len();
+        let previous_context = self.active_context.get();
         let mut erased = self.erased_parameters.borrow_mut();
         erased.extend(source.type_parameters());
         erased.extend(target.type_parameters());
         drop(erased);
+        self.refresh_context();
         let result = compare();
         let mut erased = self.erased_parameters.borrow_mut();
         let kept = erased.len() - added;
         erased.truncate(kept);
+        drop(erased);
+        self.active_context.set(previous_context);
         result
     }
 
@@ -1692,18 +1830,18 @@ mod tests {
         // Identity short-circuits before the cache is consulted.
         assert!(relations.assignable(outer, outer));
         assert_eq!(relations.cached_pairs(), 0);
-        // The first distinct query memoizes only the outermost pair (depth 1),
-        // not its nested structural sub-queries which run at depth >1.
+        // The first distinct query memoizes both the root and completed nested
+        // structural subproblems under their active assumption paths.
         assert!(relations.assignable(literal_outer, outer));
         let grown = relations.cached_pairs();
-        assert_eq!(grown, 1);
+        assert!(grown > 1);
         // Repeating the same pair returns the identical result from the cache.
         assert!(relations.assignable(literal_outer, outer));
         assert_eq!(relations.cached_pairs(), grown);
-        // The strict mode memoizes under its own key.
+        // The strict mode memoizes under separate relation keys.
         assert!(relations.subtype(literal_outer, outer));
         let after_strict = relations.cached_pairs();
-        assert_eq!(after_strict, 2);
+        assert!(after_strict > grown);
         assert!(relations.subtype(literal_outer, outer));
         assert_eq!(relations.cached_pairs(), after_strict);
     }
@@ -2195,5 +2333,205 @@ mod tests {
         let relations = TypeRelations::new(&table);
 
         assert!(!relations.assignable(source, target));
+    }
+
+    #[test]
+    fn comparable_recursive_signatures_share_monotone_erasure_context() {
+        const DEPTH: usize = 16;
+
+        let mut table = TypeTable::new();
+        let left_symbols: Vec<_> = (0..DEPTH)
+            .map(|index| SymbolId::new(600 + index as u32))
+            .collect();
+        let right_symbols: Vec<_> = (0..DEPTH)
+            .map(|index| SymbolId::new(620 + index as u32))
+            .collect();
+        let left_heads: Vec<_> = left_symbols
+            .iter()
+            .map(|&symbol| table.named(symbol))
+            .collect();
+        let right_heads: Vec<_> = right_symbols
+            .iter()
+            .map(|&symbol| table.named(symbol))
+            .collect();
+        let captured = SymbolId::new(682);
+        let captured_type = table.named(captured);
+
+        for index in 0..DEPTH {
+            let next = (index + 1) % DEPTH;
+            let left_parameter = if index == DEPTH / 2 {
+                captured
+            } else {
+                SymbolId::new(640 + index as u32)
+            };
+            let right_parameter = SymbolId::new(660 + index as u32);
+            let left_next =
+                table.function_with_parameters(vec![left_parameter], Vec::new(), left_heads[next]);
+            let right_next = table.function_with_parameters(
+                vec![right_parameter],
+                Vec::new(),
+                right_heads[next],
+            );
+            let mut left_properties = vec![PropertyType::new("next", false, left_next)];
+            let mut right_properties = vec![PropertyType::new("next", false, right_next)];
+            if index == 0 {
+                left_properties.push(PropertyType::new("value", false, captured_type));
+                right_properties.push(PropertyType::new("value", false, table.number()));
+            }
+            let left_structure = table.object_type(left_properties);
+            let right_structure = table.object_type(right_properties);
+            table.set_interface_structure(left_symbols[index], left_structure);
+            table.set_interface_structure(right_symbols[index], right_structure);
+        }
+
+        let root_left =
+            table.function_with_parameters(vec![SymbolId::new(680)], Vec::new(), left_heads[0]);
+        let root_right =
+            table.function_with_parameters(vec![SymbolId::new(681)], Vec::new(), right_heads[0]);
+        let captured_root_left =
+            table.function_with_parameters(vec![captured], Vec::new(), left_heads[0]);
+        let captured_root_right =
+            table.function_with_parameters(vec![SymbolId::new(686)], Vec::new(), right_heads[0]);
+        let captured_object =
+            table.object_type(vec![PropertyType::new("value", false, captured_type)]);
+        let number_object =
+            table.object_type(vec![PropertyType::new("value", false, table.number())]);
+        let unrelated_left =
+            table.function_with_parameters(vec![SymbolId::new(683)], Vec::new(), table.void());
+        let unrelated_right =
+            table.function_with_parameters(vec![SymbolId::new(684)], Vec::new(), table.void());
+        let captured_left =
+            table.function_with_parameters(vec![captured], Vec::new(), table.void());
+        let captured_right =
+            table.function_with_parameters(vec![SymbolId::new(685)], Vec::new(), table.void());
+        let signature = |type_id| match table.get(type_id) {
+            Type::Function(signature) => signature.clone(),
+            _ => panic!("test fixture must be a function"),
+        };
+        let unrelated_left = signature(unrelated_left);
+        let unrelated_right = signature(unrelated_right);
+        let captured_left = signature(captured_left);
+        let captured_right = signature(captured_right);
+        let relations = TypeRelations::new(&table);
+
+        assert!(!relations.comparable(root_left, root_right));
+        assert!(relations.comparable(captured_root_left, captured_root_right));
+        assert_eq!(
+            relations.contexts.borrow().len(),
+            1,
+            "nested erased signatures must share one recursive context"
+        );
+        assert!(
+            !relations.with_erased_parameters(&unrelated_left, &unrelated_right, || relations
+                .relates(captured_object, number_object, Strictness::Comparable),)
+        );
+        assert!(
+            relations.with_erased_parameters(&captured_left, &captured_right, || relations
+                .relates(captured_object, number_object, Strictness::Comparable),)
+        );
+        let reverse = TypeRelations::new(&table);
+        assert!(
+            reverse.with_erased_parameters(&captured_left, &captured_right, || reverse.relates(
+                captured_object,
+                number_object,
+                Strictness::Comparable
+            ),)
+        );
+        assert!(
+            !reverse.with_erased_parameters(&unrelated_left, &unrelated_right, || reverse.relates(
+                captured_object,
+                number_object,
+                Strictness::Comparable
+            ),)
+        );
+    }
+
+    #[test]
+    fn recursive_generic_constraint_memoizes_under_polymorphic_this_aliases() {
+        let mut table = TypeTable::new();
+        let class = SymbolId::new(510);
+        let class_value = SymbolId::new(511);
+        let class_leaf = SymbolId::new(512);
+        table.declare_class(class, vec![class_value, class_leaf]);
+        table.finish_class_bounds(
+            class,
+            vec![TypeParameterBounds::NONE, TypeParameterBounds::NONE],
+        );
+        let value = table.named(class_value);
+        let leaf = table.named(class_leaf);
+        let recursive = table.applied_class(class, vec![value, leaf]);
+        let recursive_this = table.this_type(class, recursive);
+        let mut properties: Vec<PropertyType> = (0..64)
+            .map(|index| PropertyType::new(format!("edge{index}"), false, recursive_this))
+            .collect();
+        properties.push(PropertyType::new("leaf", false, leaf));
+        let template = table.object_type(properties);
+        table.publish_final_class_template(class, template);
+
+        let source_parameter = SymbolId::new(513);
+        let target_parameter = SymbolId::new(514);
+        let source_value = table.named(source_parameter);
+        let target_value = table.named(target_parameter);
+        let source_bound = table.applied_class(class, vec![source_value, table.number()]);
+        let target_bound = table.applied_class(class, vec![target_value, table.string()]);
+        let parent_source = table.array(source_bound);
+        let parent_target = table.array(target_bound);
+        let source = table.function_with_parameter_bounds(
+            vec![source_parameter],
+            vec![TypeParameterBounds::new(Some(source_bound), None)],
+            Vec::new(),
+            table.void(),
+            false,
+        );
+        let target = table.function_with_parameter_bounds(
+            vec![target_parameter],
+            vec![TypeParameterBounds::new(Some(target_bound), None)],
+            Vec::new(),
+            table.void(),
+            false,
+        );
+        let relations = TypeRelations::new(&table);
+
+        assert!(!relations.assignable(source, target));
+        assert!(relations.cached_pairs() > 0);
+        assert!(
+            relations.computed_relations() < 24,
+            "recursive constraint relation expanded {} uncached pairs",
+            relations.computed_relations()
+        );
+
+        let parent_relation = RelationKey {
+            source: parent_source,
+            target: parent_target,
+            strictness: Strictness::Assignable,
+            context: 0,
+        };
+        let child_relation = RelationKey {
+            source: source_bound,
+            target: target_bound,
+            strictness: Strictness::Assignable,
+            context: 0,
+        };
+        let dummy_relation = RelationKey {
+            source,
+            target,
+            strictness: Strictness::Strict,
+            context: 0,
+        };
+        relations.visiting.borrow_mut().insert(dummy_relation);
+        relations.dependency_stack.borrow_mut().push(HashSet::new());
+        assert!(!relations.assignable(parent_source, parent_target));
+        relations.dependency_stack.borrow_mut().pop();
+        relations.visiting.borrow_mut().remove(&dummy_relation);
+        assert!(
+            !relations.cache.borrow().contains_key(&parent_relation),
+            "a cycle-dependent false nested result must not become universal"
+        );
+
+        relations.visiting.borrow_mut().insert(child_relation);
+        relations.dependency_stack.borrow_mut().push(HashSet::new());
+        assert!(relations.assignable(parent_source, parent_target));
+        relations.dependency_stack.borrow_mut().pop();
+        relations.visiting.borrow_mut().remove(&child_relation);
     }
 }

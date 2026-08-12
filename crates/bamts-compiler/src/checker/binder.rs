@@ -4103,14 +4103,26 @@ impl<'src> Binder<'src> {
 
     fn validate_pending_constraints(&mut self) {
         let pending = std::mem::take(&mut self.pending_constraint_checks);
-        for check in pending {
-            if !self.types_assignable(check.argument, check.constraint) {
-                self.emit(
-                    ARGUMENT_NOT_ASSIGNABLE,
-                    check.range,
-                    ARGUMENT_NOT_ASSIGNABLE_MESSAGE,
-                );
-            }
+        let relations = TypeRelations::new(&self.types);
+        let failed: Vec<_> = pending
+            .into_iter()
+            .filter(|check| {
+                let compatible = if self.strict_null_checks {
+                    relations.assignable_with_strict_null(check.argument, check.constraint)
+                } else {
+                    relations.assignable(check.argument, check.constraint)
+                };
+                !compatible
+            })
+            .collect();
+        drop(relations);
+
+        for check in failed {
+            self.emit(
+                ARGUMENT_NOT_ASSIGNABLE,
+                check.range,
+                ARGUMENT_NOT_ASSIGNABLE_MESSAGE,
+            );
         }
     }
 
