@@ -84,6 +84,12 @@ pub enum DriverError {
     },
     ProgramLoad(ProgramLoadError),
     Lower(ProgramLowerError),
+    NonUnicodeEnvironmentName {
+        name: OsString,
+    },
+    NonUnicodeEnvironmentValue {
+        name: String,
+    },
     Jit(bamts_codegen::JitError),
     Native(bamts_runtime::NativeError),
     Aot(bamts_codegen::AotError),
@@ -178,6 +184,15 @@ impl fmt::Display for DriverError {
             ),
             Self::ProgramLoad(error) => write!(formatter, "could not load program: {error}"),
             Self::Lower(error) => write!(formatter, "source cannot be lowered: {error}"),
+            Self::NonUnicodeEnvironmentName { name } => write!(
+                formatter,
+                "environment variable name `{}` is not valid Unicode for JIT execution",
+                name.to_string_lossy()
+            ),
+            Self::NonUnicodeEnvironmentValue { name } => write!(
+                formatter,
+                "environment variable `{name}` has a value that is not valid Unicode for JIT execution"
+            ),
             Self::Jit(error) => write!(formatter, "JIT compilation failed: {error}"),
             Self::Native(error) => write!(formatter, "program execution failed: {error}"),
             Self::Aot(error) => write!(formatter, "AOT object emission failed: {error}"),
@@ -281,6 +296,8 @@ impl Error for DriverError {
             | Self::Diagnostics { .. }
             | Self::LintConfig { .. }
             | Self::ProjectConfig { .. }
+            | Self::NonUnicodeEnvironmentName { .. }
+            | Self::NonUnicodeEnvironmentValue { .. }
             | Self::MultipleCompileInputs
             | Self::UnsupportedCompileTarget(_)
             | Self::UnsupportedOutputOption(_)
@@ -502,7 +519,7 @@ fn run(
         .map_err(DriverError::Lower)?;
     match args.target {
         ExecutionTarget::Jit => Ok((
-            run_jit(args, entrypoint, warnings, truncation, &executable)?,
+            run_jit(args, entrypoint, warnings, truncation, &executable, context)?,
             None,
         )),
         ExecutionTarget::Aot => {
@@ -519,6 +536,7 @@ fn run_jit(
     warnings: String,
     truncation: Option<TruncationNotice>,
     executable: &bamts_compiler::program::ExecutableProgram,
+    context: &ExecutionContext,
 ) -> Result<CommandOutcome, DriverError> {
     let program = bamts_codegen::compile_jit(executable.wire()).map_err(DriverError::Jit)?;
     let mut host = bamts_node::NodeHost::new();
@@ -528,6 +546,24 @@ fn run_jit(
             .into_iter()
             .chain(args.program_args.iter().cloned()),
     );
+    for (name, value) in context.envs() {
+        if name == OsStr::new(bamts_node::AOT_ENTRYPOINT_ENV)
+            || name == OsStr::new(bamts_node::AOT_LAUNCH_TOKEN_ENV)
+        {
+            continue;
+        }
+        let name = name
+            .to_str()
+            .ok_or_else(|| DriverError::NonUnicodeEnvironmentName {
+                name: name.to_os_string(),
+            })?;
+        let value = value
+            .to_str()
+            .ok_or_else(|| DriverError::NonUnicodeEnvironmentValue {
+                name: name.to_owned(),
+            })?;
+        host.set_env(name, value);
+    }
     let outcome = run_linked_program(executable.wire(), &program, &mut host, &Limits::default())
         .map_err(DriverError::Native)?;
     let mut stdout = host.stdout().to_vec();

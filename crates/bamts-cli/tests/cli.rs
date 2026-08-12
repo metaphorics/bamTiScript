@@ -89,12 +89,16 @@ process.stdout.write(process.argv[1] + "\n");
 process.stdout.write(process.argv[2] + "\n");
 process.stdout.write(process.argv[3] + "\n");
 process.stdout.write(process.env.BAMTS_AOT_ENTRYPOINT === undefined ? "hidden\n" : "leaked\n");
+process.stdout.write(process.env.BAMTS_AOT_LAUNCH_TOKEN === undefined ? "hidden\n" : "leaked\n");
+process.stdout.write(process.env.BAMTS_CONTEXT_PROBE + "\n");
 "#,
     );
 
     let jit = project
         .command()
-        .env_remove("BAMTS_AOT_ENTRYPOINT")
+        .env("BAMTS_AOT_ENTRYPOINT", "stale.ts")
+        .env("BAMTS_AOT_LAUNCH_TOKEN", "stale-token")
+        .env("BAMTS_CONTEXT_PROBE", "shared")
         .args(["run", "--target", "jit", "main.ts", "--", "first", "second"])
         .current_dir(&project.path)
         .output()
@@ -103,14 +107,19 @@ process.stdout.write(process.env.BAMTS_AOT_ENTRYPOINT === undefined ? "hidden\n"
 
     let aot = project
         .command()
-        .env_remove("BAMTS_AOT_ENTRYPOINT")
+        .env("BAMTS_AOT_ENTRYPOINT", "stale.ts")
+        .env("BAMTS_AOT_LAUNCH_TOKEN", "stale-token")
+        .env("BAMTS_CONTEXT_PROBE", "shared")
         .args(["run", "--target", "aot", "main.ts", "--", "first", "second"])
         .current_dir(&project.path)
         .output()
         .expect("bamts AOT argv program starts");
     assert_success(&aot, "bamts AOT argv program");
 
-    assert_eq!(jit.stdout, b"bamts\nmain.ts\nfirst\nsecond\nhidden\n");
+    assert_eq!(
+        jit.stdout,
+        b"bamts\nmain.ts\nfirst\nsecond\nhidden\nhidden\nshared\n"
+    );
     assert_eq!(aot.stdout, jit.stdout);
 }
 

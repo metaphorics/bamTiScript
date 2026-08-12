@@ -697,6 +697,8 @@ impl CorpusFailure {
             | driver::DriverError::Usage(_)
             | driver::DriverError::LintConfig { .. }
             | driver::DriverError::ProjectConfig { .. }
+            | driver::DriverError::NonUnicodeEnvironmentName { .. }
+            | driver::DriverError::NonUnicodeEnvironmentValue { .. }
             | driver::DriverError::MissingEntrypoint
             | driver::DriverError::MultipleCompileInputs
             | driver::DriverError::UnsupportedCompileTarget(_)
